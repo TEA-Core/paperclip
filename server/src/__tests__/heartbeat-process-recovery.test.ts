@@ -1429,11 +1429,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     childProcesses.add(child);
     expect(child.pid).toBeTypeOf("number");
 
-    // The detached window is bounded relative to `Date.now()` (SUP-6706): a run whose pid is
-    // alive but whose in-memory handle is lost is held `running` for 10 minutes, then converges
-    // to process_lost. The fixture default pins `updatedAt` to a fixed 2026-03-19, which is
-    // outside that window on any day but the one it was written, so the run would be reaped for
-    // being old rather than kept for being alive. Anchor it to now to test the pid check.
+    // A persisted child that is still alive but no longer owned by an in-memory handle is
+    // observed read-only: the run stays `running` as process_detached, with no termination
+    // authority and no time bound (upstream's policy replaced SUP-6706's 10-minute window that
+    // converged to process_lost). The `updatedAt` anchor dates from that window; it is no
+    // longer load-bearing but keeps the fixture shaped like a fresh run.
     const { runId, wakeupRequestId } = await seedRunFixture({
       processPid: child.pid ?? null,
       includeIssue: false,

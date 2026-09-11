@@ -148,11 +148,16 @@ describe("createGitRemoteAuthProvider", () => {
 
   it("accepts GitHub SSH remotes for process-scoped HTTPS rewriting", async () => {
     const secrets = buildSecretsFake({ GITHUB_TOKEN: "token" });
+    const probeToken = vi.fn(async () => true);
     const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
       secrets,
       env: {},
+      probeToken,
     });
     const invocation = await provider("git@github.com:example/repo.git");
+    // TEA-Core fork: an scp-style remote is scoped to its owner/repo, so the SUP-13224 probe
+    // (and its fall-through to the next candidate) applies to it like an HTTPS remote.
+    expect(probeToken).toHaveBeenCalledWith("token", "example", "repo");
     expect(invocation?.env.GIT_CONFIG_VALUE_3).toBe("git@github.com:");
     expect(invocation?.env.GIT_CONFIG_KEY_3).toBe("url.https://github.com/.insteadOf");
   });
@@ -245,6 +250,9 @@ describe("createGitRemoteAuthProvider", () => {
     const provider = createGitRemoteAuthProvider(db, "company-1", { agentId: "agent-b" }, {
       secrets,
       env: {},
+      // TEA-Core fork: without an injected probe the SUP-13224 probe calls api.github.com with
+      // this fake token, gets a 401 when online, and falls through to no credential.
+      probeToken: async () => true,
     });
 
     const invocation = await provider(githubUrl);

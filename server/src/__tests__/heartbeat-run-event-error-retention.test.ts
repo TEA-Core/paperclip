@@ -13,8 +13,8 @@ import {
 } from "../services/heartbeat.ts";
 
 // SUP-15309: the underlying Postgres/driver error must survive intact on
-// heartbeat_run_events. The `error` field is written verbatim (only current-user
-// identity redacted) and is intentionally NOT passed through the payload bounder,
+// heartbeat_run_events. The `error` field is never truncated (only secret-shaped tokens
+// and current-user identity are redacted) and is intentionally NOT passed through the payload bounder,
 // whose 16KB string bound is what truncated the error away during SUP-15254.
 //
 // The pure block below always runs (no DB) and exercises the exact insert-values
@@ -102,6 +102,25 @@ describe("heartbeat_run_events error retention (appendRunEvent insert values)", 
     });
     expect(values.error!.includes("paperclip-test-user")).toBe(false);
     // Redaction swaps the username for a mask; length stays > the 16KB bound.
+    expect(values.error!.length).toBeGreaterThan(PAYLOAD_STRING_BOUND);
+  });
+
+  it("redacts secret-shaped tokens from the message and the error (upstream #12721)", () => {
+    const githubToken = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
+    const values = buildRunEventInsertValues({
+      run,
+      seq: 4,
+      event: {
+        eventType: "error",
+        level: "error",
+        message: `git push failed: GITHUB_TOKEN=${githubToken}`,
+        error: `fatal: Authentication failed with ${githubToken} ${"w".repeat(PAYLOAD_STRING_BOUND + 256)}`,
+      },
+      currentUserRedactionOptions: NOOP_REDACTION,
+    });
+    expect(values.message).not.toContain(githubToken);
+    expect(values.error).not.toContain(githubToken);
+    // Only the token is masked; the error is still retained past the 16KB bound.
     expect(values.error!.length).toBeGreaterThan(PAYLOAD_STRING_BOUND);
   });
 });

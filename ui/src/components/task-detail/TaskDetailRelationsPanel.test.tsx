@@ -83,7 +83,10 @@ describe("task-detail relation panels", () => {
       blockerAttention: {
         state: "needs_attention",
         reason: "attention_required",
+        computed: true,
         unresolvedBlockerCount: 1,
+        explicitBlockerCount: 1,
+        childBlockerCount: 0,
         coveredBlockerCount: 0,
         stalledBlockerCount: 0,
         attentionBlockerCount: 1,

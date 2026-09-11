@@ -78,6 +78,9 @@ export function interactionReplacesComposerSkip(
 ): boolean {
   return interaction.kind === "request_confirmation"
     || interaction.kind === "request_checkbox_confirmation"
+    // TEA-Core fork: board approval renders through the confirmation card, with its own
+    // Reject/Revise path.
+    || interaction.kind === "request_board_approval"
     || interaction.kind === "suggest_tasks";
 }
 

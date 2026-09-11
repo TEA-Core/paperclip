@@ -3560,8 +3560,8 @@ export interface HeartbeatRunEventInput {
 
 // Builds the exact heartbeat_run_events insert values for a run event. Extracted
 // (and exported) so the retention contract is unit-testable: the `error` field is
-// written verbatim (only current-user identity is redacted) and is NOT passed
-// through the payload bounder, while `payload` is bounded as before.
+// never truncated (it gets the same secret and current-user redaction as `message`)
+// and is NOT passed through the payload bounder, while `payload` is bounded as before.
 export function buildRunEventInsertValues(params: {
   run: Pick<typeof heartbeatRuns.$inferSelect, "companyId" | "id" | "agentId">;
   seq: number;
@@ -3570,10 +3570,14 @@ export function buildRunEventInsertValues(params: {
 }) {
   const { run, seq, event, currentUserRedactionOptions } = params;
   const sanitizedMessage = event.message
-    ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+    ? redactSensitiveText(
+        redactCurrentUserText(event.message, currentUserRedactionOptions),
+      )
     : event.message;
   const sanitizedError = event.error
-    ? redactCurrentUserText(event.error, currentUserRedactionOptions)
+    ? redactSensitiveText(
+        redactCurrentUserText(event.error, currentUserRedactionOptions),
+      )
     : event.error;
   const boundedPayload = event.payload
     ? boundHeartbeatRunEventPayloadForStorage(event.payload)
@@ -6726,13 +6730,14 @@ function buildSessionConfigCategoryValues(input: {
   // the timestamp here makes every comment invalidate an otherwise reusable
   // task session.
   delete workspaceConfig.issueConfigRevisionAt;
-  // This row is runtime state, not requested configuration. It is absent
-  // before the first reusable run is realized and present on the next turn;
-  // fingerprinting that transition would rotate the native session exactly
-  // when the warm runner first becomes reusable. The requested/effective mode,
-  // project policy, and issue settings remain the configuration compatibility
-  // boundary; the reusable row and its evolving generation are state.
-  delete workspaceConfig.existingExecutionWorkspace;
+  // TEA-Core fork: upstream #12904 also deletes `existingExecutionWorkspace` here, so a
+  // warm runner's first realization (row absent -> present) does not rotate the session.
+  // This fork keeps it. buildSessionWorkspaceConfigCategoryValue hashes only a projection
+  // of the workspace's config-relevant fields (mode, strategy, repo, base ref, branch,
+  // config), taken from POST-attach state (SUP-13585 / SUP-13733), so that transition does
+  // not occur for host-provisioned workspaces and a genuine repo / branch / base-ref change
+  // still rotates. Deleting it would also change the hash input for every stored session
+  // and reset them all once at deploy. The reusable row's config is state, not config.
   delete workspaceConfig.reusableExecutionWorkspaceConfig;
   return {
     adapter: {
@@ -20727,20 +20732,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const provisionWorkspaceResult = await provisionIssueExecutionWorkspace({
       db,
       agent,
-      // Upstream #12616/#12845: a native run's execution input is immutable once persisted,
-      // so recovery restores the workspace bound to that input rather than the issue's
-      // current pointer. The service derives its reuse request from issueRef, so hand it
-      // that binding. Non-native runs pass issueRef through unchanged.
-      issueRef:
-        issueRef && persistedNativeExecutionWorkspaceId
-          ? {
-              ...issueRef,
-              executionWorkspaceId: persistedNativeExecutionWorkspaceId,
-              executionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
-                ? "reuse_existing"
-                : issueRef.executionWorkspacePreference,
-            }
-          : issueRef,
+      issueRef,
+      // Upstream #12616/#12845/#12901: a native run's execution input is immutable once
+      // persisted, so recovery restores the workspace bound to that input rather than the
+      // issue's current pointer, and never rewrites the issue's binding: a newer run may
+      // already have moved or cleared it.
+      requestedExecutionWorkspaceIdOverride: persistedNativeExecutionWorkspaceId,
+      skipIssueBinding: nativeRecoveryExecutionWorkspaceId !== null,
       issueId,
       run,
       runId: run.id,
@@ -20958,6 +20956,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resetTaskSession,
       sessionResetReason,
       previousSessionParams,
+      bindIssueToRealizedExecutionWorkspace,
     } = provisionWorkspaceResult;
     let { persistedExecutionWorkspace } = provisionWorkspaceResult;
     const { hostExecutionWorkspaceConfig, sessionConfigMetadata, sessionConfigFreshness, latestWorkspaceConfigMetadata, reusedExecutionWorkspace, workspaceReuseRequest } = provisionWorkspaceResult;
@@ -21091,11 +21090,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       persistedExecutionWorkspace =
         realizationResult.persistedExecutionWorkspace;
-      // Upstream re-binds the issue here after a sandbox realization
-      // (bindIssueToPersistedExecutionWorkspace, #12901/#12904). In the fork the
-      // issue binding is owned by provisionIssueExecutionWorkspace (SUP-11806,
-      // SUP-11260), so that closure is not carried here; a warm-sandbox re-bind
-      // belongs in execution-workspace-provisioning.ts.
+      // A sandbox realization may materialize or replace the durable workspace
+      // after the host-side provisioning boundary above. Bind that final ID to
+      // the issue before dispatch so warm turns reuse the exact same workspace
+      // and lease scope instead of silently creating a per-run replacement. The
+      // provisioning service owns the binding (SUP-11806) and writes only what
+      // realization changed, so this is a no-op when it kept the provisioned row.
+      await bindIssueToRealizedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
       const executionTarget = realizationResult.executionTarget;
       const remoteExecution = realizationResult.remoteExecution;
@@ -21263,7 +21264,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: boundContextSnapshot( context),
+          contextSnapshot: boundContextSnapshot(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -21533,7 +21534,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             startedAt,
             sessionIdBefore:
               runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-            contextSnapshot: boundContextSnapshot( context),
+            contextSnapshot: boundContextSnapshot(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id))
@@ -21627,7 +21628,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // adapter chunk, and only after inline base64 image payloads have been
         // replaced. This also covers the stdout/stderr excerpt DB columns below,
         // which never reach the run-log store.
-          const sanitizedChunk = redactSecretTokens( compactRunLogChunk(
+          const sanitizedChunk = redactSecretTokens(compactRunLogChunk(
             redactCurrentUserText(chunk, currentUserRedactionOptions)),
           );
           if (stream === "stdout")
@@ -21780,7 +21781,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: boundContextSnapshot( context),
+              contextSnapshot: boundContextSnapshot(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -23211,7 +23212,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: boundContextSnapshot( context),
+              contextSnapshot: boundContextSnapshot(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -24049,8 +24050,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         await finalizeAgentStatus(agent.id, "failed", message, {
-        keepIdleOnFailure: workspaceValidationFailure != null || isWorkspaceSyncConflictFailure(message),
-        errorCode: failureErrorCode,
+          keepIdleOnFailure: workspaceValidationFailure != null || isWorkspaceSyncConflictFailure(message),
+          errorCode: failureErrorCode,
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       }
@@ -24082,15 +24083,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .where(eq(issues.id, setupFailureIssueId))
                 .then((rows) => readNonEmptyString(rows[0]?.identifier))
                 .catch(() => null)
-            : null
+            : null;
         const message = redactCurrentUserText(
           outerErr instanceof Error
             ? outerErr.message
             : "Unknown setup failure",
           await getCurrentUserRedactionOptions(),
             ) +
-            issueAttributionSuffix(setupFailureIssueId, setupFailureIssueIdentifier,
-        );
+            issueAttributionSuffix(setupFailureIssueId, setupFailureIssueIdentifier);
         // A missing secret/env binding is a known pre-dispatch configuration gap,
         // not an opaque setup crash. Surface it with its own errorCode so the
         // recovery path routes it to a human owner instead of looping retries.
@@ -24137,7 +24137,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               message,
               error: runEventErrorText(outerErr),
             }).catch(() => undefined);
-          };
+          }
         const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
           error: message,
           errorCode: setupFailureErrorCode,
@@ -24181,11 +24181,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const failedRun = await getRun(runId).catch(() => null);
         if (setupFailureWrite.updated && failedRun) {
-          ;
           const livenessRun = await classifyAndPersistRunLiveness(
             failedRun,
-          ).catch(() => failedRun,
-          );
+          ).catch(() => failedRun);
           if (setupFailureIssueId) {
             await completeSkillTestRunForHeartbeatOutcome({
               run: livenessRun,

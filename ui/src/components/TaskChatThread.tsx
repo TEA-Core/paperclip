@@ -410,6 +410,9 @@ function durableInputLabel(
     return interaction.title ?? "Review items";
   if (interaction.kind === "connection_intent")
     return interaction.title ?? "Connect service";
+  // Fork-only kind (SUP-12287).
+  if (interaction.kind === "request_board_approval")
+    return interaction.title ?? "Board approval";
   if (
     interaction.payload.target?.type === "issue_document" &&
     interaction.payload.target.key === "plan"

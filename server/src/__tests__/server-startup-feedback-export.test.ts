@@ -69,6 +69,9 @@ const {
       issueIds: [],
     })),
     reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
+    // TEA-Core fork: startup schedules the issue-graph liveness orchestrator, which runs the
+    // dependency-wake backstop plus the fork sweeps that share its timer.
+    reconcileIssueGraphLiveness: vi.fn(async () => ({ dependencyWakesHealed: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     reconcileBlockedWithoutBlockers: vi.fn(async () => ({ escalated: 0, healed: 0 })),
@@ -88,6 +91,16 @@ const {
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
+    // TEA-Core fork: startup/shutdown sweeps upstream's startServer does not call. Only the
+    // tests that drive startup past recovery reach them; neutral results keep those tests on
+    // what they assert.
+    reconcileStillbornAssignedBacklog: vi.fn(async () => ({ reported: 0 })),
+    reconcileCancelledOnlyBlockerDependents: vi.fn(async () => ({ reported: 0 })),
+    reconcileUndispatchableAssignedIssues: vi.fn(async () => ({ reported: 0 })),
+    sweepAbandonedRunScratch: vi.fn(async () => ({ reaped: 0, survived: 0 })),
+    sweepHostRestartStrandedIssues: vi.fn(async () => ({ reArmed: [], escalated: [] })),
+    drainRunningRunsForShutdown: vi.fn(async () => undefined),
+    drainActiveRunExecutions: vi.fn(async () => undefined),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
   const issueThreadInteractionServiceMock = {

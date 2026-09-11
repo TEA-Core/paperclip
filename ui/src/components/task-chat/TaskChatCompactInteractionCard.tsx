@@ -49,6 +49,7 @@ import {
   type AskUserQuestionsAnswer,
   type AskUserQuestionsInteraction,
   type IssueThreadInteraction,
+  type RequestBoardApprovalInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
   type RequestItemVerdictsInteraction,
@@ -113,6 +114,12 @@ const KIND_COPY = {
     fallbackTitle: "Connect service",
     label: "Connection",
     icon: Plug,
+  },
+  // Fork-only kind (SUP-12287); renders through the confirmation card.
+  request_board_approval: {
+    fallbackTitle: "Board approval",
+    label: "Board approval",
+    icon: CheckCircle2,
   },
 } as const;
 
@@ -268,6 +275,7 @@ function ActionRow({
 function targetLabel(
   interaction:
     | RequestConfirmationInteraction
+    | RequestBoardApprovalInteraction
     | RequestCheckboxConfirmationInteraction
     | RequestItemVerdictsInteraction,
 ) {
@@ -286,6 +294,7 @@ function CompactTarget({
 }: {
   interaction:
     | RequestConfirmationInteraction
+    | RequestBoardApprovalInteraction
     | RequestCheckboxConfirmationInteraction
     | RequestItemVerdictsInteraction;
 }) {
@@ -316,7 +325,7 @@ function PlanReviewPreview({
   interaction,
   planDocument,
 }: {
-  interaction: RequestConfirmationInteraction;
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
   planDocument?: IssueDocument | null;
 }) {
   const target = interaction.payload.target;
@@ -524,7 +533,8 @@ function ReceiptDisclosure({
             </MarkdownBody>
           </div>
         ) : null}
-        {interaction.payload.toolAction ? (
+        {interaction.kind === "request_confirmation" &&
+        interaction.payload.toolAction ? (
           <div className="rounded-sm bg-muted/45 px-3 py-2.5 text-sm">
             <p>
               <strong>{interaction.payload.toolAction.toolDisplayName}</strong>{" "}
@@ -549,7 +559,8 @@ function ReceiptDisclosure({
             </p>
           </div>
         ) : null}
-        {interaction.payload.secretProposal ? (
+        {interaction.kind === "request_confirmation" &&
+        interaction.payload.secretProposal ? (
           <dl className="grid gap-1 rounded-sm bg-muted/45 px-3 py-2.5 text-sm">
             <div>
               <dt className="text-xs text-muted-foreground">Secret</dt>
@@ -802,7 +813,9 @@ function ConfirmationCard({
   onUploadImage,
   mentions,
 }: {
-  interaction: RequestConfirmationInteraction;
+  // `request_board_approval` (fork) shares the confirmation payload shape minus
+  // the tool-action / secret-proposal extensions, so it renders through here.
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
   planDocument?: IssueDocument | null;
   onAcceptInteraction?: SharedInteractionProps["onAcceptInteraction"];
   onRejectInteraction?: SharedInteractionProps["onRejectInteraction"];
@@ -877,7 +890,8 @@ function ConfirmationCard({
           </MarkdownBody>
         </Details>
       ) : null}
-      {interaction.payload.toolAction ? (
+      {interaction.kind === "request_confirmation" &&
+      interaction.payload.toolAction ? (
         <div className="mt-3 space-y-2 rounded-sm bg-muted/45 px-3 py-2.5 text-sm">
           <div className="flex flex-wrap items-center gap-2">
             <strong>{interaction.payload.toolAction.toolDisplayName}</strong>
@@ -914,7 +928,8 @@ function ConfirmationCard({
           </details>
         </div>
       ) : null}
-      {interaction.payload.secretProposal ? (
+      {interaction.kind === "request_confirmation" &&
+      interaction.payload.secretProposal ? (
         <dl className="mt-3 grid gap-2 rounded-sm bg-muted/45 px-3 py-2.5 text-sm">
           <div>
             <dt className="text-xs text-muted-foreground">Secret</dt>
@@ -1978,7 +1993,8 @@ export function TaskChatCompactInteractionCard({
           onUploadImage={onUploadImage}
           mentions={mentions}
         />
-      ) : interaction.kind === "request_confirmation" ? (
+      ) : interaction.kind === "request_confirmation" ||
+        interaction.kind === "request_board_approval" ? (
         <ConfirmationCard
           interaction={interaction}
           planDocument={planDocument}

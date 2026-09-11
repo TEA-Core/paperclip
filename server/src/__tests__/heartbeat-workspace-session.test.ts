@@ -2575,7 +2575,15 @@ describe("effective run session config freshness", () => {
     });
   });
 
-  it("does not reset when a reusable execution workspace becomes realized", async () => {
+  // TEA-Core fork: upstream #12904 drops the existing execution workspace from the session
+  // fingerprint so a warm runner's first realization (absent -> present) does not rotate the
+  // session. This fork already solved that differently (SUP-13733): it hashes a projection of
+  // the workspace's config-relevant fields taken from POST-attach state, so the transition this
+  // test simulates does not occur for host-provisioned workspaces, and a genuine repo / branch /
+  // base-ref change still rotates (see "still rotates on a genuine workspace config change").
+  // Taking upstream's deletion would also change the hash input for every existing session and
+  // reset all of them once at deploy.
+  it.skip("does not reset when a reusable execution workspace becomes realized", async () => {
     const base = await buildSessionConfigMetadata({
       workspaceConfig: {
         requestedMode: "shared_workspace",

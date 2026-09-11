@@ -346,7 +346,22 @@ describe("resolveOpenCodeSessionResume (legacy argv)", () => {
       }),
     ).not.toContain("--session");
   });
+});
 
+function probeResult(overrides: Record<string, unknown>) {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: 123,
+    startedAt: new Date().toISOString(),
+    ...overrides,
+  } as never;
+}
+
+describe("execute — OpenRouter credentials", () => {
   it("passes an OpenRouter key and complete model to OpenCode without logging the key", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-openrouter-"));
     const workspace = path.join(root, "workspace");
@@ -356,8 +371,8 @@ describe("resolveOpenCodeSessionResume (legacy argv)", () => {
     await fs.mkdir(workspace, { recursive: true });
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
-    runProcessMock.mockReset();
-    runProcessMock.mockResolvedValueOnce(probeResult({
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({
       stdout: JSON.stringify({
         type: "text",
         sessionID: "session-openrouter",
@@ -405,7 +420,7 @@ describe("resolveOpenCodeSessionResume (legacy argv)", () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.model).toBe(model);
-      const executionCall = runProcessMock.mock.calls.at(-1)!;
+      const executionCall = runAdapterExecutionTargetProcessMock.mock.calls.at(-1)!;
       expect(executionCall[3]).toContain("--model");
       expect(executionCall[3]).toContain(model);
       expect((executionCall[4] as { env: Record<string, string> }).env.OPENROUTER_API_KEY).toBe(apiKey);
@@ -490,19 +505,6 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     timeoutSec: 30,
     graceSec: 5,
   };
-
-  function probeResult(overrides: Record<string, unknown>) {
-    return {
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: "",
-      stderr: "",
-      pid: 123,
-      startedAt: new Date().toISOString(),
-      ...overrides,
-    } as never;
-  }
 
   beforeEach(() => {
     runAdapterExecutionTargetProcessMock.mockReset();
