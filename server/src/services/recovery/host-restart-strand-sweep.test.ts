@@ -106,6 +106,9 @@ function decide(overrides: Partial<Parameters<typeof decideHostRestartStrandRepa
     alreadyEscalated: false,
     latestRun: makeLatestRun(),
     now: NOW,
+    // Default to a detected (matching) boot so the non-boot tests exercise their
+    // intended paths; the fail-safe (null/undetectable) path is tested explicitly.
+    detectedBootId: BOOT_NEW,
     ...overrides,
   });
 }
@@ -121,6 +124,14 @@ describe("host-restart strand repair decision", () => {
 
   it("ignores a marker stamped for a different (older) boot", () => {
     expect(decide({ detectedBootId: "boot-newer" })).toEqual({ action: "skip-no-marker" });
+  });
+
+  it("skips a stale marker on an undetectable boot (detectedBootId: null)", () => {
+    expect(decide({ detectedBootId: null })).toEqual({ action: "skip-no-marker" });
+  });
+
+  it("skips a stale marker when the detected boot is undefined", () => {
+    expect(decide({ detectedBootId: undefined })).toEqual({ action: "skip-no-marker" });
   });
 
   it("escalates an exhausted monitor instead of re-arming", () => {
@@ -312,7 +323,7 @@ describe("planHostRestartStrandRepairs", () => {
       ["a", factsFor()],
       ["b", factsFor()],
     ]);
-    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 1 });
+    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 1, detectedBootId: BOOT_NEW });
     expect(plan.repairs.map((r) => r.issueId)).toEqual(["a"]);
     expect(plan.skipped.capExceeded).toEqual(["b"]);
   });
@@ -320,7 +331,7 @@ describe("planHostRestartStrandRepairs", () => {
   it("skips an already-escalated card without emitting a repair", () => {
     const candidates = [makeCandidate({ id: "a" })];
     const facts = new Map<string, HostRestartStrandFacts>([["a", factsFor({ alreadyEscalated: true })]]);
-    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 10 });
+    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 10, detectedBootId: BOOT_NEW });
     expect(plan.repairs).toEqual([]);
     expect(plan.skipped.alreadyEscalated).toEqual(["a"]);
   });
@@ -519,6 +530,30 @@ describe("sweepHostRestartStrandedIssues", () => {
     expect(report.reArmed).toEqual([]);
     expect(report.escalated).toEqual([]);
     expect(report.skipped.noHostRestartMarker).toEqual(["issue-stale"]);
+  });
+
+  it("re-arms nothing when the boot id is undetectable (fail-safe skip)", async () => {
+    const state: FakeDbState = {
+      candidates: [makeCandidate({ id: "issue-nullboot" })],
+      liveRunQueue: [[]],
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+      updateRows: [{ id: "issue-nullboot" }],
+    };
+    const escalateIssue = makeEscalateMock();
+
+    const report = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      resolveBootId: async () => null,
+      escalateIssue,
+    });
+
+    expect(report.bootId).toBeNull();
+    expect(report.reArmed).toEqual([]);
+    expect(report.escalated).toEqual([]);
+    expect(report.skipped.noHostRestartMarker).toEqual(["issue-nullboot"]);
+    expect(escalateIssue).not.toHaveBeenCalled();
   });
 
   it("is idempotent: an already-escalated card is skipped on a subsequent sweep", async () => {
