@@ -1695,6 +1695,163 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
   });
 });
 
+// A disabled secret is still returned by getByName (it hides only `deleted`), and
+// resolveSecretValue then throws `secret_inactive`. One such secret must cost only its own
+// arm, never the whole resolution for every repo.
+describe("GitHub token resolution — per-arm fail-soft on secret resolution errors", () => {
+  const secretInactive = () => Object.assign(new Error("Secret is not active"), { status: 422 });
+  let loggerWarn: ReturnType<typeof vi.fn>;
+
+  function mockProjectRows(rows: unknown[]) {
+    mockDb.select.mockReturnValue({
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue(rows),
+    });
+  }
+
+  beforeEach(async () => {
+    mockSecretService.getByName.mockReset();
+    mockSecretService.resolveSecretValue.mockReset();
+    mockDb.select.mockReset();
+    appTokenCache.clear();
+    const loggerModule = await import("../middleware/logger.js");
+    loggerWarn = vi.mocked(loggerModule.logger.warn);
+    loggerWarn.mockClear();
+  });
+
+  it("candidates: skips a disabled company secret and returns the next company secret's token", async () => {
+    mockProjectRows([]);
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-disabled", name };
+      if (name === "GH_TOKEN") return { id: "secret-2", name };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation(async (_companyId, secretId) => {
+      if (secretId === "secret-disabled") throw secretInactive();
+      return FIXTURE_TOKEN;
+    });
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+
+    expect(result).toEqual([{ token: FIXTURE_TOKEN, scope: "company", secretName: "GH_TOKEN" }]);
+    expect(loggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ companyId: "company-1", scope: "company", secretName: "GITHUB_TOKEN" }),
+      expect.any(String),
+    );
+    expect(JSON.stringify(loggerWarn.mock.calls)).not.toContain(FIXTURE_TOKEN);
+  });
+
+  it("candidates: skips a disabled project_env binding and still returns the company candidate", async () => {
+    mockProjectRows([
+      {
+        id: "pw-1",
+        projectId: "proj-1",
+        repoUrl: "https://github.com/owner/repo",
+        projectEnv: { GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-disabled", version: "latest" } },
+      },
+    ]);
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation(async (_companyId, secretId) => {
+      if (secretId === "ref-disabled") throw secretInactive();
+      return "company-token-value";
+    });
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+
+    expect(result).toEqual([{ token: "company-token-value", scope: "company", secretName: "GITHUB_TOKEN" }]);
+    expect(loggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: "project_env", secretName: "GITHUB_TOKEN", projectId: "proj-1" }),
+      expect.any(String),
+    );
+  });
+
+  it("candidates: keeps the minted App candidate when a later company secret is disabled", async () => {
+    mockProjectRows([]);
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) return { id: "app-key-1", name };
+      if (name === "GITHUB_TOKEN") return { id: "secret-disabled", name };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation(async (_companyId, secretId) => {
+      if (secretId === "app-key-1") return FIXTURE_PRIVATE_KEY;
+      throw secretInactive();
+    });
+    const restoreFetch = mockAppFetchResponses([
+      { url: `/repos/owner/repo/installation`, response: { id: Number(FIXTURE_INSTALLATION_ID) } },
+      {
+        url: `/app/installations/${FIXTURE_INSTALLATION_ID}/access_tokens`,
+        response: { token: FIXTURE_APP_TOKEN, expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() },
+      },
+    ]);
+
+    try {
+      const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+      expect(result).toHaveLength(1);
+      expect(result[0]!.scope).toBe("app_installation");
+      expect(result[0]!.token).toBe(FIXTURE_APP_TOKEN);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it("candidates: every arm throwing yields no candidates and the existing no-token outcome", async () => {
+    mockProjectRows([
+      {
+        id: "pw-1",
+        projectId: "proj-1",
+        repoUrl: "https://github.com/owner/repo",
+        projectEnv: { GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-disabled", version: "latest" } },
+      },
+    ]);
+    mockSecretService.getByName.mockImplementation((_companyId, name) =>
+      name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME ? null : { id: `secret-${name}`, name },
+    );
+    mockSecretService.resolveSecretValue.mockRejectedValue(secretInactive());
+
+    await expect(resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo")).resolves.toEqual([]);
+
+    const result = await resolveGitHubTokenForRepo(mockDb, "company-1", "owner", "repo");
+    expect(result.token).toBeNull();
+    expect(result.reason).toContain("No GitHub token bound to project");
+  });
+
+  it("resolveGitHubToken: skips a disabled company secret and falls through to the next name", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-disabled", name };
+      if (name === "GH_TOKEN") return { id: "secret-2", name };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation(async (_companyId, secretId) => {
+      if (secretId === "secret-disabled") throw secretInactive();
+      return FIXTURE_TOKEN;
+    });
+
+    const result = await resolveGitHubToken(mockDb, "company-1");
+
+    expect(result).toEqual({ token: FIXTURE_TOKEN, scope: "company", secretName: "GH_TOKEN" });
+    expect(loggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: "company", secretName: "GITHUB_TOKEN" }),
+      expect.any(String),
+    );
+  });
+
+  it("resolveGitHubToken: every company secret throwing yields the existing unresolved result", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) =>
+      name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME ? null : { id: `secret-${name}`, name },
+    );
+    mockSecretService.resolveSecretValue.mockRejectedValue(secretInactive());
+
+    const result = await resolveGitHubToken(mockDb, "company-1");
+
+    expect(result.token).toBeNull();
+    expect(result.reason).toContain("No GitHub token resolvable");
+  });
+});
+
 describe("normalizeRepoUrl", () => {
   it("strips URL scheme + host, .git suffix, trailing slash, and lowercases", () => {
     expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip")).toBe("tea-core/paperclip");
