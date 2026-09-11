@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { issueRecoveryActions, issues, summarySlots } from "@paperclipai/db";
 import {
   SUMMARY_SLOT_REFRESH_ACTOR_ID,
   createSummarySlotRefreshSweepService,
@@ -55,12 +56,30 @@ function generateResponse(overrides: {
   };
 }
 
-/** Builds a fake drizzle db whose discovery select() serves the given candidate rows. */
-function makeDb(rows: Array<Record<string, unknown>>) {
+/** Builds a fake drizzle db whose discovery `select()` dispatches by table and whose `update()` applies a no-op patch. */
+function makeDb(
+  slotRows: Array<Record<string, unknown>>,
+  opts: {
+    issueRows?: Array<Record<string, unknown>>;
+    recoveryRows?: Array<Record<string, unknown>>;
+  } = {},
+) {
+  const issueRows = opts.issueRows ?? [];
+  const recoveryRows = opts.recoveryRows ?? [];
   return {
     select: vi.fn(() => ({
-      from: () => ({
-        where: () => Promise.resolve(rows),
+      from: (table: unknown) => ({
+        where: async () => {
+          if (table === summarySlots) return slotRows;
+          if (table === issues) return issueRows;
+          if (table === issueRecoveryActions) return recoveryRows;
+          return [];
+        },
+      }),
+    })),
+    update: vi.fn(() => ({
+      set: () => ({
+        where: async () => [],
       }),
     })),
   };
@@ -69,13 +88,21 @@ function makeDb(rows: Array<Record<string, unknown>>) {
 /** Wires the sweep service over a fake db. */
 function makeService(
   rows: Array<Record<string, unknown>>,
-  opts: { sweepIntervalMs?: number; now?: () => Date; wakeup?: () => Promise<unknown> } = {},
+  opts: {
+    sweepIntervalMs?: number;
+    now?: () => Date;
+    wakeup?: () => Promise<unknown>;
+    issueRows?: Array<Record<string, unknown>>;
+    recoveryRows?: Array<Record<string, unknown>>;
+    wedgedMs?: number;
+  } = {},
 ) {
-  const db = makeDb(rows);
+  const db = makeDb(rows, { issueRows: opts.issueRows, recoveryRows: opts.recoveryRows });
   const service = createSummarySlotRefreshSweepService(db as never, {
     now: opts.now ?? (() => new Date("2026-09-10T00:00:00Z")),
     sweepIntervalMs: opts.sweepIntervalMs ?? 0,
     wakeup: opts.wakeup,
+    wedgedMs: opts.wedgedMs,
   });
   return { db, service };
 }
@@ -228,6 +255,108 @@ describe("createSummarySlotRefreshSweepService", () => {
       inFlight: 0,
       failed: 1,
     });
+  });
+
+  it("re-claims a `generating` slot pinned behind a `blocked` issue with an escalated recovery action (AC-4)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-wedged", updatedAt: new Date("2026-09-09T23:00:00Z") },
+    ];
+    // The stale link is cleared first, so `generate` mints a fresh issue
+    // instead of short-circuiting to `alreadyGenerating`.
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "blocked" }],
+      recoveryRows: [{ id: "ra-1", status: "escalated", sourceIssueId: "issue-wedged" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    // Counted in `claimed`, not `inFlight`.
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    // The stale `generating` link was cleared so `generate` re-mints the slot.
+    expect(db.update).toHaveBeenCalledTimes(1);
+    // The re-claim is logged and flagged as a wedged recovery — no longer log-invisible.
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        action: "summary_slot.generate_requested",
+        details: expect.objectContaining({
+          alreadyGenerating: false,
+          source: "summary-slot-refresh-sweep",
+          wedgedRecovery: true,
+          wedgedReason: "blocked_escalated_recovery",
+          supersededGenerationIssueId: "issue-wedged",
+        }),
+      }),
+    );
+  });
+
+  it("leaves a `generating` slot in-flight behind a recently-updated `in_review` issue (AC-5, no thrash)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-live", updatedAt: new Date("2026-09-09T23:30:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "in_review" }],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 1,
+      failed: 0,
+    });
+    // Not wedged: no stale-link clear and no re-claim audit entry.
+    expect(db.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    // The assignee wake is still re-delivered for the live in-flight issue.
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-claims a `generating` slot that has aged past the wedged window even without a blocked/escalated issue (age backstop)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-stale", updatedAt: new Date("2026-09-08T00:00:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "in_progress" }],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        details: expect.objectContaining({
+          wedgedRecovery: true,
+          wedgedReason: "generating_age_exceeded",
+          supersededGenerationIssueId: "issue-stale",
+        }),
+      }),
+    );
   });
 
   it("records a route-equivalent summary_slot.generate_requested activity entry on a fresh claim", async () => {

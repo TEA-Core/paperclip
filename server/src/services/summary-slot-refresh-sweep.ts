@@ -1,6 +1,6 @@
 import { and, eq, isNull, lt, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { summarySlots } from "@paperclipai/db";
+import { issueRecoveryActions, issues, summarySlots } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -9,6 +9,11 @@ import {
   type IssueAssignmentWakeupDeps,
 } from "./issue-assignment-wakeup.js";
 import { summarySlotService } from "./summary-slots.js";
+import type {
+  SummarySlotKey,
+  SummarySlotScopeKind,
+  SummarySlotStatus,
+} from "@paperclipai/shared";
 
 /**
  * Summary-slot refresh sweep (SUP-12426, shape 2).
@@ -25,9 +30,9 @@ import { summarySlotService } from "./summary-slots.js";
  *
  * A candidate is:
  *   - a `failed` slot (always retried), or
- *   - a `generating` slot (the service re-checks the linked issue: an active
- *     issue means in-flight and is left alone; a dead/wedged issue is retried),
- *     or
+ *   - a `generating` slot (the service re-checks the linked issue: an active,
+ *     progressing issue means in-flight and is left alone; a dead/wedged issue
+ *     is re-claimed — see below), or
  *   - an `idle` slot that is stale: `lastGeneratedAt` is null, or older than
  *     the staleness threshold. Fresh idle slots are excluded at the query so
  *     a recently-written summary is never re-fired.
@@ -36,16 +41,36 @@ import { summarySlotService } from "./summary-slots.js";
  * service layer — the exact consume-contract the HTTP route uses. For a fresh
  * claim it records the route-equivalent `summary_slot.generate_requested`
  * activity entry and fires the same assignment wakeup the route fires so the
- * Summarizer claims it. For a slot that is already `generating` with an active
- * issue it does not re-fire `generate`, but re-delivers the assignee wake so a
- * wake that was rejected on the minting tick is retried instead of leaving the
- * slot stranded unwoken. The route's board gate is left untouched: this path is
- * board-side, in-process, and does not introduce any new credential or auth
- * branch.
+ * Summarizer claims it. For a slot that is already `generating` with an active,
+ * progressing issue it does not re-fire `generate`, but re-delivers the
+ * assignee wake so a wake that was rejected on the minting tick is retried
+ * instead of leaving the slot stranded unwoken. The route's board gate is left
+ * untouched: this path is board-side, in-process, and does not introduce any
+ * new credential or auth branch.
+ *
+ * Wedged-generation recovery (SUP-15764): `generate` treats a `generating`
+ * slot as in-flight while its generation issue is *active* (`status` not in
+ * `{done, cancelled}`), and `blocked` counts as active. A slot pinned behind a
+ * permanently-`blocked` generation issue — e.g. one parked on a board
+ * `missing_disposition` recovery action — would otherwise be re-woken on every
+ * due tick, forever, and logged nothing. Before claiming such a `generating`
+ * candidate the sweep classifies it as *wedged* when EITHER:
+ *   - its generation issue is `blocked` and carries an active recovery action
+ *     in status `escalated` (`reason: "blocked_escalated_recovery"`), or
+ *   - the slot has been `generating` for longer than the bounded, env-tunable
+ *     window `SUMMARY_SLOT_REFRESH_WEDGED_MS` (default 6h)
+ *     (`reason: "generating_age_exceeded"`).
+ * A wedged slot is re-claimed: the sweep clears the stale `generating` link so
+ * `generate` mints a fresh issue instead of short-circuiting to
+ * `alreadyGenerating`, and records a `summary_slot.generate_requested` entry
+ * flagged `wedgedRecovery: true` so the recovery is visible in the activity
+ * log instead of a silent strand. A slot that is merely in-flight (progressing
+ * or recently updated) is never re-claimed, so live generations are not thrashed.
  */
 
 const DEFAULT_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_WEDGED_MS = 6 * 60 * 60 * 1000;
 
 export const SUMMARY_SLOT_REFRESH_ACTOR_ID = "system:summary-slot-refresh";
 
@@ -54,6 +79,13 @@ export interface SummarySlotRefreshSweepOptions {
   staleMs?: number;
   /** Minimum spacing between actual measurement runs. */
   sweepIntervalMs?: number;
+  /**
+   * How long (ms since `updatedAt`) a `generating` slot may stay pinned behind
+   * its generation issue before the sweep treats it as wedged and re-claims it,
+   * even if the issue is not `blocked`. Read from `SUMMARY_SLOT_REFRESH_WEDGED_MS`
+   * when omitted (default 6h).
+   */
+  wedgedMs?: number;
   now?: () => Date;
   /**
    * The heartbeat wakeup dispatcher. Injected so the sweep can wake the
@@ -81,10 +113,16 @@ export interface SummarySlotRefreshSweepResult {
 
 type SummarySlotRefreshCandidate = {
   companyId: string;
-  scopeKind: string;
-  slotKey: string;
+  scopeKind: SummarySlotScopeKind;
+  slotKey: SummarySlotKey;
   scopeId: string | null;
+  status: SummarySlotStatus;
+  generatingIssueId: string | null;
+  updatedAt: Date;
 };
+
+/** Why a `generating` candidate was classified as wedged and re-claimed. */
+type WedgedReason = "blocked_escalated_recovery" | "generating_age_exceeded";
 
 /** Reads a positive-integer millisecond env var, falling back to `fallbackMs` on missing or invalid values. */
 function readMsEnv(name: string, fallbackMs: number): number {
@@ -111,6 +149,7 @@ export function createSummarySlotRefreshSweepService(
   const staleMs = opts.staleMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_STALE_MS", DEFAULT_STALE_MS);
   const sweepIntervalMs =
     opts.sweepIntervalMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_SWEEP_INTERVAL_MS", DEFAULT_SWEEP_INTERVAL_MS);
+  const wedgedMs = opts.wedgedMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_WEDGED_MS", DEFAULT_WEDGED_MS);
   const now = opts.now ?? (() => new Date());
   let lastRunAt: number | null = null;
 
@@ -145,6 +184,9 @@ export function createSummarySlotRefreshSweepService(
         scopeKind: summarySlots.scopeKind,
         slotKey: summarySlots.slotKey,
         scopeId: summarySlots.scopeId,
+        status: summarySlots.status,
+        generatingIssueId: summarySlots.generatingIssueId,
+        updatedAt: summarySlots.updatedAt,
       })
       .from(summarySlots)
       .where(
@@ -193,9 +235,100 @@ export function createSummarySlotRefreshSweepService(
       });
     }
 
+    /**
+     * Decides whether a `generating` candidate is wedged behind a
+     * non-progressing generation issue (SUP-15764). Two independent rules,
+     * either of which marks the slot for re-claim:
+     *   - the generation issue is `blocked` and has an active recovery action
+     *     in status `escalated` — definitively parked on a human, so it will
+     *     never progress on its own; or
+     *   - the slot has been `generating` longer than the bounded `wedgedMs`
+     *     window (an LLM summary should not take hours; a slot this old is
+     *     not progressing).
+     * A slot whose issue is merely active and recent (e.g. `in_review` just
+     * updated) is NOT wedged, so live generations are left alone.
+     */
+    async function classifyGeneratingCandidate(
+      candidate: SummarySlotRefreshCandidate,
+      checkedAt: Date,
+    ): Promise<{ wedged: boolean; reason: WedgedReason | null; supersededIssueId: string | null }> {
+      const supersededIssueId = candidate.generatingIssueId;
+      if (
+        candidate.updatedAt &&
+        checkedAt.getTime() - candidate.updatedAt.getTime() > wedgedMs
+      ) {
+        return { wedged: true, reason: "generating_age_exceeded", supersededIssueId };
+      }
+      if (supersededIssueId) {
+        const issue = await db
+          .select({ status: issues.status })
+          .from(issues)
+          .where(and(eq(issues.id, supersededIssueId), eq(issues.companyId, candidate.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (issue?.status === "blocked") {
+          const escalated = await db
+            .select({ id: issueRecoveryActions.id })
+            .from(issueRecoveryActions)
+            .where(
+              and(
+                eq(issueRecoveryActions.companyId, candidate.companyId),
+                eq(issueRecoveryActions.sourceIssueId, supersededIssueId),
+                eq(issueRecoveryActions.status, "escalated"),
+              ),
+            )
+            .then((rows) => rows.length > 0);
+          if (escalated) {
+            return { wedged: true, reason: "blocked_escalated_recovery", supersededIssueId };
+          }
+        }
+      }
+      return { wedged: false, reason: null, supersededIssueId };
+    }
+
+    /**
+     * Clears a wedged slot's stale `generating` link so the next `generate` call
+     * mints a fresh generation issue instead of short-circuiting to
+     * `alreadyGenerating` (the dedupe in `summarySlotService.generate` only
+     * guards `status === "generating" && generatingIssueId`). This is the
+     * minimal, in-process recovery write the board-side sweep owns; it never
+     * touches `lastGeneratedAt` or `documentId`.
+     */
+    async function clearStaleGenerationLink(candidate: SummarySlotRefreshCandidate, checkedAt: Date): Promise<void> {
+      await db
+        .update(summarySlots)
+        .set({
+          status: "idle",
+          generatingIssueId: null,
+          failureReason: null,
+          updatedAt: checkedAt,
+        })
+        .where(
+          and(
+            eq(summarySlots.companyId, candidate.companyId),
+            eq(summarySlots.scopeKind, candidate.scopeKind),
+            eq(summarySlots.slotKey, candidate.slotKey),
+            candidate.scopeId === null ? isNull(summarySlots.scopeId) : eq(summarySlots.scopeId, candidate.scopeId),
+          ),
+        );
+    }
+
     for (const candidate of candidates) {
       result.candidates += 1;
       try {
+        // A `generating` slot pinned behind a non-progressing issue would
+        // otherwise be re-woken on every due tick and logged nothing
+        // (SUP-15764). Classify it; if it is wedged, clear the stale link so the
+        // `generate` below re-claims the slot with a fresh issue instead of
+        // returning `alreadyGenerating`.
+        let wedgedRecovery: { reason: WedgedReason; supersededIssueId: string | null } | null = null;
+        if (candidate.status === "generating") {
+          const verdict = await classifyGeneratingCandidate(candidate, checkedAt);
+          if (verdict.wedged && verdict.reason) {
+            wedgedRecovery = { reason: verdict.reason, supersededIssueId: verdict.supersededIssueId };
+            await clearStaleGenerationLink(candidate, checkedAt);
+          }
+        }
+
         const res = await slotService.generate(
           {
             companyId: candidate.companyId,
@@ -223,7 +356,9 @@ export function createSummarySlotRefreshSweepService(
         // Fresh claim: a generation issue was minted and the slot flipped to
         // `generating`. Record the route-equivalent audit entry (AGENTS.md:
         // "activity logging for mutating actions") before firing the wake, so
-        // the claim is audited even if the wake then fails.
+        // the claim is audited even if the wake then fails. A wedged re-claim
+        // is flagged so the recovery is visible in the log instead of a silent
+        // strand.
         await logActivity(db, {
           companyId: candidate.companyId,
           actorType: "system",
@@ -239,6 +374,13 @@ export function createSummarySlotRefreshSweepService(
             generatingIssueId: res.generatingIssue.id,
             alreadyGenerating: res.alreadyGenerating,
             source: "summary-slot-refresh-sweep",
+            ...(wedgedRecovery
+              ? {
+                  wedgedRecovery: true,
+                  wedgedReason: wedgedRecovery.reason,
+                  supersededGenerationIssueId: wedgedRecovery.supersededIssueId,
+                }
+              : {}),
           },
         });
         await fireWakeFor(res.generatingIssue, summarySlotRefreshTaskKey(candidate));
