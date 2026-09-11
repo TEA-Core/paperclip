@@ -35,8 +35,10 @@ import {
 // P4: the destructive primitive cannot run without a lease — a direct call fails
 //     to compile, a forged (non-branded) lease is refused before any git runs and
 //     moves nothing, and the standalone wrapper serializes.
-// P5: when the canonical identity cannot be resolved the lease refuses before it
-//     creates any lockfile, and the operator path reports identity_unresolved.
+// P5: on a REAL, populated repo with a forced `rev-parse --git-common-dir`
+//     failure, BOTH the operator and the auto self-heal refuse to move anything —
+//     HEAD and every ref unchanged, zero pin/CAS/reset — and the lease refuses
+//     before it creates any lockfile.
 
 const execFileAsync = promisify(execFile);
 const tempRoots: string[] = [];
@@ -171,7 +173,57 @@ async function readLog(logFile: string): Promise<string[]> {
   return raw.split("\n").filter((line) => line.length > 0);
 }
 
-const pinLines = (lines: string[]) => lines.filter((l) => l.includes("update-ref refs/paperclip/rescue/base-repo"));
+type IdShim = {
+  logFile: string;
+  restore: () => void;
+};
+
+/**
+ * Replace `git` on PATH with a shim that fails ONLY `rev-parse
+ * --git-common-dir` (exit 128, non-zero) and passes every other git invocation
+ * through to the real git. That is exactly what the fail-closed lease keys on
+ * (`resolveBaseRepoResetIdentity` -> `git rev-parse --git-common-dir`), so this
+ * forces a genuine identity-resolution failure on a REAL, populated repository —
+ * not an empty temp dir — while leaving all the other git the destructive paths
+ * need (status, rev-parse HEAD, rev-list, for-each-ref) working. The operator and
+ * auto paths must both refuse to move anything when identity cannot be resolved.
+ */
+async function installIdentityFailShim(f: Fixture): Promise<IdShim> {
+  const binDir = path.join(f.root, "shim");
+  const logFile = path.join(f.root, "git-argv.log");
+  await fs.mkdir(binDir, { recursive: true });
+  const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+  const script = [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> ${JSON.stringify(logFile)}`,
+    "case \"$*\" in",
+    "  *\"rev-parse --git-common-dir\"*)",
+    "    echo \"fatal: [shim] forced identity-resolution failure\" >&2",
+    "    exit 128",
+    "    ;;",
+    "esac",
+    `exec ${JSON.stringify(realGit)} "$@"`,
+    "",
+  ].join("\n");
+  await fs.writeFile(path.join(binDir, "git"), script);
+  await fs.chmod(path.join(binDir, "git"), 0o755);
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${priorPath ?? ""}`;
+  return {
+    logFile,
+    restore: () => {
+      process.env.PATH = priorPath;
+    },
+  };
+}
+
+// A pin is the atomic CREATE of a base-repo rescue ref, whose old value is the
+// all-zeros constant. Requiring that constant in the match excludes a
+// `update-ref -d` delete (prune housekeeping) and the `update-ref HEAD` CAS, so
+// "exactly one pin" below is unambiguous — it counts only destructive tip pins.
+const ALL_ZEROS = "0000000000000000000000000000000000000000";
+const pinLines = (lines: string[]) =>
+  lines.filter((l) => l.includes("refs/paperclip/rescue/base-repo") && l.includes(ALL_ZEROS));
 const casLines = (lines: string[]) => lines.filter((l) => l.startsWith("update-ref HEAD"));
 const resetLines = (lines: string[]) => lines.filter((l) => l.startsWith("reset --hard"));
 
@@ -183,8 +235,26 @@ async function waitForFile(file: string, timeoutMs = 20000): Promise<void> {
   }
 }
 
+// Does a git object exist? Used to prove a prior tip was never made unreachable.
+async function objectExists(repo: string, sha: string): Promise<boolean> {
+  try {
+    await execFileAsync("git", ["cat-file", "-e", sha], { cwd: repo, env: GIT_ENV });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Snapshot HEAD and every ref under refs/ so a test can assert nothing was moved.
+async function snapshotHeadAndRefs(repo: string): Promise<{ head: string; refs: string }> {
+  return {
+    head: await git(["rev-parse", "HEAD"], repo),
+    refs: await git(["for-each-ref", "--format=%(refname) %(objectname)"], repo),
+  };
+}
+
 describe("P1 — operator reset and auto self-heal contend on the lease", () => {
-  it("serializes the two destructive paths; the loser is blocked at the lock while the winner is mid-section", async () => {
+  it("forces both contenders to the same pre-reset tip and proves exactly one destructive move lands", async () => {
     const f = await makeOriginAndClone("sup15722-p1-");
     const { priorTip, originMain } = await makeAheadByDuplicates(f);
     const shim = await installBarrierShim(f);
@@ -194,9 +264,11 @@ describe("P1 — operator reset and auto self-heal contend on the lease", () => 
       void pOperator.catch(() => {});
       void pAuto.catch(() => {});
 
-      // Wait until whichever contender entered first is FROZEN at its pin, holding
-      // the lease. The other must be blocked at the on-disk lock, so it has run no
-      // git at all: exactly one pin is in the log, nothing has moved.
+      // Deterministic barrier around capture: freeze whichever contender reaches
+      // its destructive pin first. It holds the lease; the other is blocked at the
+      // on-disk lease lock, so it has captured nothing, pinned nothing, and moved
+      // nothing. At the frozen moment there is exactly one pin in flight and the
+      // tip is still where it started.
       await waitForFile(shim.frozenMarker);
       const frozen = await readLog(shim.logFile);
       expect(pinLines(frozen)).toHaveLength(1);
@@ -207,18 +279,37 @@ describe("P1 — operator reset and auto self-heal contend on the lease", () => 
       await shim.release();
       const [operatorResult, autoResult] = await Promise.all([pOperator, pAuto]);
 
-      // Both settle and the repo ends on the upstream tip.
-      expect(await git(["rev-parse", "HEAD"], f.work)).toBe(originMain);
-      expect(operatorResult.ok).toBe(true);
-      if (operatorResult.ok) expect(operatorResult.resetToSha).toBe(originMain);
-      expect(autoResult).toBeDefined();
-
-      // Exactly one destructive tip move happened (the winner's); the loser, having
-      // acquired after the reset, either saw the target already in place or fell
-      // through to "warn, preserve" — it never moved the tip a second time.
+      // EXACTLY ONE destructive move happened across both contenders: one tip pin,
+      // one CAS tip move, one reset --hard. This is the property the lease
+      // changes. Pre-fix (no on-disk lease) both the operator and the auto path
+      // capture the same tip and both pin/attempt-CAS/reset, so pinLines would be
+      // 2 — the raw pre-fix red is cited in the delivery comment.
       const full = await readLog(shim.logFile);
-      expect(resetLines(full).length).toBeGreaterThanOrEqual(1);
-      expect(pinLines(full).length).toBeGreaterThanOrEqual(1);
+      expect(pinLines(full)).toHaveLength(1);
+      expect(casLines(full)).toHaveLength(1);
+      expect(resetLines(full)).toHaveLength(1);
+
+      // The repo ends on the upstream tip, and the newer tip is still reachable:
+      // it is pinned by the single rescue ref and is a real git object — it was
+      // never made unreachable.
+      expect(await git(["rev-parse", "HEAD"], f.work)).toBe(originMain);
+      expect(await objectExists(f.work, priorTip)).toBe(true);
+      const pinnedRefs = (
+        await git(["for-each-ref", "--format=%(objectname)", "refs/paperclip/rescue/base-repo"], f.work)
+      ).split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      expect(pinnedRefs).toContain(priorTip);
+
+      // Loser side-effects: whichever path lost the lease performed no destructive
+      // move of its own — the winner either reset (operator: resetToSha) or, when
+      // the auto won, saw the operator already at target. Exactly-one above proves
+      // the loser touched nothing.
+      expect(autoResult).toBeDefined();
+      if (operatorResult.ok && !operatorResult.alreadyAtTarget) {
+        expect(operatorResult.resetToSha).toBe(originMain);
+        expect(operatorResult.previousTip).toBe(priorTip);
+      }
     } finally {
       shim.restore();
     }
@@ -247,6 +338,12 @@ describe("P2 — two auto self-heals serialize (pre-fix red, now green)", () => 
       await shim.release();
       await Promise.all([p1, p2]);
       expect(await git(["rev-parse", "HEAD"], f.work)).toBe(await git(["rev-parse", "origin/main"], f.work));
+      // Exactly one destructive move total: the winner pinned/moved/reset once and
+      // the loser, re-reading state after the winner, saw it already self-healed.
+      const full = await readLog(shim.logFile);
+      expect(pinLines(full)).toHaveLength(1);
+      expect(casLines(full)).toHaveLength(1);
+      expect(resetLines(full)).toHaveLength(1);
     } finally {
       shim.restore();
     }
@@ -366,9 +463,63 @@ describe("P4 — the destructive primitive requires a real lease", () => {
   });
 });
 
-describe("P5 — an unresolvable identity refuses and moves nothing", () => {
+describe("P5 — a forced identity-resolution failure refuses and moves nothing", () => {
+  it("operator path on a real repo: reports identity_unresolved; HEAD and all refs unchanged, zero pin/CAS/reset", async () => {
+    const f = await makeOriginAndClone("sup15722-p5a-");
+    const { priorTip } = await makeAheadByDuplicates(f);
+    const before = await snapshotHeadAndRefs(f.work);
+    const shim = await installIdentityFailShim(f);
+    try {
+      const result = await resetProjectBaseRepoWithRescue({ repoRoot: f.work, baseRef: "origin/main" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("identity_unresolved");
+
+      const after = await snapshotHeadAndRefs(f.work);
+      expect(after.head).toBe(before.head);
+      expect(after.refs).toBe(before.refs);
+      expect(await git(["for-each-ref", "refs/paperclip/rescue"], f.work)).toBe("");
+
+      const full = await readLog(shim.logFile);
+      expect(pinLines(full)).toHaveLength(0);
+      expect(casLines(full)).toHaveLength(0);
+      expect(resetLines(full)).toHaveLength(0);
+      // The prior tip is still a live object — nothing was orphaned.
+      expect(await objectExists(f.work, priorTip)).toBe(true);
+    } finally {
+      shim.restore();
+    }
+  });
+
+  it("auto path on a real repo: self-heal fails closed, preserves the repo; zero pin/CAS/reset", async () => {
+    const f = await makeOriginAndClone("sup15722-p5b-");
+    const { priorTip } = await makeAheadByDuplicates(f);
+    const before = await snapshotHeadAndRefs(f.work);
+    const shim = await installIdentityFailShim(f);
+    try {
+      const outcome = await prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" });
+      // The auto path never throws out of the self-heal; it fails closed to the
+      // "warn, preserve" path. Either way it must not have performed a reset.
+      expect(outcome).toBeDefined();
+
+      const after = await snapshotHeadAndRefs(f.work);
+      // No destructive move: the tip is exactly where it was (the local branch is
+      // untouched and no rescue ref was created). A successful self-heal would have
+      // moved HEAD to origin/main and pinned the prior tip; neither happened.
+      expect(after.head).toBe(priorTip);
+      expect(after.refs).toBe(before.refs);
+      expect(await git(["for-each-ref", "refs/paperclip/rescue"], f.work)).toBe("");
+
+      const full = await readLog(shim.logFile);
+      expect(pinLines(full)).toHaveLength(0);
+      expect(casLines(full)).toHaveLength(0);
+      expect(resetLines(full)).toHaveLength(0);
+    } finally {
+      shim.restore();
+    }
+  });
+
   it("withBaseRepoResetLease refuses before creating any lockfile", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sup15722-p5a-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sup15722-p5c-"));
     tempRoots.push(dir);
     let ran = false;
     await expect(
@@ -378,15 +529,6 @@ describe("P5 — an unresolvable identity refuses and moves nothing", () => {
       }),
     ).rejects.toBeInstanceOf(BaseRepoIdentityUnresolved);
     expect(ran).toBe(false);
-    expect(await fs.readdir(dir)).toEqual([]);
-  });
-
-  it("the operator path reports identity_unresolved and touches nothing", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sup15722-p5b-"));
-    tempRoots.push(dir);
-    const result = await resetProjectBaseRepoWithRescue({ repoRoot: dir, baseRef: "main" });
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toBe("identity_unresolved");
     expect(await fs.readdir(dir)).toEqual([]);
   });
 });
