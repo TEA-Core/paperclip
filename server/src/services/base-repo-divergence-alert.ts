@@ -18,14 +18,29 @@ import path from "node:path";
  * it was last re-observed), and turns a divergence that has persisted past a
  * configurable age threshold into a first-class signal — a durable, board-
  * published attention row plus a distinct alert line — rather than leaving the
- * operator to the inline warning. It is deliberately best-effort everywhere:
- * a tracking or signal failure must never block a dispatch, and a base repo that
- * is in sync or that self-heals promptly produces no signal and no residue.
+ * operator to the inline warning. The per-episode dedup is made atomic across
+ * processes — not just within one — by an exclusive claim lock scoped to the
+ * base-repo checkout, so two concurrent server workers can never both emit the
+ * first-class signal for one divergence episode. It is deliberately best-effort
+ * everywhere: a tracking or signal failure must never block a dispatch, and a
+ * base repo that is in sync or that self-heals promptly produces no signal and
+ * no residue.
  */
 
 export const DEFAULT_BASE_REPO_DIVERGENCE_ALERT_AGE_DAYS = 7;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Cross-process claim tuning. A crash must never permanently block alerting: a
+ * lock left behind by a dead owner is recovered once it outlives
+ * {@link CLAIM_LOCK_STALE_MS}, and a live contender stops waiting (and defers the
+ * signal to the current holder) after {@link CLAIM_ACQUIRE_TIMEOUT_MS} rather than
+ * blocking provisioning.
+ */
+const CLAIM_LOCK_STALE_MS = 60_000;
+const CLAIM_ACQUIRE_TIMEOUT_MS = 5_000;
+const CLAIM_POLL_INTERVAL_MS = 50;
 
 /**
  * Operator-configurable age threshold, in days, beyond which a non-resettable
@@ -112,6 +127,19 @@ export function divergenceRecordPath(repoRoot: string): string {
   return path.join(repoRoot, DIVERGENCE_RECORD_RELATIVE_PATH);
 }
 
+export const DIVERGENCE_CLAIM_LOCK_RELATIVE_PATH = path.join(".paperclip", "base-repo-divergence-claim.lock");
+
+/**
+ * The cross-process claim lock, scoped to this base-repo checkout's `.paperclip/`
+ * tree (next to the durable sidecar). Only one process may hold it at a time;
+ * the sidecar's read-modify-write is performed under it so two concurrent
+ * provisioning workers cannot both read an unalerted record and both emit a
+ * first-class signal for one divergence episode.
+ */
+export function divergenceClaimLockPath(repoRoot: string): string {
+  return path.join(repoRoot, DIVERGENCE_CLAIM_LOCK_RELATIVE_PATH);
+}
+
 export async function readDivergenceRecord(repoRoot: string): Promise<BaseRepoDivergenceRecord | null> {
   try {
     const text = await fs.readFile(divergenceRecordPath(repoRoot), "utf8");
@@ -174,8 +202,9 @@ export interface DivergedRefusalObservation {
  * The sidecar record is the durable, cross-restart dedup key, but two
  * concurrent provisioning passes in the same server process can both read an
  * unalerted record and both emit a first-class signal for one episode. Chaining
- * the read-modify-write per checkout path closes that window so a single
- * divergence episode produces at most one signal.
+ * the read-modify-write per checkout path closes that window WITHIN a process;
+ * the cross-process claim lock ({@link acquireDivergenceClaim}) closes it ACROSS
+ * processes, since distinct workers each hold their own chain.
  */
 const observeChains = new Map<string, Promise<unknown>>();
 
@@ -190,6 +219,76 @@ function serializeObservationByKey<T>(key: string, task: () => Promise<T>): Prom
     if (observeChains.get(key) === settled) observeChains.delete(key);
   });
   return next;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Cross-process counterpart to {@link serializeObservationByKey}. The in-process
+ * chain only serializes within one server process; distinct processes each hold
+ * their own chain, so two workers can still race the sidecar. This claim is a
+ * plain O_EXCL file scoped to the resolved repo root: the create is atomic at
+ * the filesystem level, so exactly one process wins. A lock left behind by a
+ * crashed owner is recovered once it outlives {@link CLAIM_LOCK_STALE_MS} (no
+ * permanent blocker after a crash), and a contender stops waiting after
+ * {@link CLAIM_ACQUIRE_TIMEOUT_MS}, deferring the signal to the current holder
+ * instead of blocking provisioning (fail-open).
+ *
+ * @returns true when this process now holds the claim; false when a live holder
+ * still owns it at the timeout and the caller should defer.
+ */
+async function acquireDivergenceClaim(repoRoot: string): Promise<boolean> {
+  const lockPath = divergenceClaimLockPath(repoRoot);
+  const deadline = Date.now() + CLAIM_ACQUIRE_TIMEOUT_MS;
+  for (;;) {
+    try {
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
+      const handle = await fs.open(
+        lockPath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+        0o644,
+      );
+      try {
+        await handle.writeFile(`${process.pid}:${randomUUID()}\n`);
+      } finally {
+        await handle.close();
+      }
+      return true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        // The lock could not be created for some reason other than contention
+        // (permissions, etc.): fail open. Proceed as the claimer rather than
+        // block provisioning; the durable sidecar dedup key is the fallback.
+        return true;
+      }
+      try {
+        const stat = await fs.stat(lockPath);
+        if (Date.now() - stat.mtimeMs >= CLAIM_LOCK_STALE_MS) {
+          // Stale: the owner is gone. Remove it and retry the exclusive create.
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        // The lock vanished between open and stat (the holder released it): retry.
+        continue;
+      }
+      // A live holder owns it. Yield until it releases, or give up and defer.
+      if (Date.now() >= deadline) return false;
+      await sleep(CLAIM_POLL_INTERVAL_MS);
+    }
+  }
+}
+
+/** Release the cross-process claim. Best-effort: a stray lock self-heals via stale recovery. */
+async function releaseDivergenceClaim(repoRoot: string): Promise<void> {
+  try {
+    await fs.rm(divergenceClaimLockPath(repoRoot), { force: true });
+  } catch {
+    // swallow: cleanup is telemetry, not correctness
+  }
 }
 
 /**
@@ -207,11 +306,14 @@ function serializeObservationByKey<T>(key: string, task: () => Promise<T>): Prom
  * old `firstObservedAtMs` — that would manufacture an instantly-old episode and
  * emit a spurious alert, breaking per-base-repo tracking and the no-noise rule.
  *
- * Observations for the same checkout path are serialized (see
- * {@link serializeObservationByKey}) so concurrent provisioning passes cannot
- * each read "not yet alerted" and both fire; combined with the persisted
- * `alertedForFirstObservedAtMs` dedup key, one episode yields at most one
- * first-class signal.
+ * Observations for the same checkout path are serialized both within a process
+ * (see {@link serializeObservationByKey}) and across processes (see
+ * {@link acquireDivergenceClaim}), so neither two provisioning passes in one
+ * worker nor two distinct workers can each read "not yet alerted" and both fire.
+ * Combined with the persisted `alertedForFirstObservedAtMs` dedup key, one
+ * episode yields at most one first-class signal: the claimer that performs the
+ * read-modify-write returns the real decision, and any process that finds the
+ * claim held re-reads the sidecar and returns `shouldEmitFirstClassSignal: false`.
  */
 export function observeDivergedRefusal(
   repoRoot: string,
@@ -228,33 +330,84 @@ async function recordDivergedRefusal(
 ): Promise<DivergedRefusalObservation> {
   const nowMs = input.nowMs ?? Date.now();
   const thresholdMs = input.thresholdMs ?? resolveDivergenceAlertThresholdMs();
-  const existing = await readDivergenceRecord(repoRoot);
-  // Only trust a prior record written for the current repo identity AND base
-  // ref; otherwise start a fresh episode rather than inheriting its age.
-  const prior =
-    existing && existing.repoIdentity === input.repoIdentity && existing.baseRef === input.baseRef
-      ? existing
-      : null;
-  // A future-dated existing record (clock skew) must not shrink the window we
-  // have already been watching; fall back to now for that episode's start.
-  const firstObservedAtMs =
-    prior && prior.firstObservedAtMs <= nowMs ? prior.firstObservedAtMs : nowMs;
-  const ageMs = Math.max(0, nowMs - firstObservedAtMs);
-  const alertDue = ageMs >= thresholdMs;
-  const shouldEmitFirstClassSignal = alertDue && prior?.alertedForFirstObservedAtMs !== firstObservedAtMs;
 
-  const record: BaseRepoDivergenceRecord = {
-    repoIdentity: input.repoIdentity,
-    baseRef: input.baseRef,
-    firstObservedAtMs,
-    lastObservedAtMs: nowMs,
-    aheadCount: input.aheadCount,
-    behindCount: input.behindCount,
-    aheadCommitSubjects: input.aheadCommitSubjects,
-    alertedForFirstObservedAtMs: shouldEmitFirstClassSignal
-      ? firstObservedAtMs
-      : prior?.alertedForFirstObservedAtMs ?? null,
-  };
+  // Cross-process exclusive claim (complementing the in-process chain that
+  // observeDivergedRefusal applies). The durable sidecar's
+  // `alertedForFirstObservedAtMs` is the dedup key, but the read-modify-write
+  // must be serialized ACROSS processes so two workers cannot both read "not yet
+  // alerted" and both fire.
+  const claimed = await acquireDivergenceClaim(repoRoot);
+  try {
+    if (claimed) {
+      const existing = await readDivergenceRecord(repoRoot);
+      // Only trust a prior record written for the current repo identity AND base
+      // ref; otherwise start a fresh episode rather than inheriting its age.
+      const prior =
+        existing && existing.repoIdentity === input.repoIdentity && existing.baseRef === input.baseRef
+          ? existing
+          : null;
+      // A future-dated existing record (clock skew) must not shrink the window we
+      // have already been watching; fall back to now for that episode's start.
+      const firstObservedAtMs =
+        prior && prior.firstObservedAtMs <= nowMs ? prior.firstObservedAtMs : nowMs;
+      const ageMs = Math.max(0, nowMs - firstObservedAtMs);
+      const alertDue = ageMs >= thresholdMs;
+      const shouldEmitFirstClassSignal =
+        alertDue && prior?.alertedForFirstObservedAtMs !== firstObservedAtMs;
+
+      const record: BaseRepoDivergenceRecord = {
+        repoIdentity: input.repoIdentity,
+        baseRef: input.baseRef,
+        firstObservedAtMs,
+        lastObservedAtMs: nowMs,
+        aheadCount: input.aheadCount,
+        behindCount: input.behindCount,
+        aheadCommitSubjects: input.aheadCommitSubjects,
+        alertedForFirstObservedAtMs: shouldEmitFirstClassSignal
+          ? firstObservedAtMs
+          : prior?.alertedForFirstObservedAtMs ?? null,
+      };
+      await writeDivergenceRecordBestEffort(repoRoot, record);
+      return { record, ageMs, thresholdMs, alertDue, shouldEmitFirstClassSignal };
+    }
+
+    // A live process holds the cross-process claim and is performing the
+    // read-modify-write for this episode. We are not the claimer: re-read the
+    // durable sidecar and defer the first-class signal to the claimer. Never
+    // write here, so we cannot clobber the claimer's dedup key or manufacture a
+    // second signal.
+    const reread = await readDivergenceRecord(repoRoot);
+    const prior =
+      reread && reread.repoIdentity === input.repoIdentity && reread.baseRef === input.baseRef
+        ? reread
+        : null;
+    const firstObservedAtMs =
+      prior && prior.firstObservedAtMs <= nowMs ? prior.firstObservedAtMs : nowMs;
+    const ageMs = Math.max(0, nowMs - firstObservedAtMs);
+    const alertDue = ageMs >= thresholdMs;
+    const record: BaseRepoDivergenceRecord =
+      prior ??
+      ({
+        repoIdentity: input.repoIdentity,
+        baseRef: input.baseRef,
+        firstObservedAtMs,
+        lastObservedAtMs: nowMs,
+        aheadCount: input.aheadCount,
+        behindCount: input.behindCount,
+        aheadCommitSubjects: input.aheadCommitSubjects,
+        alertedForFirstObservedAtMs: null,
+      });
+    return { record, ageMs, thresholdMs, alertDue, shouldEmitFirstClassSignal: false };
+  } finally {
+    if (claimed) await releaseDivergenceClaim(repoRoot);
+  }
+}
+
+/** Best-effort sidecar write: an atomic tmp+rename that never blocks a dispatch. */
+async function writeDivergenceRecordBestEffort(
+  repoRoot: string,
+  record: BaseRepoDivergenceRecord,
+): Promise<void> {
   try {
     await fs.mkdir(path.dirname(divergenceRecordPath(repoRoot)), { recursive: true });
     const target = divergenceRecordPath(repoRoot);
@@ -265,7 +418,6 @@ async function recordDivergedRefusal(
     // Best-effort: even if the write fails the in-memory decision is still
     // returned, so a stuck base repo still alerts from memory this pass.
   }
-  return { record, ageMs, thresholdMs, alertDue, shouldEmitFirstClassSignal };
 }
 
 /** The structured payload for the first-class attention row. */
