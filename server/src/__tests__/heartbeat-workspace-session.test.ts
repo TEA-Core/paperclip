@@ -999,6 +999,63 @@ describe("requiresPushCapabilityPreflight", () => {
       explicitRunScopedSkillKeys: ["paperclipai/bundled/software-development/github-pr-workflow"],
     })).toBe(false);
   });
+
+  const prWorkflowSkill = ["paperclipai/bundled/software-development/github-pr-workflow"];
+  const brokerFlagsOn = {
+    PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on",
+    PAPERCLIP_AGENT_GH_WRAPPER: "on",
+  };
+
+  it("waives the guard when both broker flags are on and the adapter lane wires the broker", () => {
+    expect(requiresPushCapabilityPreflight({
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    })).toBe(false);
+
+    expect(requiresPushCapabilityPreflight({
+      adapterType: "claude_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: { engine: " ACP " },
+      flagEnv: brokerFlagsOn,
+    })).toBe(false);
+  });
+
+  it("keeps the guard when the broker cannot supply push credentials for the run", () => {
+    // engine auto can fall back to the Claude CLI lane, which wires neither gate
+    expect(requiresPushCapabilityPreflight({
+      adapterType: "claude_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    })).toBe(true);
+
+    expect(requiresPushCapabilityPreflight({
+      adapterType: "codex_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    })).toBe(true);
+
+    expect(requiresPushCapabilityPreflight({
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+    })).toBe(true);
+
+    expect(requiresPushCapabilityPreflight({
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+    })).toBe(true);
+  });
 });
 
 describe("stripHostWorkspaceProvisionForLowTrustSandbox", () => {
