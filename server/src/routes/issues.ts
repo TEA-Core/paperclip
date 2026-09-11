@@ -11243,6 +11243,38 @@ export function issueRoutes(
       },
     });
 
+    // Observability (SUP-15668): an agent whose request body omits parentId
+    // starts an "orphan" work tree. Trigger on the request body, not the
+    // persisted parent, so a task-watchdog product-bug follow-up (a parentless
+    // agent create with no parentId in the body) also records a row — the
+    // contract has no watchdog exception. Strictly additive and off the
+    // response path: fire-and-forget with rejection containment so a slow or
+    // failing audit write can never delay or break the create 2xx (AC-4).
+    if (actor.actorType === "agent" && !rawCreateBody.parentId) {
+      void logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.created_without_parent",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          issueId: issue.id,
+          identifier: issue.identifier,
+          companyId,
+          projectId: issue.projectId ?? null,
+          actorAgentId: actor.agentId ?? null,
+          hasBlockedByIssueIds:
+            Array.isArray(req.body.blockedByIssueIds) && req.body.blockedByIssueIds.length > 0,
+        },
+      }).catch(() => {
+        // Best-effort audit row — never let it fail or slow the issue create.
+      });
+    }
+
     if (executionPolicy?.monitor) {
       await logActivity(db, {
         companyId,
