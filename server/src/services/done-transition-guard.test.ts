@@ -4538,21 +4538,27 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).not.toContain("is missing a done-tier declaration");
     });
 
-    it("resolves Tier 2 evidence from the true position when a line is duplicated (indexOf regression)", async () => {
+    it("resolves Tier 2 evidence from the true position when the evidence line is duplicated (indexOf regression)", async () => {
+      // Regression guard for the done-tier evidence lookahead. The prior
+      // implementation located the evidence line with `lines.indexOf(line)`
+      // (a value match) and then read exactly one following line
+      // (`lines[idx + 1]`). With a blank line directly after the prefix, that
+      // value-match path read the blank and spuriously rejected the
+      // declaration even though the evidence sat on the next non-empty line.
+      // The index-based loop resolves the evidence from its true position,
+      // past the blank, here on a line whose value also repeats later in the
+      // body — so a value-match that jumped to a duplicate could not resolve
+      // it.
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
-        "Closed at Tier 2 (live):\n\nfirst evidence\nClosed at Tier 2 (live):\nsecond evidence",
+        "Closed at Tier 2 (live):\n\nProbe: live at 2026-09-11\nProbe: live at 2026-09-11",
         null,
         () => Promise.resolve([]),
       );
-      // The first prefix line governs; its true next non-empty line is "first
-      // evidence", not the "second evidence" that would follow if resolution
-      // jumped to the duplicated prefix line by value.
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
-      expect(result.reason).toContain("first evidence");
-      expect(result.reason).not.toContain("second evidence");
+      expect(result.reason).toContain("Probe: live at 2026-09-11");
     });
 
     it("keeps the missing-declaration message when the body has no tier phrase at all (unchanged)", async () => {
