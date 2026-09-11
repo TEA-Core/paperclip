@@ -41,6 +41,7 @@ import {
   resolveTaskSessionConfigFreshness,
   isWorkspaceSyncConflictFailure,
   requiresPushCapabilityPreflight,
+  requiresPushCredentialBinding,
   resolveWorkspaceAfterLowTrustPreflight,
   resolveRuntimeSessionParamsForWorkspace,
   shouldDeferFollowupWakeForSameIssue,
@@ -999,15 +1000,17 @@ describe("requiresPushCapabilityPreflight", () => {
       explicitRunScopedSkillKeys: ["paperclipai/bundled/software-development/github-pr-workflow"],
     })).toBe(false);
   });
+});
 
+describe("requiresPushCredentialBinding", () => {
   const prWorkflowSkill = ["paperclipai/bundled/software-development/github-pr-workflow"];
   const brokerFlagsOn = {
     PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on",
     PAPERCLIP_AGENT_GH_WRAPPER: "on",
   };
 
-  it("waives the guard when both broker flags are on and the adapter lane wires the broker", () => {
-    expect(requiresPushCapabilityPreflight({
+  it("waives the binding when both broker flags are on and the adapter lane wires the broker", () => {
+    expect(requiresPushCredentialBinding({
       adapterType: "opencode_local",
       issueId: "issue-1",
       explicitRunScopedSkillKeys: prWorkflowSkill,
@@ -1015,7 +1018,7 @@ describe("requiresPushCapabilityPreflight", () => {
       flagEnv: brokerFlagsOn,
     })).toBe(false);
 
-    expect(requiresPushCapabilityPreflight({
+    expect(requiresPushCredentialBinding({
       adapterType: "claude_local",
       issueId: "issue-1",
       explicitRunScopedSkillKeys: prWorkflowSkill,
@@ -1024,9 +1027,9 @@ describe("requiresPushCapabilityPreflight", () => {
     })).toBe(false);
   });
 
-  it("keeps the guard when the broker cannot supply push credentials for the run", () => {
+  it("keeps the binding when the broker cannot supply push credentials for the run", () => {
     // engine auto can fall back to the Claude CLI lane, which wires neither gate
-    expect(requiresPushCapabilityPreflight({
+    expect(requiresPushCredentialBinding({
       adapterType: "claude_local",
       issueId: "issue-1",
       explicitRunScopedSkillKeys: prWorkflowSkill,
@@ -1034,7 +1037,7 @@ describe("requiresPushCapabilityPreflight", () => {
       flagEnv: brokerFlagsOn,
     })).toBe(true);
 
-    expect(requiresPushCapabilityPreflight({
+    expect(requiresPushCredentialBinding({
       adapterType: "codex_local",
       issueId: "issue-1",
       explicitRunScopedSkillKeys: prWorkflowSkill,
@@ -1042,7 +1045,7 @@ describe("requiresPushCapabilityPreflight", () => {
       flagEnv: brokerFlagsOn,
     })).toBe(true);
 
-    expect(requiresPushCapabilityPreflight({
+    expect(requiresPushCredentialBinding({
       adapterType: "opencode_local",
       issueId: "issue-1",
       explicitRunScopedSkillKeys: prWorkflowSkill,
@@ -1050,11 +1053,35 @@ describe("requiresPushCapabilityPreflight", () => {
       flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
     })).toBe(true);
 
-    expect(requiresPushCapabilityPreflight({
+    expect(requiresPushCredentialBinding({
       adapterType: "opencode_local",
       issueId: "issue-1",
       explicitRunScopedSkillKeys: prWorkflowSkill,
     })).toBe(true);
+  });
+
+  it("never waives the push-remote checkout validation for a broker-wired run", async () => {
+    const input = {
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    };
+    expect(requiresPushCredentialBinding(input)).toBe(false);
+    // The checkout gate keys on requiresPushCapabilityPreflight, which the broker does not waive.
+    expect(requiresPushCapabilityPreflight(input)).toBe(true);
+
+    const cwd = await createGitCheckout({ withRemote: false });
+    try {
+      await expect(assertPushCapabilityCheckoutValid({
+        enabled: requiresPushCapabilityPreflight(input),
+        issue: { id: "issue-1", identifier: "PAP-1" },
+        cwd,
+      })).rejects.toBeInstanceOf(WorkspaceValidationFailure);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
   });
 });
 

@@ -48,8 +48,15 @@ parse_owner_repo() {
     git@github.com:*|git@www.github.com:*)
       rest="${url#*:}" ;;
     *)
-      # bare owner/repo
-      case "$url" in */*) rest="${url}" ;; *) return 0 ;; esac ;;
+      # bare owner/repo, or gh's host-qualified [HOST/]OWNER/REPO. Only github.com is
+      # accepted as a host; any other host-qualified value is not a target this
+      # wrapper can mint for, so it resolves to nothing.
+      case "$url" in
+        github.com/*/*|www.github.com/*/*) rest="${url#*github.com/}" ;;
+        */*/*) return 0 ;;
+        */*) rest="${url}" ;;
+        *) return 0 ;;
+      esac ;;
   esac
   [ -n "$rest" ] || return 0
   rest="${rest%.git}"
@@ -73,16 +80,23 @@ fi
 
 OWNER_REPO=""
 # 1) repo flag: --repo owner/repo, --repo=owner/repo, -R owner/repo, -Rowner/repo
+REPO_FLAG=""
 for ((idx=0; idx<n; idx++)); do
   a="${args[idx]}"
   case "$a" in
     --repo|-R)
-      if [ $((idx+1)) -lt "$n" ]; then OWNER_REPO="$(parse_owner_repo "${args[idx+1]}")"; fi
+      if [ $((idx+1)) -lt "$n" ]; then REPO_FLAG="${args[idx+1]}"; fi
       break ;;
-    --repo=*) OWNER_REPO="$(parse_owner_repo "${a#--repo=}")"; break ;;
-    -R?*) OWNER_REPO="$(parse_owner_repo "${a#-R}")"; break ;;
+    --repo=*) REPO_FLAG="${a#--repo=}"; break ;;
+    -R?*) REPO_FLAG="${a#-R}"; break ;;
   esac
 done
+if [ -n "$REPO_FLAG" ]; then
+  OWNER_REPO="$(parse_owner_repo "$REPO_FLAG")"
+  # An explicit target that is not a github.com OWNER/REPO must not fall through to the
+  # ambient repo: that would mint a token for a different repo than the one gh calls.
+  [ -n "$OWNER_REPO" ] || fail "--repo value '$REPO_FLAG' is not a github.com [HOST/]OWNER/REPO; refusing to mint for a different repo."
+fi
 # 2) `gh api repos/<owner>/<repo>/...`: the endpoint path names the target repo, and a
 #    token minted for the cwd repo would 404 on any other private repo. `{owner}/{repo}`
 #    placeholders are left to the fallbacks below, which is where gh fills them from.

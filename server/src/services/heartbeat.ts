@@ -1195,17 +1195,26 @@ export function requiresPushCapabilityPreflight(input: {
   adapterType: string;
   issueId: string | null | undefined;
   explicitRunScopedSkillKeys: string[];
+}) {
+  return Boolean(input.issueId)
+    && GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)
+    && hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys);
+}
+
+/**
+ * Whether a push-capable run must carry a GH_TOKEN/GITHUB_TOKEN binding. Narrower
+ * than `requiresPushCapabilityPreflight`, which also gates the independent
+ * push-remote checkout validation and is not waived here.
+ */
+export function requiresPushCredentialBinding(input: {
+  adapterType: string;
+  issueId: string | null | undefined;
+  explicitRunScopedSkillKeys: string[];
   adapterConfig?: Record<string, unknown>;
   /** Server process env holding the broker rollout flags; read only. */
   flagEnv?: Record<string, string | undefined>;
 }) {
-  if (
-    !input.issueId
-    || !GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)
-    || !hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys)
-  ) {
-    return false;
-  }
+  if (!requiresPushCapabilityPreflight(input)) return false;
   // A broker-wired run pushes with a fleet-App installation token minted per
   // git/gh call, so demanding a GH_TOKEN/GITHUB_TOKEN binding here only kept the
   // personal PAT bound to every agent (SUP-15639).
@@ -17302,6 +17311,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       adapterType: agent.adapterType,
       issueId,
       explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
+    });
+    const pushCredentialBindingRequired = requiresPushCredentialBinding({
+      adapterType: agent.adapterType,
+      issueId,
+      explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
       adapterConfig: executionRunConfig,
       flagEnv: process.env, // spawn-env-guard: read-only — only the broker rollout flags are read; nothing reaches a child env
     });
@@ -17322,7 +17336,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       routineEnv: routineEnvContext.env,
       secretsSvc,
       trustPreset,
-      requiredScopedEnvBinding: pushCapabilityPreflightRequired
+      requiredScopedEnvBinding: pushCredentialBindingRequired
         ? {
             keys: [...PUSH_CAPABILITY_ENV_KEYS],
             consumerScopes: ["agent", "project"],

@@ -310,6 +310,30 @@ for (const [label, repoArgs] of [
   });
 }
 
+for (const [label, repoArgs] of [
+  ["-R github.com/owner/repo", ["-R", "github.com/TEA-Core/Other-Repo"]],
+  ["--repo=www.github.com/owner/repo", ["--repo=www.github.com/TEA-Core/Other-Repo"]],
+]) {
+  test(`gh wrapper strips the github.com host from ${label}`, () => {
+    withRoot((root, binDir) => {
+      writeFakeGh(binDir);
+      const res = runWrapper(root, { args: ["pr", "view", "7", ...repoArgs] });
+      assert.equal(res.status, 0, res.stderr);
+      assert.deepEqual(JSON.parse(readCalls(root)[0]), { owner: "tea-core", repo: "other-repo" });
+    });
+  });
+}
+
+test("gh wrapper refuses a repo flag for another host instead of minting for the ambient repo", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, { args: ["pr", "view", "7", "-R", "ghe.example.com/TEA-Core/Other-Repo"] });
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /not a github\.com/);
+    assert.throws(() => readCalls(root), /ENOENT/, "an unparseable explicit target must not mint");
+  });
+});
+
 test("gh wrapper mints for the repo in a `gh api repos/<owner>/<repo>/...` path", () => {
   withRoot((root, binDir) => {
     writeFakeGh(binDir);
