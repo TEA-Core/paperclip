@@ -2398,7 +2398,12 @@ async function materializeManagedProjectWorkspace(
   const auth = input.resolveGitAuth
     ? await input.resolveGitAuth(input.repoUrl)
     : null;
-  const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
+  // Not fs.mkdtemp: it always creates the directory 0700, and the rename below carries that
+  // mode onto the shared checkout, where agents (their own uid, reaching it through the
+  // shared group) can neither enter nor spawn in it. A plain mkdir takes the process umask,
+  // like the no-repo branch above; the UUID keeps concurrent attempts apart.
+  const cloneTmpDir = `${cwd}.clone-${randomUUID()}`;
+  await fs.mkdir(cloneTmpDir);
   try {
     await execFile(
       "git",
@@ -2449,6 +2454,7 @@ async function materializeManagedProjectWorkspace(
       `Failed to move managed checkout into place at "${cwd}": ${reason}`,
     );
   }
+  await ensureSharedGroupOwnership(cwd);
   return { cwd, warning: null };
 }
 
