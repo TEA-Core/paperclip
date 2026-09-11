@@ -1060,6 +1060,37 @@ describe("requiresPushCredentialBinding", () => {
     })).toBe(true);
   });
 
+  it("keeps the binding for a claude_local run pinned to the CLI engine", () => {
+    expect(requiresPushCredentialBinding({
+      adapterType: "claude_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: { engine: "cli" },
+      flagEnv: brokerFlagsOn,
+    })).toBe(true);
+  });
+
+  // The waiver trusts that opencode_local and the claude_local ACP lane install both broker
+  // gates, and that the claude_local CLI lane installs neither. Pin that contract to the
+  // adapter sources, so rewiring a lane cannot silently leave the waiver pointing at a lane
+  // with no broker credentials.
+  it("matches the lanes that actually install both broker gates", async () => {
+    const read = (rel: string) => fs.readFile(new URL(`../../../packages/${rel}`, import.meta.url), "utf8");
+    const gates = ["applyPaperclipGhWrapperGate(", "applyPaperclipGitHubCredentialHelperGate("];
+    const [opencode, acpx, claudeAcp, claudeCli] = await Promise.all([
+      read("adapters/opencode-local/src/server/execute.ts"),
+      read("adapter-utils/src/acpx-engine/execute.ts"),
+      read("adapters/claude-local/src/server/acp.ts"),
+      read("adapters/claude-local/src/server/execute.ts"),
+    ]);
+    for (const gate of gates) {
+      expect(opencode).toContain(gate);
+      expect(acpx).toContain(gate);
+      expect(claudeCli).not.toContain(gate);
+    }
+    expect(claudeAcp).toContain("createAcpxEngineExecutor");
+  });
+
   it("never waives the push-remote checkout validation for a broker-wired run", async () => {
     const input = {
       adapterType: "opencode_local",

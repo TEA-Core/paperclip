@@ -69,14 +69,36 @@ parse_owner_repo() {
 args=("$@")
 n=${#args[@]}
 
-# Credentials are minted per call. A gh login would persist a token under $HOME that
-# every later unwrapped gh, and `gh auth git-credential`, would then serve.
-if [ "${args[0]:-}" = "auth" ]; then
-  case "${args[1]:-}" in
-    login|logout|refresh|setup-git|switch)
-      fail "gh auth ${args[1]} is disabled in Paperclip runs: GitHub credentials are minted per call by the Paperclip broker and must not be stored." ;;
+# gh accepts options before and between command words (`gh --hostname github.com auth
+# login`, `gh -R o/r api ...`), so commands are identified from the positional arguments,
+# skipping the values of options that take one.
+positional=()
+skip_value=0
+for a in "${args[@]}"; do
+  if [ "$skip_value" = 1 ]; then skip_value=0; continue; fi
+  case "$a" in
+    --hostname|-h|--repo|-R|--jq|-q|--template|-t|-H|--header|-f|-F|--field|--raw-field|-X|--method|--input|--cache|-p|--preview|--git-protocol|-s|--scopes)
+      skip_value=1 ;;
+    -*) ;;
+    *) positional+=("$a") ;;
   esac
-fi
+done
+CMD="${positional[0]:-}"
+
+# Credentials are minted per call. A gh login would persist a token under $HOME that
+# every later unwrapped gh, and `gh auth git-credential`, would then serve. Refuse when
+# any `auth` word is followed by a credential-storing subcommand, wherever options sit,
+# and before anything is minted.
+seen_auth=0
+for p in "${positional[@]}"; do
+  if [ "$seen_auth" = 1 ]; then
+    case "$p" in
+      login|logout|refresh|setup-git|switch)
+        fail "gh auth $p is disabled in Paperclip runs: GitHub credentials are minted per call by the Paperclip broker and must not be stored." ;;
+    esac
+  fi
+  [ "$p" = "auth" ] && seen_auth=1
+done
 
 OWNER_REPO=""
 # 1) repo flag: --repo owner/repo, --repo=owner/repo, -R owner/repo, -Rowner/repo
@@ -100,9 +122,9 @@ fi
 # 2) `gh api repos/<owner>/<repo>/...`: the endpoint path names the target repo, and a
 #    token minted for the cwd repo would 404 on any other private repo. `{owner}/{repo}`
 #    placeholders are left to the fallbacks below, which is where gh fills them from.
-if [ -z "$OWNER_REPO" ] && [ "${args[0]:-}" = "api" ]; then
-  for ((idx=1; idx<n; idx++)); do
-    a="${args[idx]#/}"
+if [ -z "$OWNER_REPO" ] && [ "$CMD" = "api" ]; then
+  for p in "${positional[@]:1}"; do
+    a="${p#/}"
     case "$a" in
       repos/\{*) break ;;
       repos/*/*)

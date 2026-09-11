@@ -354,6 +354,40 @@ test("gh wrapper leaves `{owner}/{repo}` api placeholders to the ambient repo", 
   });
 });
 
+for (const [label, argv] of [
+  ["a leading global option", ["--hostname", "github.com", "auth", "login"]],
+  ["an option between auth and its subcommand", ["auth", "--hostname", "github.com", "login"]],
+  ["a leading -R", ["-R", "TEA-Core/Other-Repo", "auth", "refresh"]],
+  ["a short hostname option", ["auth", "-h", "github.com", "setup-git"]],
+]) {
+  test(`gh wrapper refuses a credential-storing gh auth subcommand behind ${label}, without minting`, () => {
+    withRoot((root, binDir) => {
+      writeFakeGh(binDir);
+      const res = runWrapper(root, { args: argv });
+      assert.equal(res.status, 1, res.stderr);
+      assert.match(res.stderr, /gh auth \w[\w-]* is disabled/);
+      assert.throws(() => readCalls(root), /ENOENT/, "a refused auth subcommand must not mint");
+    });
+  });
+}
+
+test("gh wrapper still passes read-only gh auth subcommands through", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, { args: ["--hostname", "github.com", "auth", "token"] });
+    assert.equal(res.status, 0, res.stderr);
+  });
+});
+
+test("gh wrapper identifies `api` behind a leading option", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, { args: ["--hostname", "github.com", "api", "repos/TEA-Core/Other-Repo/pulls"] });
+    assert.equal(res.status, 0, res.stderr);
+    assert.deepEqual(JSON.parse(readCalls(root)[0]), { owner: "tea-core", repo: "other-repo" });
+  });
+});
+
 test("gh wrapper refuses gh auth subcommands that would store a credential, without minting", () => {
   withRoot((root, binDir) => {
     writeFakeGh(binDir);
