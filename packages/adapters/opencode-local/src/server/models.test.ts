@@ -12,6 +12,7 @@ describe("openCode models", () => {
   afterEach(() => {
     delete process.env.PAPERCLIP_OPENCODE_COMMAND;
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
+    delete process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES;
     resetOpenCodeModelsCacheForTests();
     vi.restoreAllMocks();
     vi.useRealTimers();
@@ -137,6 +138,10 @@ describe("openCode models", () => {
   });
 
   it("refreshes a stale non-empty catalog before rejecting the configured model", async () => {
+    // TEA-Core fork: disable the fork's uncached re-enumeration retries (a0535ed8c) so this
+    // upstream test exercises the `models --refresh` path in isolation; production runs
+    // the retries first, then this refresh.
+    process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES = "0";
     const spy = vi
       .spyOn(serverUtils, "runChildProcess")
       .mockResolvedValueOnce({
@@ -182,7 +187,46 @@ describe("openCode models", () => {
     expect(spy.mock.calls[2]?.[2]).toEqual(["models"]);
   });
 
+  it("re-enumerates uncached before refreshing the cache when the configured model is missing (fork transient-blip retry)", async () => {
+    // TEA-Core fork (a0535ed8c): an enumeration blip can omit a registry/auth-backed provider
+    // while `opencode models` still exits 0. The fork re-enumerates first; upstream's
+    // `models --refresh` runs only if the model is still missing afterwards.
+    process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES = "1";
+    const spy = vi
+      .spyOn(serverUtils, "runChildProcess")
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "openrouter/example/stale-model\n",
+        stderr: "",
+        pid: 1,
+        startedAt: new Date().toISOString(),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "openrouter/example/stale-model\nopenrouter/deepseek/deepseek-v4-flash-0731\n",
+        stderr: "",
+        pid: 1,
+        startedAt: new Date().toISOString(),
+      });
+
+    await expect(
+      ensureOpenCodeModelConfiguredAndAvailable({
+        model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      }),
+    ).resolves.toContainEqual({
+      id: "openrouter/deepseek/deepseek-v4-flash-0731",
+      label: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy.mock.calls.map((call) => call[2])).toEqual([["models"], ["models"]]);
+  });
+
   it("still rejects when a refreshed non-empty catalog omits the configured model", async () => {
+    process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES = "0";
     const spy = vi
       .spyOn(serverUtils, "runChildProcess")
       .mockResolvedValueOnce({
@@ -226,6 +270,7 @@ describe("openCode models", () => {
   });
 
   it("still rejects from the original catalog when post-refresh enumeration returns no models", async () => {
+    process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES = "0";
     const spy = vi
       .spyOn(serverUtils, "runChildProcess")
       .mockResolvedValueOnce({
@@ -267,6 +312,7 @@ describe("openCode models", () => {
   });
 
   it("still rejects from the original catalog when refresh fails", async () => {
+    process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES = "0";
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const spy = vi
       .spyOn(serverUtils, "runChildProcess")
