@@ -78,12 +78,39 @@ describeEmbedded("Paperclip semantic mock/production conformance", () => {
       ids,
     );
 
+    // TEA-Core fork: every non-board close to `done` must carry a done-tier declaration in its
+    // close comment (SUP-12693; board actors are the only exemption), which upstream's semantic
+    // contract does not model. So the finish_task vectors run through BOTH adapters with a Tier-1
+    // declaration appended to the summary — mock and production must still agree on every other
+    // field — and one production-only check pins the divergence: an undeclared close is refused.
+    const TIER_1_DECLARATION =
+      "Closed at Tier 1 (landed, not liveness-probed): semantic conformance fixture. Liveness unverified.";
+    const upstreamVectors = CAPABILITY_HIGH_RISK_SEMANTIC_VECTORS.filter(
+      (vector) => vector.operationId !== "finish_task",
+    );
+    const finishVectors = CAPABILITY_HIGH_RISK_SEMANTIC_VECTORS.filter(
+      (vector) => vector.operationId === "finish_task",
+    );
+    const tierDeclaredFinishVectors = finishVectors.map((vector) => {
+      const input = vector.input as { idempotencyKey: string; summary: string };
+      return {
+        ...vector,
+        id: `${vector.id}-tier-declared`,
+        input: {
+          ...input,
+          idempotencyKey: `${input.idempotencyKey}-tier-declared`,
+          summary: `${input.summary}\n\n${TIER_1_DECLARATION}`,
+        },
+      };
+    });
+    expect(finishVectors.map((vector) => vector.id)).toEqual(["terminal-with-dependency", "terminal-finish"]);
+
     const report = await runSemanticConformanceKit({
-      vectors: CAPABILITY_HIGH_RISK_SEMANTIC_VECTORS,
+      vectors: upstreamVectors,
       adapters: [mock, production],
     });
 
-    expect(report.rows).toHaveLength(CAPABILITY_HIGH_RISK_SEMANTIC_VECTORS.length);
+    expect(report.rows).toHaveLength(upstreamVectors.length);
     expect(report.rows.every((row) => row.adapterIds.join(",") === "capability-mock,paperclip-production-services"))
       .toBe(true);
     expect(report.rows.find((row) => row.vectorId === "progress-duplicate-retry")?.observation.audit)
@@ -92,9 +119,22 @@ describeEmbedded("Paperclip semantic mock/production conformance", () => {
       .toEqual({ outcome: "denied", code: "document_revision_conflict" });
     expect(report.rows.find((row) => row.vectorId === "continuation-request")?.observation.state)
       .toMatchObject({ interactions: [{ continuationPolicy: "wake_assignee" }] });
-    expect(report.rows.find((row) => row.vectorId === "terminal-finish")?.observation.state)
-      .toMatchObject({ task: { status: "done" } });
     expect(report.rows.every((row) => row.observation.receipt?.operationReceiptPresent === true))
       .toBe(true);
+
+    // The divergence itself: production refuses an undeclared close and leaves the task open.
+    const undeclared = await production.execute(finishVectors[0]!);
+    expect(undeclared.authorization).toEqual({ outcome: "denied", code: "semantic_rule_violation" });
+    expect(undeclared.state).toMatchObject({ task: { status: "in_progress" } });
+
+    const finishReport = await runSemanticConformanceKit({
+      vectors: tierDeclaredFinishVectors,
+      adapters: [mock, production],
+    });
+    expect(finishReport.rows).toHaveLength(2);
+    expect(finishReport.rows.find((row) => row.vectorId === "terminal-with-dependency-tier-declared")?.observation.state)
+      .toMatchObject({ task: { status: "done" }, dependencies: [expect.any(String)] });
+    expect(finishReport.rows.find((row) => row.vectorId === "terminal-finish-tier-declared")?.observation.state)
+      .toMatchObject({ task: { status: "done" } });
   }, 30_000);
 });
