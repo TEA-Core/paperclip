@@ -276,13 +276,33 @@ function executionParticipantPathIsFresh(
   );
 }
 
+// SUP-15713: a card is review-liveness-eligible when it is in review, OR when
+// it is carrying a live pending stage decision awaiting an invokable agent
+// participant — regardless of its `status`. A reviewer's rejected
+// stage-decision write returns the card to active work (e.g. in_progress)
+// while the stage stays `pending` with a `currentParticipant`; the old
+// `in_review`-only gate left such a card permanently un-wakeable, with
+// `reviewAttention` stuck at `none`. Terminal statuses are always excluded.
+function isReviewLivenessEligible(
+  issue: IssueLivenessIssueInput,
+  agentsById: Map<string, IssueLivenessAgentInput>,
+): boolean {
+  if (issue.status === "done" || issue.status === "cancelled") return false;
+  if (issue.status === "in_review") return true;
+  if (issue.executionState?.status !== "pending") return false;
+  const participantAgentId = readPrincipalAgentId(issue.executionState.currentParticipant);
+  if (!participantAgentId) return false;
+  const participantAgent = agentsById.get(participantAgentId);
+  return participantAgent?.companyId === issue.companyId && isInvokableAgent(participantAgent, agentsById);
+}
+
 export function classifyIssueReviewPaths(
   input: IssueGraphLivenessInput,
   issue: IssueLivenessIssueInput,
 ): IssueReviewPathFact[] {
-  if (issue.status !== "in_review") return [];
-  const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
+  if (!isReviewLivenessEligible(issue, agentsById)) return [];
+  const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
   const paths: IssueReviewPathFact[] = [];
 
   if (issue.assigneeUserId) {
@@ -617,7 +637,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     reviewIssue: IssueLivenessIssueInput,
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
-    if (reviewIssue.status !== "in_review") return null;
+    if (!isReviewLivenessEligible(reviewIssue, agentsById)) return null;
     if (classifyIssueReviewPaths(input, reviewIssue).length > 0) return null;
 
     const ownerCandidates = ownerCandidatesForRecoveryIssue(reviewIssue, input.agents, agentsById, {
@@ -831,7 +851,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       if (chainFinding) findings.push(chainFinding);
     }
 
-    if (issue.status === "in_review" && !chainFinding && !unresolvedBlockers.has(issue.id)) {
+    if (isReviewLivenessEligible(issue, agentsById) && !chainFinding && !unresolvedBlockers.has(issue.id)) {
       const review = reviewFinding(issue, issue, [issue]);
       if (review) findings.push(review);
     }
