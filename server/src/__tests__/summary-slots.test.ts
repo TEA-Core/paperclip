@@ -473,7 +473,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const failed = await svc.getSlot(projectSelector(companyId, projectId));
       expect(failed.slot).toMatchObject({
         status: "failed",
-        generatingIssueId: first.generatingIssue.id,
+        generatingIssueId: null,
         failureReason: expect.stringContaining("finished without writing a summary"),
       });
 
@@ -502,7 +502,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const result = await svc.getSlot(projectSelector(companyId, projectId));
       expect(result.slot).toMatchObject({
         status: "failed",
-        generatingIssueId: generated.generatingIssue.id,
+        generatingIssueId: null,
         failureReason: expect.stringContaining("was cancelled before writing a summary"),
       });
     });
@@ -518,7 +518,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       return { svc, generationIssueId: generated.generatingIssue.id, runId };
     }
 
-    it("writes a board-readable revision, preserves the previous revision, and clears the generating state", async () => {
+    it("writes a board-readable revision, preserves the previous revision, and keeps the slot armed for the live generation task", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
       const summarizerAgentId = await seedSummarizer(companyId);
@@ -558,8 +558,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(written.revision.revisionNumber).toBe(2);
       expect(written.document.body).toMatch(/^\*\*Decide:\*\*[\s\S]*\*\*I suggest:\*\*/m);
       expect(written.document.body).not.toMatch(/^Issues: /m);
-      expect(written.slot.status).toBe("idle");
-      expect(written.slot.generatingIssueId).toBeNull();
+      expect(written.slot.status).toBe("generating");
+      expect(written.slot.generatingIssueId).toBe(generationIssueId);
       expect(written.slot.documentId).toBe(written.document.id);
       expect(written.slot.lastGeneratedByAgentId).toBe(summarizerAgentId);
       expect(written.slot.lastModel).toBe("cheap-model");
@@ -569,6 +569,56 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(revisions.revisions[0]!.id).toBe(written.revision.id);
       expect(revisions.revisions[1]!.id).toBe(initial.revision.id);
       expect(revisions.revisions[1]!.body).toContain("First summary for this scope.");
+    });
+
+    it("allows a second write for the same generation task after a changes_requested bounce, then releases the link only at terminal", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
+
+      // First revision lands; the slot must stay armed for the still-active task.
+      const first = await svc.write(
+        { ...projectSelector(companyId, projectId), markdown: "# Summary v1", generationIssueId },
+        { agentId: summarizerAgentId, runId },
+      );
+      expect(first.revision.revisionNumber).toBe(1);
+      expect(first.slot.status).toBe("generating");
+      expect(first.slot.generatingIssueId).toBe(generationIssueId);
+
+      // The reviewer requests changes; the SAME generation task writes a
+      // corrected revision with no board re-arm in between (SUP-15773).
+      const second = await svc.write(
+        {
+          ...projectSelector(companyId, projectId),
+          markdown: "# Summary v2 (corrected)",
+          baseRevisionId: first.revision.id,
+          generationIssueId,
+        },
+        { agentId: summarizerAgentId, runId },
+      );
+      expect(second.revision.revisionNumber).toBe(2);
+      expect(second.slot.status).toBe("generating");
+      expect(second.slot.generatingIssueId).toBe(generationIssueId);
+
+      // The link is cleared exactly once, at the terminal transition.
+      await issueService(db).update(generationIssueId, { status: "done" });
+      const afterTerminal = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(afterTerminal.slot).toMatchObject({ status: "idle", generatingIssueId: null });
+      expect(afterTerminal.generatingIssue).toBeNull();
+
+      // A terminal generation task can no longer write the slot.
+      await expect(
+        svc.write(
+          {
+            ...projectSelector(companyId, projectId),
+            markdown: "# Too late",
+            baseRevisionId: second.revision.id,
+            generationIssueId,
+          },
+          { agentId: summarizerAgentId, runId },
+        ),
+      ).rejects.toMatchObject({ status: 403 });
     });
 
     it("returns only the 20 most recent summary revisions", async () => {
