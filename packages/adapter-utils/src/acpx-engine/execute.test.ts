@@ -4131,6 +4131,54 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     expect(result.errorCode).toBe("acpx_turn_failed");
   });
 
+  it("carries the JSON-RPC error data of a failed terminal into the acpx.error payload", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const ensureInputs: Array<Record<string, unknown>> = [];
+    const terminalError = Object.assign(new Error("Internal error"), {
+      data: { details: "model request rejected: prompt is too long" },
+    });
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      createRuntime: () => {
+        const runtime = recordingRuntime({ ensureInputs });
+        return {
+          ...runtime,
+          startTurn: () => ({
+            ...runtime.startTurn(),
+            result: Promise.resolve({ status: "failed", error: terminalError }),
+          }),
+        } as never;
+      },
+      prepareRemoteManagedHome: async (input) => ({
+        stagedRuntime: await input.stage([]),
+        teardown: async () => ({ ok: true } as const),
+        disposeStaged: async () => {},
+      }),
+    });
+    const base = baseExecuteArgs({ stateDir, localCwd, executionTarget });
+    const logs: Array<{ stream: string; text: string }> = [];
+
+    const result = await execute({
+      runId: "run-a",
+      runtime: {},
+      ...base,
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+    } as never);
+
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    const terminalErrorLine = logs.find(
+      (entry) => entry.stream === "stdout"
+        && entry.text.includes("\"type\":\"acpx.error\"")
+        && entry.text.includes("\"summary\":\"failed\""),
+    );
+    expect(terminalErrorLine).toBeTruthy();
+    const payload = JSON.parse(terminalErrorLine!.text.trim());
+    expect(payload.acpErrorDetails).toBe("model request rejected: prompt is too long");
+  });
+
   it("test_idle_staged_runtime_cleanup_waits_for_active_turn_release", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const events: string[] = [];

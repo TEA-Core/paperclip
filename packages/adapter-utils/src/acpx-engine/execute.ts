@@ -5068,12 +5068,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         const terminalFailureClassification =
           terminal.status === "failed" ? classifyError(acpErrorFromTerminalError(terminal.error), "turn") : null;
+        const terminalErrorDetails = terminal.status === "failed" ? readAcpErrorDetails(terminal.error) : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
           ...(terminalFailureClassification ? { errorCode: terminalFailureClassification.errorCode } : {}),
+          ...(terminalErrorDetails ? { acpErrorDetails: terminalErrorDetails } : {}),
         });
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status. A

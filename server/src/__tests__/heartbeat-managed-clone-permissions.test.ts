@@ -39,7 +39,7 @@ describe("ensureManagedProjectWorkspace checkout permissions", () => {
   // group. A checkout that lands owner-only (fs.mkdtemp's fixed 0700, carried over by the
   // rename into place) cannot be entered by any agent, so every run in that project fails to
   // spawn in its cwd.
-  it("gives the cloned checkout the mode a plain mkdir would, not an owner-only mode", async () => {
+  it("gives the cloned checkout at least the mode a plain mkdir would, not an owner-only mode", async () => {
     const sourceRepo = await createLocalSourceRepo();
     try {
       const result = await ensureManagedProjectWorkspace({
@@ -49,9 +49,12 @@ describe("ensureManagedProjectWorkspace checkout permissions", () => {
       });
       const probe = path.join(path.dirname(result.cwd), "mode-probe");
       await fs.mkdir(probe);
-      const expectedMode = (await fs.stat(probe)).mode & 0o777;
+      const mkdirMode = (await fs.stat(probe)).mode & 0o777;
       const checkoutMode = (await fs.stat(result.cwd)).mode & 0o777;
-      expect(checkoutMode.toString(8)).toBe(expectedMode.toString(8));
+      // Superset, not equality: the umask decides the mkdir bits, and shared-group repair may
+      // add group bits on hosts where the shared group exists. Either way the checkout must
+      // keep every bit a plain mkdir grants, which an owner-only 0700 does not.
+      expect((checkoutMode & mkdirMode).toString(8)).toBe(mkdirMode.toString(8));
     } finally {
       await fs.rm(sourceRepo, { recursive: true, force: true });
     }
