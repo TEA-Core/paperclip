@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { resetBaseRepoToBaseRefWithRescue, resetProjectBaseRepoWithRescue } from "./workspace-runtime.js";
+import { resetBaseRepoToBaseRefWithRescue, resetProjectBaseRepoWithRescue, withBaseRepoResetLock } from "./workspace-runtime.js";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, stdio: "pipe" }).toString().trim();
@@ -208,5 +208,85 @@ describe("resetProjectBaseRepoWithRescue", () => {
     const ref2 = r2.rescueRef!;
 
     expect(ref1).not.toBe(ref2);
+  });
+
+  it("serializes two concurrent operator resets: one wins, the other fails closed, no tip discarded", async () => {
+    const repoRoot = await makeRepo();
+    const shaA = git(repoRoot, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "second\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "second");
+    const shaB = git(repoRoot, "rev-parse", "HEAD");
+
+    // Two operators racing to reset the same repo to the same target. Without the
+    // per-repo lock, both could pin the same prior tip and both could run
+    // `git reset --hard`, the second racing the first. The lock makes
+    // capture/pin/verify/reset atomic, so exactly one performs the destructive
+    // reset; the other re-captures the tip after the first has settled, finds it
+    // already at the target, and fails closed instead of discarding a tip it no
+    // longer owns.
+    const [r1, r2] = await Promise.all([
+      resetProjectBaseRepoWithRescue({ repoRoot, targetRef: shaA }),
+      resetProjectBaseRepoWithRescue({ repoRoot, targetRef: shaA }),
+    ]);
+
+    const winners = [r1, r2].filter((r) => r.reset);
+    expect(winners.length).toBe(1);
+
+    const winner = winners[0];
+    const loser = r1.reset ? r2 : r1;
+    expect(winner.refused).toBeNull();
+    expect(winner.rescueRef).not.toBeNull();
+    expect(loser.reset).toBe(false);
+    expect(loser.refused).toMatch(/already at the target ref/);
+
+    // No tip was discarded: the winning reset pinned the prior tip on a rescue ref.
+    expect(git(repoRoot, "rev-parse", winner.rescueRef as string)).toBe(shaB);
+    // The repo ends on the target.
+    expect(git(repoRoot, "rev-parse", "HEAD")).toBe(shaA);
+  });
+});
+
+describe("withBaseRepoResetLock", () => {
+  it("serializes concurrent holders for the same repo root", async () => {
+    let active = 0;
+    let maxSimultaneous = 0;
+    const work = () =>
+      withBaseRepoResetLock("/tmp/same-repo", async () => {
+        active += 1;
+        maxSimultaneous = Math.max(maxSimultaneous, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+      });
+    await Promise.all([work(), work(), work()]);
+    // Same repo root, three racers: never more than one holder runs at once.
+    expect(maxSimultaneous).toBe(1);
+  });
+
+  it("does not serialize distinct repo roots against each other", async () => {
+    let active = 0;
+    let maxSimultaneous = 0;
+    const work = (repoRoot: string) =>
+      withBaseRepoResetLock(repoRoot, async () => {
+        active += 1;
+        maxSimultaneous = Math.max(maxSimultaneous, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+      });
+    await Promise.all([work("/tmp/repo-a"), work("/tmp/repo-b")]);
+    // Different repos take different locks and run together.
+    expect(maxSimultaneous).toBe(2);
+  });
+
+  it("does not wedge the queue when a holder rejects", async () => {
+    await expect(
+      withBaseRepoResetLock("/tmp/wedge-repo", async () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    // A later holder on the same repo still runs to completion.
+    await expect(
+      withBaseRepoResetLock("/tmp/wedge-repo", async () => "recovered"),
+    ).resolves.toBe("recovered");
   });
 });
