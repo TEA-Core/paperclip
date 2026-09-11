@@ -4356,18 +4356,45 @@ async function resolveBaseRepoAheadCommitsAllUpstream(input: {
  * CAS read and the reset it guards are separate git subprocesses, so without
  * mutual exclusion a second caller can move the tip in the gap and the first would
  * reset a tip it no longer owns. This promise queue makes the whole
- * capture/pin/verify/reset sequence atomic for one repo root: the second caller
- * re-reads the tip only after the first has fully settled, so a reset can never
- * discard a tip a concurrent reset just moved.
+ * capture/pin/verify/reset sequence atomic for one physical repo: the second
+ * caller re-reads the tip only after the first has fully settled, so a reset can
+ * never discard a tip a concurrent reset just moved.
  *
- * Keyed on the resolved repo path so the operator and auto paths (and any future
- * caller) on the same base repo all line up on the same lock. The map entry is
- * dropped once the tail of the queue settles so it does not grow unbounded.
+ * SUP-15709: the queue is keyed on the repo's canonical Git common root, not on
+ * the caller's string path. `path.resolve(repoRoot)` alone is not canonical — a
+ * symlink alias, a relative path, or a linked worktree of the same repo each
+ * resolve to a different string, so two callers on the same physical repo would
+ * queue on different keys and race anyway. Resolving `--git-common-dir` collapses
+ * a worktree onto its owner repo, and `realpathSync` collapses symlink aliases to
+ * one physical directory, so every checkout of the same repo lines up on one
+ * lock. The map entry is dropped once the tail of the queue settles so it does
+ * not grow unbounded.
  */
 const baseRepoResetLocks = new Map<string, Promise<unknown>>();
 
-export function withBaseRepoResetLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
-  const key = path.resolve(repoRoot);
+/**
+ * Canonical lock identity for a base repo. Resolves the Git common root — which
+ * maps any linked worktree back onto its owner repo — and then realpath's it,
+ * which collapses a symlink alias onto the one physical directory it points at.
+ * A path that is not a Git checkout (or whose realpath cannot be read) falls back
+ * to the resolved input path, so the lock still works and still distinguishes
+ * plain directories exactly as it did before canonicalization.
+ */
+async function resolveBaseRepoResetLockKey(repoRoot: string): Promise<string> {
+  const ownerRoot = await resolveGitOwnerRepoRoot(repoRoot).catch(() => null);
+  const raw = ownerRoot ?? repoRoot;
+  try {
+    return realpathSync(raw);
+  } catch {
+    return path.resolve(raw);
+  }
+}
+
+export async function withBaseRepoResetLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+  // Resolve the canonical key first so two alias paths to the same physical repo
+  // share one queue. The enqueue below stays synchronous, so mutual exclusion
+  // holds even though the key resolution above is async.
+  const key = await resolveBaseRepoResetLockKey(repoRoot);
   const prev = baseRepoResetLocks.get(key) ?? Promise.resolve();
   // Chain this holder onto the repo's queue. A prior holder's rejection is
   // swallowed so a failed reset cannot wedge the queue for everyone after it.
@@ -4384,14 +4411,41 @@ export function withBaseRepoResetLock<T>(repoRoot: string, fn: () => Promise<T>)
 }
 
 /**
+ * SUP-15709: the lock-protected entry point for the destructive base-repo rescue
+ * reset. The exported name is the only way to reach the pin/verify/reset sequence
+ * that does not run under the per-repo lock: taking the lock here means any caller
+ * — present or future — that resets a base repo is serialized against every other
+ * reset of that physical repo, and the compare-and-swap inside
+ * `performBaseRepoRescueReset` is the fail-closed backstop for a tip that moves
+ * even while the lock is held. Callers that also capture the tip (the operator and
+ * auto paths) must NOT wrap this in `withBaseRepoResetLock` themselves; doing so
+ * would nest a second acquisition on the same queue and deadlock.
+ */
+export async function resetBaseRepoToBaseRefWithRescue(input: {
+  repoRoot: string;
+  baseRef: string;
+  baseRefSha: string;
+  priorTip: string;
+  aheadCount: number;
+  recorder?: WorkspaceOperationRecorder | null;
+  operatorDirected?: boolean;
+}): Promise<{ reset: boolean; rescueRef: string | null; warnings: string[] }> {
+  return withBaseRepoResetLock(input.repoRoot, () => performBaseRepoRescueReset(input));
+}
+
+/**
  * SUP-13858: pin the current tip on a rescue ref, THEN reset to the base ref.
  *
  * Order is the whole contract. The rescue ref is created and independently re-read
  * before anything moves, so a reset can never be the step that makes commits
  * unreachable. If the pin cannot be proven, nothing moves at all — the diverged
  * repo is an inconvenience, an unreachable commit is data loss.
+ *
+ * SUP-15709: runs without taking the per-repo lock; the lock is held by the
+ * exported `resetBaseRepoToBaseRefWithRescue` wrapper. Keeping this re-entrant
+ * free is what lets both callers funnel through that single acquisition.
  */
-export async function resetBaseRepoToBaseRefWithRescue(input: {
+async function performBaseRepoRescueReset(input: {
   repoRoot: string;
   baseRef: string;
   baseRefSha: string;
@@ -4533,10 +4587,14 @@ export async function resetProjectBaseRepoWithRescue(input: {
     };
   }
 
-  // SUP-15695: the whole capture/pin/verify/reset is one critical section per repo
-  // root, shared with the auto-reset path, so a concurrent reset cannot move the
-  // tip out from under the compare-and-swap that guards the destructive reset.
-  return withBaseRepoResetLock(input.repoRoot, async () => {
+  // SUP-15709: the destructive sequence is lock-protected inside
+  // `resetBaseRepoToBaseRefWithRescue`, so this path no longer takes the per-repo
+  // lock itself — wrapping it again would nest a second acquisition on the same
+  // queue and deadlock. The tip capture and the "already at target" short-circuit
+  // below run outside the lock; the compare-and-swap inside the reset is the
+  // authoritative fail-closed guard against a tip that moves between this capture
+  // and the reset.
+  return (async () => {
     const hygiene = await inspectBaseRepoHygiene(input.repoRoot);
     if (hygiene === null) {
       return {
@@ -4622,7 +4680,7 @@ export async function resetProjectBaseRepoWithRescue(input: {
       refused: outcome.reset ? null : "rescue reset did not complete; prior tip preserved",
       warnings: outcome.warnings,
     };
-  });
+  })();
 }
 
 async function inspectBaseRepoHygiene(repoRoot: string) {
@@ -5351,15 +5409,17 @@ export async function prepareBaseRepoForWorkspace(input: {
           mergeBase: shallowState.mergeBase,
         });
         const resetOutcome = upstreamCheck.allUpstream && headSha && currentBaseRefSha
-          ? await withBaseRepoResetLock(input.repoRoot, async () => {
-              // SUP-15695: re-read the tip under the per-repo reset lock, which the
-              // operator path shares. headSha was captured above, before the
-              // divergence decision; if a concurrent reset already moved the tip,
-              // fail closed here rather than pinning and resetting a tip this caller
-              // no longer owns. (The compare-and-swap inside the reset is retained as
-              // a second, lock-free guard.)
-              const tipUnderLock = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
-              if (tipUnderLock !== headSha) {
+          ? await (async () => {
+              // SUP-15709: `resetBaseRepoToBaseRefWithRescue` takes the per-repo reset
+              // lock itself (shared with the operator path), so this path no longer
+              // wraps it — wrapping again would nest a second acquisition on the same
+              // queue and deadlock. headSha was captured above, before the divergence
+              // decision; if a concurrent reset already moved the tip, skip rather than
+              // pin a tip this caller no longer owns. The compare-and-swap inside the
+              // reset is the authoritative fail-closed backstop for anything that slips
+              // past this cheap check.
+              const tipNow = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+              if (tipNow !== headSha) {
                 return null;
               }
               return await resetBaseRepoToBaseRefWithRescue({
@@ -5370,7 +5430,7 @@ export async function prepareBaseRepoForWorkspace(input: {
                 aheadCount: upstreamCheck.aheadCount,
                 recorder: input.recorder ?? null,
               });
-            })
+            })()
           : null;
 
         if (resetOutcome) {

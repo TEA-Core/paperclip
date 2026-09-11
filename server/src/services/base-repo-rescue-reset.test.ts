@@ -210,7 +210,7 @@ describe("resetProjectBaseRepoWithRescue", () => {
     expect(ref1).not.toBe(ref2);
   });
 
-  it("serializes two concurrent operator resets: one wins, the other fails closed, no tip discarded", async () => {
+  it("operator vs auto: concurrent resets on the same tip fail closed — one wins, no tip discarded", async () => {
     const repoRoot = await makeRepo();
     const shaA = git(repoRoot, "rev-parse", "HEAD");
     fs.writeFileSync(path.join(repoRoot, "a.txt"), "second\n");
@@ -218,31 +218,64 @@ describe("resetProjectBaseRepoWithRescue", () => {
     git(repoRoot, "commit", "-m", "second");
     const shaB = git(repoRoot, "rev-parse", "HEAD");
 
-    // Two operators racing to reset the same repo to the same target. Without the
-    // per-repo lock, both could pin the same prior tip and both could run
-    // `git reset --hard`, the second racing the first. The lock makes
-    // capture/pin/verify/reset atomic, so exactly one performs the destructive
-    // reset; the other re-captures the tip after the first has settled, finds it
-    // already at the target, and fails closed instead of discarding a tip it no
-    // longer owns.
-    const [r1, r2] = await Promise.all([
+    // An operator reset and an auto-reset content-proof reset race to move the same
+    // base repo from tip shaB to target shaA. Both now funnel through the single
+    // lock-protected entry point, so the destructive sequence is serialized on one
+    // canonical (common-root) key and the compare-and-swap fails closed. Whatever
+    // the scheduler order, exactly one reset may succeed; the tip the winner
+    // discards must survive on a rescue ref; and the repo must end on the target.
+    // These invariants hold deterministically, so no reliance on when the two
+    // calls happen to interleave.
+    const [operator, auto] = await Promise.all([
       resetProjectBaseRepoWithRescue({ repoRoot, targetRef: shaA }),
-      resetProjectBaseRepoWithRescue({ repoRoot, targetRef: shaA }),
+      resetBaseRepoToBaseRefWithRescue({
+        repoRoot,
+        baseRef: "main",
+        baseRefSha: shaA,
+        priorTip: shaB,
+        aheadCount: 1,
+        operatorDirected: false,
+      }),
     ]);
 
-    const winners = [r1, r2].filter((r) => r.reset);
+    const winners = [operator, auto].filter((r) => r.reset);
     expect(winners.length).toBe(1);
 
     const winner = winners[0];
-    const loser = r1.reset ? r2 : r1;
-    expect(winner.refused).toBeNull();
     expect(winner.rescueRef).not.toBeNull();
+    const loser = operator.reset ? auto : operator;
     expect(loser.reset).toBe(false);
-    expect(loser.refused).toMatch(/already at the target ref/);
 
-    // No tip was discarded: the winning reset pinned the prior tip on a rescue ref.
+    // No tip was discarded: the winner pinned the prior tip on a rescue ref that
+    // still resolves to shaB.
     expect(git(repoRoot, "rev-parse", winner.rescueRef as string)).toBe(shaB);
     // The repo ends on the target.
+    expect(git(repoRoot, "rev-parse", "HEAD")).toBe(shaA);
+  });
+
+  it("pins the newest tip when a newer commit lands before the reset", async () => {
+    const repoRoot = await makeRepo();
+    const shaA = git(repoRoot, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "second\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "second");
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "third\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "third");
+    const shaC = git(repoRoot, "rev-parse", "HEAD");
+
+    // The prior tip is the newest commit shaC. A reset to shaA must pin that newest
+    // tip on the rescue ref, not an older one, so no unshipped commit is lost.
+    const result = await resetBaseRepoToBaseRefWithRescue({
+      repoRoot,
+      baseRef: "main",
+      baseRefSha: shaA,
+      priorTip: shaC,
+      aheadCount: 2,
+      operatorDirected: true,
+    });
+    expect(result.reset).toBe(true);
+    expect(git(repoRoot, "rev-parse", result.rescueRef as string)).toBe(shaC);
     expect(git(repoRoot, "rev-parse", "HEAD")).toBe(shaA);
   });
 });
@@ -276,6 +309,49 @@ describe("withBaseRepoResetLock", () => {
     await Promise.all([work("/tmp/repo-a"), work("/tmp/repo-b")]);
     // Different repos take different locks and run together.
     expect(maxSimultaneous).toBe(2);
+  });
+
+  it("serializes two alias paths to the same physical repo (canonical key)", async () => {
+    const repoRoot = await makeRepo();
+    const aliasPath = `${repoRoot}-alias`;
+    fs.symlinkSync(repoRoot, aliasPath, "dir");
+    tempDirs.push(aliasPath);
+    let active = 0;
+    let maxSimultaneous = 0;
+    const touch = (p: string) =>
+      withBaseRepoResetLock(p, async () => {
+        active += 1;
+        maxSimultaneous = Math.max(maxSimultaneous, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+      });
+    await Promise.all([touch(repoRoot), touch(aliasPath)]);
+    // The alias is a symlink to the same physical repo. The old path.resolve key
+    // treated the two distinct strings as two repos and let them race; the
+    // realpath-collapsed canonical key makes them share one lock.
+    expect(maxSimultaneous).toBe(1);
+  });
+
+  it("serializes the owner repo and a linked worktree of it (same common root)", async () => {
+    const repoRoot = await makeRepo();
+    const wtPath = `${repoRoot}-worktree`;
+    git(repoRoot, "worktree", "add", "--detach", wtPath);
+    tempDirs.push(wtPath);
+    let active = 0;
+    let maxSimultaneous = 0;
+    const touch = (p: string) =>
+      withBaseRepoResetLock(p, async () => {
+        active += 1;
+        maxSimultaneous = Math.max(maxSimultaneous, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+      });
+    await Promise.all([touch(repoRoot), touch(wtPath)]);
+    // A linked worktree's --git-common-dir is the owner's .git, so the operator and
+    // auto paths reached through different checkouts of one repo must collapse onto
+    // a single lock. Without common-root canonicalization the two strings resolve to
+    // different keys and the destructive reset races.
+    expect(maxSimultaneous).toBe(1);
   });
 
   it("does not wedge the queue when a holder rejects", async () => {
