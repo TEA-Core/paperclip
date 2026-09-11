@@ -4462,4 +4462,110 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier2");
     });
   });
+
+  describe("SUP-15787: near-miss diagnostics", () => {
+    it("rejects a bulleted Tier 2 declaration, names it found-but-not-at-line-start, and no longer says it is missing", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Done.\n- Closed at Tier 2 (live): probe output shows the fix is live.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("does not begin its own line");
+      expect(result.reason).toContain("- Closed at Tier 2 (live): probe output shows the fix is live.");
+      // The whole point of SUP-15787: no blanket "missing" report for a near-miss.
+      expect(result.reason).not.toContain("is missing a done-tier declaration");
+      expect(result.reason).not.toContain("does not contain a done-tier declaration");
+    });
+
+    it("rejects a bolded Tier 1 declaration and names it found-but-not-at-line-start", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "**Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.**",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("does not begin its own line");
+      expect(result.reason).toContain("**Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.**");
+      expect(result.reason).not.toContain("is missing a done-tier declaration");
+    });
+
+    it("rejects a Tier 1 declaration missing the suffix with a message that names the missing suffix", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): some reason",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("Tier 1");
+      expect(result.reason).toContain("Liveness unverified.");
+      expect(result.reason).toContain("suffix");
+    });
+
+    it("accepts a Tier 2 declaration whose evidence follows one or more blank lines (resolves from the next non-empty line)", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 2 (live):\n\n\nProbe output: fix is live.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.reason).toContain("Probe output: fix is live.");
+    });
+
+    it("rejects a Tier 2 declaration followed only by blank lines, naming the missing evidence specifically", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 2 (live):\n\n   \n",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("no probe evidence follows it");
+      expect(result.reason).not.toContain("is missing a done-tier declaration");
+    });
+
+    it("resolves Tier 2 evidence from the true position when a line is duplicated (indexOf regression)", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 2 (live):\n\nfirst evidence\nClosed at Tier 2 (live):\nsecond evidence",
+        null,
+        () => Promise.resolve([]),
+      );
+      // The first prefix line governs; its true next non-empty line is "first
+      // evidence", not the "second evidence" that would follow if resolution
+      // jumped to the duplicated prefix line by value.
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.reason).toContain("first evidence");
+      expect(result.reason).not.toContain("second evidence");
+    });
+
+    it("keeps the missing-declaration message when the body has no tier phrase at all (unchanged)", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Fixed the bug, no tiers here.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("is missing a done-tier declaration");
+    });
+  });
 });
