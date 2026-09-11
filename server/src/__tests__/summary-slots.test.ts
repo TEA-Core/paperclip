@@ -20,6 +20,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { writeSummarySlotSchema } from "@paperclipai/shared";
 import { summarySlotService } from "../services/summary-slots.ts";
 import { withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
 import { issueService } from "../services/issues.ts";
@@ -320,6 +321,60 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(issueRow.description).toContain(`/${issuePrefix(companyId)}/issues/`);
       expect(issueRow.description).not.toContain("/PAP/issues/");
       expect(issueRow.description).not.toContain("Other project issue");
+    });
+
+    it("does not label the token block as the PUT request body and documents the actual body shape", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const result = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const issueRow = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, result.generatingIssue.id))
+        .then((rows) => rows[0]!);
+      const description = issueRow.description!;
+
+      // The token block must NOT be labelled as the write payload / request body.
+      expect(description).not.toContain("Use this write payload:");
+      // It IS explicitly labelled as not the request body.
+      expect(description).toContain("NOT the request body");
+
+      // The PUT body fields are documented with markdown as the only required one.
+      expect(description).toContain("`markdown` (string, required)");
+      expect(description).toContain("unknown fields are rejected");
+
+      // The write route shows scopeId resolution (matching the read route discipline).
+      expect(description).toContain(
+        `PUT /api/companies/${companyId}/summary-slots/project/header?scopeId=${projectId}`,
+      );
+
+      // The token is still parseable by the same regex the server uses.
+      const tokenMatch = description.match(/```json\n([\s\S]*?)\n```/);
+      expect(tokenMatch).not.toBeNull();
+      const token = JSON.parse(tokenMatch![1]);
+      expect(token).toEqual({
+        scopeKind: "project",
+        scopeId: projectId,
+        slotKey: "header",
+        generationIssueId: result.generatingIssue.id,
+      });
+
+      // The documented body shape round-trips through writeSummarySlotSchema.
+      const body = {
+        markdown: "Test summary",
+        generationIssueId: result.generatingIssue.id,
+        baseRevisionId: null,
+        model: "test-model",
+      };
+      expect(() => writeSummarySlotSchema.parse(body)).not.toThrow();
+
+      // Unknown fields (the token keys sent as a body) are rejected.
+      expect(() =>
+        writeSummarySlotSchema.parse({ ...body, scopeKind: "project", slotKey: "header" }),
+      ).toThrow();
     });
 
     it("keeps summaries and snapshots isolated between execution workspaces", async () => {
