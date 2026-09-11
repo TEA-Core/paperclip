@@ -1,11 +1,15 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_BASE_REPO_DIVERGENCE_ALERT_AGE_DAYS,
   buildDivergenceAlertText,
   clearDivergenceRecord,
+  divergenceAlertEpisodeHash,
+  divergenceAlertMarkerPath,
   divergenceRecordPath,
   formatDivergenceDuration,
   observeDivergedRefusal,
@@ -15,14 +19,23 @@ import {
   type BaseRepoDivergenceAlert,
 } from "../services/base-repo-divergence-alert.ts";
 
-// SUP-15615 — a project base repo that stays in the non-resettable `diverged`
-// state should emit a first-class signal once it has persisted past a
-// configurable age threshold, deduplicated to fire once per episode. These
-// tests cover the pure age/threshold decision, the per-base-repo sidecar
-// record (read/write/clear + episode dedup), and the alert text.
+// SUP-15615 / SUP-15700 — a project base repo that stays in the non-resettable
+// `diverged` state should emit a first-class signal once it has persisted past a
+// configurable age threshold, deduplicated to fire once per episode. The
+// once-per-episode guarantee is an O_EXCL claim marker under `.paperclip/` (not a
+// mutual-exclusion lock), and the observation state is append-only per writer —
+// each process publishes its own entry and every read re-merges them (min over
+// the starts, max over the ends) with the convergent sidecar. These tests cover:
+// the pure age/threshold decision, the per-base-repo sidecar record, the alert
+// text, the marker keying, and — behaviorally — the real multi-process claim,
+// cross-process observation convergence, the no-unlink invariant, crash
+// resilience, fail-open, idempotence, and the export surface.
 
 const DAY = 24 * 60 * 60 * 1000;
 const tempRoots: string[] = [];
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+const servicePath = fileURLToPath(new URL("../services/base-repo-divergence-alert.ts", import.meta.url));
 
 afterEach(async () => {
   while (tempRoots.length > 0) {
@@ -35,6 +48,191 @@ async function makeRepoRoot(): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "sup15615-"));
   tempRoots.push(root);
   return root;
+}
+
+/** The exact marker path(s) for the given episode(s), if on disk. */
+async function listAlertMarkers(repoRoot: string): Promise<string[]> {
+  const dir = path.join(repoRoot, ".paperclip");
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.startsWith("base-repo-divergence-alerted-") && e.endsWith(".marker"))
+    .map((e) => path.join(dir, e));
+}
+
+/**
+ * Every `base-repo-divergence*` artifact name under the checkout's `.paperclip/`
+ * tree (sidecar, alert markers, and observation entry directories) — the full
+ * residue surface that {@link clearDivergenceRecord} must remove on reset.
+ */
+async function listDivergenceArtifacts(repoRoot: string): Promise<string[]> {
+  const dir = path.join(repoRoot, ".paperclip");
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  return entries.filter((e) => e.startsWith("base-repo-divergence"));
+}
+
+/** Seed an over-threshold sidecar (same identity+ref) with NO marker on disk. */
+async function seedOverThresholdSidecar(repoRoot: string, nowMs: number): Promise<void> {
+  await fs.mkdir(path.join(repoRoot, ".paperclip"), { recursive: true });
+  const record = {
+    repoIdentity: repoRoot,
+    baseRef: "main",
+    firstObservedAtMs: nowMs - 10 * DAY,
+    lastObservedAtMs: nowMs - 10 * DAY,
+    aheadCount: 3,
+    behindCount: 1,
+    aheadCommitSubjects: ["a", "b", "c"],
+    alertedForFirstObservedAtMs: null,
+  };
+  await fs.writeFile(divergenceRecordPath(repoRoot), JSON.stringify(record, null, 2), "utf8");
+}
+
+// --- Real multi-process probes (run under tsx in spawned node children) -------
+
+/** T1: N children barrier on N ready-files, then each calls observeDivergedRefusal. */
+const PROBE_RACE = `
+import { pathToFileURL } from "node:url";
+import fsSync from "node:fs";
+import path from "node:path";
+const [repoRoot, baseRef, nowMs, thresholdMs, N, readyDir] = process.argv.slice(2);
+fsSync.writeFileSync(path.join(readyDir, "ready-" + process.pid), "1");
+const deadline = Date.now() + 8000;
+(async () => {
+  for (;;) {
+    let n = 0;
+    try { n = fsSync.readdirSync(readyDir).filter((f) => f.startsWith("ready-")).length; } catch {}
+    if (n >= Number(N) || Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  try {
+    const m = await import(pathToFileURL(process.env.SUP15700_SVC).href);
+    const obs = await m.observeDivergedRefusal(repoRoot, {
+      baseRef, repoIdentity: repoRoot, aheadCount: 3, behindCount: 1,
+      aheadCommitSubjects: ["a"], nowMs: Number(nowMs), thresholdMs: Number(thresholdMs),
+    });
+    process.stdout.write(JSON.stringify({ shouldEmit: obs.shouldEmitFirstClassSignal }) + "\\n");
+  } catch (e) {
+    process.stdout.write(JSON.stringify({ error: String(e) }) + "\\n");
+  }
+})();
+`;
+
+/** T3: real mid-observe crash. The child monkey-patches the shared
+ *  `node:fs/promises.open` BEFORE importing the service, so the one O_EXCL claim
+ *  open — reached only after the observation has folded the state and decided the
+ *  age — writes a `seam-<pid>` file and then blocks forever. The parent SIGKILLs
+ *  the child there, so the create never completes and no marker can exist. The
+ *  seam lives entirely in this test-local probe; it requires no new service
+ *  export. */
+const PROBE_KILL = `
+import { pathToFileURL } from "node:url";
+import fsSync from "node:fs";
+import fsP from "node:fs/promises";
+import path from "node:path";
+const [repoRoot, baseRef, nowMs, thresholdMs, readyDir] = process.argv.slice(2);
+// Test-local seam: intercept the shared fs.open so the O_EXCL claim create
+// (the only O_EXCL open the service ever performs) signals and blocks before it
+// can land on disk.
+const realOpen = fsP.open;
+const O_EXCL = fsSync.constants.O_EXCL;
+fsP.open = (file, flags, ...rest) => {
+  if (typeof flags === "number" && (flags & O_EXCL) !== 0) {
+    fsSync.writeFileSync(path.join(readyDir, "seam-" + process.pid), "1");
+    return new Promise(() => {}); // block forever; the parent SIGKILLs us here
+  }
+  return realOpen(file, flags, ...rest);
+};
+(async () => {
+  const m = await import(pathToFileURL(process.env.SUP15700_SVC).href);
+  const obs = await m.observeDivergedRefusal(repoRoot, {
+    baseRef, repoIdentity: repoRoot, aheadCount: 3, behindCount: 1,
+    aheadCommitSubjects: ["a"], nowMs: Number(nowMs), thresholdMs: Number(thresholdMs),
+  });
+  // Unreachable in the crash test: the O_EXCL open blocks before it completes.
+  process.stdout.write(JSON.stringify({ reached: true, shouldEmit: obs.shouldEmitFirstClassSignal }) + "\\n");
+})().catch((e) => process.stdout.write(JSON.stringify({ error: String(e) }) + "\\n"));
+`;
+
+/** Resolve the tsx CLI so a child node process can load the TS service. */
+async function findTsxCli(): Promise<string> {
+  const pnpm = path.join(repoRoot, "node_modules", ".pnpm");
+  const entries = await fs.readdir(pnpm);
+  const tsxDir = entries.find((e) => e.startsWith("tsx@"));
+  if (!tsxDir) throw new Error(`tsx not found under ${pnpm}`);
+  return path.join(pnpm, tsxDir, "node_modules", "tsx", "dist", "cli.mjs");
+}
+
+// Detached so each probe is its own process-group leader: tsx re-execs into a
+// grandchild that inherits our stdio pipes, so killing only the direct child
+// orphans the grandchild and leaves the pipes open (close never fires). Group
+// kill (`process.kill(-pid)`) takes the whole tree down.
+function spawnProbe(probeFile: string, args: string[], tsxCli: string): ChildProcess {
+  return spawn(process.execPath, [tsxCli, probeFile, ...args], {
+    env: { ...process.env, SUP15700_SVC: servicePath },
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+  });
+}
+
+/** SIGKILL the probe's whole process group (direct child + tsx grandchild). */
+function killProbeGroup(child: ChildProcess): void {
+  if (child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+
+function runToCompletion(child: ChildProcess): Promise<{ code: number | null; out: string }> {
+  return new Promise((resolve) => {
+    let out = "";
+    child.stdout?.on("data", (d) => {
+      out += String(d);
+    });
+    child.on("close", (code) => resolve({ code, out }));
+  });
+}
+
+/**
+ * Await a probe being fully reaped. `close` fires only after the child has
+ * exited AND its stdio pipes are closed — for the detached tsx process group,
+ * that is after the whole tree is down. Establish this promise BEFORE the
+ * SIGKILL so the reap can never be missed; if the child is already gone it
+ * resolves at once instead of waiting on a `close` event that already fired.
+ */
+function waitForReap(child: ChildProcess): Promise<void> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("close", () => resolve());
+  });
+}
+
+async function waitForFile(dir: string, prefix: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let entries: string[] = [];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      // directory not yet created
+    }
+    if (entries.some((e) => e.startsWith(prefix))) return;
+    if (Date.now() >= deadline) throw new Error(`no ${prefix}* file appeared within ${timeoutMs}ms`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
 }
 
 describe("resolveDivergenceAlertThresholdMs", () => {
@@ -101,6 +299,22 @@ describe("divergenceRecordPath", () => {
   });
 });
 
+describe("divergenceAlertEpisodeHash / divergenceAlertMarkerPath", () => {
+  it("is stable for a fixed identity+ref and distinct for a different ref or identity", () => {
+    const h = divergenceAlertEpisodeHash("/repo", "main");
+    expect(h).toBe(divergenceAlertEpisodeHash("/repo", "main"));
+    expect(h).toHaveLength(32);
+    expect(divergenceAlertEpisodeHash("/repo", "release")).not.toBe(h);
+    expect(divergenceAlertEpisodeHash("/other", "main")).not.toBe(h);
+  });
+
+  it("keys the marker on episode identity inside the .paperclip tree, never a timestamp", () => {
+    expect(divergenceAlertMarkerPath("/repo", "/repo", "main")).toBe(
+      path.join("/repo", ".paperclip", `base-repo-divergence-alerted-${divergenceAlertEpisodeHash("/repo", "main")}.marker`),
+    );
+  });
+});
+
 describe("observeDivergedRefusal", () => {
   const base = { baseRef: "main", aheadCount: 3, behindCount: 1, aheadCommitSubjects: ["a", "b", "c"] };
 
@@ -117,6 +331,8 @@ describe("observeDivergedRefusal", () => {
     expect(first.record.lastObservedAtMs).toBe(now - 10 * DAY);
     expect(first.ageMs).toBe(0);
     expect(first.shouldEmitFirstClassSignal).toBe(false);
+    // No residue: a below-threshold pass creates no claim marker.
+    expect(await listAlertMarkers(repoRoot)).toEqual([]);
   });
 
   it("preserves the earliest start, crosses the threshold, and dedupes to a single signal per episode", async () => {
@@ -133,14 +349,15 @@ describe("observeDivergedRefusal", () => {
     expect(second.alertDue).toBe(true);
     expect(second.shouldEmitFirstClassSignal).toBe(true);
 
-    // A further probe of the same episode must not re-emit.
+    // A further probe of the same episode must not re-emit (marker already present).
     const third = await observeDivergedRefusal(repoRoot, { ...base, repoIdentity: repoRoot, nowMs: now + DAY, thresholdMs: 7 * DAY });
     expect(third.record.firstObservedAtMs).toBe(now - 10 * DAY);
     expect(third.alertDue).toBe(true);
     expect(third.shouldEmitFirstClassSignal).toBe(false);
+    expect(await listAlertMarkers(repoRoot)).toHaveLength(1);
   });
 
-  it("persists the record on disk and marks the alerted episode", async () => {
+  it("persists the record on disk and mirrors the claim into alertedForFirstObservedAtMs", async () => {
     const repoRoot = await makeRepoRoot();
     const now = 1_700_000_000_000;
     await observeDivergedRefusal(repoRoot, { ...base, repoIdentity: repoRoot, nowMs: now - 10 * DAY, thresholdMs: 7 * DAY });
@@ -267,7 +484,7 @@ describe("observeDivergedRefusal", () => {
     });
 
     // Eight concurrent provisioning passes of the same stuck episode: exactly
-    // one may claim the alert; the rest must observe it already claimed.
+    // one may claim the alert (win the O_EXCL marker); the rest observe it claimed.
     const results = await Promise.all(
       Array.from({ length: 8 }, () =>
         observeDivergedRefusal(repoRoot, {
@@ -293,13 +510,305 @@ describe("observeDivergedRefusal", () => {
       thresholdMs: 7 * DAY,
     });
     expect(followUp.shouldEmitFirstClassSignal).toBe(false);
+    expect(await listAlertMarkers(repoRoot)).toHaveLength(1);
     const onDisk = await readDivergenceRecord(repoRoot);
     expect(onDisk?.alertedForFirstObservedAtMs).toBe(now - 10 * DAY);
   });
 });
 
+describe("multi-process claim (T1)", () => {
+  it("exactly one of N>=8 concurrent processes claims the alert and one marker lands on disk", async () => {
+    const root = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+    const N = 8;
+    await seedOverThresholdSidecar(root, now);
+
+    const readyDir = await fs.mkdtemp(path.join(os.tmpdir(), "sup15700-ready-"));
+    tempRoots.push(readyDir);
+    const tsxCli = await findTsxCli();
+    const probeFile = path.join(root, "__probe-race.ts");
+    await fs.writeFile(probeFile, PROBE_RACE, "utf8");
+
+    const children = Array.from({ length: N }, () =>
+      spawnProbe(probeFile, [root, "main", String(now), String(7 * DAY), String(N), readyDir], tsxCli),
+    );
+    const results = await Promise.all(children.map((c) => runToCompletion(c)));
+
+    const verdicts = results.map((r) => JSON.parse(r.out.trim()) as { shouldEmit?: boolean; error?: string });
+    expect(verdicts, `children: ${JSON.stringify(results)}`).toHaveLength(N);
+    expect(verdicts.filter((v) => v.error), `errors: ${JSON.stringify(verdicts)}`).toEqual([]);
+    expect(verdicts.filter((v) => v.shouldEmit === true).length, "exactly one winner").toBe(1);
+
+    // Exactly one marker on disk, at the exact path for this episode.
+    expect(await listAlertMarkers(root)).toEqual([divergenceAlertMarkerPath(root, root, "main")]);
+  }, 90_000);
+});
+
+describe("cross-process observation convergence (T7)", () => {
+  // The unseeded first-observation race: independent processes with DIFFERENT
+  // observation times, no prior sidecar. This is what T1 (which seeds a shared
+  // start) does not cover. With no lock, the only thing that preserves the
+  // earliest start is the per-writer entry + merge-on-read.
+  it("N children with distinct nowMs converge to min/max start/end and alert exactly once", async () => {
+    const root = await makeRepoRoot();
+    const N = 8;
+    const base = 1_700_000_000_000;
+    const step = 37_000;
+    const nowMsList = Array.from({ length: N }, (_, i) => base + i * step);
+    const minNow = nowMsList[0];
+    const maxNow = nowMsList[N - 1];
+
+    // NO seeded sidecar: the first-observation race is what this covers. Each
+    // child is injected a distinct nowMs and thresholdMs: 0 (the hardest P4
+    // setting; nowMs is already an input, so no fake timers are needed).
+    const readyDir = await fs.mkdtemp(path.join(os.tmpdir(), "sup15700-ready-"));
+    tempRoots.push(readyDir);
+    const tsxCli = await findTsxCli();
+    const probeFile = path.join(root, "__probe-race.ts");
+    await fs.writeFile(probeFile, PROBE_RACE, "utf8");
+
+    const children = nowMsList.map((nowMs) =>
+      spawnProbe(probeFile, [root, "main", String(nowMs), "0", String(N), readyDir], tsxCli),
+    );
+    const results = await Promise.all(children.map((c) => runToCompletion(c)));
+
+    const verdicts = results.map((r) => JSON.parse(r.out.trim()) as { shouldEmit?: boolean; error?: string });
+    expect(verdicts, `children: ${JSON.stringify(results)}`).toHaveLength(N);
+    expect(verdicts.filter((v) => v.error), `errors: ${JSON.stringify(verdicts)}`).toEqual([]);
+    // The marker is keyed on h, never a timestamp, so exactly one child wins it.
+    expect(verdicts.filter((v) => v.shouldEmit === true).length, "exactly one winner").toBe(1);
+    expect(await listAlertMarkers(root)).toHaveLength(1);
+
+    // Post-join, EVERY subsequent read yields exactly min/max over all
+    // observations. (Deliberately NOT asserting any racing child's own returned
+    // firstObservedAtMs — an observation not yet written cannot be known, and
+    // that in-flight skew is fail-late and self-heals next pass.)
+    const merged = await readDivergenceRecord(root);
+    expect(merged?.firstObservedAtMs).toBe(minNow);
+    expect(merged?.lastObservedAtMs).toBe(maxNow);
+
+    // A follow-up observation at max(nowMs) republishes the merge; the RAW
+    // sidecar now carries exactly that min/max (convergence, independent of
+    // which process won).
+    await observeDivergedRefusal(root, {
+      baseRef: "main",
+      repoIdentity: root,
+      aheadCount: 3,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: maxNow,
+      thresholdMs: 0,
+    });
+    const rawSidecar = JSON.parse(
+      await fs.readFile(divergenceRecordPath(root), "utf8"),
+    ) as { firstObservedAtMs?: number; lastObservedAtMs?: number };
+    expect(rawSidecar.firstObservedAtMs).toBe(minNow);
+    expect(rawSidecar.lastObservedAtMs).toBe(maxNow);
+  }, 90_000);
+});
+
+describe("no-unlink invariant (T2)", () => {
+  it("never unlinks on the observe path, while clearDivergenceRecord is the only unlink", async () => {
+    const rmSpy = vi.spyOn(fs, "rm");
+    const unlinkSpy = vi.spyOn(fs, "unlink");
+    try {
+      const root = await makeRepoRoot();
+      const now = 1_700_000_000_000;
+      // Below threshold, then at/over threshold (creates the marker), then already-alerted.
+      await observeDivergedRefusal(root, { baseRef: "main", repoIdentity: root, aheadCount: 1, behindCount: 1, aheadCommitSubjects: ["a"], nowMs: now, thresholdMs: 7 * DAY });
+      await observeDivergedRefusal(root, { baseRef: "main", repoIdentity: root, aheadCount: 3, behindCount: 1, aheadCommitSubjects: ["a"], nowMs: now + 8 * DAY, thresholdMs: 7 * DAY });
+      await observeDivergedRefusal(root, { baseRef: "main", repoIdentity: root, aheadCount: 3, behindCount: 1, aheadCommitSubjects: ["a"], nowMs: now + 9 * DAY, thresholdMs: 7 * DAY });
+
+      const afterObserve = rmSpy.mock.calls.length;
+      expect(afterObserve, "the full observe cycle must not unlink").toBe(0);
+      expect(fs.unlink).not.toHaveBeenCalled();
+
+      // Control: clearing the episode DOES unlink (proving the spy is wired to the
+      // same object the service uses, so the zero above is meaningful).
+      await clearDivergenceRecord(root);
+      expect(rmSpy.mock.calls.length, "clearing the episode unlinks").toBeGreaterThan(0);
+    } finally {
+      rmSpy.mockRestore();
+      unlinkSpy.mockRestore();
+    }
+  });
+});
+
+describe("crash resilience (T3)", () => {
+  it("a SIGKILLed mid-observe worker leaves no marker, so a subsequent observe still claims the alert", async () => {
+    const root = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+    await seedOverThresholdSidecar(root, now);
+
+    const readyDir = await fs.mkdtemp(path.join(os.tmpdir(), "sup15700-ready-"));
+    tempRoots.push(readyDir);
+    const tsxCli = await findTsxCli();
+    const probeFile = path.join(root, "__probe-kill.ts");
+    await fs.writeFile(probeFile, PROBE_KILL, "utf8");
+
+    const child = spawnProbe(probeFile, [root, "main", String(now), String(7 * DAY), readyDir], tsxCli);
+    // The child has entered observeDivergedRefusal and is blocked inside the
+    // O_EXCL claim create (its patched fs.open): the age is decided, but the
+    // marker file has NOT been created yet.
+    await waitForFile(readyDir, "seam-", 8000);
+    expect(await listAlertMarkers(root), "no marker may exist while paused pre-claim").toEqual([]);
+
+    // Establish the reap promise BEFORE the SIGKILL: the close listener is in
+    // place before the process group dies, so the reap can never be missed, and
+    // an already-reaped child resolves immediately rather than hanging the await
+    // (the prior close-after-kill ordering let a fast group kill skip the
+    // listener and wedge the test).
+    const reaped = waitForReap(child);
+    // Kill the whole process group mid-observe (direct child + tsx grandchild).
+    killProbeGroup(child);
+    // The probe is fully reaped (exited AND stdio closed) before the post-crash
+    // assertion, so no late O_EXCL create can land a marker.
+    await reaped;
+
+    // The killed worker never reached the O_EXCL create, so no marker exists.
+    expect(await listAlertMarkers(root), "a killed mid-observe worker must leave no marker").toEqual([]);
+
+    // A subsequent observation still returns a decision and claims the alert.
+    const obs = await observeDivergedRefusal(root, {
+      baseRef: "main",
+      repoIdentity: root,
+      aheadCount: 3,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: now,
+      thresholdMs: 7 * DAY,
+    });
+    expect(obs.alertDue).toBe(true);
+    expect(obs.shouldEmitFirstClassSignal).toBe(true);
+    expect(await listAlertMarkers(root)).toEqual([divergenceAlertMarkerPath(root, root, "main")]);
+  }, 90_000);
+});
+
+describe("fail-open (T4)", () => {
+  it("resolves and does not block when the .paperclip tree is unwritable", async () => {
+    const root = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+    await seedOverThresholdSidecar(root, now);
+    const paperclipDir = path.join(root, ".paperclip");
+    await fs.chmod(paperclipDir, 0o555);
+    try {
+      const started = Date.now();
+      const obs = await observeDivergedRefusal(root, {
+        baseRef: "main",
+        repoIdentity: root,
+        aheadCount: 3,
+        behindCount: 1,
+        aheadCommitSubjects: ["a"],
+        nowMs: now,
+        thresholdMs: 7 * DAY,
+      });
+      // Never threw, never blocked.
+      expect(obs).toBeDefined();
+      expect(obs.alertDue).toBe(true);
+      // Any errno other than EEXIST fails open: a tracking failure must not
+      // suppress the alert this pass.
+      expect(obs.shouldEmitFirstClassSignal).toBe(true);
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      await fs.chmod(paperclipDir, 0o755);
+    }
+  }, 90_000);
+});
+
+describe("idempotence and no-noise (T5)", () => {
+  it("below-threshold writes an entry (residue) but no marker; an alerted episode stays quiet; a new episode alerts once; clear removes every artifact", async () => {
+    const root = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+
+    // Below threshold -> an observation entry is written (expected residue), but
+    // NO claim marker.
+    const below = await observeDivergedRefusal(root, {
+      baseRef: "main",
+      repoIdentity: root,
+      aheadCount: 1,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: now,
+      thresholdMs: 7 * DAY,
+    });
+    expect(below.shouldEmitFirstClassSignal).toBe(false);
+    expect(await listAlertMarkers(root)).toEqual([]);
+    expect((await listDivergenceArtifacts(root)).some((e) => e.startsWith("base-repo-divergence-obs-"))).toBe(true);
+
+    // Cross the threshold -> alert once, exactly one marker.
+    const at = await observeDivergedRefusal(root, {
+      baseRef: "main",
+      repoIdentity: root,
+      aheadCount: 3,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: now + 8 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+    expect(at.shouldEmitFirstClassSignal).toBe(true);
+
+    // Already alerted -> false on every later pass; marker count stays one.
+    const again1 = await observeDivergedRefusal(root, {
+      baseRef: "main",
+      repoIdentity: root,
+      aheadCount: 3,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: now + 9 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+    const again2 = await observeDivergedRefusal(root, {
+      baseRef: "main",
+      repoIdentity: root,
+      aheadCount: 3,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: now + 10 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+    expect(again1.shouldEmitFirstClassSignal).toBe(false);
+    expect(again2.shouldEmitFirstClassSignal).toBe(false);
+    expect(await listAlertMarkers(root)).toEqual([divergenceAlertMarkerPath(root, root, "main")]);
+
+    // Identity/ref change -> a new episode (new h). It starts now (age 0), so it
+    // does not alert yet, but it does not reuse the "main" marker either.
+    const newEp = await observeDivergedRefusal(root, {
+      baseRef: "release",
+      repoIdentity: root,
+      aheadCount: 2,
+      behindCount: 2,
+      aheadCommitSubjects: ["b"],
+      nowMs: now + 12 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+    expect(newEp.shouldEmitFirstClassSignal).toBe(false);
+
+    // Age the new episode past the threshold -> it alerts exactly once for the new h.
+    const newEpOver = await observeDivergedRefusal(root, {
+      baseRef: "release",
+      repoIdentity: root,
+      aheadCount: 2,
+      behindCount: 2,
+      aheadCommitSubjects: ["b"],
+      nowMs: now + 19 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+    expect(newEpOver.shouldEmitFirstClassSignal).toBe(true);
+
+    const markers = (await listAlertMarkers(root)).sort();
+    expect(markers).toEqual(
+      [divergenceAlertMarkerPath(root, root, "main"), divergenceAlertMarkerPath(root, root, "release")].sort(),
+    );
+
+    // After reset, NO base-repo-divergence* path remains under .paperclip/ — the
+    // sidecar, both markers, and both observation entry directories.
+    await clearDivergenceRecord(root);
+    expect(await listDivergenceArtifacts(root)).toEqual([]);
+  });
+});
+
 describe("clearDivergenceRecord / readDivergenceRecord", () => {
-  it("reads null when no record exists and removes it on clear", async () => {
+  it("reads null when no record exists and removes the record AND alert markers on clear", async () => {
     const repoRoot = await makeRepoRoot();
     expect(await readDivergenceRecord(repoRoot)).toBeNull();
 
@@ -313,13 +822,44 @@ describe("clearDivergenceRecord / readDivergenceRecord", () => {
       nowMs: now,
       thresholdMs: 7 * DAY,
     });
+    await observeDivergedRefusal(repoRoot, {
+      baseRef: "main",
+      repoIdentity: repoRoot,
+      aheadCount: 1,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: now + 8 * DAY,
+      thresholdMs: 7 * DAY,
+    });
     expect(await readDivergenceRecord(repoRoot)).not.toBeNull();
+    expect(await listAlertMarkers(repoRoot)).toHaveLength(1);
 
     await clearDivergenceRecord(repoRoot);
     expect(await readDivergenceRecord(repoRoot)).toBeNull();
+    // The marker is cleared too, so a fresh episode could alert again.
+    expect(await listAlertMarkers(repoRoot)).toEqual([]);
+    // So are the sidecar and the observation entry directories: no
+    // base-repo-divergence* artifact remains under .paperclip/.
+    expect(await listDivergenceArtifacts(repoRoot)).toEqual([]);
 
     // Clearing a path with no record is a no-op, not an error.
     await expect(clearDivergenceRecord(repoRoot)).resolves.toBeUndefined();
+  });
+});
+
+describe("export surface (T6)", () => {
+  it("exports no acquire/release claim lock", async () => {
+    const mod = (await import("../services/base-repo-divergence-alert.ts")) as Record<string, unknown>;
+    expect(mod.acquireDivergenceClaim).toBeUndefined();
+    expect(mod.releaseDivergenceClaim).toBeUndefined();
+    expect(mod.readDivergenceClaimLock).toBeUndefined();
+    expect(mod.isDivergenceClaimOwnerLive).toBeUndefined();
+    // No test-only synchronization seam may leak into the public surface.
+    expect(mod._installDivergenceObserveSeam).toBeUndefined();
+    // The O_EXCL marker primitive (and its helpers) IS the exported surface.
+    expect(typeof mod.observeDivergedRefusal).toBe("function");
+    expect(typeof mod.divergenceAlertMarkerPath).toBe("function");
+    expect(typeof mod.divergenceAlertEpisodeHash).toBe("function");
   });
 });
 
