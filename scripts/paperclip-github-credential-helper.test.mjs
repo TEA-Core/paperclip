@@ -95,9 +95,20 @@ function runWrapper(root, { args = [], curlMode, tokenFile } = {}) {
     PAPERCLIP_GH_REAL: path.join(root, "bin", "fake-gh"),
     FAKE_GH_TOKEN_FILE: tokenFile ?? path.join(root, "gh-token.out"),
     FAKE_CURL_MODE: curlMode ?? "ok",
+    FAKE_CURL_CALLS: path.join(root, "curl-calls.log"),
     PATH: `${root}/bin:${process.env.PATH}`,
   };
   return spawnSync("bash", [WRAPPER, ...args], { env, cwd: root, encoding: "utf8" });
+}
+
+// A fake real `gh` that records the GH_TOKEN it was exec'd with.
+function writeFakeGh(binDir) {
+  const gh = path.join(binDir, "fake-gh");
+  writeFileSync(
+    gh,
+    ["#!/usr/bin/env bash", "printf '%s\\n' \"$GH_TOKEN\" > \"$FAKE_GH_TOKEN_FILE\"", "exit 0", ""].join("\n"),
+  );
+  chmodSync(gh, 0o755);
 }
 
 test("helper get mints a token and emits it over stdout only", () => {
@@ -277,6 +288,118 @@ test("gh wrapper fails legibly when the broker reports app_not_configured", () =
     const res = runWrapper(root, { args: ["repo", "view"], curlMode: "not_configured" });
     assert.equal(res.status, 1);
     assert.match(res.stderr, /app_not_configured|not configured/);
+    assert.doesNotMatch(res.stderr, /GH_TOKEN/, "the refusal must not point agents at a personal token");
+  });
+});
+
+for (const [label, repoArgs] of [
+  ["--repo owner/repo", ["--repo", "TEA-Core/Other-Repo"]],
+  ["--repo=owner/repo", ["--repo=TEA-Core/Other-Repo"]],
+  ["-R owner/repo", ["-R", "TEA-Core/Other-Repo"]],
+  ["-Rowner/repo", ["-RTEA-Core/Other-Repo"]],
+]) {
+  test(`gh wrapper mints for the repo named by ${label}, not the ambient repo`, () => {
+    withRoot((root, binDir) => {
+      writeFakeGh(binDir);
+      const res = runWrapper(root, { args: ["pr", "view", "7", ...repoArgs] });
+      assert.equal(res.status, 0, res.stderr);
+      const calls = readCalls(root);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(JSON.parse(calls[0]), { owner: "tea-core", repo: "other-repo" });
+    });
+  });
+}
+
+for (const [label, repoArgs] of [
+  ["-R github.com/owner/repo", ["-R", "github.com/TEA-Core/Other-Repo"]],
+  ["--repo=www.github.com/owner/repo", ["--repo=www.github.com/TEA-Core/Other-Repo"]],
+]) {
+  test(`gh wrapper strips the github.com host from ${label}`, () => {
+    withRoot((root, binDir) => {
+      writeFakeGh(binDir);
+      const res = runWrapper(root, { args: ["pr", "view", "7", ...repoArgs] });
+      assert.equal(res.status, 0, res.stderr);
+      assert.deepEqual(JSON.parse(readCalls(root)[0]), { owner: "tea-core", repo: "other-repo" });
+    });
+  });
+}
+
+test("gh wrapper refuses a repo flag for another host instead of minting for the ambient repo", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, { args: ["pr", "view", "7", "-R", "ghe.example.com/TEA-Core/Other-Repo"] });
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /not a github\.com/);
+    assert.throws(() => readCalls(root), /ENOENT/, "an unparseable explicit target must not mint");
+  });
+});
+
+test("gh wrapper mints for the repo in a `gh api repos/<owner>/<repo>/...` path", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, {
+      args: ["api", "-X", "GET", "/repos/TEA-Core/Other-Repo/commits/abc/status?per_page=1", "--jq", ".state"],
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.deepEqual(JSON.parse(readCalls(root)[0]), { owner: "tea-core", repo: "other-repo" });
+  });
+});
+
+test("gh wrapper leaves `{owner}/{repo}` api placeholders to the ambient repo", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, { args: ["api", "repos/{owner}/{repo}/pulls"] });
+    assert.equal(res.status, 0, res.stderr);
+    assert.deepEqual(JSON.parse(readCalls(root)[0]), { owner: "paperclipai", repo: "paperclip" });
+  });
+});
+
+for (const [label, argv] of [
+  ["a leading global option", ["--hostname", "github.com", "auth", "login"]],
+  ["an option between auth and its subcommand", ["auth", "--hostname", "github.com", "login"]],
+  ["a leading -R", ["-R", "TEA-Core/Other-Repo", "auth", "refresh"]],
+  ["a short hostname option", ["auth", "-h", "github.com", "setup-git"]],
+]) {
+  test(`gh wrapper refuses a credential-storing gh auth subcommand behind ${label}, without minting`, () => {
+    withRoot((root, binDir) => {
+      writeFakeGh(binDir);
+      const res = runWrapper(root, { args: argv });
+      assert.equal(res.status, 1, res.stderr);
+      assert.match(res.stderr, /gh auth \w[\w-]* is disabled/);
+      assert.throws(() => readCalls(root), /ENOENT/, "a refused auth subcommand must not mint");
+    });
+  });
+}
+
+test("gh wrapper still passes read-only gh auth subcommands through", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, { args: ["--hostname", "github.com", "auth", "token"] });
+    assert.equal(res.status, 0, res.stderr);
+  });
+});
+
+test("gh wrapper identifies `api` behind a leading option", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    const res = runWrapper(root, { args: ["--hostname", "github.com", "api", "repos/TEA-Core/Other-Repo/pulls"] });
+    assert.equal(res.status, 0, res.stderr);
+    assert.deepEqual(JSON.parse(readCalls(root)[0]), { owner: "tea-core", repo: "other-repo" });
+  });
+});
+
+test("gh wrapper refuses gh auth subcommands that would store a credential, without minting", () => {
+  withRoot((root, binDir) => {
+    writeFakeGh(binDir);
+    for (const sub of ["login", "logout", "refresh", "setup-git", "switch"]) {
+      const res = runWrapper(root, { args: ["auth", sub, "--hostname", "github.com"] });
+      assert.equal(res.status, 1, `${sub}: expected a refusal`);
+      assert.match(res.stderr, new RegExp(`gh auth ${sub} is disabled`));
+    }
+    assert.throws(() => readCalls(root), /ENOENT/, "a refused auth subcommand must not mint");
+
+    const status = runWrapper(root, { args: ["auth", "status"] });
+    assert.equal(status.status, 0, status.stderr);
   });
 });
 
