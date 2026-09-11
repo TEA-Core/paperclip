@@ -718,7 +718,14 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         if (!path.startsWith("/") || path.includes("..")) {
           throw new Error("path must start with / and be relative to /api, and must not contain '..'");
         }
-        return client.requestJson(method, path, {
+        // The client base URL already ends with "/api" (config.ts normalizes it), and
+        // requestJson resolves the path relative to that base. Callers frequently pass an
+        // absolute "/api/..." path (as the API quick references document); left as-is it
+        // double-prefixes into "/api/api/..." and 404s on every route. Strip a single
+        // leading "/api" so both "/api/..." and "/..." resolve to the same URL.
+        const normalizedPath =
+          path === "/api" ? "/" : path.startsWith("/api/") ? path.slice(4) : path;
+        return client.requestJson(method, normalizedPath, {
           body: parseOptionalJson(jsonBody),
         });
       },

@@ -578,4 +578,34 @@ describe("paperclip MCP tools", () => {
 
     expect(response.content[0]?.text).toContain("must not contain '..'");
   });
+
+  it("resolves absolute /api-prefixed paths without double-prefixing the base", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApiRequest");
+    await tool.execute({
+      method: "GET",
+      path: "/api/health",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toBe("http://localhost:3100/api/health");
+  });
+
+  it("resolves relative and /api-prefixed paths to the same URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApiRequest");
+    await tool.execute({ method: "GET", path: "/health" });
+    await tool.execute({ method: "GET", path: "/api/health" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [relativeUrl] = fetchMock.mock.calls[0] as [string];
+    const [prefixedUrl] = fetchMock.mock.calls[1] as [string];
+    expect(String(relativeUrl)).toBe("http://localhost:3100/api/health");
+    expect(String(prefixedUrl)).toBe("http://localhost:3100/api/health");
+  });
 });
