@@ -1,4 +1,9 @@
-import express, { Router, type Request as ExpressRequest } from "express";
+import express, {
+  Router,
+  type Request as ExpressRequest,
+  type RequestHandler,
+  type Response as ExpressResponse,
+} from "express";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import path from "node:path";
 import fs from "node:fs";
@@ -195,6 +200,47 @@ export function shouldServeViteDevHtml(req: ExpressRequest): boolean {
   if (VITE_DEV_STATIC_PATHS.has(pathname)) return false;
   if (VITE_DEV_ASSET_PREFIXES.some((prefix) => pathname.startsWith(prefix))) return false;
   return req.accepts(["html"]) === "html";
+}
+
+// A client is "plainly asking for an API response" (rather than a browser
+// navigation) when it carries an Authorization header, or when its Accept
+// header does not include text/html. Browsers always send
+// `Accept: text/html,...` on navigation, so the SPA shell keeps working for
+// them. Without this, a machine client that mis-rooted its base URL (most
+// often by dropping the /api prefix) gets the HTML shell back with a 200,
+// which reads as a successful read while every write 404s — a false
+// platform-blocker generator (SUP-15790).
+export function shouldReturnJsonApi404(req: ExpressRequest): boolean {
+  if (req.headers.authorization !== undefined) return true;
+  return req.accepts(["html"]) !== "html";
+}
+
+// The static-mode SPA fallback, extracted so createApp and its tests share the
+// exact handler instead of a copy. /assets/* keeps the existing bodiless 404
+// (a missing hashed asset must not masquerade as the shell); an evidently
+// non-browser client that reached here got a 404 it can actually act on;
+// everything else is a browser deep-link and gets the index shell.
+export function createStaticSpaFallbackHandler(uiDist: string): RequestHandler {
+  return (req: ExpressRequest, res: ExpressResponse) => {
+    if (req.path.startsWith("/assets/")) {
+      res.status(404).end();
+      return;
+    }
+    if (shouldReturnJsonApi404(req)) {
+      res.status(404).json({
+        error: "Not found",
+        message:
+          "No route matches this path for an API client. This looks like an API request missing " +
+          "the /api prefix (e.g. /api/agents/me). The SPA HTML shell is only served to browsers.",
+      });
+      return;
+    }
+    res
+      .status(200)
+      .set("Content-Type", "text/html")
+      .set("Cache-Control", "no-cache")
+      .end(readBrandedStaticIndexHtml(uiDist));
+  };
 }
 
 export function shouldEnablePrivateHostnameGuard(opts: {
@@ -736,17 +782,10 @@ export async function createApp(
       // with a MIME-type error, and cache that broken response. Return 404
       // instead. The index.html response itself is no-cache so a subsequent
       // deploy's updated asset hashes are picked up on next load.
-      app.get(/.*/, (req, res) => {
-        if (req.path.startsWith("/assets/")) {
-          res.status(404).end();
-          return;
-        }
-        res
-          .status(200)
-          .set("Content-Type", "text/html")
-          .set("Cache-Control", "no-cache")
-          .end(readBrandedStaticIndexHtml(uiDist));
-      });
+      // A non-browser client (Authorization present, or Accept lacks
+      // text/html) that lands here has mis-rooted its base URL; it gets a JSON
+      // 404 that names the likely missing /api prefix instead of a 200 shell.
+      app.get(/.*/, createStaticSpaFallbackHandler(uiDist));
     } else {
       console.warn("[paperclip] UI dist not found; running in API-only mode");
     }
