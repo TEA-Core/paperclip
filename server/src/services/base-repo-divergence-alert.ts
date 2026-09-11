@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -18,9 +18,16 @@ import path from "node:path";
  * it was last re-observed), and turns a divergence that has persisted past a
  * configurable age threshold into a first-class signal — a durable, board-
  * published attention row plus a distinct alert line — rather than leaving the
- * operator to the inline warning. It is deliberately best-effort everywhere:
- * a tracking or signal failure must never block a dispatch, and a base repo that
- * is in sync or that self-heals promptly produces no signal and no residue.
+ * operator to the inline warning.
+ *
+ * The once-per-episode guarantee is enforced by an O_EXCL claim marker under the
+ * checkout's `.paperclip/` tree rather than any mutual-exclusion lock: one
+ * atomic create that a single concurrent observer — across processes, not just
+ * within one server — can win for a given episode. There is therefore no lock to
+ * go stale, no liveness oracle, and no recovery window. It is deliberately
+ * best-effort everywhere: a tracking or signal failure must never block a
+ * dispatch, and a base repo that is in sync or that self-heals promptly produces
+ * no signal and no residue.
  */
 
 export const DEFAULT_BASE_REPO_DIVERGENCE_ALERT_AGE_DAYS = 7;
@@ -93,9 +100,10 @@ export interface BaseRepoDivergenceRecord {
   aheadCommitSubjects: string[];
   /**
    * The `firstObservedAtMs` for which a first-class signal has already been
-   * emitted. This is the per-episode dedup: a stuck base repo is probed on every
-   * worktree realization, and the alert must fire once per divergence episode,
-   * not once per realization.
+   * emitted. Retained in the persisted shape for back-compat and observability
+   * only: the once-per-episode dedup is the O_EXCL claim marker, and this field
+   * is derived from marker presence — it is never an input to
+   * `shouldEmitFirstClassSignal`.
    */
   alertedForFirstObservedAtMs: number | null;
 }
@@ -110,6 +118,88 @@ export const DIVERGENCE_RECORD_RELATIVE_PATH = path.join(".paperclip", "base-rep
  */
 export function divergenceRecordPath(repoRoot: string): string {
   return path.join(repoRoot, DIVERGENCE_RECORD_RELATIVE_PATH);
+}
+
+/**
+ * The once-per-episode claim is a single `O_EXCL` create, won by at most one
+ * concurrent observer — across processes, not just within a server — so a
+ * divergence alert fires at most once no matter how many provisioning workers
+ * race to observe it.
+ *
+ * The marker is keyed on this stable hash of the episode's identity: the
+ * canonical repo identity and the base ref it has diverged from, never a
+ * timestamp. A checkout repointed at a different repo or ref hashes to a
+ * different marker and therefore starts a fresh episode; two workers whose
+ * clocks differ by milliseconds always agree on the same marker, so the
+ * at-most-once guarantee holds at any threshold, including zero.
+ */
+export function divergenceAlertEpisodeHash(repoIdentity: string, baseRef: string): string {
+  return createHash("sha256").update(`${repoIdentity}\u0000${baseRef}`).digest("hex").slice(0, 32);
+}
+
+export function divergenceAlertMarkerPath(repoRoot: string, repoIdentity: string, baseRef: string): string {
+  return path.join(
+    repoRoot,
+    ".paperclip",
+    `base-repo-divergence-alerted-${divergenceAlertEpisodeHash(repoIdentity, baseRef)}.marker`,
+  );
+}
+
+/**
+ * Atomically claim the alert for one episode by creating its marker with
+ * O_EXCL. Returns `true` when this observer won the claim and `false` when the
+ * marker already exists (the episode already alerted). Any other error fails
+ * open and returns `true`, matching the module's best-effort posture: a
+ * tracking failure must never block a dispatch.
+ *
+ * There is no release and no unlink anywhere reachable from an observation.
+ * Removing a marker is exclusive to {@link clearDivergenceRecord} on the
+ * episode-ended path, so a claim and its reset can never race for the same
+ * episode.
+ */
+async function tryClaimDivergenceAlertEpisode(
+  repoRoot: string,
+  repoIdentity: string,
+  baseRef: string,
+): Promise<boolean> {
+  const markerPath = divergenceAlertMarkerPath(repoRoot, repoIdentity, baseRef);
+  try {
+    await fs.mkdir(path.dirname(markerPath), { recursive: true });
+  } catch {
+    // The sidecar write also creates this directory; a failure here just means
+    // the open below may fail, which fails open.
+  }
+  try {
+    const handle = await fs.open(
+      markerPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o644,
+    );
+    await handle.close();
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EEXIST") return false;
+    return true;
+  }
+}
+
+/**
+ * Best-effort presence check for an episode's marker. Used only to mirror claim
+ * state into the persisted shape for observability — it is never an input to the
+ * claim decision.
+ */
+async function divergenceAlertMarkerPresent(
+  repoRoot: string,
+  repoIdentity: string,
+  baseRef: string,
+): Promise<boolean> {
+  try {
+    await fs.access(divergenceAlertMarkerPath(repoRoot, repoIdentity, baseRef));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function readDivergenceRecord(repoRoot: string): Promise<BaseRepoDivergenceRecord | null> {
@@ -141,12 +231,31 @@ export async function readDivergenceRecord(repoRoot: string): Promise<BaseRepoDi
   }
 }
 
-/** Remove the record. Best-effort: a stale sidecar must never block provisioning. */
+/**
+ * Remove the record and any alert markers under the checkout's `.paperclip/`
+ * tree. Best-effort: a stale sidecar or marker must never block provisioning.
+ *
+ * This is the ONLY unlink reachable from the module. It runs exclusively on the
+ * episode-ended path (a reset, restore, fast-forward, or in-sync base) and is
+ * never called from {@link observeDivergedRefusal}, so it cannot race a claim
+ * decision for the same episode.
+ */
 export async function clearDivergenceRecord(repoRoot: string): Promise<void> {
   try {
     await fs.rm(divergenceRecordPath(repoRoot), { force: true });
   } catch {
     // swallow: cleanup is telemetry, not correctness
+  }
+  try {
+    const dir = path.dirname(divergenceRecordPath(repoRoot));
+    const entries = await fs.readdir(dir);
+    for (const entry of entries) {
+      if (entry.startsWith("base-repo-divergence-alerted-") && entry.endsWith(".marker")) {
+        await fs.rm(path.join(dir, entry), { force: true }).catch(() => {});
+      }
+    }
+  } catch {
+    // swallow: a missing .paperclip tree means there is nothing to clear
   }
 }
 
@@ -171,11 +280,12 @@ export interface DivergedRefusalObservation {
 
 /**
  * In-process per-repo-root serialization for {@link observeDivergedRefusal}.
- * The sidecar record is the durable, cross-restart dedup key, but two
- * concurrent provisioning passes in the same server process can both read an
- * unalerted record and both emit a first-class signal for one episode. Chaining
- * the read-modify-write per checkout path closes that window so a single
- * divergence episode produces at most one signal.
+ * Kept for write economy — coalescing concurrent read-modify-writes of the
+ * sidecar within one server process — and because in-process ordering is a
+ * preserved behaviour. It is NO LONGER what makes the alert fire at most once
+ * per episode: that guarantee now comes from the O_EXCL claim marker, which is
+ * won by at most one observer even across processes. Serialization is
+ * therefore not load-bearing for dedup any more.
  */
 const observeChains = new Map<string, Promise<unknown>>();
 
@@ -208,10 +318,12 @@ function serializeObservationByKey<T>(key: string, task: () => Promise<T>): Prom
  * emit a spurious alert, breaking per-base-repo tracking and the no-noise rule.
  *
  * Observations for the same checkout path are serialized (see
- * {@link serializeObservationByKey}) so concurrent provisioning passes cannot
- * each read "not yet alerted" and both fire; combined with the persisted
- * `alertedForFirstObservedAtMs` dedup key, one episode yields at most one
- * first-class signal.
+ * {@link serializeObservationByKey}) for write economy, but the once-per-episode
+ * guarantee no longer depends on that. It now comes from the O_EXCL claim
+ * marker: when the threshold is crossed, exactly one concurrent observer —
+ * across processes — can create the episode's marker, so one divergence episode
+ * yields at most one first-class signal no matter how many workers race to
+ * observe it.
  */
 export function observeDivergedRefusal(
   repoRoot: string,
@@ -241,7 +353,28 @@ async function recordDivergedRefusal(
     prior && prior.firstObservedAtMs <= nowMs ? prior.firstObservedAtMs : nowMs;
   const ageMs = Math.max(0, nowMs - firstObservedAtMs);
   const alertDue = ageMs >= thresholdMs;
-  const shouldEmitFirstClassSignal = alertDue && prior?.alertedForFirstObservedAtMs !== firstObservedAtMs;
+
+  // The alert decision IS one atomic create: an O_EXCL marker for this episode.
+  // It is attempted ONLY when the threshold is already crossed, so a
+  // below-threshold pass leaves no residue. Exactly one concurrent observer
+  // (across processes) can win; every other sees EEXIST and stays quiet.
+  let shouldEmitFirstClassSignal = false;
+  if (alertDue) {
+    shouldEmitFirstClassSignal = await tryClaimDivergenceAlertEpisode(
+      repoRoot,
+      input.repoIdentity,
+      input.baseRef,
+    );
+  }
+
+  // Observability / back-compat only: mirror whether the episode holds its claim
+  // marker. It is derived from marker presence and is never an input to
+  // `shouldEmitFirstClassSignal`.
+  const alertedForFirstObservedAtMs = alertDue
+    ? (await divergenceAlertMarkerPresent(repoRoot, input.repoIdentity, input.baseRef)
+        ? firstObservedAtMs
+        : null)
+    : null;
 
   const record: BaseRepoDivergenceRecord = {
     repoIdentity: input.repoIdentity,
@@ -251,9 +384,7 @@ async function recordDivergedRefusal(
     aheadCount: input.aheadCount,
     behindCount: input.behindCount,
     aheadCommitSubjects: input.aheadCommitSubjects,
-    alertedForFirstObservedAtMs: shouldEmitFirstClassSignal
-      ? firstObservedAtMs
-      : prior?.alertedForFirstObservedAtMs ?? null,
+    alertedForFirstObservedAtMs,
   };
   try {
     await fs.mkdir(path.dirname(divergenceRecordPath(repoRoot)), { recursive: true });
