@@ -126,18 +126,38 @@ const deadline = Date.now() + 8000;
 })();
 `;
 
-/** T3: child signals ready, then sleeps (longer than any parent SIGKILL window)
- *  before it can create the marker — so a kill during the sleep never leaves a
- *  marker behind. */
+/** T3: child imports the service, installs a blocking seam hook, and enters
+ *  observeDivergedRefusal. When it reaches the observe/claim seam (after the age
+ *  has been decided, before the O_EXCL create) it reports `seam-<pid>` and blocks;
+ *  the parent SIGKILLs it there, so the create never runs and no marker can exist.
+ *  This is a real mid-observe crash, not a pre-observe sleep. */
 const PROBE_KILL = `
+import { pathToFileURL } from "node:url";
 import fsSync from "node:fs";
 import path from "node:path";
 const [repoRoot, baseRef, nowMs, thresholdMs, readyDir] = process.argv.slice(2);
-// Signal readiness, then stay alive WITHOUT calling observe. The parent will
-// SIGKILL us before any marker can be written, so this deterministically models
-// a worker that dies mid-episode and must not leave an orphan marker.
-fsSync.writeFileSync(path.join(readyDir, "ready-" + process.pid), "1");
-setInterval(() => {}, 1000);
+(async () => {
+  const m = await import(pathToFileURL(process.env.SUP15700_SVC).href);
+  // Deterministic mid-observe pause: report the seam, then block until a "go"
+  // marker appears (the parent never writes one; it SIGKILLs us instead).
+  m._installDivergenceObserveSeam(async () => {
+    fsSync.writeFileSync(path.join(readyDir, "seam-" + process.pid), "1");
+    for (;;) {
+      let go = false;
+      try {
+        go = fsSync.existsSync(path.join(readyDir, "go"));
+      } catch {}
+      if (go) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  });
+  const obs = await m.observeDivergedRefusal(repoRoot, {
+    baseRef, repoIdentity: repoRoot, aheadCount: 3, behindCount: 1,
+    aheadCommitSubjects: ["a"], nowMs: Number(nowMs), thresholdMs: Number(thresholdMs),
+  });
+  // Unreachable in the crash test: we are killed at the seam before this runs.
+  process.stdout.write(JSON.stringify({ reached: true, shouldEmit: obs.shouldEmitFirstClassSignal }) + "\\n");
+})().catch((e) => process.stdout.write(JSON.stringify({ error: String(e) }) + "\\n"));
 `;
 
 /** Resolve the tsx CLI so a child node process can load the TS service. */
@@ -181,7 +201,7 @@ function runToCompletion(child: ChildProcess): Promise<{ code: number | null; ou
   });
 }
 
-async function waitForReady(dir: string, timeoutMs: number): Promise<void> {
+async function waitForFile(dir: string, prefix: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     let entries: string[] = [];
@@ -190,8 +210,8 @@ async function waitForReady(dir: string, timeoutMs: number): Promise<void> {
     } catch {
       // directory not yet created
     }
-    if (entries.some((e) => e.startsWith("ready-"))) return;
-    if (Date.now() >= deadline) throw new Error("child did not signal readiness");
+    if (entries.some((e) => e.startsWith(prefix))) return;
+    if (Date.now() >= deadline) throw new Error(`no ${prefix}* file appeared within ${timeoutMs}ms`);
     await new Promise((r) => setTimeout(r, 20));
   }
 }
@@ -596,7 +616,7 @@ describe("no-unlink invariant (T2)", () => {
 });
 
 describe("crash resilience (T3)", () => {
-  it("a SIGKILLed worker leaves no marker, so a subsequent observe still claims the alert", async () => {
+  it("a SIGKILLed mid-observe worker leaves no marker, so a subsequent observe still claims the alert", async () => {
     const root = await makeRepoRoot();
     const now = 1_700_000_000_000;
     await seedOverThresholdSidecar(root, now);
@@ -608,12 +628,17 @@ describe("crash resilience (T3)", () => {
     await fs.writeFile(probeFile, PROBE_KILL, "utf8");
 
     const child = spawnProbe(probeFile, [root, "main", String(now), String(7 * DAY), readyDir], tsxCli);
-    await waitForReady(readyDir, 8000);
+    // The child has entered observeDivergedRefusal and reached the observe/claim
+    // seam: the age is decided, but the O_EXCL create has NOT run yet.
+    await waitForFile(readyDir, "seam-", 8000);
+    expect(await listAlertMarkers(root), "no marker may exist while paused pre-claim").toEqual([]);
+
+    // Kill the whole process group mid-observe (direct child + tsx grandchild).
     killProbeGroup(child);
     await new Promise<void>((resolve) => child.on("close", () => resolve()));
 
     // The killed worker never reached the O_EXCL create, so no marker exists.
-    expect(await listAlertMarkers(root), "a killed worker must leave no marker").toEqual([]);
+    expect(await listAlertMarkers(root), "a killed mid-observe worker must leave no marker").toEqual([]);
 
     // A subsequent observation still returns a decision and claims the alert.
     const obs = await observeDivergedRefusal(root, {
