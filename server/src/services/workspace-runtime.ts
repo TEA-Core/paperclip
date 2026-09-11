@@ -4477,7 +4477,13 @@ export type BaseRepoRescueResetResult =
     }
   | {
       ok: false;
-      reason: "base_ref_unresolvable" | "head_unresolvable" | "identity_unresolved" | "lease_timeout" | "reset_failed";
+      reason:
+        | "base_ref_unresolvable"
+        | "head_unresolvable"
+        | "dirty_or_unmerged"
+        | "identity_unresolved"
+        | "lease_timeout"
+        | "reset_failed";
       detail: string;
     };
 
@@ -4499,9 +4505,29 @@ export async function resetProjectBaseRepoWithRescue(input: {
   type OpInner =
     | { kind: "reset"; resetToSha: string; previousTip: string; rescueRef: string; aheadCount: number; warning: string }
     | { kind: "already"; resetToSha: string }
-    | { kind: "refuse"; reason: "base_ref_unresolvable" | "head_unresolvable"; detail: string };
+    | {
+        kind: "refuse";
+        reason: "base_ref_unresolvable" | "head_unresolvable" | "dirty_or_unmerged";
+        detail: string;
+      };
   try {
     const inner = await withBaseRepoResetLease(input.repoRoot, async (lease): Promise<OpInner> => {
+      // SUP-15722 R1 (finding: base-repo-reset-hygiene-bypass): the destructive
+      // `reset --hard` below would discard uncommitted tracked changes that the tip
+      // pin does NOT preserve. Re-inspect hygiene UNDER the lease and refuse a dirty
+      // or unmerged tree before any destructive operation — the check and the move
+      // share the same critical section, so no TOCTOU sits between them.
+      const hygiene = await inspectBaseRepoHygiene(input.repoRoot);
+      if (hygiene && (hygiene.dirtyTrackedPathCount > 0 || hygiene.unmergedPathCount > 0)) {
+        return {
+          kind: "refuse",
+          reason: "dirty_or_unmerged",
+          detail:
+            `Base repository at ${input.repoRoot} has ${hygiene.dirtyTrackedPathCount} modified tracked path(s) ` +
+            `and ${hygiene.unmergedPathCount} unmerged path(s); a reset --hard would discard uncommitted work, ` +
+            `so the reset was refused and nothing was moved.`,
+        };
+      }
       const baseRefSha = await resolveBaseRefSha(input.repoRoot, input.baseRef);
       if (!baseRefSha) {
         return { kind: "refuse", reason: "base_ref_unresolvable", detail: `${input.baseRef} does not resolve to a commit` };
@@ -5290,6 +5316,16 @@ export async function prepareBaseRepoForWorkspace(input: {
         // failure, a lease timeout, a CAS mismatch, or any git failure fails
         // closed to the unchanged "warn, preserve, never reset" path below.
         const resetOutcome = await withBaseRepoResetLease(input.repoRoot, async (lease) => {
+          // SUP-15722 R1 (finding: base-repo-auto-capture-outside-lease): the
+          // pre-lease `decision.action === "diverged"` gate is not a destructive
+          // precondition — state can change between that read and the reset. Re-verify
+          // the tree is clean UNDER the lease: a dirty or unmerged tree is refused here
+          // because `reset --hard` would discard uncommitted work the tip pin does not
+          // preserve. This is the required inspection inside the critical section.
+          const hygieneNow = await inspectBaseRepoHygiene(input.repoRoot);
+          if (hygieneNow && (hygieneNow.dirtyTrackedPathCount > 0 || hygieneNow.unmergedPathCount > 0)) {
+            return null;
+          }
           const upstreamCheck = await resolveBaseRepoAheadCommitsAllUpstream({
             repoRoot: input.repoRoot,
             baseRef,
