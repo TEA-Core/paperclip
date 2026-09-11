@@ -79,6 +79,14 @@ import {
   resolveDivergenceAlertThresholdMs,
   type BaseRepoDivergenceAlert,
 } from "./base-repo-divergence-alert.js";
+import {
+  BaseRepoIdentityUnresolved,
+  BaseRepoResetLeaseMismatch,
+  BaseRepoResetLeaseTimeout,
+  assertLease,
+  withBaseRepoResetLease,
+  type BaseRepoResetLease,
+} from "./base-repo-reset-lease.js";
 import { logger } from "../middleware/logger.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
@@ -4351,82 +4359,207 @@ async function resolveBaseRepoAheadCommitsAllUpstream(input: {
 }
 
 /**
- * SUP-13858: pin the current tip on a rescue ref, THEN reset to the base ref.
+ * SUP-15722: the base-repo rescue reset destructive primitive.
  *
- * Order is the whole contract. The rescue ref is created and independently re-read
- * before anything moves, so a reset can never be the step that makes commits
- * unreachable. If the pin cannot be proven, nothing moves at all — the diverged
- * repo is an inconvenience, an unreachable commit is data loss.
+ * This is the ONLY place the base repo is moved off its current tip back onto its
+ * base ref. The base repo is shared by every worktree under it, so two concurrent
+ * resets (an operator-directed `resetProjectBaseRepoWithRescue`, the auto
+ * `prepareBaseRepoForWorkspace` self-heal, or two operators) must not interleave:
+ * both could read the same `priorTip`, both pin, and both move HEAD, with the
+ * second losing the first's update. Cross-process mutual exclusion is held by the
+ * SUP-15721 lease; this primitive does NOT acquire it. It is only ever run under a
+ * `BaseRepoResetLease` and re-asserts that lease, fail-closed: a forged or
+ * wrong-repo lease is refused, and an unresolvable identity is refused before any
+ * git runs. Order is still the whole contract: the tip is pinned (atomically) and
+ * independently re-read before the tip move, and the tip is moved only by CAS
+ * (`update-ref HEAD <base> <priorTip>`), so a reset can never be the step that
+ * makes commits unreachable and a concurrent writer is detected and refused.
  */
-async function resetBaseRepoToBaseRefWithRescue(input: {
+export async function performBaseRepoRescueReset(input: {
+  repoRoot: string;
+  baseRef: string;
+  baseRefSha: string;
+  priorTip: string;
+  aheadCount: number;
+  operatorDirected: boolean;
+  recorder?: WorkspaceOperationRecorder | null;
+  lease: BaseRepoResetLease;
+}): Promise<{ rescueRef: string; warning: string }> {
+  // Fail-closed, before any git: refuse if the lease does not actually cover this
+  // repoRoot (forged/wrong-repo lease -> mismatch; unresolvable identity ->
+  // unresolved). Neither path mutates anything.
+  assertLease(input.lease, input.repoRoot);
+
+  const stamp = `${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}-${randomUUID().slice(0, 8)}`;
+  const rescueRef = `${RESCUE_REF_PREFIX}/base-repo/${stamp}/head`;
+
+  // Best-effort: sweep expired rescue refs so the namespaced refs do not
+  // accumulate without bound; never changes whether this reset is safe.
+  await pruneExpiredRescueRefs(input.repoRoot);
+
+  // 1. Atomically pin the captured tip on a short-lived, namespaced ref that keeps
+  //    the commit reachable even though we are about to move HEAD off it. The
+  //    all-zeros old-value means "create only if it does not already exist," so
+  //    the pin is atomic and can never clobber an existing ref.
+  await runGit(["update-ref", rescueRef, input.priorTip, "0000000000000000000000000000000000000000"], input.repoRoot);
+
+  // 2. Read it back rather than trusting update-ref's exit code: this is the only
+  //    guarantee that the commits survive the reset.
+  const pinned = await runGit(["rev-parse", "--verify", `${rescueRef}^{commit}`], input.repoRoot).catch(() => null);
+  if (pinned !== input.priorTip) {
+    throw new Error(
+      `Rescue ref ${rescueRef} did not resolve to the prior tip ${input.priorTip.slice(0, 12)} ` +
+        `(got ${pinned ? pinned.slice(0, 12) : "nothing"}) — refusing reset, no commits moved.`,
+    );
+  }
+
+  // 3. CAS the tip move: move HEAD to the base ref only if it still equals the tip
+  //    we captured. This is the guard against any write that landed between capture
+  //    and here; on mismatch git fails the update and we refuse, leaving the pinned
+  //    ref in place for inspection. Runs under git's own ref lock, so the
+  //    check-and-move is atomic with respect to other git ref updates on this repo.
+  await runGit(["update-ref", "HEAD", input.baseRefSha, input.priorTip], input.repoRoot);
+
+  // 4. Sync the working tree and index to the (now) base ref. HEAD already points at
+  //    the base ref; this reconciles the index and worktree and is a no-op on the ref.
+  await runGit(["reset", "--hard", "HEAD"], input.repoRoot);
+
+  // 5. Warn. The pin is namespaced and time-stamped; `pruneExpiredRescueRefs`
+  //    sweeps it when it goes stale.
+  const warning =
+    `${input.operatorDirected ? "Operator reset: " : "Auto reset: "}Base repository at ${input.repoRoot} was reset to ${input.baseRef}: ` +
+    `all ${input.aheadCount} ahead commit(s) carried only content already at the base ref, so none represented unshipped work. ` +
+    `Prior tip ${input.priorTip.slice(0, 12)} is preserved at ${rescueRef}.`;
+  return { rescueRef, warning };
+}
+
+/**
+ * SUP-15722: the standalone rescue reset — the only public way to run the
+ * destructive primitive without already holding the lease. It acquires the
+ * SUP-15721 cross-process lease itself, hands it to the primitive, and releases
+ * it when the destructive sequence completes. It contends with
+ * `resetProjectBaseRepoWithRescue` and the auto `prepareBaseRepoForWorkspace`
+ * path on the same on-disk lock.
+ */
+export async function resetBaseRepoToBaseRefWithRescue(input: {
   repoRoot: string;
   baseRef: string;
   baseRefSha: string;
   priorTip: string;
   aheadCount: number;
   recorder?: WorkspaceOperationRecorder | null;
-}): Promise<{ reset: boolean; rescueRef: string | null; warnings: string[] }> {
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-  const rescueRef = `${RESCUE_REF_PREFIX}/base-repo/${stamp}/head`;
+  operatorDirected?: boolean;
+}): Promise<{ rescueRef: string; warnings: string[] }> {
+  const { rescueRef, warning } = await withBaseRepoResetLease(input.repoRoot, (lease) =>
+    performBaseRepoRescueReset({
+      repoRoot: input.repoRoot,
+      baseRef: input.baseRef,
+      baseRefSha: input.baseRefSha,
+      priorTip: input.priorTip,
+      aheadCount: input.aheadCount,
+      operatorDirected: input.operatorDirected ?? false,
+      recorder: input.recorder ?? null,
+      lease,
+    }),
+  );
+  return { rescueRef, warnings: [warning] };
+}
 
+export type BaseRepoRescueResetResult =
+  | {
+      ok: true;
+      alreadyAtTarget: boolean;
+      resetToSha: string;
+      previousTip: string | null;
+      rescueRef: string | null;
+      aheadCount: number;
+      warning: string | null;
+    }
+  | {
+      ok: false;
+      reason: "base_ref_unresolvable" | "head_unresolvable" | "identity_unresolved" | "lease_timeout" | "reset_failed";
+      detail: string;
+    };
+
+/**
+ * SUP-15722: the operator-directed base-repo rescue reset — the sanctioned,
+ * human-initiated escape hatch for a base repo the auto path left frozen (ahead
+ * commits that are NOT all upstream, or a repo the auto path will not touch).
+ * The whole sequence — target resolution, tip capture, pin, CAS tip move, and
+ * worktree sync — runs under a single SUP-15721 cross-process lease so it cannot
+ * interleave with the auto self-heal or a second operator. It fails closed: an
+ * unresolvable repository identity, a lease timeout, a CAS mismatch, or any git
+ * failure refuses the reset and moves nothing.
+ */
+export async function resetProjectBaseRepoWithRescue(input: {
+  repoRoot: string;
+  baseRef: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<BaseRepoRescueResetResult> {
+  type OpInner =
+    | { kind: "reset"; resetToSha: string; previousTip: string; rescueRef: string; aheadCount: number; warning: string }
+    | { kind: "already"; resetToSha: string }
+    | { kind: "refuse"; reason: "base_ref_unresolvable" | "head_unresolvable"; detail: string };
   try {
-    await runGit(["update-ref", rescueRef, input.priorTip], input.repoRoot);
+    const inner = await withBaseRepoResetLease(input.repoRoot, async (lease): Promise<OpInner> => {
+      const baseRefSha = await resolveBaseRefSha(input.repoRoot, input.baseRef);
+      if (!baseRefSha) {
+        return { kind: "refuse", reason: "base_ref_unresolvable", detail: `${input.baseRef} does not resolve to a commit` };
+      }
+      const headSha = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+      if (!headSha) {
+        return { kind: "refuse", reason: "head_unresolvable", detail: "HEAD does not resolve to a commit" };
+      }
+      if (headSha === baseRefSha) {
+        return { kind: "already", resetToSha: baseRefSha };
+      }
+      const aheadRaw = await runGit(["rev-list", "--count", `${baseRefSha}..HEAD`], input.repoRoot).catch(() => "0");
+      const aheadCount = Number.parseInt(aheadRaw, 10) || 0;
+      const { rescueRef, warning } = await performBaseRepoRescueReset({
+        repoRoot: input.repoRoot,
+        baseRef: input.baseRef,
+        baseRefSha,
+        priorTip: headSha,
+        aheadCount,
+        operatorDirected: true,
+        recorder: input.recorder ?? null,
+        lease,
+      });
+      return { kind: "reset", resetToSha: baseRefSha, previousTip: headSha, rescueRef, aheadCount, warning };
+    });
+    if (inner.kind === "refuse") return { ok: false, reason: inner.reason, detail: inner.detail };
+    if (inner.kind === "already") {
+      return {
+        ok: true,
+        alreadyAtTarget: true,
+        resetToSha: inner.resetToSha,
+        previousTip: null,
+        rescueRef: null,
+        aheadCount: 0,
+        warning: null,
+      };
+    }
+    return {
+      ok: true,
+      alreadyAtTarget: false,
+      resetToSha: inner.resetToSha,
+      previousTip: inner.previousTip,
+      rescueRef: inner.rescueRef,
+      aheadCount: inner.aheadCount,
+      warning: inner.warning,
+    };
   } catch (error) {
-    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
-    return {
-      reset: false,
-      rescueRef: null,
-      warnings: [
-        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) whose content is already at the ` +
-          `base ref, but the rescue ref could not be created (${detail}). NOT reset — local commits preserved.`,
-      ],
-    };
+    if (error instanceof BaseRepoIdentityUnresolved) {
+      return { ok: false, reason: "identity_unresolved", detail: error.message };
+    }
+    if (error instanceof BaseRepoResetLeaseTimeout) {
+      return { ok: false, reason: "lease_timeout", detail: error.message };
+    }
+    if (error instanceof BaseRepoResetLeaseMismatch) {
+      return { ok: false, reason: "reset_failed", detail: error.message };
+    }
+    return { ok: false, reason: "reset_failed", detail: error instanceof Error ? error.message : String(error) };
   }
-
-  // Read it back rather than trusting update-ref's exit code: this is the only
-  // guarantee that the commits survive the reset.
-  const pinned = await runGit(["rev-parse", "--verify", `${rescueRef}^{commit}`], input.repoRoot).catch(() => null);
-  if (pinned !== input.priorTip) {
-    return {
-      reset: false,
-      rescueRef: null,
-      warnings: [
-        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) whose content is already at the ` +
-          `base ref, but the rescue ref ${rescueRef} did not resolve to the prior tip ${input.priorTip.slice(0, 12)} ` +
-          `(got ${pinned ? pinned.slice(0, 12) : "nothing"}). NOT reset — local commits preserved.`,
-      ],
-    };
-  }
-
-  // This path pins a base-repo tip into the shared store and then throws it away. Sweep the
-  // rescue store right here rather than leaving it to an unrelated worktree teardown — this is
-  // what kept the correctly-namespaced refs accumulating. Best-effort; pruning never changes
-  // whether this reset is safe.
-  await pruneExpiredRescueRefs(input.repoRoot);
-
-  try {
-    await runGit(["reset", "--hard", input.baseRefSha], input.repoRoot);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
-    return {
-      reset: false,
-      rescueRef,
-      warnings: [
-        `Base repository at ${input.repoRoot} could not be reset to ${input.baseRef} (${detail}). ` +
-          `The prior tip is pinned at ${rescueRef}; no commits were lost.`,
-      ],
-    };
-  }
-
-  return {
-    reset: true,
-    rescueRef,
-    warnings: [
-      `Base repository at ${input.repoRoot} was reset to ${input.baseRef}: all ${input.aheadCount} ahead ` +
-        `commit(s) carried only content already at the base ref, so none represented unshipped work. ` +
-        `Prior tip ${input.priorTip.slice(0, 12)} is preserved at ${rescueRef}.`,
-    ],
-  };
 }
 
 async function inspectBaseRepoHygiene(repoRoot: string) {
@@ -5149,21 +5282,40 @@ export async function prepareBaseRepoForWorkspace(input: {
         // the base ref (by blob, not patch-id, with no commit-count window), pin the
         // tip, and only then reset. Anything short of proof falls through to the
         // unchanged warning below.
-        const upstreamCheck = await resolveBaseRepoAheadCommitsAllUpstream({
-          repoRoot: input.repoRoot,
-          baseRef,
-          mergeBase: shallowState.mergeBase,
+        // SUP-15722: the duplication proof, the tip capture, and the destructive
+        // reset all run under one SUP-15721 cross-process lease, with the tip
+        // re-captured INSIDE the critical section — nothing is captured or moved
+        // outside it. The `headSha`/`currentBaseRefSha` read above only gate the
+        // attempt; the lease-protected capture below is authoritative. Identity
+        // failure, a lease timeout, a CAS mismatch, or any git failure fails
+        // closed to the unchanged "warn, preserve, never reset" path below.
+        const resetOutcome = await withBaseRepoResetLease(input.repoRoot, async (lease) => {
+          const upstreamCheck = await resolveBaseRepoAheadCommitsAllUpstream({
+            repoRoot: input.repoRoot,
+            baseRef,
+            mergeBase: shallowState.mergeBase,
+          });
+          if (!upstreamCheck.allUpstream) return null;
+          const tipNow = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+          const baseRefShaNow = await resolveBaseRefSha(input.repoRoot, baseRef);
+          if (!tipNow || !baseRefShaNow) return null;
+          const { rescueRef, warning } = await performBaseRepoRescueReset({
+            repoRoot: input.repoRoot,
+            baseRef,
+            baseRefSha: baseRefShaNow,
+            priorTip: tipNow,
+            aheadCount: upstreamCheck.aheadCount,
+            operatorDirected: false,
+            recorder: input.recorder ?? null,
+            lease,
+          });
+          return { rescueRef, warnings: [warning] };
+        }).catch((error) => {
+          logger.warn(
+            `base-repo auto rescue reset failed closed at ${input.repoRoot}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return null;
         });
-        const resetOutcome = upstreamCheck.allUpstream && headSha && currentBaseRefSha
-          ? await resetBaseRepoToBaseRefWithRescue({
-              repoRoot: input.repoRoot,
-              baseRef,
-              baseRefSha: currentBaseRefSha,
-              priorTip: headSha,
-              aheadCount: upstreamCheck.aheadCount,
-              recorder: input.recorder ?? null,
-            })
-          : null;
 
         if (resetOutcome) {
           baseRepoHygieneWarnings.push(...resetOutcome.warnings);
