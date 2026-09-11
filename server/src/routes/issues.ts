@@ -269,6 +269,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   assertPatchableExecutionPolicyWrite,
+  isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -807,10 +808,15 @@ async function applyReviewEscalationDecision(args: {
 
   // Re-opening an escalated review bounces the summary-generation task back to
   // the Summarizer, never to a policy `returnAssigneeAgentId` (SUP-15768).
-  const summaryForcedReturnAssignee =
-    requestedStatus === "in_progress"
-      ? await resolveSummaryGenerationReturnAssignee(db, issue)
-      : null;
+  // Resolve it only when this decision is a pending review changes_requested
+  // bounce, so unrelated decisions never trigger the summary-slot lookup.
+  const summaryForcedReturnAssignee = isReviewChangesRequestedTransition({
+    policy,
+    executionState: existingState,
+    requestedStatus,
+  })
+    ? await resolveSummaryGenerationReturnAssignee(db, issue)
+    : null;
   const transition = applyIssueExecutionPolicyTransition({
     issue,
     policy,
@@ -12552,10 +12558,16 @@ export function issueRoutes(
     const requestedTransitionStatus =
       typeof updateFields.status === "string" ? updateFields.status : undefined;
     // A summary-generation issue must always bounce back to the Summarizer
-    // agent, never to a policy `returnAssigneeAgentId` (SUP-15768). Only the
-    // status-transition path can trigger a `changes_requested` bounce, so the
-    // lookup is skipped for statusless patches.
-    const summaryForcedReturnAssignee = requestedTransitionStatus
+    // agent, never to a policy `returnAssigneeAgentId` (SUP-15768). The
+    // forced-return lookup is only meaningful when this PATCH is an active
+    // pending-review changes_requested bounce, so it is skipped for every
+    // other transition (reopen, approve, re-arm, statusless patches) to avoid
+    // an unneeded summary-slot DB query on unrelated paths.
+    const summaryForcedReturnAssignee = isReviewChangesRequestedTransition({
+      policy: nextExecutionPolicy,
+      executionState: parseIssueExecutionState(existing.executionState),
+      requestedStatus: requestedTransitionStatus,
+    })
       ? await resolveSummaryGenerationReturnAssignee(db, existing)
       : null;
     const transition = applyIssueExecutionPolicyTransition({
