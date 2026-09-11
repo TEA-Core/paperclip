@@ -57,15 +57,21 @@ import type {
  * candidate the sweep classifies it as *wedged* when EITHER:
  *   - its generation issue is `blocked` and carries an active recovery action
  *     in status `escalated` (`reason: "blocked_escalated_recovery"`), or
- *   - the slot has been `generating` for longer than the bounded, env-tunable
- *     window `SUMMARY_SLOT_REFRESH_WEDGED_MS` (default 6h)
- *     (`reason: "generating_age_exceeded"`).
- * A wedged slot is re-claimed: the sweep clears the stale `generating` link so
- * `generate` mints a fresh issue instead of short-circuiting to
+ *   - the linked generation issue has made no progress for longer than the
+ *     bounded, env-tunable window `SUMMARY_SLOT_REFRESH_WEDGED_MS` (default
+ *     6h) (`reason: "generating_age_exceeded"`). Progress is measured off the
+ *     issue's own `updatedAt`, not the slot row's: the slot row stops moving
+ *     the moment it flips to `generating`, while the issue keeps a live
+ *     progress clock. When the linked issue row is missing the slot's own
+ *     `updatedAt` is the fallback.
+ * A wedged slot is re-claimed: the sweep clears the stale `generating` link (a
+ * compare-and-set, so a race with a concurrent claim never clobbers newer state)
+ * so `generate` mints a fresh issue instead of short-circuiting to
  * `alreadyGenerating`, and records a `summary_slot.generate_requested` entry
  * flagged `wedgedRecovery: true` so the recovery is visible in the activity
- * log instead of a silent strand. A slot that is merely in-flight (progressing
- * or recently updated) is never re-claimed, so live generations are not thrashed.
+ * log instead of a silent strand. A slot that is merely in-flight (its issue
+ * progressing or recently updated) is never re-claimed, so live generations
+ * are not thrashed.
  */
 
 const DEFAULT_STALE_MS = 24 * 60 * 60 * 1000;
@@ -242,9 +248,13 @@ export function createSummarySlotRefreshSweepService(
      *   - the generation issue is `blocked` and has an active recovery action
      *     in status `escalated` — definitively parked on a human, so it will
      *     never progress on its own; or
-     *   - the slot has been `generating` longer than the bounded `wedgedMs`
-     *     window (an LLM summary should not take hours; a slot this old is
-     *     not progressing).
+     *   - the generation has made no progress for the bounded `wedgedMs`
+     *     window. Progress is measured off the linked issue's `updatedAt` (the
+     *     issue is what is actually doing the work), NOT the slot row's
+     *     `updatedAt`: the slot row stops moving the moment it flips to
+     *     `generating`, so measuring off it would re-claim a slot whose issue
+     *     was just updated to `in_review` (thrash a live generation). When the
+     *     linked issue row is missing we fall back to the slot's `updatedAt`.
      * A slot whose issue is merely active and recent (e.g. `in_review` just
      * updated) is NOT wedged, so live generations are left alone.
      */
@@ -253,34 +263,38 @@ export function createSummarySlotRefreshSweepService(
       checkedAt: Date,
     ): Promise<{ wedged: boolean; reason: WedgedReason | null; supersededIssueId: string | null }> {
       const supersededIssueId = candidate.generatingIssueId;
-      if (
-        candidate.updatedAt &&
-        checkedAt.getTime() - candidate.updatedAt.getTime() > wedgedMs
-      ) {
-        return { wedged: true, reason: "generating_age_exceeded", supersededIssueId };
-      }
-      if (supersededIssueId) {
-        const issue = await db
-          .select({ status: issues.status })
-          .from(issues)
-          .where(and(eq(issues.id, supersededIssueId), eq(issues.companyId, candidate.companyId)))
-          .then((rows) => rows[0] ?? null);
-        if (issue?.status === "blocked") {
-          const escalated = await db
-            .select({ id: issueRecoveryActions.id })
-            .from(issueRecoveryActions)
-            .where(
-              and(
-                eq(issueRecoveryActions.companyId, candidate.companyId),
-                eq(issueRecoveryActions.sourceIssueId, supersededIssueId),
-                eq(issueRecoveryActions.status, "escalated"),
-              ),
-            )
-            .then((rows) => rows.length > 0);
-          if (escalated) {
-            return { wedged: true, reason: "blocked_escalated_recovery", supersededIssueId };
-          }
+      const issue = supersededIssueId
+        ? await db
+            .select({ status: issues.status, updatedAt: issues.updatedAt })
+            .from(issues)
+            .where(and(eq(issues.id, supersededIssueId), eq(issues.companyId, candidate.companyId)))
+            .then((rows) => rows[0] ?? null)
+        : null;
+
+      // Rule 1: definitively parked on a human.
+      if (supersededIssueId && issue?.status === "blocked") {
+        const escalated = await db
+          .select({ id: issueRecoveryActions.id })
+          .from(issueRecoveryActions)
+          .where(
+            and(
+              eq(issueRecoveryActions.companyId, candidate.companyId),
+              eq(issueRecoveryActions.sourceIssueId, supersededIssueId),
+              eq(issueRecoveryActions.status, "escalated"),
+            ),
+          )
+          .then((rows) => rows.length > 0);
+        if (escalated) {
+          return { wedged: true, reason: "blocked_escalated_recovery", supersededIssueId };
         }
+      }
+
+      // Rule 2: no progress for the bounded window, clocked off the linked
+      // generation issue's progress timestamp; fall back to the slot row only
+      // when the linked issue is missing.
+      const progressAt = issue?.updatedAt ?? candidate.updatedAt;
+      if (progressAt && checkedAt.getTime() - progressAt.getTime() > wedgedMs) {
+        return { wedged: true, reason: "generating_age_exceeded", supersededIssueId };
       }
       return { wedged: false, reason: null, supersededIssueId };
     }
@@ -292,6 +306,12 @@ export function createSummarySlotRefreshSweepService(
      * guards `status === "generating" && generatingIssueId`). This is the
      * minimal, in-process recovery write the board-side sweep owns; it never
      * touches `lastGeneratedAt` or `documentId`.
+     *
+     * Compare-and-set: the write is guarded by the slot still being in the exact
+     * state the sweep discovered — `status === "generating"` behind the SAME
+     * `generatingIssueId`. If a write or a newer generation claim landed between
+     * candidate discovery and this clear, the guard matches 0 rows and the newer
+     * state is left untouched (never clobber a live claim back to `idle`).
      */
     async function clearStaleGenerationLink(candidate: SummarySlotRefreshCandidate, checkedAt: Date): Promise<void> {
       await db
@@ -307,7 +327,11 @@ export function createSummarySlotRefreshSweepService(
             eq(summarySlots.companyId, candidate.companyId),
             eq(summarySlots.scopeKind, candidate.scopeKind),
             eq(summarySlots.slotKey, candidate.slotKey),
+            eq(summarySlots.status, "generating"),
             candidate.scopeId === null ? isNull(summarySlots.scopeId) : eq(summarySlots.scopeId, candidate.scopeId),
+            candidate.generatingIssueId === null
+              ? isNull(summarySlots.generatingIssueId)
+              : eq(summarySlots.generatingIssueId, candidate.generatingIssueId),
           ),
         );
     }

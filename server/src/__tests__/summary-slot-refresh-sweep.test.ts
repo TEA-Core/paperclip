@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { issueRecoveryActions, issues, summarySlots } from "@paperclipai/db";
 import {
   SUMMARY_SLOT_REFRESH_ACTOR_ID,
@@ -56,7 +57,7 @@ function generateResponse(overrides: {
   };
 }
 
-/** Builds a fake drizzle db whose discovery `select()` dispatches by table and whose `update()` applies a no-op patch. */
+/** Builds a fake drizzle db whose discovery `select()` dispatches by table and whose `update()` records the WHERE clause. */
 function makeDb(
   slotRows: Array<Record<string, unknown>>,
   opts: {
@@ -66,7 +67,8 @@ function makeDb(
 ) {
   const issueRows = opts.issueRows ?? [];
   const recoveryRows = opts.recoveryRows ?? [];
-  return {
+  const updateWhereArgs: unknown[] = [];
+  const db = {
     select: vi.fn(() => ({
       from: (table: unknown) => ({
         where: async () => {
@@ -79,10 +81,17 @@ function makeDb(
     })),
     update: vi.fn(() => ({
       set: () => ({
-        where: async () => [],
+        where: async (whereArg: unknown) => {
+          updateWhereArgs.push(whereArg);
+          return [];
+        },
       }),
     })),
+    // Captured drizzle WHERE clauses from `clearStaleGenerationLink`, so a test
+    // can prove the recovery write is compare-and-set guarded.
+    updateWhereArgs,
   };
+  return db;
 }
 
 /** Wires the sweep service over a fake db. */
@@ -299,14 +308,17 @@ describe("createSummarySlotRefreshSweepService", () => {
     );
   });
 
-  it("leaves a `generating` slot in-flight behind a recently-updated `in_review` issue (AC-5, no thrash)", async () => {
+  it("leaves a `generating` slot in-flight when its linked `in_review` issue was recently updated, even though the slot row is old (AC-5, no thrash)", async () => {
     const rows = [
-      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-live", updatedAt: new Date("2026-09-09T23:30:00Z") },
+      // Old slot row — would trip a naive slot-age backstop (CR finding 1) ...
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-live", updatedAt: new Date("2026-09-08T00:00:00Z") },
     ];
     mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
     const { db, service } = makeService(rows, {
       wakeup: vi.fn(),
-      issueRows: [{ status: "in_review" }],
+      // ... but the generation issue itself made progress 30 minutes ago, so the
+      // age backstop must clock off the issue's timestamp, not the slot's.
+      issueRows: [{ status: "in_review", updatedAt: new Date("2026-09-09T23:30:00Z") }],
       recoveryRows: [],
       wedgedMs: 6 * 60 * 60 * 1000,
     });
@@ -326,14 +338,16 @@ describe("createSummarySlotRefreshSweepService", () => {
     expect(mockQueueWakeup).toHaveBeenCalledTimes(1);
   });
 
-  it("re-claims a `generating` slot that has aged past the wedged window even without a blocked/escalated issue (age backstop)", async () => {
+  it("re-claims a `generating` slot whose linked issue has made no progress past the wedged window (age backstop clocked off the issue timestamp)", async () => {
     const rows = [
-      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-stale", updatedAt: new Date("2026-09-08T00:00:00Z") },
+      // The slot row is recent, but the linked generation issue has not
+      // progressed in > 6h, so the age backstop (clocked off the issue) fires.
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-stale", updatedAt: new Date("2026-09-09T23:55:00Z") },
     ];
     mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
     const { db, service } = makeService(rows, {
       wakeup: vi.fn(),
-      issueRows: [{ status: "in_progress" }],
+      issueRows: [{ status: "in_progress", updatedAt: new Date("2026-09-08T00:00:00Z") }],
       recoveryRows: [],
       wedgedMs: 6 * 60 * 60 * 1000,
     });
@@ -357,6 +371,63 @@ describe("createSummarySlotRefreshSweepService", () => {
         }),
       }),
     );
+  });
+
+  it("falls back to the slot's own timestamp for the age backstop when the linked issue is missing", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-gone", updatedAt: new Date("2026-09-08T00:00:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      // No linked issue row: the classifier must not crash and must fall back to
+      // the slot's `updatedAt` (2 days old) to decide the recovery.
+      issueRows: [],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        details: expect.objectContaining({ wedgedRecovery: true, wedgedReason: "generating_age_exceeded" }),
+      }),
+    );
+  });
+
+  it("clears the stale link with a compare-and-set guarded by status and generatingIssueId (CR finding 2, no clobber)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-wedged", updatedAt: new Date("2026-09-09T23:00:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "blocked", updatedAt: new Date("2026-09-09T23:00:00Z") }],
+      recoveryRows: [{ id: "ra-1", status: "escalated", sourceIssueId: "issue-wedged" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await service.sweep();
+
+    // Exactly one recovery write, and its WHERE clause is the compare-and-set:
+    // it must require `status = 'generating'` AND the same generatingIssueId, so
+    // a concurrent write/claim between discovery and the clear matches 0 rows and
+    // the newer state is never clobbered back to `idle`.
+    expect(db.updateWhereArgs).toHaveLength(1);
+    const { sql, params } = new PgDialect().sqlToQuery(db.updateWhereArgs[0] as never);
+    expect(sql).toContain("status");
+    expect(sql).toContain("generating_issue_id");
+    expect(params).toContain("generating");
+    expect(params).toContain("issue-wedged");
   });
 
   it("records a route-equivalent summary_slot.generate_requested activity entry on a fresh claim", async () => {
