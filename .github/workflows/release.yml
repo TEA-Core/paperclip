@@ -1117,25 +1117,6 @@ jobs:
             echo "::warning::Could not dispatch docker.yml at ${tag}. Run docker.yml manually at that tag to publish the stable images."
           fi
 
-      # Tag pushes made with GITHUB_TOKEN do not fire docker.yml's tag
-      # trigger (GitHub suppresses workflow runs caused by GITHUB_TOKEN
-      # pushes), so dispatch the image build at the new tag explicitly. This
-      # is what moves Docker `:latest` and publishes the versioned stable
-      # image tags.
-      - name: Build Docker images for the stable tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="$(git tag --points-at HEAD | grep '^v' | head -1)"
-          if gh workflow run docker.yml --ref "refs/tags/${tag}" --repo "$GITHUB_REPOSITORY"; then
-            echo "Dispatched docker.yml at ${tag}."
-          else
-            # Older source commits may predate docker.yml's workflow_dispatch
-            # trigger; the dispatch then fails while the npm release is
-            # already complete and correct.
-            echo "::warning::Could not dispatch docker.yml at ${tag}. Run docker.yml manually at that tag to publish the stable images."
-          fi
-
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

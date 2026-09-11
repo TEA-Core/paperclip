@@ -68,14 +68,18 @@ test("the guard is not scoped to a single event", () => {
   assert.match(prWorkflow, /^\s{2}merge_group:$/m, "pr.yml must still run on merge_group");
 });
 
-test("the guard is advisory, and says why", () => {
-  // The gate cannot first bind on the PR that introduces it, and the open
-  // 2026-09-07 fold was authored before it existed. When this assertion is
-  // flipped, `continue-on-error` must go with it -- that is the point of
-  // pinning it here rather than leaving the state implicit.
-  const body = stepBody("Fold duplication guard");
-  assert.match(body, /continue-on-error: true/);
-  assert.match(body, /ADVISORY FOR NOW/);
+test("the guard is blocking", () => {
+  // It shipped advisory in #576 so that it would not first bind on the fold
+  // that was already open when it was written (#573). That fold has landed.
+  // With `continue-on-error` a failing step still reads green and ejects
+  // nothing, so a stray one would quietly turn the guard back into a report.
+  // Assert on the directives, not the comments, which name the setting.
+  const directives = stepBody("Fold duplication guard")
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+  assert.doesNotMatch(directives, /continue-on-error/);
+  assert.match(stepBody("Fold duplication guard"), /BLOCKING/);
 });
 
 test("the guard's own tests run in CI", () => {

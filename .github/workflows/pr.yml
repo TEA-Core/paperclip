@@ -268,7 +268,7 @@ jobs:
         # reports no conflict, tsc reports nothing (identical adjacent
         # statements are legal, and a cross-scope redeclaration is legal), and
         # this repository has no ESLint config, so nothing else looks. Fold
-        # 1446a58c0 landed five at once, four of which are still on the branch.
+        # 1446a58c0 landed six at once, and they sat on the branch for days.
         #
         # Checked over the RANGE, not just the head. A fold PR carries its fold
         # merge inside the branch and its head is an ordinary follow-up commit:
@@ -283,13 +283,15 @@ jobs:
         # is empty on `merge_group` anyway, which would void any branch-name
         # exemption written here (the trap documented on the lockfile guards).
         #
-        # ADVISORY FOR NOW, on purpose. A gate cannot first bind on the very PR
-        # that introduces it, and the 2026-09-07 fold (#573) is already open
-        # against this branch: it was authored before this check existed and
-        # must not be judged by it. Flip `continue-on-error` off in a follow-up
-        # once #573 has landed. The wiring test pins the current state, so the
-        # flip has to be deliberate rather than accidental.
-        continue-on-error: true
+        # BLOCKING. It shipped advisory in #576 because a gate cannot first
+        # bind on the PR that introduces it, and the 2026-09-07 fold (#573) was
+        # already open against this branch. #573 has landed. A failure here
+        # fails `policy`, which every required check reaches through `needs`,
+        # so the merge queue ejects the entry.
+        #
+        # A clean result is not proof that a merge duplicated nothing. Two
+        # copies far apart that bind different variables match neither rule,
+        # so the regions a fold relocated still need reading by hand.
         run: node ./scripts/check-fold-duplication.mjs "$HEAD_SHA" "$BASE_SHA"
 
       - name: Test fold duplication guard
