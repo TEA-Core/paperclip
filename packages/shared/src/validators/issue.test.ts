@@ -347,6 +347,107 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("lets a false-positive verdict leave a live in_progress source issue exactly where it is", () => {
+    // `undispatchable_assignee` fires on todo/in_progress. For a permanently pull-only
+    // assignee the documented disposition is `false_positive` + the card's current status.
+    // `in_progress` is a live status, so it must be an expressible sourceIssueStatus that
+    // leaves the card verbatim where it is — the route applies it as the new status, so
+    // in_progress -> in_progress is a no-op and the issue's status stays unchanged
+    // (SUP-15486).
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "false_positive",
+        sourceIssueStatus: "in_progress",
+      }),
+    ).toMatchObject({
+      outcome: "false_positive",
+      sourceIssueStatus: "in_progress",
+    });
+
+    // `cancelled` shares the same non-blocked matrix, so the same live card is truthful
+    // under it too.
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "in_progress",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "in_progress",
+    });
+
+    // A bogus-alert verdict must still be unable to force-block a card.
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "false_positive",
+        sourceIssueStatus: "blocked",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("lets a false-positive verdict leave a live backlog source issue exactly where it is", () => {
+    // `stillborn_assigned_backlog` fires on backlog. Same argument as in_progress:
+    // backlog is a live status the resolver must be able to express without moving the
+    // card off it (SUP-15486).
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "false_positive",
+        sourceIssueStatus: "backlog",
+      }),
+    ).toMatchObject({
+      outcome: "false_positive",
+      sourceIssueStatus: "backlog",
+    });
+
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "backlog",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "backlog",
+    });
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "cancelled",
+        sourceIssueStatus: "blocked",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps restored deliberately off in_progress and backlog (no route machinery to act on)", () => {
+    // SUP-15486 decided `restored` is NOT widened to the new live statuses: the route's
+    // hand-back/re-dispatch machinery is wired only to todo/done/in_review, so widening
+    // the refine without that behaviour would mint a legal-but-inert disposition. A bogus
+    // alert on a live in_progress/backlog card is a false_positive, not a restore.
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "restored",
+        sourceIssueStatus: "in_progress",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "restored",
+        sourceIssueStatus: "backlog",
+      }).success,
+    ).toBe(false);
+
+    // The existing restored targets remain valid.
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+      }),
+    ).toMatchObject({
+      outcome: "restored",
+      sourceIssueStatus: "in_review",
+    });
+  });
+
   it("keeps the blocked recovery outcome restricted to a blocked source status", () => {
     expect(
       resolveIssueRecoveryActionSchema.safeParse({

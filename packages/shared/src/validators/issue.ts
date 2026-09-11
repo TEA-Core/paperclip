@@ -406,10 +406,24 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().guid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked", "cancelled"]),
+  // Base enum mirrors ISSUE_STATUSES so every live status is expressible as a
+  // sourceIssueStatus; the per-outcome matrix below then narrows which statuses
+  // each verdict may set. Hardcoding the list here is what let `in_progress` and
+  // `backlog` — live statuses the shipped `undispatchable_assignee` and
+  // `stillborn_assigned_backlog` detectors mint on — fall out of the resolve
+  // matrix, leaving a recovery action on such a card with no disposition that
+  // left it truthful (SUP-15486, repeating SUP-13874 / SUP-14035).
+  sourceIssueStatus: z.enum(ISSUE_STATUSES),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {
+    // `restored` is deliberately NOT widened to in_progress/backlog (SUP-15486):
+    // the route's corrective machinery (safe hand-back gate + re-dispatch wakeup)
+    // is wired only to todo/done/in_review, and there is no "restore a card to
+    // in_progress" or "to backlog" semantics the route can act on — re-dispatch
+    // fires only on todo, and backlog has no dispatch-from-this-route path. A bogus
+    // alert on a live in_progress/backlog card is a false_positive (leave it where
+    // it is), not a restore. Widen this only with matching route behaviour.
     if (
       value.sourceIssueStatus !== "todo" &&
       value.sourceIssueStatus !== "done" &&
@@ -437,17 +451,18 @@ export const resolveIssueRecoveryActionSchema = z.object({
 
   if (value.outcome === "false_positive" || value.outcome === "cancelled") {
     // A false-positive/cancelled verdict is a statement that the alert was never valid, not that
-    // the work closed. `sourceIssueStatus` is applied verbatim as the card's new status, so
-    // `todo` leaves a live card exactly where it is, and `cancelled` is an honest no-op for a card
-    // that is already terminal: without it the matrix has no value that both satisfies the refine
-    // and leaves a `cancelled` source truthful, so a recovery action on a cancelled source issue
-    // has no legal disposition (SUP-13874 / SUP-14035). The only status that must stay off-limits
-    // is `blocked`: a bogus alert must never be the thing that force-blocks a card. Board-only
-    // enforcement for these outcomes lives in the route (`assertBoard`), not in this schema.
+    // the work closed. `sourceIssueStatus` is applied verbatim as the card's new status, so `todo`,
+    // `in_progress`, and `backlog` each leave a live card exactly where it is, and `cancelled` is an
+    // honest no-op for a card that is already terminal: without these the matrix has no value that
+    // both satisfies the refine and leaves such a source truthful, so a recovery action on a live
+    // in_progress/backlog (or a cancelled) source issue would have no legal disposition
+    // (SUP-13874 / SUP-14035 / SUP-15486). The only status that must stay off-limits is `blocked`:
+    // a bogus alert must never be the thing that force-blocks a card. Board-only enforcement for
+    // these outcomes lives in the route (`assertBoard`), not in this schema.
     if (value.sourceIssueStatus === "blocked") {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "This recovery outcome requires sourceIssueStatus to be todo, done, in_review, or cancelled",
+        message: "This recovery outcome requires a non-blocked source issue status",
         path: ["sourceIssueStatus"],
       });
     }
