@@ -1877,6 +1877,62 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(stderrLog!.text).toContain(stderrTail);
   });
 
+  it("surfaces the JSON-RPC error data when ensureSession rejects with a bare Internal error", async () => {
+    // The ACP SDK answers an agent-side exception with JSON-RPC -32603 "Internal error" and
+    // carries the real cause only in `data.details` (for example the SDK failing to spawn the
+    // Claude CLI in a cwd the agent uid cannot enter). Without it the run records nothing but
+    // "Internal error".
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+
+    class FakeJsonRpcRequestError extends Error {
+      readonly code = -32603;
+      readonly data = { details: "spawn /usr/local/bin/claude EACCES" };
+      constructor() {
+        super("Internal error");
+        this.name = "RequestError";
+      }
+    }
+
+    const logs: Array<{ stream: string; text: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => {
+          throw new FakeJsonRpcRequestError();
+        },
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+      },
+      context: {},
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("acpx_session_init_failed");
+    const errorLogLine = logs.find((entry) => entry.stream === "stdout" && entry.text.includes("\"type\":\"acpx.error\""));
+    expect(errorLogLine).toBeTruthy();
+    const errorPayload = JSON.parse(errorLogLine!.text.trim());
+    expect(errorPayload.message).toBe("Internal error");
+    expect(errorPayload.acpErrorDetails).toBe("spawn /usr/local/bin/claude EACCES");
+  });
+
   it("configures in-process child stderr capture without forcing verbose mode", async () => {
     const root = await makeTempRoot();
     const { runtimeOptions } = await runExecutor({ agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") });
