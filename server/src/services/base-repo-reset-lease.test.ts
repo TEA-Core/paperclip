@@ -257,6 +257,43 @@ describe("withBaseRepoResetLease", () => {
     const surviving = JSON.parse(fs.readFileSync(lockPathB, "utf8")) as { token: string };
     expect(surviving.token).toBe("foreign-live-token"); // untouched
   });
+
+  it("recovers an unreadable (corrupt-owner) lock once it has aged, and never steals a fresh one", async () => {
+    const root = newTempRoot();
+    const repo = makeRepo(root, "corrupt");
+    const lockDir = await resolveBaseRepoResetIdentity(repo);
+    const lockPath = baseRepoResetLockFilePath(lockDir);
+
+    // (a) Fresh corrupt lock: owner unparseable, mtime ~now. With a large
+    //     staleMs the (mtime-derived) age is below the threshold, so the lock
+    //     is treated as "held by an unknown, possibly-alive holder": we wait,
+    //     and time out without touching it.
+    fs.writeFileSync(lockPath, "not-valid-json", "utf8");
+    let tookFresh = false;
+    await expect(
+      withBaseRepoResetLease(
+        repo,
+        async () => {
+          tookFresh = true;
+        },
+        { timeoutMs: 300, staleMs: 60_000 },
+      ),
+    ).rejects.toBeInstanceOf(BaseRepoResetLeaseTimeout);
+    expect(tookFresh).toBe(false);
+    expect(fs.existsSync(lockPath)).toBe(true); // we never stole it
+
+    // (b) The same corrupt lock, backdated well past staleMs: now it is safe
+    //     to recover, and the caller takes it over.
+    const old = new Date(Date.now() - 10 * 60_000);
+    fs.utimesSync(lockPath, old, old);
+    const holder = await withBaseRepoResetLease(
+      repo,
+      async (lease) => lease.holderId,
+      { timeoutMs: 2000, staleMs: 60_000 },
+    );
+    expect(holder.startsWith(`${process.pid}-`)).toBe(true);
+    expect(fs.existsSync(lockPath)).toBe(false); // released on exit
+  });
 });
 
 describe("assertLease", () => {
