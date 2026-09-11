@@ -179,7 +179,7 @@ export function decideHostRestartStrandRepair(input: {
   // A marker stamped for a different (older) boot is stale for the currently
   // detected boot — the reap for this boot would have re-stamped it. Never act
   // on a marker we cannot attribute to the current boot (fail-safe: skip).
-  if (input.detectedBootId && marker.currentBootId !== input.detectedBootId) {
+  if (!input.detectedBootId || marker.currentBootId !== input.detectedBootId) {
     return { action: "skip-no-marker" };
   }
 

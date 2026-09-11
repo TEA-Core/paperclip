@@ -106,21 +106,26 @@ function decide(overrides: Partial<Parameters<typeof decideHostRestartStrandRepa
     alreadyEscalated: false,
     latestRun: makeLatestRun(),
     now: NOW,
+    detectedBootId: BOOT_NEW,
     ...overrides,
   });
 }
 
 describe("host-restart strand repair decision", () => {
-  it("re-arms a monitorable card whose monitor policy is still live", () => {
-    expect(decide()).toEqual({ action: "rearm" });
-  });
-
-  it("re-arms when the marker's currentBootId matches the detected boot", () => {
+  it("re-arms a monitorable card whose marker matches the detected boot", () => {
     expect(decide({ detectedBootId: BOOT_NEW })).toEqual({ action: "rearm" });
   });
 
   it("ignores a marker stamped for a different (older) boot", () => {
     expect(decide({ detectedBootId: "boot-newer" })).toEqual({ action: "skip-no-marker" });
+  });
+
+  it("skips a re-armable marker when boot detection fails (detectedBootId: null)", () => {
+    expect(decide({ detectedBootId: null })).toEqual({ action: "skip-no-marker" });
+  });
+
+  it("skips a re-armable marker when no detected boot is passed (detectedBootId: undefined)", () => {
+    expect(decide({ detectedBootId: undefined })).toEqual({ action: "skip-no-marker" });
   });
 
   it("escalates an exhausted monitor instead of re-arming", () => {
@@ -312,7 +317,7 @@ describe("planHostRestartStrandRepairs", () => {
       ["a", factsFor()],
       ["b", factsFor()],
     ]);
-    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 1 });
+    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 1, detectedBootId: BOOT_NEW });
     expect(plan.repairs.map((r) => r.issueId)).toEqual(["a"]);
     expect(plan.skipped.capExceeded).toEqual(["b"]);
   });
@@ -320,9 +325,17 @@ describe("planHostRestartStrandRepairs", () => {
   it("skips an already-escalated card without emitting a repair", () => {
     const candidates = [makeCandidate({ id: "a" })];
     const facts = new Map<string, HostRestartStrandFacts>([["a", factsFor({ alreadyEscalated: true })]]);
-    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 10 });
+    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 10, detectedBootId: BOOT_NEW });
     expect(plan.repairs).toEqual([]);
     expect(plan.skipped.alreadyEscalated).toEqual(["a"]);
+  });
+
+  it("plans no repair when boot detection fails (detectedBootId: null)", () => {
+    const candidates = [makeCandidate({ id: "null-boot" })];
+    const facts = new Map<string, HostRestartStrandFacts>([["null-boot", factsFor()]]);
+    const plan = planHostRestartStrandRepairs({ candidates, facts, now: NOW, cap: 10, detectedBootId: null });
+    expect(plan.repairs).toEqual([]);
+    expect(plan.skipped.noHostRestartMarker).toEqual(["null-boot"]);
   });
 });
 
