@@ -3417,9 +3417,38 @@ async function listIssueReviewAttentionMap(
   const result = new Map<string, IssueReviewAttention>();
   for (const row of issueRows) result.set(row.id, reviewAttentionNone());
 
-  const reviewIds = issueRows
+  const reviewIds: string[] = issueRows
     .filter((row) => row.companyId === companyId && row.status === "in_review")
     .map((row) => row.id);
+  // SUP-15713: a rejected stage-decision write returns the card to active work
+  // (e.g. in_progress) while the stage stays `pending` with a
+  // `currentParticipant`. The old in_review-only gate left such a card at
+  // `reviewAttention: none` — permanently un-wakeable (SUP-15696). Admit any
+  // non-terminal card carrying a pending execution stage; the shared
+  // isReviewLivenessEligible predicate (invokable-participant + blocker
+  // precedence) still decides the outcome. The list rows don't carry
+  // executionState (issueListSelect nulls it for perf), so read it back from the
+  // table for the non-in_review candidates only. Terminal statuses are excluded.
+  const pendingStageCandidateIds = issueRows
+    .filter(
+      (row) =>
+        row.companyId === companyId
+        && row.status !== "in_review"
+        && row.status !== "done"
+        && row.status !== "cancelled",
+    )
+    .map((row) => row.id);
+  for (const chunk of chunkList(pendingStageCandidateIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    const pendingRows = await dbOrTx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        inArray(issues.id, chunk),
+        sql`${issues.executionState}->>'status' = 'pending'`,
+      ));
+    for (const row of pendingRows as Array<{ id: string }>) reviewIds.push(row.id);
+  }
   if (reviewIds.length === 0) return result;
 
   const reviewIssues: IssueRow[] = [];

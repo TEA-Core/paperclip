@@ -575,6 +575,129 @@ describeEmbeddedPostgres("issue review attention", () => {
       expect(kinds).not.toContain("execution_participant");
     });
   });
+
+  // SUP-15713: the wire projection (svc.list -> listIssueReviewAttentionMap)
+  // previously gated its input to status === "in_review", so the SUP-15696 shape
+  // — an in_progress card whose stage-decision write was rejected while the
+  // stage stayed pending with an invokable currentParticipant — reported
+  // reviewAttention: none on the actual API path even though the pure
+  // classifier had been widened. These tests assert the service projection, not
+  // the pure classifier, so acceptance #1 is pinned at the wire.
+  describe("review liveness status gate service projection (SUP-15713)", () => {
+    const twoHourAgoIso = () => new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const fiveMinAgoIso = () => new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+    const pendingReviewStage = (participantAgentId: string, pendingSince: string) => ({
+      status: "pending",
+      currentStageType: "review",
+      currentStageIndex: 0,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: "changes_requested",
+      changesRequestedCount: 1,
+      currentParticipant: { type: "agent", agentId: participantAgentId },
+      pendingSince,
+    });
+
+    async function seedCompanyWithTwoAgents() {
+      const companyId = randomUUID();
+      const leadId = randomUUID();
+      const participantId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Review Attention Co",
+        issuePrefix: "RVA",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: leadId,
+        companyId,
+        name: "Lead Agent",
+        role: "engineer",
+        status: "idle",
+      });
+      await db.insert(agents).values({
+        id: participantId,
+        companyId,
+        name: "Support CR",
+        role: "engineer",
+        status: "idle",
+      });
+      return { companyId, leadId, participantId };
+    }
+
+    async function insertActiveCard(input: {
+      companyId: string;
+      status: string;
+      identifier: string;
+      assigneeAgentId: string | null;
+      executionState: Record<string, unknown> | null;
+    }) {
+      const id = randomUUID();
+      await db.insert(issues).values({
+        id,
+        companyId: input.companyId,
+        identifier: input.identifier,
+        title: input.identifier,
+        status: input.status,
+        priority: "medium",
+        assigneeAgentId: input.assigneeAgentId,
+        assigneeUserId: null,
+        executionState: input.executionState,
+      });
+      return id;
+    }
+
+    it("produces a non-none stalled reviewAttention for an in_progress card with a stale pending review stage", async () => {
+      const { companyId, leadId, participantId } = await seedCompanyWithTwoAgents();
+      const issueId = await insertActiveCard({
+        companyId,
+        status: "in_progress",
+        identifier: "SUP-15696-REPRO",
+        assigneeAgentId: leadId,
+        executionState: pendingReviewStage(participantId, twoHourAgoIso()),
+      });
+
+      const row = (await svc.list(companyId, { status: "in_progress" })).find((issue) => issue.id === issueId);
+      // Before the gate widened this was {state: "none", paths: [], reason: null}.
+      expect(row?.reviewAttention?.state).toBe("stalled");
+      expect(row?.reviewAttention?.paths).toEqual([]);
+      // The finding names the participant that is awaiting the decision.
+      expect(row?.reviewAttention?.reason).toContain("Support CR");
+    });
+
+    it("reports a fresh in_progress review participant as a maintained execution_participant path", async () => {
+      const { companyId, leadId, participantId } = await seedCompanyWithTwoAgents();
+      const issueId = await insertActiveCard({
+        companyId,
+        status: "in_progress",
+        identifier: "SUP-15713-FRESH",
+        assigneeAgentId: leadId,
+        executionState: pendingReviewStage(participantId, fiveMinAgoIso()),
+      });
+
+      const row = (await svc.list(companyId, { status: "in_progress" })).find((issue) => issue.id === issueId);
+      expect(row?.reviewAttention).toMatchObject({
+        state: "covered",
+        paths: [expect.objectContaining({ kind: "execution_participant" })],
+      });
+    });
+
+    it("still reports none for a done or cancelled card carrying a stale pending executionState", async () => {
+      const { companyId, leadId, participantId } = await seedCompanyWithTwoAgents();
+      for (const status of ["done", "cancelled"]) {
+        const issueId = await insertActiveCard({
+          companyId,
+          status,
+          identifier: `SUP-15713-TERM-${status}`,
+          assigneeAgentId: leadId,
+          executionState: pendingReviewStage(participantId, twoHourAgoIso()),
+        });
+        const row = (await svc.list(companyId, { status })).find((issue) => issue.id === issueId);
+        expect(row?.reviewAttention, status).toEqual({ state: "none", paths: [], reason: null });
+      }
+    });
+  });
 });
 
 // SUP-15713: review liveness was gated on `status === "in_review"`, so a card
