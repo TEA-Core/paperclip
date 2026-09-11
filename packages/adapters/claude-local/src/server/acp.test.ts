@@ -584,6 +584,14 @@ describe("claude_local ACP lane", () => {
 
   it("passes the exact configured Fable 5.1 ID through ANTHROPIC_MODEL on the ACP lane", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-fable51-");
+    // TEA-Core fork: the local lane seeds the agent-side Claude home from the server's
+    // shared home and probes its OAuth health before the turn, so give this upstream test
+    // the same temp-root seam and credentials as the other local-lane tests. Without it,
+    // it reads the host's real ~/.claude and fails on any machine without one (CI).
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const meta: AdapterInvocationMeta[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
