@@ -354,6 +354,7 @@ describeEmbeddedPostgres("activity service", () => {
       runId,
       agentId,
       invocationSource: "assignment",
+      contextIssueId: issueId,
     });
     expect(runs[0]?.usageJson).toEqual({
       inputTokens: 11,

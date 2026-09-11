@@ -42,3 +42,5 @@ export { instanceSettingsRoutes } from "./instance-settings.js";
 export { dispatchQuiesceRoutes } from "./dispatch-quiesce.js";
 export { instanceDatabaseBackupRoutes } from "./instance-database-backups.js";
 export { workSessionRoutes } from "./work-sessions.js";
+export { managedAgentProfileRoutes } from "./managed-agent-profiles.js";
+export { remoteAgentProfileRoutes } from "./remote-agent-profiles.js";

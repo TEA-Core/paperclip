@@ -27,6 +27,7 @@ import {
   resolveExecutionWorkspaceOccupancyDecision,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveExecutionWorkspaceReuseRequestForIssue,
+  resolveNativeRecoveryExecutionWorkspaceBinding,
   resolveTaskSessionConfigFreshness,
   resolveWorkspaceAfterLowTrustPreflight,
   stripHostWorkspaceProvisionForLowTrustSandbox,
@@ -122,6 +123,17 @@ export interface ExecutionWorkspaceProvisioningInput {
   agent: AgentRow;
   issueId: string | null;
   issueRef: ExecutionWorkspaceProvisioningIssueRef | null;
+  /**
+   * The execution workspace a persisted native execution input is bound to. It replaces
+   * issueRef.executionWorkspaceId as the reuse request (upstream #12616/#12845), while
+   * issueRef itself stays the issue's current row.
+   */
+  requestedExecutionWorkspaceIdOverride?: string | null;
+  /**
+   * Suppresses every write of this run's workspace onto the issue. Native recovery never
+   * touches the issue's binding, because a newer run may already have moved or cleared it.
+   */
+  skipIssueBinding?: boolean;
   runId: string;
   effectiveExecutionWorkspaceMode: ParsedExecutionWorkspaceMode;
   trustPreset: TrustPresetResolution;
@@ -204,6 +216,12 @@ export interface ProvisionedIssueExecutionWorkspace {
   sessionResetReason: string | null;
   sessionConfigFreshness: ReturnType<typeof resolveTaskSessionConfigFreshness>;
   previousSessionParams: Record<string, unknown> | null;
+  /**
+   * Re-binds the issue to the workspace environment realization settled on (upstream
+   * #12901/#12904). Writes only what differs from the binding provisioning already wrote,
+   * and nothing under skipIssueBinding.
+   */
+  bindIssueToRealizedExecutionWorkspace: (workspace: ExecutionWorkspace | null) => Promise<void>;
 }
 
 export interface DeferredIssueExecutionWorkspace {
@@ -240,10 +258,16 @@ export async function provisionIssueExecutionWorkspace(
     environmentRuntime,
   });
 
-  const requestedExecutionWorkspaceId = readNonEmptyString(issueRef?.executionWorkspaceId);
+  const requestedExecutionWorkspaceIdOverride = readNonEmptyString(input.requestedExecutionWorkspaceIdOverride);
+  const requestedExecutionWorkspaceId =
+    requestedExecutionWorkspaceIdOverride ?? readNonEmptyString(issueRef?.executionWorkspaceId);
   const existingExecutionWorkspace = requestedExecutionWorkspaceId
     ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId)
     : null;
+  const nativeRecoveryExecutionWorkspaceId = resolveNativeRecoveryExecutionWorkspaceBinding({
+    bindingId: requestedExecutionWorkspaceIdOverride,
+    persistedWorkspaceFound: existingExecutionWorkspace !== null,
+  });
 
   const existingExecutionWorkspaceDirectoryExists = await (async () => {
     if (existingExecutionWorkspace?.status !== "archived") return null;
@@ -260,7 +284,9 @@ export async function provisionIssueExecutionWorkspace(
 
   const workspaceReuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
     issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
-    issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
+    issueExecutionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
+      ? "reuse_existing"
+      : (issueRef?.executionWorkspacePreference ?? null),
     existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
     existingExecutionWorkspaceCleanupReason: existingExecutionWorkspace?.cleanupReason ?? null,
     existingExecutionWorkspaceDirectoryExists,
@@ -558,6 +584,8 @@ export async function provisionIssueExecutionWorkspace(
   const workspaceGitAuthProvider = createGitRemoteAuthProvider(db, agent.companyId, {
     issueId,
     heartbeatRunId: run.id,
+    responsibleUserId: run.responsibleUserId,
+    agentId: agent.id,
   });
   const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
     await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
@@ -818,10 +846,17 @@ export async function provisionIssueExecutionWorkspace(
   const nextIssueWorkspaceMode = persistedExecutionWorkspace
     ? issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode)
     : null;
+  // Upstream #12901/#12904: a warm, lease-reusing sandbox keeps the issue on one workspace
+  // across turns. Always false for local and SSH environments.
+  const warmReusableExecutionWorkspace =
+    input.selectedEnvironmentForConfig?.driver === "sandbox" &&
+    selectedEnvironmentConfigForFingerprint.reuseLease === true &&
+    selectedEnvironmentConfigForFingerprint.runnerLifecycleMode === "warm";
   const shouldSwitchIssueToExistingWorkspace =
     issueRef?.executionWorkspacePreference === "reuse_existing" ||
     input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
-    input.effectiveExecutionWorkspaceMode === "operator_branch";
+    input.effectiveExecutionWorkspaceMode === "operator_branch" ||
+    warmReusableExecutionWorkspace;
   const nextIssuePatch: Record<string, unknown> = {};
   const postAttachIssuePatch: {
     executionWorkspaceId?: string;
@@ -829,8 +864,14 @@ export async function provisionIssueExecutionWorkspace(
     executionWorkspaceSettings?: Record<string, unknown>;
     projectWorkspaceId?: string;
   } | null = persistedExecutionWorkspace ? {} : null;
+  // The issue's binding as this run last wrote it, so the post-realization re-bind below
+  // writes only what changed.
+  let issueExecutionWorkspaceIdForRun = issueRef?.executionWorkspaceId ?? null;
+  let issueProjectWorkspaceIdForRun = issueRef?.projectWorkspaceId ?? null;
+  let issueExecutionWorkspacePreferenceForRun = issueRef?.executionWorkspacePreference ?? null;
+  let issueExecutionWorkspaceModeForRun: unknown = input.issueExecutionWorkspaceSettings?.mode ?? null;
 
-  if (issueId && persistedExecutionWorkspace) {
+  if (issueId && persistedExecutionWorkspace && !input.skipIssueBinding) {
     if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
       nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
       postAttachIssuePatch!.executionWorkspaceId = persistedExecutionWorkspace.id;
@@ -855,8 +896,51 @@ export async function provisionIssueExecutionWorkspace(
       // `allowIssueOverride: false` project could never provision any issue at all
       // (SUP-13058).
       await issuesSvc.update(issueId, { ...nextIssuePatch, systemWorkspaceBinding: true });
+      issueExecutionWorkspaceIdForRun = persistedExecutionWorkspace.id;
+      issueProjectWorkspaceIdForRun = resolvedProjectWorkspaceId ?? issueProjectWorkspaceIdForRun;
+      if (shouldSwitchIssueToExistingWorkspace) {
+        issueExecutionWorkspacePreferenceForRun = "reuse_existing";
+        issueExecutionWorkspaceModeForRun = nextIssueWorkspaceMode;
+      }
     }
   }
+
+  // Upstream's second bindIssueToPersistedExecutionWorkspace call, made after environment
+  // realization: a sandbox realization may materialize or replace the durable workspace after
+  // this provisioning boundary. It compares against what this run already wrote rather than
+  // issueRef, so it is a no-op whenever realization kept the provisioned row (every local and
+  // SSH run).
+  const bindIssueToRealizedExecutionWorkspace = async (workspace: ExecutionWorkspace | null) => {
+    if (!issueId || !workspace || input.skipIssueBinding) return;
+    const realizedIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(workspace.mode);
+    const realizedIssuePatch: Record<string, unknown> = {};
+    if (issueExecutionWorkspaceIdForRun !== workspace.id) {
+      realizedIssuePatch.executionWorkspaceId = workspace.id;
+    }
+    if (resolvedProjectWorkspaceId && issueProjectWorkspaceIdForRun !== resolvedProjectWorkspaceId) {
+      realizedIssuePatch.projectWorkspaceId = resolvedProjectWorkspaceId;
+    }
+    if (
+      shouldSwitchIssueToExistingWorkspace &&
+      (issueExecutionWorkspacePreferenceForRun !== "reuse_existing" ||
+        issueExecutionWorkspaceModeForRun !== realizedIssueWorkspaceMode)
+    ) {
+      realizedIssuePatch.executionWorkspacePreference = "reuse_existing";
+      realizedIssuePatch.executionWorkspaceSettings = {
+        ...(input.issueExecutionWorkspaceSettings ?? {}),
+        mode: realizedIssueWorkspaceMode,
+      };
+    }
+    if (Object.keys(realizedIssuePatch).length === 0) return;
+    // Same system-binding marker as the bind above (SUP-13058).
+    await issuesSvc.update(issueId, { ...realizedIssuePatch, systemWorkspaceBinding: true });
+    issueExecutionWorkspaceIdForRun = workspace.id;
+    issueProjectWorkspaceIdForRun = resolvedProjectWorkspaceId ?? issueProjectWorkspaceIdForRun;
+    if (shouldSwitchIssueToExistingWorkspace) {
+      issueExecutionWorkspacePreferenceForRun = "reuse_existing";
+      issueExecutionWorkspaceModeForRun = realizedIssueWorkspaceMode;
+    }
+  };
 
   const {
     previousSessionParams,
@@ -906,5 +990,6 @@ export async function provisionIssueExecutionWorkspace(
     sessionResetReason,
     sessionConfigFreshness,
     previousSessionParams,
+    bindIssueToRealizedExecutionWorkspace,
   };
 }

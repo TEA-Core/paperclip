@@ -95,7 +95,10 @@ vi.mock("./permissions.js", () => ({
   buildClaudeExecutionPermissionArgs: () => [],
 }));
 
-vi.mock("./cli-capabilities.js", () => ({
+// Spread the real module: upstream #12730 made execute.ts import more than the effort
+// probe from here (claudeCommandLooksLike, the Fable 5.1 CLI-version helpers).
+vi.mock("./cli-capabilities.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./cli-capabilities.js")>()),
   claudeCommandSupportsEffortFlag: async () => false,
 }));
 

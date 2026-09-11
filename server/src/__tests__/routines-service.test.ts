@@ -47,6 +47,7 @@ const originalSecretsProviderEnv = process.env.PAPERCLIP_SECRETS_PROVIDER;
 const originalKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
 const originalAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
 const secretsTmpDir = path.join(os.tmpdir(), `paperclip-routines-service-${randomUUID()}`);
+const originalPaperclipApiUrlEnv = process.env.PAPERCLIP_API_URL;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -62,6 +63,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
+    process.env.PAPERCLIP_API_URL = "http://localhost:3100";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-routines-service-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
@@ -104,6 +106,11 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     if (originalAllowKeyGeneration === undefined) delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
     else process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = originalAllowKeyGeneration;
     rmSync(secretsTmpDir, { recursive: true, force: true });
+    if (originalPaperclipApiUrlEnv === undefined) {
+      delete process.env.PAPERCLIP_API_URL;
+    } else {
+      process.env.PAPERCLIP_API_URL = originalPaperclipApiUrlEnv;
+    }
   });
 
   async function seedFixture(opts?: {
@@ -772,15 +779,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
           },
         },
         runtimeConfig: {
-          modelProfiles: {
-            cheap: {
-              adapterConfig: {
-                env: {
-                  ROUTINE_ASSIGNEE_RUNTIME_SECRET: { type: "plain", value: sentinelSecret },
-                },
-              },
-            },
-          },
+          privateRuntimeSetting: { token: sentinelSecret },
         },
       })
       .where(eq(agents.id, agentId));

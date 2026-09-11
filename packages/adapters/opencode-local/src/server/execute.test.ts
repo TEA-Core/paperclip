@@ -348,6 +348,90 @@ describe("resolveOpenCodeSessionResume (legacy argv)", () => {
   });
 });
 
+function probeResult(overrides: Record<string, unknown>) {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: 123,
+    startedAt: new Date().toISOString(),
+    ...overrides,
+  } as never;
+}
+
+describe("execute — OpenRouter credentials", () => {
+  it("passes an OpenRouter key and complete model to OpenCode without logging the key", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-openrouter-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    const apiKey = "openrouter-test-secret";
+    const model = "openrouter/anthropic/claude-sonnet-4.5";
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({
+      stdout: JSON.stringify({
+        type: "text",
+        sessionID: "session-openrouter",
+        part: { text: "done" },
+      }),
+    }));
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+
+    try {
+      const result = await execute({
+        runId: "run-openrouter",
+        agent: {
+          id: "agent-openrouter",
+          companyId: "company-1",
+          name: "OpenRouter Coder",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          model,
+          env: {
+            OPENROUTER_API_KEY: apiKey,
+            OPENCODE_ALLOW_ALL_MODELS: "1",
+          },
+          promptTemplate: "Run the task.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+        onMeta: async (value) => {
+          metadata.push(value);
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.model).toBe(model);
+      const executionCall = runAdapterExecutionTargetProcessMock.mock.calls.at(-1)!;
+      expect(executionCall[3]).toContain("--model");
+      expect(executionCall[3]).toContain(model);
+      expect((executionCall[4] as { env: Record<string, string> }).env.OPENROUTER_API_KEY).toBe(apiKey);
+      expect(JSON.stringify({ logs, metadata, result })).not.toContain(apiKey);
+      expect(JSON.stringify(metadata)).toContain('"OPENROUTER_API_KEY":"***REDACTED***"');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
@@ -421,19 +505,6 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     timeoutSec: 30,
     graceSec: 5,
   };
-
-  function probeResult(overrides: Record<string, unknown>) {
-    return {
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: "",
-      stderr: "",
-      pid: 123,
-      startedAt: new Date().toISOString(),
-      ...overrides,
-    } as never;
-  }
 
   beforeEach(() => {
     runAdapterExecutionTargetProcessMock.mockReset();
