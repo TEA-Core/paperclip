@@ -41,6 +41,7 @@ import {
   resolveTaskSessionConfigFreshness,
   isWorkspaceSyncConflictFailure,
   requiresPushCapabilityPreflight,
+  requiresPushCredentialBinding,
   resolveWorkspaceAfterLowTrustPreflight,
   resolveRuntimeSessionParamsForWorkspace,
   shouldDeferFollowupWakeForSameIssue,
@@ -998,6 +999,120 @@ describe("requiresPushCapabilityPreflight", () => {
       issueId: "issue-1",
       explicitRunScopedSkillKeys: ["paperclipai/bundled/software-development/github-pr-workflow"],
     })).toBe(false);
+  });
+});
+
+describe("requiresPushCredentialBinding", () => {
+  const prWorkflowSkill = ["paperclipai/bundled/software-development/github-pr-workflow"];
+  const brokerFlagsOn = {
+    PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on",
+    PAPERCLIP_AGENT_GH_WRAPPER: "on",
+  };
+
+  it("waives the binding when both broker flags are on and the adapter lane wires the broker", () => {
+    expect(requiresPushCredentialBinding({
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    })).toBe(false);
+
+    expect(requiresPushCredentialBinding({
+      adapterType: "claude_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: { engine: " ACP " },
+      flagEnv: brokerFlagsOn,
+    })).toBe(false);
+  });
+
+  it("keeps the binding when the broker cannot supply push credentials for the run", () => {
+    // engine auto can fall back to the Claude CLI lane, which wires neither gate
+    expect(requiresPushCredentialBinding({
+      adapterType: "claude_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    })).toBe(true);
+
+    expect(requiresPushCredentialBinding({
+      adapterType: "codex_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    })).toBe(true);
+
+    expect(requiresPushCredentialBinding({
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+    })).toBe(true);
+
+    expect(requiresPushCredentialBinding({
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+    })).toBe(true);
+  });
+
+  it("keeps the binding for a claude_local run pinned to the CLI engine", () => {
+    expect(requiresPushCredentialBinding({
+      adapterType: "claude_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: { engine: "cli" },
+      flagEnv: brokerFlagsOn,
+    })).toBe(true);
+  });
+
+  // The waiver trusts that opencode_local and the claude_local ACP lane install both broker
+  // gates, and that the claude_local CLI lane installs neither. Pin that contract to the
+  // adapter sources, so rewiring a lane cannot silently leave the waiver pointing at a lane
+  // with no broker credentials.
+  it("matches the lanes that actually install both broker gates", async () => {
+    const read = (rel: string) => fs.readFile(new URL(`../../../packages/${rel}`, import.meta.url), "utf8");
+    const gates = ["applyPaperclipGhWrapperGate(", "applyPaperclipGitHubCredentialHelperGate("];
+    const [opencode, acpx, claudeAcp, claudeCli] = await Promise.all([
+      read("adapters/opencode-local/src/server/execute.ts"),
+      read("adapter-utils/src/acpx-engine/execute.ts"),
+      read("adapters/claude-local/src/server/acp.ts"),
+      read("adapters/claude-local/src/server/execute.ts"),
+    ]);
+    for (const gate of gates) {
+      expect(opencode).toContain(gate);
+      expect(acpx).toContain(gate);
+      expect(claudeCli).not.toContain(gate);
+    }
+    expect(claudeAcp).toContain("createAcpxEngineExecutor");
+  });
+
+  it("never waives the push-remote checkout validation for a broker-wired run", async () => {
+    const input = {
+      adapterType: "opencode_local",
+      issueId: "issue-1",
+      explicitRunScopedSkillKeys: prWorkflowSkill,
+      adapterConfig: {},
+      flagEnv: brokerFlagsOn,
+    };
+    expect(requiresPushCredentialBinding(input)).toBe(false);
+    // The checkout gate keys on requiresPushCapabilityPreflight, which the broker does not waive.
+    expect(requiresPushCapabilityPreflight(input)).toBe(true);
+
+    const cwd = await createGitCheckout({ withRemote: false });
+    try {
+      await expect(assertPushCapabilityCheckoutValid({
+        enabled: requiresPushCapabilityPreflight(input),
+        issue: { id: "issue-1", identifier: "PAP-1" },
+        cwd,
+      })).rejects.toBeInstanceOf(WorkspaceValidationFailure);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
   });
 });
 

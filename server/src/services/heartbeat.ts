@@ -456,6 +456,8 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
+  isPaperclipGhWrapperEnabled,
+  isPaperclipGitHubCredentialHelperEnabled,
   readPaperclipSkillSyncPreference,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -1360,6 +1362,17 @@ function hasGithubPrWorkflowSkill(desiredSkills: string[]) {
   });
 }
 
+// Local adapter lanes that install the broker-minted git credential helper and gh
+// shim when both agent-lane GitHub App flags are on. claude_local qualifies only
+// with engine pinned to "acp": its auto engine can fall back to the CLI lane,
+// which wires neither gate.
+function localAdapterLaneWiresGitHubBroker(adapterType: string, adapterConfig: Record<string, unknown>) {
+  if (adapterType === "opencode_local") return true;
+  if (adapterType !== "claude_local") return false;
+  const engine = typeof adapterConfig.engine === "string" ? adapterConfig.engine.trim().toLowerCase() : "";
+  return engine === "acp";
+}
+
 export function requiresPushCapabilityPreflight(input: {
   adapterType: string;
   issueId: string | null | undefined;
@@ -1370,6 +1383,29 @@ export function requiresPushCapabilityPreflight(input: {
     GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType) &&
     hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys)
   );
+}
+
+/**
+ * Whether a push-capable run must carry a GH_TOKEN/GITHUB_TOKEN binding. Narrower
+ * than `requiresPushCapabilityPreflight`, which also gates the independent
+ * push-remote checkout validation and is not waived here.
+ */
+export function requiresPushCredentialBinding(input: {
+  adapterType: string;
+  issueId: string | null | undefined;
+  explicitRunScopedSkillKeys: string[];
+  adapterConfig?: Record<string, unknown>;
+  /** Server process env holding the broker rollout flags; read only. */
+  flagEnv?: Record<string, string | undefined>;
+}) {
+  if (!requiresPushCapabilityPreflight(input)) return false;
+  // A broker-wired run pushes with a fleet-App installation token minted per
+  // git/gh call, so demanding a GH_TOKEN/GITHUB_TOKEN binding here only kept the
+  // personal PAT bound to every agent (SUP-15639).
+  const flagEnv = input.flagEnv ?? {};
+  const brokerFlagsOn =
+    isPaperclipGitHubCredentialHelperEnabled(flagEnv) && isPaperclipGhWrapperEnabled(flagEnv);
+  return !(brokerFlagsOn && localAdapterLaneWiresGitHubBroker(input.adapterType, input.adapterConfig ?? {}));
 }
 
 const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
@@ -20611,6 +20647,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
         explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
       });
+      const pushCredentialBindingRequired = requiresPushCredentialBinding({
+        adapterType: agent.adapterType,
+        issueId,
+        explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
+        adapterConfig: executionRunConfig,
+        flagEnv: process.env, // spawn-env-guard: read-only — only the broker rollout flags are read; nothing reaches a child env
+      });
       // Fork policy: agents run on HOST git credentials. Upstream #12843 projects a
       // resolved GitHub credential into the run env, and that projection both
       // overrides GH_TOKEN/GITHUB_TOKEN and clears ambient credential helpers
@@ -20657,7 +20700,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ],
               }
             : {}),
-          requiredScopedEnvBinding: pushCapabilityPreflightRequired
+          requiredScopedEnvBinding: pushCredentialBindingRequired
             ? {
                 keys: [...PUSH_CAPABILITY_ENV_KEYS],
                 consumerScopes: ["agent", "project"],
