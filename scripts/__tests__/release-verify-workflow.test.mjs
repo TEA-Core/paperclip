@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -132,4 +132,123 @@ test("release verify workflow covers the same split test surface as stable PR ve
 
   assert.match(verifyWorkflow, /pnpm test:run:general -- --group/);
   assert.match(verifyWorkflow, /pnpm test:run:serialized -- --shard-index/);
+});
+
+// Step names per job, read from each job's `steps:` list. A step's `name` can
+// sit on its `- ` line or on any later key line of that step, so this tracks
+// step boundaries instead of matching `- name:` alone. Keys nested deeper than
+// the step's own keys (a `with: name:` input, say) are not step names, and
+// neither are `- name:` entries outside `steps:` (a matrix `include:` list).
+// Line-based on purpose: the policy job runs this before any install, and a
+// YAML parser would be a new dependency, which means a lockfile edit.
+function stepNamesByJob(text) {
+  const lines = text.split("\n");
+  const jobs = new Map();
+  const jobsAt = lines.findIndex((line) => /^jobs:\s*$/.test(line));
+  if (jobsAt === -1) return jobs;
+  const unquote = (value) => value.replace(/^(["'])(.*)\1$/, "$2");
+  let names = null;
+  let stepsIndent = -1;
+  let itemIndent = -1;
+  for (const line of lines.slice(jobsAt + 1)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.search(/\S/);
+    const job = line.match(/^ {2}([A-Za-z0-9_-]+):\s*$/);
+    if (job) {
+      names = [];
+      jobs.set(job[1], names);
+      stepsIndent = -1;
+      itemIndent = -1;
+      continue;
+    }
+    if (!names) continue;
+    const item = line.match(/^(\s*)-\s+(.*)$/);
+    if (stepsIndent !== -1) {
+      const leftSteps = indent < stepsIndent || (indent === stepsIndent && !item);
+      if (leftSteps) {
+        stepsIndent = -1;
+        itemIndent = -1;
+      }
+    }
+    if (stepsIndent === -1) {
+      const steps = line.match(/^(\s+)steps:\s*$/);
+      if (steps) stepsIndent = steps[1].length;
+      continue;
+    }
+    if (item && (itemIndent === -1 || item[1].length === itemIndent)) {
+      itemIndent = item[1].length;
+      const inline = item[2].match(/^name:\s*(.+?)\s*$/);
+      if (inline) names.push(unquote(inline[1]));
+      continue;
+    }
+    const key = line.match(/^(\s*)name:\s*(.+?)\s*$/);
+    if (key && key[1].length === itemIndent + 2) names.push(unquote(key[2]));
+  }
+  return jobs;
+}
+
+function duplicateStepNames(text) {
+  const offenders = [];
+  for (const [job, names] of stepNamesByJob(text)) {
+    const seen = new Map();
+    for (const name of names) seen.set(name, (seen.get(name) ?? 0) + 1);
+    for (const [name, count] of seen) {
+      if (count > 1) offenders.push(`${job}: "${name}" x${count}`);
+    }
+  }
+  return offenders;
+}
+
+test("no workflow repeats a step name within one job", () => {
+  // A 3-way merge that resolves a conflicted region by keeping BOTH sides
+  // leaves a whole step twice, back to back, with no conflict marker. YAML
+  // accepts it and Actions runs both copies. Fold 1446a58c0 (2026-08-30) did
+  // exactly that to publish_stable's "Build Docker images for the stable tag"
+  // step, so every stable release dispatched docker.yml twice at the same tag.
+  // A repeated step name inside one job is how that defect shows up in a
+  // workflow, and no workflow here repeats one on purpose. If a future step
+  // genuinely needs the same label, rename one of them.
+  const workflowsDir = path.join(repoRoot, ".github/workflows");
+  const offenders = [];
+  for (const file of readdirSync(workflowsDir).filter((name) => /\.ya?ml$/.test(name))) {
+    for (const offender of duplicateStepNames(readWorkflow(file))) {
+      offenders.push(`${file} > ${offender}`);
+    }
+  }
+  assert.deepEqual(offenders, [], `duplicated steps:\n${offenders.join("\n")}`);
+});
+
+test("the step-name parser reads names in any key order and skips non-step names", () => {
+  const workflow = [
+    "jobs:",
+    "  build:",
+    "    strategy:",
+    "      matrix:",
+    "        include:",
+    "          - name: linux",
+    "          - name: linux",
+    "    steps:",
+    "      - name: Checkout",
+    "        uses: actions/checkout@v4",
+    "      - uses: actions/upload-artifact@v4",
+    "        name: Upload",
+    "        with:",
+    "          name: Upload",
+    "      - run: echo done",
+    "        name: 'Upload'",
+    "  other:",
+    "    steps:",
+    "    - name: Upload",
+    "",
+  ].join("\n");
+
+  // `name` after `uses:`/`run:` counts, a quoted name matches an unquoted one,
+  // the `with: name:` input does not count, the matrix entries do not count,
+  // and a list written at the same indent as `steps:` still parses.
+  assert.deepEqual([...stepNamesByJob(workflow)], [
+    ["build", ["Checkout", "Upload", "Upload"]],
+    ["other", ["Upload"]],
+  ]);
+  assert.deepEqual(duplicateStepNames(workflow), ['build: "Upload" x2']);
 });
