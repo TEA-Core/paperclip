@@ -488,22 +488,6 @@ export function observeDivergedRefusal(
   );
 }
 
-/**
- * Test-only synchronization seam on the observe/claim path. Inert in production
- * and in every test that does not install a hook: when unset it is a no-op. The
- * multi-process crash test installs a hook that reports it has been reached and
- * then blocks, so a forked worker can be SIGKILLed deterministically after the
- * observation has decided the age but before the O_EXCL claim — proving a
- * mid-observe crash cannot wedge the episode. This adds no lock and no
- * dependency; it is a no-op on the real path.
- */
-let observeSeamHook: (() => void | Promise<void>) | null = null;
-
-/** Install (or clear with `null`) the observe/claim seam hook. Test-only. */
-export function _installDivergenceObserveSeam(hook: (() => void | Promise<void>) | null): void {
-  observeSeamHook = hook;
-}
-
 async function recordDivergedRefusal(
   repoRoot: string,
   input: DivergedRefusalObservationInput,
@@ -528,12 +512,6 @@ async function recordDivergedRefusal(
   const { firstObservedAtMs, lastObservedAtMs } = foldObservation(firstCandidates, lastCandidates, nowMs, nowMs);
   const ageMs = Math.max(0, nowMs - firstObservedAtMs);
   const alertDue = ageMs >= thresholdMs;
-
-  // Test-only seam: reached now that the observation has folded the state and
-  // decided the age, before the O_EXCL claim. No hook is installed in production,
-  // so this is a no-op on the real path; the crash test installs one to pause a
-  // forked worker here so a SIGKILL cannot have created the episode's marker.
-  if (observeSeamHook) await observeSeamHook();
 
   // The alert decision IS one atomic create: an O_EXCL marker for this episode.
   // Attempted ONLY when the threshold is already crossed, so a below-threshold

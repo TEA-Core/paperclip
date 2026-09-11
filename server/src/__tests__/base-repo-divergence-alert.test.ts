@@ -126,36 +126,38 @@ const deadline = Date.now() + 8000;
 })();
 `;
 
-/** T3: child imports the service, installs a blocking seam hook, and enters
- *  observeDivergedRefusal. When it reaches the observe/claim seam (after the age
- *  has been decided, before the O_EXCL create) it reports `seam-<pid>` and blocks;
- *  the parent SIGKILLs it there, so the create never runs and no marker can exist.
- *  This is a real mid-observe crash, not a pre-observe sleep. */
+/** T3: real mid-observe crash. The child monkey-patches the shared
+ *  `node:fs/promises.open` BEFORE importing the service, so the one O_EXCL claim
+ *  open — reached only after the observation has folded the state and decided the
+ *  age — writes a `seam-<pid>` file and then blocks forever. The parent SIGKILLs
+ *  the child there, so the create never completes and no marker can exist. The
+ *  seam lives entirely in this test-local probe; it requires no new service
+ *  export. */
 const PROBE_KILL = `
 import { pathToFileURL } from "node:url";
 import fsSync from "node:fs";
+import fsP from "node:fs/promises";
 import path from "node:path";
 const [repoRoot, baseRef, nowMs, thresholdMs, readyDir] = process.argv.slice(2);
+// Test-local seam: intercept the shared fs.open so the O_EXCL claim create
+// (the only O_EXCL open the service ever performs) signals and blocks before it
+// can land on disk.
+const realOpen = fsP.open;
+const O_EXCL = fsSync.constants.O_EXCL;
+fsP.open = (file, flags, ...rest) => {
+  if (typeof flags === "number" && (flags & O_EXCL) !== 0) {
+    fsSync.writeFileSync(path.join(readyDir, "seam-" + process.pid), "1");
+    return new Promise(() => {}); // block forever; the parent SIGKILLs us here
+  }
+  return realOpen(file, flags, ...rest);
+};
 (async () => {
   const m = await import(pathToFileURL(process.env.SUP15700_SVC).href);
-  // Deterministic mid-observe pause: report the seam, then block until a "go"
-  // marker appears (the parent never writes one; it SIGKILLs us instead).
-  m._installDivergenceObserveSeam(async () => {
-    fsSync.writeFileSync(path.join(readyDir, "seam-" + process.pid), "1");
-    for (;;) {
-      let go = false;
-      try {
-        go = fsSync.existsSync(path.join(readyDir, "go"));
-      } catch {}
-      if (go) break;
-      await new Promise((r) => setTimeout(r, 25));
-    }
-  });
   const obs = await m.observeDivergedRefusal(repoRoot, {
     baseRef, repoIdentity: repoRoot, aheadCount: 3, behindCount: 1,
     aheadCommitSubjects: ["a"], nowMs: Number(nowMs), thresholdMs: Number(thresholdMs),
   });
-  // Unreachable in the crash test: we are killed at the seam before this runs.
+  // Unreachable in the crash test: the O_EXCL open blocks before it completes.
   process.stdout.write(JSON.stringify({ reached: true, shouldEmit: obs.shouldEmitFirstClassSignal }) + "\\n");
 })().catch((e) => process.stdout.write(JSON.stringify({ error: String(e) }) + "\\n"));
 `;
@@ -628,8 +630,9 @@ describe("crash resilience (T3)", () => {
     await fs.writeFile(probeFile, PROBE_KILL, "utf8");
 
     const child = spawnProbe(probeFile, [root, "main", String(now), String(7 * DAY), readyDir], tsxCli);
-    // The child has entered observeDivergedRefusal and reached the observe/claim
-    // seam: the age is decided, but the O_EXCL create has NOT run yet.
+    // The child has entered observeDivergedRefusal and is blocked inside the
+    // O_EXCL claim create (its patched fs.open): the age is decided, but the
+    // marker file has NOT been created yet.
     await waitForFile(readyDir, "seam-", 8000);
     expect(await listAlertMarkers(root), "no marker may exist while paused pre-claim").toEqual([]);
 
@@ -826,6 +829,8 @@ describe("export surface (T6)", () => {
     expect(mod.releaseDivergenceClaim).toBeUndefined();
     expect(mod.readDivergenceClaimLock).toBeUndefined();
     expect(mod.isDivergenceClaimOwnerLive).toBeUndefined();
+    // No test-only synchronization seam may leak into the public surface.
+    expect(mod._installDivergenceObserveSeam).toBeUndefined();
     // The O_EXCL marker primitive (and its helpers) IS the exported surface.
     expect(typeof mod.observeDivergedRefusal).toBe("function");
     expect(typeof mod.divergenceAlertMarkerPath).toBe("function");
