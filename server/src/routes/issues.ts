@@ -843,7 +843,14 @@ async function applyReviewEscalationDecision(args: {
   // A final-stage approval completes every execution stage; the engine leaves the
   // issue status untouched, so route the card back to its return assignee to close.
   if (requestedStatus === "done" && updateFields.status === undefined) {
-    const returnAssignee = existingState.returnAssignee ?? null;
+    // A summary-generation card's approval hand-back must land on the Summarizer
+    // (the only writer of its slot), never on a policy `returnAssigneeAgentId`
+    // (SUP-15768). Ordinary issues resolve to null here, so they keep routing to
+    // their stored return assignee.
+    const returnAssignee =
+      (await resolveSummaryGenerationReturnAssignee(db, issue)) ??
+      existingState.returnAssignee ??
+      null;
     updateFields.status = "in_progress";
     if (returnAssignee?.type === "agent") {
       updateFields.assigneeAgentId = returnAssignee.agentId ?? null;

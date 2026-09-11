@@ -713,6 +713,29 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(forced).toEqual({ type: "agent", agentId: summarizerAgentId, userId: null });
     });
 
+    it("routes to the Summarizer even when the built-in is needs_setup (agentId present, status not ready)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      // Simulate the Summarizer losing its adapter config after the generation
+      // task was created. The slot link and generation issue persist, and a
+      // review bounce must still land on the Summarizer (the only writer of the
+      // slot), not on a policy `returnAssigneeAgentId` (SUP-15768 round-2 finding A).
+      await db
+        .update(agents)
+        .set({ adapterConfig: {} })
+        .where(eq(agents.id, summarizerAgentId));
+
+      const forced = await resolveSummaryGenerationReturnAssignee(db, {
+        id: generated.generatingIssue.id,
+        companyId,
+      });
+      expect(forced).toEqual({ type: "agent", agentId: summarizerAgentId, userId: null });
+    });
+
     it("returns null for an issue that is not a linked generation task", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);

@@ -96,6 +96,12 @@ const mockDb = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+// The summary-generation forced-return resolver (SUP-15768). issues.ts imports
+// this directly from ../services/summary-slots.js, so it is not covered by the
+// ../services/index.js module mock. Default resolves null (a non-summary issue
+// keeps its stored return assignee); individual tests override it to force the
+// Summarizer and assert the hand-back routes there.
+const mockResolveSummaryGenerationReturnAssignee = vi.hoisted(() => vi.fn(async () => null));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
@@ -213,6 +219,15 @@ function registerModuleMocks() {
       refreshIssueObjects: vi.fn(async () => []),
     }),
   }));
+  // Swap only the resolver for the forced-return routing tests; keep every other
+  // summary-slot export real so the app-under-test is unaffected.
+  vi.doMock("../services/summary-slots.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../services/summary-slots.js")>();
+    return {
+      ...actual,
+      resolveSummaryGenerationReturnAssignee: mockResolveSummaryGenerationReturnAssignee,
+    };
+  });
 }
 
 type TestActor =
@@ -262,6 +277,7 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../services/external-objects.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.addComment.mockImplementation(async (_id: string, body: string) => ({
@@ -2615,6 +2631,81 @@ describe("issue execution policy routes", () => {
           }),
         }),
       );
+    });
+
+    it("SUP-15768: approving a summary-generation escalation hands the card back to the Summarizer, not returnAssigneeAgentId", async () => {
+      const summarizerAgentId = "66666666-6666-4666-8666-666666666666";
+      const issue = escalatedRoundCapIssue();
+      const pending = pendingEscalationInteraction();
+      // The card is a summary-generation task: the forced-return resolver
+      // yields the Summarizer even though the policy's stored return assignee is
+      // a plain (non-Summarizer) agent.
+      mockResolveSummaryGenerationReturnAssignee.mockResolvedValue({
+        type: "agent",
+        agentId: summarizerAgentId,
+        userId: null,
+      });
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({
+        ...issue,
+        status: "in_progress",
+        assigneeAgentId: summarizerAgentId,
+        assigneeUserId: null,
+      } as any);
+      mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
+      mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
+        interaction: {
+          ...pending,
+          status: "accepted",
+          result: { version: 1, outcome: "accepted" },
+        },
+        createdIssues: [],
+        continuationIssue: null,
+      });
+      captureDecisionInsert();
+      mockDbSelectWhere.mockImplementation(() => {
+        const resolveDefault = (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([{
+            id: "55555555-5555-4555-8555-555555555555",
+            companyId: "company-1",
+            agentId: "33333333-3333-4333-8333-333333333333",
+            contextSnapshot: { issueId },
+            permissions: null,
+          }]).then(onFulfilled, onRejected);
+        const chain: Record<string, unknown> = {
+          for: () => ({ then: resolveDefault }),
+          orderBy: () => chain,
+          limit: () => chain,
+          then: resolveDefault,
+        };
+        return chain;
+      });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      });
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(mockResolveSummaryGenerationReturnAssignee).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ id: issueId, companyId: "company-1" }),
+      );
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      // The card routes to the Summarizer, not the policy return assignee.
+      expect(updatePatch).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: summarizerAgentId,
+        assigneeUserId: null,
+      });
+      expect(updatePatch.assigneeAgentId).not.toBe(returnAssigneeAgentId);
     });
 
     it("rejecting the escalation records a changes_requested decision, resets rounds, and returns the card to the return assignee", async () => {

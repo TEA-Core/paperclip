@@ -144,6 +144,14 @@ function scopeLabel(scopeKind: SummarySlotScopeKind): string {
  * Summarizer principal when the issue is an active (or terminal-cleared)
  * generation task for some slot in its company, and `null` otherwise so
  * non-summary issues keep their normal return-assignee routing.
+ *
+ * The Summarizer is routed on its `agentId` alone, not on built-in status: a
+ * paused/`needs_setup` Summarizer is still the single writer of its slot, so a
+ * bounce must land there rather than fall back to a policy `returnAssigneeAgentId`
+ * that cannot write the slot (SUP-15768). The `agentId` is always present
+ * whenever `generate()` created the generation issue, so the `!builtIn.agentId`
+ * guard only covers the degenerate "Summarizer no longer provisioned" case,
+ * which `generate()` does not produce.
  */
 export async function resolveSummaryGenerationReturnAssignee(
   db: Db,
@@ -161,7 +169,7 @@ export async function resolveSummaryGenerationReturnAssignee(
     .then((rows) => rows[0] ?? null);
   if (!slot) return null;
   const builtIn = await builtInAgentService(db).get(issue.companyId, SUMMARIZER_BUILT_IN_KEY);
-  if (builtIn.status !== "ready" || !builtIn.agentId) return null;
+  if (!builtIn.agentId) return null;
   return { type: "agent", agentId: builtIn.agentId, userId: null };
 }
 
