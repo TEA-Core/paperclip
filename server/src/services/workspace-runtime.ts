@@ -1207,6 +1207,10 @@ async function remoteExists(repoRoot: string, remote: string): Promise<boolean> 
  * can be resolved it falls back to the resolved checkout path, which stays
  * deterministic for that checkout. Fail-open: a git error never blocks
  * provisioning, it only degrades the identity to the path fallback.
+ * Cross-reference (do NOT confuse the two): destructive cross-process reflog
+ * rewrites must be serialized on the fail-CLOSED mutex identity in
+ * server/src/services/base-repo-reset-lease.ts (keyed on the realpath'd
+ * `git rev-parse --git-common-dir`), not on this fail-open episode identity.
  */
 async function resolveCanonicalBaseRepoIdentity(repoRoot: string): Promise<string> {
   const pathFallback = path.resolve(repoRoot);
