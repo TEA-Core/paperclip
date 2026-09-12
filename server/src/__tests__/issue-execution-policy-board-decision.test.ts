@@ -317,6 +317,56 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     ).not.toThrow();
   });
 
+  it("refuses a board approval when the board user is the delivery author and no return assignee is set", () => {
+    const policy = reviewOnlyPolicy();
+    const reviewStage = policy.stages[0];
+    const makeIssue = () => ({
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStage.id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: null,
+        deliveryAuthor: { type: "user", agentId: null, userId: ctoUserId },
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        changesRequestedCount: 0,
+      },
+    });
+
+    // With no `returnAssignee`, only `deliveryAuthor` records who the delivery
+    // belongs to. The old return-assignee-only guard left this shape unrefused:
+    // the board user could approve their own delivery. The canonical resolver
+    // falls back to `deliveryAuthor` and refuses it.
+    expect(() =>
+      applyBoardStageDecision({
+        issue: makeIssue(),
+        policy,
+        decision: "approved",
+        commentBody: "board: approving my own delivery",
+        actorUserId: ctoUserId,
+      }),
+    ).toThrowError(BoardStageSelfApprovalError);
+
+    // A different board user may still approve it.
+    expect(() =>
+      applyBoardStageDecision({
+        issue: makeIssue(),
+        policy,
+        decision: "approved",
+        commentBody: "board: approving someone else's delivery",
+        actorUserId: "a-different-board-user",
+      }),
+    ).not.toThrow();
+  });
+
   it("skips a stage carrying a durable approved row even when its projection was cleared", () => {
     const policy = twoStagePolicy();
     const reviewStage = policy.stages[0];
@@ -350,13 +400,55 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     });
 
     // S1's projection is empty but it carries a durable approved row: the board
-    // acts on the next undecided stage instead of silently superseding it.
+    // acts on the next undecided stage instead of silently superseding it. The
+    // completed projection must also carry the durably-decided S1 id — otherwise
+    // the cleared projection would let a later decision re-target and supersede
+    // it (SUP-15805 addendum item 3 regression).
     expect(result.targetStage.id).toBe(approvalStage.id);
     expect(result.patch.status).toBe("in_progress");
     expect(result.patch.executionState).toMatchObject({
       status: "completed",
-      completedStageIds: [approvalStage.id],
+      completedStageIds: [reviewStage.id, approvalStage.id],
     });
+  });
+
+  it("clears a workflow-controlled assignee when the final stage has no return assignee", () => {
+    const policy = reviewOnlyPolicy();
+    const reviewStage = policy.stages[0];
+
+    const result = applyBoardStageDecision({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStage.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          returnAssignee: null,
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        },
+      },
+      policy,
+      decision: "approved",
+      commentBody: "board: final stage approved, no return assignee recorded",
+    });
+
+    // The ladder completed with no return assignee. The card cannot go
+    // `in_progress` (that requires an assignee) and must not be left assigned to
+    // the reviewer the board just decided against, so it is queued (`todo`) with
+    // the assignee explicitly cleared, mirroring the changes-requested hand-back.
+    expect(result.patch.status).toBe("todo");
+    expect(result.patch.assigneeAgentId).toBeNull();
+    expect(result.patch.assigneeUserId).toBeNull();
   });
 
   it("throws BoardStageNoUndecidedStageError when every stage is completed", () => {
