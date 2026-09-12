@@ -3,6 +3,7 @@ import { z } from "zod";
 import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
+  checkoutIssueSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   issueExecutionMonitorPolicySchema,
@@ -34,6 +35,26 @@ describe("issue validators", () => {
     });
     expect(stalledReviewDecisionSchema.parse({ action: "approve" })).toEqual({ action: "approve" });
     expect(stalledReviewDecisionSchema.parse({ action: "send_back" })).toEqual({ action: "send_back" });
+  });
+
+  it("rejects terminal statuses in checkout expectedStatuses so the route fails closed", () => {
+    const agentId = "22222222-2222-4222-8222-222222222222";
+
+    // A request that names a terminal status must be refused at validation,
+    // before the route can rebuild a closed execution worktree.
+    expect(checkoutIssueSchema.safeParse({ agentId, expectedStatuses: ["done"] }).success).toBe(false);
+    expect(checkoutIssueSchema.safeParse({ agentId, expectedStatuses: ["cancelled"] }).success).toBe(false);
+    // Terminal statuses mixed with live ones are still rejected.
+    expect(checkoutIssueSchema.safeParse({ agentId, expectedStatuses: ["done", "todo"] }).success).toBe(false);
+
+    // Live statuses keep validating; every in-repo caller passes one of these.
+    expect(checkoutIssueSchema.parse({ agentId, expectedStatuses: ["todo", "backlog", "blocked"] }))
+      .toEqual({ agentId, expectedStatuses: ["todo", "backlog", "blocked"] });
+    expect(checkoutIssueSchema.parse({ agentId, expectedStatuses: ["in_progress"] }))
+      .toEqual({ agentId, expectedStatuses: ["in_progress"] });
+
+    // Nonempty still required.
+    expect(checkoutIssueSchema.safeParse({ agentId, expectedStatuses: [] }).success).toBe(false);
   });
 
   it("passes real line breaks through unchanged", () => {
