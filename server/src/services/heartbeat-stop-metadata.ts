@@ -1,5 +1,13 @@
 export type HeartbeatRunOutcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
+/**
+ * SUP-15842: a run admitted to `running` that registered neither a child process nor an
+ * environment lease within the launch grace window was never actually launched. Kept distinct
+ * from `process_lost` so recovery evidence names a launch failure rather than a lost in-flight
+ * process or a server restart.
+ */
+export const DISPATCH_UNLAUNCHED_ERROR_CODE = "dispatch_unlaunched";
+
 export type HeartbeatRunStopReason =
   | "completed"
   | "interrupted"
@@ -9,6 +17,7 @@ export type HeartbeatRunStopReason =
   | "paused"
   | "max_turns_exhausted"
   | "process_lost"
+  | "dispatch_unlaunched"
   | "unmanaged_background_task_stopped"
   | "adapter_failed";
 
@@ -91,6 +100,7 @@ export function inferHeartbeatRunStopReason(input: {
   if (input.outcome === "timed_out") return "timeout";
   if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
+  if (input.outcome === "failed" && input.errorCode === DISPATCH_UNLAUNCHED_ERROR_CODE) return "dispatch_unlaunched";
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();
     if (message.includes("budget")) return "budget_paused";

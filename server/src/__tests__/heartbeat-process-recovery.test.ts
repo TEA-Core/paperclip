@@ -537,6 +537,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     contextSnapshot?: Record<string, unknown>;
     invocationSource?: string;
     updatedAt?: Date;
+    startedAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -597,7 +598,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ...(input?.runtimeMode ? { runtimeMode: input.runtimeMode } : {}),
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
-      startedAt: now,
+      startedAt: input?.startedAt ?? now,
       updatedAt: input?.updatedAt ?? new Date("2026-03-19T00:00:00.000Z"),
     });
 
@@ -1142,7 +1143,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     if (input.cause === "execution_review_participant_recovery") {
       expect(action.nextAction).toContain("failed review participant path");
-    } else if (input.cause === "process_lost") {
+    } else if (input.cause === "process_lost" || input.cause === "dispatch_unlaunched") {
       expect(action.nextAction).toContain("Retry the original assignee from durable progress");
     } else {
       expect(action.nextAction).toContain(
@@ -1873,7 +1874,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toMatchObject({
       id: secondAttempt.runId,
       status: "failed",
-      errorCode: "process_lost",
+      errorCode: "dispatch_unlaunched",
       processLossRetryCount: 1,
     });
     expect(secondAttemptRuns.some((run) => run.processLossRetryCount > 1)).toBe(
@@ -1899,7 +1900,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runId: secondAttempt.runId,
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
-      cause: "process_lost",
+      cause: "dispatch_unlaunched",
     });
   });
 
@@ -3024,6 +3025,152 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(lease?.status).toBe("failed");
     expect(lease?.releasedAt).toBeTruthy();
+  });
+
+  it("fast-fails a run admitted to running with no child and no lease as dispatch_unlaunched (SUP-15842)", async () => {
+    const recent = new Date(Date.now() - 60_000);
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      startedAt: recent,
+      updatedAt: recent,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Well inside the 5-minute process-loss threshold: only the short launch grace applies.
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const run = runs[0];
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("dispatch_unlaunched");
+    expect(run?.resultJson).toMatchObject({ stopReason: "dispatch_unlaunched" });
+    expect(run?.error).toContain("never launched");
+    expect(run?.error).not.toContain("server may have restarted");
+    expect(run?.error).not.toContain("Host restart detected");
+    expect(readHostRestartMarker(run?.resultJson as Record<string, unknown> | null)).toBeNull();
+    // SUP-15842: the reap carries bounded root-cause evidence (last dispatch step reached,
+    // lease outcome) so the next occurrence is self-describing instead of a bare process_lost.
+    expect(run?.resultJson).toMatchObject({
+      dispatchUnlaunched: {
+        dispatchStep: "admitted_running",
+        leaseOutcome: "no_active_lease_observed",
+        childHandleRegistered: false,
+        telemetryObserved: false,
+        adapterType: "opencode_local",
+        graceMs: 30_000,
+      },
+    });
+  });
+
+  it("does not reap a healthy dispatch still inside the launch grace", async () => {
+    // No child and no lease yet, but only just admitted: still dispatching, not a launch failure.
+    const recent = new Date(Date.now() - 5_000);
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      startedAt: recent,
+      updatedAt: recent,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const held = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(held.reaped).toBe(0);
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("running");
+  });
+
+  it("does not fast-fail a child-registered run as dispatch_unlaunched", async () => {
+    const recent = new Date(Date.now() - 60_000);
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      processPid: 999_999_999,
+      startedAt: recent,
+      updatedAt: recent,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Held back by the normal threshold: the process path, not the launch-failure path.
+    const held = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(held.reaped).toBe(0);
+    const stillRunning = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(stillRunning?.status).toBe("running");
+
+    // Once it does reap, it is a lost process — never a never-launched one.
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({ stopReason: "process_lost" });
+  });
+
+  it("does not fast-fail a run holding an active environment lease", async () => {
+    const recent = new Date(Date.now() - 60_000);
+    const { companyId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      startedAt: recent,
+      updatedAt: recent,
+    });
+    await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+    const heartbeat = heartbeatService(db);
+
+    const held = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(held.reaped).toBe(0);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("keeps process_lost and the host-restart marker for a never-launched run recorded on a previous boot", async () => {
+    const currentBootId = await resolveHostBootId();
+    expect(typeof currentBootId).toBe("string");
+    const recent = new Date(Date.now() - 60_000);
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      startedAt: recent,
+      updatedAt: recent,
+      contextSnapshot: { [HOST_BOOT_ID_CONTEXT_KEY]: "boot-previous-host" },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.error).toContain("Host restart detected");
+    const marker = readHostRestartMarker(run?.resultJson as Record<string, unknown> | null);
+    expect(marker).toMatchObject({
+      detected: true,
+      runBootId: "boot-previous-host",
+      currentBootId: currentBootId!,
+    });
   });
 
   it.skipIf(process.platform === "win32")(

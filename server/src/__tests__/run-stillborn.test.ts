@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildDispatchUnlaunchedEvidence,
+  buildDispatchUnlaunchedMessage,
   canDetectStillbornRun,
+  isDispatchUnlaunchedRun,
   isStillbornRun,
+  DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
   DEFAULT_STILLBORN_RUN_TTL_MS,
+  type DispatchUnlaunchedRunCandidate,
   type StillbornRunCandidate,
 } from "../services/run-stillborn.js";
 
@@ -96,5 +101,167 @@ describe("canDetectStillbornRun", () => {
     for (const adapterType of ["http", "process", "openclaw_gateway", "sandbox", null, undefined]) {
       expect(canDetectStillbornRun(adapterType)).toBe(false);
     }
+  });
+});
+
+/** The SUP-15842 run: admitted to running, then the spawn went dead before it launched anything. */
+function dispatchUnlaunchedRun(
+  overrides: Partial<DispatchUnlaunchedRunCandidate> = {},
+): DispatchUnlaunchedRunCandidate {
+  const admittedAt = new Date(NOW.getTime() - DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS - 1000);
+  return {
+    status: "running",
+    finishedAt: null,
+    startedAt: admittedAt,
+    createdAt: admittedAt,
+    updatedAt: admittedAt,
+    processPid: null,
+    processGroupId: null,
+    processStartedAt: null,
+    logBytes: null,
+    usageJson: null,
+    resultJson: null,
+    ...overrides,
+  };
+}
+
+describe("isDispatchUnlaunchedRun", () => {
+  it("detects a run past the grace with no child, no lease and no telemetry", () => {
+    expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun(), false, NOW)).toBe(true);
+  });
+
+  it("waits out the grace window before acting", () => {
+    const young = dispatchUnlaunchedRun({
+      startedAt: new Date(NOW.getTime() - 5_000),
+      createdAt: new Date(NOW.getTime() - 5_000),
+      updatedAt: new Date(NOW.getTime() - 5_000),
+    });
+    expect(isDispatchUnlaunchedRun(young, false, NOW)).toBe(false);
+  });
+
+  it("ignores runs that are not running or have already finished", () => {
+    expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun({ status: "queued" }), false, NOW)).toBe(false);
+    expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun({ status: "succeeded" }), false, NOW)).toBe(false);
+    expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun({ finishedAt: NOW }), false, NOW)).toBe(false);
+  });
+
+  it("never touches a run that registered a child process", () => {
+    for (const sign of [
+      { processPid: 4242 },
+      { processGroupId: 4242 },
+      { processStartedAt: new Date(NOW.getTime() - 60_000) },
+    ] as Array<Partial<DispatchUnlaunchedRunCandidate>>) {
+      expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun(sign), false, NOW)).toBe(false);
+    }
+  });
+
+  it("never touches a run that holds an active environment lease", () => {
+    expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun(), true, NOW)).toBe(false);
+  });
+
+  it("never touches a run that shows any dispatch telemetry", () => {
+    for (const sign of [
+      { logBytes: 1 },
+      { usageJson: { inputTokens: 10 } },
+      { resultJson: { stopReason: "completed" } },
+    ] as Array<Partial<DispatchUnlaunchedRunCandidate>>) {
+      expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun(sign), false, NOW)).toBe(false);
+    }
+  });
+
+  it("treats zero log bytes as no output rather than as output", () => {
+    expect(isDispatchUnlaunchedRun(dispatchUnlaunchedRun({ logBytes: 0 }), false, NOW)).toBe(true);
+  });
+
+  it("falls back to createdAt when the run recorded neither start nor update", () => {
+    expect(
+      isDispatchUnlaunchedRun(
+        dispatchUnlaunchedRun({ startedAt: null, updatedAt: null }),
+        false,
+        NOW,
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts a custom grace", () => {
+    const run = dispatchUnlaunchedRun({
+      startedAt: new Date(NOW.getTime() - 90_000),
+      createdAt: new Date(NOW.getTime() - 90_000),
+      updatedAt: new Date(NOW.getTime() - 90_000),
+    });
+    expect(isDispatchUnlaunchedRun(run, false, NOW, 60_000)).toBe(true);
+    expect(isDispatchUnlaunchedRun(run, false, NOW, 120_000)).toBe(false);
+  });
+});
+
+describe("buildDispatchUnlaunchedMessage", () => {
+  it("names a launch failure, not a restart or a lost process", () => {
+    const message = buildDispatchUnlaunchedMessage("agent-1", "opencode_local");
+    expect(message).toContain("never launched");
+    expect(message).toContain("opencode_local");
+    expect(message).not.toContain("server may have restarted");
+    expect(message).not.toContain("Host restart");
+  });
+});
+
+describe("buildDispatchUnlaunchedEvidence", () => {
+  it("records the admitted-running step, the missing lease and the absent child handle", () => {
+    const evidence = buildDispatchUnlaunchedEvidence({
+      adapterType: "opencode_local",
+      graceMs: DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
+      hasActiveEnvironmentLease: false,
+      processPid: null,
+      processGroupId: null,
+      processStartedAt: null,
+      logBytes: null,
+      usageJson: null,
+      resultJson: null,
+      lastProgressAt: NOW,
+    });
+    expect(evidence).toEqual({
+      dispatchStep: "admitted_running",
+      leaseOutcome: "no_active_lease_observed",
+      childHandleRegistered: false,
+      telemetryObserved: false,
+      adapterType: "opencode_local",
+      graceMs: DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
+      lastProgressAt: NOW.toISOString(),
+    });
+  });
+
+  it("reports an active lease and a registered child handle when either is present", () => {
+    const evidence = buildDispatchUnlaunchedEvidence({
+      adapterType: "claude_local",
+      graceMs: 45_000,
+      hasActiveEnvironmentLease: true,
+      processPid: 4242,
+      processGroupId: null,
+      processStartedAt: NOW,
+      logBytes: 0,
+      usageJson: null,
+      resultJson: null,
+      lastProgressAt: null,
+    });
+    expect(evidence.leaseOutcome).toBe("active_lease_present");
+    expect(evidence.childHandleRegistered).toBe(true);
+    expect(evidence.telemetryObserved).toBe(false);
+    expect(evidence.lastProgressAt).toBeNull();
+  });
+
+  it("flags telemetry when any log, usage or result evidence was written", () => {
+    const evidence = buildDispatchUnlaunchedEvidence({
+      adapterType: null,
+      graceMs: 30_000,
+      hasActiveEnvironmentLease: false,
+      processPid: null,
+      processGroupId: null,
+      processStartedAt: null,
+      logBytes: 0,
+      usageJson: { inputTokens: 10 },
+      resultJson: null,
+      lastProgressAt: null,
+    });
+    expect(evidence.adapterType).toBeNull();
+    expect(evidence.telemetryObserved).toBe(true);
   });
 });

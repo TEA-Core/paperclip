@@ -106,3 +106,138 @@ export function isSelfDeclaredRunExpired(
   if (refMs === 0) return false;
   return now.getTime() - refMs >= ttlMs;
 }
+
+/**
+ * SUP-15842: how long a run admitted to `running` may register neither a child process nor an
+ * environment lease before the reaper treats it as never actually launched.
+ *
+ * The window is deliberately short (a few multiples of the 30s sweep interval) because the
+ * signal is cheap to check and decisive: a healthy dispatch records its environment lease well
+ * before this bound, and a run still dispatching in this process is excluded via the in-flight
+ * handle, not via waiting out a threshold. The misdiagnosis this prevents (reaping as
+ * `process_lost` / "server may have restarted") otherwise only surfaces after the full 5-minute
+ * staleness gate.
+ */
+export const DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS = 30_000;
+
+export interface DispatchUnlaunchedRunCandidate {
+  status: string;
+  finishedAt: Date | null;
+  startedAt: Date | null;
+  createdAt: Date | null;
+  updatedAt: Date | null;
+  /** Child-process handle registered by the adapter during dispatch. */
+  processPid: number | null;
+  processGroupId: number | null;
+  processStartedAt: Date | null;
+  logBytes: number | null;
+  usageJson: unknown;
+  resultJson: unknown;
+}
+
+/**
+ * A run admitted to `running` that is past the grace window, has registered neither a child
+ * process nor an environment lease, and shows no dispatch telemetry was never actually launched:
+ * the spawn went dead / gone-quiet mid-dispatch. This is distinct from a lost in-flight process
+ * (`process_lost`) and from a stillborn run that did begin. Host-restart evidence and
+ * self-declared runs are handled by the reaper before this predicate and never reach it.
+ */
+export function isDispatchUnlaunchedRun(
+  run: DispatchUnlaunchedRunCandidate,
+  hasActiveEnvironmentLease: boolean,
+  now: Date,
+  graceMs: number = DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
+): boolean {
+  if (run.status !== "running" || run.finishedAt !== null) return false;
+  if (hasActiveEnvironmentLease) return false;
+  if (
+    run.processPid !== null ||
+    run.processGroupId !== null ||
+    run.processStartedAt !== null
+  ) {
+    return false;
+  }
+  if (run.logBytes !== null && run.logBytes > 0) return false;
+  if (run.usageJson != null) return false;
+  if (run.resultJson != null) return false;
+
+  // Reference the run's last-progress timestamp, matching the reaper's staleness gate: a dispatch
+  // that is progressing (even on another process) bumps updatedAt, while one that went dead/gone-
+  // quiet right after admission does not.
+  const referenceAt = run.updatedAt ?? run.startedAt ?? run.createdAt;
+  if (!referenceAt) return false;
+
+  return now.getTime() - referenceAt.getTime() >= graceMs;
+}
+
+export function buildDispatchUnlaunchedMessage(
+  agentId: string | null | undefined,
+  adapterType: string | null | undefined,
+  graceMs: number = DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
+): string {
+  const seconds = Math.round(graceMs / 1000);
+  const detail = adapterType ? ` via adapter '${adapterType}'` : "";
+  return (
+    `Run ${agentId ?? "?"} was admitted to running but never launched: ` +
+    `no child process or environment lease was registered within ${seconds}s of admission${detail}. ` +
+    `The dispatch did not start — this is a launch failure, not a server restart or a lost in-flight process.`
+  );
+}
+
+/**
+ * SUP-15842: bounded, non-secret root-cause evidence recorded when a run is reaped as
+ * `dispatch_unlaunched`.
+ *
+ * The reaper only ever observes the run's end state, so "last dispatch step reached" is the
+ * furthest milestone the observable row proves: admission to `running`. Nothing past it was
+ * ever registered — no child handle, no active environment lease, no dispatch telemetry — which
+ * is exactly the claim→launch window this defect sits in. The lease outcome is recorded
+ * explicitly so a later occurrence distinguishes "the lease request never completed / was not
+ * active at reap time" from "a lease existed and the child died" (the latter stays
+ * `process_lost`).
+ */
+export interface DispatchUnlaunchedEvidence {
+  /** Furthest dispatch milestone the observable row proves (admission only; nothing launched). */
+  dispatchStep: "admitted_running";
+  /** What the reaper observed about the environment-lease request. */
+  leaseOutcome: "no_active_lease_observed" | "active_lease_present";
+  /** No child-process handle (pid / group / start) was ever registered. */
+  childHandleRegistered: boolean;
+  /** No dispatch telemetry (log bytes / usage / result) was ever written. */
+  telemetryObserved: boolean;
+  adapterType: string | null;
+  /** The launch-grace window (ms) in effect when the run was reaped. */
+  graceMs: number;
+  /** The run's last-progress timestamp as ISO-8601, or null if none was recorded. */
+  lastProgressAt: string | null;
+}
+
+export function buildDispatchUnlaunchedEvidence(input: {
+  adapterType?: string | null;
+  graceMs: number;
+  hasActiveEnvironmentLease: boolean;
+  processPid: number | null;
+  processGroupId: number | null;
+  processStartedAt: Date | string | null;
+  logBytes: number | null;
+  usageJson: unknown;
+  resultJson: unknown;
+  lastProgressAt?: Date | string | null;
+}): DispatchUnlaunchedEvidence {
+  const lastProgressAt = input.lastProgressAt
+    ? new Date(input.lastProgressAt).toISOString()
+    : null;
+  return {
+    dispatchStep: "admitted_running",
+    leaseOutcome: input.hasActiveEnvironmentLease ? "active_lease_present" : "no_active_lease_observed",
+    childHandleRegistered:
+      input.processPid !== null ||
+      input.processGroupId !== null ||
+      input.processStartedAt !== null,
+    telemetryObserved:
+      (input.logBytes ?? 0) > 0 || input.usageJson != null || input.resultJson != null,
+    adapterType: typeof input.adapterType === "string" ? input.adapterType : null,
+    graceMs: input.graceMs,
+    lastProgressAt,
+  };
+}
