@@ -189,13 +189,13 @@ describe("paperclip MCP tools", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const tool = getTool("paperclipHeartbeatWorkSession");
-    const response = await tool.execute({ issueId: "PAP-1135", runId: "00000000-0000-0000-0000-000000000001" });
+    const response = await tool.execute({ issueId: "PAP-1135", runId: "f47ac10b-58cc-4372-a567-0e02b2c3d479" });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/work-session/heartbeat");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(String(init.body))).toEqual({ runId: "00000000-0000-0000-0000-000000000001" });
+    expect(JSON.parse(String(init.body))).toEqual({ runId: "f47ac10b-58cc-4372-a567-0e02b2c3d479" });
     expect(response.content[0]?.text).toContain("2026-08-09T14:00:00Z");
   });
 
@@ -208,7 +208,7 @@ describe("paperclip MCP tools", () => {
     const tool = getTool("paperclipCloseWorkSession");
     await tool.execute({
       issueId: "PAP-1135",
-      runId: "00000000-0000-0000-0000-000000000001",
+      runId: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
       outcome: "succeeded",
       summary: "All done",
     });
@@ -218,7 +218,7 @@ describe("paperclip MCP tools", () => {
     expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/work-session/close");
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
-      runId: "00000000-0000-0000-0000-000000000001",
+      runId: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
       outcome: "succeeded",
       summary: "All done",
     });
@@ -233,7 +233,9 @@ describe("paperclip MCP tools", () => {
       outcome: "bogus" as unknown as "succeeded",
     });
 
-    expect(response.content[0]?.text).toContain("Invalid enum value");
+    // zod 4.x renders enum rejections as "Invalid option: expected one of ..."
+    // (zod 3 used "Invalid enum value").
+    expect(response.content[0]?.text).toContain("Invalid option");
   });
 
   it("allows create issue requests to omit status so the API applies assignee defaults", async () => {
@@ -258,6 +260,7 @@ describe("paperclip MCP tools", () => {
       workMode: "standard",
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
+      parkDeliberately: false,
       requestDepth: 0,
       allowDuplicate: false,
     });
@@ -577,5 +580,35 @@ describe("paperclip MCP tools", () => {
     });
 
     expect(response.content[0]?.text).toContain("must not contain '..'");
+  });
+
+  it("resolves absolute /api-prefixed paths without double-prefixing the base", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApiRequest");
+    await tool.execute({
+      method: "GET",
+      path: "/api/health",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toBe("http://localhost:3100/api/health");
+  });
+
+  it("resolves relative and /api-prefixed paths to the same URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApiRequest");
+    await tool.execute({ method: "GET", path: "/health" });
+    await tool.execute({ method: "GET", path: "/api/health" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [relativeUrl] = fetchMock.mock.calls[0] as [string];
+    const [prefixedUrl] = fetchMock.mock.calls[1] as [string];
+    expect(String(relativeUrl)).toBe("http://localhost:3100/api/health");
+    expect(String(prefixedUrl)).toBe("http://localhost:3100/api/health");
   });
 });
