@@ -494,7 +494,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       returnOwnerAgentId: managerId,
       status: "active",
       cause: "review_stage_armed_stranded",
-      fingerprint: `review_stage_armed_stranded:${companyId}:${issueId}`,
+      fingerprint: `review_stage_armed_stranded:${companyId}:${issueId}:${stageId}:${managerId}`,
       wakePolicy: null,
       monitorPolicy: null,
       maxAttempts: null,
@@ -527,7 +527,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     });
     expect(activity?.details).toMatchObject({
       source: "recovery.reconcile_review_stage_armed_stranded",
-      fingerprint: `review_stage_armed_stranded:${companyId}:${issueId}`,
+      fingerprint: `review_stage_armed_stranded:${companyId}:${issueId}:${stageId}:${managerId}`,
     });
 
     // Detection must not touch the stage: no re-arm, no reassign, no status write.
@@ -708,6 +708,166 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(actions.some((action) => action.kind === "review_stage_armed_stranded")).toBe(false);
+  });
+
+  it("leaves a pending approval stage on an agent participant untouched (only review stages are wedged)", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: stageId,
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+          },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { id: randomUUID(), type: "agent", agentId: managerId, userId: null },
+        returnAssignee: null,
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        completedStageIds: [],
+        pendingSince: pastGraceDate().toISOString(),
+      },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // The `currentStageType === "review"` restriction keeps a pending *approval*
+    // stage out of the wedged-review classification even when its participant
+    // is an agent (SUP-15788 round-1 review finding: predicate).
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions.some((action) => action.kind === "review_stage_armed_stranded")).toBe(false);
+  });
+
+  it("mints the participant-owned action, not no_live_path_owner_unavailable, when the original assignee is unavailable", async () => {
+    const { companyId, managerId, prefix } = await seedCompany();
+    const pausedAgentId = await seedPausedAgent(companyId, managerId);
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", pausedAgentId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // The wedged review is classified BEFORE the assignee-recovery paths
+    // (SUP-15788 round-1 review finding: precedence): a paused assignee must not
+    // mint no_live_path_owner_unavailable ahead of the participant action.
+    expect(result.reviewStageArmedStranded).toBe(1);
+    expect(result.noLivePathOwnerUnavailable).toBe(0);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action?.kind).toBe("review_stage_armed_stranded");
+    expect(action?.ownerAgentId).toBe(managerId);
+    expect(action?.previousOwnerAgentId).toBe(pausedAgentId);
+  });
+
+  it("mints the participant-owned action, not no_live_path_unowned, when the original assignee is missing", async () => {
+    const { companyId, managerId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", null, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // A missing assignee no longer mints no_live_path_unowned for a card that
+    // carries a live review stage; the participant is the recovery target.
+    expect(result.reviewStageArmedStranded).toBe(1);
+    expect(result.noLivePathUnowned).toBe(0);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action?.kind).toBe("review_stage_armed_stranded");
+    expect(action?.ownerAgentId).toBe(managerId);
+    expect(action?.previousOwnerAgentId).toBeNull();
+  });
+
+  it("reconciles ownership to the new participant when the wedge identity changes", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    await recovery.reconcileStrandedAssignedIssues();
+
+    const [first] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(first?.ownerAgentId).toBe(managerId);
+    expect(first?.fingerprint).toBe(
+      `review_stage_armed_stranded:${companyId}:${issueId}:${stageId}:${managerId}`,
+    );
+
+    // The stage moves to a different agent participant after the wedge: the
+    // fingerprint no longer matches, so the upsert reconciles ownership in place
+    // instead of waking the prior participant (SUP-15788 round-1 finding: idempotency).
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { id: randomUUID(), type: "agent", agentId: coderId, userId: null },
+          returnAssignee: null,
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          completedStageIds: [],
+          pendingSince: pastGraceDate().toISOString(),
+        },
+        updatedAt: pastGraceDate(),
+      })
+      .where(eq(issues.id, issueId));
+
+    await recovery.reconcileStrandedAssignedIssues();
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    const active = actions.filter((action) => action.status === "active");
+    expect(active).toHaveLength(1);
+    expect(active[0].ownerAgentId).toBe(coderId);
+    expect(active[0].fingerprint).toBe(
+      `review_stage_armed_stranded:${companyId}:${issueId}:${stageId}:${coderId}`,
+    );
   });
 
   it("branch 3: non-in_review issue with paused assignee past grace window creates no_live_path_owner_unavailable recovery action", async () => {
