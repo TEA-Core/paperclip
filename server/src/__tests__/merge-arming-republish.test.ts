@@ -337,6 +337,9 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       projectId,
       projectWorkspaceId,
       executionWorkspaceId,
+      // ADR-091 D1 (SUP-15909): the shared-workspace owner is the card's genuine
+      // ADR-083 carrier ancestor, so wire it as the card's parent.
+      ...(parentOwnerIssueId ? { parentId: parentOwnerIssueId } : {}),
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
@@ -831,6 +834,12 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
      * carrier-child shape. Default undefined leaves the row isolated.
      */
     sharedWorkspaceOwnerBranch?: string;
+    /**
+     * ADR-091 D1 (SUP-15909): when true together with sharedWorkspaceOwnerBranch,
+     * the owner issue is NOT wired as the card's parent, so it is an UNRELATED
+     * (non-ancestor) owner — the laundering shape D1 must refuse.
+     */
+    unrelatedOwner?: boolean;
   }
 
   async function seedIssue(opts: SeedOpts = {}) {
@@ -941,6 +950,10 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       projectWorkspaceId,
       executionWorkspaceId,
       executionRunId: opts.executionRunId ?? null,
+      // ADR-091 D1 (SUP-15909): wire the carrier owner as a genuine strict ancestor
+      // (the card's parent) so the shared-workspace carrier row passes the ADR-083
+      // gate — UNLESS the test explicitly asks for an unrelated (non-ancestor) owner.
+      ...(carrierOwnerIssueId && !opts.unrelatedOwner ? { parentId: carrierOwnerIssueId } : {}),
     });
 
     return { companyId, issueId, agentId };
@@ -1033,6 +1046,47 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
     expect(res.body.details.recordedBranch).toBe("SUP-999-foreign-branch");
     expect(res.body.details.controlPlaneBranch).toBe("SUP-14824-branch");
+    // No partial write: status stays in_progress and no delivery recorded.
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
+  it("rejects deliveryIdentity when the recorded branch is owned by an unrelated (non-ancestor) issue (SUP-15909)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      sharedWorkspaceOwnerBranch: "SUP-14823-carrier-branch",
+      unrelatedOwner: true,
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    // The card's execution-workspace row is a shared row sourced to an UNRELATED
+    // issue (not its ancestor). Even though the recorded branch EXACTLY equals the
+    // row's branch_name, the gate must refuse: the card cannot be proven to have
+    // delivered on a branch it neither owns nor lawfully inherits. This is the
+    // write-time half of the ancestor check (CR: recorded-delivery-branch-ancestor-
+    // unvalidated).
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14823-carrier-branch",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(res.body.details.recordedBranch).toBe("SUP-14823-carrier-branch");
+    expect(res.body.details.controlPlaneBranch).toBe("SUP-14823-carrier-branch");
+    expect(res.body.details.ownerIssueId).toBeTruthy();
+    expect(res.body.details.reason).toMatch(/not its ADR-083 carrier owner/);
     // No partial write: status stays in_progress and no delivery recorded.
     const [row] = await db
       .select({ executionState: issues.executionState, status: issues.status })

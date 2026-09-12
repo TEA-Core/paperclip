@@ -242,12 +242,25 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       identifier?: string;
       deliveryIdentity?: boolean;
       /**
+       * ADR-091 D1 (SUP-15909): the card's `parent_id`, used to build a genuine
+       * strict-ancestor chain so a carrier owner (a strict ancestor of the card)
+       * passes the ADR-083 carrier gate in resolveCardDeliveryBranchOwnership.
+       */
+      parentId?: string;
+      /**
        * SUP-14783: make the card's execution-workspace row a `shared_workspace`
        * OWNED BY ANOTHER ISSUE, carrying that owner's branch — the shape every
        * TSP child card has. Default undefined leaves the row's sourceIssueId
        * null, which is the pre-existing fixture and must keep its verdicts.
        */
       sharedWorkspaceOwnerIssueId?: string;
+      /**
+       * ADR-091 D1 (SUP-15909): when true, a sharedWorkspaceOwnerIssueId owner is
+       * NOT wired as the card's ancestor — the UNRELATED-owner laundering shape D1
+       * must refuse. Default false: the owner is the card's parent (the real
+       * ADR-083 carrier shape).
+       */
+      sharedWorkspaceOwnerUnrelated?: boolean;
       branchName?: string;
     } = {},
   ) {
@@ -288,6 +301,14 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         .returning();
       executionWorkspaceId = ewRow!.id;
     }
+    // ADR-091 D1 (SUP-15909): a shared-workspace owner is the real ADR-083 carrier
+    // ancestor, so wire it as the card's parent by default (an explicit parentId
+    // wins; sharedWorkspaceOwnerUnrelated opts out to model an unrelated owner).
+    const ancestorParentId =
+      overrides.parentId ??
+      (overrides.sharedWorkspaceOwnerIssueId && !overrides.sharedWorkspaceOwnerUnrelated
+        ? overrides.sharedWorkspaceOwnerIssueId
+        : undefined);
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -296,6 +317,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       identifier: overrides.identifier ?? "SUP-42",
       projectId,
       executionWorkspaceId,
+      ...(ancestorParentId ? { parentId: ancestorParentId } : {}),
     });
     return issueId;
   }
@@ -1140,6 +1162,9 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       const CARRIER_BRANCH = "SUP-1-carrier-branch";
       const issueId = await insertIssue({
         identifier: "SUP-42",
+        // ADR-091 D1: the owner must be a genuine strict ancestor (the card's
+        // parent) for the shared-workspace carrier row to be legitimate.
+        parentId: ownerIssueId,
         sharedWorkspaceOwnerIssueId: ownerIssueId,
         branchName: CARRIER_BRANCH,
       });
@@ -1162,6 +1187,46 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(result.kind).toBe("resolved");
       if (result.kind === "resolved") {
         expect(result.headSha).toBe(APPROVED_HEAD);
+      }
+    });
+
+    // SUP-15909 negative control (unrelated owner): the laundering vector D1 closes
+    // is a card whose execution-workspace row is borrowed from an issue that is NOT
+    // its ADR-083 carrier owner. Even when the recorded identity EXACTLY names that
+    // foreign branch, the card must not arm on it — the branch is not provably one
+    // this card delivered. This is the approval-time half of the ancestor check.
+    it("refuses approval when the recorded branch is owned by an unrelated (non-ancestor) issue (SUP-15909)", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      const FOREIGN_BRANCH = "SUP-1-carrier-branch";
+      // No ancestor: the "owner" is NOT an ancestor of the card, so the shared row
+      // is an unrelated owner — the shape D1 must refuse.
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        sharedWorkspaceOwnerUnrelated: true,
+        branchName: FOREIGN_BRANCH,
+      });
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: OWNER, repo: REPO },
+            branch: FOREIGN_BRANCH,
+            headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      // A PR really sitting on that foreign branch — but the card may not arm on it.
+      await insertMention(issueId, { number: 42, headRefName: FOREIGN_BRANCH });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          "delivery_identity_unresolved: this card's execution-workspace branch is owned by another issue that is not its ADR-083 carrier owner (not a strict ancestor passing the carrier gate); refusing to arm on a branch this card cannot be proven to have delivered (ADR-091 D1); refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
       }
     });
 
