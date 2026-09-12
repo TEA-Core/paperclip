@@ -147,6 +147,7 @@ import {
   documentService,
   documentAnnotationService,
   logActivity,
+  logActivityInTransaction,
   publishActivity,
   projectService,
   routineService,
@@ -13035,7 +13036,14 @@ export function issueRoutes(
         ));
       missingApprovalStageGap = diagnoseMissingApprovalStage({
         policy: nextExecutionPolicy,
-        childCount: childRows.filter((child) => child.status !== "cancelled").length,
+        // Count only rows with a determinate non-cancelled status. In production
+        // every row is a child issue (NOT NULL status column), so this is a
+        // no-op; it keeps the probe from counting a statusless/non-issue row that
+        // a query-level mock can return, which would otherwise miscount a
+        // childless card as having children (SUP-15878).
+        childCount: childRows.filter(
+          (child) => typeof child.status === "string" && child.status !== "cancelled",
+        ).length,
       });
     }
     // The typed ladder-gap refusal (raised under the update lock below) replaces
@@ -13220,6 +13228,14 @@ export function issueRoutes(
         missingApprovalStageGap !== null
         && requestedTransitionStatus === "done"
         && existing.status !== "done"
+      )
+      || (
+        // The in_review completion signal must commit with the transition
+        // (durable before the response), so it is written inside this same
+        // transaction rather than after commit.
+        missingApprovalStageGap !== null
+        && effectiveStatus === "in_review"
+        && existing.status !== "in_review"
       );
     try {
       if (shouldUseTransactionalIssueUpdate) {
@@ -13312,6 +13328,38 @@ export function issueRoutes(
 
           await persistReviewTransitionActivity(tx, updated);
 
+          // SUP-15878: record the in_review completion signal inside the update
+          // transaction so the durable row commits atomically with the status
+          // transition. Using the transactional logger (which propagates errors)
+          // means a persistence failure aborts the transaction and the transition
+          // does not commit — the route can never report success while the row is
+          // missing.
+          if (
+            missingApprovalStageGap
+            && effectiveStatus === "in_review"
+            && existing.status !== "in_review"
+          ) {
+            await logActivityInTransaction(tx as unknown as Db, {
+              companyId: existing.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+              action: "issue.in_review_missing_approval_stage",
+              entityType: "issue",
+              entityId: updated.id,
+              issueId: updated.id,
+              details: {
+                identifier: updated.identifier ?? null,
+                childCount: missingApprovalStageGap.childCount,
+                stageTypes: missingApprovalStageGap.stageTypes,
+                source: "in_review",
+              },
+            });
+          }
+
           return updated;
         });
       } else if (shouldRelayStop) {
@@ -13359,30 +13407,40 @@ export function issueRoutes(
         && (err.details as Record<string, unknown> | null | undefined)?.code
           === MISSING_APPROVAL_STAGE_ERROR_CODE
       ) {
-        void logActivity(db, {
-          companyId: existing.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-          action: "issue.done_missing_approval_stage_refused",
-          entityType: "issue",
-          entityId: existing.id,
-          issueId: existing.id,
-          details: {
-            identifier: existing.identifier ?? null,
-            childCount: missingApprovalStageGap.childCount,
-            stageTypes: missingApprovalStageGap.stageTypes,
-            source: "done",
-          },
-        }).catch((logErr) => {
+        // SUP-15878: the update transaction rolled back (the close was refused),
+        // so the durable refusal signal is written in its own awaited
+        // transaction. Awaiting — through the transactional logger, which
+        // propagates persistence errors — means the 409 is only sent after the
+        // row is durably recorded; a failure here is logged rather than silently
+        // swallowed, so a refused close is never left without its durable signal.
+        try {
+          await db.transaction(async (tx) => {
+            await logActivityInTransaction(tx as unknown as Db, {
+              companyId: existing.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+              action: "issue.done_missing_approval_stage_refused",
+              entityType: "issue",
+              entityId: existing.id,
+              issueId: existing.id,
+              details: {
+                identifier: existing.identifier ?? null,
+                childCount: missingApprovalStageGap.childCount,
+                stageTypes: missingApprovalStageGap.stageTypes,
+                source: "done",
+              },
+            });
+          });
+        } catch (logErr) {
           logger.warn(
             { err: logErr, issueId: id },
             "failed to write missing approval stage refusal audit log",
           );
-        });
+        }
       }
       throw err;
     }
@@ -13444,39 +13502,6 @@ export function issueRoutes(
       decision: transition.decision,
       closingTransition: isDoneRequest,
     });
-
-    // SUP-15878: the `in_review` transition of an in-scope card completes as
-    // today, but records a durable signal so the missing approval stage is not
-    // silent. (The `done` refusal above writes its own row.)
-    if (
-      missingApprovalStageGap
-      && effectiveStatus === "in_review"
-      && existing.status !== "in_review"
-    ) {
-      void logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.in_review_missing_approval_stage",
-        entityType: "issue",
-        entityId: issue.id,
-        issueId: issue.id,
-        details: {
-          identifier: issue.identifier ?? null,
-          childCount: missingApprovalStageGap.childCount,
-          stageTypes: missingApprovalStageGap.stageTypes,
-          source: "in_review",
-        },
-      }).catch((err) => {
-        logger.warn(
-          { err, issueId: id },
-          "failed to write missing approval stage diagnosis audit log",
-        );
-      });
-    }
 
     if (enteringBlocked) {
       const blockedIssue = issue;
