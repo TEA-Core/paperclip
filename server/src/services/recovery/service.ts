@@ -44,6 +44,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
 import { logActivity, redactActivityDetails } from "../activity-log.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { DISPATCH_UNLAUNCHED_ERROR_CODE } from "../heartbeat-stop-metadata.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -286,6 +287,10 @@ export type StrandedRecoveryCause =
   | "stranded_assigned_issue"
   | "deliberate_wait_without_target"
   | "process_lost"
+  // SUP-15842: a run admitted to `running` that registered neither a child process nor an
+  // environment lease — the dispatch never actually launched. Named distinctly so recovery
+  // evidence reports a launch failure instead of a lost in-flight process.
+  | "dispatch_unlaunched"
   | "provider_quota"
   | "codex_output_inactivity_monitor"
   | "workspace_validation_failed"
@@ -313,7 +318,11 @@ const NATIVE_RUNNER_RECOVERY_CAUSES = new Set<StrandedRecoveryCause>([
 ]);
 
 export function shouldRouteRecoveryToOriginalAgent(cause: StrandedRecoveryCause): boolean {
+  // SUP-15842: `dispatch_unlaunched` reaps the same never-progressed run shape that
+  // `process_lost` did before it was distinguished. Routing it to the original agent keeps
+  // recovery-action routing unchanged (the distinct cause rides only in the evidence).
   return cause === "process_lost"
+    || cause === "dispatch_unlaunched"
     || cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
     || cause === "codex_output_inactivity_monitor"
     || NATIVE_RUNNER_RECOVERY_CAUSES.has(cause);
@@ -344,6 +353,8 @@ function recoveryCauseTitle(cause: StrandedRecoveryCause) {
   switch (cause) {
     case "process_lost":
       return "retries exhausted";
+    case "dispatch_unlaunched":
+      return "dispatch never launched";
     case "codex_output_inactivity_monitor":
       return "output-inactivity retry exhausted";
     case "workspace_validation_failed":
@@ -418,6 +429,7 @@ function resolveStrandedRecoveryCause(
   if (explicitCause) return explicitCause;
   if (isProviderQuotaRecovery(latestRun)) return "provider_quota";
   if (latestRun?.errorCode === "process_lost") return "process_lost";
+  if (latestRun?.errorCode === DISPATCH_UNLAUNCHED_ERROR_CODE) return "dispatch_unlaunched";
   if (latestRun?.errorCode === "codex_output_inactivity_monitor") {
     return "codex_output_inactivity_monitor";
   }
@@ -2400,6 +2412,8 @@ export function recoveryService(
         ? "Choose and record a valid issue disposition without copying transcript content."
         : recoveryCause === "process_lost"
           ? "Retry the original assignee from durable progress without redoing completed steps."
+        : recoveryCause === "dispatch_unlaunched"
+          ? "Retry the original assignee from durable progress; the previous dispatch never registered a child process or environment lease."
         : recoveryCause === "provider_quota"
           ? "Wait for provider quota recovery, then retry the original assignee; do not wake a takeover owner."
         : recoveryCause === "codex_output_inactivity_monitor"

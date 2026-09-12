@@ -231,6 +231,7 @@ import {
   type RunPresentationDecision,
 } from "./heartbeat-run-summary.js";
 import {
+  DISPATCH_UNLAUNCHED_ERROR_CODE,
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
@@ -262,10 +263,13 @@ import {
 } from "./run-truncation.js";
 import { boundContextSnapshot } from "./context-snapshot-bound.js";
 import {
+  buildDispatchUnlaunchedMessage,
   buildStillbornRunMessage,
   canDetectStillbornRun,
+  isDispatchUnlaunchedRun,
   isStillbornRun,
   isSelfDeclaredRunExpired,
+  DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
   DEFAULT_STILLBORN_RUN_TTL_MS,
   DEFAULT_SELF_DECLARED_RUN_TTL_MS,
 } from "./run-stillborn.js";
@@ -1126,7 +1130,8 @@ function isRetryableInteractionContinuationInfrastructureFailure(
 ) {
   if (
     run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE ||
-    run.errorCode === "process_lost"
+    run.errorCode === "process_lost" ||
+    run.errorCode === DISPATCH_UNLAUNCHED_ERROR_CODE
   ) {
     return true;
   }
@@ -18670,10 +18675,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ).catch(() => undefined);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; stillbornTtlMs?: number; selfDeclaredRunTtlMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; stillbornTtlMs?: number; selfDeclaredRunTtlMs?: number; dispatchUnlaunchedGraceMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const stillbornTtlMs = opts?.stillbornTtlMs ?? DEFAULT_STILLBORN_RUN_TTL_MS;
     const selfDeclaredRunTtlMs = opts?.selfDeclaredRunTtlMs ?? DEFAULT_SELF_DECLARED_RUN_TTL_MS;
+    const dispatchUnlaunchedGraceMs =
+      opts?.dispatchUnlaunchedGraceMs ?? DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS;
     const now = new Date();
     // Resolved once per sweep: the boot identity of THIS host. A lost process whose run
     // recorded a different boot id was in flight on a previous boot and its host went down;
@@ -18883,6 +18890,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       )
       .where(eq(heartbeatRuns.status, "running"));
 
+    // SUP-15842: which of these active runs already own an active environment lease. A run that
+    // registered a lease (or a child) is dispatching/running normally; only a run with neither,
+    // still past the short launch grace, is treated as never actually launched.
+    const activeRunIds = activeRuns.map(({ run }) => run.id);
+    const activeLeaseRunIds = new Set(
+      activeRunIds.length > 0
+        ? (
+            await db
+              .select({ heartbeatRunId: environmentLeases.heartbeatRunId })
+              .from(environmentLeases)
+              .where(
+                and(
+                  inArray(environmentLeases.heartbeatRunId, activeRunIds),
+                  eq(environmentLeases.status, "active"),
+                ),
+              )
+          )
+            .map((row) => row.heartbeatRunId)
+            .filter((runId): runId is string => typeof runId === "string" && runId.length > 0)
+        : [],
+    );
+
     const monitorIssueIds = [
       ...new Set(
         activeRuns.flatMap(({ run }) => {
@@ -19023,8 +19052,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
-      // Apply staleness threshold to avoid false positives
-      if (!stillborn && staleThresholdMs > 0) {
+      // SUP-15842: decide "was this run ever actually launched?" before the staleness gate, so a
+      // never-launched run fails on its own short grace window instead of sitting out the full
+      // 5-minute threshold and then being misdiagnosed as `process_lost`/"server may have
+      // restarted". Host-restart evidence still wins (and keeps `process_lost`); a live in-flight
+      // handle means the dispatch is still dispatching; self-declared runs use their own TTL above.
+      const runContext = parseObject(run.contextSnapshot);
+      const hostRestartMarker = detectHostRestart({
+        recordedBootId: readNonEmptyString(runContext[HOST_BOOT_ID_CONTEXT_KEY]),
+        currentBootId: currentHostBootId,
+        detectedAt: now.toISOString(),
+      });
+      const dispatchUnlaunched =
+        !stillborn &&
+        run.invocationSource !== "self_declared" &&
+        !hostRestartMarker &&
+        !locallyTracked &&
+        isDispatchUnlaunchedRun(
+          run,
+          activeLeaseRunIds.has(run.id),
+          now,
+          dispatchUnlaunchedGraceMs,
+        );
+
+      // Apply staleness threshold to avoid false positives. A never-launched run has already
+      // been identified above and must not wait out the full threshold.
+      if (!stillborn && !dispatchUnlaunched && staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
@@ -19095,7 +19148,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // evidence shape below is unchanged, but nothing is signalled from this path.
       const descendantOnlyCleanup = false;
 
-      const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
       const monitorNextCheckAt = monitorIssueId
         ? monitorNextCheckAtByIssue.get(`${run.companyId}:${monitorIssueId}`)
@@ -19113,14 +19165,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // infrastructure-failure classifier and recovery routing, and a distinct code would silently
       // opt these runs out of all of it. The distinction rides in the message instead, which is
       // enough to tell them apart in triage.
-      let baseMessage = stillborn
-        ? buildStillbornRunMessage(run, stillbornTtlMs)
-        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
-      const hostRestartMarker = detectHostRestart({
-        recordedBootId: readNonEmptyString(runContext[HOST_BOOT_ID_CONTEXT_KEY]),
-        currentBootId: currentHostBootId,
-        detectedAt: now.toISOString(),
-      });
+      //
+      // A never-launched run (SUP-15842) is deliberately different: it IS the condition, and its
+      // own `dispatch_unlaunched` code is registered with every one of those consumers so the
+      // recovery evidence names a launch failure instead of a lost in-flight process. Host-restart
+      // evidence, when present, still wins and keeps `process_lost`.
+      const reapErrorCode = dispatchUnlaunched ? "dispatch_unlaunched" : "process_lost";
+      let baseMessage = dispatchUnlaunched
+        ? buildDispatchUnlaunchedMessage(run.agentId, adapterType, dispatchUnlaunchedGraceMs)
+        : stillborn
+          ? buildStillbornRunMessage(run, stillbornTtlMs)
+          : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
       if (hostRestartMarker) baseMessage = buildHostRestartMessage(hostRestartMarker);
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
         ? {
@@ -19135,7 +19190,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        errorCode: reapErrorCode,
         finishedAt: now,
         resultJson: (() => {
           const result = mergeRunStopMetadataForAgent(
@@ -19143,7 +19198,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "failed",
             {
               resultJson: parseObject(run.resultJson),
-              errorCode: "process_lost",
+              errorCode: reapErrorCode,
               errorMessage: shouldRetry
                 ? `${baseMessage}; retrying once`
                 : baseMessage,
@@ -19210,7 +19265,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
-        errorCode: "process_lost",
+        errorCode: reapErrorCode,
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       await startNextQueuedRunForAgent(run.agentId);
