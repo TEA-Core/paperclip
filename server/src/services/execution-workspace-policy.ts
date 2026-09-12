@@ -175,7 +175,10 @@ export function executionWorkspaceBranchNamesAnyIssueIdentifier(
  * exactly this anchor (case-insensitive), so the platform's inheritance gate
  * mirrors it: `SUP-15486-carrier-x` is anchored at SUP-15486, while
  * `feature/SUP-15486-x` (not at the start) and `SUP-1549-x` (a different
- * number) are not. A missing branch or identifier is not anchored.
+ * number) are not. Both sides are validated as whole `sup-<n>` card ids — not
+ * trailing numbers — so a source whose identifier carries a foreign prefix such
+ * as `ABC-15486` is not anchored at the `SUP-15486-*` branch. A missing branch
+ * or a non-`sup-<n>` identifier is not anchored.
  */
 function branchAnchoredAtIssueIdentifier(input: {
   workspaceBranchName?: string | null;
@@ -185,11 +188,12 @@ function branchAnchoredAtIssueIdentifier(input: {
   if (!branchName) return false;
   const issueIdentifier = input.issueIdentifier?.trim();
   if (!issueIdentifier) return false;
-  const separator = issueIdentifier.lastIndexOf("-");
-  if (separator < 0) return false;
-  const issueNumber = issueIdentifier.slice(separator + 1);
-  if (!/^[0-9]+$/.test(issueNumber)) return false;
-  return branchName.match(/^sup-([0-9]+)/i)?.[1] === issueNumber;
+  // Validate the whole identifier as a `sup-<n>` card id (case-insensitive) and
+  // capture its number; a foreign prefix such as `ABC-15486` must not match a
+  // `SUP-15486-*` branch on the shared number alone.
+  const identifierNumber = issueIdentifier.match(/^sup-([0-9]+)$/i)?.[1];
+  if (!identifierNumber) return false;
+  return branchName.match(/^sup-([0-9]+)/i)?.[1] === identifierNumber;
 }
 
 /**

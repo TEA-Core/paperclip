@@ -1681,6 +1681,35 @@ describe("inheritedExecutionWorkspaceBranchExempt (SUP-15231, widened by SUP-158
     ).toBe(true);
   });
 
+  it("does not exempt an isolated_workspace carrier whose source identifier is not a well-formed sup-<n> card id", () => {
+    // A foreign prefix with the same number is not the D11 anchor: `ABC-15486`
+    // is not anchored at the `SUP-15486-*` branch, so the exemption must not fire
+    // on the shared number alone.
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({
+        issueId: "child",
+        issueIdentifier: "SUP-2",
+        workspaceSourceIssueId: "parent",
+        workspaceSourceIssueIdentifier: "ABC-15486",
+        workspaceBranchName: "SUP-15486-carrier-child-delivery",
+        workspaceMode: "isolated_workspace",
+        sourceIssueIsAncestorOfBoundIssue: true,
+        sourceIssueDepth: 1,
+      }),
+    ).toBe(true);
+    // And the exempt predicate rejects the foreign-prefix identifier directly.
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "isolated_workspace",
+        workspaceSourceIssueId: "parent",
+        sourceIssueIsAncestorOfBoundIssue: true,
+        workspaceBranchName: "SUP-15486-carrier-child-delivery",
+        workspaceSourceIssueIdentifier: "ABC-15486",
+        sourceIssueDepth: 1,
+      }),
+    ).toBe(false);
+  });
+
   it("does not exempt an isolated_workspace carrier sourced by an ancestor deeper than the D6 limit", () => {
     expect(
       inheritedExecutionWorkspaceBranchDeclined({
