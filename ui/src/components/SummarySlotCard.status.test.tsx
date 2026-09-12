@@ -17,7 +17,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __liveUpdatesTestUtils } from "@/context/LiveUpdatesProvider";
-import { SummarySlotCard, resolveGenerationStatusLine } from "./SummarySlotCard";
+import { SummarySlotCard, resolveGenerationStatusLine, slotIsLiveGeneration } from "./SummarySlotCard";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -176,6 +176,25 @@ describe("resolveGenerationStatusLine", () => {
     expect(
       resolveGenerationStatusLine({ message: null, currentToolName: null, lastAssistantSnippet: null }),
     ).toBeNull();
+  });
+});
+
+describe("slotIsLiveGeneration", () => {
+  it("polls only while a generation is armed and its task is still live", () => {
+    // An active generation (non-terminal linked task) keeps the card polling.
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue() })).toBe(true);
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "in_review" }) })).toBe(true);
+
+    // A written slot whose generation task reached a terminal status stops polling,
+    // even though it still carries the "generating" status and the linked task.
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "done" }) })).toBe(false);
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "cancelled" }) })).toBe(false);
+  });
+
+  it("does not poll when there is no slot, no linked task, or the slot is idle", () => {
+    expect(slotIsLiveGeneration(null)).toBe(false);
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: null })).toBe(false);
+    expect(slotIsLiveGeneration({ slot: slot({ status: "idle" }), generatingIssue: issue() })).toBe(false);
   });
 });
 

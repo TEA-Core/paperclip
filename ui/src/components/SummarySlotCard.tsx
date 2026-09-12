@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
+  SummarySlot,
   SummarySlotDocument,
   SummarySlotIssueRef,
   SummarySlotKey,
@@ -96,6 +97,25 @@ export function resolveGenerationStatusLine(status: LiveGenerationStatus | null)
 }
 
 /**
+ * True when a summary slot has a LIVE, non-terminal generation in flight. This is
+ * the single source of truth for both the "Generating" badge and the 3s poll, so a
+ * written slot whose generation task has reached a terminal status stops polling
+ * instead of re-fetching indefinitely (SUP-15773 review: unbounded poll on
+ * `generating`).
+ */
+export function slotIsLiveGeneration(
+  data: {
+    slot: SummarySlot | null;
+    generatingIssue: SummarySlotIssueRef | null;
+  } | null | undefined,
+): boolean {
+  if (!data || data.slot?.status !== "generating") return false;
+  const issue = data.generatingIssue;
+  if (!issue) return false;
+  return !TERMINAL_ISSUE_STATUSES.has(issue.status);
+}
+
+/**
  * Subscribe to the shared LiveUpdates socket and track the generation run's
  * live status derived from `heartbeat.run.progress` events matching the slot's
  * generating issue. Resets whenever the tracked generation changes, and stays
@@ -180,7 +200,7 @@ export function SummarySlotCard({
     queryFn: () => summarySlotsApi.get(selector!),
     enabled: Boolean(selector && summariesEnabled),
     retry: false,
-    refetchInterval: (query) => query.state.data?.slot?.status === "generating" ? 3_000 : false,
+    refetchInterval: (query) => (slotIsLiveGeneration(query.state.data) ? 3_000 : false),
   });
 
   const revisionsQuery = useQuery({
@@ -241,9 +261,7 @@ export function SummarySlotCard({
   // The token-streamed STATUS line is more responsive than the server-derived
   // progress snippet; prefer it and fall back to the Phase 1 status line.
   const generationStatusLine = draftStream.statusLine ?? liveStatusLine;
-  const isGenerating = slotQuery.data?.slot?.status === "generating"
-    && generatingIssue
-    && !TERMINAL_ISSUE_STATUSES.has(generatingIssue.status);
+  const isGenerating = slotIsLiveGeneration(slotQuery.data);
   const generationFailed = slotQuery.data?.slot?.status === "failed";
   const canGenerateFirstSummary = summarizerState?.status === "ready";
 

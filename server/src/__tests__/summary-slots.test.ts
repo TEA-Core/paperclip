@@ -510,6 +510,56 @@ describeEmbeddedPostgres("summary slot service", () => {
         failureReason: expect.stringContaining("was cancelled before writing a summary"),
       });
     });
+
+    it("classifies a new generation over an inherited document as failed when it never writes (stale-document regression)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      // A PRIOR generation wrote and finished, leaving a document + last_generated_at
+      // that survive across generations (upsertSlot never clears them).
+      const priorDoc = await db
+        .insert(documents)
+        .values({
+          companyId,
+          format: "markdown",
+          latestBody: "# Prior generation summary",
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+      await db.insert(summarySlots).values({
+        companyId,
+        scopeKind: "project",
+        slotKey: "header",
+        scopeId: projectId,
+        documentId: priorDoc.id,
+        status: "idle",
+        generatingIssueId: null,
+        lastGeneratedAt: new Date("2020-01-01T00:00:00.000Z"),
+      });
+
+      // Arm a FRESH generation over the inherited slot, then cancel it without writing.
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const armed = await db
+        .select()
+        .from(summarySlots)
+        .where(eq(summarySlots.companyId, companyId))
+        .then((rows) => rows[0]!);
+      // The new generation inherited the prior document + timestamp but is fresh.
+      expect(armed.documentId).toBe(priorDoc.id);
+      expect(armed.status).toBe("generating");
+
+      await issueService(db).update(generated.generatingIssue.id, { status: "cancelled" });
+
+      // A present document must NOT mark this never-written generation as `idle`.
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot).toMatchObject({
+        status: "failed",
+        generatingIssueId: null,
+        failureReason: expect.stringContaining("was cancelled before writing a summary"),
+      });
+    });
   });
 
   describe("summarizer writes", () => {
