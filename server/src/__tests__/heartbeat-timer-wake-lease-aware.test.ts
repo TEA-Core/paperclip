@@ -14,6 +14,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { resolveLiveExecutionLeases } from "../services/issue-execution-lease.ts";
 
@@ -65,42 +66,38 @@ async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
   `));
 }
 
-async function cleanupLeaseFixture(db: ReturnType<typeof createDb>) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    try {
-      await db.execute(sql.raw(`
-        TRUNCATE TABLE
-          "company_skills",
-          "issue_comments",
-          "issue_documents",
-          "document_revisions",
-          "documents",
-          "issue_relations",
-          "issue_tree_holds",
-          "issues",
-          "heartbeat_run_events",
-          "cost_events",
-          "activity_log",
-          "heartbeat_runs",
-          "agent_wakeup_requests",
-          "agent_runtime_state",
-          "agents",
-          "companies"
-        RESTART IDENTITY CASCADE
-      `));
-      return;
-    } catch (error) {
-      const isLateCommentRace =
-        error instanceof Error &&
-        error.message.includes("issue_comments_issue_id_issues_id_fk");
-      if (!isLateCommentRace || attempt === 9) {
-        throw error;
-      }
-      // Heartbeat completion can write issue-thread comments shortly after the
-      // run leaves queued/running. Retry the dependent deletes once those land.
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
+const LEASE_FIXTURE_TRUNCATE_SQL = `
+  TRUNCATE TABLE
+    "company_skills",
+    "issue_comments",
+    "issue_documents",
+    "document_revisions",
+    "documents",
+    "issue_relations",
+    "issue_tree_holds",
+    "issues",
+    "heartbeat_run_events",
+    "cost_events",
+    "activity_log",
+    "heartbeat_runs",
+    "agent_wakeup_requests",
+    "agent_runtime_state",
+    "agents",
+    "companies"
+  RESTART IDENTITY CASCADE
+`;
+
+async function cleanupLeaseFixture(
+  db: ReturnType<typeof createDb>,
+  heartbeat: ReturnType<typeof heartbeatService>,
+) {
+  // The TRUNCATE takes AccessExclusiveLock on every listed table, so it
+  // deadlocks (Postgres 40P01) against a run still writing its trailing
+  // lifecycle rows after leaving queued/running. Drain the in-flight execution
+  // promises first, then retry on the lock family and on the late
+  // issue_comments foreign key this fixture used to retry on exclusively.
+  await heartbeat.drainActiveRunExecutions();
+  await truncateWithLockRetry(db, LEASE_FIXTURE_TRUNCATE_SQL, { attempts: 10 });
 }
 
 type Seed = { companyId: string; agentId: string };
@@ -132,7 +129,7 @@ describeEmbeddedPostgres("unscoped timer wake: lease-aware actionability (SUP-14
       provider: "test",
       model: "test-model",
     }));
-    await cleanupLeaseFixture(db);
+    await cleanupLeaseFixture(db, heartbeat);
   });
 
   afterAll(async () => {

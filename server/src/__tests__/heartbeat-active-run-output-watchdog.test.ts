@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -19,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
@@ -43,27 +44,13 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-function errorHasPostgresCode(error: unknown, code: string): boolean {
-  let current: unknown = error;
-  for (let depth = 0; depth < 4; depth += 1) {
-    if (!current || typeof current !== "object") return false;
-    const record = current as { code?: unknown; cause?: unknown };
-    if (record.code === code) return true;
-    current = record.cause;
-  }
-  return false;
-}
-
 async function truncateCompaniesWithDeadlockRetry(db: ReturnType<typeof createDb>) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
-      return;
-    } catch (error) {
-      if (!errorHasPostgresCode(error, "40P01") || attempt === 4) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
-    }
-  }
+  // This suite seeds heartbeat_runs rows directly and drives recoveryService
+  // with a mocked enqueueWakeup, so it never dispatches a background run to
+  // drain; the retry is the guard that matters here. It used to match 40P01
+  // only — the shared predicate also covers lock timeout (55P03) and
+  // serialization failure (40001).
+  await truncateWithLockRetry(db, `TRUNCATE TABLE "companies" CASCADE`);
 }
 
 describeEmbeddedPostgres("active-run output watchdog", () => {

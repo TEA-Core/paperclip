@@ -14,6 +14,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
@@ -44,7 +45,11 @@ describeEmbeddedPostgres("productivity review service", () => {
   }, 30_000);
 
   afterEach(async () => {
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    // No drain here: productivityReviewService is constructed without an
+    // enqueueWakeup dep, so this suite never dispatches a background run whose
+    // late writes could race the TRUNCATE. The retry still guards the lock
+    // family (40P01 / 55P03 / 40001) against any other writer.
+    await truncateWithLockRetry(db, `TRUNCATE TABLE "companies" CASCADE`);
   });
 
   afterAll(async () => {

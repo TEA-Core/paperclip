@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -25,6 +25,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -108,29 +109,6 @@ const TRUNCATE_ALL_SQL = `
   RESTART IDENTITY CASCADE
 `;
 
-// TRUNCATE takes AccessExclusiveLock on every listed table, so a heartbeat run
-// dispatched by a heal and still writing in the background can deadlock with it
-// (Postgres 40P01) or block it past lock_timeout (55P03). Losing that race used
-// to abort cleanup and leak the previous test's issues/recovery actions into the
-// next test, which then failed on unrelated count assertions. Retry instead: the
-// competing statement is already finishing when Postgres breaks the cycle.
-function isRetryableLockError(error: unknown): boolean {
-  const codes = new Set(["40P01", "55P03", "40001"]);
-  for (let current: unknown = error, depth = 0; current && depth < 6; depth += 1) {
-    const code = (current as { code?: unknown }).code;
-    if (typeof code === "string" && codes.has(code)) return true;
-    const message = (current as { message?: unknown }).message;
-    if (
-      typeof message === "string" &&
-      (message.includes("deadlock detected") || message.includes("due to lock timeout"))
-    ) {
-      return true;
-    }
-    current = (current as { cause?: unknown }).cause;
-  }
-  return false;
-}
-
 describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -151,19 +129,11 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     // awaits the in-flight execution promises (module-level, shared across
     // heartbeatService instances) so the DB is quiescent before we truncate.
     await heartbeatService(db).drainActiveRunExecutions();
-
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await db.execute(sql.raw(TRUNCATE_ALL_SQL));
-        return;
-      } catch (error) {
-        if (!isRetryableLockError(error)) throw error;
-        lastError = error;
-        await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
-      }
-    }
-    throw lastError;
+    // Retry anyway: a heartbeat run is not the only possible writer, and losing
+    // the lock race used to abort cleanup and leak the previous test's
+    // issues/recovery actions into the next test, which then failed on
+    // unrelated count assertions.
+    await truncateWithLockRetry(db, TRUNCATE_ALL_SQL);
   });
 
   afterAll(async () => {

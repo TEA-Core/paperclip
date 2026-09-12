@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -14,6 +14,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -89,7 +90,11 @@ describeEmbeddedPostgres("recovery reconcileDispatchSuppressionParks", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
-    await db.execute(sql.raw(TRUNCATE_ALL_SQL));
+    // No drain here: recovery() injects a mocked enqueueWakeup, so this suite
+    // never dispatches a background run whose late writes could race the
+    // TRUNCATE. The retry still guards the lock family (40P01 / 55P03 / 40001)
+    // against any other writer.
+    await truncateWithLockRetry(db, TRUNCATE_ALL_SQL);
   });
 
   afterAll(async () => {
