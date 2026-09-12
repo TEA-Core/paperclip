@@ -7,11 +7,27 @@ const mockStorage = vi.hoisted(() => ({
   headObject: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../storage/index.js", () => ({
-    getStorageService: () => mockStorage,
-  }));
-}
+// The route graph under test (routes/access.ts plus its transitive services)
+// is large, so its one-time transform cost is paid here at module load instead
+// of inside the first test. The serialized runner executes every suite in its
+// own fork (`--pool=forks --isolate`), so the first import in a file is always
+// cold; when that import runs inside a test body the transform is charged to
+// that test's timeout budget, and under shard CPU contention it crosses the
+// 10s per-test cap. `getStorageService()` is consulted lazily inside the
+// handler and the per-test `db` is passed to `accessRoutes(...)`, so a single
+// shared module keeps every test isolated. Registering the storage mock before
+// the import lets access.ts's `../storage/index.js` dependency resolve to the
+// stub.
+vi.doMock("../storage/index.js", () => ({
+  getStorageService: () => mockStorage,
+}));
+
+const { accessRoutes } = await vi.importActual<typeof import("../routes/access.js")>(
+  "../routes/access.js",
+);
+const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+  "../middleware/index.js",
+);
 
 function createSelectChain(rows: unknown[]) {
   const query = {
@@ -46,16 +62,10 @@ function createDbStub(...selectResponses: unknown[][]) {
   };
 }
 
-async function createApp(
+function createApp(
   db: Record<string, unknown>,
   actor: Record<string, unknown> = { type: "anon" },
 ) {
-  const { accessRoutes } = await vi.importActual<typeof import("../routes/access.js")>(
-    "../routes/access.js",
-  );
-  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
-    "../middleware/index.js",
-  );
   const app = express();
   app.use((req, _res, next) => {
     (req as any).actor = actor;
@@ -77,11 +87,6 @@ async function createApp(
 
 describe("GET /invites/:token", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../storage/index.js");
-    vi.doUnmock("../routes/access.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     mockStorage.headObject.mockReset();
     mockStorage.headObject.mockResolvedValue({ exists: true, contentLength: 3, contentType: "image/png" });
   });
@@ -130,7 +135,7 @@ describe("GET /invites/:token", () => {
     expect(res.body).not.toHaveProperty("companyBrandColor");
     expect(res.body.companyLogoUrl).toBe("/api/invites/pcp_invite_test/logo");
     expect(res.body.inviteType).toBe("company_join");
-  }, 10_000);
+  });
 
   it("omits companyLogoUrl when the stored logo object is missing", async () => {
     mockStorage.headObject.mockResolvedValue({ exists: false });
@@ -174,7 +179,7 @@ describe("GET /invites/:token", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.companyLogoUrl).toBeNull();
-  }, 10_000);
+  });
 
   it("returns pending join-request status for an already-accepted invite", async () => {
     const invite = {
@@ -219,7 +224,7 @@ describe("GET /invites/:token", () => {
     expect(res.body.joinRequestStatus).toBe("pending_approval");
     expect(res.body.joinRequestType).toBe("human");
     expect(res.body.companyName).toBe("Acme Robotics");
-  }, 10_000);
+  });
 
   it("falls back to a reusable human join request when the accepted invite reused an existing queue entry", async () => {
     const invite = {
@@ -274,5 +279,5 @@ describe("GET /invites/:token", () => {
     expect(res.status).toBe(200);
     expect(res.body.joinRequestStatus).toBe("pending_approval");
     expect(res.body.joinRequestType).toBe("human");
-  }, 10_000);
+  });
 });
