@@ -1034,6 +1034,198 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(list.body.fingerprintAttempts[fingerprint]).toBe(1);
   });
 
+  it("SUP-15847: reports the durable cumulative depth across separate reset rows, not the high-water mark", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint =
+      `source_scoped_recovery:${companyId}:${sourceIssue.id}:execution_review_participant_recovery`;
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    const t1 = new Date("2026-01-02T00:00:00.000Z");
+    const t2 = new Date("2026-01-03T00:00:00.000Z");
+
+    // Three SEPARATE rows for one fingerprint, each carrying a reset count.
+    // The high-water mark is only 5 (the resolved predecessor), but the
+    // fingerprint has actually burned 5 + 1 + 1 = 7 attempts, because the fold
+    // `depth = max(depth + 1, attemptCount)` adds one attempt for each reset
+    // successor instead of restarting at the low per-row count.
+    await db.insert(issueRecoveryActions).values([
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint,
+        status: "resolved",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: { latestRunId: "run-r1" },
+        nextAction: "Prior resolution.",
+        attemptCount: 5,
+        maxAttempts: 5,
+        outcome: "restored",
+        createdAt: t0,
+        updatedAt: t0,
+        resolvedAt: t0,
+      },
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint,
+        status: "cancelled",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: { latestRunId: "run-r2" },
+        nextAction: "Interrupted mid-lifecycle.",
+        attemptCount: 1,
+        maxAttempts: 5,
+        outcome: "cancelled",
+        createdAt: t1,
+        updatedAt: t1,
+        resolvedAt: t1,
+      },
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint,
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: { latestRunId: "run-r3" },
+        nextAction: "Repair the failed review participant path.",
+        attemptCount: 2,
+        maxAttempts: 5,
+        createdAt: t2,
+        updatedAt: t2,
+      },
+    ]);
+
+    const totals = await svc.getFingerprintAttemptTotals(companyId, sourceIssue.id);
+    expect(totals[fingerprint]).toBe(7);
+
+    // The high-water `max(attemptCount)` reading is what used to be exposed
+    // (and carried): it reports 5 and understates the true cost.
+    const raw = await db
+      .select({ attemptCount: issueRecoveryActions.attemptCount })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssue.id),
+        ),
+      );
+    expect(Math.max(...raw.map((row) => row.attemptCount))).toBe(5);
+  });
+
+  it("SUP-15847: carries the durable cumulative depth into the ceiling so a reset cannot understate the escalation", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint =
+      `source_scoped_recovery:${companyId}:${sourceIssue.id}:execution_review_participant_recovery`;
+    const runR3 = randomUUID();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    const t1 = new Date("2026-01-02T00:00:00.000Z");
+    const t2 = new Date("2026-01-03T00:00:00.000Z");
+
+    await db.insert(issueRecoveryActions).values([
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint,
+        status: "resolved",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: { latestRunId: "run-r1" },
+        nextAction: "Prior resolution.",
+        attemptCount: 4,
+        maxAttempts: 5,
+        outcome: "restored",
+        createdAt: t0,
+        updatedAt: t0,
+        resolvedAt: t0,
+      },
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint,
+        status: "cancelled",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: { latestRunId: "run-r2" },
+        nextAction: "Interrupted mid-lifecycle.",
+        attemptCount: 1,
+        maxAttempts: 5,
+        outcome: "cancelled",
+        createdAt: t1,
+        updatedAt: t1,
+        resolvedAt: t1,
+      },
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint,
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: { latestRunId: runR3 },
+        nextAction: "Repair the failed review participant path.",
+        attemptCount: 1,
+        maxAttempts: 5,
+        createdAt: t2,
+        updatedAt: t2,
+      },
+    ]);
+
+    // High-water is 4; the durable cumulative depth is 4 + 1 + 1 = 6.
+    expect((await svc.getFingerprintAttemptTotals(companyId, sourceIssue.id))[fingerprint]).toBe(6);
+
+    // Resolve the live row so the re-park takes the carry-forward (insert) path,
+    // then re-park on the exact run that row was resolved on.
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId: sourceIssue.id,
+      status: "resolved",
+      outcome: "restored",
+    });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId: runR3,
+      issueId: sourceIssue.id,
+      status: "failed",
+    });
+    const rePark = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: sourceIssue.id,
+      kind: "stranded_assigned_issue",
+      cause: "execution_review_participant_recovery",
+      fingerprint,
+      evidence: { latestRunId: runR3 },
+      nextAction: "Repair the failed review participant path.",
+    });
+
+    // The durable depth (6) already exceeds the ceiling, so the successor is the
+    // board-facing exhausted action. A high-water carry (4 + 1 = 5) would have
+    // minted an active row the sweep would only re-escalate on a later pass.
+    expect(rePark).toMatchObject({
+      fingerprint,
+      status: "escalated",
+      ownerType: "board",
+      outcome: "exhausted",
+      attemptCount: 5,
+      maxAttempts: 5,
+    });
+  });
+
   // Model the production payload: `requestedRef` keeps the operator spelling,
   // and the fingerprint carries the canonical remote ref. Two equivalent
   // spellings of one remote branch share `identityRef`, so they share one

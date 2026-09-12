@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -270,15 +270,29 @@ export function issueRecoveryActionService(db: Db) {
   // SUP-15847: `attemptCount` is per-row, so a re-mint that only looked at the
   // most recently updated row could restart at a lower count whenever a newer
   // row for the same fingerprint existed with a small count (the SUP-15825
-  // "5, then 1, then 2" reading). The cumulative attempt total is a property of
-  // the fingerprint, not of any one row, so read every row and derive both the
-  // high-water mark and the latest row from one query.
+  // "5, then 1, then 2" reading). `max(attemptCount)` is a high-water mark, not
+  // the cumulative total: a board reset mints a low-count successor after a
+  // high-count predecessor, so the high-water understates the true cost the
+  // fingerprint has already incurred. The cumulative depth is a property of the
+  // fingerprint, not of any one row, so read every row in chronological order
+  // and fold it.
+  //
+  // The fold `depth = max(depth + 1, row.attemptCount)`:
+  //   - a row whose internal counter exceeds the running total (a carried, not
+  //     reset, counter) advances depth to that counter, so a continuation never
+  //     double-counts the attempts it already carried;
+  //   - a row carrying a smaller counter (a reset successor) contributes one
+  //     more attempt, so a reset -> re-park cycle can never restart the depth
+  //     below the cost already paid.
+  // For a monotonic no-reset history the fold equals the high-water mark, so
+  // existing carry-forward and ceiling behavior is unchanged; it only diverges
+  // (upward) when reset rows are present.
   async function getFingerprintHistory(
     companyId: string,
     sourceIssueId: string,
     fingerprint: string,
     dbOrTx: DbOrTransaction = db,
-  ): Promise<{ latest: IssueRecoveryAction | null; maxAttemptCount: number }> {
+  ): Promise<{ latest: IssueRecoveryAction | null; cumulativeDepth: number }> {
     const rows = await dbOrTx
       .select()
       .from(issueRecoveryActions)
@@ -289,13 +303,17 @@ export function issueRecoveryActionService(db: Db) {
           eq(issueRecoveryActions.fingerprint, fingerprint),
         ),
       )
-      .orderBy(desc(issueRecoveryActions.updatedAt));
-    if (rows.length === 0) return { latest: null, maxAttemptCount: 0 };
-    let maxAttemptCount = 0;
+      .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
+    if (rows.length === 0) return { latest: null, cumulativeDepth: 0 };
+    let cumulativeDepth = 0;
     for (const row of rows) {
-      if (row.attemptCount > maxAttemptCount) maxAttemptCount = row.attemptCount;
+      cumulativeDepth = Math.max(cumulativeDepth + 1, row.attemptCount);
     }
-    return { latest: toReadModel(rows[0]!), maxAttemptCount };
+    let latest = rows[0]!;
+    for (const row of rows) {
+      if (row.updatedAt.getTime() > latest.updatedAt.getTime()) latest = row;
+    }
+    return { latest: toReadModel(latest), cumulativeDepth };
   }
 
   async function getFingerprintAttemptTotals(
@@ -305,7 +323,7 @@ export function issueRecoveryActionService(db: Db) {
     const rows = await db
       .select({
         fingerprint: issueRecoveryActions.fingerprint,
-        maxAttemptCount: sql<number>`max(${issueRecoveryActions.attemptCount})`,
+        attemptCount: issueRecoveryActions.attemptCount,
       })
       .from(issueRecoveryActions)
       .where(
@@ -314,10 +332,18 @@ export function issueRecoveryActionService(db: Db) {
           eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
         ),
       )
-      .groupBy(issueRecoveryActions.fingerprint);
-    const totals: Record<string, number> = {};
+      .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
+    // SUP-15847: same durable cumulative depth as `getFingerprintHistory`,
+    // exposed per fingerprint for the read route. A `max(attemptCount)`
+    // projection understates the true cost whenever reset rows exist.
+    const depths = new Map<string, number>();
     for (const row of rows) {
-      totals[row.fingerprint] = Number(row.maxAttemptCount ?? 0);
+      const depth = Math.max((depths.get(row.fingerprint) ?? 0) + 1, row.attemptCount);
+      depths.set(row.fingerprint, depth);
+    }
+    const totals: Record<string, number> = {};
+    for (const [fingerprint, depth] of depths) {
+      totals[fingerprint] = depth;
     }
     return totals;
   }
@@ -676,7 +702,7 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
-      const { latest: prev, maxAttemptCount } = await getFingerprintHistory(
+      const { latest: prev, cumulativeDepth } = await getFingerprintHistory(
         input.companyId,
         input.sourceIssueId,
         input.fingerprint,
@@ -687,14 +713,14 @@ export function issueRecoveryActionService(db: Db) {
       // post-ceiling count forward. Carrying it would mint a new action
       // already past its ceiling, which the next sweep re-escalates and
       // re-comments on immediately. This is the deliberate board-resolution
-      // reset, so it must keep winning over the cumulative high-water mark.
+      // reset, so it must keep winning over the cumulative depth.
       const predecessorBudgetExhausted =
         prev != null && prev.maxAttempts != null && prev.attemptCount >= prev.maxAttempts;
-      // SUP-15847: carry the fingerprint's cumulative high-water mark forward,
-      // not the count of whichever row happens to be most recently updated. A
-      // resolve -> re-park cycle previously read a low per-row count and
-      // restarted the ladder, defeating the ceiling.
-      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : maxAttemptCount + 1;
+      // SUP-15847: carry the fingerprint's durable cumulative depth forward,
+      // not the high-water `max(attemptCount)`. A resolve -> re-park cycle
+      // previously read a low per-row count (or the high-water of a reset
+      // predecessor) and restarted the ladder, defeating the ceiling.
+      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : cumulativeDepth + 1;
       const effectiveMaxAttempts = input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
       // SUP-14151: clamp the carried count to the effective ceiling. The
       // predecessor-budget reset above only fires when the predecessor carries
