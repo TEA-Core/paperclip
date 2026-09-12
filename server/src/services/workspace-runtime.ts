@@ -42,6 +42,7 @@ import {
   ensureSharedGroupOwnership,
   ensureSharedGroupTraversalPath,
   type EnsureSharedGroupOwnershipOptions,
+  type SharedGroupRepairOutcome,
 } from "./shared-group-ownership.js";
 import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
@@ -3882,6 +3883,11 @@ export async function assertWorktreeWritableByProcessUser(
   };
 
   let unwritable = await probeUnwritablePaths();
+  // SUP-15903: capture each shared-group repair's outcome so the failure message
+  // below can distinguish "the repair ran and still could not make the file
+  // writable" from "the repair was refused by the OS because the server user
+  // does not own the file" — the old message conflated the two.
+  const repairOutcomes = new Map<string, SharedGroupRepairOutcome>();
 
   if (unwritable.length > 0) {
     // SUP-14642: the common cause of an unwritable tracked file here is NOT a
@@ -3895,7 +3901,7 @@ export async function assertWorktreeWritableByProcessUser(
     // shared-group repair the provisioning path already runs at four other
     // sites in this module is the right one, so attempt it here and re-probe
     // before anyone is told to touch the host.
-    await ensureSharedGroupOwnership(worktreePath, { ...sharedGroupRepairOptions, containmentRoot: worktreePath });
+    repairOutcomes.set(worktreePath, await ensureSharedGroupOwnership(worktreePath, { ...sharedGroupRepairOptions, containmentRoot: worktreePath }));
     const resolvedWorktreePath = await fs.realpath(worktreePath);
     // Bounded repair: this per-path shared-group repair targets a small number
     // of files that escaped the root's setgid inheritance. A tree-wide
@@ -3926,7 +3932,7 @@ export async function assertWorktreeWritableByProcessUser(
       ) {
         continue;
       }
-      await ensureSharedGroupOwnership(fullPath, { ...sharedGroupRepairOptions, containmentRoot: worktreePath });
+      repairOutcomes.set(fullPath, await ensureSharedGroupOwnership(fullPath, { ...sharedGroupRepairOptions, containmentRoot: worktreePath }));
     }
     const surviving = await probeUnwritablePaths();
     if (surviving.length === 0) {
@@ -3948,6 +3954,47 @@ export async function assertWorktreeWritableByProcessUser(
     const uidPart = uid != null ? `uid ${uid}` : "current user";
     const gidPart = gid != null ? `:${gid}` : "";
     const sharedGroupName = sharedGroupRepairOptions.groupName ?? "agents";
+
+    // SUP-15903: classify the surviving unwritable paths. A path owned by a uid
+    // other than the server uid cannot be chgrped by the server — POSIX permits
+    // chown/chgrp only to the file's owner or root, so the server's shared-group
+    // self-repair was refused by the OS. For those, the honest remedy is for the
+    // file's OWN uid to run `chgrp` from its seat (no root, no host access). A
+    // path owned by the server uid (or whose owner cannot be determined) is the
+    // ordinary setgid-escape case where the host-level `chgrp -R` repair is the
+    // right one. Prefer the captured repair outcome's owner; fall back to stat
+    // for paths the repair never reached (containment-skipped) or a stubbed
+    // repair.
+    const crossUidPaths: Array<{ path: string; ownerUid: number }> = [];
+    for (const p of shown) {
+      let ownerUid = repairOutcomes.get(p)?.ownerUid;
+      if (ownerUid == null) {
+        try {
+          ownerUid = (await fs.stat(p)).uid;
+        } catch {
+          ownerUid = undefined; // vanished between probe and here
+        }
+      }
+      if (ownerUid != null && uid != null && ownerUid !== uid) {
+        crossUidPaths.push({ path: p, ownerUid });
+      }
+    }
+    const hasCrossUid = crossUidPaths.length > 0;
+
+    if (hasCrossUid) {
+      const ownerList = [
+        ...new Set(crossUidPaths.map((c) => `uid ${c.ownerUid}`)),
+      ].join(", ");
+      const examplePath = crossUidPaths[0].path;
+      throw new Error(
+        `Execution worktree at ${worktreePath} still contains ${unwritable.length} files not writable by the server user (${uidPart}${gidPart}) (showing first ${shown.length}): ${shown.join(", ")}. ` +
+          `The shared-group self-repair could not run on these: they are owned by ${ownerList}, not the server user, and POSIX allows chgrp/chown only to a file's owner or root, so the server user's chgrp was refused — the file is trivially fixable by its owner, who does not need root. ` +
+          `Repair by running, as the file's owner: chgrp ${sharedGroupName} <path> (e.g. chgrp ${sharedGroupName} ${examplePath}) — then retry provisioning. ` +
+          `A host operator may instead run the tree-wide repair: chgrp -R ${sharedGroupName} ${worktreePath} && chmod -R g+w ${worktreePath}. ` +
+          `Fall back to chown only when a path is genuinely owned by root: chown -R ${uid != null ? uid : ""}${gidPart} ${worktreePath}.`,
+      );
+    }
+
     throw new Error(
       `Execution worktree at ${worktreePath} still contains ${unwritable.length} files not writable by the server user (${uidPart}${gidPart}) after a shared-group self-repair attempt (showing first ${shown.length}): ${shown.join(", ")}. ` +
         `Most likely cause: a tracked file escaped the worktree root's setgid inheritance and carries a group the server user is not in (its mode is usually already group-writable). Repair on the host with: chgrp -R ${sharedGroupName} ${worktreePath} && chmod -R g+w ${worktreePath} — then retry provisioning. ` +
