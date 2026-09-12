@@ -818,6 +818,82 @@ describe("issue validators", () => {
     });
   });
 
+  describe("issueExecutionPolicySchema.baseRef (SUP-15838)", () => {
+    it("accepts a valid baseRef via the update path and reads it back verbatim", () => {
+      const result = updateIssueSchema.safeParse({
+        executionPolicy: {
+          baseRef: "feature/carrier-branch",
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }] }],
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.executionPolicy?.baseRef).toBe("feature/carrier-branch");
+      }
+    });
+
+    it("accepts a valid baseRef via the create path", () => {
+      const result = createIssueSchema.safeParse({
+        title: "BaseRef at create",
+        executionPolicy: {
+          baseRef: "fold/tea-patches-v2026.722.0",
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.executionPolicy?.baseRef).toBe("fold/tea-patches-v2026.722.0");
+      }
+    });
+
+    it("accepts a baseRef that stands alone (no stages) so the field is genuinely settable", () => {
+      const result = issueExecutionPolicySchema.safeParse({
+        baseRef: "feature/carrier-branch",
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.baseRef).toBe("feature/carrier-branch");
+      }
+    });
+
+    it("rejects an invalid ref value naming baseRef (route 400)", () => {
+      for (const bad of ["../escape", "-leading-dash", "has space", "trail.", "a//b", "with:colon"]) {
+        const result = updateIssueSchema.safeParse({
+          executionPolicy: { baseRef: bad },
+        });
+        expect(result.success, `expected rejection for ${JSON.stringify(bad)}`).toBe(false);
+        if (!result.success) {
+          expect(result.error.issues.some((i) =>
+            i.path?.includes("baseRef") || i.message.includes("baseRef"),
+          )).toBe(true);
+        }
+      }
+    });
+
+    it("leaves the policy otherwise unchanged when baseRef is omitted (additive, indistinguishable from today)", () => {
+      const result = issueExecutionPolicySchema.safeParse({
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }] }],
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).not.toHaveProperty("baseRef");
+        expect(result.data.stages).toHaveLength(1);
+        expect(result.data.mode).toBe("normal");
+      }
+    });
+
+    it("leaves the policy otherwise unchanged when baseRef is null", () => {
+      const result = issueExecutionPolicySchema.safeParse({
+        baseRef: null,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }] }],
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.baseRef ?? null).toBeNull();
+        expect(result.data.stages).toHaveLength(1);
+      }
+    });
+  });
+
   describe("issueExecutionMonitorPolicySchema strictness", () => {
     it("rejects an unrecognized key in monitor policy with the offending key named", () => {
       const result = issueExecutionMonitorPolicySchema.safeParse({

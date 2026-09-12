@@ -2809,6 +2809,85 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     }));
   });
 
+  it("round-trips executionPolicy.baseRef verbatim on create and update, and clears it on null (SUP-15838)", async () => {
+    const companyId = randomUUID();
+    const reviewerAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // Stacked carrier-child shape: a review stage plus a PR-base override that
+    // deliver.sh Phase 2c reads first. Must persist, not be dropped.
+    const issue = await svc.create(companyId, {
+      title: "BaseRef round-trip issue",
+      status: "todo",
+      priority: "medium",
+      executionPolicy: {
+        baseRef: "SUP-15486-carrier",
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    });
+
+    let row = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0]);
+
+    expect(row?.executionPolicy?.baseRef).toBe("SUP-15486-carrier");
+    expect((row?.executionPolicy?.stages ?? []).length).toBe(1);
+
+    // A subsequent PATCH re-targets the base; the value must come back verbatim.
+    await svc.update(issue.id, {
+      executionPolicy: {
+        baseRef: "SUP-15486-carrier-followup",
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    });
+
+    row = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0]);
+
+    expect(row?.executionPolicy?.baseRef).toBe("SUP-15486-carrier-followup");
+    expect((row?.executionPolicy?.stages ?? []).length).toBe(1);
+
+    // An explicit null clears the override while leaving the rest intact.
+    await svc.update(issue.id, {
+      executionPolicy: {
+        baseRef: null,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    });
+
+    row = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0]);
+
+    expect(row?.executionPolicy?.baseRef ?? null).toBeNull();
+    expect((row?.executionPolicy?.stages ?? []).length).toBe(1);
+  });
+
   it("rejects create with nonexistent returnAssigneeAgentId", async () => {
     const companyId = randomUUID();
     const nonexistentAgentId = randomUUID();

@@ -441,13 +441,15 @@ export function normalizeIssueExecutionPolicy(
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
   const returnAssigneeAgentId = parsed.data.returnAssigneeAgentId ?? null;
+  const baseRef = parsed.data.baseRef ?? null;
 
   if (
     stages.length === 0 &&
     !monitor &&
     !reviewPreset &&
     !authorizationPolicy &&
-    !returnAssigneeAgentId
+    !returnAssigneeAgentId &&
+    !baseRef
   ) {
     return null;
   }
@@ -461,6 +463,7 @@ export function normalizeIssueExecutionPolicy(
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
+    ...(baseRef ? { baseRef } : {}),
   };
 }
 

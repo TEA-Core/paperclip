@@ -311,6 +311,13 @@ export const issueExecutionPolicySchema = z.object({
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
   returnAssigneeAgentId: z.string().trim().uuid().optional().nullable(),
+  // Optional PR-base override for delivery (read first by deliver.sh Phase 2c).
+  // A stacked carrier-child bases its PR on this ref instead of the repository
+  // default branch. Reuses the existing branch-name refinement so it rejects the
+  // same path-escape / ref-syntax values `existingBranch` rejects.
+  baseRef: z.string().trim().refine(isValidExistingBranchName, {
+    message: "baseRef must be a valid git branch name",
+  }).optional().nullable(),
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
