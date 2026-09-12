@@ -44,6 +44,7 @@ import {
   updateProjectSchema,
   createProjectWorkspaceSchema,
   updateProjectWorkspaceSchema,
+  baseRepoRescueResetSchema,
   // Company
   createCompanySchema,
   updateCompanySchema,
@@ -905,6 +906,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/remote-agent-profiles",
   "POST /api/execution-workspaces/{id}/reconcile-branch",
   "POST /api/execution-workspaces/{id}/login-handoff",
+  // SUP-15614: board-only operator path for a base-repo rescue reset (handler calls assertBoard).
+  "POST /api/projects/{id}/workspaces/{workspaceId}/base-repo/rescue-reset",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
   "DELETE /api/board-api-keys/{keyId}",
@@ -3107,6 +3110,28 @@ registry.registerPath({
   summary: "Delete a project workspace",
   request: { params: z.object({ id: z.string(), workspaceId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/projects/{id}/workspaces/{workspaceId}/base-repo/rescue-reset",
+  tags: ["projects"],
+  summary: "Operator: reset a project base repo to a target ref, pinning the prior tip on a rescue ref",
+  description:
+    "Board-only. Clears a base-repo divergence that the auto-reset content proof refuses. Refuses a dirty or unmerged worktree, pins the prior tip on a rescue ref, verifies the pin, then resets. Runs in the server process as the repo-owning uid. The prior tip, target ref/sha and actor are audit-logged.",
+  request: {
+    params: z.object({ id: z.string(), workspaceId: z.string() }),
+    body: jsonBody(baseRepoRescueResetSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 // ─── Routines ────────────────────────────────────────────────────────────────

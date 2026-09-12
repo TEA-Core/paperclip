@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import {
+  baseRepoRescueResetSchema,
   createProjectSchema,
   createProjectWorkspaceSchema,
   findWorkspaceCommandDefinition,
@@ -17,10 +18,11 @@ import { accessService, projectService, logActivity, workspaceOperationService }
 import { conflict, forbidden, unprocessable } from "../errors.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
   listConfiguredRuntimeServiceEntries,
+  resetProjectBaseRepoWithRescue,
   runWorkspaceJobForControl,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForProjectWorkspace,
@@ -396,6 +398,100 @@ export function projectRoutes(db: Db) {
       res.json(workspace);
     },
   );
+
+  /**
+   * SUP-15614: sanctioned operator path for clearing a base-repo divergence the
+   * auto-reset content proof refuses. Board-only, and it runs in the server
+   * process (as the repo-owning uid), not in a root-capable exec: the operator
+   * pins the prior tip on a rescue ref, verifies the pin, refuses a dirty worktree,
+   * then resets. Every attempt is audit-logged with the repo, prior tip, target and
+   * actor.
+   */
+  router.post("/projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", validate(baseRepoRescueResetSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const workspaceId = req.params.workspaceId as string;
+    assertBoard(req);
+    const project = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!project) return;
+
+    const workspace = project.workspaces.find((entry) => entry.id === workspaceId) ?? null;
+    if (!workspace) {
+      res.status(404).json({ error: "Project workspace not found" });
+      return;
+    }
+    const repoRoot = workspace.cwd;
+    if (!repoRoot) {
+      res.status(422).json({ error: "Project workspace has no base repo path (cwd)" });
+      return;
+    }
+
+    const body = req.body as { targetRef?: string; reason?: string };
+    const requestedTargetRef = typeof body?.targetRef === "string" ? body.targetRef.trim() : "";
+    const targetRef = requestedTargetRef || (workspace.defaultRef ?? "").trim();
+    if (!targetRef) {
+      res.status(422).json({ error: "No target ref supplied and the project workspace has no defaultRef" });
+      return;
+    }
+
+    const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
+    const actor = getActorInfo(req);
+
+    // F3: record the attempt before the destructive mutation so that a failed
+    // reset (e.g. CAS guard, git error) still leaves an audit trail.
+    try {
+      await logActivity(db, {
+        companyId: project.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "project.base_repo_rescue_reset",
+        entityType: "project_workspace",
+        entityId: workspace.id,
+        details: {
+          repo: repoRoot,
+          targetRef,
+          phase: "attempt",
+          reason: reason || null,
+        },
+      });
+    } catch {
+      res.status(500).json({ error: "Could not record audit entry before reset" });
+      return;
+    }
+
+    const result = await resetProjectBaseRepoWithRescue({ repoRoot, targetRef });
+
+    await logActivity(db, {
+      companyId: project.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "project.base_repo_rescue_reset",
+      entityType: "project_workspace",
+      entityId: workspace.id,
+      details: {
+        repo: repoRoot,
+        targetRef,
+        targetSha: result.targetSha,
+        priorTip: result.priorTip,
+        rescueRef: result.rescueRef,
+        reset: result.reset,
+        refused: result.refused,
+        phase: "result",
+        reason: reason || null,
+      },
+    });
+
+    if (!result.reset && result.refused) {
+      res.status(409).json({ error: result.refused, ...result });
+      return;
+    }
+    res.json(result);
+  });
 
   async function handleProjectWorkspaceRuntimeCommand(req: Request, res: Response) {
     const id = req.params.id as string;
