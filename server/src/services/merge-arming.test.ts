@@ -1071,16 +1071,18 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
   });
 
   describe("ADR-091 D1 SUP-14824: recorded delivery identity", () => {
-    it("prefers the recorded identity over the workspace row (AC1)", async () => {
-      const issueId = await insertIssue();
-      // The workspace row says branch "SUP-42-branch" (the default). The recorded
-      // identity says branch "RECORDED-BRANCH" — the D1 gate must narrow against
-      // the recorded branch, NOT the workspace row.
+    // SUP-15909 negative control: a recorded identity whose branch does NOT match
+    // the card's control-plane delivery branch is unusable. It fails closed instead
+    // of (a) stamping the foreign branch, or (b) silently falling back to the
+    // workspace row. This is the card-boundary half D1 exists to close: a card can
+    // no longer record a same-repo branch it never delivered on.
+    it("refuses a recorded identity whose branch is not the card's control-plane delivery branch (SUP-15909)", async () => {
+      const issueId = await insertIssue(); // execution-workspace row branch "SUP-42-branch"
       await db.update(issues).set({
         executionState: {
           delivery: {
             repo: { owner: OWNER, repo: REPO },
-            branch: "RECORDED-BRANCH",
+            branch: "SUP-999-foreign-branch",
             headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
             recordedByRunId: randomUUID(),
             recordedAt: "2026-09-01T00:00:00.000Z",
@@ -1088,10 +1090,9 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         },
       }).where(eq(issues.id, issueId));
 
-      // The PR sits on the WORKSPACE branch (not the recorded branch).
-      // Without the recorded identity, this would resolve (workspace fallback).
-      // With the recorded identity, it must be REFUSED — proving the recorded
-      // branch takes precedence.
+      // A PR sitting on the card's OWN control-plane branch. Even though the card
+      // actually delivered here, the recorded identity names a foreign branch, so
+      // the gate refuses to stamp on it and does not fall back to the row.
       await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
       installRoutes([]);
 
@@ -1099,20 +1100,68 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(result.kind).toBe("unresolvable");
       if (result.kind === "unresolvable") {
         expect(result.reason).toBe(
-          `not_delivered: ${OWNER}/${REPO}#42 head ${OWNER}/${REPO}:SUP-42-branch is not this card's delivery branch RECORDED-BRANCH`,
+          "delivery_identity_unresolved: recorded delivery identity's branch does not match this card's control-plane delivery branch; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
         );
       }
+    });
 
-      // Positive: a PR on the RECORDED branch resolves fine.
-      await db.delete(externalObjectMentions).where(eq(externalObjectMentions.sourceIssueId, issueId));
-      await db.delete(externalObjects).where(eq(externalObjects.companyId, companyId));
-      await insertMention(issueId, { number: 42, headRefName: "RECORDED-BRANCH" });
+    // SUP-15909 positive control (own branch): a recorded identity naming the card's
+    // own control-plane branch still narrows against it — the legitimate deliver.sh
+    // shape is unchanged.
+    it("arms when the recorded identity names the card's own control-plane branch (SUP-15909)", async () => {
+      const issueId = await insertIssue(); // execution-workspace row branch "SUP-42-branch"
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: OWNER, repo: REPO },
+            branch: "SUP-42-branch",
+            headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
       installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
 
-      const result2 = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
-      expect(result2.kind).toBe("resolved");
-      if (result2.kind === "resolved") {
-        expect(result2.headSha).toBe(APPROVED_HEAD);
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+      }
+    });
+
+    // SUP-15909 carrier positive control: an ADR-083 carrier child records its
+    // owner's carrier branch (the shared row's branch_name) and still arms via the
+    // identifier-prefix predicate — proving the recorded path resolves branchIsOwn
+    // from the control plane instead of hard-coding true.
+    it("arms a carrier child that records its owner's carrier branch via the prefix predicate (SUP-15909)", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      const CARRIER_BRANCH = "SUP-1-carrier-branch";
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: CARRIER_BRANCH,
+      });
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: OWNER, repo: REPO },
+            branch: CARRIER_BRANCH,
+            headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      // The child's delivery: a head ref carrying THIS card's identifier prefix.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-carrier-fork" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
       }
     });
 

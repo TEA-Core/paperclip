@@ -1023,6 +1023,13 @@ export interface PublishApprovalStatusOptions {
  * empty branch/headSha, a repo that does not resolve, cannot be anchored to the
  * project repo, or a repo that differs from the project repo (F1) — fails
  * closed with a named reason and never falls back to the workspace row.
+ *
+ * ADR-091 D1 (SUP-15909): the recorded BRANCH half is validated the same way —
+ * it must equal the card's control-plane delivery branch (the execution-workspace
+ * row's branch_name: the card's own branch, or a carrier owner's branch for an
+ * ADR-083 child). `branchIsOwn` is resolved from that row's sourceIssueId, never
+ * hard-coded true, so a borrowed (carrier) record routes to the identifier-prefix
+ * predicate exactly like the fallback path.
  */
 async function resolveDeliveryIdentity(
   db: Db,
@@ -1157,7 +1164,41 @@ async function resolveDeliveryIdentity(
         identifier,
       };
     }
-    return { branch, repo: projectRepo, branchIsOwn: true, identifier };
+    // ADR-091 D1 (SUP-15909): the recorded BRANCH half is a security boundary, not
+    // a passthrough. It must be the card's control-plane delivery branch — its own
+    // execution-workspace branch, or (for an ADR-083 carrier child) the carrier
+    // owner's branch. `ctx.branch` IS that branch: resolveIssueRepoContext returns
+    // the execution-workspace row's branch_name (a control-plane fact), or null
+    // when the card has no execution-workspace row to ground a delivery branch.
+    // A recorded branch naming any other same-repo branch would let the card stamp
+    // a PR it never delivered (the SUP-15896 -> SUP-15908 laundering vector), so it
+    // is unusable — fail closed, never fall back to the workspace row.
+    const controlPlaneBranch = ctx?.branch ?? null;
+    if (controlPlaneBranch === null || branch.toLowerCase() !== controlPlaneBranch.toLowerCase()) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable:
+          "recorded delivery identity's branch does not match this card's control-plane delivery branch",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
+    // ADR-091 D1 (SUP-15909): `branchIsOwn` is a control-plane fact, never a
+    // default. A recorded identity riding a `shared_workspace` row sourced to
+    // another issue (a carrier owner) is NOT this card's own delivery branch, so it
+    // routes to the identifier-prefix predicate — exactly as the fallback path below
+    // already does — rather than the exact-branch predicate that would let the card
+    // stamp the owner's (or a sibling's) PR on that shared branch.
+    let recordedBranchIsOwn = true;
+    if (issueRow?.executionWorkspaceId) {
+      const [wsRow] = await db
+        .select({ sourceIssueId: executionWorkspaces.sourceIssueId })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, issueRow.executionWorkspaceId));
+      if (wsRow?.sourceIssueId && wsRow.sourceIssueId !== issueId) recordedBranchIsOwn = false;
+    }
+    return { branch, repo: projectRepo, branchIsOwn: recordedBranchIsOwn, identifier };
   }
 
   let branchIsOwn = true;

@@ -12817,6 +12817,39 @@ export function issueRoutes(
         });
         return;
       }
+      // ADR-091 D1 (SUP-15909): the recorded BRANCH half is a security boundary too.
+      // It must be this card's control-plane delivery branch — its own
+      // execution-workspace branch, or an ADR-083 carrier child's owner carrier
+      // branch. `ctx.branch` is exactly that branch (the execution-workspace row's
+      // branch_name, a control-plane fact) and is null when the card has no
+      // execution-workspace row to ground a delivery branch against. A recorded
+      // branch naming any other same-repo branch would let the card stamp a PR it
+      // never delivered (the SUP-15896 -> SUP-15908 laundering vector), so it is
+      // rejected before any write lands — mirroring the service-side cross-check in
+      // resolveDeliveryIdentity. This is the card-boundary half D1 exists to close.
+      const controlPlaneBranch = ctx?.branch ?? null;
+      if (
+        controlPlaneBranch === null ||
+        requestedDeliveryIdentity.branch.toLowerCase() !== controlPlaneBranch.toLowerCase()
+      ) {
+        res.status(422).json({
+          error: "deliveryIdentity.branch must match this card's control-plane delivery branch",
+          code: "delivery_identity_branch_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            recordedBranch: requestedDeliveryIdentity.branch,
+            controlPlaneBranch,
+            reason:
+              controlPlaneBranch === null
+                ? "card has no execution-workspace delivery branch to validate the recorded branch against"
+                : "recorded branch is not this card's execution-workspace branch (own branch or ADR-083 carrier owner's branch)",
+          },
+        });
+        return;
+      }
       // SUP-14824 F2: base the delivery write on the STORED execution state (not
       // just the patch) so a patch that omits executionState cannot drop stored
       // fields — same pattern as the execution-state patch paths.

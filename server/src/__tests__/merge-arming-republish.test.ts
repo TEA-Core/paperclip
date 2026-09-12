@@ -825,6 +825,12 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
   interface SeedOpts {
     executionRunId?: string | null;
     status?: string;
+    /**
+     * SUP-15909: make the execution-workspace row a real `shared_workspace` row
+     * OWNED BY ANOTHER issue, carrying the given carrier branch — the ADR-083
+     * carrier-child shape. Default undefined leaves the row isolated.
+     */
+    sharedWorkspaceOwnerBranch?: string;
   }
 
   async function seedIssue(opts: SeedOpts = {}) {
@@ -887,15 +893,36 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
         status: "running",
       });
     }
+    // SUP-15909: a carrier child's workspace row is the OWNER's shared row, so
+    // the owner card must exist before the FK-bearing row can point at it.
+    let carrierOwnerIssueId: string | null = null;
+    if (opts.sharedWorkspaceOwnerBranch) {
+      carrierOwnerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: carrierOwnerIssueId,
+        companyId,
+        identifier: "SUP-14823-1",
+        issueNumber: 2,
+        title: "Carrier owner card",
+        status: "in_progress",
+        priority: "medium",
+        assigneeUserId: USER_ID,
+        createdByUserId: USER_ID,
+        projectId,
+        projectWorkspaceId,
+      });
+    }
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
       projectId,
-      mode: "isolated",
+      ...(carrierOwnerIssueId
+        ? { mode: "shared_workspace", sourceIssueId: carrierOwnerIssueId }
+        : { mode: "isolated" }),
       strategyType: "git_worktree",
       name: "card-ws",
       status: "active",
-      branchName: "SUP-14824-branch",
+      branchName: opts.sharedWorkspaceOwnerBranch ?? "SUP-14824-branch",
       repoUrl: REPO_URL,
       createdAt: now,
       updatedAt: now,
@@ -930,7 +957,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
         status: "in_review",
         deliveryIdentity: {
           repo: { owner: OWNER, repo: REPO },
-          branch: "SUP-14824-delivery",
+          branch: "SUP-14824-branch",
           headSha: HEAD_SHA,
         },
       });
@@ -944,10 +971,75 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
     expect(delivery).toBeDefined();
     expect(delivery!.repo).toEqual({ owner: OWNER, repo: REPO });
-    expect(delivery!.branch).toBe("SUP-14824-delivery");
+    expect(delivery!.branch).toBe("SUP-14824-branch");
     expect(delivery!.headSha).toBe(HEAD_SHA);
     expect(delivery!.recordedByRunId).toBe(runId);
     expect(typeof delivery!.recordedAt).toBe("string");
+  });
+
+  it("records a carrier child delivery identity on its owner's carrier branch (SUP-15909)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      sharedWorkspaceOwnerBranch: "SUP-14823-carrier-branch",
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    // ADR-083 carrier child: the card's execution-workspace row is the owner's
+    // shared row, so its control-plane delivery branch IS the owner's carrier
+    // branch. Recording it must still succeed — no carrier-mode regression.
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14823-carrier-branch",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_review");
+    const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
+    expect(delivery).toBeDefined();
+    expect(delivery!.branch).toBe("SUP-14823-carrier-branch");
+  });
+
+  it("rejects deliveryIdentity when the recorded branch is not the card's execution-workspace branch (SUP-15909)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    // The card's execution-workspace row names "SUP-14824-branch". Recording a
+    // foreign same-repo branch must be rejected BEFORE any write lands — the
+    // card-boundary half D1 exists to close.
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-999-foreign-branch",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(res.body.details.recordedBranch).toBe("SUP-999-foreign-branch");
+    expect(res.body.details.controlPlaneBranch).toBe("SUP-14824-branch");
+    // No partial write: status stays in_progress and no delivery recorded.
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
   });
 
   it("rejects deliveryIdentity when actor does not hold the lease (AC4)", async () => {
