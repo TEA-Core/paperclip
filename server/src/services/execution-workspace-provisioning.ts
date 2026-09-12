@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type {
@@ -232,6 +232,45 @@ export type ProvisionIssueExecutionWorkspaceResult =
   | ProvisionedIssueExecutionWorkspace
   | DeferredIssueExecutionWorkspace;
 
+/**
+ * SUP-15837: resolve an issue's identifier and its ancestor depth (the number of
+ * strict ancestors, root = 0) in one recursive-CTE walk over `issues.parent_id`,
+ * the same shape `isStrictAncestorIssueIdOf` uses. The ADR-083 isolated-carrier
+ * exemption needs both: the identifier to check the branch anchor (D11) and the
+ * depth for the <= 2 guard (D6). Returns null when the issue cannot be read.
+ */
+async function resolveIssueIdentifierAndDepth(
+  db: Pick<Db, "execute">,
+  companyId: string,
+  issueId: string,
+): Promise<{ identifier: string | null; depth: number } | null> {
+  if (!issueId) return null;
+  const result = await db.execute(sql`
+    WITH RECURSIVE ancestors(id) AS (
+      SELECT parent_id
+      FROM issues
+      WHERE id = ${issueId} AND company_id = ${companyId}
+      UNION
+      SELECT i.parent_id
+      FROM issues i
+      JOIN ancestors a ON i.id = a.id
+      WHERE i.parent_id IS NOT NULL AND i.company_id = ${companyId}
+    )
+    SELECT
+      (SELECT identifier FROM issues WHERE id = ${issueId} AND company_id = ${companyId} LIMIT 1) AS identifier,
+      (SELECT COUNT(*) FROM ancestors WHERE id IS NOT NULL) AS depth
+  `);
+  const rows: unknown[] = Array.isArray(result)
+    ? result
+    : ((result as { rows?: unknown[] }).rows ?? []);
+  const row = rows[0] as { identifier?: unknown; depth?: unknown } | undefined;
+  if (!row) return null;
+  const identifier =
+    typeof row.identifier === "string" && row.identifier.trim().length > 0 ? row.identifier : null;
+  const depth = Number(row.depth ?? 0);
+  return { identifier, depth: Number.isFinite(depth) ? depth : 0 };
+}
+
 export interface ProvisionIssueExecutionWorkspaceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: EnvironmentRuntimeService;
@@ -349,10 +388,12 @@ export async function provisionIssueExecutionWorkspace(
   // authoritative decline happens at the inheritance site, which knows the
   // binding is implicit.
   //
-  // The one sanctioned exception is the shared_workspace plan carrier: a
+  // The sanctioned exceptions are the carriers the exemption recognises: a
   // shared_workspace row sourced by an ANCESTOR of this issue is the shared
-  // branch the plan's children build on, so it restores rather than declines.
-  // An isolated_workspace / operator_branch row sourced by a parent still
+  // branch the plan's children build on, and (SUP-15837) an isolated_workspace
+  // row sourced by an ancestor whose branch is anchored at that ancestor at
+  // depth <= 2 is the ADR-083 redo carrier. Both restore rather than decline.
+  // Any other isolated_workspace / operator_branch row sourced by a parent still
   // declines, and so does a shared row sourced by a non-ancestor. A cross-source
   // binding whose branch names this issue's own sup id (a resumption) is still
   // restored, matching deliver.sh's explicit out-of-scope override.
@@ -362,9 +403,11 @@ export async function provisionIssueExecutionWorkspace(
       : null;
   const carrierSourceIssueId = carrierWorkspace?.sourceIssueId?.trim() ?? null;
   let sourceIssueIsAncestorOfBoundIssue = false;
+  let carrierSourceIssueIdentifier: string | null = null;
+  let carrierSourceIssueDepth: number | null = null;
   if (
     carrierWorkspace !== null &&
-    carrierWorkspace.mode === "shared_workspace" &&
+    (carrierWorkspace.mode === "shared_workspace" || carrierWorkspace.mode === "isolated_workspace") &&
     carrierSourceIssueId !== null &&
     issueId !== null &&
     carrierSourceIssueId !== issueId
@@ -375,6 +418,18 @@ export async function provisionIssueExecutionWorkspace(
       issueId,
       carrierSourceIssueId,
     );
+    // SUP-15837: the isolated carrier arm additionally needs the source issue's
+    // identifier (D11 branch anchor) and depth (D6 <= 2 guard). Computed only
+    // for the isolated arm; the shared arm's verdict is ancestry alone.
+    if (carrierWorkspace.mode === "isolated_workspace") {
+      const sourceRef = await resolveIssueIdentifierAndDepth(
+        db,
+        carrierWorkspace.companyId,
+        carrierSourceIssueId,
+      );
+      carrierSourceIssueIdentifier = sourceRef?.identifier ?? null;
+      carrierSourceIssueDepth = sourceRef?.depth ?? null;
+    }
   }
 
   if (
@@ -387,6 +442,8 @@ export async function provisionIssueExecutionWorkspace(
       workspaceBranchName: existingExecutionWorkspace.branchName,
       workspaceMode: existingExecutionWorkspace.mode,
       sourceIssueIsAncestorOfBoundIssue,
+      workspaceSourceIssueIdentifier: carrierSourceIssueIdentifier,
+      sourceIssueDepth: carrierSourceIssueDepth,
     })
   ) {
     requestedShouldReuseExisting = false;
