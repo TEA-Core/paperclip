@@ -754,9 +754,24 @@ export const stalledReviewDecisionSchema = z.object({
 
 export type StalledReviewDecision = z.infer<typeof stalledReviewDecisionSchema>;
 
+// Checkout is the one write that flips a card back into `in_progress`, so it may
+// only name statuses a live card can still hold. Terminal statuses (`done`,
+// `cancelled`) are rejected here so a request that names them fails closed at
+// validation, before the route can rebuild a closed execution worktree. This is
+// the outermost layer; `issuesSvc.checkout` also refuses terminal cards on their
+// own, so a code path that bypasses this schema still cannot re-open a closed
+// card.
+export const CHECKOUT_EXPECTED_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+] as const;
+
 export const checkoutIssueSchema = z.object({
   agentId: z.string().guid(),
-  expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
+  expectedStatuses: z.array(z.enum(CHECKOUT_EXPECTED_ISSUE_STATUSES)).nonempty(),
 });
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;

@@ -6928,6 +6928,173 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it("refuses to check out a done card named in expectedStatuses and leaves the row byte-identical (SUP-15832)", async () => {
+    // Regression for the SUP-15832 defect: a run dispatched ~13s after a card
+    // closed through an approved ladder checked the DONE card out, flipping it
+    // back to in_progress, leaving a stale completedAt, and advancing
+    // statusVersion with no issue.updated row to explain it. The checkout write
+    // was gated only by `inArray(status, expectedStatuses)`, so an external
+    // route body naming "done" validated and re-opened the card.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const completedAt = new Date("2026-09-12T04:06:22.291Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // The late run that dispatched after the close.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-09-12T04:07:13.853Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Closed card checked out by a late run",
+      status: "done",
+      priority: "medium",
+      statusVersion: 4,
+      assigneeAgentId: agentId,
+      startedAt: new Date("2026-09-12T04:00:00.000Z"),
+      completedAt,
+    });
+
+    const before = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+
+    // The exact SUP-15832 trigger: a terminal status named in expectedStatuses.
+    await expect(svc.checkout(issueId, agentId, ["done"], runId)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "checkout_refused_terminal_status", status: "done" },
+    });
+
+    // A refused checkout is a no-op write: status, completedAt, statusVersion,
+    // startedAt, and the checkout/execution run pointers are all unchanged.
+    const after = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(after).toMatchObject({
+      status: "done",
+      completedAt,
+      statusVersion: 4,
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    // The whole row is byte-identical, not just the named fields.
+    expect(after).toEqual(before);
+  });
+
+  it("refuses to check out a cancelled card even when expectedStatuses names it", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const completedAt = new Date("2026-09-12T04:06:22.291Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cancelled card checked out by a late run",
+      status: "cancelled",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      completedAt,
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["cancelled"], runId)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "checkout_refused_terminal_status", status: "cancelled" },
+    });
+
+    const row = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row).toMatchObject({ status: "cancelled", completedAt, checkoutRunId: null, executionRunId: null });
+  });
+
+  it("clears a stale completedAt when a non-terminal card is re-opened into in_progress", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const staleCompletedAt = new Date("2026-09-12T04:06:22.291Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-09-12T04:00:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live card carrying a stale completion timestamp",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      completedAt: staleCompletedAt,
+    });
+
+    const result = await svc.checkout(issueId, agentId, ["in_review"], runId);
+    expect(result.status).toBe("in_progress");
+
+    const row = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    // No row is ever in_progress with a completion timestamp.
+    expect(row).toMatchObject({ status: "in_progress", completedAt: null });
+  });
+
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
     // Regression for PR #2482 checkout-adoption review finding: any adoption
     // helper that re-locks an existing in_progress issue (e.g. when the prior

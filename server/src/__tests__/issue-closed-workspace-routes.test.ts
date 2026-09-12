@@ -301,6 +301,22 @@ describe.sequential("closed isolated workspace issue routes", () => {
     expect(res.status).toBe(200);
   });
 
+  it("fails closed at validation when expectedStatuses names a terminal status (no rebuild, no checkout)", async () => {
+    // SUP-15832: a body that names a terminal status must be refused at the
+    // checkoutIssueSchema validation, before the route can rebuild a closed
+    // execution worktree or run the checkout write.
+    const res = await request(createApp())
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["done"],
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
   it("returns 409 and blocks the comment when the workspace cannot be reopened", async () => {
     mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
       ok: false,

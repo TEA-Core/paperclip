@@ -9413,11 +9413,29 @@ export function issueService(db: Db) {
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, status: issues.status })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
+
+      // Checkout is a re-open write. A card that is already terminal (done /
+      // cancelled) must never be flipped back to in_progress, regardless of what
+      // the caller asks for in `expectedStatuses`: the write below is gated only
+      // by `inArray(issues.status, expectedStatuses)`, and a caller that names a
+      // terminal status would otherwise silently re-open the card, leave a stale
+      // `completedAt` behind, and advance `statusVersion` with no `issue.updated`
+      // row to explain it. Refusing here, before any write, makes a refused
+      // checkout a true no-op (status, completedAt, statusVersion, and the
+      // checkout/execution run pointers are all untouched).
+      if (issueCompany.status === "done" || issueCompany.status === "cancelled") {
+        throw conflict("Issue cannot be checked out because it is already closed", {
+          code: "checkout_refused_terminal_status",
+          issueId: id,
+          status: issueCompany.status,
+        });
+      }
+
       await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
 
       const now = new Date();
@@ -9472,6 +9490,10 @@ export function issueService(db: Db) {
           executionRunId: checkoutRunId,
           status: "in_progress",
           startedAt: now,
+          // A card that is opened (or re-opened) into in_progress must never carry
+          // a completion timestamp; clear any stale one so no row is ever
+          // in_progress with a completedAt.
+          completedAt: null,
           updatedAt: now,
         })
         .where(
@@ -9572,6 +9594,8 @@ export function issueService(db: Db) {
             executionAgentNameKey: null,
             executionLockedAt: now,
             status: "in_progress",
+            // Re-opening into in_progress clears any stale completion timestamp.
+            completedAt: null,
             updatedAt: now,
           };
           if (current.status !== "in_progress") {
