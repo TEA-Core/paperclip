@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { and, eq, ilike } from "drizzle-orm";
+import { and, eq, ilike, sql } from "drizzle-orm";
 import {
   externalObjectMentions,
   externalObjects,
@@ -14,6 +14,8 @@ import {
   resolveGitHubTokenForRepo,
   type GitHubTokenResolution,
 } from "./github-credential.js";
+import { inheritedExecutionWorkspaceBranchExempt } from "./execution-workspace-policy.js";
+import { isStrictAncestorIssueIdOf } from "./issues.js";
 
 export {
   isGitHubTokenResolution,
@@ -1007,6 +1009,161 @@ export interface PublishApprovalStatusOptions {
 }
 
 /**
+ * ADR-091 D1 (SUP-15909): the branch half of a card's delivery identity is a
+ * security boundary. A lease-holding run entering in_review must not be able to
+ * name ANY same-repo branch and have paperclip/approved published on a PR it
+ * never delivered (the SUP-15896 -> SUP-15908 laundering vector). The repo half
+ * (D5) is already a control-plane fact; this closes the card-boundary half (D1)
+ * WITHIN the repo.
+ *
+ * The delivery branch is ALWAYS the card's execution-workspace row's branch_name
+ * (a control-plane fact, never the record). It is LEGITIMATE for this card to
+ * arm on when it is EITHER:
+ *   - the card's OWN workspace row (sourceless, or sourceIssueId === the card), or
+ *   - a legitimate ADR-083 CARRIER owner's branch: the row's sourceIssueId is a
+ *     STRICT ANCESTOR of the card AND the row passes the ADR-083 carrier gate
+ *     (inheritedExecutionWorkspaceBranchExempt — a shared_workspace plan carrier,
+ *     or an isolated_workspace redo carrier whose branch is anchored at that
+ *     ancestor at depth <= 2).
+ *
+ * Any other owner — a sibling, an unrelated issue, a non-ancestor, an
+ * operator_branch row, an ancestor deeper than 2, or an unanchored isolated
+ * branch — is NOT a legitimate delivery branch for this card and must be
+ * refused. `branchIsOwn` is true only for the card's own row; a legitimate
+ * carrier row is NOT the card's own branch and routes to the identifier-prefix
+ * predicate rather than the exact-branch one.
+ */
+export interface CardDeliveryBranchOwnership {
+ /** The card's execution-workspace row branch_name, or null when it has no such row/branch. */
+ branch: string | null;
+ /** True iff the card's own row (sourceless or self-sourced) backs the branch. */
+ branchIsOwn: boolean;
+ /** True iff the branch is borrowed from a legitimate ADR-083 carrier owner. */
+ carrier: boolean;
+ /** True iff the branch is the card's own branch OR a legitimate carrier branch. */
+ legitimate: boolean;
+ /** The owning issue when the branch is borrowed (null for the card's own row). */
+ ownerIssueId: string | null;
+ /** Named refusal reason when `legitimate` is false. */
+ refusalReason: string | null;
+}
+
+/**
+ * SUP-15837-style recursive-CTE walk over issues.parent_id returning an issue's
+ * identifier + strict-ancestor depth (root = 0). Same shape as
+ * execution-workspace-provisioning's private copy; inlined here so the D1 branch
+ * gate stays self-contained on the two ADR-083 inputs the isolated-carrier arm
+ * needs (D11 branch anchor + D6 depth bound).
+ */
+async function resolveSourceIdentifierAndDepth(
+ db: Pick<Db, "execute">,
+ companyId: string,
+ issueId: string,
+): Promise<{ identifier: string | null; depth: number } | null> {
+ if (!issueId) return null;
+ const result = await db.execute(sql`
+   WITH RECURSIVE ancestors(id) AS (
+     SELECT parent_id
+     FROM issues
+     WHERE id = ${issueId} AND company_id = ${companyId}
+     UNION
+     SELECT i.parent_id
+     FROM issues i
+     JOIN ancestors a ON i.id = a.id
+     WHERE i.parent_id IS NOT NULL AND i.company_id = ${companyId}
+   )
+   SELECT
+     (SELECT identifier FROM issues WHERE id = ${issueId} AND company_id = ${companyId} LIMIT 1) AS identifier,
+     (SELECT COUNT(*) FROM ancestors WHERE id IS NOT NULL) AS depth
+ `);
+ const rows: unknown[] = Array.isArray(result)
+   ? result
+   : ((result as { rows?: unknown[] }).rows ?? []);
+ const row = rows[0] as { identifier?: unknown; depth?: unknown } | undefined;
+ if (!row) return null;
+ const identifier =
+   typeof row.identifier === "string" && row.identifier.trim().length > 0 ? row.identifier : null;
+ const depth = Number(row.depth ?? 0);
+ return { identifier, depth: Number.isFinite(depth) ? depth : 0 };
+}
+
+/**
+ * ADR-091 D1 (SUP-15909): resolve whether a card's execution-workspace delivery
+ * branch is one this card may lawfully arm on. Shared by the write-time branch
+ * gate (routes/issues.ts) and the approval-time gate (resolveDeliveryIdentity),
+ * so the two halves of D1 never disagree on which owners are legitimate.
+ */
+export async function resolveCardDeliveryBranchOwnership(
+ db: Db,
+ companyId: string,
+ issueId: string,
+): Promise<CardDeliveryBranchOwnership> {
+ const [issueRow] = await db
+   .select({ executionWorkspaceId: issues.executionWorkspaceId })
+   .from(issues)
+   .where(eq(issues.id, issueId));
+ const executionWorkspaceId = issueRow?.executionWorkspaceId ?? null;
+ if (!executionWorkspaceId) {
+   return {
+     branch: null,
+     branchIsOwn: true,
+     carrier: false,
+     legitimate: false,
+     ownerIssueId: null,
+     refusalReason: "card has no execution-workspace delivery branch to validate the recorded branch against",
+   };
+ }
+ const [wsRow] = await db
+   .select({
+     branchName: executionWorkspaces.branchName,
+     sourceIssueId: executionWorkspaces.sourceIssueId,
+     mode: executionWorkspaces.mode,
+   })
+   .from(executionWorkspaces)
+   .where(eq(executionWorkspaces.id, executionWorkspaceId));
+ const branch = wsRow?.branchName ?? null;
+ const source = wsRow?.sourceIssueId?.trim() ?? "";
+
+ // Own / sourceless row: the card's own delivery branch. Ownership is legitimate;
+ // whether a branch exists at all is a separate axis the caller checks.
+ if (!source || source === issueId) {
+   return { branch, branchIsOwn: true, carrier: false, legitimate: true, ownerIssueId: null, refusalReason: null };
+ }
+
+ // Borrowed row: legitimate ONLY when the source is a strict ancestor of the card
+ // AND the ADR-083 carrier gate admits that row. An unrelated/sibling/non-ancestor
+ // owner is the laundering vector D1 exists to close.
+ const sourceIsAncestor = await isStrictAncestorIssueIdOf(db, companyId, issueId, source);
+ let sourceIdentifier: string | null = null;
+ let sourceDepth: number | null = null;
+ if (wsRow?.mode === "isolated_workspace") {
+   const ref = await resolveSourceIdentifierAndDepth(db, companyId, source);
+   sourceIdentifier = ref?.identifier ?? null;
+   sourceDepth = ref?.depth ?? null;
+ }
+ const carrier = inheritedExecutionWorkspaceBranchExempt({
+   workspaceMode: wsRow?.mode ?? null,
+   workspaceSourceIssueId: source,
+   sourceIssueIsAncestorOfBoundIssue: sourceIsAncestor,
+   workspaceBranchName: branch,
+   workspaceSourceIssueIdentifier: sourceIdentifier,
+   sourceIssueDepth: sourceDepth,
+ });
+ if (carrier) {
+   return { branch, branchIsOwn: false, carrier: true, legitimate: true, ownerIssueId: source, refusalReason: null };
+ }
+ return {
+   branch,
+   branchIsOwn: false,
+   carrier: false,
+   legitimate: false,
+   ownerIssueId: source,
+   refusalReason:
+     "this card's execution-workspace branch is owned by another issue that is not its ADR-083 carrier owner (not a strict ancestor passing the carrier gate); refusing to arm on a branch this card cannot be proven to have delivered (ADR-091 D1)",
+ };
+}
+
+/**
  * ADR-091 D1 (SUP-14676): the card's own delivery identity — the repo it was
  * assigned and the branch it delivered on. Both the cached-mention path and the
  * SUP-13313/SUP-13831 live-discovery path authorize against this, so it is
@@ -1023,6 +1180,13 @@ export interface PublishApprovalStatusOptions {
  * empty branch/headSha, a repo that does not resolve, cannot be anchored to the
  * project repo, or a repo that differs from the project repo (F1) — fails
  * closed with a named reason and never falls back to the workspace row.
+ *
+ * ADR-091 D1 (SUP-15909): the recorded BRANCH half is validated the same way —
+ * it must equal the card's control-plane delivery branch (the execution-workspace
+ * row's branch_name: the card's own branch, or a carrier owner's branch for an
+ * ADR-083 child). `branchIsOwn` is resolved from that row's sourceIssueId, never
+ * hard-coded true, so a borrowed (carrier) record routes to the identifier-prefix
+ * predicate exactly like the fallback path.
  */
 async function resolveDeliveryIdentity(
   db: Db,
@@ -1157,21 +1321,69 @@ async function resolveDeliveryIdentity(
         identifier,
       };
     }
-    return { branch, repo: projectRepo, branchIsOwn: true, identifier };
+    // ADR-091 D1 (SUP-15909): the recorded BRANCH half is a security boundary, not
+    // a passthrough. It must equal the card's control-plane delivery branch AND that
+    // branch must be one this card may lawfully arm on — its own execution-workspace
+    // branch, or an ADR-083 carrier owner's branch. resolveCardDeliveryBranchOwnership
+    // resolves both from the control plane (the execution-workspace row plus the
+    // card's ancestor chain), never from the record. A recorded branch naming a
+    // branch owned by an UNRELATED issue would let the card stamp a PR it never
+    // delivered (the SUP-15896 -> SUP-15908 laundering vector), so it fails closed —
+    // never fall back to the workspace row.
+    const branchOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+    if (
+      branchOwnership.branch === null ||
+      branch.toLowerCase() !== branchOwnership.branch.toLowerCase()
+    ) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable:
+          "recorded delivery identity's branch does not match this card's control-plane delivery branch",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
+    // ADR-091 D1 (SUP-15909): an unrelated owner (neither this card nor an ADR-083
+    // carrier-owner ancestor) is a foreign same-repo branch. Refuse to arm on it even
+    // when the row is already in the DB — the gate asserts a named refusal, not just
+    // the absence of a stamp.
+    if (!branchOwnership.legitimate) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable:
+          branchOwnership.refusalReason ?? "recorded delivery branch is owned by an unrelated issue",
+        branchIsOwn: false,
+        identifier,
+      };
+    }
+    // ADR-091 D1 (SUP-15909): `branchIsOwn` is a control-plane fact, never a default.
+    // A legitimate carrier record (the owner's branch) routes to the identifier-prefix
+    // predicate exactly like the fallback path; only the card's own branch uses the
+    // exact-branch predicate.
+    return { branch, repo: projectRepo, branchIsOwn: branchOwnership.branchIsOwn, identifier };
   }
 
-  let branchIsOwn = true;
-  if (issueRow?.executionWorkspaceId) {
-    const [wsRow] = await db
-      .select({ sourceIssueId: executionWorkspaces.sourceIssueId })
-      .from(executionWorkspaces)
-      .where(eq(executionWorkspaces.id, issueRow.executionWorkspaceId));
-    if (wsRow?.sourceIssueId && wsRow.sourceIssueId !== issueId) branchIsOwn = false;
+  // ADR-091 D1 (SUP-15909): even with no recorded identity the card arms on its
+  // control-plane branch, which must still be a branch it may lawfully arm on. A
+  // no-record card riding an UNRELATED issue's execution-workspace row is the same
+  // laundering vector, so it fails closed with a named reason. Own cards and
+  // legitimate ADR-083 carriers arm exactly as before (accept-set parity).
+  const branchOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+  if (!branchOwnership.legitimate && branchOwnership.ownerIssueId !== null) {
+    return {
+      branch: null,
+      repo: null,
+      recordedUnusable: branchOwnership.refusalReason ?? "delivery branch is owned by an unrelated issue",
+      branchIsOwn: false,
+      identifier,
+    };
   }
   return {
     branch: ctx?.branch ?? null,
     repo: projectRepo,
-    branchIsOwn,
+    branchIsOwn: branchOwnership.branchIsOwn,
     identifier,
   };
 }

@@ -158,6 +158,7 @@ import {
   publishApprovalStatus,
   resolveApprovalDecisionHead,
   resolveIssueRepoContext,
+  resolveCardDeliveryBranchOwnership,
   shouldPublishApprovalStatus,
   ladderIsTerminallyApproved,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
@@ -12819,6 +12820,42 @@ export function issueRoutes(
             enteringReview,
             recordedRepo: `${recordedRepo.owner}/${recordedRepo.repo}`,
             projectRepo: projectRepo ? `${projectRepo.owner}/${projectRepo.repo}` : null,
+          },
+        });
+        return;
+      }
+      // ADR-091 D1 (SUP-15909): the recorded BRANCH half is a security boundary too.
+      // It must be a branch this card may lawfully arm on — its own execution-workspace
+      // branch, or an ADR-083 carrier owner's branch. resolveCardDeliveryBranchOwnership
+      // resolves ownership from the control plane (the execution-workspace row plus the
+      // card's ancestor chain), never from the record. A recorded branch naming a branch
+      // owned by an UNRELATED issue would let the card stamp a PR it never delivered (the
+      // SUP-15896 -> SUP-15908 laundering vector), so it is rejected before any write
+      // lands — mirroring the service-side gate in resolveDeliveryIdentity. This is the
+      // card-boundary half D1 exists to close.
+      const branchOwnership = await resolveCardDeliveryBranchOwnership(db, existing.companyId, existing.id);
+      const recordedBranchMismatch =
+        branchOwnership.branch === null ||
+        requestedDeliveryIdentity.branch.toLowerCase() !== branchOwnership.branch.toLowerCase();
+      if (recordedBranchMismatch || !branchOwnership.legitimate) {
+        const branchReason =
+          branchOwnership.branch === null
+            ? "card has no execution-workspace delivery branch to validate the recorded branch against"
+            : !branchOwnership.legitimate
+              ? branchOwnership.refusalReason ?? "recorded branch is owned by an unrelated issue"
+              : "recorded branch does not match this card's control-plane delivery branch";
+        res.status(422).json({
+          error: "deliveryIdentity.branch must be this card's own branch or a legitimate ADR-083 carrier owner's branch",
+          code: "delivery_identity_branch_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            recordedBranch: requestedDeliveryIdentity.branch,
+            controlPlaneBranch: branchOwnership.branch,
+            ownerIssueId: branchOwnership.ownerIssueId,
+            reason: branchReason,
           },
         });
         return;
