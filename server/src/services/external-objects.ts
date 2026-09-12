@@ -632,6 +632,29 @@ export function externalObjectService(
     };
   }
 
+  // Company-scoped stuck-read boundary: an explicit allowlist of operational
+  // identity/status fields only. Persisted provider diagnostics (lastErrorMessage)
+  // and the raw provider payload body (data) never cross this boundary — the
+  // write-path sanitizer does not establish a read-safe projection.
+  function toStuckObjectPayload(object: ExternalObjectRecord, now = new Date()) {
+    return {
+      id: object.id,
+      providerKey: object.providerKey,
+      objectType: object.objectType,
+      displayKey: object.displayKey,
+      iconKey: object.iconKey,
+      displayTitle: object.displayTitle,
+      statusIconKey: object.statusIconKey,
+      statusCategory: object.statusCategory,
+      statusTone: object.statusTone,
+      liveness: visibleLiveness(object, now),
+      isTerminal: object.isTerminal,
+      lastErrorCode: object.lastErrorCode,
+      lastErrorAt: object.lastErrorAt,
+      lastResolvedAt: object.lastResolvedAt,
+    };
+  }
+
   async function listForIssue(issueId: string) {
     if (!(await isEnabled())) return [];
     const issue = await issueById(issueId);
@@ -814,7 +837,7 @@ export function externalObjectService(
       );
     return rows
       .filter((row) => isExternalObjectStuck(row, now))
-      .map((row) => toObjectPayload(row, now))
+      .map((row) => toStuckObjectPayload(row, now))
       .sort((a, b) => (a.lastResolvedAt?.getTime() ?? 0) - (b.lastResolvedAt?.getTime() ?? 0));
   }
 

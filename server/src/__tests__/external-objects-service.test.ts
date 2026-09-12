@@ -1363,4 +1363,42 @@ describeEmbeddedPostgres("externalObjectService", () => {
       lastResolvedAt: null,
     });
   });
+
+  it("never exposes raw provider error bodies or token-like values on the company stuck read", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // Persist a raw provider error body the write-path sanitizer did not
+    // fully redact, to prove the read boundary is independent of it.
+    await db
+      .update(externalObjects)
+      .set({
+        lastErrorAt: new Date("2026-09-01T00:00:00Z"),
+        lastErrorCode: "github_provider_error",
+        lastErrorMessage: '{"message":"provider body token=secret-value"}',
+        lastResolvedAt: null,
+        liveness: "auth_required",
+      })
+      .where(eq(externalObjects.id, object.id));
+
+    const stuck = await svc.getStuckObjects(companyId, new Date("2026-09-12T00:00:00Z"));
+    const entry = stuck.find((found) => found.id === object.id)!;
+
+    // Identity/status fields are retained ...
+    expect(entry).toMatchObject({
+      id: object.id,
+      liveness: "auth_required",
+      lastErrorCode: "github_provider_error",
+      lastResolvedAt: null,
+    });
+    // ... but the persisted raw provider body and token-like value never reach the response.
+    const serialized = JSON.stringify(stuck);
+    expect(serialized).not.toContain("provider body");
+    expect(serialized).not.toContain("secret-value");
+    expect("lastErrorMessage" in entry).toBe(false);
+    expect("data" in entry).toBe(false);
+    expect("refreshToken" in entry).toBe(false);
+  });
 });
