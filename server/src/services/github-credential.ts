@@ -347,6 +347,30 @@ export async function resolveAppInstallationToken(
   };
 }
 
+/**
+ * Resolve one PAT arm's secret value, or null when resolution throws. `getByName` still returns
+ * a disabled secret (it hides only `deleted`) and `resolveSecretValue` then throws
+ * `secret_inactive`, so without this one disabled secret would abort resolution for every repo.
+ * Logs the secret NAME only, never the value.
+ */
+async function resolveTokenSecretFailSoft(
+  secrets: Pick<AppInstallationTokenSecrets, "resolveSecretValue">,
+  companyId: string,
+  secretId: string,
+  version: SecretVersionSelector,
+  arm: { scope: GitHubTokenScope; secretName: string; projectId?: string },
+): Promise<string | null> {
+  try {
+    return await secrets.resolveSecretValue(companyId, secretId, version);
+  } catch (err) {
+    logger.warn(
+      { companyId, ...arm, error: err instanceof Error ? err.message : "unknown" },
+      "GitHub token secret could not be resolved; skipping to the next candidate",
+    );
+    return null;
+  }
+}
+
 export async function resolveGitHubToken(
   db: Db,
   companyId: string,
@@ -359,8 +383,11 @@ export async function resolveGitHubToken(
   for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
     const secret = await secrets.getByName(companyId, secretName);
     if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
+    const token = await resolveTokenSecretFailSoft(secrets, companyId, secret.id, "latest", {
+      scope: "company",
+      secretName,
+    });
+    const trimmed = token?.trim();
     if (trimmed) return { token: trimmed, scope: "company", secretName };
   }
   return { token: null, reason: `No GitHub token resolvable for company ${companyId}` };
@@ -421,8 +448,12 @@ export async function resolveGitHubTokenCandidatesForRepo(
       if (ref.type !== "secret_ref") continue;
       if (typeof ref.secretId !== "string") continue;
       const version: SecretVersionSelector = typeof ref.version === "number" ? ref.version : "latest";
-      const token = await secrets.resolveSecretValue(companyId, ref.secretId, version);
-      const trimmed = token.trim();
+      const token = await resolveTokenSecretFailSoft(secrets, companyId, ref.secretId, version, {
+        scope: "project_env",
+        secretName: key,
+        projectId: row.projectId,
+      });
+      const trimmed = token?.trim();
       if (!trimmed) continue;
       if (seenTokens.has(trimmed)) continue;
       seenTokens.add(trimmed);
@@ -433,8 +464,11 @@ export async function resolveGitHubTokenCandidatesForRepo(
   for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
     const secret = await secrets.getByName(companyId, secretName);
     if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
+    const token = await resolveTokenSecretFailSoft(secrets, companyId, secret.id, "latest", {
+      scope: "company",
+      secretName,
+    });
+    const trimmed = token?.trim();
     if (!trimmed) continue;
     if (seenTokens.has(trimmed)) continue;
     seenTokens.add(trimmed);
