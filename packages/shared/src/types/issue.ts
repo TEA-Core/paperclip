@@ -700,6 +700,14 @@ export interface IssueExecutionPolicy {
    * default. Human decisions reset the round counter.
    */
   maxReviewRounds?: number | null;
+  /**
+   * Optional git ref that overrides the PR base branch for this issue's
+   * delivery (consumed first by deliver.sh Phase 2c). When set, a stacked
+   * carrier-child bases its PR on this ref instead of the repository default
+   * branch. Absent/null means "no override" — indistinguishable from the
+   * pre-field behaviour.
+   */
+  baseRef?: string | null;
 }
 
 export interface IssueExecutionMonitorState {

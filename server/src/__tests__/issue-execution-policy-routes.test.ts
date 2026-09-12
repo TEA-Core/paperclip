@@ -18,6 +18,14 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  // GET /issues/:id read projections (baseRef readback route test).
+  getAncestors: vi.fn(),
+  findMentionedProjectIds: vi.fn(),
+  listBlockerAttention: vi.fn(),
+  listReviewAttention: vi.fn(),
+  listProductivityReviews: vi.fn(),
+  getCurrentScheduledRetry: vi.fn(),
+  getActiveInboxArchiveFields: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -159,13 +167,17 @@ function registerModuleMocks() {
       completeTestRunForIssue: vi.fn(async () => null),
     }),
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
-    documentService: () => ({}),
+    documentService: () => ({
+      getIssueDocumentPayload: vi.fn(async () => ({})),
+    }),
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
     }),
-    goalService: () => ({}),
+    goalService: () => ({
+      getDefaultCompanyGoal: vi.fn(async () => null),
+    }),
     heartbeatService: () => mockHeartbeatService,
     environmentService: () => ({
       getById: vi.fn(async () => null),
@@ -206,7 +218,9 @@ function registerModuleMocks() {
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
-    workProductService: () => ({}),
+    workProductService: () => ({
+      listForIssue: vi.fn(async () => []),
+    }),
   }));
   vi.doMock("../services/external-objects.js", () => ({
     externalObjectService: () => ({
@@ -268,6 +282,36 @@ async function createApp(actor?: TestActor) {
   return app;
 }
 
+// The GET /issues/:id read path runs two db query shapes the per-test PATCH
+// mocks never needed: a three-level innerJoin chain (listIssueLinkedCases) and
+// a where().orderBy() activity-log read (listSuccessfulRunHandoffStates). One
+// recursive thenable node satisfies any traversal: joins and orderBy/limit
+// collapse to empty rows, while a bare .where()/`.for` still resolves the
+// hoisted agent row the PATCH wake path depends on.
+const HANDOFF_AGENT_ROWS = [{
+  id: "55555555-5555-4555-8555-555555555555",
+  companyId: "company-1",
+  agentId: "33333333-3333-4333-8333-333333333333",
+  contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+  permissions: null,
+}];
+
+function dbChainNode(rows: unknown[]): Record<string, unknown> {
+  return {
+    where: () => dbChainNode(rows),
+    for: () => dbChainNode(rows),
+    orderBy: () => dbChainNode([]),
+    limit: () => dbChainNode([]),
+    offset: () => dbChainNode([]),
+    innerJoin: () => dbChainNode([]),
+    leftJoin: () => dbChainNode([]),
+    returning: () => dbChainNode([]),
+    then: (onFulfilled: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve(rows).then(onFulfilled, onRejected),
+    catch: (onRejected: (reason: unknown) => unknown) => Promise.resolve(rows).catch(onRejected),
+  };
+}
+
 describe("issue execution policy routes", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -286,6 +330,13 @@ describe("issue execution policy routes", () => {
     }));
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.getAncestors.mockResolvedValue([]);
+    mockIssueService.findMentionedProjectIds.mockResolvedValue([]);
+    mockIssueService.listBlockerAttention.mockResolvedValue(new Map());
+    mockIssueService.listReviewAttention.mockResolvedValue(new Map());
+    mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
+    mockIssueService.getActiveInboxArchiveFields.mockResolvedValue({});
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
@@ -303,29 +354,11 @@ describe("issue execution policy routes", () => {
     mockDbSelectFrom.mockImplementation(() => ({
       where: mockDbSelectWhere,
       // See the hoisted default above: the fork's merge-arming done-transition
-      // guard joins external_object_mentions to external_objects.
-      innerJoin: () => ({ where: () => Promise.resolve([]) }),
+      // guard joins external_object_mentions to external_objects, and the GET
+      // read path also chains three innerJoins (listIssueLinkedCases).
+      innerJoin: () => dbChainNode([]),
     }));
-    mockDbSelectWhere.mockImplementation(() => ({
-      for: () => ({
-        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-          Promise.resolve([{
-            id: "55555555-5555-4555-8555-555555555555",
-            companyId: "company-1",
-            agentId: "33333333-3333-4333-8333-333333333333",
-            contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-            permissions: null,
-          }]).then(onFulfilled, onRejected),
-      }),
-      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([{
-          id: "55555555-5555-4555-8555-555555555555",
-          companyId: "company-1",
-          agentId: "33333333-3333-4333-8333-333333333333",
-          contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-          permissions: null,
-        }]).then(onFulfilled, onRejected),
-    }));
+    mockDbSelectWhere.mockImplementation(() => dbChainNode(HANDOFF_AGENT_ROWS));
     mockIssueService.createChild.mockResolvedValue({
       issue: {
         id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -2802,6 +2835,105 @@ describe("issue execution policy routes", () => {
           }),
         }),
       );
+    });
+  });
+
+  describe("executionPolicy.baseRef HTTP round-trip (SUP-15838)", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const baseIssue = {
+      id: issueId,
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1551",
+      title: "Stacked carrier child",
+      projectId: null,
+      goalId: null,
+      executionPolicy: null,
+      executionState: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+
+    it("PATCHes executionPolicy.baseRef (200) and reads it back verbatim from GET /issues/:id", async () => {
+      const baseRef = "SUP-15486-carrier-child";
+      mockIssueService.getById.mockResolvedValue(baseIssue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...baseIssue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const app = await createApp();
+      const patchRes = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: { baseRef } });
+
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          executionPolicy: expect.objectContaining({ baseRef }),
+        }),
+      );
+
+      // The exact policy handed to the service is what a later read must project
+      // back verbatim — deliver.sh Phase 2c reads `.executionPolicy.baseRef` off
+      // the GET body, so this asserts the real route pair, not the service shape.
+      const persistedPolicy = (mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>)
+        .executionPolicy;
+      mockIssueService.getById.mockResolvedValue({ ...baseIssue, executionPolicy: persistedPolicy });
+
+      const getRes = await request(app).get(`/api/issues/${issueId}`);
+      expect(getRes.status, JSON.stringify(getRes.body)).toBe(200);
+      expect(getRes.body.executionPolicy).toMatchObject({ baseRef });
+      expect(getRes.body.executionPolicy.baseRef).toBe(baseRef);
+    });
+
+    it("rejects a path-escaping executionPolicy.baseRef with 400 naming the baseRef field", async () => {
+      mockIssueService.getById.mockResolvedValue(baseIssue);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: { baseRef: "feature/../escape" } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      const details = res.body.details as Array<{ path?: Array<string | number> }>;
+      expect(Array.isArray(details)).toBe(true);
+      expect(
+        details.some((detail) => Array.isArray(detail.path) && detail.path.join(".") === "executionPolicy.baseRef"),
+      ).toBe(true);
+    });
+
+    it("keeps executionPolicy additive when baseRef is omitted or null", async () => {
+      mockIssueService.getById.mockResolvedValue(baseIssue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...baseIssue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const app = await createApp();
+      const omitted = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: { mode: "normal" } });
+      expect(omitted.status, JSON.stringify(omitted.body)).toBe(200);
+      const omittedPatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      // An empty/default policy still collapses to null exactly as it did before
+      // baseRef existed: omitting the field introduces no new stored shape.
+      expect(omittedPatch.executionPolicy ?? null).toBeNull();
+
+      mockIssueService.update.mockClear();
+      const nulled = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: { mode: "normal", baseRef: null } });
+      expect(nulled.status, JSON.stringify(nulled.body)).toBe(200);
+      const nulledPatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(nulledPatch.executionPolicy ?? null).toBeNull();
     });
   });
 });
