@@ -62,6 +62,37 @@ function logEvent(runId: string, seq: number, text: string): LiveEvent {
   };
 }
 
+function statusEvent(runId: string, status: string): LiveEvent {
+  return {
+    id: 999,
+    companyId: "company-1",
+    type: "heartbeat.run.status",
+    createdAt: "2026-07-15T00:01:00.000Z",
+    payload: { runId, status },
+  };
+}
+
+// Fake-timer-friendly settle: advance zero-ms timers + flush microtasks so the
+// react-query fetches and the persisted-log reads resolve. (The real-timer
+// `flushQueries` above deadlocks under fake timers.)
+async function settleNow() {
+  for (let index = 0; index < 6; index += 1) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+  }
+}
+
+// Advance the persisted-log poller (1500ms interval) forward and flush follow-ups.
+async function advanceTimers(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+}
+
 interface Captured {
   runId: string | null;
   statusLine: string | null;
@@ -141,6 +172,7 @@ describe("useSummaryDraftStream", () => {
   afterEach(async () => {
     await act(() => root?.unmount());
     root = null;
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -287,5 +319,98 @@ describe("useSummaryDraftStream", () => {
     expect(captured.current?.runId).toBe("run-1");
     expect(captured.current?.draft).toBe("## Needs you\nRecovered after refresh.");
     expect(captured.current?.draftClosed).toBe(true);
+  });
+
+  it("stops persisted-log polling and clears the draft when the tracked run finishes", async () => {
+    vi.useFakeTimers();
+    const subscribers = new Set<CompanyLiveEventHandler>();
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+    ({ root } = renderHarness(issue("1"), subscribers));
+    await settleNow();
+
+    // Learn the run and stream a closed draft.
+    await act(async () => {
+      dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-1"));
+    });
+    await settleNow();
+    await act(async () => {
+      dispatchLiveEventToSubscribers(
+        subscribers,
+        "company-1",
+        logEvent("run-1", 1, "<<<SUMMARY-DRAFT>>>\nold draft\n<<<END-SUMMARY-DRAFT>>>"),
+      );
+    });
+    await settleNow();
+    expect(captured.current?.runId).toBe("run-1");
+    expect(captured.current?.draft).toBe("old draft");
+
+    // The persisted-log poller is live: advancing time reads more log.
+    const readsBefore = mockHeartbeatsApi.log.mock.calls.length;
+    await advanceTimers(1500 * 3);
+    expect(mockHeartbeatsApi.log.mock.calls.length).toBeGreaterThan(readsBefore);
+
+    // The run reaches a terminal status → stop polling + clear the draft.
+    await act(async () => {
+      dispatchLiveEventToSubscribers(subscribers, "company-1", statusEvent("run-1", "succeeded"));
+    });
+    await settleNow();
+    expect(captured.current?.runId).toBeNull();
+    expect(captured.current?.draft).toBeNull();
+    expect(captured.current?.hasStream).toBe(false);
+
+    // No more log reads: the poller is torn down when the run id clears.
+    const readsAfterFinish = mockHeartbeatsApi.log.mock.calls.length;
+    await advanceTimers(1500 * 3);
+    await settleNow();
+    expect(mockHeartbeatsApi.log.mock.calls.length).toBe(readsAfterFinish);
+  });
+
+  it("rediscovers a later run for the same issue and streams a fresh draft", async () => {
+    vi.useFakeTimers();
+    const subscribers = new Set<CompanyLiveEventHandler>();
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+    ({ root } = renderHarness(issue("1"), subscribers));
+    await settleNow();
+
+    // First run streams a closed draft.
+    await act(async () => {
+      dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-1"));
+    });
+    await settleNow();
+    await act(async () => {
+      dispatchLiveEventToSubscribers(
+        subscribers,
+        "company-1",
+        logEvent("run-1", 1, "<<<SUMMARY-DRAFT>>>\nfirst\n<<<END-SUMMARY-DRAFT>>>"),
+      );
+    });
+    await settleNow();
+    expect(captured.current?.draft).toBe("first");
+
+    // The first run finishes → draft is cleared.
+    await act(async () => {
+      dispatchLiveEventToSubscribers(subscribers, "company-1", statusEvent("run-1", "succeeded"));
+    });
+    await settleNow();
+    expect(captured.current?.runId).toBeNull();
+    expect(captured.current?.draft).toBeNull();
+
+    // A later run for the SAME issue is discovered and starts from a clean slate.
+    await act(async () => {
+      dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-2"));
+    });
+    await settleNow();
+    expect(captured.current?.runId).toBe("run-2");
+    expect(captured.current?.draft).toBeNull();
+
+    await act(async () => {
+      dispatchLiveEventToSubscribers(
+        subscribers,
+        "company-1",
+        logEvent("run-2", 1, "<<<SUMMARY-DRAFT>>>\nsecond\n<<<END-SUMMARY-DRAFT>>>"),
+      );
+    });
+    await settleNow();
+    expect(captured.current?.draft).toBe("second");
   });
 });
