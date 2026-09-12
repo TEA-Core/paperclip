@@ -1675,6 +1675,19 @@ export interface BoardStageDecisionInput {
   policy: IssueExecutionPolicy;
   decision: BoardStageDecision;
   commentBody: string;
+  /**
+   * Stage ids that already carry a durable `approved` decision row. Target
+   * selection consults these alongside the projection's completed/skipped sets,
+   * so a stage whose projection was cleared (e.g. by a board `done` PATCH) is
+   * never silently re-targeted and superseded (SUP-15805 addendum item 3).
+   */
+  decidedStageIds?: readonly string[];
+  /**
+   * The acting board user's id. Used to refuse a board approval of that user's
+   * own delivery — the self-satisfying shape the agent-path Guard B rejects
+   * (SUP-15805 addendum item 4).
+   */
+  actorUserId?: string | null;
 }
 
 export interface BoardStageDecisionResult {
@@ -1704,6 +1717,21 @@ export class BoardStageNoUndecidedStageError extends Error {
 }
 
 /**
+ * A board user asked to approve a stage whose return assignee is that same user:
+ * the user would be approving their own delivery. Guard B refuses this shape on
+ * the agent path; the board route must not be a hole (SUP-15805 addendum item 4).
+ * The route maps this to `409 { reason: "self_approval" }`.
+ */
+export class BoardStageSelfApprovalError extends Error {
+  readonly reason = "self_approval" as const;
+
+  constructor() {
+    super("A board user cannot approve their own delivery on this issue");
+    this.name = "BoardStageSelfApprovalError";
+  }
+}
+
+/**
  * The stage a board decision acts on. The active pending stage when one exists;
  * otherwise the first policy stage not yet completed or skipped. This covers the
  * live shape of the stuck cards (SUP-15547 / 13951 / 15638), where the card sits
@@ -1713,14 +1741,17 @@ export class BoardStageNoUndecidedStageError extends Error {
 function resolveBoardTargetStage(
   policy: IssueExecutionPolicy,
   previous: IssueExecutionState | null,
+  decidedStageIds?: readonly string[],
 ): IssueExecutionStage | null {
+  const durablyDecided = new Set(decidedStageIds ?? []);
   if (previous?.status === PENDING_STATUS && previous.currentStageId) {
     const active = findStageById(policy, previous.currentStageId);
-    if (active) return active;
+    if (active && !durablyDecided.has(active.id)) return active;
   }
   const decided = new Set([
     ...(previous?.completedStageIds ?? []),
     ...(previous?.skippedStageIds ?? []),
+    ...durablyDecided,
   ]);
   return policy.stages.find((stage) => !decided.has(stage.id)) ?? null;
 }
@@ -1733,13 +1764,24 @@ function resolveBoardTargetStage(
  * participant is. The round counter is always reset: a board decision is a human
  * decision, so the agent↔agent changes-requested cap never escalates here.
  *
- * The card is advanced but never closed: `approved` on the final stage only
- * completes the execution state (it does not set issue status to `done`).
+ * The card is advanced but never closed:
+ * - `approved` on a non-final stage re-pends the next stage (`in_review`);
+ * - `approved` on the final stage completes the execution state and routes the
+ *   card back to its return assignee `in_progress`, mirroring
+ *   `applyReviewEscalationDecision`, rather than stranding it `in_review` with no
+ *   reviewer (the SUP-10525 no-review-path state);
+ * - `changes_requested` lands the card in `todo` (not `in_progress`): a board
+ *   hand-back cannot assume a wake path exists (the live stuck cards return to an
+ *   external-pull agent with `wakeOnDemand` false), so the card is queued for the
+ *   return assignee instead of being stranded mid-flight.
+ *
+ * A board user may not approve their own delivery (the return assignee is that
+ * same user): {@link BoardStageSelfApprovalError}.
  */
 export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardStageDecisionResult {
   const previous = parseIssueExecutionState(input.issue.executionState);
   const currentAssignee = assigneePrincipal(input.issue);
-  const targetStage = resolveBoardTargetStage(input.policy, previous);
+  const targetStage = resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
   if (!targetStage) throw new BoardStageNoUndecidedStageError();
 
   const returnAssignee = resolveReturnAssignee({
@@ -1753,6 +1795,13 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
   const body = input.commentBody.trim();
 
   if (input.decision === "approved") {
+    if (
+      input.actorUserId &&
+      returnAssignee?.type === "user" &&
+      returnAssignee.userId === input.actorUserId
+    ) {
+      throw new BoardStageSelfApprovalError();
+    }
     const completedState = buildCompletedState(previous, targetStage);
     const nextStage = nextPendingStageAfter(input.policy, targetStage, completedState);
     const patch: Record<string, unknown> = {};
@@ -1772,7 +1821,13 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
         returnAssignee: returnAssignee ?? null,
       });
     } else {
+      // Final stage: complete the ladder and hand the card back to its return
+      // assignee in_progress (never `done`), matching the review-escalation path.
       patch.executionState = completedState;
+      patch.status = "in_progress";
+      if (returnAssignee) {
+        Object.assign(patch, patchForPrincipal(returnAssignee));
+      }
     }
     return {
       patch,
@@ -1787,7 +1842,7 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
     throw unprocessable("This execution stage has no return assignee");
   }
   const patch: Record<string, unknown> = {};
-  patch.status = "in_progress";
+  patch.status = "todo";
   Object.assign(patch, patchForPrincipal(returnAssignee));
   patch.executionState = buildChangesRequestedState(previous, targetStage, returnAssignee, 0);
   return {

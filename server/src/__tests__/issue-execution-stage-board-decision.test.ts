@@ -4,10 +4,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
   createDb,
+  heartbeatRuns,
+  issueComments,
   issueExecutionDecisions,
   issues,
   type Db,
@@ -67,6 +70,9 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
   beforeEach(async () => {
     process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
     await db.delete(issueExecutionDecisions);
+    await db.delete(issueComments);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(activityLog);
     await db.delete(agents);
@@ -74,14 +80,27 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     await db.delete(companies);
   });
 
-  function createApp() {
+  function createApp(routeOpts: Record<string, unknown> = {}) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       req.actor = currentActor;
       next();
     });
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use(
+      "/api",
+      issueRoutes(
+        db,
+        {} as any,
+        {
+          // Keep the real heartbeat service out of these route tests: a live wake
+          // would create heartbeat_runs tied to the seeded agents and make per-test
+          // cleanup FK-hostile. Tests that assert the wake inject a recording spy.
+          executionStageWakeupEnqueue: async () => ({ id: "wakeup-stub" }),
+          ...routeOpts,
+        } as any,
+      ),
+    );
     app.use(errorHandler);
     return app;
   }
@@ -114,6 +133,12 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     twoStages?: boolean;
     /** Seed an executionState with no active pending stage (completed ladder). */
     terminalState?: boolean;
+    /** Issue status to seed (defaults to in_review); use done/cancelled for terminal cases. */
+    issueStatus?: string;
+    /** Seed executionState as null (a ladder that never ran). */
+    noExecutionState?: boolean;
+    /** Seed the return assignee as this board user instead of an agent. */
+    returnAssigneeUserId?: string;
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -178,35 +203,41 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
         : []),
     ];
 
-    const executionState = opts.terminalState
-      ? {
-          status: "completed",
-          currentStageId: null,
-          currentStageIndex: null,
-          currentStageType: null,
-          currentParticipant: null,
-          returnAssignee: { type: "agent", agentId: returnAssigneeAgentId, userId: null },
-          deliveryAuthor: null,
-          completedStageIds: opts.completedStageIds ?? stages.map((s) => s.id),
-          skippedStageIds: [],
-          lastDecisionId: null,
-          lastDecisionOutcome: "approved",
-          changesRequestedCount: 0,
-        }
-      : {
-          status: "pending",
-          currentStageId: STAGE_ID,
-          currentStageIndex: 0,
-          currentStageType: "review",
-          currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
-          returnAssignee: { type: "agent", agentId: returnAssigneeAgentId, userId: null },
-          deliveryAuthor: null,
-          completedStageIds: opts.completedStageIds ?? [],
-          skippedStageIds: [],
-          lastDecisionId: null,
-          lastDecisionOutcome: null,
-          changesRequestedCount: 0,
-        };
+    const returnAssigneePrincipal = opts.returnAssigneeUserId
+      ? { type: "user" as const, agentId: null, userId: opts.returnAssigneeUserId }
+      : { type: "agent" as const, agentId: returnAssigneeAgentId, userId: null };
+
+    const executionState = opts.noExecutionState
+      ? null
+      : opts.terminalState
+        ? {
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: returnAssigneePrincipal,
+            deliveryAuthor: null,
+            completedStageIds: opts.completedStageIds ?? stages.map((s) => s.id),
+            skippedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: "approved",
+            changesRequestedCount: 0,
+          }
+        : {
+            status: "pending",
+            currentStageId: STAGE_ID,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+            returnAssignee: returnAssigneePrincipal,
+            deliveryAuthor: null,
+            completedStageIds: opts.completedStageIds ?? [],
+            skippedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            changesRequestedCount: 0,
+          };
 
     await db.insert(issues).values({
       id: issueId,
@@ -214,14 +245,16 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       identifier: "SUP-15805-1",
       issueNumber: 1,
       title: "Board stage decision target",
-      status: "in_review",
+      status: opts.issueStatus ?? "in_review",
       priority: "medium",
       assigneeAgentId: reviewerAgentId,
       createdByUserId: USER_ID,
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
-        returnAssigneeAgentId,
+        // A user return assignee lives on the execution state; the policy's
+        // agent id wins resolution, so omit it for the user case.
+        ...(opts.returnAssigneeUserId ? {} : { returnAssigneeAgentId }),
         stages,
       },
       executionState,
@@ -377,7 +410,10 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(res.body.outcome).toBe("changes_requested");
 
     const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(row!.status).toBe("in_progress");
+    // A board hand-back lands in todo, not in_progress: the live stuck cards
+    // return to an external-pull agent (wakeOnDemand false), so the card must be
+    // queued rather than stranded mid-flight.
+    expect(row!.status).toBe("todo");
     expect(row!.assigneeAgentId).toBe(returnAssigneeAgentId);
     const state = row!.executionState as Record<string, unknown>;
     expect(state.status).toBe("changes_requested");
@@ -453,5 +489,144 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     const approvalStatus = ((row!.executionState as Record<string, unknown>).approvalStatus ??
       {}) as Record<string, unknown>;
     expect(approvalStatus.publishedHeadSha).toBeUndefined();
+
+    // Distinguishing (SUP-15805 addendum 7): the shared hook ALWAYS writes a
+    // `[Merge-arming]` system comment when it runs — armed or refused. Its
+    // presence proves the route invoked the hook; `publishedHeadSha` alone is
+    // also undefined when the hook never runs at all.
+    const armComments = await db
+      .select()
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+    expect(armComments.some((c) => c.body.startsWith("[Merge-arming]"))).toBe(true);
+  });
+
+  it("409s with terminal_status on a done issue", async () => {
+    const { companyId, issueId } = await seedIssue({ issueStatus: "done" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving a closed card" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.reason).toBe("terminal_status");
+  });
+
+  it("409s with terminal_status on a cancelled issue", async () => {
+    const { companyId, issueId } = await seedIssue({ issueStatus: "cancelled" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "changes_requested", comment: "board: changes on a cancelled card" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.reason).toBe("terminal_status");
+  });
+
+  it("409s with not_in_review when approving an issue with no execution state", async () => {
+    const { companyId, issueId } = await seedIssue({ noExecutionState: true });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving a ladder that never ran" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.reason).toBe("not_in_review");
+  });
+
+  it("409s with self_approval when the board user is the return assignee", async () => {
+    const { companyId, issueId } = await seedIssue({ returnAssigneeUserId: USER_ID });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving own delivery" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.reason).toBe("self_approval");
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(0);
+  });
+
+  it("rejects a board actor with no concrete user id with 403", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = {
+      type: "board",
+      companyIds: [companyId],
+      source: "cloud_tenant",
+    } as unknown as Express.Request["actor"];
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving" });
+
+    expect(res.status).toBe(403);
+  });
+
+  it("enqueues the next-stage wake when a board approval advances the ladder", async () => {
+    const { companyId, issueId } = await seedIssue({ twoStages: true });
+    currentActor = boardActor(companyId);
+    const secondStageAgentId = "66666666-6666-4666-8666-666666666666";
+    const calls: Array<{ agentId: string; reason: string | null; issueId: unknown }> = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string, options: any) => {
+        calls.push({
+          agentId,
+          reason: options?.reason ?? null,
+          issueId: options?.payload?.issueId ?? null,
+        });
+        return { id: "wakeup-test" } as any;
+      },
+    });
+
+    const res = await request(localApp)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.agentId).toBe(secondStageAgentId);
+    expect(calls[0]!.reason).toBe("execution_approval_requested");
+    expect(calls[0]!.issueId).toBe(issueId);
+  });
+
+  it("skips a stage that already has a durable approved decision row", async () => {
+    const { companyId, issueId } = await seedIssue({ twoStages: true });
+    currentActor = boardActor(companyId);
+    // The projection can lose completedStageIds (a board `done` PATCH clears it)
+    // while the durable approved row survives. The target selector must consult
+    // the row and never re-decide the stage.
+    await db.insert(issueExecutionDecisions).values({
+      id: "77777777-7777-4777-8777-777777777777",
+      companyId,
+      issueId,
+      stageId: STAGE_ID,
+      stageType: "review",
+      actorAgentId: null,
+      actorUserId: USER_ID,
+      outcome: "approved",
+      body: "prior board approval",
+      createdByRunId: null,
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stageId).toBe(SECOND_STAGE_ID);
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(2);
   });
 });
