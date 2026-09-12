@@ -271,7 +271,9 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  applyBoardStageDecision,
   assertPatchableExecutionPolicyWrite,
+  BoardStageNoUndecidedStageError,
   isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -8674,6 +8676,177 @@ export function issueRoutes(
       outcome: "armed",
       headSha: publishOutcome.headSha,
       message: publishOutcome.message,
+    });
+  });
+
+  // SUP-15805: board stage-decision override. A board user approves or requests
+  // changes on an execution stage on behalf of an unresponsive or absent agent
+  // participant. The existing PATCH override path is gated to a card's active
+  // pending stage and requires principalsEqual(participant, actor), which a board
+  // user never satisfies on an agent-gated card, so stuck reviews/approvals had
+  // no sanctioned escape hatch. This route advances (never closes) the card.
+  router.post("/issues/:id/execution-stage/board-decision", async (req, res) => {
+    // Gate 0 (strict, first): the endpoint is unreachable unless the operator
+    // opted in. A disabled flag is a 404 BEFORE any read, membership check, or
+    // body parse — to an unopted caller the route does not exist.
+    const boardOverrideFlag = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+    if (boardOverrideFlag !== "true" && boardOverrideFlag !== "1") {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+
+    // Gate 1: board-only. Agent actors are refused here (403) before any read.
+    assertBoard(req);
+
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+
+    // Gate 2: company owner/admin. Deciding a stage on someone's behalf is a
+    // judgment call, not a mechanical one. local_implicit (trusted local dev) is
+    // exempt, matching the republish route.
+    if (req.actor.source !== "local_implicit") {
+      const gateUserId = req.actor.userId?.trim();
+      const membership = gateUserId
+        ? await db
+            .select({ membershipRole: companyMemberships.membershipRole })
+            .from(companyMemberships)
+            .where(
+              and(
+                eq(companyMemberships.companyId, issue.companyId),
+                eq(companyMemberships.principalType, "user"),
+                eq(companyMemberships.principalId, gateUserId),
+                eq(companyMemberships.status, "active"),
+              ),
+            )
+            .then((rows) => rows[0] ?? null)
+        : null;
+      const role = membership?.membershipRole;
+      if (!role || (role !== "owner" && role !== "admin")) {
+        throw forbidden("Company owner or admin required to decide an execution stage");
+      }
+    }
+
+    // Gate 3: body. `decision` must be a known outcome and a non-empty comment is
+    // required (a decision without reasoning is not auditable). A ZodError here
+    // surfaces as the generic 400 via the global error handler.
+    const boardStageDecisionBody = z.object({
+      decision: z.enum(["approved", "changes_requested"]),
+      comment: z.string().trim().min(1),
+    });
+    const { decision, comment } = boardStageDecisionBody.parse(req.body);
+
+    const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+    if (!policy) {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "no_undecided_stage",
+        message: "This issue has no execution policy to decide a stage on",
+      });
+      return;
+    }
+
+    let result;
+    try {
+      result = applyBoardStageDecision({
+        issue,
+        policy,
+        decision,
+        commentBody: comment,
+      });
+    } catch (err) {
+      if (err instanceof BoardStageNoUndecidedStageError) {
+        res.status(409).json({
+          outcome: "rejected",
+          reason: "no_undecided_stage",
+          message: err.message,
+        });
+        return;
+      }
+      throw err;
+    }
+
+    const actor = getActorInfo(req);
+    const decisionId = randomUUID();
+    const rawExecutionState = result.patch.executionState;
+    if (!rawExecutionState || typeof rawExecutionState !== "object") {
+      throw new Error("Board stage decision patch is missing executionState");
+    }
+    const nextExecutionState = {
+      ...(rawExecutionState as Record<string, unknown>),
+      lastDecisionId: decisionId,
+    };
+
+    const updated = await db.transaction(async (tx) => {
+      const row = await svc.update(
+        id,
+        {
+          ...result.patch,
+          executionState: nextExecutionState,
+          actorAgentId: null,
+          actorUserId: actor.actorId,
+        } as Parameters<typeof svc.update>[1],
+        tx,
+      );
+      if (!row) return null;
+      await tx.insert(issueExecutionDecisions).values({
+        id: decisionId,
+        companyId: row.companyId,
+        issueId: row.id,
+        stageId: result.decision.stageId,
+        stageType: result.decision.stageType,
+        actorAgentId: null,
+        actorUserId: actor.actorId,
+        outcome: result.decision.outcome,
+        body: result.decision.body,
+        createdByRunId: null,
+      });
+      return row;
+    });
+    if (!updated) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+
+    const commentRow = await svc.addComment(id, result.decision.body, {
+      agentId: undefined,
+      userId: actor.actorType === "user" ? actor.actorId : undefined,
+      runId: null,
+    });
+
+    await logActivity(db, {
+      companyId: updated.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: "issue.board_stage_override",
+      entityType: "issue",
+      entityId: updated.id,
+      agentId: null,
+      runId: null,
+      details: {
+        stageId: result.targetStage.id,
+        stageType: result.targetStage.type,
+        decision: result.decision.outcome,
+        displacedParticipant: result.displacedParticipant,
+        commentId: commentRow.id,
+      },
+    });
+
+    // Post-decision hook, identical to the PATCH path: publishes the approval
+    // status / arms the merge on an approved stage (a no-op for changes_requested).
+    await runApprovalMergeArming({
+      issue: updated,
+      decision: result.decision,
+      closingTransition: false,
+    });
+
+    res.status(200).json({
+      outcome: result.decision.outcome,
+      stageId: result.targetStage.id,
+      stageType: result.targetStage.type,
+      decisionId,
+      commentId: commentRow.id,
+      executionState: nextExecutionState,
     });
   });
 

@@ -835,13 +835,26 @@ function buildPendingState(input: {
 }
 
 function buildChangesRequestedState(
-  previous: IssueExecutionState,
+  previous: IssueExecutionState | null,
   currentStage: IssueExecutionStage,
   returnAssignee: IssueExecutionStagePrincipal,
   changesRequestedCount: number,
 ): IssueExecutionState {
+  // A null `previous` is the board-override shape: a stuck card that never
+  // entered the pending phase (no executionState row) still has a resolvable
+  // target stage, so the decision must land on a fully-formed state rather than
+  // spreading nothing. The fallback fills every required field so the widened
+  // state satisfies the schema; non-null `previous` keeps its exact prior shape.
   return {
-    ...previous,
+    ...(previous ?? {
+      currentStageIndex: null,
+      currentParticipant: null,
+      deliveryAuthor: null,
+      completedStageIds: [],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      pendingSince: null,
+    }),
     status: CHANGES_REQUESTED_STATUS,
     currentStageId: currentStage.id,
     currentStageType: currentStage.type,
@@ -1653,4 +1666,140 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
   return { patch: applyMonitorTransition(input, {}) };
+}
+
+export type BoardStageDecision = "approved" | "changes_requested";
+
+export interface BoardStageDecisionInput {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  decision: BoardStageDecision;
+  commentBody: string;
+}
+
+export interface BoardStageDecisionResult {
+  patch: Record<string, unknown>;
+  decision: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
+  targetStage: IssueExecutionStage;
+  /**
+   * The stage participant the board is deciding on behalf of (the agent the
+   * decision displaces). Null when the stage has no configured participant.
+   */
+  displacedParticipant: IssueExecutionStagePrincipal | null;
+  workflowControlledAssignment: boolean;
+}
+
+/**
+ * No undecided execution stage remains for a board decision to act on: the
+ * card's policy has no stages, or every stage is already completed or skipped.
+ * The route maps this to `409 { reason: "no_undecided_stage" }` (SUP-15805).
+ */
+export class BoardStageNoUndecidedStageError extends Error {
+  readonly reason = "no_undecided_stage" as const;
+
+  constructor() {
+    super("No undecided execution stage to decide on this issue");
+    this.name = "BoardStageNoUndecidedStageError";
+  }
+}
+
+/**
+ * The stage a board decision acts on. The active pending stage when one exists;
+ * otherwise the first policy stage not yet completed or skipped. This covers the
+ * live shape of the stuck cards (SUP-15547 / 13951 / 15638), where the card sits
+ * with a stuck `executionState` (or no executionState at all) and no active
+ * pending stage.
+ */
+function resolveBoardTargetStage(
+  policy: IssueExecutionPolicy,
+  previous: IssueExecutionState | null,
+): IssueExecutionStage | null {
+  if (previous?.status === PENDING_STATUS && previous.currentStageId) {
+    const active = findStageById(policy, previous.currentStageId);
+    if (active) return active;
+  }
+  const decided = new Set([
+    ...(previous?.completedStageIds ?? []),
+    ...(previous?.skippedStageIds ?? []),
+  ]);
+  return policy.stages.find((stage) => !decided.has(stage.id)) ?? null;
+}
+
+/**
+ * SUP-15805: a board user approves or requests changes on an execution stage on
+ * behalf of an (unresponsive or absent) agent participant. Unlike the PATCH
+ * decision path this function is NOT bound to `principalsEqual(participant,
+ * actor)` — the board decides the stage regardless of who the configured
+ * participant is. The round counter is always reset: a board decision is a human
+ * decision, so the agent↔agent changes-requested cap never escalates here.
+ *
+ * The card is advanced but never closed: `approved` on the final stage only
+ * completes the execution state (it does not set issue status to `done`).
+ */
+export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardStageDecisionResult {
+  const previous = parseIssueExecutionState(input.issue.executionState);
+  const currentAssignee = assigneePrincipal(input.issue);
+  const targetStage = resolveBoardTargetStage(input.policy, previous);
+  if (!targetStage) throw new BoardStageNoUndecidedStageError();
+
+  const returnAssignee = resolveReturnAssignee({
+    policy: input.policy,
+    existingState: previous,
+    currentAssignee,
+  });
+  const displacedParticipant =
+    previous?.currentParticipant ??
+    selectStageParticipant(targetStage, { exclude: returnAssignee });
+  const body = input.commentBody.trim();
+
+  if (input.decision === "approved") {
+    const completedState = buildCompletedState(previous, targetStage);
+    const nextStage = nextPendingStageAfter(input.policy, targetStage, completedState);
+    const patch: Record<string, unknown> = {};
+    if (nextStage) {
+      const participant = selectStageParticipant(nextStage, { exclude: returnAssignee });
+      if (!participant) {
+        throw unprocessable(
+          `No eligible ${nextStage.type} participant is configured for this issue (stage ${nextStage.id}); the return assignee is excluded from participant selection`,
+        );
+      }
+      buildPendingStagePatch({
+        patch,
+        previous: completedState,
+        policy: input.policy,
+        stage: nextStage,
+        participant,
+        returnAssignee: returnAssignee ?? null,
+      });
+    } else {
+      patch.executionState = completedState;
+    }
+    return {
+      patch,
+      decision: { stageId: targetStage.id, stageType: targetStage.type, outcome: "approved", body },
+      targetStage,
+      displacedParticipant,
+      workflowControlledAssignment: true,
+    };
+  }
+
+  if (!returnAssignee) {
+    throw unprocessable("This execution stage has no return assignee");
+  }
+  const patch: Record<string, unknown> = {};
+  patch.status = "in_progress";
+  Object.assign(patch, patchForPrincipal(returnAssignee));
+  patch.executionState = buildChangesRequestedState(previous, targetStage, returnAssignee, 0);
+  return {
+    patch,
+    decision: {
+      stageId: targetStage.id,
+      stageType: targetStage.type,
+      outcome: "changes_requested",
+      body,
+    },
+    targetStage,
+    displacedParticipant,
+    workflowControlledAssignment: true,
+  };
 }
