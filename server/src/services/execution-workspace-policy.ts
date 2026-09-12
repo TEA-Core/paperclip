@@ -24,7 +24,7 @@ export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
 
 export const WORKSPACE_PATH_HELD_CODE = "workspace_path_held_by_live_workspace";
 export const WORKSPACE_PATH_HELD_REMEDIATION =
-  "Archive the holding execution workspace (or release the source issue's binding to it) and retry the allocation.";
+  "Archive the holding execution workspace and retry the allocation.";
 
 export const WORKSPACE_CROSS_SOURCE_BINDING_CODE = "workspace_cross_source_binding";
 export const WORKSPACE_CROSS_SOURCE_BINDING_REMEDIATION =
@@ -169,42 +169,97 @@ export function executionWorkspaceBranchNamesAnyIssueIdentifier(
 }
 
 /**
- * SUP-15231: is a parent-sourced workspace binding EXEMPT from the SUP-15205
- * branch-identity inheritance decline?
+ * ADR-083 D11: does the branch BEGIN with the given issue's `sup-<n>` token?
  *
- * The sanctioned `shared_workspace` plan carrier is the one legitimate shape a
- * parent-sourced row can have. TSP's project policy defaults every card to
- * `shared_workspace`, and the plan parent sources the carrier row that its
- * children deliver onto. `merge-arming.ts` keys `branchIsOwn` on
- * `workspaceRow.sourceIssueId === issueId`, so the parent — and only the
- * parent — can lawfully mint `paperclip/approved` on the carrier PR; the
- * children close nested and the parent lands the branch once through its own
- * ladder. Declining that binding pushes every open child onto a fresh
- * `baseRef: origin/main` workspace that lacks the carrier content, deadlocking
- * the parent's ladder. (The 7 commits on #3443 and 3 on #3446 were all pushed
- * by children through deliver.sh — the carrier branch is real, shared content,
- * not a strand.)
+ * `deliver-carrier.sh:carrier_mode_detect` recognises a carrier branch by
+ * exactly this anchor (case-insensitive), so the platform's inheritance gate
+ * mirrors it: `SUP-15486-carrier-x` is anchored at SUP-15486, while
+ * `feature/SUP-15486-x` (not at the start) and `SUP-1549-x` (a different
+ * number) are not. Both sides are validated as whole `sup-<n>` card ids — not
+ * trailing numbers — so a source whose identifier carries a foreign prefix such
+ * as `ABC-15486` is not anchored at the `SUP-15486-*` branch. A missing branch
+ * or a non-`sup-<n>` identifier is not anchored.
+ */
+function branchAnchoredAtIssueIdentifier(input: {
+  workspaceBranchName?: string | null;
+  issueIdentifier?: string | null;
+}): boolean {
+  const branchName = input.workspaceBranchName?.trim();
+  if (!branchName) return false;
+  const issueIdentifier = input.issueIdentifier?.trim();
+  if (!issueIdentifier) return false;
+  // Validate the whole identifier as a `sup-<n>` card id (case-insensitive) and
+  // capture its number; a foreign prefix such as `ABC-15486` must not match a
+  // `SUP-15486-*` branch on the shared number alone.
+  const identifierNumber = issueIdentifier.match(/^sup-([0-9]+)$/i)?.[1];
+  if (!identifierNumber) return false;
+  return branchName.match(/^sup-([0-9]+)/i)?.[1] === identifierNumber;
+}
+
+/**
+ * SUP-15231, widened by SUP-15837: is a parent-sourced workspace binding EXEMPT
+ * from the SUP-15205 branch-identity inheritance decline?
  *
- * The exemption fires iff BOTH hold:
- *   1. the source row's mode is `shared_workspace`, and
- *   2. its `sourceIssueId` is a strict ancestor of the issue being bound
- *       (the caller walks the issues parent chain and supplies the verdict).
+ * Two legitimate carrier shapes exist, and the platform must agree with the
+ * carrier contract `deliver.sh` already enforces for exactly these:
  *
- * An `isolated_workspace` / `operator_branch` row sourced by a parent — the
- * defect SUP-15205 exists to fix — is NOT exempt. A `shared_workspace` row
- * sourced by a sibling or an unrelated card (not an ancestor) is NOT exempt.
- * Self-sourced and sourceless bindings never reach here: they restore as
- * before and are outside the gate's scope.
+ *   1. The `shared_workspace` plan carrier. TSP's project policy defaults every
+ *      card to `shared_workspace`, and the plan parent sources the carrier row
+ *      that its children deliver onto. `merge-arming.ts` keys `branchIsOwn` on
+ *      `workspaceRow.sourceIssueId === issueId`, so the parent — and only the
+ *      parent — can lawfully mint `paperclip/approved` on the carrier PR; the
+ *      children close nested and the parent lands the branch once through its
+ *      own ladder. Declining that binding pushes every open child onto a fresh
+ *      `baseRef: origin/main` workspace that lacks the carrier content,
+ *      deadlocking the parent's ladder. (The 7 commits on #3443 and 3 on #3446
+ *      were all pushed by children through deliver.sh — the carrier branch is
+ *      real, shared content, not a strand.)
+ *
+ *   2. The SUP-15837 `isolated_workspace` redo carrier. In a project whose
+ *      `defaultMode` is `isolated_workspace` (this project), an ADR-083 redo
+ *      child must deliver on its parent's branch, but an ancestor-sourced
+ *      `isolated_workspace` row names a foreign `SUP-nnnn`, so the
+ *      branch-identity gate declined every child and carrier-child delivery was
+ *      structurally unreachable (SUP-15794/SUP-15832). This shape is admitted
+ *      ONLY when it matches `deliver-carrier.sh:carrier_mode_detect` precisely.
+ *
+ * The exemption fires iff the source `sourceIssueId` is present and a strict
+ * ancestor of the bound issue (the caller walks the parent chain and supplies
+ * the verdict), AND either:
+ *   - the source row's mode is `shared_workspace`; or
+ *   - the source row's mode is `isolated_workspace`, the row's `branchName` is
+ *     anchored at the source issue's identifier (D11), and the source issue's
+ *     depth is <= 2 (D6).
+ *
+ * Everything else declines. An `operator_branch` row, a sibling-sourced row, an
+ * ancestor-sourced row whose branch is not anchored at that ancestor, and an
+ * ancestor deeper than 2 are all NOT exempt. On the isolated arm a missing
+ * depth, source identifier, or branch fails closed (not exempt), so an existing
+ * caller that has not been taught the new inputs keeps the pre-widening verdict.
+ * Self-sourced and sourceless bindings never reach here: they restore as before
+ * and are outside the gate's scope.
  */
 export function inheritedExecutionWorkspaceBranchExempt(input: {
   workspaceMode?: string | null;
   workspaceSourceIssueId?: string | null;
   sourceIssueIsAncestorOfBoundIssue?: boolean;
+  workspaceBranchName?: string | null;
+  workspaceSourceIssueIdentifier?: string | null;
+  sourceIssueDepth?: number | null;
 }): boolean {
-  if (input.workspaceMode !== "shared_workspace") return false;
   const sourceIssueId = input.workspaceSourceIssueId?.trim();
   if (!sourceIssueId) return false;
-  return input.sourceIssueIsAncestorOfBoundIssue === true;
+  if (input.sourceIssueIsAncestorOfBoundIssue !== true) return false;
+  // The shared_workspace plan carrier predates ADR-083 and is unchanged.
+  if (input.workspaceMode === "shared_workspace") return true;
+  if (input.workspaceMode !== "isolated_workspace") return false;
+  const sourceIssueDepth = input.sourceIssueDepth;
+  if (typeof sourceIssueDepth !== "number" || !Number.isFinite(sourceIssueDepth)) return false;
+  if (sourceIssueDepth > 2) return false;
+  return branchAnchoredAtIssueIdentifier({
+    workspaceBranchName: input.workspaceBranchName,
+    issueIdentifier: input.workspaceSourceIssueIdentifier,
+  });
 }
 
 /**
@@ -220,10 +275,10 @@ export function inheritedExecutionWorkspaceBranchExempt(input: {
  * lawfully stamp it for the child. The child must realize its own workspace
  * instead.
  *
- * The one sanctioned exception is the `shared_workspace` plan carrier (see
- * `inheritedExecutionWorkspaceBranchExempt`): a `shared_workspace` row sourced
- * by an ANCESTOR of this issue is the shared branch the plan's children are
- * meant to build on, so it restores as before.
+ * The sanctioned exceptions are the carriers `inheritedExecutionWorkspaceBranchExempt`
+ * recognises: a `shared_workspace` plan carrier sourced by an ANCESTOR, and
+ * (SUP-15837) an `isolated_workspace` redo carrier sourced by an ancestor whose
+ * branch is anchored at that ancestor at depth <= 2. Both restore as before.
  *
  * This is the provisioning-side backstop; the authoritative decline happens at
  * the inheritance site (issues.ts) which knows the binding is implicit. The
@@ -242,12 +297,17 @@ export function inheritedExecutionWorkspaceBranchDeclined(input: {
   workspaceBranchName?: string | null;
   workspaceMode?: string | null;
   sourceIssueIsAncestorOfBoundIssue?: boolean;
+  workspaceSourceIssueIdentifier?: string | null;
+  sourceIssueDepth?: number | null;
 }): boolean {
   if (
     inheritedExecutionWorkspaceBranchExempt({
       workspaceMode: input.workspaceMode,
       workspaceSourceIssueId: input.workspaceSourceIssueId,
       sourceIssueIsAncestorOfBoundIssue: input.sourceIssueIsAncestorOfBoundIssue,
+      workspaceBranchName: input.workspaceBranchName,
+      workspaceSourceIssueIdentifier: input.workspaceSourceIssueIdentifier,
+      sourceIssueDepth: input.sourceIssueDepth,
     })
   ) {
     return false;

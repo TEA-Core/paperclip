@@ -1808,6 +1808,45 @@ export async function isStrictAncestorIssueIdOf(
   return rows.length > 0;
 }
 
+/**
+ * SUP-15837: resolve an issue's identifier and its ancestor depth (the number of
+ * strict ancestors, root = 0) in one recursive-CTE walk over `issues.parent_id`,
+ * the same shape `isStrictAncestorIssueIdOf` uses. The ADR-083 isolated-carrier
+ * exemption needs both: the identifier to check the branch anchor (D11) and the
+ * depth for the <= 2 guard (D6). Returns null when the issue cannot be read.
+ */
+async function resolveIssueIdentifierAndDepth(
+  db: Pick<Db, "execute">,
+  companyId: string,
+  issueId: string,
+): Promise<{ identifier: string | null; depth: number } | null> {
+  if (!issueId) return null;
+  const result = await db.execute(sql`
+    WITH RECURSIVE ancestors(id) AS (
+      SELECT parent_id
+      FROM issues
+      WHERE id = ${issueId} AND company_id = ${companyId}
+      UNION
+      SELECT i.parent_id
+      FROM issues i
+      JOIN ancestors a ON i.id = a.id
+      WHERE i.parent_id IS NOT NULL AND i.company_id = ${companyId}
+    )
+    SELECT
+      (SELECT identifier FROM issues WHERE id = ${issueId} AND company_id = ${companyId} LIMIT 1) AS identifier,
+      (SELECT COUNT(*) FROM ancestors WHERE id IS NOT NULL) AS depth
+  `);
+  const rows: unknown[] = Array.isArray(result)
+    ? result
+    : ((result as { rows?: unknown[] }).rows ?? []);
+  const row = rows[0] as { identifier?: unknown; depth?: unknown } | undefined;
+  if (!row) return null;
+  const identifier =
+    typeof row.identifier === "string" && row.identifier.trim().length > 0 ? row.identifier : null;
+  const depth = Number(row.depth ?? 0);
+  return { identifier, depth: Number.isFinite(depth) ? depth : 0 };
+}
+
 // Mine participation fails closed. Add new user-authored issue mutation actions
 // here instead of admitting every issue activity, because reads, previews, and
 // denied resource requests are audited too.
@@ -7957,8 +7996,64 @@ export function issueService(db: Db) {
             // inside that issue's worktree. Inheriting it would bind this new
             // issue cross-source, so it is declined (and logged) exactly like a
             // terminal source; the issue gets its own workspace on next run.
+            //
+            // The ADR-083 carrier shapes are the exception. Both are decided by
+            // the shared exemption predicate, computed once here so the
+            // cross-source arm and the branch-identity arm below always agree:
+            //   - the shared_workspace plan carrier (SUP-15231) — a shared row
+            //     sourced by an ancestor of the new issue;
+            //   - the isolated_workspace redo carrier (SUP-15837) — an isolated
+            //     row sourced by an ancestor whose branch is anchored at that
+            //     ancestor's identifier at depth <= 2 (deliver-carrier.sh D11/D6).
+            // Sibling-sourced, unanchored, deeper-ancestor, and plain-branch
+            // shapes are NOT exempt and decline as before.
+            const carrierSourceIssueId = sourceWorkspace?.sourceIssueId?.trim() || null;
+            const carrierSourceIsAncestorOfNewIssue =
+              sourceWorkspace &&
+              (sourceWorkspace.mode === "shared_workspace" || sourceWorkspace.mode === "isolated_workspace") &&
+              carrierSourceIssueId !== null &&
+              issueData.parentId != null
+                ? carrierSourceIssueId === issueData.parentId ||
+                  (await isStrictAncestorIssueIdOf(
+                    tx as unknown as Pick<Db, "execute">,
+                    companyId,
+                    issueData.parentId,
+                    carrierSourceIssueId,
+                  ))
+                : false;
+            // SUP-15837: the isolated carrier arm additionally needs the source
+            // issue's identifier (D11 branch anchor) and depth (D6 <= 2 guard).
+            // Computed only when that arm could be exempt; the shared arm's
+            // verdict is ancestry alone.
+            let carrierSourceIssueIdentifier: string | null = null;
+            let carrierSourceIssueDepth: number | null = null;
+            if (
+              sourceWorkspace?.mode === "isolated_workspace" &&
+              carrierSourceIsAncestorOfNewIssue &&
+              carrierSourceIssueId !== null
+            ) {
+              const sourceRef = await resolveIssueIdentifierAndDepth(
+                tx as unknown as Pick<Db, "execute">,
+                companyId,
+                carrierSourceIssueId,
+              );
+              carrierSourceIssueIdentifier = sourceRef?.identifier ?? null;
+              carrierSourceIssueDepth = sourceRef?.depth ?? null;
+            }
+            const sourceWorkspaceExemptCarrier = sourceWorkspace
+              ? inheritedExecutionWorkspaceBranchExempt({
+                  workspaceMode: sourceWorkspace.mode,
+                  workspaceSourceIssueId: carrierSourceIssueId,
+                  sourceIssueIsAncestorOfBoundIssue: carrierSourceIsAncestorOfNewIssue,
+                  workspaceBranchName: sourceWorkspace.branchName,
+                  workspaceSourceIssueIdentifier: carrierSourceIssueIdentifier,
+                  sourceIssueDepth: carrierSourceIssueDepth,
+                })
+              : false;
             const sourceWorkspaceSourcedByOtherIssue =
-              Boolean(sourceWorkspace?.sourceIssueId) && sourceWorkspace?.mode !== "shared_workspace";
+              Boolean(sourceWorkspace?.sourceIssueId) &&
+              sourceWorkspace?.mode !== "shared_workspace" &&
+              !sourceWorkspaceExemptCarrier;
             if (sourceWorkspace && sourceWorkspaceOwnerIsTerminal) declinedWorkspaceInheritance = true;
             else if (sourceWorkspace && sourceWorkspaceSourcedByOtherIssue) {
               declinedWorkspaceInheritance = true;
@@ -7978,71 +8073,49 @@ export function issueService(db: Db) {
             }
             else if (
               sourceWorkspace &&
+              !sourceWorkspaceExemptCarrier &&
               executionWorkspaceBranchNamesAnyIssueIdentifier(sourceWorkspace.branchName)
             ) {
-              // SUP-15205 (narrowed by SUP-15231): the source branch carries a
-              // deliverable `sup-<n>` token. At create time the new issue's
-              // number is strictly greater than every existing issue's, so that
-              // token necessarily names a different issue's delivery branch —
-              // the branch scripts/deliver.sh's one-branch-one-issue gate would
-              // refuse for the new issue. This arm catches the shapes the
-              // cross-source arm above leaves reachable: shared workspaces and
-              // sourceless rows.
+              // SUP-15205 (narrowed by SUP-15231, widened by SUP-15837): the
+              // source branch carries a deliverable `sup-<n>` token. At create
+              // time the new issue's number is strictly greater than every
+              // existing issue's, so that token necessarily names a different
+              // issue's delivery branch — the branch scripts/deliver.sh's
+              // one-branch-one-issue gate would refuse for the new issue. This
+              // arm catches the shapes the cross-source arm above leaves
+              // reachable: sourceless rows, and shared/isolated rows that are
+              // not an exempt carrier.
               //
-              // The one exception is the shared_workspace plan carrier: when the
-              // source row is shared_workspace and its sourceIssueId is an
-              // ancestor of the new issue, inheritance is the sanctioned path
-              // (the children build on the parent's carrier branch), so it is
-              // NOT declined — it falls through to the inherit arm below and no
-              // inheritance_declined_branch_identity row is logged. The new row
-              // is not yet in the DB, so the new issue's parent chain is rooted
-              // at issueData.parentId: the source is an ancestor iff it equals
-              // the parent or sits in the parent's chain.
-              const carrierSourceIssueId = sourceWorkspace.sourceIssueId?.trim() || null;
-              const carrierSourceIsAncestorOfNewIssue =
-                sourceWorkspace.mode === "shared_workspace" &&
-                carrierSourceIssueId !== null &&
-                issueData.parentId != null
-                  ? carrierSourceIssueId === issueData.parentId ||
-                    (await isStrictAncestorIssueIdOf(
-                      tx as unknown as Pick<Db, "execute">,
-                      companyId,
-                      issueData.parentId,
-                      carrierSourceIssueId,
-                    ))
-                  : false;
-              if (
-                !inheritedExecutionWorkspaceBranchExempt({
-                  workspaceMode: sourceWorkspace.mode,
-                  workspaceSourceIssueId: carrierSourceIssueId,
-                  sourceIssueIsAncestorOfBoundIssue: carrierSourceIsAncestorOfNewIssue,
-                })
-              ) {
-                declinedWorkspaceInheritance = true;
-                await logActivityInTransaction(tx as unknown as Db, {
-                  companyId,
-                  actorType: "system",
-                  actorId: "workspace_binding_guard",
-                  action: "execution_workspace.inheritance_declined_branch_identity",
-                  entityType: "execution_workspace",
-                  entityId: sourceWorkspace.id,
-                  details: {
-                    requestedByIssueId: workspaceInheritanceIssueId,
-                    sourceIssueId: sourceWorkspace.sourceIssueId,
-                    branchName: sourceWorkspace.branchName,
-                    reason: "workspace branch names a different issue's delivery branch",
-                  },
-                }, createActivityPublications);
-              }
-             }
-             // Inherit a live, non-cross-source source workspace unless one of the
-             // guards above declined it. This includes the SUP-15231
-             // shared_workspace plan carrier: when the branch-identity arm finds
-             // the row exempt it leaves declinedWorkspaceInheritance unset, so
-             // the child inherits the carrier branch verbatim (the children build
-             // on the parent's carrier). A non-exempt cross-source branch or a
-             // terminal source still declines above.
-             if (!declinedWorkspaceInheritance && sourceWorkspace) {
+              // A row already recognised as an ADR-083 carrier
+              // (`sourceWorkspaceExemptCarrier`) is NOT declined here: it falls
+              // through to the inherit arm below and the child receives the
+              // existing workspace row verbatim (the children build on the
+              // parent's carrier branch).
+              declinedWorkspaceInheritance = true;
+              await logActivityInTransaction(tx as unknown as Db, {
+                companyId,
+                actorType: "system",
+                actorId: "workspace_binding_guard",
+                action: "execution_workspace.inheritance_declined_branch_identity",
+                entityType: "execution_workspace",
+                entityId: sourceWorkspace.id,
+                details: {
+                  requestedByIssueId: workspaceInheritanceIssueId,
+                  sourceIssueId: sourceWorkspace.sourceIssueId,
+                  branchName: sourceWorkspace.branchName,
+                  reason: "workspace branch names a different issue's delivery branch",
+                },
+              }, createActivityPublications);
+            }
+              // Inherit a live, non-cross-source source workspace unless one of the
+              // guards above declined it. This includes both ADR-083 carriers:
+              // the SUP-15231 shared_workspace plan carrier and the SUP-15837
+              // isolated_workspace redo carrier. When the arms above find the row
+              // exempt they leave declinedWorkspaceInheritance unset, so the child
+              // inherits the carrier branch verbatim (the children build on the
+              // parent's carrier). A non-exempt cross-source branch or a terminal
+              // source still declines above.
+              if (!declinedWorkspaceInheritance && sourceWorkspace) {
                executionWorkspaceId = sourceWorkspace.id;
                executionWorkspacePreference = "reuse_existing";
                executionWorkspaceSettings = {

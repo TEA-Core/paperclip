@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -397,5 +397,255 @@ describeEmbeddedPostgres("execution workspace allocation invariants (SUP-14139)"
         ),
       );
     expect(declineLog).toEqual([{ action: "execution_workspace.inheritance_declined_cross_source", entityId: executionWorkspaceId }]);
+  });
+
+  // SUP-15837: the ADR-083 isolated_workspace redo carrier. A parent-sourced
+  // isolated_workspace row whose branch is anchored at the source's identifier
+  // at depth <= 2 is inherited by a descendant child instead of declined, so
+  // the child can deliver on the parent's branch. These tests exercise the real
+  // issue-create inheritance gate (issues.ts), not just the provisioning
+  // backstop.
+  async function seedIsolatedCarrier(
+    companyId: string,
+    projectId: string,
+    projectWorkspaceId: string,
+    opts: {
+      sourceIssueId: string;
+      identifier: string;
+      issueNumber: number;
+      branchName: string;
+      parentId?: string | null;
+    },
+  ) {
+    const executionWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "carrier",
+      status: "active",
+      cwd: `/paperclip/worktrees/tsp/${opts.identifier}`,
+      providerType: "git_worktree",
+      providerRef: `/paperclip/worktrees/tsp/${opts.identifier}`,
+      branchName: opts.branchName,
+    });
+    await db.insert(issues).values({
+      id: opts.sourceIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Carrier source",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: opts.issueNumber,
+      identifier: opts.identifier,
+      parentId: opts.parentId ?? null,
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId: opts.sourceIssueId })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    return executionWorkspaceId;
+  }
+
+  it("inherits an isolated_workspace ADR-083 redo carrier sourced by its parent (SUP-15837)", async () => {
+    const companyId = await seedCompany();
+    const { projectId, projectWorkspaceId } = await seedProjectWorkspace(companyId);
+
+    const sourceIssueId = randomUUID();
+    const executionWorkspaceId = await seedIsolatedCarrier(companyId, projectId, projectWorkspaceId, {
+      sourceIssueId,
+      identifier: "SUP-15794",
+      issueNumber: 15794,
+      branchName: "SUP-15794-plan-deep-tools",
+    });
+
+    const child = await issuesSvc.create(companyId, {
+      projectId,
+      projectWorkspaceId,
+      title: "Redo child on the carrier",
+      status: "todo",
+      priority: "high",
+      parentId: sourceIssueId,
+      inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(child.executionWorkspacePreference).toBe("reuse_existing");
+
+    // No second execution-workspace row was created: the child sits on the
+    // existing carrier row (acceptance 4).
+    const rows = await db
+      .select({ id: executionWorkspaces.id })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.companyId, companyId));
+    expect(rows).toEqual([{ id: executionWorkspaceId }]);
+
+    // No inheritance decline was recorded.
+    const declines = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          inArray(activityLog.action, [
+            "execution_workspace.inheritance_declined_branch_identity",
+            "execution_workspace.inheritance_declined_cross_source",
+          ]),
+        ),
+      );
+    expect(declines).toHaveLength(0);
+  });
+
+  it("still declines an isolated_workspace row sourced by a sibling (SUP-15837)", async () => {
+    const companyId = await seedCompany();
+    const { projectId, projectWorkspaceId } = await seedProjectWorkspace(companyId);
+
+    const grandparentId = randomUUID();
+    await db.insert(issues).values({
+      id: grandparentId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Plan root",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: 1,
+      identifier: "SUP-1",
+    });
+    const siblingId = randomUUID();
+    const executionWorkspaceId = await seedIsolatedCarrier(companyId, projectId, projectWorkspaceId, {
+      sourceIssueId: siblingId,
+      identifier: "SUP-2",
+      issueNumber: 2,
+      branchName: "SUP-2-plan",
+      parentId: grandparentId,
+    });
+
+    const issue = await issuesSvc.create(companyId, {
+      projectId,
+      projectWorkspaceId,
+      title: "New child (sibling of the carrier)",
+      status: "todo",
+      priority: "high",
+      parentId: grandparentId,
+      inheritExecutionWorkspaceFromIssueId: siblingId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    expect(issue.executionWorkspaceId).toBeNull();
+    expect(issue.executionWorkspacePreference).toBeNull();
+    const declines = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "execution_workspace.inheritance_declined_cross_source"),
+        ),
+      );
+    expect(declines).toEqual([{ entityId: executionWorkspaceId }]);
+  });
+
+  it("still declines an isolated_workspace parent carrier whose branch is not anchored at the source (SUP-15837)", async () => {
+    const companyId = await seedCompany();
+    const { projectId, projectWorkspaceId } = await seedProjectWorkspace(companyId);
+
+    const sourceIssueId = randomUUID();
+    await seedIsolatedCarrier(companyId, projectId, projectWorkspaceId, {
+      sourceIssueId,
+      identifier: "SUP-7",
+      issueNumber: 7,
+      branchName: "feature/SUP-9-plan",
+    });
+
+    const child = await issuesSvc.create(companyId, {
+      projectId,
+      projectWorkspaceId,
+      title: "Child",
+      status: "todo",
+      priority: "high",
+      parentId: sourceIssueId,
+      inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspacePreference).toBeNull();
+  });
+
+  it("still declines an isolated_workspace parent carrier sourced deeper than depth 2 (SUP-15837)", async () => {
+    const companyId = await seedCompany();
+    const { projectId, projectWorkspaceId } = await seedProjectWorkspace(companyId);
+
+    // Chain: SUP-1 (0) -> SUP-2 (1) -> SUP-3 (2) -> SUP-4 (3). The carrier is
+    // sourced by SUP-4, the new child's parent, so SUP-4 sits at depth 3.
+    const idR = randomUUID();
+    const idA = randomUUID();
+    const idB = randomUUID();
+    const idS = randomUUID();
+    await db.insert(issues).values({
+      id: idR,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "R",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: 1,
+      identifier: "SUP-1",
+    });
+    await db.insert(issues).values({
+      id: idA,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "A",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: 2,
+      identifier: "SUP-2",
+      parentId: idR,
+    });
+    await db.insert(issues).values({
+      id: idB,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "B",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: 3,
+      identifier: "SUP-3",
+      parentId: idA,
+    });
+    await seedIsolatedCarrier(companyId, projectId, projectWorkspaceId, {
+      sourceIssueId: idS,
+      identifier: "SUP-4",
+      issueNumber: 4,
+      branchName: "SUP-4-plan",
+      parentId: idB,
+    });
+
+    const child = await issuesSvc.create(companyId, {
+      projectId,
+      projectWorkspaceId,
+      title: "Child of SUP-4",
+      status: "todo",
+      priority: "high",
+      parentId: idS,
+      inheritExecutionWorkspaceFromIssueId: idS,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspacePreference).toBeNull();
   });
 });
