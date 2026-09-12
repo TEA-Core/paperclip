@@ -15,6 +15,8 @@ import {
   issueLabels,
   issueRecoveryActions,
   issueThreadInteractions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
   issues,
   labels,
 } from "@paperclipai/db";
@@ -26,6 +28,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -54,6 +57,8 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     await db.delete(issueComments);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
+    await db.delete(issueTreeHoldMembers);
+    await db.delete(issueTreeHolds);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -880,6 +885,48 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(actions).toHaveLength(0);
+  });
+
+  it("does not mint review_stage_armed_stranded under an active subtree pause hold", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    // An operator places the card's subtree under a pause hold. The detector must
+    // honour the same suppression the generic assignee-recovery path applies, or the
+    // stale-wake sweep could re-fire the parked participant mid-pause (round-3 finding:
+    // pause-hold guard).
+    await issueTreeControlService(db).createHold(companyId, issueId, {
+      mode: "pause",
+      reason: "operator requested pause",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+    const [activity] = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.review_stage_armed_stranded_escalated"),
+        ),
+      );
+    expect(activity).toBeUndefined();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("mints the participant-owned action, not no_live_path_owner_unavailable, when the original assignee is unavailable", async () => {
