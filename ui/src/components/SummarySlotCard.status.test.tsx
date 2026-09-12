@@ -180,13 +180,30 @@ describe("resolveGenerationStatusLine", () => {
 });
 
 describe("slotIsLiveGeneration", () => {
-  it("polls only while a generation is armed and its task is still live", () => {
-    // An active generation (non-terminal linked task) keeps the card polling.
+  it("keeps polling while a generation is active and unwritten", () => {
+    // An active generation (non-terminal linked task, no write yet) polls.
     expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue() })).toBe(true);
-    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "in_review" }) })).toBe(true);
+    // A changes_requested bounce re-arms the slot: a document already exists from
+    // the prior write, but the linked task is back in in_progress actively
+    // producing — the write evidence alone must not disarm the poll.
+    expect(
+      slotIsLiveGeneration({ slot: slot({ documentId: "doc-1" }), generatingIssue: issue() }),
+    ).toBe(true);
+  });
 
-    // A written slot whose generation task reached a terminal status stops polling,
-    // even though it still carries the "generating" status and the linked task.
+  it("stops polling a written slot parked in review", () => {
+    // After a successful write the slot stays `generating` and the link survives
+    // through the review window (SUP-15773). The linked task is in_review and the
+    // slot carries write evidence, so generation is no longer active — poll stops.
+    expect(
+      slotIsLiveGeneration({
+        slot: slot({ documentId: "doc-1", lastGeneratedAt: "2026-07-14T01:00:00.000Z" }),
+        generatingIssue: issue({ status: "in_review" }),
+      }),
+    ).toBe(false);
+  });
+
+  it("stops polling when the linked task has reached a terminal status", () => {
     expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "done" }) })).toBe(false);
     expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "cancelled" }) })).toBe(false);
   });
