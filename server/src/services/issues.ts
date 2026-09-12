@@ -9526,6 +9526,22 @@ export function issueService(db: Db) {
 
       if (!current) throw notFound("Issue not found");
 
+      // SUP-15888 / SUP-15832: the conditional write above can miss when a close
+      // commits after the guard read at the top of this function (the row is no
+      // longer in a live status by the time the WHERE clause re-evaluates). This
+      // fresh read sees the committed status, so if the card is now terminal,
+      // return the distinct refusal instead of the generic checkout conflict.
+      // This keeps the terminal refusal race-safe: a card that ends up closed is
+      // never re-opened by checkout, and the 409 carries the same distinct code
+      // as the guard read rather than a bare "Issue checkout conflict".
+      if (current.status === "done" || current.status === "cancelled") {
+        throw conflict("Issue cannot be checked out because it is already closed", {
+          code: "checkout_refused_terminal_status",
+          issueId: id,
+          status: current.status,
+        });
+      }
+
       if (
         current.assigneeAgentId === agentId &&
         current.status === "in_progress" &&

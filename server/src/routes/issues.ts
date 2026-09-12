@@ -14381,6 +14381,26 @@ export function issueRoutes(
       });
     }
 
+    // SUP-15888 / SUP-15832: a card whose CURRENT status is terminal (done /
+    // cancelled) must never be re-opened by checkout, and — critically — the
+    // route must not rebuild and republish a closed execution worktree for a
+    // checkout that will be refused. The schema already refuses a body that
+    // *names* a terminal status, but a valid non-terminal body (e.g.
+    // expectedStatuses: ["in_progress"]) still passes when the card is already
+    // closed; refusing here, before any workspace work, keeps a terminal
+    // checkout a true no-op. This throws the same distinct 409 the service
+    // raises, so the refusal is byte-identical whether caught at the route or
+    // the service. The service re-checks terminal status again after a failed
+    // write, so a close that commits between this read and the write is also
+    // refused with the same distinct code.
+    if (issue.status === "done" || issue.status === "cancelled") {
+      throw conflict("Issue cannot be checked out because it is already closed", {
+        code: "checkout_refused_terminal_status",
+        issueId: issue.id,
+        status: issue.status,
+      });
+    }
+
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
 
     const checkoutRunId = await requireAgentRunId(req, res, { checkoutRunId: issue.checkoutRunId });
