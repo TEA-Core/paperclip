@@ -89,7 +89,12 @@ export async function truncateWithLockRetry(
     } catch (error) {
       if (!isRetryable(error)) throw error;
       lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
+      // Back off only while another attempt remains. After the last one there is
+      // nothing to wait for, so the sleep would only delay the rethrow — 500ms
+      // at the default five attempts, 1s for a ten-attempt caller.
+      if (attempt + 1 < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
+      }
     }
   }
   throw lastError;

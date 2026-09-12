@@ -101,4 +101,24 @@ describe("truncateWithLockRetry", () => {
     ).rejects.toThrow("deadlock detected");
     expect(execute).toHaveBeenCalledTimes(3);
   });
+
+  it("does not back off after the final attempt", async () => {
+    // A sleep after the last attempt delays the rethrow and buys nothing, so the
+    // backoff count is one below the attempt count.
+    const execute = vi
+      .fn<(query: unknown) => Promise<unknown>>()
+      .mockRejectedValue(postgresError("deadlock detected", "40P01"));
+    const sleep = vi.spyOn(globalThis, "setTimeout");
+
+    try {
+      await expect(
+        truncateWithLockRetry({ execute }, TRUNCATE_SQL, { attempts: 3, baseDelayMs: 1 }),
+      ).rejects.toThrow("deadlock detected");
+      expect(execute).toHaveBeenCalledTimes(3);
+      expect(sleep).toHaveBeenCalledTimes(2);
+      expect(sleep.mock.calls.map(([, delay]) => delay)).toEqual([1, 2]);
+    } finally {
+      sleep.mockRestore();
+    }
+  });
 });
