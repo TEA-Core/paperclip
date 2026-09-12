@@ -25,11 +25,17 @@ import {
 // lease, and prove the operator path and the auto self-heal contend correctly.
 //
 // P1: the operator reset and the auto `prepareBaseRepoForWorkspace` self-heal
-//     contend on one repo; the on-disk lease serializes them — exactly one enters
-//     the destructive section at a time — and the repo ends on the upstream tip.
-// P2: the same serialization holds for two auto self-heals. This assertion is RED
-//     against the pre-fix tree (no lease => both enter the section at once); the
-//     captured pre-fix failure is cited in the delivery comment.
+//     contend on one repo. The capture barrier records the tip each contender
+//     captured — a pin's argv is `update-ref <ref> <capturedTip> <all-zeros>`, so
+//     the pin is the deterministic record of the capture. Post-fix the on-disk
+//     lease admits exactly one contender into the destructive section at a time:
+//     it pins the stale tip, moves it once, and the other is refused; the repo
+//     ends on the upstream tip. This assertion is RED against the pre-fix tree
+//     (on-disk lease lock removed): both contenders capture the SAME stale tip and
+//     BOTH pin it, so `capturedTips` => [priorTip, priorTip]. The exact pre-fix
+//     red command + raw output is in the SUP-15839 delivery comment.
+// P2: the same serialization holds for two auto self-heals; RED pre-fix for the
+//     same reason, cited in the SUP-15722 delivery comment.
 // P3: path aliases (a symlink and a linked worktree) of one repo converge on one
 //     lease identity and serialize.
 // P4: the destructive primitive cannot run without a lease — a direct call fails
@@ -121,12 +127,17 @@ type Shim = {
 };
 
 /**
- * Replace `git` on PATH with a shim that (1) logs every argv in order and
- * (2) BLOCKS the first destructive pin (`update-ref refs/paperclip/rescue/
- * base-repo/...`) until `release()` creates a gate file. The gate is a real
- * filesystem event, not a sleep: it freezes whichever contender reaches the
- * destructive section first while it holds the lease, so the test can observe
- * that the OTHER contender is blocked at the lock and has touched no git at all.
+ * The capture barrier. Replace `git` on PATH with a shim that (1) logs every argv
+ * in order and (2) BLOCKS the first destructive pin (`update-ref
+ * refs/paperclip/rescue/base-repo/...`) until `release()` creates a gate file. The
+ * gate is a real filesystem event, not a sleep. A pin's argv carries the tip the
+ * contender just captured (`update-ref <ref> <capturedTip> <all-zeros>`), so this
+ * is the point where the capture becomes observable and assertable. Post-fix the
+ * on-disk lease admits only one contender into the destructive section at a time,
+ * so exactly one reaches this gate. Pre-fix (on-disk lease lock removed) BOTH
+ * contenders reach it, each having captured the SAME stale tip — precisely the
+ * interleaving the lease must prevent, and the distinguishing pre-fix red the
+ * test is cited for in the SUP-15839 delivery comment.
  */
 async function installBarrierShim(f: Fixture): Promise<Shim> {
   const binDir = path.join(f.root, "shim");
@@ -227,6 +238,17 @@ const pinLines = (lines: string[]) =>
 const casLines = (lines: string[]) => lines.filter((l) => l.startsWith("update-ref HEAD"));
 const resetLines = (lines: string[]) => lines.filter((l) => l.startsWith("reset --hard"));
 
+// A pin's argv is `update-ref <rescueRef> <priorTip> <all-zeros>`. The third
+// token is the tip that contender observed at capture time. This is the
+// deterministic record of "which tip did this caller capture" that a capture
+// barrier asserts on — both contenders capturing the same stale tip is exactly
+// the interleaving the lease + CAS must prevent.
+const capturedTips = (lines: string[]): string[] =>
+  lines
+    .map((line) => line.split(/\s+/))
+    .filter((t) => t[0] === "update-ref" && t[3] === ALL_ZEROS && t[2]?.length === 40)
+    .map((t) => t[2] as string);
+
 async function waitForFile(file: string, timeoutMs = 20000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(file)) {
@@ -264,34 +286,45 @@ describe("P1 — operator reset and auto self-heal contend on the lease", () => 
       void pOperator.catch(() => {});
       void pAuto.catch(() => {});
 
-      // Deterministic barrier around capture: freeze whichever contender reaches
-      // its destructive pin first. It holds the lease; the other is blocked at the
-      // on-disk lease lock, so it has captured nothing, pinned nothing, and moved
-      // nothing. At the frozen moment there is exactly one pin in flight and the
-      // tip is still where it started.
+      // Capture barrier: freeze whichever contender reaches its destructive pin
+      // first. That contender holds the lease and has just recorded the tip it
+      // observed into the rescue pin; the other is still blocked at the on-disk
+      // lease lock, so it has not captured, pinned, or moved anything. At the
+      // frozen moment there is exactly one in-flight pin and the tip is still
+      // where it started.
       await waitForFile(shim.frozenMarker);
       const frozen = await readLog(shim.logFile);
       expect(pinLines(frozen)).toHaveLength(1);
       expect(casLines(frozen)).toEqual([]);
       expect(resetLines(frozen)).toEqual([]);
       expect(await git(["rev-parse", "HEAD"], f.work)).toBe(priorTip);
+      // The contender that reached the pin captured the STALE prior tip, not a
+      // newer one — the very tip the reset is about to protect.
+      expect(capturedTips(pinLines(frozen))).toEqual([priorTip]);
 
       await shim.release();
       const [operatorResult, autoResult] = await Promise.all([pOperator, pAuto]);
 
+      const full = await readLog(shim.logFile);
+      // Every capture that reached a pin recorded the SAME stale tip — no
+      // contender ever pinned a newer tip. Pre-fix (no on-disk lease) BOTH the
+      // operator and the auto capture this same tip and BOTH pin it: the raw
+      // pre-fix red — exact command and failure output — is in the SUP-15839
+      // delivery comment.
+      expect(capturedTips(pinLines(full))).toEqual([priorTip]);
+
       // EXACTLY ONE destructive move happened across both contenders: one tip pin,
       // one CAS tip move, one reset --hard. This is the property the lease
-      // changes. Pre-fix (no on-disk lease) both the operator and the auto path
-      // capture the same tip and both pin/attempt-CAS/reset, so pinLines would be
-      // 2 — the raw pre-fix red is cited in the delivery comment.
-      const full = await readLog(shim.logFile);
+      // changes. Pre-fix both callers pin the same tip and both attempt the CAS,
+      // so pinLines would be 2 and casLines would be 2 — the distinguishing red
+      // cited in the delivery comment.
       expect(pinLines(full)).toHaveLength(1);
       expect(casLines(full)).toHaveLength(1);
       expect(resetLines(full)).toHaveLength(1);
 
-      // The repo ends on the upstream tip, and the newer tip is still reachable:
-      // it is pinned by the single rescue ref and is a real git object — it was
-      // never made unreachable.
+      // The repo ends on the upstream tip, and the stale tip is still a live,
+      // reachable object: pinned by the single rescue ref — never made
+      // unreachable.
       expect(await git(["rev-parse", "HEAD"], f.work)).toBe(originMain);
       expect(await objectExists(f.work, priorTip)).toBe(true);
       const pinnedRefs = (
@@ -301,14 +334,30 @@ describe("P1 — operator reset and auto self-heal contend on the lease", () => 
         .filter(Boolean);
       expect(pinnedRefs).toContain(priorTip);
 
-      // Loser side-effects: whichever path lost the lease performed no destructive
-      // move of its own — the winner either reset (operator: resetToSha) or, when
-      // the auto won, saw the operator already at target. Exactly-one above proves
-      // the loser touched nothing.
-      expect(autoResult).toBeDefined();
+      // The non-winning contender is REFUSED from a second destructive move:
+      // exactly one of the two results reflects a destructive reset, and the
+      // other reflects an explicit, non-destructive refusal — the operator loser
+      // reports the tip already at target (alreadyAtTarget), the auto loser
+      // preserves with no reset warning. Neither performs a second move.
+      const autoDidReset = autoResult.warnings.some(
+        (w) => w.includes("Auto reset: Base repository") && w.includes(" was reset to "),
+      );
+      const operatorDidReset = operatorResult.ok && !operatorResult.alreadyAtTarget;
+      expect([operatorDidReset, autoDidReset].filter(Boolean)).toHaveLength(1);
       if (operatorResult.ok && !operatorResult.alreadyAtTarget) {
+        // Operator won the destructive move; the auto loser made no move of its own.
         expect(operatorResult.resetToSha).toBe(originMain);
         expect(operatorResult.previousTip).toBe(priorTip);
+        expect(autoDidReset).toBe(false);
+      } else if (operatorResult.ok && operatorResult.alreadyAtTarget) {
+        // Auto won the destructive move; the operator loser is an explicit
+        // refusal: it re-read the tip under the lease, found it already at the
+        // upstream target, and refused to move it a second time.
+        expect(operatorResult.resetToSha).toBe(originMain);
+        expect(operatorResult.previousTip).toBeNull();
+        expect(autoDidReset).toBe(true);
+      } else {
+        throw new Error(`operator returned an unexpected refusal: ${JSON.stringify(operatorResult)}`);
       }
     } finally {
       shim.restore();
