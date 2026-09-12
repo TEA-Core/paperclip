@@ -486,12 +486,20 @@ function parseTier2Declaration(body: string): Tier2Parse {
         return { kind: "matched", evidence };
       }
       // No trailing evidence on the prefix line. Resolve it from the next
-      // non-empty line using the loop's true index for the lookahead — not
-      // `lines.indexOf(line)`, which matches by value and would resolve from an
-      // earlier duplicate's position when the body repeats a line (SUP-15787
-      // case 4). Blank lines are skipped, so evidence sitting after a blank still
-      // resolves (SUP-15787 case 3); if no non-empty line follows, name the missing
-      // evidence specifically rather than reporting the declaration as absent.
+      // non-empty line using the loop's true index for the lookahead.
+      //
+      // The true-index form here is a robustness/complexity fix, not a
+      // behaviour change: a value match such as `lines.indexOf(lines[i])`
+      // would be unreachable, because this loop returns at the first prefix
+      // line, so no equal-valued line can sit ahead of it to mis-resolve to an
+      // earlier duplicate — a 19,607-body brute-force equivalence check found
+      // zero divergence between the two (SUP-15845). Do not "revert the dead
+      // code" back to a value scan.
+      //
+      // Blank lines are skipped, so evidence sitting after a blank still
+      // resolves (SUP-15787 case 3); if no non-empty line follows, name the
+      // missing evidence specifically rather than reporting the declaration as
+      // absent.
       for (let j = i + 1; j < lines.length; j++) {
         const candidate = lines[j].trim();
         if (candidate.length > 0) {
