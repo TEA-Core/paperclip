@@ -165,7 +165,7 @@ describe("shared-group-ownership", () => {
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("cannot open"));
     });
 
-    it("warns exactly once when the group is missing across multiple calls", async () => {
+    it("warns once per distinct path when the group is missing across multiple calls", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const warnSpy = vi.fn();
       const dir1 = path.join(os.tmpdir(), "paperclip-shared-group-test-missing-1");
@@ -186,8 +186,23 @@ describe("shared-group-ownership", () => {
         warn: warnSpy,
       });
 
-      expect(warnSpy).toHaveBeenCalledTimes(1);
+      // SUP-15903: a second DISTINCT offending path in a later attempt produces
+      // its own diagnostic — the old process-lifetime latch suppressed it.
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(dir1));
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(dir2));
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("not found"));
+
+      // Re-running the SAME path in a later attempt does not re-warn (no unbounded
+      // spam for an already-diagnosed (reason, path) pair).
+      mockOpen.mockReset();
+      setupOpenSuccess(dir1);
+      await ensureSharedGroupOwnership(dir1, {
+        resolveGid: async () => null,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+        warn: warnSpy,
+      });
+      expect(warnSpy).toHaveBeenCalledTimes(2);
     });
 
     it("warns when open fails with ELOOP (symlink leaf)", async () => {
@@ -232,6 +247,57 @@ describe("shared-group-ownership", () => {
       expect(handle.close).toHaveBeenCalled();
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("special file"));
+    });
+
+    it("surfaces a cross-uid chown EPERM as a 'could not repair' outcome, not a swallowed failure; a second distinct path still reports", async () => {
+      const { ensureSharedGroupOwnership } = await loadFreshModule();
+      const warnSpy = vi.fn();
+
+      const dir1 = path.join(os.tmpdir(), "paperclip-shared-group-test-eperm-1");
+      const dir2 = path.join(os.tmpdir(), "paperclip-shared-group-test-eperm-2");
+
+      // The server (uid 1000) opens a file owned by the agent uid (1001) that
+      // escaped setgid inheritance. chown is refused by the OS with EPERM: the
+      // server user does not own the file and cannot change its group.
+      setupOpenSuccess(dir1, {
+        stat: vi.fn().mockResolvedValue({ uid: 1001, gid: 1001, mode: 0o664, isDirectory: () => false }),
+        chown: vi.fn().mockRejectedValue(
+          Object.assign(new Error("EPERM: operation not permitted, chown"), { code: "EPERM" }),
+        ),
+      });
+
+      const outcome1 = await ensureSharedGroupOwnership(dir1, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+        warn: warnSpy,
+      });
+
+      // The outcome is surfaced to the caller (not swallowed) and classified as
+      // a cross-uid refusal with the errno, not a generic failure.
+      expect(outcome1).toMatchObject({ result: "could-not", reason: "chown-refused", errno: "EPERM", repaired: false });
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("does not own this file"));
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("EPERM"));
+
+      // A SECOND distinct offending path in a later attempt must still produce
+      // its own diagnostic — the old process-lifetime latch suppressed it.
+      mockOpen.mockReset();
+      setupOpenSuccess(dir2, {
+        stat: vi.fn().mockResolvedValue({ uid: 1001, gid: 1001, mode: 0o664, isDirectory: () => false }),
+        chown: vi.fn().mockRejectedValue(
+          Object.assign(new Error("EPERM: operation not permitted, chown"), { code: "EPERM" }),
+        ),
+      });
+
+      const outcome2 = await ensureSharedGroupOwnership(dir2, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+        warn: warnSpy,
+      });
+
+      expect(outcome2).toMatchObject({ result: "could-not", reason: "chown-refused", errno: "EPERM", repaired: false });
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(dir2));
     });
   });
 

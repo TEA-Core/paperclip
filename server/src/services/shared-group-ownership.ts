@@ -41,9 +41,69 @@ function isSpecialFileType(mode: number): boolean {
   return SPECIAL_FILE_TYPES.has(mode & fsSync.constants.S_IFMT);
 }
 
-let missingGroupWarned = false;
-let chgrpFailedWarned = false;
-let specialFileWarned = false;
+// SUP-15903: the shared-group self-repair previously latched three
+// process-lifetime booleans `true` on the first failure anywhere and silently
+// suppressed every later cross-uid repair failure for the whole life of the
+// server. That is exactly why the uid-split bug recurred with no trail: after
+// the first EPERM anywhere, no second offending path ever produced a diagnostic.
+// Diagnostics are now deduped per (reason, path): a second DISTINCT offending
+// path in a later provisioning attempt produces its own diagnostic, while the
+// same (reason, path) pair is not re-warned on every attempt. The set is capped
+// so it cannot grow without bound.
+const warnedKeys = new Set<string>();
+const WARNED_KEYS_CAP = 4096;
+
+/**
+ * Record that `reason` was diagnosed for `dirPath`. Returns true when this is
+ * the first time this (reason, path) pair has been seen (the caller should
+ * emit its diagnostic), false when it was already reported for this pair.
+ */
+function shouldWarn(reason: string, dirPath: string): boolean {
+  const key = `${reason}\u0000${dirPath}`;
+  if (warnedKeys.has(key)) return false;
+  warnedKeys.add(key);
+  if (warnedKeys.size > WARNED_KEYS_CAP) {
+    warnedKeys.clear();
+    warnedKeys.add(key);
+  }
+  return true;
+}
+
+export type SharedGroupRepairReason =
+  | "cannot-open"
+  | "unverifiable"
+  | "outside-containment"
+  | "denied-server-owned"
+  | "missing-group"
+  | "special-file"
+  | "chown-refused";
+
+/**
+ * The outcome of a single `ensureSharedGroupOwnership` repair attempt.
+ *
+ * The repair no longer returns `void` in all three of "mutated", "already
+ * correct", and "could not mutate" — the caller (worktree self-repair) now
+ * distinguishes them, so it can stop claiming a self-repair ran when the OS
+ * actually refused it.
+ */
+export interface SharedGroupRepairOutcome {
+  /**
+   * - "repaired"    — a chown/chmod mutation was applied.
+   * - "not-needed"  — the target already carried the shared group + group bits;
+   *                   no mutation was required or performed.
+   * - "could-not"   — the repair could not be performed (open refused, group
+   *                   missing, a guard fired, or the OS refused the chown/chmod).
+   */
+  result: "repaired" | "not-needed" | "could-not";
+  /** True only when a chown/chmod mutation was actually applied. */
+  repaired: boolean;
+  /** Machine-readable reason within the "could-not" class. */
+  reason?: SharedGroupRepairReason;
+  /** OS errno (e.g. "EPERM", "EACCES", "ELOOP") when a syscall was refused. */
+  errno?: string;
+  /** Owner uid of the target, when the inode was opened and stat'd. */
+  ownerUid?: number;
+}
 
 function resolveDefaultMasterKeyDir(): string {
   return resolveSecretsKeyDir();
@@ -188,7 +248,7 @@ export async function ensureSharedGroupTraversalPath(
 export async function ensureSharedGroupOwnership(
   dirPath: string,
   opts: EnsureSharedGroupOwnershipOptions = {},
-): Promise<void> {
+): Promise<SharedGroupRepairOutcome> {
   const groupName = opts.groupName ?? DEFAULT_SHARED_GROUP_NAME;
   const resolveGid = opts.resolveGid ?? defaultResolveGid;
   const resolveMasterKeyDir = opts.resolveMasterKeyDir ?? resolveDefaultMasterKeyDir;
@@ -197,6 +257,14 @@ export async function ensureSharedGroupOwnership(
   const warn = opts.warn ?? console.warn.bind(console);
   const containmentRoot =
     opts.containmentRoot != null ? path.resolve(opts.containmentRoot) : null;
+  // The server uid, used to classify a cross-uid chown refusal (the M1 split:
+  // server uid 1000 cannot chgrp a file owned by the agent uid 1001).
+  const serverUid = typeof process.getuid === "function" ? process.getuid() : null;
+
+  const errnoOf = (err: unknown): string | undefined =>
+    err instanceof Error && typeof (err as NodeJS.ErrnoException).code === "string"
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
 
   let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
@@ -208,16 +276,21 @@ export async function ensureSharedGroupOwnership(
     // EWOULDBLOCK/ENXIO: a special file (FIFO) whose non-blocking open cannot
     // be established on this platform — O_NONBLOCK already prevents the common
     // Linux read-open case; on any platform that still surfaces these, we skip.
-    // All fail-closed: no mutation, no path-based fallback.
-    if (!chgrpFailedWarned) {
-      chgrpFailedWarned = true;
+    // All fail-closed: no mutation, no path-based fallback. The repair could
+    // not even open the target, so it could not have repaired it.
+    const errno = errnoOf(err);
+    if (shouldWarn("cannot-open", dirPath)) {
       warn(
         `Paperclip: cannot open ${dirPath} for shared-group ownership repair: ` +
-          `${err instanceof Error ? err.message : String(err)}. No path-based mutation performed.`,
+          `${err instanceof Error ? err.message : String(err)}${errno ? ` (errno ${errno})` : ""}. ` +
+          `The repair could not even open the target, so it could not be repaired by the server user. ` +
+          `No path-based mutation performed.`,
       );
     }
-    return;
+    return { result: "could-not", reason: "cannot-open", errno, repaired: false };
   }
+
+  let ownerUid: number | undefined;
 
   try {
     // Resolve the real path of the opened fd. On Linux, /proc/self/fd/<N> is
@@ -240,11 +313,13 @@ export async function ensureSharedGroupOwnership(
     // inside it, so refuse rather than mutate. The self-repair caller always
     // passes containmentRoot; a non-Linux host is not where it runs.
     if (containmentRoot != null && verifiedPath === null) {
-      warn(
-        `Paperclip: refusing shared-group ownership on ${dirPath} — the opened handle could not ` +
-          `be verified (no /proc/self/fd) and a containment root was required. No mutation performed.`,
-      );
-      return;
+      if (shouldWarn("unverifiable", dirPath)) {
+        warn(
+          `Paperclip: refusing shared-group ownership on ${dirPath} — the opened handle could not ` +
+            `be verified (no /proc/self/fd) and a containment root was required. No mutation performed.`,
+        );
+      }
+      return { result: "could-not", reason: "unverifiable", repaired: false };
     }
 
     if (verifiedPath !== null && containmentRoot != null) {
@@ -256,12 +331,14 @@ export async function ensureSharedGroupOwnership(
         verifiedPath !== resolvedRoot &&
         !verifiedPath.startsWith(resolvedRoot + path.sep)
       ) {
-        warn(
-          `Paperclip: refusing shared-group ownership on ${dirPath} — the resolved target ` +
-            `${verifiedPath} is outside the containment root ${resolvedRoot}. ` +
-            `This may indicate a concurrent symlink swap (TOCTOU). No mutation performed.`,
-        );
-        return;
+        if (shouldWarn("outside-containment", dirPath)) {
+          warn(
+            `Paperclip: refusing shared-group ownership on ${dirPath} — the resolved target ` +
+              `${verifiedPath} is outside the containment root ${resolvedRoot}. ` +
+              `This may indicate a concurrent symlink swap (TOCTOU). No mutation performed.`,
+          );
+        }
+        return { result: "could-not", reason: "outside-containment", repaired: false };
       }
     }
 
@@ -277,26 +354,27 @@ export async function ensureSharedGroupOwnership(
         resolveDatabaseBackupDir,
       ])
     ) {
-      warn(
-        `Paperclip: refusing shared-group ownership on ${dirPath} — it resolves to ${deniedCheckPath}, ` +
-          `which is a server-owned directory (secrets master-key, embedded-Postgres data, or ` +
-          `database backup) or an ancestor/descendant of one. ` +
-          `Under M1 (agent uid 1001, server uid 1000) these directories must remain owned by ` +
-          `the server group, not "${groupName}".`,
-      );
-      return;
+      if (shouldWarn("denied-server-owned", dirPath)) {
+        warn(
+          `Paperclip: refusing shared-group ownership on ${dirPath} — it resolves to ${deniedCheckPath}, ` +
+            `which is a server-owned directory (secrets master-key, embedded-Postgres data, or ` +
+            `database backup) or an ancestor/descendant of one. ` +
+            `Under M1 (agent uid 1001, server uid 1000) these directories must remain owned by ` +
+            `the server group, not "${groupName}".`,
+        );
+      }
+      return { result: "could-not", reason: "denied-server-owned", repaired: false };
     }
 
     const gid = await resolveGid(groupName);
     if (gid == null) {
-      if (!missingGroupWarned) {
-        missingGroupWarned = true;
+      if (shouldWarn("missing-group", dirPath)) {
         warn(
           `Paperclip: group "${groupName}" not found; skipping shared-group ownership for ${dirPath}. ` +
             `Under M1 (agent uid 1001, server uid 1000) this group is required for cross-uid write access.`,
         );
       }
-      return;
+      return { result: "could-not", reason: "missing-group", repaired: false };
     }
 
     // Hardlink note: chown/chmod via fd targets the inode, so a concurrent
@@ -305,13 +383,13 @@ export async function ensureSharedGroupOwnership(
     // is not exploitable in practice because the caller (worktree self-repair)
     // only operates on git-tracked paths within the containment root.
     const stat = await handle.stat();
+    ownerUid = stat.uid;
     // A special file (FIFO, character/block device, socket) is not a directory
     // or a regular file. O_NONBLOCK already kept the open from hanging on a
     // FIFO; now refuse to add setgid/group bits to it. Fail closed: no
     // mutation, no path-based fallback, one warned skip.
     if (isSpecialFileType(stat.mode)) {
-      if (!specialFileWarned) {
-        specialFileWarned = true;
+      if (shouldWarn("special-file", dirPath)) {
         warn(
           `Paperclip: skipping shared-group ownership on ${dirPath} — the opened target is a ` +
             `special file (FIFO, character/block device, or socket), not a directory or regular ` +
@@ -319,23 +397,68 @@ export async function ensureSharedGroupOwnership(
             `No mutation performed.`,
         );
       }
-      return;
+      return {
+        result: "could-not",
+        reason: "special-file",
+        repaired: false,
+        ownerUid: stat.uid,
+      };
     }
-    await handle.chown(stat.uid, gid);
+
     const currentMode = stat.mode & 0o7777;
     // Directories need setgid + group rwx for group inheritance and traversal.
     // Regular files need only group rw: adding setgid + group execute to a
     // file produces a setgid executable built from content an agent can write.
     const groupBits = stat.isDirectory() ? 0o2070 : 0o0060;
+
+    // Already correct? If the target already carries the shared group and the
+    // required group bits, the repair would be a no-op — skip the mutation
+    // rather than issuing a chown that a cross-uid target would refuse anyway.
+    // (In the M1 uid split the owning uid is the agent, not the server, so an
+    // unnecessary chown is exactly what turns into a spurious EPERM.)
+    const groupAlreadyCorrect = stat.gid === gid;
+    const bitsAlreadyCorrect = (currentMode & groupBits) === groupBits;
+    if (groupAlreadyCorrect && bitsAlreadyCorrect) {
+      return { result: "not-needed", repaired: false, ownerUid: stat.uid };
+    }
+
+    await handle.chown(stat.uid, gid);
     await handle.chmod(currentMode | groupBits);
+    return {
+      result: "repaired",
+      repaired: true,
+      ownerUid: stat.uid,
+    };
   } catch (err) {
-    if (!chgrpFailedWarned) {
-      chgrpFailedWarned = true;
+    const errno = errnoOf(err);
+    // A cross-uid refusal: POSIX permits chown/chgrp only for the file's owner
+    // or root. When the server uid opened a file owned by another uid (the M1
+    // split: server 1000 vs. agent 1001), the chown below is refused with
+    // EPERM and mutates nothing. Say so explicitly instead of a generic
+    // "chgrp failed", which the caller previously read as "repaired but
+    // genuinely unfixable".
+    const crossUid =
+      ownerUid != null && serverUid != null && ownerUid !== serverUid;
+    if (shouldWarn("chown-refused", dirPath)) {
+      const detail =
+        errno === "EPERM"
+          ? `The server user${serverUid != null ? ` (uid ${serverUid})` : ""} does not own this file ` +
+            `${crossUid ? `(owned by uid ${ownerUid})` : ""} and cannot change its group — chown/chgrp is ` +
+            `permitted only for the file's owner or root. Its owner can run: chgrp ${groupName} <path>.`
+          : `The "${groupName}" group (gid resolved) is present but chgrp/chmod via handle failed`;
       warn(
-        `Paperclip: failed to set shared-group ownership on ${dirPath}: ${err instanceof Error ? err.message : String(err)}. ` +
-          `The "${groupName}" group (gid resolved) is present but chgrp/chmod via handle failed.`,
+        `Paperclip: could not repair shared-group ownership on ${dirPath}: ` +
+          `${err instanceof Error ? err.message : String(err)}${errno ? ` (errno ${errno})` : ""}. ` +
+          `${detail}`,
       );
     }
+    return {
+      result: "could-not",
+      reason: "chown-refused",
+      errno,
+      repaired: false,
+      ownerUid,
+    };
   } finally {
     try {
       await handle.close();
