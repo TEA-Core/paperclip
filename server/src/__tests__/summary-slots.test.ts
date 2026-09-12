@@ -31,10 +31,6 @@ import {
 } from "../services/issue-execution-policy.ts";
 import { withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
 import { issueService } from "../services/issues.ts";
-import {
-  applyIssueExecutionPolicyTransition,
-  normalizeIssueExecutionPolicy,
-} from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
