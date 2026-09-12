@@ -4055,6 +4055,32 @@ export function recoveryService(
           result.skipped += 1;
           continue;
         }
+        // The wedged-review wedge is only actionable when NO other live path already
+        // owns this card. An in-flight run, a future monitor, a queued/deferred/
+        // claimed wake, or a pending continuation interaction is a legitimate
+        // self-resolving path; minting a participant action on top of any of them
+        // would race that authority (SUP-15788 round-2 review finding: live-path
+        // guard). These are the same liveness predicates the generic assignee-
+        // recovery paths below are gated on (hasActiveExecutionPath,
+        // hasLiveIssueWake, hasPendingWakeInteraction, hasFutureMonitorCheck);
+        // checking them here preserves this detector's precedence over those
+        // paths while honouring the guards those paths themselves apply.
+        if (hasFutureMonitorCheck(issue.monitorNextCheckAt)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (await hasActiveExecutionPath(issue.companyId, issue.id, null)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (await hasLiveIssueWake(issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
         const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
         // A board-owned recovery action is already the durable, human-owned path;
         // do not race that authority by minting a participant action on top of it.
