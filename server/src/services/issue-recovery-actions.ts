@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -267,6 +267,183 @@ export function issueRecoveryActionService(db: Db) {
     return row ? toReadModel(row) : null;
   }
 
+  // SUP-15847: `attemptCount` is per-row, so a re-mint that only looked at the
+  // most recently updated row could restart at a lower count whenever a newer
+  // row for the same fingerprint existed with a small count (the SUP-15825
+  // "5, then 1, then 2" reading). `max(attemptCount)` is a high-water mark, not
+  // the cumulative total: a board reset mints a low-count successor after a
+  // high-count predecessor, so the high-water understates the true cost the
+  // fingerprint has already incurred. The cumulative depth is a property of the
+  // fingerprint, not of any one row, so read every row in chronological order
+  // and fold it.
+  //
+  // The fold `depth = max(depth + 1, row.attemptCount)`:
+  //   - a row whose internal counter exceeds the running total (a carried, not
+  //     reset, counter) advances depth to that counter, so a continuation never
+  //     double-counts the attempts it already carried;
+  //   - a row carrying a smaller counter (a reset successor) contributes one
+  //     more attempt, so a reset -> re-park cycle can never restart the depth
+  //     below the cost already paid.
+  // For a monotonic no-reset history the fold equals the high-water mark, so
+  // existing carry-forward and ceiling behavior is unchanged; it only diverges
+  // (upward) when reset rows are present.
+  async function getFingerprintHistory(
+    companyId: string,
+    sourceIssueId: string,
+    fingerprint: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<{ latest: IssueRecoveryAction | null; cumulativeDepth: number }> {
+    const rows = await dbOrTx
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.fingerprint, fingerprint),
+        ),
+      )
+      .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
+    if (rows.length === 0) return { latest: null, cumulativeDepth: 0 };
+    // SUP-15847 (round 2): fold only the rows since the most recent board-reset
+    // boundary. Rows before it belong to a lineage a board resolution already
+    // closed and paid out, so counting them again would blow the fresh attempt
+    // budget the board granted on the successor's next re-park.
+    let boundaryIndex = -1;
+    for (let i = 0; i < rows.length; i++) {
+      if (rowHasLineageResetBoundary(rows[i]!)) boundaryIndex = i;
+    }
+    const foldStart = boundaryIndex >= 0 ? boundaryIndex : 0;
+    let cumulativeDepth = 0;
+    for (let i = foldStart; i < rows.length; i++) {
+      const row = rows[i]!;
+      cumulativeDepth = Math.max(cumulativeDepth + 1, row.attemptCount);
+    }
+    let latest = rows[0]!;
+    for (const row of rows) {
+      if (row.updatedAt.getTime() > latest.updatedAt.getTime()) latest = row;
+    }
+    return { latest: toReadModel(latest), cumulativeDepth };
+  }
+
+  async function getFingerprintAttemptTotals(
+    companyId: string,
+    sourceIssueId: string,
+  ): Promise<Record<string, number>> {
+    const rows = await db
+      .select({
+        fingerprint: issueRecoveryActions.fingerprint,
+        attemptCount: issueRecoveryActions.attemptCount,
+        evidence: issueRecoveryActions.evidence,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+        ),
+      )
+      .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
+    // SUP-15847: same durable cumulative depth as `getFingerprintHistory`,
+    // exposed per fingerprint for the read route. A `max(attemptCount)`
+    // projection understates the true cost whenever reset rows exist.
+    //
+    // Round 3: group the chronologically-ordered rows by fingerprint and fold
+    // each group independently. Each fingerprint's board-reset boundary is its
+    // own most-recent `lineageReset` row (round 2), so a reset for one
+    // fingerprint can never skip rows or seed the depth of another interleaved
+    // fingerprint. Keeping the boundary and the running depth scoped to one
+    // fingerprint each is what the round-3 review asked for explicitly.
+    const byFingerprint = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const group = byFingerprint.get(row.fingerprint);
+      if (group) group.push(row);
+      else byFingerprint.set(row.fingerprint, [row]);
+    }
+    const totals: Record<string, number> = {};
+    for (const [fingerprint, groupRows] of byFingerprint) {
+      let boundaryIndex = -1;
+      for (let i = 0; i < groupRows.length; i++) {
+        if (rowHasLineageResetBoundary(groupRows[i]!)) boundaryIndex = i;
+      }
+      let depth = 0;
+      for (let i = boundaryIndex >= 0 ? boundaryIndex : 0; i < groupRows.length; i++) {
+        depth = Math.max(depth + 1, groupRows[i]!.attemptCount);
+      }
+      totals[fingerprint] = depth;
+    }
+    return totals;
+  }
+
+  // SUP-15847: the latest recorded run for the issue, used to decide whether a
+  // re-park's `evidence.latestRunId` has actually advanced. Mirrors
+  // `recovery.getLatestIssueRun` so the "is there a newer run?" question is
+  // answered the same way the reconciler answers it.
+  async function getLatestIssueRunId(companyId: string, sourceIssueId: string): Promise<string | null> {
+    const row = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${sourceIssueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row?.id ?? null;
+  }
+
+  function readEvidenceRunId(evidence: Record<string, unknown> | null | undefined): string | null {
+    const value = evidence?.latestRunId;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  // SUP-15847: the predecessor is a resolved row and the incoming evidence
+  // cites the exact run that row was resolved on. That is a re-park on stale
+  // evidence, not a new failure.
+  function isStaleReparkEvidence(
+    prev: IssueRecoveryAction | null,
+    input: UpsertIssueRecoveryActionInput,
+  ): boolean {
+    if (!prev || prev.status !== "resolved") return false;
+    const priorRunId = readEvidenceRunId(prev.evidence);
+    const incomingRunId = readEvidenceRunId(input.evidence);
+    return priorRunId != null && incomingRunId != null && priorRunId === incomingRunId;
+  }
+
+  // SUP-15847 (round 2): a board reset — an exhausted predecessor explicitly
+  // resolved and re-minted at attempt 1 — closes the attempt lineage that
+  // precedes it. The fresh successor starts an independent attempt budget. This
+  // marker is stamped on the boundary row at mint time so the cumulative-depth
+  // fold (below) stops counting at the most recent reset instead of resurrecting
+  // the old exhausted history on the next re-park, which is what re-escalated
+  // a fresh board-reset budget on its very next stale re-park.
+  const LINEAGE_RESET_EVIDENCE_KEY = "lineageReset" as const;
+
+  function rowHasLineageResetBoundary(row: { evidence: unknown }): boolean {
+    const marker = (row.evidence as Record<string, unknown> | null)?.[LINEAGE_RESET_EVIDENCE_KEY];
+    return Boolean(marker && typeof marker === "object" && !Array.isArray(marker));
+  }
+
+  // A fresh-budget successor keeps its boundary across in-place evidence
+  // rewrites (sweep bumps, reconciler re-upserts): if the incoming evidence does
+  // not already carry the marker and the existing row does, carry it forward so
+  // the fold still starts at this row.
+  function carryLineageResetBoundary(
+    existingEvidence: Record<string, unknown> | undefined,
+    nextEvidence: Record<string, unknown> | undefined,
+  ): Record<string, unknown> {
+    const base: Record<string, unknown> = nextEvidence ?? {};
+    if (base[LINEAGE_RESET_EVIDENCE_KEY]) return base;
+    const inherited = existingEvidence?.[LINEAGE_RESET_EVIDENCE_KEY];
+    if (inherited && typeof inherited === "object" && !Array.isArray(inherited)) {
+      return { ...base, [LINEAGE_RESET_EVIDENCE_KEY]: inherited };
+    }
+    return base;
+  }
+
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
     if (sourceIssueIds.length === 0) return new Map<string, IssueRecoveryAction>();
     const rows = await db
@@ -324,6 +501,9 @@ export function issueRecoveryActionService(db: Db) {
     // here would reset every re-mint to 1, so the sweep ceiling is never
     // reachable and an exhausted action is re-escalated forever.
     attemptCountOverride?: number,
+    // SUP-15847: extra evidence merged last, used to type a below-ceiling stale
+    // re-park distinctly (`staleRepark`) without changing any other caller.
+    evidenceExtra?: Record<string, unknown>,
   ) {
     return {
       companyId: input.companyId,
@@ -341,6 +521,7 @@ export function issueRecoveryActionService(db: Db) {
       evidence: {
         ...(input.evidence ?? {}),
         ...(input.evidenceOnCreate ?? {}),
+        ...(evidenceExtra ?? {}),
       },
       nextAction: input.nextAction,
       wakePolicy: input.wakePolicy ?? null,
@@ -530,11 +711,17 @@ export function issueRecoveryActionService(db: Db) {
           cause: input.preserveExistingOwner ? existing.cause : input.cause,
           fingerprint: input.preserveExistingOwner ? existing.fingerprint : input.fingerprint,
           evidence: input.preserveExistingOwner
-            ? {
-              ...(existing.evidence ?? {}),
-              ...(input.evidence ?? {}),
-            }
-            : input.evidence ?? existing.evidence,
+            ? carryLineageResetBoundary(
+                existing.evidence,
+                {
+                  ...(existing.evidence ?? {}),
+                  ...(input.evidence ?? {}),
+                },
+              )
+            : carryLineageResetBoundary(
+                existing.evidence,
+                input.evidence ?? existing.evidence,
+              ),
           nextAction: input.preserveExistingOwner ? existing.nextAction : input.nextAction,
           wakePolicy: input.preserveExistingOwner
             ? existing.wakePolicy
@@ -579,7 +766,7 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
-      const prev = await getLatestForFingerprint(
+      const { latest: prev, cumulativeDepth } = await getFingerprintHistory(
         input.companyId,
         input.sourceIssueId,
         input.fingerprint,
@@ -589,10 +776,16 @@ export function issueRecoveryActionService(db: Db) {
       // escalation), start a fresh attempt budget instead of carrying the
       // post-ceiling count forward. Carrying it would mint a new action
       // already past its ceiling, which the next sweep re-escalates and
-      // re-comments on immediately.
+      // re-comments on immediately. This is the deliberate board-resolution
+      // reset, so it must keep winning over the cumulative depth.
       const predecessorBudgetExhausted =
         prev != null && prev.maxAttempts != null && prev.attemptCount >= prev.maxAttempts;
-      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : (prev?.attemptCount ?? 0) + 1;
+      // SUP-15847: carry the fingerprint's durable cumulative depth forward,
+      // not the high-water `max(attemptCount)`. A resolve -> re-park cycle
+      // previously read a low per-row count (or the high-water of a reset
+      // predecessor) and restarted the ladder, defeating the ceiling.
+      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : cumulativeDepth + 1;
+      const effectiveMaxAttempts = input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
       // SUP-14151: clamp the carried count to the effective ceiling. The
       // predecessor-budget reset above only fires when the predecessor carries
       // a non-null maxAttempts; where it was null the count carried forward
@@ -603,13 +796,85 @@ export function issueRecoveryActionService(db: Db) {
       // the true count for this fingerprint (run stamp, persisted action, or
       // legacy park history). Every carry-forward caller above passes none, so
       // the SUP-13698/SUP-14151 clamp still governs each of them.
-      const nextAttemptCount = input.attemptCount ?? Math.min(
-        carriedAttemptCount,
-        input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
-      );
+      const nextAttemptCount = input.attemptCount ??
+        (predecessorBudgetExhausted ? 1 : Math.min(carriedAttemptCount, effectiveMaxAttempts));
+      // SUP-15847: a re-park whose evidence has not advanced past the row that
+      // was just resolved is a stale re-park -- it is driven by an unchanged
+      // `latestRunId`, not a new failure.
+      const staleRepark = isStaleReparkEvidence(prev, input);
+      const staleReparkEvidence = staleRepark
+        ? { staleRepark: { detected: true, latestRunId: readEvidenceRunId(input.evidence) } }
+        : undefined;
+      // SUP-15847 (round 2): a board reset mints a fresh attempt-1 successor
+      // after an exhausted predecessor was explicitly resolved. Stamp the
+      // boundary on that row so the durable-depth fold and the read projection
+      // stop counting the closed lineage it just replaced. Only the reset path
+      // itself stamps it — a caller that supplies an explicit `attemptCount` is
+      // setting the authoritative count and is not starting a fresh lineage.
+      const resetRemint = predecessorBudgetExhausted && input.attemptCount === undefined;
+      const insertEvidenceExtra: Record<string, unknown> = {
+        ...(staleReparkEvidence ?? {}),
+        ...(resetRemint
+          ? { [LINEAGE_RESET_EVIDENCE_KEY]: { inheritedDepthBefore: cumulativeDepth } }
+          : {}),
+      };
+      // Once the fingerprint has consumed its cumulative budget, mint the
+      // successor directly as the board-facing exhausted action instead of an
+      // active row the sweep would only re-escalate on the next pass.
+      if (
+        input.attemptCount === undefined &&
+        !predecessorBudgetExhausted &&
+        carriedAttemptCount > effectiveMaxAttempts &&
+        staleRepark
+      ) {
+        const staleRunId = readEvidenceRunId(prev!.evidence)!;
+        const latestIssueRunId = await getLatestIssueRunId(input.companyId, input.sourceIssueId);
+        // Only suppress when the cited run really is the issue's latest run, so
+        // a genuinely newer failure still gets a normal active action.
+        if (latestIssueRunId != null && latestIssueRunId === staleRunId) {
+          const [escalated] = await db
+            .insert(issueRecoveryActions)
+            .values({
+              ...buildInsertValues(input, "board", now, effectiveMaxAttempts),
+              status: "escalated" as const,
+              ownerType: "board" as const,
+              ownerAgentId: null,
+              ownerUserId: null,
+              previousOwnerAgentId: prev!.ownerAgentId ?? input.previousOwnerAgentId ?? null,
+              returnOwnerAgentId: prev!.ownerAgentId ?? input.returnOwnerAgentId ?? null,
+              evidence: {
+                ...(input.evidence ?? {}),
+                recoveryBudget: {
+                  state: "exhausted",
+                  attemptsUsed: effectiveMaxAttempts,
+                  maxAttempts: effectiveMaxAttempts,
+                  exhaustedAt: now.toISOString(),
+                  cause: input.cause,
+                  fingerprint: input.fingerprint,
+                  suppressedStaleRepark: true,
+                },
+              },
+              nextAction:
+                `Automatic recovery exhausted after ${effectiveMaxAttempts}/${effectiveMaxAttempts} attempts on an unchanged run ` +
+                `(${staleRunId}). Dispatch a new run or choose a replacement configuration; the same stale evidence will not re-park.`,
+              wakePolicy: null,
+              monitorPolicy: null,
+              attemptCount: effectiveMaxAttempts,
+              maxAttempts: effectiveMaxAttempts,
+              // DB-level terminal sentinel (`escalated` + `outcome: "exhausted"`),
+              // matching the sweep. Ordinary callers cannot clear it without a
+              // board resolution, so the stale loop cannot restart.
+              outcome: "exhausted",
+              resolutionNote: null,
+              resolvedAt: null,
+            })
+            .returning();
+          return toReadModel(escalated!);
+        }
+      }
       const [created] = await db
         .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now, nextAttemptCount))
+        .values(buildInsertValues(input, ownerType, now, nextAttemptCount, insertEvidenceExtra))
         .returning();
       return toReadModel(created!);
     } catch (error) {
@@ -682,6 +947,7 @@ export function issueRecoveryActionService(db: Db) {
     getLiveContinuationForIssue,
     getLatestResolvedForIssue,
     getLatestForFingerprint,
+    getFingerprintAttemptTotals,
     listActiveForIssues,
     listAllForIssue,
     resolveActiveForIssue,
