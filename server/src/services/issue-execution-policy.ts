@@ -1654,3 +1654,41 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
   return { patch: applyMonitorTransition(input, {}) };
 }
+
+/**
+ * SUP-15878: the typed error code for a `done` transition refused on the
+ * parent-close ladder gap (open children + no `approval` stage).
+ */
+export const MISSING_APPROVAL_STAGE_ERROR_CODE = "done_transition_missing_approval_stage";
+
+export interface MissingApprovalStageGap {
+  /** Number of non-`cancelled` child issues on the card. */
+  childCount: number;
+  /** Stage types stored on the card's executionPolicy, in ladder order. */
+  stageTypes: string[];
+  remediation: string;
+}
+
+/**
+ * SUP-15878: a card with at least one non-`cancelled` child issue but no
+ * `approval` stage in its executionPolicy can never reach a recorded approval
+ * decision. `diagnoseMissingApprovalStage` returns the diagnostic for that gap
+ * (or `null` when the ladder is fine or the card has no open children).
+ */
+export function diagnoseMissingApprovalStage(input: {
+  policy: IssueExecutionPolicy | null;
+  childCount: number;
+}): MissingApprovalStageGap | null {
+  if (input.childCount <= 0) return null;
+  const stages = input.policy?.stages ?? [];
+  if (stages.some((stage) => stage.type === "approval")) return null;
+  const stageTypes = stages.map((stage) => stage.type);
+  return {
+    childCount: input.childCount,
+    stageTypes,
+    remediation:
+      `Add an "approval" stage to this issue's executionPolicy before it can be marked done: ` +
+      `a card with ${input.childCount} open child issue(s) and no approval stage cannot reach ` +
+      `a recorded approval decision (stored stage types: ${stageTypes.length > 0 ? stageTypes.join(", ") : "none"}).`,
+  };
+}

@@ -272,12 +272,15 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   assertPatchableExecutionPolicyWrite,
+  diagnoseMissingApprovalStage,
   isReviewChangesRequestedTransition,
+  MISSING_APPROVAL_STAGE_ERROR_CODE,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   resolvePatchExecutionPolicy,
   setIssueExecutionPolicyMonitorScheduledBy,
+  type MissingApprovalStageGap,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
@@ -13010,7 +13013,35 @@ export function issueRoutes(
     const effectiveStatus =
       typeof transition.patch.status === "string" ? transition.patch.status : requestedStatus;
     const isDoneRequest = effectiveStatus === "done" && existing.status !== "done";
-    if (isDoneRequest) {
+    // SUP-15878: a card with open children and no approval stage in its
+    // executionPolicy can never reach a recorded approval decision. Diagnose the
+    // gap once, up front: a `done` request is refused with a typed 409 inside the
+    // update transaction, and an `in_review` request (the coercion target)
+    // completes as today but records a durable signal after commit.
+    const policyStageTypes = (nextExecutionPolicy?.stages ?? []).map((stage) => stage.type);
+    const policyLacksApprovalStage = !policyStageTypes.includes("approval");
+    let missingApprovalStageGap: MissingApprovalStageGap | null = null;
+    if (
+      policyLacksApprovalStage
+      && ((requestedTransitionStatus === "done" && existing.status !== "done")
+        || (requestedTransitionStatus === "in_review" && existing.status !== "in_review"))
+    ) {
+      const childRows = await db
+        .select({ status: issueRows.status })
+        .from(issueRows)
+        .where(and(
+          eq(issueRows.companyId, existing.companyId),
+          eq(issueRows.parentId, existing.id),
+        ));
+      missingApprovalStageGap = diagnoseMissingApprovalStage({
+        policy: nextExecutionPolicy,
+        childCount: childRows.filter((child) => child.status !== "cancelled").length,
+      });
+    }
+    // The typed ladder-gap refusal (raised under the update lock below) replaces
+    // the delivery guard's `done_transition_missing_delivery` catchall for
+    // in-scope cards, so the guard is skipped only when the gap is present.
+    if (isDoneRequest && !missingApprovalStageGap) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
           ? {
@@ -13186,6 +13217,26 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
+          // SUP-15878: refuse the close under the update lock (after the review
+          // policy reauthorization above) with a typed diagnosis instead of
+          // letting the transition silently coerce the card back to in_review.
+          if (
+            missingApprovalStageGap
+            && requestedTransitionStatus === "done"
+            && existing.status !== "done"
+          ) {
+            throw conflict(
+              "Cannot mark this issue done: it has open child issues but no approval stage in its executionPolicy",
+              {
+                code: MISSING_APPROVAL_STAGE_ERROR_CODE,
+                issueId: existing.id,
+                identifier: existing.identifier ?? null,
+                childCount: missingApprovalStageGap.childCount,
+                stageTypes: missingApprovalStageGap.stageTypes,
+                remediation: missingApprovalStageGap.remediation,
+              },
+            );
+          }
           // SUP-15543 (round-1 fail-closed gate): reclaim the pinned vehicle
           // BEFORE the issue update so the correction commits only when the
           // vehicle can actually be invalidated. The pre-flight
@@ -13291,6 +13342,37 @@ export function issueRoutes(
           "issue update rejected with 422",
         );
       }
+      if (
+        missingApprovalStageGap
+        && err instanceof HttpError
+        && (err.details as Record<string, unknown> | null | undefined)?.code
+          === MISSING_APPROVAL_STAGE_ERROR_CODE
+      ) {
+        void logActivity(db, {
+          companyId: existing.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+          action: "issue.done_missing_approval_stage_refused",
+          entityType: "issue",
+          entityId: existing.id,
+          issueId: existing.id,
+          details: {
+            identifier: existing.identifier ?? null,
+            childCount: missingApprovalStageGap.childCount,
+            stageTypes: missingApprovalStageGap.stageTypes,
+            source: "done",
+          },
+        }).catch((logErr) => {
+          logger.warn(
+            { err: logErr, issueId: id },
+            "failed to write missing approval stage refusal audit log",
+          );
+        });
+      }
       throw err;
     }
     if (!issue) {
@@ -13351,6 +13433,39 @@ export function issueRoutes(
       decision: transition.decision,
       closingTransition: isDoneRequest,
     });
+
+    // SUP-15878: the `in_review` transition of an in-scope card completes as
+    // today, but records a durable signal so the missing approval stage is not
+    // silent. (The `done` refusal above writes its own row.)
+    if (
+      missingApprovalStageGap
+      && effectiveStatus === "in_review"
+      && existing.status !== "in_review"
+    ) {
+      void logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.in_review_missing_approval_stage",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          childCount: missingApprovalStageGap.childCount,
+          stageTypes: missingApprovalStageGap.stageTypes,
+          source: "in_review",
+        },
+      }).catch((err) => {
+        logger.warn(
+          { err, issueId: id },
+          "failed to write missing approval stage diagnosis audit log",
+        );
+      });
+    }
 
     if (enteringBlocked) {
       const blockedIssue = issue;
