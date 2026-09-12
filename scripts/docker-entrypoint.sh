@@ -66,6 +66,45 @@ if [ -d "$home_dir" ] && [ "$(stat -c %u "$home_dir")" != "$(id -u node)" ]; the
     chown node "$home_dir"
 fi
 
+# SUP-15937: keep a run-scoped toolchain install out of the shared home.
+#
+# Once the agent-uid split is armed, agent runs (uid 1001) have the SAME
+# HOME=$home_dir as the server (uid 1000), on a persistent volume. A run that
+# bootstraps a toolchain (rustup, in the incident) appends its shell hook --
+# `. "<scratch>/cargo/env"` -- to $HOME/.profile. The scratch is reaped when the
+# run ends, so the hook outlives its target and aborts EVERY later login shell
+# in the container ("cannot open ...: No such file"), taking the server's own
+# `sh -l` health checks down with it.
+#
+# The run env now points CARGO_HOME/RUSTUP_HOME at the run scratch, so the
+# toolchain itself stays run-local. This block removes the other half: the
+# shared home's login profiles must not be writable by the agent uid, so no run
+# can leave a hook behind. A node-owned 0644 profile is readable (so `sh -l`
+# still sources it) but not appendable by uid 1001. A fresh home gets an INERT
+# node-owned .profile -- deliberately free of any source line, so it can never
+# dangle; an existing profile has its CONTENT left exactly as-is (it may hold
+# operator-managed settings) and only its owner/mode locked. Only a distinct
+# agent uid can be locked out, so this requires the split -- never a recursive
+# chown, which this fork forbids on the shared home.
+if [ -n "${PAPERCLIP_AGENT_UID:-}" ] && [ -d "$home_dir" ]; then
+    shared_profile="${home_dir}/.profile"
+    if [ ! -e "$shared_profile" ]; then
+        printf '%s\n' \
+            '# Managed by paperclip docker-entrypoint.sh (SUP-15937).' \
+            '# Agent runs share HOME with the server, so this file is kept free' \
+            '# of run-scoped toolchain hooks: a dangling source here aborts every' \
+            '# login shell in the container. Run-scoped toolchain homes live in' \
+            '# the run scratch and are removed with it.' \
+            > "$shared_profile" 2>/dev/null || true
+    fi
+    for f in "$shared_profile" "${home_dir}/.bash_profile" "${home_dir}/.bashrc" \
+        "${home_dir}/.zprofile" "${home_dir}/.zshrc" "${home_dir}/.zshenv"; do
+        [ -e "$f" ] || continue
+        chown node "$f" 2>/dev/null || true
+        chmod 0644 "$f" 2>/dev/null || true
+    done
+fi
+
 # Root-own the secrets directory so agent runs (uid 1000) can neither read nor
 # write it. DAC cannot distinguish the server from agents — both run uid 1000 —
 # so the key is handed to the server via the environment (exported below) BEFORE

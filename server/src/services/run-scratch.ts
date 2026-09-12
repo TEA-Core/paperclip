@@ -73,6 +73,25 @@ export const RUN_SCRATCH_TERMINATION_GRACE_MS = 5_000;
 export const RUN_SCRATCH_REAP_MIN_AGE_MS = 10 * 60 * 1000;
 
 const TEMP_ENV_KEYS = ["TMPDIR", "TEMP", "TMP"] as const;
+
+/**
+ * SUP-15937: toolchain-home env scoped to the run scratch.
+ *
+ * Both the server and every agent run have HOME=$PAPERCLIP_HOME, and the shared
+ * home is a persistent volume. A run that bootstraps a toolchain therefore
+ * installs it into `$HOME/.cargo` / `$HOME/.rustup` by default -- files that
+ * outlive the run on the volume. Worse, rustup writes a shell hook pointing at
+ * the scratch CARGO_HOME (`. "<scratch>/cargo/env"`) into `$HOME/.profile`; the
+ * scratch is reaped when the run ends, so the hook dangles and every later
+ * login shell (`sh -l`) aborts on the missing file. Pointing both homes at the
+ * run scratch keeps the install run-local and dies with the run. An operator-set
+ * value wins, so a deliberately shared toolchain is never shadowed.
+ */
+const TOOLCHAIN_HOME_ENV_KEYS = {
+  CARGO_HOME: "cargo",
+  RUSTUP_HOME: "rustup",
+} as const;
+
 const ISSUE_SEGMENT_MAX_CHARS = 32;
 
 function sanitizePathSegment(value: string | null | undefined, fallback: string): string {
@@ -162,6 +181,11 @@ export function buildHeartbeatRunScratchEnv(
     if (typeof existing === "string" && existing.trim().length > 0) continue;
     env[key] = scratch.dir;
     tempKeysApplied.push(key);
+  }
+  for (const [key, subdir] of Object.entries(TOOLCHAIN_HOME_ENV_KEYS)) {
+    const existing = existingEnv[key];
+    if (typeof existing === "string" && existing.trim().length > 0) continue;
+    env[key] = path.join(scratch.dir, subdir);
   }
   return { env, tempKeysApplied };
 }
