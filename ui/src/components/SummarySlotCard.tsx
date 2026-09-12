@@ -97,11 +97,13 @@ export function resolveGenerationStatusLine(status: LiveGenerationStatus | null)
 }
 
 /**
- * True when a summary slot has a LIVE, non-terminal generation in flight. This is
- * the single source of truth for both the "Generating" badge and the 3s poll, so a
- * written slot whose generation task has reached a terminal status stops polling
- * instead of re-fetching indefinitely (SUP-15773 review: unbounded poll on
- * `generating`).
+ * True when a summary slot has a LIVE, unwritten generation in flight. This is
+ * the single source of truth for both the "Generating" badge and the 3s poll, so
+ * a slot that has written its summary and whose generation task is parked in
+ * review stops polling instead of re-fetching for the whole review window
+ * (SUP-15773 review: unbounded poll on `generating`). Only an active, not
+ * yet-written run — or a changes_requested bounce back in `in_progress` — keeps
+ * the slot live.
  */
 export function slotIsLiveGeneration(
   data: {
@@ -109,10 +111,21 @@ export function slotIsLiveGeneration(
     generatingIssue: SummarySlotIssueRef | null;
   } | null | undefined,
 ): boolean {
-  if (!data || data.slot?.status !== "generating") return false;
+  if (!data) return false;
+  const slot = data.slot;
+  if (!slot || slot.status !== "generating") return false;
   const issue = data.generatingIssue;
   if (!issue) return false;
-  return !TERMINAL_ISSUE_STATUSES.has(issue.status);
+  if (TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
+  // A successful write keeps the slot armed (`generating`) and the generation
+  // link alive through the review window so a changes_requested bounce can write
+  // a second revision (SUP-15773). `in_review` therefore no longer means
+  // "actively producing": a slot that carries write evidence (`documentId`) with
+  // its linked task parked in review is done producing until it is bounced back.
+  // Only an active, not-yet-written run — or a bounce back in `in_progress` —
+  // keeps the 3s poll.
+  if (issue.status === "in_review" && slot.documentId) return false;
+  return true;
 }
 
 /**
