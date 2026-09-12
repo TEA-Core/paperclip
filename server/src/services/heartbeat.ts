@@ -11914,6 +11914,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const terminalRun = write.run;
+    // Emit exactly one container log line on the normal path — the only stdout a
+    // lease-release terminalization leaves. The heartbeat_runs row and the run
+    // event below are invisible to a `docker logs`-only monitor, so this record
+    // is what a log-reading gate can actually attribute. warn when the run was
+    // cut short ("interrupted"); info when it reached a matching terminal status,
+    // mirroring the level appendRunEvent picks. The issue identifier rides in the
+    // rendered message via issueAttributionSuffix, and issueAttributionLogFields
+    // contributes the structured issueId/issueIdentifier fields (absent when the
+    // run has no owning issue, so nothing throws or emits undefined).
+    const logFields = {
+      runId: run.id,
+      previousStatus: run.status,
+      terminalStatus,
+      errorCode:
+        run.errorCode ??
+        (terminalStatus === "interrupted" ? "lease_released_before_terminal" : null),
+      ...issueAttributionLogFields(issueId, issueIdentifier),
+    };
+    if (terminalStatus === "interrupted") {
+      logger.warn(logFields, message);
+    } else {
+      logger.info(logFields, message);
+    }
+
     if (terminalRun) {
       await appendRunEvent(terminalRun, {
         eventType: "lifecycle",
