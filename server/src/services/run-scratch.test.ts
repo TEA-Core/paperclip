@@ -128,6 +128,39 @@ describe("heartbeat run scratch cleanup", () => {
     expect(result.env.TMP).toBe(scratch.dir);
     expect(result.tempKeysApplied).toEqual(["TEMP", "TMP"]);
   });
+
+  it("scopes toolchain homes to the run scratch (SUP-15937)", async () => {
+    // The incident: a run's rustup install wrote into the shared home
+    // ($HOME=/paperclip) and appended a hook pointing at its now-reaped scratch
+    // CARGO_HOME, so every later `sh -l` aborted on the dangling source.
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    }));
+
+    const result = buildHeartbeatRunScratchEnv({}, scratch);
+
+    expect(result.env.CARGO_HOME).toBe(path.join(scratch.dir, "cargo"));
+    expect(result.env.RUSTUP_HOME).toBe(path.join(scratch.dir, "rustup"));
+  });
+
+  it("does not shadow an operator-configured toolchain home", async () => {
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    }));
+
+    const result = buildHeartbeatRunScratchEnv(
+      { CARGO_HOME: "/opt/shared/cargo", RUSTUP_HOME: "  " },
+      scratch,
+    );
+
+    // Configured values win; only a blank one is treated as unset.
+    expect(result.env.CARGO_HOME).toBeUndefined();
+    expect(result.env.RUSTUP_HOME).toBe(path.join(scratch.dir, "rustup"));
+  });
 });
 
 describe("run scratch process group termination (SUP-13949)", () => {

@@ -262,4 +262,71 @@ describe("docker-entrypoint.sh", () => {
     const mode = statSync(outFile).mode;
     expect(mode & 0o020).toBe(0o020);
   });
+
+  describe("shared-home toolchain-install containment (SUP-15937)", () => {
+    it("pre-seeds an inert, node-owned login profile when the agent-uid split is armed", async () => {
+      // A run's rustup appends `. "<scratch>/cargo/env"` to $HOME/.profile; the
+      // scratch is reaped with the run, so the hook dangles and aborts every
+      // later `sh -l`. Seed a profile with no source line, owned by node and
+      // not writable by the agent uid, so the append cannot land.
+      installStubs({ uid: 0, gid: 0 });
+
+      const { calls } = await runEntrypoint({
+        PAPERCLIP_HOME: stubDir,
+        PAPERCLIP_AGENT_UID: "1001",
+      });
+
+      const profile = join(stubDir, ".profile");
+      expect(existsSync(profile)).toBe(true);
+      const body = readFileSync(profile, "utf8");
+      expect(body).not.toMatch(/(^|\n)\s*\.\s+/);
+      expect(body).not.toMatch(/(^|\n)\s*source\s+/);
+      expect(calls).toContain(`chown node ${profile}`);
+      // 0644: readable by uid 1001 (so `sh -l` sources it) but not appendable.
+      expect(statSync(profile).mode & 0o777).toBe(0o644);
+    });
+
+    it("locks an existing profile without editing its content", async () => {
+      installStubs({ uid: 0, gid: 0 });
+      const profile = join(stubDir, ".profile");
+      const operatorContent = "# operator-managed\nexport FOO=bar\n";
+      writeFileSync(profile, operatorContent, { mode: 0o666 });
+
+      const { calls } = await runEntrypoint({
+        PAPERCLIP_HOME: stubDir,
+        PAPERCLIP_AGENT_UID: "1001",
+      });
+
+      // Content is preserved verbatim; only owner/mode are locked down.
+      expect(readFileSync(profile, "utf8")).toBe(operatorContent);
+      expect(statSync(profile).mode & 0o777).toBe(0o644);
+      expect(calls).toContain(`chown node ${profile}`);
+    });
+
+    it("leaves a login shell working after the profile is seeded", async () => {
+      // Acceptance shape: with the seeded shared-home profile, `sh -l` must
+      // still run the command rather than aborting on a dangling source.
+      installStubs({ uid: 0, gid: 0 });
+
+      await runEntrypoint({
+        PAPERCLIP_HOME: stubDir,
+        PAPERCLIP_AGENT_UID: "1001",
+      });
+
+      const result = await execFileAsync("sh", ["-lc", "echo MARKER_OK"], {
+        env: { PATH: process.env.PATH, HOME: stubDir },
+      });
+      expect(result.stdout).toContain("MARKER_OK");
+      expect(result.stderr).not.toContain("cannot open");
+    });
+
+    it("does not create or chown a shared profile without the agent-uid split", async () => {
+      installStubs({ uid: 0, gid: 0 });
+
+      const { calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+      expect(existsSync(join(stubDir, ".profile"))).toBe(false);
+      expect(calls).not.toContain(`chown node ${join(stubDir, ".profile")}`);
+    });
+  });
 });
