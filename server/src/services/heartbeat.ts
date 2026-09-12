@@ -176,6 +176,7 @@ import {
   shouldEmitTimerDispatchSuppression,
   TIMER_DISPATCH_SUPPRESSED_ACTION,
   TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS,
+  toContinuationPathDate,
   type ContinuationPathEvidence,
   type ContinuationPathResult,
 } from "./issue-continuation-path.js";
@@ -16550,7 +16551,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ): Promise<void> {
     const [prior] = await db
       .select({
-        latestSuppressedAt: sql<Date | null>`MAX(${activityLog.createdAt})`,
+        // Raw aggregate: drizzle maps nothing here and its postgres-js driver
+        // returns the timestamp as a STRING, so type it as what actually
+        // arrives and coerce below. Typing it `Date` is what let a `.getTime()`
+        // call crash-loop the server on 2026-09-11.
+        latestSuppressedAt: sql<Date | string | null>`MAX(${activityLog.createdAt})`,
       })
       .from(activityLog)
       .where(
@@ -16563,7 +16568,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     if (
       !shouldEmitTimerDispatchSuppression({
-        lastSuppressedAt: prior?.latestSuppressedAt ?? null,
+        lastSuppressedAt: toContinuationPathDate(prior?.latestSuppressedAt),
         now: new Date(),
         windowMs: TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS,
       })

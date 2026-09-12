@@ -282,4 +282,33 @@ describe("shouldEmitTimerDispatchSuppression (one row per suppression decision)"
     // 3-min window: last suppression 4 min ago is outside it -> emit.
     expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW, windowMs: 3 * 60 * 1000 })).toBe(true);
   });
+
+  // The caller's `sql<...>MAX(activity_log.created_at)` is a raw fragment, so
+  // drizzle hands back the driver's unparsed timestamp STRING, not a Date. The
+  // predicate used to call .getTime() on it, which threw inside startup
+  // heartbeat recovery and crash-looped the server on 2026-09-11.
+  it("accepts the driver's raw timestamp string, in window", () => {
+    const lastSuppressedAt = new Date(NOW.getTime() - 5 * 60 * 1000).toISOString();
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW })).toBe(false);
+  });
+
+  it("accepts the driver's raw timestamp string, out of window", () => {
+    const lastSuppressedAt = new Date(NOW.getTime() - 15 * 60 * 1000).toISOString();
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW })).toBe(true);
+  });
+
+  it("accepts postgres' space-separated timestamp rendering", () => {
+    // `MAX(created_at)` renders as e.g. "2026-09-03 11:55:00+00" over the wire.
+    expect(
+      shouldEmitTimerDispatchSuppression({ lastSuppressedAt: "2026-09-03 11:55:00+00", now: NOW }),
+    ).toBe(false);
+    expect(
+      shouldEmitTimerDispatchSuppression({ lastSuppressedAt: "2026-09-03 11:45:00+00", now: NOW }),
+    ).toBe(true);
+  });
+
+  it("treats an unreadable or missing timestamp as no prior row (emit)", () => {
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt: "not-a-date", now: NOW })).toBe(true);
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt: undefined, now: NOW })).toBe(true);
+  });
 });
