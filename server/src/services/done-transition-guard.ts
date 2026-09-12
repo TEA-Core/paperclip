@@ -1043,8 +1043,13 @@ function evaluateReviewLadderSatisfaction(
  * this runs before any GitHub path, and it fails closed on a throw: the
  * transition write targets the same store, so a Postgres error must not be
  * waved through.
+ *
+ * Exported as the canonical shared in-scope predicate: the missing-approval
+ * stage route probe (SUP-15878 / SUP-15958) and mechanisms A and D all count a
+ * card's laddered children through this one helper so their exclusions and the
+ * `>= 2` threshold can never drift.
  */
-async function countLadderedChildren(
+export async function countLadderedChildren(
   db: Db,
   companyId: string,
   parentId: string,

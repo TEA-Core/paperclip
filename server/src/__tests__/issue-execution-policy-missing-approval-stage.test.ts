@@ -1,13 +1,17 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { issueLabels, labels } from "@paperclipai/db";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
-// SUP-15878: a card with at least one non-`cancelled` child issue and no
-// `approval` stage in its executionPolicy. A `done` request is refused with a
-// typed 409 (done_transition_missing_approval_stage) and a durable activity row;
-// an `in_review` request completes as today and records the same diagnosis.
+// SUP-15878 / SUP-15958: the in-scope predicate is the canonical shared
+// `countLadderedChildren` (post-exclusion, `>= 2` mechanism-D count). A card
+// whose only children are redo/delivery or otherwise excluded does NOT owe a
+// close ladder and is not diagnosed; a card with two or more laddered children
+// and no `approval` stage is refused with a typed 409 and a durable activity
+// row on both the `done` and `in_review` paths, carrying the canonical
+// ladderedChildCount / ladderedChildIdentifiers / excludedChildIdentifiers.
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -55,6 +59,12 @@ const mockLogActivityInTransaction = vi.hoisted(() => vi.fn(async () => undefine
 // Non-`cancelled` child rows the child-count query resolves. Per-test override
 // switches between open children, cancelled-only children, and no children.
 const childRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
+// SUP-15958: the carve-out label rows (`work-type:redo` / `work-type:delivery`)
+// and the issue_labels mapping they resolve to. `countLadderedChildren` reads
+// these to exclude redo/delivery children from the laddered count; empty by
+// default so the carve-out is inert unless a test arms it.
+const carveOutLabelRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
+const carveOutIssueLabelRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
@@ -263,21 +273,48 @@ function dbChainNode(rows: unknown[]): Record<string, unknown> {
   };
 }
 
-// The SUP-15878 child-count query is the only `select` in the PATCH path whose
-// projection is exactly `{ status }`; every other chain (the handoff-agent row
-// the wake path depends on) keeps the hoisted default.
-function isChildCountSelect(columns: unknown) {
-  return !!columns
-    && typeof columns === "object"
-    && !Array.isArray(columns)
-    && Object.keys(columns as object).length === 1
-    && Object.prototype.hasOwnProperty.call(columns, "status");
-}
-
 const PARENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CHILD_PARTICIPANT_ID = "44444444-4444-4444-8444-444444444444";
 const AGENT_ID = "33333333-3333-4333-8333-333333333333";
 const RUN_ID = "55555555-5555-4555-8555-555555555555";
+
+// A decomposition child that counts toward the laddered count: manual origin,
+// a non-null executionPolicy, and at least one completed stage — exactly the
+// row shape `countLadderedChildren` reads from the issues table.
+function ladderedChildRow(id: string, identifier: string, originKind: string = "manual") {
+  return {
+    id,
+    identifier,
+    executionPolicy: {
+      stages: [{ id: "stage-x", type: "review", participants: [{ type: "agent", agentId: AGENT_ID }] }],
+    },
+    executionState: {
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      deliveryAuthor: null,
+        reviewRequest: null,
+        completedStageIds: ["11111111-1111-4111-8111-111111111111"],
+        skippedStageIds: [],
+      lastDecisionId: "22222222-2222-4222-8222-222222222222",
+      lastDecisionOutcome: "approved",
+      monitor: null,
+      changesRequestedCount: 0,
+    },
+    originKind,
+  };
+}
+
+// Arm the `work-type:redo` carve-out so the named child is excluded from the
+// laddered count by the real helper (the label-name read returns the redo
+// label and the issue_labels read maps it onto that child).
+function armRedoCarveOutFor(childId: string) {
+  carveOutLabelRowsState.rows = [{ id: "label-work-type-redo" }];
+  carveOutIssueLabelRowsState.rows = [{ issueId: childId }];
+}
 
 function reviewOnlyPolicy() {
   return normalizeIssueExecutionPolicy({
@@ -348,6 +385,8 @@ describe("issue execution policy missing approval stage", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     childRowsState.rows = [];
+    carveOutLabelRowsState.rows = [];
+    carveOutIssueLabelRowsState.rows = [];
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -372,12 +411,38 @@ describe("issue execution policy missing approval stage", () => {
     mockIssueThreadInteractionService.getForIssue.mockResolvedValue(null);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation((columns: unknown) => {
-      const childCountQuery = isChildCountSelect(columns);
+      const keys =
+        columns && typeof columns === "object" && !Array.isArray(columns)
+          ? Object.keys(columns as object)
+          : [];
+      // SUP-15958: `countLadderedChildren` runs up to three indexed reads on the
+      // PATCH path. Route each to its own state so the real helper's exclusions
+      // are exercised; every other select keeps the hoisted handoff-agent-row
+      // default. The child decomposition is the only 5-key projection on the
+      // path, so it is matched by signature alone (no table-identity assumption);
+      // the carve-out label reads are matched by table + single-key projection.
+      const childSignature =
+        keys.length === 5
+        && keys.includes("id")
+        && keys.includes("identifier")
+        && keys.includes("executionPolicy")
+        && keys.includes("executionState")
+        && keys.includes("originKind");
       return {
-        from: () => ({
-          where: () => dbChainNode(childCountQuery ? childRowsState.rows : HANDOFF_AGENT_ROWS),
-          innerJoin: () => dbChainNode([]),
-        }),
+        from: (table: unknown) => {
+          let rows: unknown[] = HANDOFF_AGENT_ROWS;
+          if (childSignature) {
+            rows = childRowsState.rows;
+          } else if (table === labels && keys.length === 1 && keys[0] === "id") {
+            rows = carveOutLabelRowsState.rows;
+          } else if (table === issueLabels && keys.length === 1 && keys[0] === "issueId") {
+            rows = carveOutIssueLabelRowsState.rows;
+          }
+          return {
+            where: () => dbChainNode(rows),
+            innerJoin: () => dbChainNode([]),
+          };
+        },
       };
     });
     mockAccessService.canUser.mockResolvedValue(false);
@@ -409,7 +474,10 @@ describe("issue execution policy missing approval stage", () => {
 
   it("refuses done on an in-scope card with the typed ladder-gap signal", async () => {
     const issue = parentIssue(reviewOnlyPolicy());
-    childRowsState.rows = [{ status: "in_progress" }, { status: "cancelled" }];
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -429,7 +497,9 @@ describe("issue execution policy missing approval stage", () => {
       details: {
         issueId: PARENT_ID,
         identifier: "PAP-1587",
-        childCount: 1,
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+        excludedChildIdentifiers: [],
         stageTypes: ["review"],
       },
     });
@@ -438,7 +508,9 @@ describe("issue execution policy missing approval stage", () => {
       entityId: PARENT_ID,
       issueId: PARENT_ID,
       details: {
-        childCount: 1,
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+        excludedChildIdentifiers: [],
         stageTypes: ["review"],
         source: "done",
       },
@@ -452,7 +524,10 @@ describe("issue execution policy missing approval stage", () => {
   // gap was present), and closed the card successfully with neither guard.
   it("refuses a stage-less in-scope done that otherwise needs no transaction", async () => {
     const issue = parentIssue(null);
-    childRowsState.rows = [{ status: "in_progress" }];
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -470,7 +545,9 @@ describe("issue execution policy missing approval stage", () => {
       details: {
         issueId: PARENT_ID,
         identifier: "PAP-1587",
-        childCount: 1,
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+        excludedChildIdentifiers: [],
         stageTypes: [],
       },
     });
@@ -479,7 +556,9 @@ describe("issue execution policy missing approval stage", () => {
       entityId: PARENT_ID,
       issueId: PARENT_ID,
       details: {
-        childCount: 1,
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+        excludedChildIdentifiers: [],
         stageTypes: [],
         source: "done",
       },
@@ -507,7 +586,10 @@ describe("issue execution policy missing approval stage", () => {
         changesRequestedCount: 0,
       },
     };
-    childRowsState.rows = [{ status: "in_progress" }];
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -525,7 +607,9 @@ describe("issue execution policy missing approval stage", () => {
       details: {
         issueId: PARENT_ID,
         identifier: "PAP-1587",
-        childCount: 1,
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+        excludedChildIdentifiers: [],
         stageTypes: ["review"],
       },
     });
@@ -534,7 +618,9 @@ describe("issue execution policy missing approval stage", () => {
       entityId: PARENT_ID,
       issueId: PARENT_ID,
       details: {
-        childCount: 1,
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+        excludedChildIdentifiers: [],
         stageTypes: ["review"],
         source: "done",
       },
@@ -543,7 +629,10 @@ describe("issue execution policy missing approval stage", () => {
 
   it("completes an in_review transition on an in-scope card and records the signal", async () => {
     const issue = parentIssue(reviewOnlyPolicy());
-    childRowsState.rows = [{ status: "in_progress" }];
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -574,7 +663,9 @@ describe("issue execution policy missing approval stage", () => {
       entityId: PARENT_ID,
       issueId: PARENT_ID,
       details: {
-        childCount: 1,
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+        excludedChildIdentifiers: [],
         stageTypes: ["review"],
         source: "in_review",
       },
@@ -599,9 +690,18 @@ describe("issue execution policy missing approval stage", () => {
     expect(gapActivityInputs()).toEqual([]);
   });
 
-  it("treats cancelled-only children as childless", async () => {
+  // Distinguishing regression (SUP-15958): the SUP-15826 / SUP-15813 shape — a
+  // card whose ONLY child is a work-type:redo child. The redo child is itself a
+  // genuine laddered child (manual origin, a policy, a completed stage), so under
+  // the old raw parent_id count it armed the diagnosis (1 child, no approval
+  // stage → 409 refusal + spurious in_review row). The canonical
+  // countLadderedChildren predicate excludes it via the work-type:redo
+  // carve-out, so the laddered count is 0, the card owes no close ladder, and the
+  // `done` transition is unchanged with neither signal.
+  it("does not diagnose a redo-only child set and leaves the done transition unchanged", async () => {
     const issue = parentIssue(reviewOnlyPolicy());
-    childRowsState.rows = [{ status: "cancelled" }, { status: "cancelled" }];
+    childRowsState.rows = [ladderedChildRow("child-redo-id", "PAP-2")];
+    armRedoCarveOutFor("child-redo-id");
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -619,7 +719,10 @@ describe("issue execution policy missing approval stage", () => {
 
   it("does not diagnose a card whose policy already has an approval stage", async () => {
     const issue = parentIssue(reviewPlusApprovalPolicy());
-    childRowsState.rows = [{ status: "in_progress" }];
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
