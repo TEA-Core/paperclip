@@ -19,6 +19,7 @@ import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from ".
 import {
   armMergeOnApproval,
   ladderIsTerminallyApproved,
+  pickMostRecentMergeQueueEjection,
   publishApprovalStatus,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
@@ -118,6 +119,84 @@ describe("ladderIsTerminallyApproved", () => {
     expect(ladderIsTerminallyApproved(policy, undefined)).toBe(false);
     expect(ladderIsTerminallyApproved(policy, { completedStageIds: [A, B] })).toBe(false);
     expect(ladderIsTerminallyApproved(undefined, undefined)).toBe(false);
+  });
+});
+
+// SUP-15953 / review finding `latest-ejection-invalid-timestamp-fail-open`:
+// `pickMostRecentMergeQueueEjection` is pure (no I/O), so it runs even where
+// embedded Postgres is absent — no DB fixtures required. GitHub returns
+// `timelineItems(last:)` nodes chronologically (oldest first), so recency MUST
+// be decided by array position. The regression: an OLDER readable event plus a
+// NEWER unreadable one — the older event must NOT win.
+describe("pickMostRecentMergeQueueEjection", () => {
+  it("returns the last non-null node when every event is readable", () => {
+    const nodes = [
+      { reason: "failed_checks", createdAt: "2026-09-12T16:00:00Z", beforeCommit: { oid: "aaa" } },
+      { reason: "merge_conflict", createdAt: "2026-09-12T17:04:36Z", beforeCommit: { oid: "f03a03ce" } },
+    ];
+    expect(pickMostRecentMergeQueueEjection(nodes)).toEqual({
+      reason: "merge_conflict",
+      createdAt: "2026-09-12T17:04:36Z",
+      beforeCommitOid: "f03a03ce",
+    });
+  });
+
+  // The review regression fixture: an OLDER readable event and a NEWER event
+  // whose `createdAt` is malformed/missing (so the old `parsed || index` trick
+  // gave the older event the win and re-enqueueed a merge_conflict head). The
+  // newest event must win even though its timestamp is unreadable — that null
+  // reason is what makes the caller fail closed (defer).
+  it("picks the NEWER unreadable event, never an older readable one (fail closed)", () => {
+    const nodes = [
+      // Older, fully readable, valid epoch-ms timestamp (~1.7e12).
+      {
+        reason: "failed_checks",
+        createdAt: "2026-09-12T16:07:16Z",
+        beforeCommit: { oid: "older-head" },
+      },
+      // Newer, but malformed/missing `createdAt` and an unreadable reason —
+      // recency must still come from array position, not from the older event's
+      // valid timestamp.
+      { reason: "", createdAt: "not-a-timestamp", beforeCommit: { oid: "newer-head" } },
+    ];
+    const picked = pickMostRecentMergeQueueEjection(nodes);
+    // NOT the older `failed_checks`/`older-head` (that would be the fail-open bug);
+    // the newer, unreadable event, so `reason === null` and the caller defers.
+    expect(picked).toEqual({
+      reason: null,
+      createdAt: "not-a-timestamp",
+      beforeCommitOid: "newer-head",
+    });
+  });
+
+  it("picks a newest event with a missing reason and null beforeCommit", () => {
+    const nodes = [
+      { reason: "failed_checks", createdAt: "2026-09-12T16:00:00Z", beforeCommit: { oid: "aaa" } },
+      { reason: null },
+    ];
+    expect(pickMostRecentMergeQueueEjection(nodes)).toEqual({
+      reason: null,
+      createdAt: null,
+      beforeCommitOid: null,
+    });
+  });
+
+  it("skips trailing null nodes and returns the most recent real ejection", () => {
+    const nodes = [
+      null,
+      { reason: "merge_conflict", createdAt: "2026-09-12T17:04:36Z", beforeCommit: { oid: "f03a03ce" } },
+      null,
+    ];
+    expect(pickMostRecentMergeQueueEjection(nodes)).toEqual({
+      reason: "merge_conflict",
+      createdAt: "2026-09-12T17:04:36Z",
+      beforeCommitOid: "f03a03ce",
+    });
+  });
+
+  it("returns null when there are no ejection nodes", () => {
+    expect(pickMostRecentMergeQueueEjection([])).toBeNull();
+    expect(pickMostRecentMergeQueueEjection([null, null])).toBeNull();
   });
 });
 

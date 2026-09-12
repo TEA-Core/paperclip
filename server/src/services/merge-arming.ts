@@ -2251,6 +2251,225 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
 }
 
 /**
+ * SUP-15953: the ejection reason the merge queue removed a PR for. `reason` is
+ * nullable because GitHub returns the field as `String` and a malformed event
+ * must never be read as "not a conflict" — the caller defers on null.
+ */
+export interface MergeQueueEjectionEvent {
+  reason: string | null;
+  createdAt: string | null;
+  /**
+   * The merge-queue GROUP commit oid the queue held at ejection. This is a
+   * synthetic commit that is structurally DISTINCT from the PR's own head — it
+   * is retained as audit context only, NEVER compared by oid to the live head to
+   * prove the head moved. Finding:
+   * merge-conflict-ejection-compares-head-to-queue-group-commit.
+   */
+  beforeCommitOid: string | null;
+}
+
+export type MergeQueueEjectionReadResult =
+  | {
+      ok: true;
+      headRefOid: string;
+      /** The live head commit's creation time, or null when the head target is not a commit. */
+      headCommitAt: string | null;
+      lastEjection: MergeQueueEjectionEvent | null;
+    }
+  | { ok: false; reason: string };
+
+type MergeQueueEjectionFetch =
+  | {
+      ok: true;
+      headRefOid: string;
+      headCommitAt: string | null;
+      lastEjection: MergeQueueEjectionEvent | null;
+      status: number;
+      message: string | null;
+    }
+  | { ok: false; status: number; message: string | null };
+
+// SUP-15953: a PR's most recent merge-queue ejection PLUS its current head, in
+// one GraphQL round-trip. The ejection `reason` is available ONLY here — the REST
+// timeline omits it — so this read has no REST fallback. `beforeCommit.oid` is
+// the merge-queue GROUP commit the queue held (NOT the PR head); it is read for
+// audit context only. The head-movement predicate instead reads the live head
+// commit's `committedDate` and compares it to the ejection `createdAt` — the
+// head has moved iff that commit postdates the ejection.
+const MERGE_QUEUE_EJECTION_QUERY = `query PaperclipMergeQueueEjection($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      headRefOid
+      headRef {
+        target {
+          ... on Commit {
+            committedDate
+          }
+        }
+      }
+      timelineItems(last: 50, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            reason
+            createdAt
+            beforeCommit {
+              oid
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+// SUP-15953: pick the most recent ejection from a GraphQL
+// `timelineItems(last:)` node list. GitHub returns those nodes in chronological
+// order (oldest first), so the most recent ejection is the LAST non-null node.
+// Recency is established by ARRAY POSITION ONLY: a parsed timestamp is never used
+// for ordering, so a malformed/missing `createdAt` (or a null reason) on the
+// newest event can never make an OLDER, readable event win — that would be
+// fail-open (e.g. picking an older `failed_checks` event over a newer,
+// unreadable one and re-enqueueing a `merge_conflict` head). When the picked
+// event's `reason` is unreadable, `reason` stays null and the caller defers
+// (fail closed). Finding: latest-ejection-invalid-timestamp-fail-open.
+export function pickMostRecentMergeQueueEjection(
+  nodes: Array<Record<string, unknown> | null>,
+): MergeQueueEjectionEvent | null {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const node = nodes[i];
+    if (!node || typeof node !== "object") continue;
+    const createdAt = typeof node.createdAt === "string" ? node.createdAt : null;
+    const beforeCommit = node.beforeCommit as Record<string, unknown> | undefined;
+    return {
+      reason: typeof node.reason === "string" && node.reason.length > 0 ? node.reason : null,
+      createdAt,
+      beforeCommitOid:
+        typeof beforeCommit?.oid === "string" && beforeCommit.oid.length > 0
+          ? beforeCommit.oid
+          : null,
+    };
+  }
+  return null;
+}
+
+async function fetchMergeQueueEjection(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<MergeQueueEjectionFetch> {
+  let response: Response;
+  try {
+    response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-merge-arming",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query: MERGE_QUEUE_EJECTION_QUERY,
+        variables: { owner, repo, number },
+      }),
+    });
+  } catch {
+    return { ok: false, status: 0, message: "network_error" };
+  }
+
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const errors = body?.errors as Array<{ message?: string }> | undefined;
+  if (!response.ok || (errors && errors.length > 0)) {
+    const message =
+      errors?.[0]?.message
+      ?? readString(body?.message)
+      ?? `HTTP ${response.status}`;
+    return { ok: false, status: response.status, message };
+  }
+
+  const data = body?.data as Record<string, unknown> | undefined;
+  const repository = data?.repository as Record<string, unknown> | undefined;
+  const pullRequest = repository?.pullRequest as Record<string, unknown> | undefined;
+  if (!pullRequest) {
+    return { ok: false, status: response.status, message: "pull_request_missing" };
+  }
+  const headRefOid =
+    typeof pullRequest.headRefOid === "string" && pullRequest.headRefOid.length > 0
+      ? pullRequest.headRefOid
+      : null;
+  if (headRefOid === null) {
+    return { ok: false, status: response.status, message: "head_oid_missing" };
+  }
+  // The live head commit's creation time — the "has the head moved since the
+  // ejection" signal. Null when the head ref target is not a Commit (e.g. a tag
+  // object); the caller then fails closed rather than assuming head movement.
+  const headRef = pullRequest.headRef as Record<string, unknown> | undefined;
+  const headTarget = headRef?.target as Record<string, unknown> | undefined;
+  const headCommitAt = readString(headTarget?.committedDate);
+
+  const timelineItems = pullRequest.timelineItems as Record<string, unknown> | undefined;
+  const nodes = Array.isArray(timelineItems?.nodes)
+    ? (timelineItems!.nodes as Array<Record<string, unknown> | null>)
+    : [];
+  // Recency is decided by array position only (chronological); an unreadable
+  // newest event never yields to an older readable one — see
+  // `pickMostRecentMergeQueueEjection`.
+  const lastEjection = pickMostRecentMergeQueueEjection(nodes);
+
+  return { ok: true, headRefOid, headCommitAt, lastEjection, status: response.status, message: null };
+}
+
+/**
+ * SUP-15953: resolves a PR's current head oid and its most recent
+ * `RemovedFromMergeQueueEvent` across the resolvable token candidates (401/403
+ * advances to the next candidate). A terminal failure returns
+ * `{ ok: false, reason }` so the caller fails closed — it must never re-enqueue
+ * on an assumption about why the queue ejected a PR.
+ */
+export async function fetchLastMergeQueueEjectionViaTokenCandidates(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<MergeQueueEjectionReadResult> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  if (candidates.length === 0) {
+    const tokenResult = await resolveGitHubTokenForRepo(db, companyId, owner, repo);
+    const reason = isGitHubTokenResolution(tokenResult)
+      ? `auth_required: no GitHub token resolvable for ${owner}/${repo}`
+      : `auth_required: ${tokenResult.reason}`;
+    return { ok: false, reason };
+  }
+  let lastStatus = 0;
+  let lastMessage: string | null = null;
+  for (const candidate of candidates) {
+    const result = await fetchMergeQueueEjection(candidate.token, owner, repo, number);
+    if (result.ok) {
+      return { ok: true, headRefOid: result.headRefOid, headCommitAt: result.headCommitAt, lastEjection: result.lastEjection };
+    }
+    lastStatus = result.status;
+    lastMessage = result.message;
+    if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) {
+      continue;
+    }
+    break;
+  }
+  if (lastStatus === 404) return { ok: false, reason: "pr_not_found: HTTP 404" };
+  if (lastStatus === 429) return { ok: false, reason: "pr_rate_limited: HTTP 429" };
+  if (lastStatus === 0) return { ok: false, reason: `pr_network: ${lastMessage ?? "network_error"}` };
+  if (lastStatus === 401 || lastStatus === 403) {
+    const scopeDetail =
+      candidates.length === 1
+        ? `(scope=${candidates[0]!.scope}, secretName=${candidates[0]!.secretName})`
+        : `(tried: ${candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ")})`;
+    return { ok: false, reason: `pr_auth: HTTP ${lastStatus} ${lastMessage ?? ""} ${scopeDetail}` };
+  }
+  return { ok: false, reason: `pr_error: HTTP ${lastStatus} ${lastMessage ?? ""}` };
+}
+
+/**
  * SUP-15315: reads one head SHA's commit statuses from the GitHub statuses API
  * (GET, read-only) and reports whether a `paperclip/approved` status with state
  * `success` is present. Uses the shared ghFetch transport — no new HTTP layer.
