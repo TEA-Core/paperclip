@@ -301,6 +301,45 @@ describe.sequential("closed isolated workspace issue routes", () => {
     expect(res.status).toBe(200);
   });
 
+  it("refuses a terminal card before reopening the workspace or running the checkout (SUP-15888)", async () => {
+    // A live body (["in_progress"]) passes schema validation even though the card
+    // is already closed. The route must refuse it with the distinct 409 BEFORE any
+    // workspace work, so a checkout the service will reject cannot rebuild and
+    // republish a closed execution worktree.
+    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), status: "done" });
+
+    const res = await request(createApp())
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["in_progress"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({
+      code: "checkout_refused_terminal_status",
+      details: { code: "checkout_refused_terminal_status", status: "done" },
+    });
+    expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  it("fails closed at validation when expectedStatuses names a terminal status (no rebuild, no checkout)", async () => {
+    // SUP-15832: a body that names a terminal status must be refused at the
+    // checkoutIssueSchema validation, before the route can rebuild a closed
+    // execution worktree or run the checkout write.
+    const res = await request(createApp())
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["done"],
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
   it("returns 409 and blocks the comment when the workspace cannot be reopened", async () => {
     mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
       ok: false,
@@ -386,7 +425,9 @@ describe.sequential("closed isolated workspace issue routes", () => {
   });
 
   it("clears the reopen-pending flag when the checkout throws after a reopen", async () => {
-    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), status: "done" });
+    // SUP-15888: a terminal card is now refused at the route before any reopen,
+    // so this flag path is exercised with a live card whose workspace was archived.
+    mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.checkout.mockRejectedValue(new Error("checkout failed"));
 
     const res = await request(createApp())
@@ -410,10 +451,12 @@ describe.sequential("closed isolated workspace issue routes", () => {
     }, { timeout: REOPEN_PENDING_WAIT_TIMEOUT_MS });
   });
 
-  it("does not clear the reopen-pending flag when the checkout resumes the issue", async () => {
-    // The checkout moves the issue out of the terminal state, so the reaper clears
-    // the flag on its next cycle. The route must not clear it here.
-    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), status: "done" });
+  it("does not clear the reopen-pending flag when the checkout leaves the issue live", async () => {
+    // The checkout moves the live issue forward and so consumes the reopened
+    // worktree, letting the reaper clear the flag on its next cycle. The route
+    // must not clear it here. SUP-15888: a terminal card never reaches this path —
+    // it is refused at the route before any reopen.
+    mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.checkout.mockResolvedValue({ ...makeIssue(), status: "in_progress" });
 
     const res = await request(createApp())
@@ -429,11 +472,10 @@ describe.sequential("closed isolated workspace issue routes", () => {
 
   it("does not clear the reopen-pending flag when a concurrent request already reopened the workspace", async () => {
     // A concurrent request reopened the workspace first, so this request receives
-    // reopened: false and never set the flag. Even though the checkout leaves the
-    // issue terminal, this request must not clear the flag that the other request
-    // owns. Otherwise the reaper or the archive route can destroy the rebuilt
-    // worktree while the other request still uses it.
-    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), status: "done" });
+    // reopened: false and never set the flag. It must not clear the flag that the
+    // other request owns. Otherwise the reaper or the archive route can destroy
+    // the rebuilt worktree while the other request still uses it.
+    mockIssueService.getById.mockResolvedValue(makeIssue());
     mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
       ok: true,
       reopened: false,
