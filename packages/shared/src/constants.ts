@@ -388,6 +388,7 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "blocked_without_blockers",
   "no_live_path_unowned",
   "review_stage_unarmed",
+  "review_stage_armed_stranded",
   "no_live_path_owner_unavailable",
   "pending_review_rearm_cap_exhausted",
   "undispatchable_assignee",
