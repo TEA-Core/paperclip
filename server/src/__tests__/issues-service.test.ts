@@ -7045,6 +7045,103 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row).toMatchObject({ status: "cancelled", completedAt, checkoutRunId: null, executionRunId: null });
   });
 
+  it("returns the distinct terminal refusal (not a generic conflict) when a close lands in the checkout write window (SUP-15888)", async () => {
+    // Finding 3: the conditional write is gated by
+    // `inArray(status, expectedStatuses)`. A close that commits AFTER the
+    // terminal guard read at the top of `checkout` but BEFORE the write
+    // re-evaluates makes the write miss; the pre-fix code then fell through to
+    // a generic `Issue checkout conflict` instead of the distinct terminal
+    // refusal. This test forces exactly that interleaving deterministically:
+    // the row is live when the guard reads it, and a close is committed during
+    // the write via a db proxy. `checkout` must re-read, see the terminal
+    // status, and raise the distinct code — never the generic conflict.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const completedAt = new Date("2026-09-12T04:06:22.291Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Live at the guard read. Null run pointers keep the clear*IfTerminal
+    // helpers (which run before the write) as no-ops, so the only issues-table
+    // write in this path is the checkout's own conditional update.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Card closed in the checkout write window",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    let closed = false;
+    const closingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "update") {
+          return function update(table: unknown) {
+            const builder = (target.update as (t: unknown) => any)(table);
+            if (table !== issues) return builder;
+            return {
+              set(values: unknown) {
+                const afterSet = builder.set(values);
+                return {
+                  where(condition: unknown) {
+                    const afterWhere = afterSet.where(condition);
+                    return {
+                      async returning() {
+                        if (!closed) {
+                          closed = true;
+                          // Commit the close precisely in the window between the
+                          // guard read and this conditional write.
+                          await db
+                            .update(issues)
+                            .set({ status: "done", completedAt, updatedAt: new Date() })
+                            .where(eq(issues.id, issueId));
+                        }
+                        // The real conditional write now misses: the row is no
+                        // longer in the expected (live) status.
+                        return afterWhere.returning();
+                      },
+                    };
+                  },
+                };
+              },
+            };
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const closingSvc = issueService(closingDb as unknown as ReturnType<typeof createDb>);
+
+    await expect(closingSvc.checkout(issueId, agentId, ["in_review"], runId)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "checkout_refused_terminal_status", status: "done" },
+    });
+
+    const row = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row).toMatchObject({ status: "done", completedAt });
+  });
+
   it("clears a stale completedAt when a non-terminal card is re-opened into in_progress", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
