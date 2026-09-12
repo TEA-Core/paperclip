@@ -4088,6 +4088,22 @@ export function recoveryService(
           result.skipped += 1;
           continue;
         }
+        // A subtree pause hold suppresses ALL automatic recovery. The participant is
+        // deliberately parked, so minting a participant-owned action here would let the
+        // stale-wake sweep re-fire it mid-pause and bypass the pause contract
+        // (SUP-15788 round-3 finding: pause-hold guard). This mirrors the same guard
+        // the generic assignee-recovery path below applies before it mints anything.
+        if (
+          await isAutomaticRecoverySuppressedByPauseHold(
+            db,
+            issue.companyId,
+            issue.id,
+            treeControlSvc,
+          )
+        ) {
+          result.skipped += 1;
+          continue;
+        }
         // Idempotency is scoped to the exact wedge identity (stage + participant).
         // A repeat pass over the same wedged card skips; a stage or participant
         // change no longer matches, so the upsert below reconciles ownership to
