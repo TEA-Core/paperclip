@@ -305,8 +305,18 @@ export function issueRecoveryActionService(db: Db) {
       )
       .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
     if (rows.length === 0) return { latest: null, cumulativeDepth: 0 };
+    // SUP-15847 (round 2): fold only the rows since the most recent board-reset
+    // boundary. Rows before it belong to a lineage a board resolution already
+    // closed and paid out, so counting them again would blow the fresh attempt
+    // budget the board granted on the successor's next re-park.
+    let boundaryIndex = -1;
+    for (let i = 0; i < rows.length; i++) {
+      if (rowHasLineageResetBoundary(rows[i]!)) boundaryIndex = i;
+    }
+    const foldStart = boundaryIndex >= 0 ? boundaryIndex : 0;
     let cumulativeDepth = 0;
-    for (const row of rows) {
+    for (let i = foldStart; i < rows.length; i++) {
+      const row = rows[i]!;
       cumulativeDepth = Math.max(cumulativeDepth + 1, row.attemptCount);
     }
     let latest = rows[0]!;
@@ -324,6 +334,7 @@ export function issueRecoveryActionService(db: Db) {
       .select({
         fingerprint: issueRecoveryActions.fingerprint,
         attemptCount: issueRecoveryActions.attemptCount,
+        evidence: issueRecoveryActions.evidence,
       })
       .from(issueRecoveryActions)
       .where(
@@ -335,9 +346,19 @@ export function issueRecoveryActionService(db: Db) {
       .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
     // SUP-15847: same durable cumulative depth as `getFingerprintHistory`,
     // exposed per fingerprint for the read route. A `max(attemptCount)`
-    // projection understates the true cost whenever reset rows exist.
+    // projection understates the true cost whenever reset rows exist. Round 2:
+    // honor the board-reset boundary so a resolved predecessor's spent history
+    // is not re-counted into the fresh successor's budget.
+    const lastBoundaryByFingerprint = new Map<string, number>();
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      if (rowHasLineageResetBoundary(row)) lastBoundaryByFingerprint.set(row.fingerprint, i);
+    }
     const depths = new Map<string, number>();
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      const boundary = lastBoundaryByFingerprint.get(row.fingerprint) ?? -1;
+      if (i < boundary) continue;
       const depth = Math.max((depths.get(row.fingerprint) ?? 0) + 1, row.attemptCount);
       depths.set(row.fingerprint, depth);
     }
@@ -384,6 +405,37 @@ export function issueRecoveryActionService(db: Db) {
     const priorRunId = readEvidenceRunId(prev.evidence);
     const incomingRunId = readEvidenceRunId(input.evidence);
     return priorRunId != null && incomingRunId != null && priorRunId === incomingRunId;
+  }
+
+  // SUP-15847 (round 2): a board reset — an exhausted predecessor explicitly
+  // resolved and re-minted at attempt 1 — closes the attempt lineage that
+  // precedes it. The fresh successor starts an independent attempt budget. This
+  // marker is stamped on the boundary row at mint time so the cumulative-depth
+  // fold (below) stops counting at the most recent reset instead of resurrecting
+  // the old exhausted history on the next re-park, which is what re-escalated
+  // a fresh board-reset budget on its very next stale re-park.
+  const LINEAGE_RESET_EVIDENCE_KEY = "lineageReset" as const;
+
+  function rowHasLineageResetBoundary(row: { evidence: unknown }): boolean {
+    const marker = (row.evidence as Record<string, unknown> | null)?.[LINEAGE_RESET_EVIDENCE_KEY];
+    return Boolean(marker && typeof marker === "object" && !Array.isArray(marker));
+  }
+
+  // A fresh-budget successor keeps its boundary across in-place evidence
+  // rewrites (sweep bumps, reconciler re-upserts): if the incoming evidence does
+  // not already carry the marker and the existing row does, carry it forward so
+  // the fold still starts at this row.
+  function carryLineageResetBoundary(
+    existingEvidence: Record<string, unknown> | undefined,
+    nextEvidence: Record<string, unknown> | undefined,
+  ): Record<string, unknown> {
+    const base: Record<string, unknown> = nextEvidence ?? {};
+    if (base[LINEAGE_RESET_EVIDENCE_KEY]) return base;
+    const inherited = existingEvidence?.[LINEAGE_RESET_EVIDENCE_KEY];
+    if (inherited && typeof inherited === "object" && !Array.isArray(inherited)) {
+      return { ...base, [LINEAGE_RESET_EVIDENCE_KEY]: inherited };
+    }
+    return base;
   }
 
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
@@ -653,11 +705,17 @@ export function issueRecoveryActionService(db: Db) {
           cause: input.preserveExistingOwner ? existing.cause : input.cause,
           fingerprint: input.preserveExistingOwner ? existing.fingerprint : input.fingerprint,
           evidence: input.preserveExistingOwner
-            ? {
-              ...(existing.evidence ?? {}),
-              ...(input.evidence ?? {}),
-            }
-            : input.evidence ?? existing.evidence,
+            ? carryLineageResetBoundary(
+                existing.evidence,
+                {
+                  ...(existing.evidence ?? {}),
+                  ...(input.evidence ?? {}),
+                },
+              )
+            : carryLineageResetBoundary(
+                existing.evidence,
+                input.evidence ?? existing.evidence,
+              ),
           nextAction: input.preserveExistingOwner ? existing.nextAction : input.nextAction,
           wakePolicy: input.preserveExistingOwner
             ? existing.wakePolicy
@@ -741,6 +799,19 @@ export function issueRecoveryActionService(db: Db) {
       const staleReparkEvidence = staleRepark
         ? { staleRepark: { detected: true, latestRunId: readEvidenceRunId(input.evidence) } }
         : undefined;
+      // SUP-15847 (round 2): a board reset mints a fresh attempt-1 successor
+      // after an exhausted predecessor was explicitly resolved. Stamp the
+      // boundary on that row so the durable-depth fold and the read projection
+      // stop counting the closed lineage it just replaced. Only the reset path
+      // itself stamps it — a caller that supplies an explicit `attemptCount` is
+      // setting the authoritative count and is not starting a fresh lineage.
+      const resetRemint = predecessorBudgetExhausted && input.attemptCount === undefined;
+      const insertEvidenceExtra: Record<string, unknown> = {
+        ...(staleReparkEvidence ?? {}),
+        ...(resetRemint
+          ? { [LINEAGE_RESET_EVIDENCE_KEY]: { inheritedDepthBefore: cumulativeDepth } }
+          : {}),
+      };
       // Once the fingerprint has consumed its cumulative budget, mint the
       // successor directly as the board-facing exhausted action instead of an
       // active row the sweep would only re-escalate on the next pass.
@@ -797,7 +868,7 @@ export function issueRecoveryActionService(db: Db) {
       }
       const [created] = await db
         .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now, nextAttemptCount, staleReparkEvidence))
+        .values(buildInsertValues(input, ownerType, now, nextAttemptCount, insertEvidenceExtra))
         .returning();
       return toReadModel(created!);
     } catch (error) {

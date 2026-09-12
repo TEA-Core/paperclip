@@ -557,6 +557,84 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(upserted.outcome).toBeNull();
   });
 
+  it("SUP-15847 (round 2): a re-park of a board-reset successor keeps the fresh budget, not the closed predecessor's depth", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const fingerprint = "recovery:board-reset-boundary:fingerprint";
+    const run2 = randomUUID();
+    const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const svc = issueRecoveryActionService(db);
+
+    // 1. Sweep escalates the exhausted candidate to the ceiling.
+    const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+    expect(sweep.maxAttemptsReached).toBe(1);
+
+    // 2. An explicit board resolution closes the spent lineage.
+    const cleared = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Board reviewed; fresh budget granted.",
+      boardResolution: true,
+    });
+    expect(cleared?.id).toBe(actionId);
+    expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    // 3. The reconciler re-parks on a fresh run: the board reset mints a fresh
+    //    attempt-1 successor and stamps the lineage boundary on it.
+    const successor = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      evidence: { latestRunId: run2 },
+      nextAction: "Restore a live execution path.",
+    });
+    expect(successor).toMatchObject({ status: "active", attemptCount: 1 });
+    expect(successor.evidence.lineageReset).toBeTruthy();
+
+    // 4. The successor is resolved on run2, then the reconciler re-parks on
+    //    the SAME run (stale evidence) with zero intervening dispatch.
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      actionId: successor.id,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "durable_path_restored:healthy_child",
+    });
+    // Seed the issue's latest run so the escalation branch's run-match gate
+    // would fire if the closed predecessor's depth were ever re-counted.
+    await seedHeartbeatRun({ companyId, agentId: managerId, runId: run2, issueId: sourceIssueId, status: "failed" });
+
+    const reParked = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      evidence: { latestRunId: run2 },
+      nextAction: "Restore a live execution path.",
+    });
+
+    // The fresh board-reset budget is still alive: this is the successor's
+    // SECOND attempt, not a re-escalation of the closed predecessor's depth.
+    expect(reParked).toMatchObject({ status: "active", attemptCount: 2 });
+    expect(reParked.outcome).toBeNull();
+    // The read projection reports the fresh lineage depth (2), not the
+    // pre-reset spent history (which would read as 7 without the boundary).
+    const totals = await svc.getFingerprintAttemptTotals(companyId, sourceIssueId);
+    expect(totals[fingerprint]).toBe(2);
+  });
+
   it("lets the resolve endpoint clear a swept-exhausted action so a fresh action can be minted", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const fingerprint = "recovery:endpoint:fingerprint";
