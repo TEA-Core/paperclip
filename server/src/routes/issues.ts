@@ -147,6 +147,7 @@ import {
   documentService,
   documentAnnotationService,
   logActivity,
+  logActivityInTransaction,
   publishActivity,
   projectService,
   routineService,
@@ -274,6 +275,7 @@ import {
   applyBoardStageDecision,
   assertPatchableExecutionPolicyWrite,
   BoardStageNoUndecidedStageError,
+  BoardStageSelfApprovalError,
   isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -3295,6 +3297,10 @@ export function issueRoutes(
       agentId: string,
       options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
     ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
+    executionStageWakeupEnqueue?: (
+      agentId: string,
+      options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
+    ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
     issueListDiagnostics?: IssueListDiagnostics;
     approveToolActionRequest?: (input: {
       companyId: string;
@@ -3336,6 +3342,7 @@ export function issueRoutes(
   };
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
+  const enqueueExecutionStageWakeup = opts.executionStageWakeupEnqueue ?? heartbeat.wakeup;
 
   async function postAuthFailureComment(
     issueSvc: ReturnType<typeof issueService>,
@@ -8685,6 +8692,21 @@ export function issueRoutes(
   // pending stage and requires principalsEqual(participant, actor), which a board
   // user never satisfies on an agent-gated card, so stuck reviews/approvals had
   // no sanctioned escape hatch. This route advances (never closes) the card.
+  /**
+   * Rejection carrying the machine-readable reason the board-decision route maps
+   * to `409 { outcome: "rejected", reason }`. Thrown inside the decision
+   * transaction so its row lock and any partial writes roll back together.
+   */
+  class BoardDecisionRejection extends Error {
+    constructor(
+      readonly reason: "terminal_status" | "not_in_review" | "no_undecided_stage" | "self_approval",
+      message: string,
+    ) {
+      super(message);
+      this.name = "BoardDecisionRejection";
+    }
+  }
+
   router.post("/issues/:id/execution-stage/board-decision", async (req, res) => {
     // Gate 0 (strict, first): the endpoint is unreachable unless the operator
     // opted in. A disabled flag is a 404 BEFORE any read, membership check, or
@@ -8698,6 +8720,15 @@ export function issueRoutes(
     // Gate 1: board-only. Agent actors are refused here (403) before any read.
     assertBoard(req);
 
+    // Gate 1b (SUP-15805 CR-3): a board decision must be attributable to a
+    // concrete user. The decision row, the visible comment and the activity all
+    // key on a real user id; the `"board"` sentinel getActorInfo falls back to is
+    // not a decision-maker. Refuse before any read.
+    const boardUserId = req.actor.userId?.trim();
+    if (!boardUserId) {
+      throw forbidden("A concrete board user is required to decide an execution stage");
+    }
+
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
@@ -8706,21 +8737,18 @@ export function issueRoutes(
     // judgment call, not a mechanical one. local_implicit (trusted local dev) is
     // exempt, matching the republish route.
     if (req.actor.source !== "local_implicit") {
-      const gateUserId = req.actor.userId?.trim();
-      const membership = gateUserId
-        ? await db
-            .select({ membershipRole: companyMemberships.membershipRole })
-            .from(companyMemberships)
-            .where(
-              and(
-                eq(companyMemberships.companyId, issue.companyId),
-                eq(companyMemberships.principalType, "user"),
-                eq(companyMemberships.principalId, gateUserId),
-                eq(companyMemberships.status, "active"),
-              ),
-            )
-            .then((rows) => rows[0] ?? null)
-        : null;
+      const membership = await db
+        .select({ membershipRole: companyMemberships.membershipRole })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, issue.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, boardUserId),
+            eq(companyMemberships.status, "active"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
       const role = membership?.membershipRole;
       if (!role || (role !== "owner" && role !== "admin")) {
         throw forbidden("Company owner or admin required to decide an execution stage");
@@ -8736,117 +8764,227 @@ export function issueRoutes(
     });
     const { decision, comment } = boardStageDecisionBody.parse(req.body);
 
-    const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
-    if (!policy) {
-      res.status(409).json({
-        outcome: "rejected",
-        reason: "no_undecided_stage",
-        message: "This issue has no execution policy to decide a stage on",
-      });
-      return;
-    }
+    const actor = getActorInfo(req);
+    const decisionId = randomUUID();
+    const postCommitActivityPublications: ActivityPublication[] = [];
 
-    let result;
+    type BoardDecisionTransactionResult = {
+      updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
+      result: ReturnType<typeof applyBoardStageDecision>;
+      commentRow: Awaited<ReturnType<typeof svc.addComment>>;
+      previousState: ReturnType<typeof parseIssueExecutionState>;
+      nextExecutionState: Record<string, unknown>;
+    };
+    let outcome: BoardDecisionTransactionResult | null = null;
+
     try {
-      result = applyBoardStageDecision({
-        issue,
-        policy,
-        decision,
-        commentBody: comment,
+      outcome = await db.transaction(async (tx) => {
+        // SUP-15805 addendum 2: lock the issue row and recompute the whole
+        // decision from the locked state. The pre-transaction read above is a
+        // visibility snapshot only; recomputing under the lock stops two
+        // concurrent decisions from resolving last-writer-wins and from
+        // `lastDecisionId` naming the losing row.
+        const [lockedIssue] = await tx
+          .select()
+          .from(issueRows)
+          .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, id)))
+          .for("update");
+        if (!lockedIssue) return null;
+
+        // SUP-15805 addendum 1: require a live, non-terminal issue. A done/
+        // cancelled card would otherwise be silently reopened by the patch below,
+        // and a card whose ladder never ran (no executionState) would be
+        // pre-approved for a stage no reviewer ever saw.
+        if (lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+          throw new BoardDecisionRejection(
+            "terminal_status",
+            "Cannot decide an execution stage on a done or cancelled issue",
+          );
+        }
+        const previousState = parseIssueExecutionState(lockedIssue.executionState);
+        if (decision === "approved" && !previousState) {
+          throw new BoardDecisionRejection(
+            "not_in_review",
+            "Cannot approve an execution stage on an issue with no execution state",
+          );
+        }
+
+        const lockedPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy);
+        if (!lockedPolicy) {
+          throw new BoardDecisionRejection(
+            "no_undecided_stage",
+            "This issue has no execution policy to decide a stage on",
+          );
+        }
+
+        // SUP-15805 addendum 3: target selection must consult the durable
+        // decision rows, not only the projection. A stage that already carries an
+        // `approved` row whose projection was cleared (a board `done` PATCH does
+        // exactly this) must never be targeted again and silently superseded.
+        const decidedStageIds = await tx
+          .select({ stageId: issueExecutionDecisions.stageId })
+          .from(issueExecutionDecisions)
+          .where(
+            and(
+              eq(issueExecutionDecisions.companyId, lockedIssue.companyId),
+              eq(issueExecutionDecisions.issueId, id),
+              eq(issueExecutionDecisions.outcome, "approved"),
+            ),
+          )
+          .then((rows) =>
+            rows
+              .map((row) => row.stageId)
+              .filter((stageId): stageId is string => typeof stageId === "string"),
+          );
+
+        let result: ReturnType<typeof applyBoardStageDecision>;
+        try {
+          result = applyBoardStageDecision({
+            issue: lockedIssue,
+            policy: lockedPolicy,
+            decision,
+            commentBody: comment,
+            decidedStageIds,
+            actorUserId: boardUserId,
+          });
+        } catch (err) {
+          if (err instanceof BoardStageNoUndecidedStageError) {
+            throw new BoardDecisionRejection("no_undecided_stage", err.message);
+          }
+          if (err instanceof BoardStageSelfApprovalError) {
+            throw new BoardDecisionRejection("self_approval", err.message);
+          }
+          throw err;
+        }
+
+        const rawExecutionState = result.patch.executionState;
+        if (!rawExecutionState || typeof rawExecutionState !== "object") {
+          throw new Error("Board stage decision patch is missing executionState");
+        }
+        const nextExecutionState = {
+          ...(rawExecutionState as Record<string, unknown>),
+          lastDecisionId: decisionId,
+        };
+
+        const updated = await svc.update(
+          id,
+          {
+            ...result.patch,
+            executionState: nextExecutionState,
+            actorAgentId: null,
+            actorUserId: boardUserId,
+          } as Parameters<typeof svc.update>[1],
+          tx,
+          postCommitActivityPublications,
+        );
+        if (!updated) return null;
+
+        await tx.insert(issueExecutionDecisions).values({
+          id: decisionId,
+          companyId: updated.companyId,
+          issueId: updated.id,
+          stageId: result.decision.stageId,
+          stageType: result.decision.stageType,
+          actorAgentId: null,
+          actorUserId: boardUserId,
+          outcome: result.decision.outcome,
+          body: result.decision.body,
+          createdByRunId: actor.runId ?? null,
+        });
+
+        // SUP-15805 CR-2: the visible comment shares the decision's transaction —
+        // a comment referencing a decision that then rolls back (or a decision
+        // whose comment fails) would be a half-written audit.
+        const commentRow = await svc.addComment(
+          id,
+          result.decision.body,
+          {
+            agentId: undefined,
+            userId: boardUserId,
+            runId: actor.runId ?? null,
+          },
+          undefined,
+          tx,
+        );
+
+        // SUP-15805 CR-2: the audit entry shares the decision's fate too. Its
+        // publication is deferred to after commit so subscribers never observe an
+        // activity for a mutation that rolled back.
+        await logActivityInTransaction(
+          tx as unknown as Db,
+          {
+            companyId: updated.companyId,
+            actorType: actor.actorType,
+            actorId: boardUserId,
+            action: "issue.board_stage_override",
+            entityType: "issue",
+            entityId: updated.id,
+            agentId: null,
+            runId: actor.runId ?? null,
+            details: {
+              stageId: result.targetStage.id,
+              stageType: result.targetStage.type,
+              decision: result.decision.outcome,
+              displacedParticipant: result.displacedParticipant,
+              commentId: commentRow.id,
+            },
+          },
+          postCommitActivityPublications,
+        );
+
+        return { updated, result, commentRow, previousState, nextExecutionState };
       });
     } catch (err) {
-      if (err instanceof BoardStageNoUndecidedStageError) {
+      if (err instanceof BoardDecisionRejection) {
         res.status(409).json({
           outcome: "rejected",
-          reason: "no_undecided_stage",
+          reason: err.reason,
           message: err.message,
         });
         return;
       }
       throw err;
     }
-
-    const actor = getActorInfo(req);
-    const decisionId = randomUUID();
-    const rawExecutionState = result.patch.executionState;
-    if (!rawExecutionState || typeof rawExecutionState !== "object") {
-      throw new Error("Board stage decision patch is missing executionState");
-    }
-    const nextExecutionState = {
-      ...(rawExecutionState as Record<string, unknown>),
-      lastDecisionId: decisionId,
-    };
-
-    const updated = await db.transaction(async (tx) => {
-      const row = await svc.update(
-        id,
-        {
-          ...result.patch,
-          executionState: nextExecutionState,
-          actorAgentId: null,
-          actorUserId: actor.actorId,
-        } as Parameters<typeof svc.update>[1],
-        tx,
-      );
-      if (!row) return null;
-      await tx.insert(issueExecutionDecisions).values({
-        id: decisionId,
-        companyId: row.companyId,
-        issueId: row.id,
-        stageId: result.decision.stageId,
-        stageType: result.decision.stageType,
-        actorAgentId: null,
-        actorUserId: actor.actorId,
-        outcome: result.decision.outcome,
-        body: result.decision.body,
-        createdByRunId: null,
-      });
-      return row;
-    });
-    if (!updated) {
+    if (!outcome) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
 
-    const commentRow = await svc.addComment(id, result.decision.body, {
-      agentId: undefined,
-      userId: actor.actorType === "user" ? actor.actorId : undefined,
-      runId: null,
-    });
+    for (const publication of postCommitActivityPublications) publishActivity(publication);
 
-    await logActivity(db, {
-      companyId: updated.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      action: "issue.board_stage_override",
-      entityType: "issue",
-      entityId: updated.id,
-      agentId: null,
-      runId: null,
-      details: {
-        stageId: result.targetStage.id,
-        stageType: result.targetStage.type,
-        decision: result.decision.outcome,
-        displacedParticipant: result.displacedParticipant,
-        commentId: commentRow.id,
-      },
+    // SUP-15805 CR-1: the board decision is a real stage transition. Enqueue the
+    // same execution-stage wake the PATCH path would, so an approved-next-stage
+    // participant or a changes-requested return assignee is actually told. Best
+    // effort: a wake failure must not fail an already-committed decision.
+    const executionStageWakeup = buildExecutionStageWakeup({
+      issueId: id,
+      previousState: outcome.previousState,
+      nextState: parseIssueExecutionState(outcome.nextExecutionState),
+      interruptedRunId: null,
+      requestedByActorType: actor.actorType,
+      requestedByActorId: boardUserId,
     });
+    if (executionStageWakeup) {
+      void enqueueExecutionStageWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup).catch((err) => {
+        logger.warn({ err, issueId: id }, "failed to enqueue board stage decision wakeup");
+      });
+    }
 
     // Post-decision hook, identical to the PATCH path: publishes the approval
     // status / arms the merge on an approved stage (a no-op for changes_requested).
     await runApprovalMergeArming({
-      issue: updated,
-      decision: result.decision,
+      issue: outcome.updated,
+      decision: outcome.result.decision,
       closingTransition: false,
     });
 
     res.status(200).json({
-      outcome: result.decision.outcome,
-      stageId: result.targetStage.id,
-      stageType: result.targetStage.type,
+      outcome: outcome.result.decision.outcome,
+      stageId: outcome.result.targetStage.id,
+      stageType: outcome.result.targetStage.type,
       decisionId,
-      commentId: commentRow.id,
-      executionState: nextExecutionState,
+      commentId: outcome.commentRow.id,
+      executionState: outcome.nextExecutionState,
     });
   });
 
