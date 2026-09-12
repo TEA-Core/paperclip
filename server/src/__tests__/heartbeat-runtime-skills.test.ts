@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -22,6 +22,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { companySkillService } from "../services/company-skills.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
@@ -50,6 +51,22 @@ async function waitForRunToFinish(
   }
   return await heartbeat.getRun(runId);
 }
+
+const RUNTIME_SKILLS_TRUNCATE_SQL = `
+  TRUNCATE TABLE
+    "activity_log",
+    "environment_leases",
+    "environments",
+    "heartbeat_run_events",
+    "heartbeat_runs",
+    "agent_wakeup_requests",
+    "agent_runtime_state",
+    "company_skill_versions",
+    "company_skills",
+    "agents",
+    "companies"
+  RESTART IDENTITY CASCADE
+`;
 
 describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
   let db!: ReturnType<typeof createDb>;
@@ -113,21 +130,13 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     capturedRuns.length = 0;
     await instanceSettingsService(db).updateExperimental({ enableBetaSkills: false });
     await new Promise((resolve) => setTimeout(resolve, 100));
-    await db.execute(sql.raw(`
-      TRUNCATE TABLE
-        "activity_log",
-        "environment_leases",
-        "environments",
-        "heartbeat_run_events",
-        "heartbeat_runs",
-        "agent_wakeup_requests",
-        "agent_runtime_state",
-        "company_skill_versions",
-        "company_skills",
-        "agents",
-        "companies"
-      RESTART IDENTITY CASCADE
-    `));
+    // A run reaches its terminal status before executeRun finishes writing its
+    // trailing lifecycle rows, and a fixed sleep does not prove they landed.
+    // The TRUNCATE takes AccessExclusiveLock on every listed table and
+    // deadlocks against those late writes (Postgres 40P01), so drain the
+    // in-flight execution promises first and retry the lock family regardless.
+    await heartbeatService(db).drainActiveRunExecutions();
+    await truncateWithLockRetry(db, RUNTIME_SKILLS_TRUNCATE_SQL);
     await Promise.all(Array.from(cleanupDirs, (dir) => fs.rm(dir, { recursive: true, force: true })));
     cleanupDirs.clear();
   });

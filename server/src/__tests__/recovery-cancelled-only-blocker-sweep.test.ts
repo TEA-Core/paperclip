@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -16,6 +16,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -33,6 +34,20 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+const CANCELLED_ONLY_BLOCKER_TRUNCATE_SQL = `
+  TRUNCATE TABLE
+    "activity_log",
+    "issue_relations",
+    "issues",
+    "workspace_operations",
+    "execution_workspaces",
+    "projects",
+    "heartbeat_runs",
+    "agents",
+    "companies"
+  RESTART IDENTITY CASCADE
+`;
+
 describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -43,19 +58,13 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
   }, 20_000);
 
   afterEach(async () => {
-    await db.execute(sql.raw(`
-      TRUNCATE TABLE
-        "activity_log",
-        "issue_relations",
-        "issues",
-        "workspace_operations",
-        "execution_workspaces",
-        "projects",
-        "heartbeat_runs",
-        "agents",
-        "companies"
-      RESTART IDENTITY CASCADE
-    `));
+    // These tests dispatch real heartbeat runs, and a run reaches its terminal
+    // status before executeRun finishes writing its trailing lifecycle rows.
+    // The TRUNCATE takes AccessExclusiveLock on every listed table and
+    // deadlocks against those late writes (Postgres 40P01), so drain the
+    // in-flight execution promises first and retry the lock family regardless.
+    await heartbeatService(db).drainActiveRunExecutions();
+    await truncateWithLockRetry(db, CANCELLED_ONLY_BLOCKER_TRUNCATE_SQL);
   });
 
   afterAll(async () => {

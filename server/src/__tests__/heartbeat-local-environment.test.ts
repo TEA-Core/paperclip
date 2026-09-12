@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -15,6 +15,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -60,6 +61,21 @@ async function waitForRunLeasesToRelease(
     .where(eq(environmentLeases.heartbeatRunId, runId));
 }
 
+const LOCAL_ENVIRONMENT_TRUNCATE_SQL = `
+  TRUNCATE TABLE
+    "environment_leases",
+    "environments",
+    "activity_log",
+    "heartbeat_run_events",
+    "heartbeat_runs",
+    "agent_wakeup_requests",
+    "agent_runtime_state",
+    "company_skills",
+    "agents",
+    "companies"
+  RESTART IDENTITY CASCADE
+`;
+
 describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -81,20 +97,10 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
     // before the TRUNCATE below, or a write that lands after the company row
     // is gone violates heartbeat_run_events' foreign key.
     await heartbeat.drainActiveRunExecutions();
-    await db.execute(sql.raw(`
-      TRUNCATE TABLE
-        "environment_leases",
-        "environments",
-        "activity_log",
-        "heartbeat_run_events",
-        "heartbeat_runs",
-        "agent_wakeup_requests",
-        "agent_runtime_state",
-        "company_skills",
-        "agents",
-        "companies"
-      RESTART IDENTITY CASCADE
-    `));
+    // Retry anyway: the drain settles this suite's own runs, but the TRUNCATE
+    // takes AccessExclusiveLock on every listed table and can still lose a
+    // race with another writer (Postgres 40P01 / 55P03 / 40001).
+    await truncateWithLockRetry(db, LOCAL_ENVIRONMENT_TRUNCATE_SQL);
   });
 
   afterAll(async () => {

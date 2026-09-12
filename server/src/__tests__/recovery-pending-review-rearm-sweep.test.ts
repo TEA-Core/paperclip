@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
@@ -13,6 +13,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { recoveryService } from "../services/recovery/service.ts";
 
 type RecoveryWakeup = (agentId: string, opts?: Record<string, unknown>) => Promise<{ id: string } | null>;
@@ -34,6 +35,20 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+const PENDING_REVIEW_REARM_TRUNCATE_SQL = `
+  TRUNCATE TABLE
+    "activity_log",
+    "agent_wakeup_requests",
+    "heartbeat_runs",
+    "issue_execution_decisions",
+    "issue_recovery_actions",
+    "issue_relations",
+    "issues",
+    "agents",
+    "companies"
+  RESTART IDENTITY CASCADE
+`;
+
 describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -45,19 +60,11 @@ describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
-    await db.execute(sql.raw(`
-      TRUNCATE TABLE
-        "activity_log",
-        "agent_wakeup_requests",
-        "heartbeat_runs",
-        "issue_execution_decisions",
-        "issue_recovery_actions",
-        "issue_relations",
-        "issues",
-        "agents",
-        "companies"
-      RESTART IDENTITY CASCADE
-    `));
+    // No drain here: every test injects a mocked enqueueWakeup, so this suite
+    // never dispatches a background run whose late writes could race the
+    // TRUNCATE. The retry still guards the lock family (40P01 / 55P03 / 40001)
+    // against any other writer.
+    await truncateWithLockRetry(db, PENDING_REVIEW_REARM_TRUNCATE_SQL);
   });
 
   afterAll(async () => {

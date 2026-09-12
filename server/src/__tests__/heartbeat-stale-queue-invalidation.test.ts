@@ -19,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
@@ -83,43 +84,44 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
   return fn();
 }
 
-async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createDb>) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    try {
-      await db.execute(sql.raw(`
-        TRUNCATE TABLE
-          "company_skills",
-          "issue_comments",
-          "issue_documents",
-          "document_revisions",
-          "documents",
-          "issue_relations",
-          "issue_tree_holds",
-          "issues",
-          "heartbeat_run_events",
-          "cost_events",
-          "activity_log",
-          "heartbeat_runs",
-          "agent_wakeup_requests",
-          "agent_runtime_state",
-          "agents",
-          "companies"
-        RESTART IDENTITY CASCADE
-      `));
-      return;
-    } catch (error) {
-      const isLateCommentRace =
-        error instanceof Error &&
-        error.message.includes("issue_comments_issue_id_issues_id_fk");
-      if (!isLateCommentRace || attempt === 9) {
-        throw error;
-      }
+const HEARTBEAT_INVALIDATION_TRUNCATE_SQL = `
+  TRUNCATE TABLE
+    "company_skills",
+    "issue_comments",
+    "issue_documents",
+    "document_revisions",
+    "documents",
+    "issue_relations",
+    "issue_tree_holds",
+    "issues",
+    "heartbeat_run_events",
+    "cost_events",
+    "activity_log",
+    "heartbeat_runs",
+    "agent_wakeup_requests",
+    "agent_runtime_state",
+    "agents",
+    "companies"
+  RESTART IDENTITY CASCADE
+`;
 
-      // Heartbeat completion can write issue-thread comments shortly after the
-      // run leaves queued/running. Retry the dependent deletes once those land.
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
+async function cleanupHeartbeatInvalidationFixture(
+  db: ReturnType<typeof createDb>,
+  heartbeat: ReturnType<typeof heartbeatService>,
+) {
+  // A run reaches its terminal status before executeRun finishes writing its
+  // trailing lifecycle rows, so waiting for heartbeat_runs to leave
+  // queued/running is not enough on its own: heartbeat_run_events, issues and
+  // issue_comments writes can still be in flight. The TRUNCATE below takes
+  // AccessExclusiveLock on every listed table and deadlocks against those late
+  // writes (Postgres 40P01). drainActiveRunExecutions awaits the in-flight
+  // execution promises (module-level, shared across heartbeatService instances)
+  // so the database is quiescent before the lock is taken.
+  await heartbeat.drainActiveRunExecutions();
+  // Retry anyway: a heartbeat run is not the only possible writer, and the
+  // predicate covers both the deadlock/lock-timeout family and the late
+  // issue_comments foreign key this fixture used to retry on exclusively.
+  await truncateWithLockRetry(db, HEARTBEAT_INVALIDATION_TRUNCATE_SQL, { attempts: 10 });
 }
 
 type SeedOptions = {
@@ -191,7 +193,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    await cleanupHeartbeatInvalidationFixture(db);
+    await cleanupHeartbeatInvalidationFixture(db, heartbeat);
   });
 
   afterAll(async () => {

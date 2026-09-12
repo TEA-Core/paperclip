@@ -8,7 +8,6 @@ import {
   it,
   vi,
 } from "vitest";
-import { sql } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -25,6 +24,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   registerServerAdapter,
@@ -61,6 +61,26 @@ async function waitForRunToFinish(
   }
   return heartbeat.getRun(runId);
 }
+
+const NATIVE_ISOLATION_TRUNCATE_SQL = `
+  TRUNCATE TABLE
+    "native_run_finalizations",
+    "status_decisions",
+    "work_assessments",
+    "native_run_results",
+    "completion_contracts",
+    "environment_leases",
+    "environments",
+    "activity_log",
+    "heartbeat_run_events",
+    "heartbeat_runs",
+    "agent_wakeup_requests",
+    "agent_runtime_state",
+    "company_skills",
+    "agents",
+    "companies"
+  RESTART IDENTITY CASCADE
+`;
 
 describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
   let db!: ReturnType<typeof createDb>;
@@ -101,27 +121,10 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
     );
     expect(pendingRuns).toEqual([]);
     vi.clearAllMocks();
-    await db.execute(
-      sql.raw(`
-      TRUNCATE TABLE
-        "native_run_finalizations",
-        "status_decisions",
-        "work_assessments",
-        "native_run_results",
-        "completion_contracts",
-        "environment_leases",
-        "environments",
-        "activity_log",
-        "heartbeat_run_events",
-        "heartbeat_runs",
-        "agent_wakeup_requests",
-        "agent_runtime_state",
-        "company_skills",
-        "agents",
-        "companies"
-      RESTART IDENTITY CASCADE
-    `),
-    );
+    // The drain above settles this suite's runs, but the TRUNCATE takes
+    // AccessExclusiveLock on every listed table and can still lose a race with
+    // another writer (Postgres 40P01 / 55P03 / 40001), so retry.
+    await truncateWithLockRetry(db, NATIVE_ISOLATION_TRUNCATE_SQL);
   });
 
   afterAll(async () => {
