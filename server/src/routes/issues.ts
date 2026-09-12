@@ -13204,12 +13204,23 @@ export function issueRoutes(
       finalIssueStatus: () => issue?.status,
     });
     const decision = transition.decision && decisionId ? transition.decision : null;
+    // The in-scope `done` refusal below must run inside the update transaction,
+    // under the same update lock that serializes concurrent mutations. Force the
+    // transactional path when the gap is present so the guarantee is self-contained
+    // and does not depend on the incidental `reviewPolicySensitiveMutationRequested`
+    // clause (which today happens to be true for every `done` PATCH, but is not
+    // semantically about the approval-stage gap).
     const shouldUseTransactionalIssueUpdate =
       Boolean(decision)
       || shouldRelayStop
       || persistReviewActivityTransactionally
       || reviewPolicySensitiveMutationRequested
-      || workspaceReprovisionCloseId !== null;
+      || workspaceReprovisionCloseId !== null
+      || (
+        missingApprovalStageGap !== null
+        && requestedTransitionStatus === "done"
+        && existing.status !== "done"
+      );
     try {
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {

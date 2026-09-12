@@ -436,6 +436,102 @@ describe("issue execution policy missing approval stage", () => {
     });
   });
 
+  // Regression: a `done` request that does not otherwise require a transaction
+  // (no execution policy at all, so no decision, no relay stop, no review
+  // activity) must STILL be refused with the typed signal. Pre-fix this took the
+  // non-transactional `updateIssue()` branch, skipped the delivery catchall (the
+  // gap was present), and closed the card successfully with neither guard.
+  it("refuses a stage-less in-scope done that otherwise needs no transaction", async () => {
+    const issue = parentIssue(null);
+    childRowsState.rows = [{ status: "in_progress" }];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      code: "done_transition_missing_approval_stage",
+      details: {
+        issueId: PARENT_ID,
+        identifier: "PAP-1587",
+        childCount: 1,
+        stageTypes: [],
+      },
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(gapActivityInput("issue.done_missing_approval_stage_refused")).toMatchObject({
+      entityId: PARENT_ID,
+      issueId: PARENT_ID,
+      details: {
+        childCount: 1,
+        stageTypes: [],
+        source: "done",
+      },
+    });
+  });
+
+  it("refuses a done on a review-only card whose review is already completed", async () => {
+    const issue = {
+      ...parentIssue(reviewOnlyPolicy()),
+      status: "in_review",
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        deliveryAuthor: null,
+        reviewRequest: null,
+        completedStageIds: ["11111111-1111-4111-8111-111111111111"],
+        skippedStageIds: [],
+        lastDecisionId: "22222222-2222-4222-8222-222222222222",
+        lastDecisionOutcome: "approved",
+        monitor: null,
+        changesRequestedCount: 0,
+      },
+    };
+    childRowsState.rows = [{ status: "in_progress" }];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      code: "done_transition_missing_approval_stage",
+      details: {
+        issueId: PARENT_ID,
+        identifier: "PAP-1587",
+        childCount: 1,
+        stageTypes: ["review"],
+      },
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(gapActivityInput("issue.done_missing_approval_stage_refused")).toMatchObject({
+      entityId: PARENT_ID,
+      issueId: PARENT_ID,
+      details: {
+        childCount: 1,
+        stageTypes: ["review"],
+        source: "done",
+      },
+    });
+  });
+
   it("completes an in_review transition on an in-scope card and records the signal", async () => {
     const issue = parentIssue(reviewOnlyPolicy());
     childRowsState.rows = [{ status: "in_progress" }];
