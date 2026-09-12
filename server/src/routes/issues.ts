@@ -175,6 +175,7 @@ import { artifactReviewDocumentService } from "../services/artifact-review-docum
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
+  countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
   writeAuditLog,
@@ -13027,24 +13028,22 @@ export function issueRoutes(
       && ((requestedTransitionStatus === "done" && existing.status !== "done")
         || (requestedTransitionStatus === "in_review" && existing.status !== "in_review"))
     ) {
-      const childRows = await db
-        .select({ status: issueRows.status })
-        .from(issueRows)
-        .where(and(
-          eq(issueRows.companyId, existing.companyId),
-          eq(issueRows.parentId, existing.id),
-        ));
-      missingApprovalStageGap = diagnoseMissingApprovalStage({
-        policy: nextExecutionPolicy,
-        // Count only rows with a determinate non-cancelled status. In production
-        // every row is a child issue (NOT NULL status column), so this is a
-        // no-op; it keeps the probe from counting a statusless/non-issue row that
-        // a query-level mock can return, which would otherwise miscount a
-        // childless card as having children (SUP-15878).
-        childCount: childRows.filter(
-          (child) => typeof child.status === "string" && child.status !== "cancelled",
-        ).length,
-      });
+      // SUP-15878 / SUP-15958: the in-scope predicate is the canonical shared
+      // laddered-child count (countLadderedChildren) — the SAME post-exclusion,
+      // `>= 2` mechanism-D predicate the done-transition guard uses. A card whose
+      // only children are redo/delivery or otherwise platform-generated/excluded
+      // does not owe a close ladder, so it is never diagnosed here (the raw
+      // `parent_id` child count that previously armed this fired on exactly those
+      // shapes — the SUP-15826 / SUP-15813 false positives exec-CTO named).
+      const laddered = await countLadderedChildren(db, existing.companyId, existing.id);
+      if (laddered.count >= 2) {
+        missingApprovalStageGap = diagnoseMissingApprovalStage({
+          policy: nextExecutionPolicy,
+          ladderedChildCount: laddered.count,
+          ladderedChildIdentifiers: laddered.identifiers,
+          excludedChildIdentifiers: laddered.excludedChildIdentifiers,
+        });
+      }
     }
     // The typed ladder-gap refusal (raised under the update lock below) replaces
     // the delivery guard's `done_transition_missing_delivery` catchall for
@@ -13258,7 +13257,9 @@ export function issueRoutes(
                 code: MISSING_APPROVAL_STAGE_ERROR_CODE,
                 issueId: existing.id,
                 identifier: existing.identifier ?? null,
-                childCount: missingApprovalStageGap.childCount,
+                ladderedChildCount: missingApprovalStageGap.ladderedChildCount,
+                ladderedChildIdentifiers: missingApprovalStageGap.ladderedChildIdentifiers,
+                excludedChildIdentifiers: missingApprovalStageGap.excludedChildIdentifiers,
                 stageTypes: missingApprovalStageGap.stageTypes,
                 remediation: missingApprovalStageGap.remediation,
               },
@@ -13353,7 +13354,9 @@ export function issueRoutes(
               issueId: updated.id,
               details: {
                 identifier: updated.identifier ?? null,
-                childCount: missingApprovalStageGap.childCount,
+                ladderedChildCount: missingApprovalStageGap.ladderedChildCount,
+                ladderedChildIdentifiers: missingApprovalStageGap.ladderedChildIdentifiers,
+                excludedChildIdentifiers: missingApprovalStageGap.excludedChildIdentifiers,
                 stageTypes: missingApprovalStageGap.stageTypes,
                 source: "in_review",
               },
@@ -13429,7 +13432,9 @@ export function issueRoutes(
               issueId: existing.id,
               details: {
                 identifier: existing.identifier ?? null,
-                childCount: missingApprovalStageGap.childCount,
+                ladderedChildCount: missingApprovalStageGap.ladderedChildCount,
+                ladderedChildIdentifiers: missingApprovalStageGap.ladderedChildIdentifiers,
+                excludedChildIdentifiers: missingApprovalStageGap.excludedChildIdentifiers,
                 stageTypes: missingApprovalStageGap.stageTypes,
                 source: "done",
               },

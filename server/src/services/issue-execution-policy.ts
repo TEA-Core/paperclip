@@ -1657,38 +1657,62 @@ export function applyIssueMonitorPolicyTransition(input: TransitionInput): Trans
 
 /**
  * SUP-15878: the typed error code for a `done` transition refused on the
- * parent-close ladder gap (open children + no `approval` stage).
+ * parent-close ladder gap (laddered children + no `approval` stage).
  */
 export const MISSING_APPROVAL_STAGE_ERROR_CODE = "done_transition_missing_approval_stage";
 
 export interface MissingApprovalStageGap {
-  /** Number of non-`cancelled` child issues on the card. */
-  childCount: number;
+  /**
+   * Number of laddered (decomposition) children that gate the close,
+   * post-exclusions — the canonical mechanism-D count from
+   * `countLadderedChildren`. A card owes a close ladder only when this is
+   * `>= 2`; redo/delivery and platform-generated children are excluded and do
+   * NOT count toward it.
+   */
+  ladderedChildCount: number;
+  /** Identifiers of the laddered children that gate the close. */
+  ladderedChildIdentifiers: string[];
+  /**
+   * Identifiers of children excluded from the ladder count by the canonical
+   * carve-outs (work-type:redo / work-type:delivery), so a reader can falsify
+   * the count without re-deriving it by hand.
+   */
+  excludedChildIdentifiers: string[];
   /** Stage types stored on the card's executionPolicy, in ladder order. */
   stageTypes: string[];
   remediation: string;
 }
 
 /**
- * SUP-15878: a card with at least one non-`cancelled` child issue but no
- * `approval` stage in its executionPolicy can never reach a recorded approval
- * decision. `diagnoseMissingApprovalStage` returns the diagnostic for that gap
- * (or `null` when the ladder is fine or the card has no open children).
+ * SUP-15878: a card with at least two laddered child issues (the canonical
+ * post-exclusion mechanism-D predicate) but no `approval` stage in its
+ * executionPolicy can never reach a recorded approval decision.
+ * `diagnoseMissingApprovalStage` returns the diagnostic for that gap (or
+ * `null` when the ladder is fine, or when the card owes no close ladder —
+ * fewer than two laddered children, e.g. a redo/delivery-only or otherwise
+ * excluded child set). The laddered count and identifiers are passed in from
+ * the caller (the shared `countLadderedChildren` helper) rather than
+ * re-derived here, so the predicate cannot drift from the done-transition
+ * guard.
  */
 export function diagnoseMissingApprovalStage(input: {
   policy: IssueExecutionPolicy | null;
-  childCount: number;
+  ladderedChildCount: number;
+  ladderedChildIdentifiers: string[];
+  excludedChildIdentifiers: string[];
 }): MissingApprovalStageGap | null {
-  if (input.childCount <= 0) return null;
+  if (input.ladderedChildCount < 2) return null;
   const stages = input.policy?.stages ?? [];
   if (stages.some((stage) => stage.type === "approval")) return null;
   const stageTypes = stages.map((stage) => stage.type);
   return {
-    childCount: input.childCount,
+    ladderedChildCount: input.ladderedChildCount,
+    ladderedChildIdentifiers: input.ladderedChildIdentifiers,
+    excludedChildIdentifiers: input.excludedChildIdentifiers,
     stageTypes,
     remediation:
       `Add an "approval" stage to this issue's executionPolicy before it can be marked done: ` +
-      `a card with ${input.childCount} open child issue(s) and no approval stage cannot reach ` +
+      `a card with ${input.ladderedChildCount} laddered child issue(s) and no approval stage cannot reach ` +
       `a recorded approval decision (stored stage types: ${stageTypes.length > 0 ? stageTypes.join(", ") : "none"}).`,
   };
 }
