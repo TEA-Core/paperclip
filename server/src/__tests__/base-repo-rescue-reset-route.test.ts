@@ -60,10 +60,8 @@ vi.mock("../services/workspace-runtime.js", () => ({
 }));
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ projectRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/projects.js")>("../routes/projects.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { projectRoutes } = await vi.importActual<typeof import("../routes/projects.js")>("../routes/projects.js");
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
