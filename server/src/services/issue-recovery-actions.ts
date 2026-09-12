@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -267,6 +267,99 @@ export function issueRecoveryActionService(db: Db) {
     return row ? toReadModel(row) : null;
   }
 
+  // SUP-15847: `attemptCount` is per-row, so a re-mint that only looked at the
+  // most recently updated row could restart at a lower count whenever a newer
+  // row for the same fingerprint existed with a small count (the SUP-15825
+  // "5, then 1, then 2" reading). The cumulative attempt total is a property of
+  // the fingerprint, not of any one row, so read every row and derive both the
+  // high-water mark and the latest row from one query.
+  async function getFingerprintHistory(
+    companyId: string,
+    sourceIssueId: string,
+    fingerprint: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<{ latest: IssueRecoveryAction | null; maxAttemptCount: number }> {
+    const rows = await dbOrTx
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.fingerprint, fingerprint),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt));
+    if (rows.length === 0) return { latest: null, maxAttemptCount: 0 };
+    let maxAttemptCount = 0;
+    for (const row of rows) {
+      if (row.attemptCount > maxAttemptCount) maxAttemptCount = row.attemptCount;
+    }
+    return { latest: toReadModel(rows[0]!), maxAttemptCount };
+  }
+
+  async function getFingerprintAttemptTotals(
+    companyId: string,
+    sourceIssueId: string,
+  ): Promise<Record<string, number>> {
+    const rows = await db
+      .select({
+        fingerprint: issueRecoveryActions.fingerprint,
+        maxAttemptCount: sql<number>`max(${issueRecoveryActions.attemptCount})`,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+        ),
+      )
+      .groupBy(issueRecoveryActions.fingerprint);
+    const totals: Record<string, number> = {};
+    for (const row of rows) {
+      totals[row.fingerprint] = Number(row.maxAttemptCount ?? 0);
+    }
+    return totals;
+  }
+
+  // SUP-15847: the latest recorded run for the issue, used to decide whether a
+  // re-park's `evidence.latestRunId` has actually advanced. Mirrors
+  // `recovery.getLatestIssueRun` so the "is there a newer run?" question is
+  // answered the same way the reconciler answers it.
+  async function getLatestIssueRunId(companyId: string, sourceIssueId: string): Promise<string | null> {
+    const row = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${sourceIssueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row?.id ?? null;
+  }
+
+  function readEvidenceRunId(evidence: Record<string, unknown> | null | undefined): string | null {
+    const value = evidence?.latestRunId;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  // SUP-15847: the predecessor is a resolved row and the incoming evidence
+  // cites the exact run that row was resolved on. That is a re-park on stale
+  // evidence, not a new failure.
+  function isStaleReparkEvidence(
+    prev: IssueRecoveryAction | null,
+    input: UpsertIssueRecoveryActionInput,
+  ): boolean {
+    if (!prev || prev.status !== "resolved") return false;
+    const priorRunId = readEvidenceRunId(prev.evidence);
+    const incomingRunId = readEvidenceRunId(input.evidence);
+    return priorRunId != null && incomingRunId != null && priorRunId === incomingRunId;
+  }
+
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
     if (sourceIssueIds.length === 0) return new Map<string, IssueRecoveryAction>();
     const rows = await db
@@ -324,6 +417,9 @@ export function issueRecoveryActionService(db: Db) {
     // here would reset every re-mint to 1, so the sweep ceiling is never
     // reachable and an exhausted action is re-escalated forever.
     attemptCountOverride?: number,
+    // SUP-15847: extra evidence merged last, used to type a below-ceiling stale
+    // re-park distinctly (`staleRepark`) without changing any other caller.
+    evidenceExtra?: Record<string, unknown>,
   ) {
     return {
       companyId: input.companyId,
@@ -341,6 +437,7 @@ export function issueRecoveryActionService(db: Db) {
       evidence: {
         ...(input.evidence ?? {}),
         ...(input.evidenceOnCreate ?? {}),
+        ...(evidenceExtra ?? {}),
       },
       nextAction: input.nextAction,
       wakePolicy: input.wakePolicy ?? null,
@@ -579,7 +676,7 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
-      const prev = await getLatestForFingerprint(
+      const { latest: prev, maxAttemptCount } = await getFingerprintHistory(
         input.companyId,
         input.sourceIssueId,
         input.fingerprint,
@@ -589,10 +686,16 @@ export function issueRecoveryActionService(db: Db) {
       // escalation), start a fresh attempt budget instead of carrying the
       // post-ceiling count forward. Carrying it would mint a new action
       // already past its ceiling, which the next sweep re-escalates and
-      // re-comments on immediately.
+      // re-comments on immediately. This is the deliberate board-resolution
+      // reset, so it must keep winning over the cumulative high-water mark.
       const predecessorBudgetExhausted =
         prev != null && prev.maxAttempts != null && prev.attemptCount >= prev.maxAttempts;
-      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : (prev?.attemptCount ?? 0) + 1;
+      // SUP-15847: carry the fingerprint's cumulative high-water mark forward,
+      // not the count of whichever row happens to be most recently updated. A
+      // resolve -> re-park cycle previously read a low per-row count and
+      // restarted the ladder, defeating the ceiling.
+      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : maxAttemptCount + 1;
+      const effectiveMaxAttempts = input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
       // SUP-14151: clamp the carried count to the effective ceiling. The
       // predecessor-budget reset above only fires when the predecessor carries
       // a non-null maxAttempts; where it was null the count carried forward
@@ -603,13 +706,72 @@ export function issueRecoveryActionService(db: Db) {
       // the true count for this fingerprint (run stamp, persisted action, or
       // legacy park history). Every carry-forward caller above passes none, so
       // the SUP-13698/SUP-14151 clamp still governs each of them.
-      const nextAttemptCount = input.attemptCount ?? Math.min(
-        carriedAttemptCount,
-        input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
-      );
+      const nextAttemptCount = input.attemptCount ??
+        (predecessorBudgetExhausted ? 1 : Math.min(carriedAttemptCount, effectiveMaxAttempts));
+      // SUP-15847: a re-park whose evidence has not advanced past the row that
+      // was just resolved is a stale re-park -- it is driven by an unchanged
+      // `latestRunId`, not a new failure.
+      const staleRepark = isStaleReparkEvidence(prev, input);
+      const staleReparkEvidence = staleRepark
+        ? { staleRepark: { detected: true, latestRunId: readEvidenceRunId(input.evidence) } }
+        : undefined;
+      // Once the fingerprint has consumed its cumulative budget, mint the
+      // successor directly as the board-facing exhausted action instead of an
+      // active row the sweep would only re-escalate on the next pass.
+      if (
+        input.attemptCount === undefined &&
+        !predecessorBudgetExhausted &&
+        carriedAttemptCount > effectiveMaxAttempts &&
+        staleRepark
+      ) {
+        const staleRunId = readEvidenceRunId(prev!.evidence)!;
+        const latestIssueRunId = await getLatestIssueRunId(input.companyId, input.sourceIssueId);
+        // Only suppress when the cited run really is the issue's latest run, so
+        // a genuinely newer failure still gets a normal active action.
+        if (latestIssueRunId != null && latestIssueRunId === staleRunId) {
+          const [escalated] = await db
+            .insert(issueRecoveryActions)
+            .values({
+              ...buildInsertValues(input, "board", now, effectiveMaxAttempts),
+              status: "escalated" as const,
+              ownerType: "board" as const,
+              ownerAgentId: null,
+              ownerUserId: null,
+              previousOwnerAgentId: prev!.ownerAgentId ?? input.previousOwnerAgentId ?? null,
+              returnOwnerAgentId: prev!.ownerAgentId ?? input.returnOwnerAgentId ?? null,
+              evidence: {
+                ...(input.evidence ?? {}),
+                recoveryBudget: {
+                  state: "exhausted",
+                  attemptsUsed: effectiveMaxAttempts,
+                  maxAttempts: effectiveMaxAttempts,
+                  exhaustedAt: now.toISOString(),
+                  cause: input.cause,
+                  fingerprint: input.fingerprint,
+                  suppressedStaleRepark: true,
+                },
+              },
+              nextAction:
+                `Automatic recovery exhausted after ${effectiveMaxAttempts}/${effectiveMaxAttempts} attempts on an unchanged run ` +
+                `(${staleRunId}). Dispatch a new run or choose a replacement configuration; the same stale evidence will not re-park.`,
+              wakePolicy: null,
+              monitorPolicy: null,
+              attemptCount: effectiveMaxAttempts,
+              maxAttempts: effectiveMaxAttempts,
+              // DB-level terminal sentinel (`escalated` + `outcome: "exhausted"`),
+              // matching the sweep. Ordinary callers cannot clear it without a
+              // board resolution, so the stale loop cannot restart.
+              outcome: "exhausted",
+              resolutionNote: null,
+              resolvedAt: null,
+            })
+            .returning();
+          return toReadModel(escalated!);
+        }
+      }
       const [created] = await db
         .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now, nextAttemptCount))
+        .values(buildInsertValues(input, ownerType, now, nextAttemptCount, staleReparkEvidence))
         .returning();
       return toReadModel(created!);
     } catch (error) {
@@ -682,6 +844,7 @@ export function issueRecoveryActionService(db: Db) {
     getLiveContinuationForIssue,
     getLatestResolvedForIssue,
     getLatestForFingerprint,
+    getFingerprintAttemptTotals,
     listActiveForIssues,
     listAllForIssue,
     resolveActiveForIssue,

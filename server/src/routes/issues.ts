@@ -9148,9 +9148,15 @@ export function issueRoutes(
       actor: getActorInfo(req),
     });
     const all = await recoveryActionsSvc.listAllForIssue(issue.companyId, issue.id);
+    // SUP-15847: expose the cumulative attempt depth per fingerprint. `actions`
+    // reports per-row counts, so after a resolve -> re-park the row list alone
+    // understates the true cost; this map lets a recovery agent read the real
+    // depth for a fingerprint in one call.
+    const fingerprintAttempts = await recoveryActionsSvc.getFingerprintAttemptTotals(issue.companyId, issue.id);
     res.json({
       active,
       actions: all,
+      fingerprintAttempts,
     });
   });
 
