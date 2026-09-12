@@ -263,6 +263,7 @@ import {
 } from "./run-truncation.js";
 import { boundContextSnapshot } from "./context-snapshot-bound.js";
 import {
+  buildDispatchUnlaunchedEvidence,
   buildDispatchUnlaunchedMessage,
   buildStillbornRunMessage,
   canDetectStillbornRun,
@@ -19188,6 +19189,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         : null;
 
+      // SUP-15842: a never-launched run carries bounded root-cause evidence (last dispatch step
+      // reached, lease outcome, child-handle and telemetry state) so the next occurrence's
+      // failure is self-describing instead of re-diagnosing from a bare `process_lost`.
+      const dispatchUnlaunchedEvidence = dispatchUnlaunched
+        ? buildDispatchUnlaunchedEvidence({
+            adapterType,
+            graceMs: dispatchUnlaunchedGraceMs,
+            hasActiveEnvironmentLease: activeLeaseRunIds.has(run.id),
+            processPid: run.processPid,
+            processGroupId: run.processGroupId,
+            processStartedAt: run.processStartedAt,
+            logBytes: run.logBytes,
+            usageJson: run.usageJson,
+            resultJson: run.resultJson,
+            lastProgressAt: run.updatedAt ?? run.startedAt ?? run.createdAt,
+          })
+        : null;
+
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: reapErrorCode,
@@ -19205,6 +19224,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
           );
           if (hostRestartMarker) result.hostRestart = hostRestartMarker;
+          if (dispatchUnlaunchedEvidence) result.dispatchUnlaunched = dispatchUnlaunchedEvidence;
           return result;
         })(),
       });
@@ -19261,6 +19281,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          ...(dispatchUnlaunchedEvidence ? { dispatchUnlaunched: dispatchUnlaunchedEvidence } : {}),
         },
       });
 

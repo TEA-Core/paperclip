@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildDispatchUnlaunchedEvidence,
   buildDispatchUnlaunchedMessage,
   canDetectStillbornRun,
   isDispatchUnlaunchedRun,
@@ -200,5 +201,67 @@ describe("buildDispatchUnlaunchedMessage", () => {
     expect(message).toContain("opencode_local");
     expect(message).not.toContain("server may have restarted");
     expect(message).not.toContain("Host restart");
+  });
+});
+
+describe("buildDispatchUnlaunchedEvidence", () => {
+  it("records the admitted-running step, the missing lease and the absent child handle", () => {
+    const evidence = buildDispatchUnlaunchedEvidence({
+      adapterType: "opencode_local",
+      graceMs: DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
+      hasActiveEnvironmentLease: false,
+      processPid: null,
+      processGroupId: null,
+      processStartedAt: null,
+      logBytes: null,
+      usageJson: null,
+      resultJson: null,
+      lastProgressAt: NOW,
+    });
+    expect(evidence).toEqual({
+      dispatchStep: "admitted_running",
+      leaseOutcome: "no_active_lease_observed",
+      childHandleRegistered: false,
+      telemetryObserved: false,
+      adapterType: "opencode_local",
+      graceMs: DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
+      lastProgressAt: NOW.toISOString(),
+    });
+  });
+
+  it("reports an active lease and a registered child handle when either is present", () => {
+    const evidence = buildDispatchUnlaunchedEvidence({
+      adapterType: "claude_local",
+      graceMs: 45_000,
+      hasActiveEnvironmentLease: true,
+      processPid: 4242,
+      processGroupId: null,
+      processStartedAt: NOW,
+      logBytes: 0,
+      usageJson: null,
+      resultJson: null,
+      lastProgressAt: null,
+    });
+    expect(evidence.leaseOutcome).toBe("active_lease_present");
+    expect(evidence.childHandleRegistered).toBe(true);
+    expect(evidence.telemetryObserved).toBe(false);
+    expect(evidence.lastProgressAt).toBeNull();
+  });
+
+  it("flags telemetry when any log, usage or result evidence was written", () => {
+    const evidence = buildDispatchUnlaunchedEvidence({
+      adapterType: null,
+      graceMs: 30_000,
+      hasActiveEnvironmentLease: false,
+      processPid: null,
+      processGroupId: null,
+      processStartedAt: null,
+      logBytes: 0,
+      usageJson: { inputTokens: 10 },
+      resultJson: null,
+      lastProgressAt: null,
+    });
+    expect(evidence.adapterType).toBeNull();
+    expect(evidence.telemetryObserved).toBe(true);
   });
 });

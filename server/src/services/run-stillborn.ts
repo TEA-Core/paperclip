@@ -183,3 +183,61 @@ export function buildDispatchUnlaunchedMessage(
     `The dispatch did not start — this is a launch failure, not a server restart or a lost in-flight process.`
   );
 }
+
+/**
+ * SUP-15842: bounded, non-secret root-cause evidence recorded when a run is reaped as
+ * `dispatch_unlaunched`.
+ *
+ * The reaper only ever observes the run's end state, so "last dispatch step reached" is the
+ * furthest milestone the observable row proves: admission to `running`. Nothing past it was
+ * ever registered — no child handle, no active environment lease, no dispatch telemetry — which
+ * is exactly the claim→launch window this defect sits in. The lease outcome is recorded
+ * explicitly so a later occurrence distinguishes "the lease request never completed / was not
+ * active at reap time" from "a lease existed and the child died" (the latter stays
+ * `process_lost`).
+ */
+export interface DispatchUnlaunchedEvidence {
+  /** Furthest dispatch milestone the observable row proves (admission only; nothing launched). */
+  dispatchStep: "admitted_running";
+  /** What the reaper observed about the environment-lease request. */
+  leaseOutcome: "no_active_lease_observed" | "active_lease_present";
+  /** No child-process handle (pid / group / start) was ever registered. */
+  childHandleRegistered: boolean;
+  /** No dispatch telemetry (log bytes / usage / result) was ever written. */
+  telemetryObserved: boolean;
+  adapterType: string | null;
+  /** The launch-grace window (ms) in effect when the run was reaped. */
+  graceMs: number;
+  /** The run's last-progress timestamp as ISO-8601, or null if none was recorded. */
+  lastProgressAt: string | null;
+}
+
+export function buildDispatchUnlaunchedEvidence(input: {
+  adapterType?: string | null;
+  graceMs: number;
+  hasActiveEnvironmentLease: boolean;
+  processPid: number | null;
+  processGroupId: number | null;
+  processStartedAt: Date | string | null;
+  logBytes: number | null;
+  usageJson: unknown;
+  resultJson: unknown;
+  lastProgressAt?: Date | string | null;
+}): DispatchUnlaunchedEvidence {
+  const lastProgressAt = input.lastProgressAt
+    ? new Date(input.lastProgressAt).toISOString()
+    : null;
+  return {
+    dispatchStep: "admitted_running",
+    leaseOutcome: input.hasActiveEnvironmentLease ? "active_lease_present" : "no_active_lease_observed",
+    childHandleRegistered:
+      input.processPid !== null ||
+      input.processGroupId !== null ||
+      input.processStartedAt !== null,
+    telemetryObserved:
+      (input.logBytes ?? 0) > 0 || input.usageJson != null || input.resultJson != null,
+    adapterType: typeof input.adapterType === "string" ? input.adapterType : null,
+    graceMs: input.graceMs,
+    lastProgressAt,
+  };
+}

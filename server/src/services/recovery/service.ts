@@ -2187,7 +2187,12 @@ export function recoveryService(
   }) {
     const originalAgentId = input.latestRun?.agentId ?? input.issue.assigneeAgentId;
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
+    // SUP-15842: `dispatch_unlaunched` reaps the same never-progressed run shape that
+    // `process_lost` did before it was distinguished, so it keeps the original-agent routing
+    // contract (owner and return owner). Without this term it fell through to the manager
+    // ladder, changing routing for a cause that must behave exactly like `process_lost`.
     const routeToOriginal = input.recoveryCause === "process_lost" ||
+      input.recoveryCause === "dispatch_unlaunched" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
       input.recoveryCause === "codex_output_inactivity_monitor";
     if (input.recoveryCause === "provider_quota") {

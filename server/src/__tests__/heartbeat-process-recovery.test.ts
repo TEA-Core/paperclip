@@ -3053,6 +3053,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.error).not.toContain("server may have restarted");
     expect(run?.error).not.toContain("Host restart detected");
     expect(readHostRestartMarker(run?.resultJson as Record<string, unknown> | null)).toBeNull();
+    // SUP-15842: the reap carries bounded root-cause evidence (last dispatch step reached,
+    // lease outcome) so the next occurrence is self-describing instead of a bare process_lost.
+    expect(run?.resultJson).toMatchObject({
+      dispatchUnlaunched: {
+        dispatchStep: "admitted_running",
+        leaseOutcome: "no_active_lease_observed",
+        childHandleRegistered: false,
+        telemetryObserved: false,
+        adapterType: "opencode_local",
+        graceMs: 30_000,
+      },
+    });
   });
 
   it("does not reap a healthy dispatch still inside the launch grace", async () => {

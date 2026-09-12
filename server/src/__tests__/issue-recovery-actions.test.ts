@@ -1160,6 +1160,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it.each([
     ["process_lost", undefined, "coder"],
+    ["dispatch_unlaunched", undefined, "coder"],
     ["adapter_failed", "successful_run_missing_state", "coder"],
     ["codex_output_inactivity_monitor", undefined, "coder"],
     ["workspace_validation_failed", "workspace_validation_failed", "manager"],
@@ -1210,6 +1211,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       );
     },
   );
+
+  it("routes dispatch_unlaunched recovery to the original agent for owner and return owner, not the manager ladder (SUP-15842)", async () => {
+    const { companyId, coderId, sourceIssue, prefix } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "dispatch never launched",
+      errorCode: "dispatch_unlaunched",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: {
+        stopReason: "dispatch_unlaunched",
+        dispatchUnlaunched: {
+          dispatchStep: "admitted_running",
+          leaseOutcome: "no_active_lease_observed",
+          childHandleRegistered: false,
+          telemetryObserved: false,
+        },
+      },
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // The original agent keeps both the ownership and the return-owner contract — identical to
+    // `process_lost` — instead of falling through the manager ladder.
+    expect(action?.cause).toBe("dispatch_unlaunched");
+    expect(action?.ownerAgentId).toBe(coderId);
+    expect(action?.returnOwnerAgentId).toBe(coderId);
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      coderId,
+      expect.objectContaining({
+        reason: "source_scoped_recovery_action",
+        payload: expect.objectContaining({ recoveryCause: "dispatch_unlaunched" }),
+      }),
+    );
+  });
 
   it("stands down while the latest run was cancelled by a board operator", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
