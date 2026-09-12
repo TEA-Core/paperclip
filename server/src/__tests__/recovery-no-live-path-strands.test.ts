@@ -5,6 +5,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -56,6 +57,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issueLabels);
     await db.delete(labels);
     await db.delete(issues);
@@ -754,6 +756,130 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(actions.some((action) => action.kind === "review_stage_armed_stranded")).toBe(false);
+  });
+
+  // -- SUP-15788 round-2: the early detector must honour the live-path guards --
+
+  it("does not mint review_stage_armed_stranded while an execution run is in flight (active live path)", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // An in-flight run is a self-resolving path; the early detector must not
+    // race it by minting a competing participant action (round-2 finding:
+    // live-path guard).
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not mint review_stage_armed_stranded while a wake is queued for the issue (live wake path)", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      source: "recovery",
+      status: "queued",
+      payload: { issueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+  });
+
+  it("does not mint review_stage_armed_stranded while a future monitor check is armed", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, issueId));
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+  });
+
+  it("does not mint review_stage_armed_stranded while a pending continuation interaction is held", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: {},
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
   });
 
   it("mints the participant-owned action, not no_live_path_owner_unavailable, when the original assignee is unavailable", async () => {
