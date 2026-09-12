@@ -75,6 +75,10 @@ const DELIVERY_LABEL_NAME = "work-type:delivery";
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
+// Machine-checkable accepted forms, embedded verbatim in every rejection message so the
+// 422 remedy and the parser always agree on the exact literal (SUP-15787).
+const TIER2_FORM = '"Closed at Tier 2 (live): <probe evidence>"';
+const TIER1_FORM = '"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."';
 
 export interface DoneTransitionGuardResult {
   allowed: boolean;
@@ -459,44 +463,116 @@ async function hydrateLinkedPrState(
   }
 }
 
-function parseTier2Declaration(body: string): { matched: boolean; evidence: string } {
+type Tier2Parse =
+  | { kind: "matched"; evidence: string }
+  | { kind: "not_at_line_start"; offendingLine: string }
+  | { kind: "missing_evidence" }
+  | { kind: "absent" };
+
+type Tier1Parse =
+  | { kind: "matched"; reason: string }
+  | { kind: "not_at_line_start"; offendingLine: string }
+  | { kind: "missing_suffix" }
+  | { kind: "absent" };
+
+function parseTier2Declaration(body: string): Tier2Parse {
   const lines = body.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
+  let notAtLineStart: string | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
     if (trimmed.startsWith(TIER_2_PREFIX)) {
       const evidence = trimmed.slice(TIER_2_PREFIX.length).trim();
       if (evidence.length > 0) {
-        return { matched: true, evidence };
+        return { kind: "matched", evidence };
       }
-      const idx = lines.indexOf(line);
-      const nextLine = idx >= 0 && idx + 1 < lines.length ? lines[idx + 1] : undefined;
-      if (nextLine !== undefined) {
-        const nextTrimmed = nextLine.trim();
-        if (nextTrimmed.length > 0) {
-          return { matched: true, evidence: nextTrimmed };
+      // No trailing evidence on the prefix line. Resolve it from the next
+      // non-empty line using the loop's true index for the lookahead — not
+      // `lines.indexOf(line)`, which matches by value and would resolve from an
+      // earlier duplicate's position when the body repeats a line (SUP-15787
+      // case 4). Blank lines are skipped, so evidence sitting after a blank still
+      // resolves (SUP-15787 case 3); if no non-empty line follows, name the missing
+      // evidence specifically rather than reporting the declaration as absent.
+      for (let j = i + 1; j < lines.length; j++) {
+        const candidate = lines[j].trim();
+        if (candidate.length > 0) {
+          return { kind: "matched", evidence: candidate };
         }
       }
-      return { matched: false, evidence: "" };
+      return { kind: "missing_evidence" };
+    }
+    // A decorated (non-line-start) occurrence is recorded but never accepted:
+    // the machine-checkable literal must begin its own line.
+    if (notAtLineStart === null && trimmed.includes(TIER_2_PREFIX)) {
+      notAtLineStart = trimmed;
     }
   }
-  return { matched: false, evidence: "" };
+  return notAtLineStart !== null
+    ? { kind: "not_at_line_start", offendingLine: notAtLineStart }
+    : { kind: "absent" };
 }
 
-function parseTier1Declaration(body: string): { matched: boolean; reason: string } {
+function parseTier1Declaration(body: string): Tier1Parse {
   const lines = body.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
+  let notAtLineStart: string | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
     if (trimmed.startsWith(TIER_1_PREFIX)) {
       const rest = trimmed.slice(TIER_1_PREFIX.length).trim();
       const suffixIdx = rest.lastIndexOf(TIER_1_SUFFIX);
       if (suffixIdx === -1) {
-        return { matched: false, reason: "" };
+        return { kind: "missing_suffix" };
       }
       const reason = rest.slice(0, suffixIdx).trim();
-      return { matched: true, reason };
+      return { kind: "matched", reason };
+    }
+    if (notAtLineStart === null && trimmed.includes(TIER_1_PREFIX)) {
+      notAtLineStart = trimmed;
     }
   }
-  return { matched: false, reason: "" };
+  return notAtLineStart !== null
+    ? { kind: "not_at_line_start", offendingLine: notAtLineStart }
+    : { kind: "absent" };
+}
+
+/**
+ * Turn the two parsers' near-miss results into a truthful rejection message.
+ * Returns null when neither tier phrase appears at all — the caller then falls
+ * back to the pre-existing "declaration is missing" message, unchanged
+ * (SUP-15787 case 4). Tier 2 is the primary tier, so its specific defect is
+ * reported before Tier 1's.
+ */
+function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse): string | null {
+  if (tier2.kind === "not_at_line_start") {
+    return (
+      "A Tier 2 declaration was found but it does not begin its own line — the guard " +
+      "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
+      `Offending line: "${tier2.offendingLine.slice(0, 200)}". ` +
+      `Accepted form: ${TIER2_FORM} — per SUP-12693.`
+    );
+  }
+  if (tier2.kind === "missing_evidence") {
+    return (
+      "A Tier 2 declaration was found but no probe evidence follows it — the line after " +
+      `"${TIER_2_PREFIX}" is blank and no non-empty line follows. ` +
+      `Accepted form: ${TIER2_FORM} — per SUP-12693.`
+    );
+  }
+  if (tier1.kind === "not_at_line_start") {
+    return (
+      "A Tier 1 declaration was found but it does not begin its own line — the guard " +
+      "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
+      `Offending line: "${tier1.offendingLine.slice(0, 200)}". ` +
+      `Accepted form: ${TIER1_FORM} — per SUP-12693.`
+    );
+  }
+  if (tier1.kind === "missing_suffix") {
+    return (
+      "A Tier 1 declaration was found but it is missing the required " +
+      `"${TIER_1_SUFFIX}" suffix on the prefix line. ` +
+      `Accepted form: ${TIER1_FORM} — per SUP-12693.`
+    );
+  }
+  return null;
 }
 
 export async function evaluateDoneTierDeclaration(
@@ -516,7 +592,7 @@ export async function evaluateDoneTierDeclaration(
 
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
     const tier2 = parseTier2Declaration(accompanyingComment);
-    if (tier2.matched) {
+    if (tier2.kind === "matched") {
       return {
         allowed: true,
         reason: `Tier 2 declaration found: ${tier2.evidence.slice(0, 200)}`,
@@ -526,11 +602,11 @@ export async function evaluateDoneTierDeclaration(
       };
     }
     const tier1 = parseTier1Declaration(accompanyingComment);
-    if (tier1.matched) {
+    if (tier1.kind === "matched") {
       if (tier1.reason.length === 0) {
         return {
           allowed: false,
-          reason: `Tier 1 declaration found but <reason> is empty. Use: "Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."`,
+          reason: `Tier 1 declaration found but <reason> is empty. Use: ${TIER1_FORM}`,
           tier: null,
           skipped: false,
           skipReason: null,
@@ -547,11 +623,12 @@ export async function evaluateDoneTierDeclaration(
     return {
       allowed: false,
       reason:
-        "Close comment is missing a done-tier declaration. Accepted forms: " +
-        `"Closed at Tier 2 (live): <probe evidence>"` +
-        ` or ` +
-        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
-        ` — per SUP-12693.`,
+        describeTierRejection(tier2, tier1) ??
+        ("Close comment is missing a done-tier declaration. Accepted forms: " +
+          `${TIER2_FORM}` +
+          ` or ` +
+          `${TIER1_FORM}` +
+          ` — per SUP-12693.`),
       tier: null,
       skipped: false,
       skipReason: null,
@@ -611,7 +688,7 @@ export async function evaluateDoneTierDeclaration(
   }
 
   const tier2 = parseTier2Declaration(sameRunComment.body);
-  if (tier2.matched) {
+  if (tier2.kind === "matched") {
     return {
       allowed: true,
       reason: `Tier 2 declaration found in same-run comment: ${tier2.evidence.slice(0, 200)}`,
@@ -622,13 +699,13 @@ export async function evaluateDoneTierDeclaration(
   }
 
   const tier1 = parseTier1Declaration(sameRunComment.body);
-  if (tier1.matched) {
+  if (tier1.kind === "matched") {
     if (tier1.reason.length === 0) {
       return {
         allowed: false,
         reason:
           "Tier 1 declaration found in same-run comment but <reason> is empty. " +
-          `Use: "Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."`,
+          `Use: ${TIER1_FORM}`,
         tier: null,
         skipped: false,
         skipReason: null,
@@ -646,11 +723,12 @@ export async function evaluateDoneTierDeclaration(
   return {
     allowed: false,
     reason:
-      "Same-run comment does not contain a done-tier declaration. " +
-      `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
-      ` or ` +
-      `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
-      ` — per SUP-12693.`,
+      describeTierRejection(tier2, tier1) ??
+      ("Same-run comment does not contain a done-tier declaration. " +
+        `Accepted forms: ${TIER2_FORM}` +
+        ` or ` +
+        `${TIER1_FORM}` +
+        ` — per SUP-12693.`),
     tier: null,
     skipped: false,
     skipReason: null,
