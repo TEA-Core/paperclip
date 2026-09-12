@@ -2644,6 +2644,50 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(live).toMatchObject({ status: "todo", assigneeAgentId: coderId });
   });
 
+  it.each(["in_progress", "backlog"] as const)(
+    "lets a board declare a %s card a false positive without changing its status",
+    async (sourceIssueStatus) => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: sourceIssueStatus }).where(eq(issues.id, sourceIssueId));
+      const action = await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "missing_disposition",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: `missing-disposition:false-positive-${sourceIssueStatus}`,
+        evidence: { sourceRunId: "run-1" },
+        nextAction: "Choose a valid issue disposition.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "false_positive",
+          sourceIssueStatus,
+          resolutionNote: "Board declared the alert a false positive.",
+        })
+        .expect(200);
+
+      expect(resolved.body.recoveryAction).toMatchObject({
+        id: action.id,
+        status: "resolved",
+        outcome: "false_positive",
+      });
+      expect(resolved.body.issue).toMatchObject({
+        id: sourceIssueId,
+        status: sourceIssueStatus,
+        activeRecoveryAction: null,
+      });
+      const [persistedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(persistedIssue?.status).toBe(sourceIssueStatus);
+    },
+  );
+
   it("still refuses an agent actor resolving a recovery action as false_positive or cancelled (board-only gate unchanged)", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db.update(issues).set({ status: "todo" }).where(eq(issues.id, sourceIssueId));
