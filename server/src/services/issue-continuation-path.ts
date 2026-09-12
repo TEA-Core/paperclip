@@ -149,17 +149,30 @@ export function buildTimerDispatchSuppressionDetails(input: {
 // and this constant as the window.
 export const TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 
+// `lastSuppressedAt` arrives from a raw `sql<...>MAX(activity_log.created_at)`
+// aggregate in services/heartbeat.ts. That generic is a TYPE ASSERTION ONLY:
+// drizzle applies no per-column mapping to a raw sql fragment, and its
+// postgres-js driver overrides the driver's own date parsing (drizzle maps
+// mapped columns itself), so the value reaches us as an unparsed timestamp
+// STRING. Calling a Date method on it throws
+// `TypeError: input.lastSuppressedAt.getTime is not a function`, and on the
+// startup-recovery path that throw is fatal: it crash-looped production on
+// 2026-09-11 once an issue had a prior suppression row to read back.
+// Coerce exactly like every other §2a timestamp input (toContinuationPathDate),
+// which accepts Date and string alike and yields null for an unparseable value.
 export function shouldEmitTimerDispatchSuppression(input: {
-  lastSuppressedAt: Date | null;
+  lastSuppressedAt: Date | string | null | undefined;
   now: Date;
   windowMs?: number;
 }): boolean {
   const windowMs = input.windowMs ?? TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS;
-  if (input.lastSuppressedAt === null) return true;
+  const lastSuppressedAt = toContinuationPathDate(input.lastSuppressedAt);
+  // No readable prior row is the same decision as no prior row at all: emit.
+  if (lastSuppressedAt === null) return true;
   // Strictly outside the trailing window (matches the existing
   // `createdAt >= now - window` existence check: a row at exactly the window edge
   // still counts as "in window" and suppresses the emit).
-  return input.now.getTime() - input.lastSuppressedAt.getTime() > windowMs;
+  return input.now.getTime() - lastSuppressedAt.getTime() > windowMs;
 }
 
 // ADR-093 D2 (SUP-15553) — the `todo` arm of the stranded-card detector.
