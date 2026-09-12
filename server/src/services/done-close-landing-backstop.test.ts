@@ -362,6 +362,7 @@ beforeEach(() => {
   mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
     ok: true,
     headRefOid: LIVE_SHA,
+    headCommitAt: "2026-08-18T16:07:16Z",
     lastEjection: null,
   });
   mockCreateGitHubExternalObjectProvider.mockReset();
@@ -1896,26 +1897,43 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
   const RECENT_ROW = new Date(NOW_MS - 90 * 60 * 1000).toISOString();
   // The verbatim #662 ejection timestamp (2026-08-18T17:04:36Z, before NOW).
   const EJECTED_AT = "2026-08-18T17:04:36Z";
-  const MOVED_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  // #662's conflict head was last pushed BEFORE the ejection → head unchanged.
+  const HEAD_PUSHED_BEFORE = "2026-08-18T16:07:16Z";
+  // A head re-pushed AFTER the ejection → head moved since ejection (AC5).
+  const HEAD_PUSHED_AFTER = "2026-08-18T19:00:00Z";
+  // The merge-queue GROUP commit held at ejection — structurally DISTINCT from
+  // the PR head. The predicate must never compare the head to this by oid.
+  const GROUP_SHA = "cccccccccccccccccccccccccccccccccccccccc";
 
   function allowEjection(overrides: { headRefOid?: string } = {}) {
     mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
       ok: true,
       headRefOid: overrides.headRefOid ?? LIVE_SHA,
+      headCommitAt: HEAD_PUSHED_BEFORE,
       lastEjection: null,
     });
   }
 
   function conflictEjection(
-    overrides: { headRefOid?: string; beforeCommitOid?: string; reason?: string | null } = {},
+    overrides: {
+      headRefOid?: string;
+      beforeCommitOid?: string;
+      headCommitAt?: string | null;
+      reason?: string | null;
+    } = {},
   ) {
     mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
       ok: true,
       headRefOid: overrides.headRefOid ?? LIVE_SHA,
+      // Default: the head commit predates the ejection (unchanged head) and the
+      // beforeCommit is a GROUP commit distinct from the head — proving the
+      // predicate does not compare the head to the queue group commit.
+      headCommitAt:
+        overrides.headCommitAt === undefined ? HEAD_PUSHED_BEFORE : overrides.headCommitAt,
       lastEjection: {
         reason: overrides.reason === undefined ? "merge_conflict" : overrides.reason,
         createdAt: EJECTED_AT,
-        beforeCommitOid: overrides.beforeCommitOid ?? LIVE_SHA,
+        beforeCommitOid: overrides.beforeCommitOid ?? GROUP_SHA,
       },
     });
   }
@@ -2024,7 +2042,11 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
     };
     const { service } = makeService(state);
     candidateIn(openSnapshot);
-    conflictEjection();
+    // #662 shape: merge_conflict ejection, head last pushed 16:07:16 (BEFORE the
+    // 17:04:36 ejection), and beforeCommit is the DISTINCT merge-queue group
+    // commit — the head has not moved, so the re-enqueue is refused even though
+    // beforeCommit ≠ live head.
+    conflictEjection({ headCommitAt: HEAD_PUSHED_BEFORE, beforeCommitOid: GROUP_SHA });
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -2142,8 +2164,10 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
     };
     const { service } = makeService(state);
     candidateIn(openSnapshot);
-    // Ejected at MOVED_SHA; the live head is now LIVE_SHA — head has moved.
-    conflictEjection({ beforeCommitOid: MOVED_SHA, headRefOid: LIVE_SHA });
+    // The live head commit postdates the ejection — the head was re-pushed after
+    // the conflict ejection, so re-enqueueing is the remedy. beforeCommit stays
+    // the (distinct) GROUP commit; the decision rests on the head commit time.
+    conflictEjection({ headCommitAt: HEAD_PUSHED_AFTER, headRefOid: LIVE_SHA });
     armSuccessfulReenqueue();
 
     await expect(service.sweep()).resolves.toEqual({
@@ -2197,6 +2221,32 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
     const { service } = makeService(state);
     candidateIn(openSnapshot);
     conflictEjection({ reason: null });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
+    });
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("AC6c: DEFERS (fails closed) when the head commit time cannot be read", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    // A merge_conflict ejection, but the head target is not a Commit (no
+    // committedDate) → head movement cannot be proven → defer (fail closed).
+    conflictEjection({ headCommitAt: null });
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,

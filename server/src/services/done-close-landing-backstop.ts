@@ -1036,9 +1036,12 @@ export function createDoneCloseLandingBackstopService(
    * SUP-15953: decide whether a still-open PR may be re-enqueued given its last
    * merge-queue ejection. A `merge_conflict` ejection on an UNCHANGED head cannot
    * be discharged by re-enqueueing — the same conflict ejects it again — so the
-   * re-enqueue is refused until the head moves. `failed_checks` and every other
-   * reason stay on the old behaviour (re-enqueue is the remedy). Fails CLOSED
-   * (deferred) when the ejection read cannot be trusted.
+   * re-enqueue is refused until the head moves. "Head moved" is proven by the
+   * live head commit's creation time POSTDATING the ejection (the same
+   * head-changed-since-ejection predicate the SUP-15952 sweep uses), NOT by
+   * comparing the head to the merge-queue group commit. `failed_checks` and every
+   * other reason stay on the old behaviour (re-enqueue is the remedy). Fails
+   * CLOSED (deferred) when the ejection read cannot be trusted.
    */
   async function authorizeReenqueueAfterEjection(
     companyId: string,
@@ -1061,24 +1064,34 @@ export function createDoneCloseLandingBackstopService(
     // non-conflict reason — fail closed rather than blind re-enqueue.
     if (ejection.lastEjection.reason === null) return { kind: "deferred" };
     if (ejection.lastEjection.reason !== "merge_conflict") return { kind: "allow" };
+    // A `merge_conflict` ejection is discharged only by a NEW head: the live
+    // head commit must postdate the ejection. `beforeCommit.oid` is the
+    // merge-queue GROUP commit — a synthetic commit structurally distinct from
+    // the PR head — so it is deliberately NOT compared here by oid; doing so
+    // would treat every unchanged head as "moved" and blind-re-enqueue the
+    // conflict. Finding:
+    // merge-conflict-ejection-compares-head-to-queue-group-commit.
     const liveHeadSha = ejection.headRefOid;
-    const beforeCommitOid = ejection.lastEjection.beforeCommitOid;
-    if (liveHeadSha === null || beforeCommitOid === null) {
-      // We cannot prove the head moved — fail closed rather than risk a blind
-      // re-enqueue of a conflict-ejected head.
+    const headCommitAt = ejection.headCommitAt;
+    const ejectedAt = ejection.lastEjection.createdAt;
+    const headCommitMs = headCommitAt !== null ? Date.parse(headCommitAt) : NaN;
+    const ejectedMs = ejectedAt !== null ? Date.parse(ejectedAt) : NaN;
+    if (Number.isNaN(headCommitMs) || Number.isNaN(ejectedMs)) {
+      // We cannot prove whether the head moved since the ejection — fail closed
+      // rather than risk a blind re-enqueue of a conflict-ejected head.
       return { kind: "deferred" };
     }
-    if (liveHeadSha !== beforeCommitOid) return { kind: "allow" };
+    if (headCommitMs > ejectedMs) return { kind: "allow" };
     const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
     const shortHead = liveHeadSha.slice(0, 7);
     return {
       kind: "refused",
       headSha: liveHeadSha,
-      ejectedAt: ejection.lastEjection.createdAt,
+      ejectedAt,
       reason:
         `PR ${prKey} was ejected from the merge queue with reason "merge_conflict"` +
-        `${ejection.lastEjection.createdAt ? ` at ${ejection.lastEjection.createdAt}` : ""}` +
-        ` and its head ${shortHead} has not moved since — re-enqueueing the same head would hit the same conflict`,
+        `${ejectedAt ? ` at ${ejectedAt}` : ""}` +
+        ` and its head ${shortHead} has not been re-pushed since — re-enqueueing the same head would hit the same conflict`,
     };
   }
 

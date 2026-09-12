@@ -2258,18 +2258,31 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
 export interface MergeQueueEjectionEvent {
   reason: string | null;
   createdAt: string | null;
-  /** The PR head oid the queue held at the moment of ejection. */
+  /**
+   * The merge-queue GROUP commit oid the queue held at ejection. This is a
+   * synthetic commit that is structurally DISTINCT from the PR's own head — it
+   * is retained as audit context only, NEVER compared by oid to the live head to
+   * prove the head moved. Finding:
+   * merge-conflict-ejection-compares-head-to-queue-group-commit.
+   */
   beforeCommitOid: string | null;
 }
 
 export type MergeQueueEjectionReadResult =
-  | { ok: true; headRefOid: string; lastEjection: MergeQueueEjectionEvent | null }
+  | {
+      ok: true;
+      headRefOid: string;
+      /** The live head commit's creation time, or null when the head target is not a commit. */
+      headCommitAt: string | null;
+      lastEjection: MergeQueueEjectionEvent | null;
+    }
   | { ok: false; reason: string };
 
 type MergeQueueEjectionFetch =
   | {
       ok: true;
       headRefOid: string;
+      headCommitAt: string | null;
       lastEjection: MergeQueueEjectionEvent | null;
       status: number;
       message: string | null;
@@ -2279,12 +2292,21 @@ type MergeQueueEjectionFetch =
 // SUP-15953: a PR's most recent merge-queue ejection PLUS its current head, in
 // one GraphQL round-trip. The ejection `reason` is available ONLY here — the REST
 // timeline omits it — so this read has no REST fallback. `beforeCommit.oid` is
-// the head the queue held when it removed the PR, which is exactly what the
-// re-enqueue predicate compares the live `headRefOid` against.
+// the merge-queue GROUP commit the queue held (NOT the PR head); it is read for
+// audit context only. The head-movement predicate instead reads the live head
+// commit's `committedDate` and compares it to the ejection `createdAt` — the
+// head has moved iff that commit postdates the ejection.
 const MERGE_QUEUE_EJECTION_QUERY = `query PaperclipMergeQueueEjection($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       headRefOid
+      headRef {
+        target {
+          ... on Commit {
+            committedDate
+          }
+        }
+      }
       timelineItems(last: 50, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
         nodes {
           ... on RemovedFromMergeQueueEvent {
@@ -2379,6 +2401,12 @@ async function fetchMergeQueueEjection(
   if (headRefOid === null) {
     return { ok: false, status: response.status, message: "head_oid_missing" };
   }
+  // The live head commit's creation time — the "has the head moved since the
+  // ejection" signal. Null when the head ref target is not a Commit (e.g. a tag
+  // object); the caller then fails closed rather than assuming head movement.
+  const headRef = pullRequest.headRef as Record<string, unknown> | undefined;
+  const headTarget = headRef?.target as Record<string, unknown> | undefined;
+  const headCommitAt = readString(headTarget?.committedDate);
 
   const timelineItems = pullRequest.timelineItems as Record<string, unknown> | undefined;
   const nodes = Array.isArray(timelineItems?.nodes)
@@ -2389,7 +2417,7 @@ async function fetchMergeQueueEjection(
   // `pickMostRecentMergeQueueEjection`.
   const lastEjection = pickMostRecentMergeQueueEjection(nodes);
 
-  return { ok: true, headRefOid, lastEjection, status: response.status, message: null };
+  return { ok: true, headRefOid, headCommitAt, lastEjection, status: response.status, message: null };
 }
 
 /**
@@ -2419,7 +2447,7 @@ export async function fetchLastMergeQueueEjectionViaTokenCandidates(
   for (const candidate of candidates) {
     const result = await fetchMergeQueueEjection(candidate.token, owner, repo, number);
     if (result.ok) {
-      return { ok: true, headRefOid: result.headRefOid, lastEjection: result.lastEjection };
+      return { ok: true, headRefOid: result.headRefOid, headCommitAt: result.headCommitAt, lastEjection: result.lastEjection };
     }
     lastStatus = result.status;
     lastMessage = result.message;
