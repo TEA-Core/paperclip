@@ -7331,11 +7331,21 @@ export function shouldQueueFollowupForRunningIssueWake(input: {
   );
 }
 
-function isCheckoutConflictError(error: unknown): boolean {
+export function isCheckoutConflictError(error: unknown): boolean {
+  if (!(error instanceof HttpError) || error.status !== 409) return false;
+  if (error.message === "Issue checkout conflict") return true;
+  // SUP-15888: a card already in a terminal status (done / cancelled) is refused
+  // by checkout with a distinct 409 (details.code "checkout_refused_terminal_status").
+  // Heartbeat auto-checkout treats a closed card the same as a transient checkout
+  // conflict — skip the checkout (or cancel the now-stale queued run, which the
+  // staleness gate already classifies as issue_terminal_status) rather than
+  // rethrowing — so the terminal refusal stays distinct in the API response while
+  // this caller's behavior is unchanged.
+  const details = error.details;
   return (
-    error instanceof HttpError &&
-    error.status === 409 &&
-    error.message === "Issue checkout conflict"
+    typeof details === "object" &&
+    details !== null &&
+    (details as { code?: unknown }).code === "checkout_refused_terminal_status"
   );
 }
 
