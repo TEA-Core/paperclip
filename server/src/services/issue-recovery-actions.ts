@@ -346,24 +346,30 @@ export function issueRecoveryActionService(db: Db) {
       .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
     // SUP-15847: same durable cumulative depth as `getFingerprintHistory`,
     // exposed per fingerprint for the read route. A `max(attemptCount)`
-    // projection understates the true cost whenever reset rows exist. Round 2:
-    // honor the board-reset boundary so a resolved predecessor's spent history
-    // is not re-counted into the fresh successor's budget.
-    const lastBoundaryByFingerprint = new Map<string, number>();
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i]!;
-      if (rowHasLineageResetBoundary(row)) lastBoundaryByFingerprint.set(row.fingerprint, i);
-    }
-    const depths = new Map<string, number>();
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i]!;
-      const boundary = lastBoundaryByFingerprint.get(row.fingerprint) ?? -1;
-      if (i < boundary) continue;
-      const depth = Math.max((depths.get(row.fingerprint) ?? 0) + 1, row.attemptCount);
-      depths.set(row.fingerprint, depth);
+    // projection understates the true cost whenever reset rows exist.
+    //
+    // Round 3: group the chronologically-ordered rows by fingerprint and fold
+    // each group independently. Each fingerprint's board-reset boundary is its
+    // own most-recent `lineageReset` row (round 2), so a reset for one
+    // fingerprint can never skip rows or seed the depth of another interleaved
+    // fingerprint. Keeping the boundary and the running depth scoped to one
+    // fingerprint each is what the round-3 review asked for explicitly.
+    const byFingerprint = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const group = byFingerprint.get(row.fingerprint);
+      if (group) group.push(row);
+      else byFingerprint.set(row.fingerprint, [row]);
     }
     const totals: Record<string, number> = {};
-    for (const [fingerprint, depth] of depths) {
+    for (const [fingerprint, groupRows] of byFingerprint) {
+      let boundaryIndex = -1;
+      for (let i = 0; i < groupRows.length; i++) {
+        if (rowHasLineageResetBoundary(groupRows[i]!)) boundaryIndex = i;
+      }
+      let depth = 0;
+      for (let i = boundaryIndex >= 0 ? boundaryIndex : 0; i < groupRows.length; i++) {
+        depth = Math.max(depth + 1, groupRows[i]!.attemptCount);
+      }
       totals[fingerprint] = depth;
     }
     return totals;

@@ -1198,6 +1198,104 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(Math.max(...raw.map((row) => row.attemptCount))).toBe(5);
   });
 
+  it("SUP-15847 (round 3): folds interleaved fingerprints independently, honoring only the marked fingerprint's reset boundary", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprintA = "recovery:interleaved:boundary:A";
+    const fingerprintB = "recovery:interleaved:boundary:B";
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    const t1 = new Date("2026-01-02T00:00:00.000Z");
+    const t2 = new Date("2026-01-03T00:00:00.000Z");
+    const t3 = new Date("2026-01-04T00:00:00.000Z");
+
+    // Two fingerprints interleaved on one issue. Only A carries a board-reset
+    // lineage boundary (the attempt-1 successor after a resolved attempt-4
+    // predecessor). A's closed predecessor must not count, but B's row that was
+    // created *between* A's two rows must still count for B: a boundary that is
+    // tracked as a single global row index would skip it.
+    await db.insert(issueRecoveryActions).values([
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint: fingerprintA,
+        status: "resolved",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: {},
+        nextAction: "Prior resolution.",
+        attemptCount: 4,
+        maxAttempts: 5,
+        outcome: "restored",
+        createdAt: t0,
+        updatedAt: t0,
+        resolvedAt: t0,
+      },
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint: fingerprintB,
+        status: "cancelled",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: {},
+        nextAction: "Repair B.",
+        attemptCount: 1,
+        maxAttempts: 5,
+        outcome: "cancelled",
+        createdAt: t1,
+        updatedAt: t1,
+        resolvedAt: t1,
+      },
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint: fingerprintA,
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: { lineageReset: { inheritedDepthBefore: 4 } },
+        nextAction: "Repair A after board reset.",
+        attemptCount: 1,
+        maxAttempts: 5,
+        createdAt: t2,
+        updatedAt: t2,
+      },
+      {
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "execution_review_participant_recovery",
+        fingerprint: fingerprintB,
+        status: "cancelled",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        evidence: {},
+        nextAction: "Repair B again.",
+        attemptCount: 1,
+        maxAttempts: 5,
+        outcome: "cancelled",
+        createdAt: t3,
+        updatedAt: t3,
+        resolvedAt: t3,
+      },
+    ]);
+
+    const totals = await svc.getFingerprintAttemptTotals(companyId, sourceIssue.id);
+    // A: only the attempt-1 successor counts (the attempt-4 predecessor was
+    // closed by the board reset) -> depth 1.
+    expect(totals[fingerprintA]).toBe(1);
+    // B: both of its rows count (no reset) -> fold 1 then max(1 + 1, 1) = 2.
+    // If the boundary were applied as a single global index, B's earlier row
+    // (created between A's rows) would be skipped and B would report 1.
+    expect(totals[fingerprintB]).toBe(2);
+  });
+
   it("SUP-15847: carries the durable cumulative depth into the ceiling so a reset cannot understate the escalation", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const svc = issueRecoveryActionService(db);
