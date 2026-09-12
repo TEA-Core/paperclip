@@ -2300,6 +2300,36 @@ const MERGE_QUEUE_EJECTION_QUERY = `query PaperclipMergeQueueEjection($owner: St
   }
 }`;
 
+// SUP-15953: pick the most recent ejection from a GraphQL
+// `timelineItems(last:)` node list. GitHub returns those nodes in chronological
+// order (oldest first), so the most recent ejection is the LAST non-null node.
+// Recency is established by ARRAY POSITION ONLY: a parsed timestamp is never used
+// for ordering, so a malformed/missing `createdAt` (or a null reason) on the
+// newest event can never make an OLDER, readable event win — that would be
+// fail-open (e.g. picking an older `failed_checks` event over a newer,
+// unreadable one and re-enqueueing a `merge_conflict` head). When the picked
+// event's `reason` is unreadable, `reason` stays null and the caller defers
+// (fail closed). Finding: latest-ejection-invalid-timestamp-fail-open.
+export function pickMostRecentMergeQueueEjection(
+  nodes: Array<Record<string, unknown> | null>,
+): MergeQueueEjectionEvent | null {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const node = nodes[i];
+    if (!node || typeof node !== "object") continue;
+    const createdAt = typeof node.createdAt === "string" ? node.createdAt : null;
+    const beforeCommit = node.beforeCommit as Record<string, unknown> | undefined;
+    return {
+      reason: typeof node.reason === "string" && node.reason.length > 0 ? node.reason : null,
+      createdAt,
+      beforeCommitOid:
+        typeof beforeCommit?.oid === "string" && beforeCommit.oid.length > 0
+          ? beforeCommit.oid
+          : null,
+    };
+  }
+  return null;
+}
+
 async function fetchMergeQueueEjection(
   token: string,
   owner: string,
@@ -2354,28 +2384,10 @@ async function fetchMergeQueueEjection(
   const nodes = Array.isArray(timelineItems?.nodes)
     ? (timelineItems!.nodes as Array<Record<string, unknown> | null>)
     : [];
-  let lastEjection: MergeQueueEjectionEvent | null = null;
-  let lastAt = -Infinity;
-  nodes.forEach((node, index) => {
-    if (!node || typeof node !== "object") return;
-    const createdAt = typeof node.createdAt === "string" ? node.createdAt : null;
-    const parsed = createdAt !== null ? Date.parse(createdAt) : NaN;
-    // `timelineItems(last:)` is chronological, so fall back to array order when a
-    // node has no parseable timestamp.
-    const at = Number.isFinite(parsed) ? parsed : index;
-    if (lastEjection === null || at >= lastAt) {
-      const beforeCommit = node.beforeCommit as Record<string, unknown> | undefined;
-      lastEjection = {
-        reason: typeof node.reason === "string" && node.reason.length > 0 ? node.reason : null,
-        createdAt,
-        beforeCommitOid:
-          typeof beforeCommit?.oid === "string" && beforeCommit.oid.length > 0
-            ? beforeCommit.oid
-            : null,
-      };
-      lastAt = at;
-    }
-  });
+  // Recency is decided by array position only (chronological); an unreadable
+  // newest event never yields to an older readable one — see
+  // `pickMostRecentMergeQueueEjection`.
+  const lastEjection = pickMostRecentMergeQueueEjection(nodes);
 
   return { ok: true, headRefOid, lastEjection, status: response.status, message: null };
 }
