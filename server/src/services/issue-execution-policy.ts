@@ -12,6 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -21,6 +22,7 @@ type AssigneeLike = {
 type IssueLike = AssigneeLike & {
   status: string;
   responsibleUserId?: string | null;
+  createdByAgentId?: string | null;
   createdByUserId?: string | null;
   executionPolicy?: IssueExecutionPolicy | Record<string, unknown> | null;
   executionState?: IssueExecutionState | Record<string, unknown> | null;
@@ -739,8 +741,14 @@ function mergeSkippedStageIds(
   return Array.from(new Set([...(previous?.skippedStageIds ?? []), ...(added ?? [])]));
 }
 
-function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
-  const completedStageIds = Array.from(new Set([...(previous?.completedStageIds ?? []), currentStage.id]));
+function buildCompletedState(
+  previous: IssueExecutionState | null,
+  currentStage: IssueExecutionStage,
+  decidedStageIds: readonly string[] = [],
+): IssueExecutionState {
+  const completedStageIds = Array.from(
+    new Set([...(previous?.completedStageIds ?? []), ...decidedStageIds, currentStage.id]),
+  );
   return {
     status: COMPLETED_STATUS,
     currentStageId: null,
@@ -1795,14 +1803,22 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
   const body = input.commentBody.trim();
 
   if (input.decision === "approved") {
-    if (
-      input.actorUserId &&
-      returnAssignee?.type === "user" &&
-      returnAssignee.userId === input.actorUserId
-    ) {
-      throw new BoardStageSelfApprovalError();
+    if (input.actorUserId) {
+      // SUP-15805 redo: resolve the gated principal through the canonical
+      // resolver so the board path refuses the same principals Guard B does —
+      // including a `deliveryAuthor` fallback when no return assignee is set.
+      // Comparing only `returnAssignee` left the delivery-author shape (the
+      // exact self-satisfying hole this guard exists to close) unrefused.
+      const gated = resolveGatedPrincipal(
+        input.policy as unknown as Record<string, unknown>,
+        (previous ?? {}) as Record<string, unknown>,
+        input.issue.createdByAgentId ?? null,
+      );
+      if (gated.userIds.has(input.actorUserId)) {
+        throw new BoardStageSelfApprovalError();
+      }
     }
-    const completedState = buildCompletedState(previous, targetStage);
+    const completedState = buildCompletedState(previous, targetStage, input.decidedStageIds);
     const nextStage = nextPendingStageAfter(input.policy, targetStage, completedState);
     const patch: Record<string, unknown> = {};
     if (nextStage) {
@@ -1823,11 +1839,17 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
     } else {
       // Final stage: complete the ladder and hand the card back to its return
       // assignee in_progress (never `done`), matching the review-escalation path.
+      // With no return assignee there is no one to hand back to: queue the card
+      // (`todo`, mirroring the changes-requested hand-back) and clear the
+      // workflow-controlled assignee, so it is never left assigned to — or woken
+      // against — the participant the board displaced.
       patch.executionState = completedState;
-      patch.status = "in_progress";
       if (returnAssignee) {
-        Object.assign(patch, patchForPrincipal(returnAssignee));
+        patch.status = "in_progress";
+      } else {
+        patch.status = "todo";
       }
+      Object.assign(patch, patchForPrincipal(returnAssignee));
     }
     return {
       patch,

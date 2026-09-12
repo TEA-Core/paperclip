@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -71,10 +71,12 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
     await db.delete(issueExecutionDecisions);
     await db.delete(issueComments);
+    // activity_log.run_id references heartbeat_runs WITHOUT a delete rule, so the
+    // activity must go before any seeded run (the provenance test seeds one).
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
-    await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -105,13 +107,14 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     return app;
   }
 
-  function boardActor(companyId: string): Express.Request["actor"] {
+  function boardActor(companyId: string, overrides: Record<string, unknown> = {}): Express.Request["actor"] {
     return {
       type: "board",
       userId: USER_ID,
       companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }],
       source: "cloud_tenant",
+      ...overrides,
     } as unknown as Express.Request["actor"];
   }
 
@@ -139,6 +142,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     noExecutionState?: boolean;
     /** Seed the return assignee as this board user instead of an agent. */
     returnAssigneeUserId?: string;
+    /** Seed no return assignee at all (a ladder with no recorded owner). */
+    nullReturnAssignee?: boolean;
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -203,9 +208,11 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
         : []),
     ];
 
-    const returnAssigneePrincipal = opts.returnAssigneeUserId
-      ? { type: "user" as const, agentId: null, userId: opts.returnAssigneeUserId }
-      : { type: "agent" as const, agentId: returnAssigneeAgentId, userId: null };
+    const returnAssigneePrincipal = opts.nullReturnAssignee
+      ? null
+      : opts.returnAssigneeUserId
+        ? { type: "user" as const, agentId: null, userId: opts.returnAssigneeUserId }
+        : { type: "agent" as const, agentId: returnAssigneeAgentId, userId: null };
 
     const executionState = opts.noExecutionState
       ? null
@@ -253,8 +260,9 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
         mode: "normal",
         commentRequired: true,
         // A user return assignee lives on the execution state; the policy's
-        // agent id wins resolution, so omit it for the user case.
-        ...(opts.returnAssigneeUserId ? {} : { returnAssigneeAgentId }),
+        // agent id wins resolution, so omit it for the user case (and when no
+        // return assignee is seeded at all).
+        ...(opts.returnAssigneeUserId || opts.nullReturnAssignee ? {} : { returnAssigneeAgentId }),
         stages,
       },
       executionState,
@@ -499,6 +507,21 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .from(issueComments)
       .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
     expect(armComments.some((c) => c.body.startsWith("[Merge-arming]"))).toBe(true);
+
+    // A board decision is NOT a closing transition. The shared hook's CLOSE
+    // refusal signal (keyed by the done-close-landing backstop) must not be
+    // written: flipping `closingTransition: false` to true in the route would
+    // record `issue.merge_arming_refused_on_close` here and go red.
+    const refusalActivity = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.merge_arming_refused_on_close"),
+        ),
+      );
+    expect(refusalActivity).toHaveLength(0);
   });
 
   it("409s with terminal_status on a done issue", async () => {
@@ -628,5 +651,224 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .from(issueExecutionDecisions)
       .where(eq(issueExecutionDecisions.issueId, issueId));
     expect(decisions).toHaveLength(2);
+  });
+
+  it("wakes the return assignee when a board decision requests changes", async () => {
+    const { companyId, issueId, returnAssigneeAgentId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    const calls: Array<{ agentId: string; reason: string | null }> = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string, options: any) => {
+        calls.push({ agentId, reason: options?.reason ?? null });
+        return { id: "wakeup-test" } as any;
+      },
+    });
+
+    const res = await request(localApp)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "changes_requested", comment: "board: needs more error handling" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.agentId).toBe(returnAssigneeAgentId);
+    expect(calls[0]!.reason).toBe("execution_changes_requested");
+  });
+
+  it("wakes the resolved return assignee when a board approval completes the final stage", async () => {
+    const { companyId, issueId, returnAssigneeAgentId, reviewerAgentId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    const calls: Array<{ agentId: string; reason: string | null; payload: any; contextSnapshot: any }> = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string, options: any) => {
+        calls.push({
+          agentId,
+          reason: options?.reason ?? null,
+          payload: options?.payload ?? {},
+          contextSnapshot: options?.contextSnapshot ?? {},
+        });
+        return { id: "wakeup-test" } as any;
+      },
+    });
+
+    const res = await request(localApp)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: final stage approved" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    // The ladder completed, so no execution-stage wake exists. The handback must
+    // still tell the resolved return assignee the card is theirs again — not the
+    // displaced reviewer the board decided against.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.agentId).toBe(returnAssigneeAgentId);
+    expect(calls[0]!.agentId).not.toBe(reviewerAgentId);
+    expect(calls[0]!.reason).toBe("issue_assigned");
+    expect(calls[0]!.payload.commentId).toBe(res.body.commentId);
+    expect(calls[0]!.contextSnapshot.commentId).toBe(res.body.commentId);
+  });
+
+  it("clears the assignee and enqueues no wake when the final stage has no return assignee", async () => {
+    const { companyId, issueId } = await seedIssue({ nullReturnAssignee: true });
+    currentActor = boardActor(companyId);
+    const calls: unknown[] = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string, options: any) => {
+        calls.push({ agentId, options });
+        return { id: "wakeup-test" } as any;
+      },
+    });
+
+    const res = await request(localApp)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: final stage approved, no owner" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    // No return assignee: the card is queued (`todo`) with the assignee cleared
+    // rather than left `in_progress` on the displaced reviewer the board decided
+    // against (and cannot be `in_progress` with no assignee).
+    expect(row!.status).toBe("todo");
+    expect(row!.assigneeAgentId).toBeNull();
+    expect(row!.assigneeUserId).toBeNull();
+    // No assignee to wake: the route must not enqueue a wake for a null agent.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rolls back the decision and the transition when the audit comment write fails", async () => {
+    const { companyId, issueId, reviewerAgentId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    await db.execute(sql.raw(`
+      CREATE OR REPLACE FUNCTION paperclip_test_fail_board_comment()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        RAISE EXCEPTION 'forced board-decision comment failure';
+      END
+      $function$;
+      CREATE TRIGGER paperclip_test_fail_board_comment
+      BEFORE INSERT ON issue_comments
+      FOR EACH ROW EXECUTE FUNCTION paperclip_test_fail_board_comment();
+    `));
+    try {
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      expect(res.status).toBe(500);
+    } finally {
+      await db.execute(sql.raw(`
+        DROP TRIGGER IF EXISTS paperclip_test_fail_board_comment ON issue_comments;
+        DROP FUNCTION IF EXISTS paperclip_test_fail_board_comment();
+      `));
+    }
+
+    // The comment shares the decision's transaction: a failed comment must leave
+    // neither the decision row nor the transition committed (no half-written audit).
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(0);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_review");
+    expect(row!.assigneeAgentId).toBe(reviewerAgentId);
+    expect((row!.executionState as Record<string, unknown>).completedStageIds).not.toContain(STAGE_ID);
+  });
+
+  it("records the concrete board user and run on the decision, comment, activity, and wake", async () => {
+    const { companyId, issueId, reviewerAgentId, returnAssigneeAgentId } = await seedIssue();
+    const runId = "88888888-8888-4888-8888-888888888888";
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: reviewerAgentId });
+    currentActor = boardActor(companyId, { runId });
+    const calls: Array<{ agentId: string; options: any }> = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string, options: any) => {
+        calls.push({ agentId, options });
+        return { id: "wakeup-test" } as any;
+      },
+    });
+
+    const res = await request(localApp)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "changes_requested", comment: "board: needs more error handling" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const commentId = res.body.commentId as string;
+
+    const [decisionRow] = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisionRow!.actorUserId).toBe(USER_ID);
+    expect(decisionRow!.actorAgentId).toBeNull();
+    expect(decisionRow!.createdByRunId).toBe(runId);
+
+    const [commentRow] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+    expect(commentRow!.authorUserId).toBe(USER_ID);
+    expect(commentRow!.authorAgentId).toBeNull();
+    expect(commentRow!.createdByRunId).toBe(runId);
+
+    const [activityRow] = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_override")));
+    expect(activityRow!.actorId).toBe(USER_ID);
+    expect(activityRow!.runId).toBe(runId);
+    expect((activityRow!.details as Record<string, unknown>).commentId).toBe(commentId);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.agentId).toBe(returnAssigneeAgentId);
+    expect(calls[0]!.options.requestedByActorType).toBe("user");
+    expect(calls[0]!.options.requestedByActorId).toBe(USER_ID);
+    expect(calls[0]!.options.payload.runId).toBe(runId);
+    expect(calls[0]!.options.contextSnapshot.runId).toBe(runId);
+  });
+
+  it("serializes concurrent board decisions so each targets a distinct stage", async () => {
+    const { companyId, issueId } = await seedIssue({ twoStages: true });
+    currentActor = boardActor(companyId);
+    const advisoryLockKey = 917460186;
+    await db.execute(sql.raw(`
+      CREATE OR REPLACE FUNCTION paperclip_test_pause_board_decision()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        PERFORM pg_advisory_xact_lock(${advisoryLockKey});
+        PERFORM pg_sleep(1);
+        RETURN NEW;
+      END
+      $function$;
+      CREATE TRIGGER paperclip_test_pause_board_decision
+      BEFORE INSERT ON issue_execution_decisions
+      FOR EACH ROW EXECUTE FUNCTION paperclip_test_pause_board_decision();
+    `));
+    try {
+      const [first, second] = await Promise.all([
+        request(app)
+          .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+          .send({ decision: "approved", comment: "board: concurrent A" }),
+        request(app)
+          .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+          .send({ decision: "approved", comment: "board: concurrent B" }),
+      ]);
+      expect(first.status, JSON.stringify(first.body)).toBe(200);
+      expect(second.status, JSON.stringify(second.body)).toBe(200);
+    } finally {
+      await db.execute(sql.raw(`
+        DROP TRIGGER IF EXISTS paperclip_test_pause_board_decision ON issue_execution_decisions;
+        DROP FUNCTION IF EXISTS paperclip_test_pause_board_decision();
+      `));
+    }
+
+    // The row lock (`.for("update")`) forces the losing decision to re-read the
+    // committed state; it must therefore resolve the NEXT undecided stage instead
+    // of double-deciding the first. Removing the lock lets both target STAGE_ID
+    // and this collapses to a single distinct stage.
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(2);
+    expect(new Set(decisions.map((decision) => decision.stageId)).size).toBe(2);
   });
 });

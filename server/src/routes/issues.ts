@@ -2756,6 +2756,7 @@ function buildExecutionStageWakeup(input: {
   interruptedRunId: string | null;
   requestedByActorType: "user" | "agent";
   requestedByActorId: string;
+  requestedByRunId?: string | null;
 }) {
   const { issueId, previousState, nextState, interruptedRunId } = input;
   if (!nextState) return null;
@@ -2788,6 +2789,7 @@ function buildExecutionStageWakeup(input: {
           mutation: "update",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(input.requestedByRunId ? { runId: input.requestedByRunId } : {}),
         },
         requestedByActorType: input.requestedByActorType,
         requestedByActorId: input.requestedByActorId,
@@ -2798,6 +2800,7 @@ function buildExecutionStageWakeup(input: {
           source: "issue.execution_stage",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(input.requestedByRunId ? { runId: input.requestedByRunId } : {}),
         },
       },
     };
@@ -2828,6 +2831,7 @@ function buildExecutionStageWakeup(input: {
           mutation: "update",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(input.requestedByRunId ? { runId: input.requestedByRunId } : {}),
         },
         requestedByActorType: input.requestedByActorType,
         requestedByActorId: input.requestedByActorId,
@@ -2838,6 +2842,7 @@ function buildExecutionStageWakeup(input: {
           source: "issue.execution_stage",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(input.requestedByRunId ? { runId: input.requestedByRunId } : {}),
         },
       },
     };
@@ -8773,6 +8778,8 @@ export function issueRoutes(
       commentRow: Awaited<ReturnType<typeof svc.addComment>>;
       previousState: ReturnType<typeof parseIssueExecutionState>;
       nextExecutionState: Record<string, unknown>;
+      previousAssigneeAgentId: string | null;
+      previousAssigneeUserId: string | null;
     };
     let outcome: BoardDecisionTransactionResult | null = null;
 
@@ -8789,6 +8796,8 @@ export function issueRoutes(
           .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, id)))
           .for("update");
         if (!lockedIssue) return null;
+        const previousAssigneeAgentId = lockedIssue.assigneeAgentId ?? null;
+        const previousAssigneeUserId = lockedIssue.assigneeUserId ?? null;
 
         // SUP-15805 addendum 1: require a live, non-terminal issue. A done/
         // cancelled card would otherwise be silently reopened by the patch below,
@@ -8931,7 +8940,15 @@ export function issueRoutes(
           postCommitActivityPublications,
         );
 
-        return { updated, result, commentRow, previousState, nextExecutionState };
+        return {
+          updated,
+          result,
+          commentRow,
+          previousState,
+          nextExecutionState,
+          previousAssigneeAgentId,
+          previousAssigneeUserId,
+        };
       });
     } catch (err) {
       if (err instanceof BoardDecisionRejection) {
@@ -8962,11 +8979,48 @@ export function issueRoutes(
       interruptedRunId: null,
       requestedByActorType: actor.actorType,
       requestedByActorId: boardUserId,
+      requestedByRunId: actor.runId ?? null,
     });
     if (executionStageWakeup) {
       void enqueueExecutionStageWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup).catch((err) => {
         logger.warn({ err, issueId: id }, "failed to enqueue board stage decision wakeup");
       });
+    } else {
+      // SUP-15805 redo: the final-stage approval handback (and any decision that
+      // moves the workflow-controlled assignee) transitions without producing an
+      // execution-stage wake — `buildExecutionStageWakeup` returns null once the
+      // ladder is complete. Mirror the PATCH path's `issue_assigned` wake so the
+      // newly-assigned return assignee is actually told, with the same
+      // comment/run provenance the decision row and comment carry.
+      const assigneeChanged =
+        outcome.updated.assigneeAgentId !== outcome.previousAssigneeAgentId ||
+        outcome.updated.assigneeUserId !== outcome.previousAssigneeUserId;
+      const nextAssigneeAgentId = outcome.updated.assigneeAgentId ?? null;
+      if (assigneeChanged && nextAssigneeAgentId && outcome.updated.status !== "backlog") {
+        void enqueueExecutionStageWakeup(nextAssigneeAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: {
+            issueId: id,
+            commentId: outcome.commentRow.id,
+            mutation: "update",
+            ...(actor.runId ? { runId: actor.runId } : {}),
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: boardUserId,
+          contextSnapshot: {
+            issueId: id,
+            taskId: id,
+            commentId: outcome.commentRow.id,
+            wakeCommentId: outcome.commentRow.id,
+            source: "issue.execution_stage",
+            ...(actor.runId ? { runId: actor.runId } : {}),
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: id }, "failed to enqueue board stage decision assignment wakeup");
+        });
+      }
     }
 
     // Post-decision hook, identical to the PATCH path: publishes the approval
