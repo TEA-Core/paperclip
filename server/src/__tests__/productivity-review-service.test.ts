@@ -18,6 +18,7 @@ import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
+  DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
@@ -186,6 +187,44 @@ describeEmbeddedPostgres("productivity review service", () => {
         sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
       ))
       .orderBy(issueComments.createdAt);
+  }
+
+  function armedMonitorState(overrides: {
+    status?: "scheduled" | "triggered" | "cleared";
+    nextCheckAt?: string | null;
+    attemptCount?: number;
+  } = {}) {
+    return {
+      status: overrides.status ?? "scheduled",
+      nextCheckAt: overrides.nextCheckAt ?? null,
+      lastTriggeredAt: null,
+      attemptCount: overrides.attemptCount ?? 0,
+      notes: null,
+      scheduledBy: "assignee" as const,
+      clearedAt: null,
+      clearReason: null,
+    };
+  }
+
+  function executionStateWithMonitor(monitor: ReturnType<typeof armedMonitorState> | null) {
+    return {
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor,
+    };
+  }
+
+  async function setIssueExecutionState(
+    issueId: string,
+    executionState: Record<string, unknown>,
+  ) {
+    await db.update(issues).set({ executionState }).where(eq(issues.id, issueId));
   }
 
   it("creates exactly one manager-assigned review for a no-comment run streak and rate-limits immediate refresh", async () => {
@@ -651,6 +690,162 @@ describeEmbeddedPostgres("productivity review service", () => {
       .update(agents)
       .set({ runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true } } })
       .where(eq(agents.id, seeded.coderId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("does not raise a long-active review for a card idle behind an armed monitor with a future next check (SUP-15831)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // No runs, so the only trigger that could fire is long_active_duration
+    // (7h elapsed). The armed monitor with a live future next check must
+    // exempt it, producing no card.
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({ nextCheckAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString() }),
+      ),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still raises a review for an armed-monitor card when no_comment_streak fires (SUP-15831, trigger-scoped)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({ nextCheckAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString() }),
+      ),
+    );
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  it("still raises a review for an armed-monitor card when high_churn fires (SUP-15831, trigger-scoped)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({ nextCheckAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString() }),
+      ),
+    );
+    // Comments on every run keep no_comment_streak at zero so only high_churn
+    // can fire.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+      now,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
+  it("keeps long_active_duration live when the monitor arm is not scheduled (SUP-15831, stale arm)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // A triggered/cleared arm is not the armed idle steady state.
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(armedMonitorState({ status: "triggered", nextCheckAt: null })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("keeps long_active_duration live when an armed monitor's nextCheckAt is null (SUP-15831, stale arm)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(armedMonitorState({ status: "scheduled", nextCheckAt: null })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("keeps long_active_duration live when an armed monitor's nextCheckAt is in the past (SUP-15831, stale arm)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // A past nextCheckAt is a lapsed arm, not a live wait.
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({ nextCheckAt: new Date(now.getTime() - 60 * 1000).toISOString() }),
+      ),
+    );
 
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,

@@ -14,6 +14,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { hasNoPlatformDispatchPath } from "./agent-work-delivery.js";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { budgetService } from "./budgets.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -211,6 +212,27 @@ function choosePrimaryTrigger(input: {
   if (input.highChurn) return "high_churn";
   if (input.longActive) return "long_active_duration";
   return null;
+}
+
+/**
+ * True when the issue is parked `in_progress` behind an armed monitor whose
+ * next check is still in the future — the harness's sanctioned resting state
+ * for a recurring watcher. Such a card's active episode is unbounded *by
+ * design*, so the `long_active_duration` trigger (a plain 6h elapsed clock
+ * from `startedAt`) latches true permanently and re-fires on every generator
+ * pass as a structural false positive. This exemption is trigger-scoped: it
+ * silences only `long_active_duration`; `no_comment_streak` and `high_churn`
+ * stay live so a watcher that stops posting digests or starts thrashing is
+ * still caught. A stale arm (status not `scheduled`, or a null/past
+ * `nextCheckAt`) does NOT exempt.
+ */
+function isIdleBehindArmedMonitor(sourceIssue: IssueRow, now: Date): boolean {
+  if (sourceIssue.status !== "in_progress") return false;
+  const monitor = parseIssueExecutionState(sourceIssue.executionState)?.monitor;
+  if (monitor?.status !== "scheduled") return false;
+  if (!monitor.nextCheckAt) return false;
+  const nextCheckAtMs = Date.parse(monitor.nextCheckAt);
+  return Number.isFinite(nextCheckAtMs) && nextCheckAtMs > now.getTime();
 }
 
 function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
@@ -568,7 +590,13 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // A card idle behind an armed monitor has an unbounded active episode by
+    // design, so the duration trigger is structurally meaningless for it; the
+    // no-comment and churn triggers remain live (see isIdleBehindArmedMonitor).
+    const longActive =
+      !isIdleBehindArmedMonitor(sourceIssue, now) &&
+      elapsedMs !== null &&
+      elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
