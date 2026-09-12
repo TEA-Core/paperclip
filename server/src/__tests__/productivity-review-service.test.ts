@@ -6,6 +6,7 @@ import {
   agents,
   companies,
   createDb,
+  environmentLeases,
   heartbeatRuns,
   issueComments,
   issues,
@@ -127,6 +128,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    withLeases?: boolean;
     status?: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
     durationMs?: number;
   }) {
@@ -153,6 +155,27 @@ describeEmbeddedPostgres("productivity review service", () => {
     }
     await db.insert(heartbeatRuns).values(runs);
 
+    // A run that actually ran acquired an environment lease; a run cancelled at
+    // admission (shared-workspace contention) never did. `countIssueRunsSince`
+    // only screens leased runs, so mirror that here unless a caller asks for
+    // never-leased runs.
+    if (input.withLeases !== false) {
+      await db.insert(environmentLeases).values(
+        runs.map((run) => ({
+          companyId: input.companyId,
+          heartbeatRunId: run.id,
+          issueId: input.issueId,
+          status: "released",
+          leasePolicy: "ephemeral",
+          provider: "local",
+          acquiredAt: run.startedAt as Date,
+          lastUsedAt: run.startedAt as Date,
+          createdAt: run.startedAt as Date,
+          updatedAt: run.startedAt as Date,
+        })),
+      );
+    }
+
     if (input.withRunComments) {
       await db.insert(issueComments).values(
         runs.map((run, index) => ({
@@ -168,6 +191,52 @@ describeEmbeddedPostgres("productivity review service", () => {
     }
 
     return runs;
+  }
+
+  // Inserts a single run with precise control over whether an environment lease
+  // was acquired, so the high-churn lease screen (SUP-15947) can be exercised
+  // per-run. A short duration keeps the budget-weighted no-comment streak below
+  // threshold regardless of comments, isolating the run-count trigger.
+  async function insertControlledRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    startedAt: Date;
+    status: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+    withLease: boolean;
+  }) {
+    const runId = randomUUID();
+    const startedAt = input.startedAt;
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: input.status,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 30_000),
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      livenessState: "advanced",
+      nextAction: "Continue processing the next batch.",
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+    if (input.withLease) {
+      await db.insert(environmentLeases).values({
+        companyId: input.companyId,
+        heartbeatRunId: runId,
+        issueId: input.issueId,
+        status: "released",
+        leasePolicy: "ephemeral",
+        provider: "local",
+        acquiredAt: startedAt,
+        lastUsedAt: startedAt,
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      });
+    }
+    return runId;
   }
 
   async function listProductivityReviews(companyId: string) {
@@ -896,6 +965,75 @@ describeEmbeddedPostgres("productivity review service", () => {
       companyId: seeded.companyId,
     });
 
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+  });
+
+  it("excludes never-leased admission-cancelled runs from the high-churn count (SUP-15947)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const base = { companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId };
+    const min = 60_000;
+    // SUP-15945 shape: 2 runs actually leased an environment, 8 were cancelled
+    // at admission by shared-workspace contention and never leased. Only the 2
+    // leased runs are agent activity, so the run count is 2, not 10.
+    await insertControlledRun({ ...base, status: "succeeded", startedAt: new Date(now.getTime() - 5 * min), withLease: true });
+    await insertControlledRun({ ...base, status: "succeeded", startedAt: new Date(now.getTime() - 10 * min), withLease: true });
+    for (let i = 0; i < 8; i += 1) {
+      await insertControlledRun({
+        ...base,
+        status: "cancelled",
+        startedAt: new Date(now.getTime() - (15 + i * 5) * min),
+        withLease: false,
+      });
+    }
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // If the 8 never-leased runs were counted the run total would be 10 and
+    // high_churn would fire; they must be screened out of the input metric.
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires high_churn when 10 runs in the hour actually leased environments (SUP-15947 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const base = { companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId };
+    const min = 60_000;
+    for (let i = 0; i < 10; i += 1) {
+      await insertControlledRun({ ...base, status: "succeeded", startedAt: new Date(now.getTime() - i * 5 * min), withLease: true });
+    }
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // Guards against an over-broad screen: 10 genuinely-leased runs still trip
+    // high_churn and report 10/1h, so the filter does not drop real churn.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+  });
+
+  it("counts a leased run that later failed or timed out as churn (SUP-15947)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const base = { companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId };
+    const min = 60_000;
+    const statuses = [
+      "failed", "timed_out", "failed", "succeeded", "interrupted",
+      "timed_out", "failed", "succeeded", "failed", "timed_out",
+    ] as const;
+    for (let i = 0; i < 10; i += 1) {
+      await insertControlledRun({ ...base, status: statuses[i]!, startedAt: new Date(now.getTime() - i * 5 * min), withLease: true });
+    }
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // A run that leased an environment and then burned budget failing is still
+    // churn: the screen only drops runs that never leased, not terminal failures.
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");

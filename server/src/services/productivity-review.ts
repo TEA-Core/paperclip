@@ -6,6 +6,7 @@ import {
   agents,
   companies,
   costEvents,
+  environmentLeases,
   heartbeatRuns,
   issueComments,
   issues,
@@ -450,6 +451,19 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
+          // A run cancelled at admission — e.g. shared-workspace contention
+          // (`execution_workspace_occupied`) — never acquires an environment
+          // lease, so no agent process started and no budget was burned. Counting
+          // it as churn fabricates a high-churn card on a seat that is merely
+          // blocked by contention (SUP-15947). Count only runs that actually
+          // leased an environment; a leased run that later failed/timed_out
+          // still counts, since it burned real budget.
+          sql`exists (
+            select 1
+            from ${environmentLeases}
+            where ${environmentLeases.companyId} = ${companyId}
+              and ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id}
+          )`,
         ),
       )
       .then((rows) => rows[0]?.count ?? 0);
