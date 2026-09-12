@@ -4538,17 +4538,19 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).not.toContain("is missing a done-tier declaration");
     });
 
-    it("resolves Tier 2 evidence from the true position when the evidence line is duplicated (indexOf regression)", async () => {
-      // Regression guard for the done-tier evidence lookahead. The prior
-      // implementation located the evidence line with `lines.indexOf(line)`
-      // (a value match) and then read exactly one following line
-      // (`lines[idx + 1]`). With a blank line directly after the prefix, that
-      // value-match path read the blank and spuriously rejected the
-      // declaration even though the evidence sat on the next non-empty line.
-      // The index-based loop resolves the evidence from its true position,
-      // past the blank, here on a line whose value also repeats later in the
-      // body — so a value-match that jumped to a duplicate could not resolve
-      // it.
+    it("resolves Tier 2 evidence across the blank line after the prefix, from its true position even when the evidence value repeats later in the body", async () => {
+      // Pins the blank-line forward scan, not an indexOf fix. The prefix line
+      // carries no trailing evidence, so the guard skips the blank line that
+      // follows it and resolves the evidence from the next non-empty line, at
+      // its true position (SUP-15787 case 3). The evidence value's later
+      // duplicate in this body is incidental: it does not exercise any
+      // value-match path, because the pre-fix `lines.indexOf(...)` lookup ran
+      // on the prefix line's position — never on the evidence line — so
+      // duplicating the evidence line cannot discriminate indexOf from a
+      // true-index scan. A 19,607-body brute-force equivalence check found zero
+      // divergence between the two (SUP-15845); the true-index form is kept as
+      // a robustness/complexity fix with no observable behaviour delta. See
+      // parseTier2Declaration in done-transition-guard.ts.
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
