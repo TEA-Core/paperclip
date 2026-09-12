@@ -13,6 +13,7 @@ import {
   resolveLinkedPullRequestsWithState,
   fetchHeadViaTokenCandidates,
   fetchHeadApprovedStatusViaTokenCandidates,
+  fetchLastMergeQueueEjectionViaTokenCandidates,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
@@ -50,6 +51,14 @@ import type {
 const DEFAULT_GRACE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+// SUP-15953: the re-enqueue leg gets its OWN eligibility window. The landing
+// VERDICT must wait the full DEFAULT_GRACE_MS (24h) — a merge deserves time to
+// land before it is called failed — but a queue EJECTION happens in minutes, and
+// a 24h gate on the re-enqueue leg left the platform with no re-arm path at all
+// for the first day (support-RE filled the hole by hand, cycle after cycle). One
+// sweep interval is the floor: an ejected PR is visible to the re-enqueue leg a
+// sweep or two after it is ejected, while the verdict still waits its full 24h.
+const DEFAULT_REENQUEUE_GRACE_MS = 60 * 60 * 1000;
 // A PR re-enqueued into the merge queue can be EJECTED by the queue (failing
 // checks, conflicts, behind the base branch) and left `open` again — in which
 // case the confirm/failed/escalated branches are all unreachable for it. So the
@@ -96,6 +105,14 @@ export interface DoneCloseLandingBackstopOptions {
   wakeup?: DoneCloseLandingWakeup;
   /** How long after the decision-carried skip a merge had to land. */
   graceMs?: number;
+  /**
+   * SUP-15953: how long after the decision-carried skip a RE-ENQUEUE is
+   * permitted. Deliberately far shorter than `graceMs` (the landing-verdict
+   * window) because a queue ejection happens in minutes. A candidate inside this
+   * window but outside `graceMs` is eligible for re-enqueue ONLY — never for a
+   * confirmed / failed / escalated verdict. Defaults to one sweep interval.
+   */
+  reenqueueGraceMs?: number;
   /** Oldest skip the sweep will consider (bounds the first run). */
   lookbackMs?: number;
   /** Minimum spacing between actual measurement runs. */
@@ -178,6 +195,11 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** SUP-15953: idempotency key for one (PR, head, ejection-reason) refusal. */
+function refusalKey(pr: string, headSha: string, ejectionReason: string): string {
+  return `${pr}\u0000${headSha}\u0000${ejectionReason}`;
+}
+
 /**
  * Build (but do not execute) the discovery query for done cards whose linked PR
  * may not have landed. Extracted so the exact WHERE predicate can be asserted in
@@ -191,7 +213,7 @@ function readRecord(value: unknown): Record<string, unknown> | null {
  *      never-armed card still produces it (SUP-14959/#514 carries exactly this row).
  *   2. arming refusal on close (SUP-14900): `issue.merge_arming_refused_on_close`.
  */
-export function buildDiscoveryQuery(db: Db, windowStart: Date, graceCutoff: Date) {
+export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: Date) {
   const issueIdAsText = sql<string>`${issues.id}::text`;
   return db
     .select({
@@ -224,7 +246,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, graceCutoff: Date
           eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
         ),
         gte(activityLog.createdAt, windowStart),
-        lte(activityLog.createdAt, graceCutoff),
+        lte(activityLog.createdAt, discoveryCutoff),
         eq(issues.status, "done"),
       ),
     );
@@ -233,14 +255,20 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, graceCutoff: Date
 /**
  * Qualify raw discovery rows into candidate cards: keep only the LATEST
  * transition-of-record per issue, require it to be `done` and inside the
- * lookback/grace window, and require it to carry a decision-carried skip reason
- * or an arming-refusal reason. Mirrors the discovery WHERE so a row the query
- * returns is always re-validated before it is measured.
+ * lookback/discovery window, and require it to carry a decision-carried skip
+ * reason or an arming-refusal reason. Mirrors the discovery WHERE so a row the
+ * query returns is always re-validated before it is measured.
+ *
+ * SUP-15953: `discoveryCutoff` is the WIDER of the verdict grace and the
+ * re-enqueue grace, so a recently ejected PR is a candidate here. Verdict
+ * eligibility is a separate, later check against `graceCutoff` (passed to
+ * `sweepCandidate`); this function only qualifies candidacy, not disposition.
  */
 export function selectLandingCandidates(
   rows: CandidateRow[],
   windowStart: Date,
   graceCutoff: Date,
+  discoveryCutoff: Date = graceCutoff,
 ): CandidateRow[] {
   const latestByIssue = new Map<string, CandidateRow>();
   for (const row of rows) {
@@ -252,7 +280,7 @@ export function selectLandingCandidates(
   return [...latestByIssue.values()].filter((row) => {
     if (row.issue.status !== "done") return false;
     const createdAt = row.createdAt.getTime();
-    if (createdAt < windowStart.getTime() || createdAt > graceCutoff.getTime()) return false;
+    if (createdAt < windowStart.getTime() || createdAt > discoveryCutoff.getTime()) return false;
     const details = readRecord(row.details);
     const isDecisionCarried =
       readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
@@ -288,6 +316,9 @@ export function createDoneCloseLandingBackstopService(
   opts: DoneCloseLandingBackstopOptions = {},
 ) {
   const graceMs = opts.graceMs ?? readMsEnv("DONE_CLOSE_LANDING_GRACE_MS", DEFAULT_GRACE_MS);
+  const reenqueueGraceMs =
+    opts.reenqueueGraceMs
+    ?? readMsEnv("DONE_CLOSE_LANDING_REENQUEUE_GRACE_MS", DEFAULT_REENQUEUE_GRACE_MS);
   const lookbackMs = opts.lookbackMs ?? readMsEnv("DONE_CLOSE_LANDING_LOOKBACK_MS", DEFAULT_LOOKBACK_MS);
   const sweepIntervalMs = opts.sweepIntervalMs ?? readMsEnv("DONE_CLOSE_LANDING_SWEEP_INTERVAL_MS", DEFAULT_SWEEP_INTERVAL_MS);
   const now = opts.now ?? (() => new Date());
@@ -313,8 +344,15 @@ export function createDoneCloseLandingBackstopService(
 
     const windowStart = new Date(checkedAt.getTime() - lookbackMs);
     const graceCutoff = new Date(checkedAt.getTime() - graceMs);
-    const rows = await buildDiscoveryQuery(db, windowStart, graceCutoff);
-    const candidates = selectLandingCandidates(rows, windowStart, graceCutoff);
+    const reenqueueCutoff = new Date(checkedAt.getTime() - reenqueueGraceMs);
+    // SUP-15953: discovery widens to the LESS restrictive of the two cutoffs so a
+    // recently ejected PR is visible to the re-enqueue leg. The verdict legs
+    // still require the unchanged 24h `graceCutoff` (checked per candidate).
+    const discoveryCutoff = new Date(
+      Math.max(graceCutoff.getTime(), reenqueueCutoff.getTime()),
+    );
+    const rows = await buildDiscoveryQuery(db, windowStart, discoveryCutoff);
+    const candidates = selectLandingCandidates(rows, windowStart, graceCutoff, discoveryCutoff);
     result.candidates = candidates.length;
     if (candidates.length === 0) return result;
 
@@ -325,7 +363,7 @@ export function createDoneCloseLandingBackstopService(
     for (const row of candidates) {
       const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 };
       try {
-        await sweepCandidate(row, counts, { resolver, svc });
+        await sweepCandidate(row, counts, { resolver, svc, graceCutoff });
       } catch (err) {
         logger.warn(
           { err, issueId: row.issue.id },
@@ -344,10 +382,14 @@ export function createDoneCloseLandingBackstopService(
   async function sweepCandidate(
     row: CandidateRow,
     counts: SweepCounts,
-    deps: { resolver: ExternalObjectResolver | null; svc: ReturnType<typeof issueService> },
+    deps: { resolver: ExternalObjectResolver | null; svc: ReturnType<typeof issueService>; graceCutoff: Date },
   ) {
     const issue = row.issue;
     const details = readRecord(row.details);
+    // SUP-15953: verdicts (confirmed/failed/escalated) require the full landing
+    // grace. A candidate inside the wider re-enqueue window but outside this
+    // bound is eligible for the re-enqueue leg ONLY.
+    const verdictEligible = row.createdAt.getTime() <= deps.graceCutoff.getTime();
     // SUP-14900: an arming-refusal candidate carries `refusalReason` (there is no
     // guard `skipReason`/`reason` for it); a decision-carried candidate carries the
     // guard's skipReason/reason. Prefer the refusal reason so the report names the
@@ -438,6 +480,7 @@ export function createDoneCloseLandingBackstopService(
               DONE_CLOSE_LANDING_REENQUEUED_ACTION,
               DONE_CLOSE_LANDING_ESCALATED_ACTION,
               DONE_CLOSE_LANDING_ATTRIBUTED_ACTION,
+              DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION,
             ],
           ),
           // This card's own rows (per-card ledger) OR any company row that
@@ -502,6 +545,20 @@ export function createDoneCloseLandingBackstopService(
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
+    // SUP-15953: an ejection refusal is keyed on (PR, head, ejectionReason) so a
+    // PR that is conflict-ejected on an unchanged head records ONE refusal row,
+    // not one per sweep. The refusal never consumes a MAX_REENQUEUE_ATTEMPTS slot.
+    const alreadyRefused = new Set<string>();
+    for (const r of existing) {
+      if (r.action !== DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION) continue;
+      const refusal = readRecord(r.details);
+      const pr = readString(refusal?.pr);
+      const head = readString(refusal?.headSha);
+      const ejectionReason = readString(refusal?.ejectionReason);
+      if (pr !== null && head !== null && ejectionReason !== null) {
+        alreadyRefused.add(refusalKey(pr, head, ejectionReason));
+      }
+    }
 
     // Two-pass reconciliation (SUP-14971): measure EVERY linked PR on the card
     // before dispositioning any of them. The card-level question is "did this
@@ -572,6 +629,12 @@ export function createDoneCloseLandingBackstopService(
       const isSupersededCarrier = state === "closed" && hasMergedSibling;
 
       if (state === "merged") {
+        if (!verdictEligible) {
+          // Visible to the re-enqueue leg's widened window, but the landing
+          // VERDICT still waits the full grace (SUP-15953) — defer, never report.
+          counts.deferred += 1;
+          continue;
+        }
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: "system",
@@ -597,6 +660,11 @@ export function createDoneCloseLandingBackstopService(
       }
 
       if (state === "closed") {
+        if (!verdictEligible) {
+          // No PR is reported failed before the full landing grace (SUP-15953).
+          counts.deferred += 1;
+          continue;
+        }
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: "system",
@@ -733,48 +801,74 @@ export function createDoneCloseLandingBackstopService(
       // UNSTAMPED (refused); the pair then falls through to the escalation path
       // below with the head-moved cause instead of being armed.
       let refusedHead: { headSha: string; approvedHeadSha: string | null; reason: string } | null = null;
+      // SUP-15953: set when the last merge-queue ejection was `merge_conflict` and
+      // the head has NOT moved since. The re-enqueue is refused (recorded, bounded
+      // to one row per PR+head), and no MAX_REENQUEUE_ATTEMPTS slot is consumed.
+      let ejectionRefusal: { headSha: string; reason: string; ejectedAt: string | null } | null = null;
 
       if (!reenqueueExhausted && mergeArmingEnabled) {
-        const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha);
-        if (gate.kind === "deferred") {
-          // AC4: unresolvable head or approval status — fail closed, never
-          // re-enqueue and never report; retry on a later sweep.
+        // SUP-15953 predicate FIRST: a conflict-ejected PR cannot be landed by
+        // re-enqueueing the same head, so never spend a head-authorization read or
+        // a queue add on it. An unreadable ejection read or reason fails closed.
+        const ejectionGate = await authorizeReenqueueAfterEjection(issue.companyId, pr);
+        if (ejectionGate.kind === "deferred") {
           counts.deferred += 1;
           continue;
         }
-        if (gate.kind === "refused") {
-          // AC2/AC3: head positively unstamped — record the refusal and fall
-          // through to the escalation path below with the head-moved cause.
-          refusedHead = gate;
+        if (ejectionGate.kind === "refused") {
+          ejectionRefusal = ejectionGate;
+          await recordEjectionRefusal(issue, prKey, ejectionGate, alreadyRefused);
         } else {
-          const reenqueueSucceeded = await attemptReenqueue(
-            issue.companyId,
-            pr,
-          );
-          if (reenqueueSucceeded) {
-            await logActivity(db, {
-              companyId: issue.companyId,
-              actorType: "system",
-              actorId: DONE_CLOSE_LANDING_ACTOR_ID,
-              agentId: null,
-              runId: null,
-              agentApiKeyId: null,
-              action: DONE_CLOSE_LANDING_REENQUEUED_ACTION,
-              entityType: "issue",
-              entityId: issue.id,
-              issueId: issue.id,
-              details: {
-                identifier: issue.identifier ?? null,
-                pr: prKey,
-                prState: "open",
-                skipReason: skipReason ?? null,
-                refusal: isArmingRefusal,
-              },
-            });
-            counts.reenqueued += 1;
+          const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha);
+          if (gate.kind === "deferred") {
+            // AC4: unresolvable head or approval status — fail closed, never
+            // re-enqueue and never report; retry on a later sweep.
+            counts.deferred += 1;
             continue;
           }
+          if (gate.kind === "refused") {
+            // AC2/AC3: head positively unstamped — record the refusal and fall
+            // through to the escalation path below with the head-moved cause.
+            refusedHead = gate;
+          } else {
+            const reenqueueSucceeded = await attemptReenqueue(
+              issue.companyId,
+              pr,
+            );
+            if (reenqueueSucceeded) {
+              await logActivity(db, {
+                companyId: issue.companyId,
+                actorType: "system",
+                actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+                agentId: null,
+                runId: null,
+                agentApiKeyId: null,
+                action: DONE_CLOSE_LANDING_REENQUEUED_ACTION,
+                entityType: "issue",
+                entityId: issue.id,
+                issueId: issue.id,
+                details: {
+                  identifier: issue.identifier ?? null,
+                  pr: prKey,
+                  prState: "open",
+                  skipReason: skipReason ?? null,
+                  refusal: isArmingRefusal,
+                },
+              });
+              counts.reenqueued += 1;
+              continue;
+            }
+          }
         }
+      }
+
+      // SUP-15953: a candidate inside the widened re-enqueue window but outside
+      // the landing-verdict window gets NO verdict yet — including escalation.
+      // Only the re-enqueue leg above runs for it; everything else waits for the
+      // unchanged 24h graceCutoff.
+      if (!verdictEligible) {
+        counts.deferred += 1;
+        continue;
       }
 
       // Escalate: re-enqueue cap exhausted (still open), lane closed, the
@@ -785,9 +879,11 @@ export function createDoneCloseLandingBackstopService(
           ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
           : refusedHead
             ? refusedHead.reason
-            : mergeArmingEnabled
-              ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
-              : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+            : ejectionRefusal
+              ? ejectionRefusal.reason
+              : mergeArmingEnabled
+                ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
+                : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
         if (refusedHead) {
           // SUP-15315 (AC2): durable refusal row — the live head is not covered
           // by an authorized head, so no re-enqueue row is written for it.
@@ -837,7 +933,9 @@ export function createDoneCloseLandingBackstopService(
             ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window after ${MAX_REENQUEUE_ATTEMPTS} re-enqueue attempts — the merge queue is not landing it (${reason}). Board/operator must fix the PR (checks/conflicts/rebase) and merge it, or re-open the card.`
             : refusedHead
               ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${refusedHead.reason}. Re-review and re-approve the PR at its current head to re-stamp paperclip/approved (or land it through the review lane); the merge queue will not arm an unauthorized head.`
-              : `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
+              : ejectionRefusal
+                ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${ejectionRefusal.reason}. Rebase the branch onto the base branch to produce a new head; the sweep re-enqueues a conflict-ejected PR automatically once its head has moved.`
+                : `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
           {},
           { authorType: "system" },
         );
@@ -849,7 +947,9 @@ export function createDoneCloseLandingBackstopService(
               ? `Fix and merge PR ${prKey} (re-enqueued ${MAX_REENQUEUE_ATTEMPTS}x, still not landing — check CI checks, conflicts, or rebase onto the base branch) or re-open the card`
               : refusedHead
                 ? `Re-approve PR ${prKey} at its current head ${refusedHead.headSha.slice(0, 7)} to re-stamp paperclip/approved (approval stamp is ${refusedHead.approvedHeadSha ? `stranded on ${refusedHead.approvedHeadSha.slice(0, 7)}` : "missing"}) — re-review, not rebase/CI, is the unblock; the merge queue will not arm an unauthorized head`
-                : `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
+                : ejectionRefusal
+                  ? `Rebase PR ${prKey} onto its base branch to produce a new head (last merge_conflict ejection left head ${ejectionRefusal.headSha.slice(0, 7)} unchanged) — the sweep re-enqueues it automatically once the head has moved`
+                  : `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
           },
         });
         if (opts.wakeup && issue.assigneeAgentId) {
@@ -930,6 +1030,88 @@ export function createDoneCloseLandingBackstopService(
           ? `approval stamp stranded: the card approved head ${approvedHeadSha.slice(0, 7)} but the live head is ${liveHeadSha.slice(0, 7)}, and that head carries no paperclip/approved success status`
           : `no valid approval on head: the live head ${liveHeadSha.slice(0, 7)} carries no paperclip/approved success status and the card has no pinned approvedHeadSha`,
     };
+  }
+
+  /**
+   * SUP-15953: decide whether a still-open PR may be re-enqueued given its last
+   * merge-queue ejection. A `merge_conflict` ejection on an UNCHANGED head cannot
+   * be discharged by re-enqueueing — the same conflict ejects it again — so the
+   * re-enqueue is refused until the head moves. `failed_checks` and every other
+   * reason stay on the old behaviour (re-enqueue is the remedy). Fails CLOSED
+   * (deferred) when the ejection read cannot be trusted.
+   */
+  async function authorizeReenqueueAfterEjection(
+    companyId: string,
+    pr: LinkedPullRequest,
+  ): Promise<
+    | { kind: "allow" }
+    | { kind: "deferred" }
+    | { kind: "refused"; headSha: string; reason: string; ejectedAt: string | null }
+  > {
+    const ejection = await fetchLastMergeQueueEjectionViaTokenCandidates(
+      db,
+      companyId,
+      pr.owner,
+      pr.repo,
+      pr.number,
+    );
+    if (!ejection.ok) return { kind: "deferred" };
+    if (ejection.lastEjection === null) return { kind: "allow" };
+    // An ejection event whose reason could not be read is NOT evidence of a
+    // non-conflict reason — fail closed rather than blind re-enqueue.
+    if (ejection.lastEjection.reason === null) return { kind: "deferred" };
+    if (ejection.lastEjection.reason !== "merge_conflict") return { kind: "allow" };
+    const liveHeadSha = ejection.headRefOid;
+    const beforeCommitOid = ejection.lastEjection.beforeCommitOid;
+    if (liveHeadSha === null || beforeCommitOid === null) {
+      // We cannot prove the head moved — fail closed rather than risk a blind
+      // re-enqueue of a conflict-ejected head.
+      return { kind: "deferred" };
+    }
+    if (liveHeadSha !== beforeCommitOid) return { kind: "allow" };
+    const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
+    const shortHead = liveHeadSha.slice(0, 7);
+    return {
+      kind: "refused",
+      headSha: liveHeadSha,
+      ejectedAt: ejection.lastEjection.createdAt,
+      reason:
+        `PR ${prKey} was ejected from the merge queue with reason "merge_conflict"` +
+        `${ejection.lastEjection.createdAt ? ` at ${ejection.lastEjection.createdAt}` : ""}` +
+        ` and its head ${shortHead} has not moved since — re-enqueueing the same head would hit the same conflict`,
+    };
+  }
+
+  async function recordEjectionRefusal(
+    issue: CandidateRow["issue"],
+    prKey: string,
+    refusal: { headSha: string; reason: string; ejectedAt: string | null },
+    alreadyRefused: Set<string>,
+  ): Promise<void> {
+    const key = refusalKey(prKey, refusal.headSha, "merge_conflict");
+    if (alreadyRefused.has(key)) return;
+    alreadyRefused.add(key);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: "system",
+      actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+      agentId: null,
+      runId: null,
+      agentApiKeyId: null,
+      action: DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION,
+      entityType: "issue",
+      entityId: issue.id,
+      issueId: issue.id,
+      details: {
+        identifier: issue.identifier ?? null,
+        pr: prKey,
+        headSha: refusal.headSha,
+        reason: refusal.reason,
+        ejectionReason: "merge_conflict",
+        ejectedAt: refusal.ejectedAt,
+        refusalKind: "merge_conflict_head_unchanged",
+      },
+    });
   }
 
   async function attemptReenqueue(

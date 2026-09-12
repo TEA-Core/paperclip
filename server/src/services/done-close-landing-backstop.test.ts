@@ -19,6 +19,10 @@ const mockFetchGitHubNodeId = vi.hoisted(() => vi.fn());
 // the real token-credential + GitHub paths (or, worse, real network).
 const mockFetchHeadViaTokenCandidates = vi.hoisted(() => vi.fn());
 const mockFetchHeadApprovedStatusViaTokenCandidates = vi.hoisted(() => vi.fn());
+// SUP-15953: the merge-queue ejection reader feeding the head-changed-since-
+// ejection predicate. Default below is "no ejection" so pre-existing re-enqueue
+// tests keep their old behaviour.
+const mockFetchLastMergeQueueEjectionViaTokenCandidates = vi.hoisted(() => vi.fn());
 vi.mock("./merge-arming.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("./merge-arming.js")>();
   return {
@@ -30,6 +34,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     fetchGitHubNodeId: mockFetchGitHubNodeId,
     fetchHeadViaTokenCandidates: mockFetchHeadViaTokenCandidates,
     fetchHeadApprovedStatusViaTokenCandidates: mockFetchHeadApprovedStatusViaTokenCandidates,
+    fetchLastMergeQueueEjectionViaTokenCandidates: mockFetchLastMergeQueueEjectionViaTokenCandidates,
   };
 });
 
@@ -320,13 +325,21 @@ const notFoundSnapshot = {
 
 function makeService(
   state: DbState,
-  opts: { now?: () => Date; wakeup?: unknown; sweepIntervalMs?: number } = {},
+  opts: {
+    now?: () => Date;
+    wakeup?: unknown;
+    sweepIntervalMs?: number;
+    graceMs?: number;
+    reenqueueGraceMs?: number;
+  } = {},
 ) {
   const db = makeDb(state);
   const service = createDoneCloseLandingBackstopService(db as never, {
     now: opts.now ?? fixedNow,
     sweepIntervalMs: opts.sweepIntervalMs ?? 0,
     ...(opts.wakeup ? { wakeup: opts.wakeup as never } : {}),
+    ...(opts.graceMs !== undefined ? { graceMs: opts.graceMs } : {}),
+    ...(opts.reenqueueGraceMs !== undefined ? { reenqueueGraceMs: opts.reenqueueGraceMs } : {}),
   });
   return { db, state, service };
 }
@@ -343,6 +356,14 @@ beforeEach(() => {
   mockFetchGitHubNodeId.mockReset();
   mockFetchHeadViaTokenCandidates.mockReset();
   mockFetchHeadApprovedStatusViaTokenCandidates.mockReset();
+  // SUP-15953 default: no recent ejection, live head = LIVE_SHA, so the changed-
+  // since-ejection predicate allows and pre-existing tests keep their behaviour.
+  mockFetchLastMergeQueueEjectionViaTokenCandidates.mockReset();
+  mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
+    ok: true,
+    headRefOid: LIVE_SHA,
+    lastEjection: null,
+  });
   mockCreateGitHubExternalObjectProvider.mockReset();
   mockResolveCarrierOwner.mockReset();
   mockResolveCarrierOwner.mockResolvedValue(null);
@@ -1867,4 +1888,357 @@ describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
     expect(mockResolveCarrierOwner).not.toHaveBeenCalled();
   });
 });
+
+describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + ejection predicate", () => {
+  const NOW_MS = Date.parse(NOW);
+  // 90 min past the close skip: older than the 1h re-enqueue grace, but NOT yet
+  // 24h old, so the landing verdict is not due.
+  const RECENT_ROW = new Date(NOW_MS - 90 * 60 * 1000).toISOString();
+  // The verbatim #662 ejection timestamp (2026-08-18T17:04:36Z, before NOW).
+  const EJECTED_AT = "2026-08-18T17:04:36Z";
+  const MOVED_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  function allowEjection(overrides: { headRefOid?: string } = {}) {
+    mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
+      ok: true,
+      headRefOid: overrides.headRefOid ?? LIVE_SHA,
+      lastEjection: null,
+    });
+  }
+
+  function conflictEjection(
+    overrides: { headRefOid?: string; beforeCommitOid?: string; reason?: string | null } = {},
+  ) {
+    mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
+      ok: true,
+      headRefOid: overrides.headRefOid ?? LIVE_SHA,
+      lastEjection: {
+        reason: overrides.reason === undefined ? "merge_conflict" : overrides.reason,
+        createdAt: EJECTED_AT,
+        beforeCommitOid: overrides.beforeCommitOid ?? LIVE_SHA,
+      },
+    });
+  }
+
+  function armSuccessfulReenqueue() {
+    mockResolveGitHubTokenForRepo.mockResolvedValue({
+      token: "ghp_test_token",
+      scope: "company",
+      secretName: "github-token",
+    });
+    mockEnableAutoMerge.mockResolvedValue({
+      success: true,
+      alreadyQueued: false,
+      error: null,
+      status: 200,
+    });
+  }
+
+  function candidateIn(snapshot: ExternalObjectResolveResult) {
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
+    ]);
+    mockResolver(async () => snapshot);
+    mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+  }
+
+  it("AC1: re-enqueues a PR only 90 min past its close skip — not gated behind the 24h verdict grace", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: RECENT_ROW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    allowEjection();
+    armSuccessfulReenqueue();
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 1,
+      escalated: 0,
+    });
+    expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_reenqueued",
+      details: expect.objectContaining({ pr: "paperclipai/paperclip#514" }),
+    }));
+    // No verdict for a PR inside the grace: no confirm/failed/escalate.
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+  });
+
+  it("AC2: does NOT confirm a merged PR until the full 24h landing grace has elapsed", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: RECENT_ROW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+    };
+    const { service } = makeService(state);
+    candidateIn(mergedSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
+    });
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("AC2 regression: still confirms a merged PR once it is past the full 24h grace", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+    };
+    const { service } = makeService(state);
+    candidateIn(mergedSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 1,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
+    });
+  });
+
+  it("AC3 (#662 shape): REFUSES a merge_conflict-ejected PR whose head has not moved", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    conflictEjection();
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 1,
+    });
+    // The predicate runs BEFORE the head-authorization gate: no queue add, no
+    // head read (which would otherwise be a wasted API round-trip).
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockFetchHeadViaTokenCandidates).not.toHaveBeenCalled();
+    expect(mockFetchLastMergeQueueEjectionViaTokenCandidates).toHaveBeenCalledWith(
+      expect.anything(), COMPANY, "paperclipai", "paperclip", 514,
+    );
+    // AC3: the attempt counter is UNCHANGED — a refusal consumes no cap slot.
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_reenqueued",
+    }));
+    // Durable refusal row keyed on the ejection, not on a stranded stamp.
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_reenqueue_refused",
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#514",
+        headSha: LIVE_SHA,
+        ejectionReason: "merge_conflict",
+        refusalKind: "merge_conflict_head_unchanged",
+        reason: expect.stringContaining("merge_conflict"),
+      }),
+    }));
+    // Escalation names the conflict and the unblock action is a rebase.
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_escalated",
+      details: expect.objectContaining({
+        reason: expect.stringContaining("merge_conflict"),
+      }),
+    }));
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+      status: "blocked",
+      unblockDescriptor: expect.objectContaining({
+        owner: "board",
+        action: expect.stringContaining("Rebase PR paperclipai/paperclip#514"),
+      }),
+    }));
+  });
+
+  it("AC3b: inside the re-enqueue-only window a conflict refusal DEFERS — no verdict escalation", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: RECENT_ROW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    conflictEjection();
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
+    });
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_reenqueue_refused",
+      details: expect.objectContaining({ refusalKind: "merge_conflict_head_unchanged" }),
+    }));
+    // No verdict yet: no escalation, no board park, no comment.
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_escalated",
+    }));
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+  });
+
+  it("AC4 (#661 shape): re-enqueues a failed_checks-ejected PR on an unchanged head", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    conflictEjection({ reason: "failed_checks" });
+    armSuccessfulReenqueue();
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 1,
+      escalated: 0,
+    });
+    expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_reenqueued",
+    }));
+  });
+
+  it("AC5: re-enqueues a merge_conflict-ejected PR once its head has moved", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    // Ejected at MOVED_SHA; the live head is now LIVE_SHA — head has moved.
+    conflictEjection({ beforeCommitOid: MOVED_SHA, headRefOid: LIVE_SHA });
+    armSuccessfulReenqueue();
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 1,
+      escalated: 0,
+    });
+    expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+  });
+
+  it("AC6: DEFERS (fails closed) when the merge-queue ejection read is unresolvable", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
+      ok: false,
+      reason: "pr_network: network_error",
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
+    });
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockFetchHeadViaTokenCandidates).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("AC6b: DEFERS when the ejection events carry an unreadable reason", async () => {
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    conflictEjection({ reason: null });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
+    });
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("AC7: records ONE conflict-refusal row per (PR, head, reason) across sweeps", async () => {
+    const existingRefusal = {
+      action: "issue.done_close_landing_reenqueue_refused",
+      details: {
+        pr: "paperclipai/paperclip#514",
+        headSha: LIVE_SHA,
+        ejectionReason: "merge_conflict",
+        refusalKind: "merge_conflict_head_unchanged",
+      },
+    };
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: IN_WINDOW })],
+      existingLandingRows: [existingRefusal],
+      companyMergeArmingEnabled: true,
+      issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+    };
+    const { service } = makeService(state);
+    candidateIn(openSnapshot);
+    conflictEjection();
+
+    await service.sweep();
+
+    // The refusal is already on record for this exact head → no second row.
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_reenqueue_refused",
+    }));
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+  });
+});
+
 

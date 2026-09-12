@@ -2251,6 +2251,185 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
 }
 
 /**
+ * SUP-15953: the ejection reason the merge queue removed a PR for. `reason` is
+ * nullable because GitHub returns the field as `String` and a malformed event
+ * must never be read as "not a conflict" — the caller defers on null.
+ */
+export interface MergeQueueEjectionEvent {
+  reason: string | null;
+  createdAt: string | null;
+  /** The PR head oid the queue held at the moment of ejection. */
+  beforeCommitOid: string | null;
+}
+
+export type MergeQueueEjectionReadResult =
+  | { ok: true; headRefOid: string; lastEjection: MergeQueueEjectionEvent | null }
+  | { ok: false; reason: string };
+
+type MergeQueueEjectionFetch =
+  | {
+      ok: true;
+      headRefOid: string;
+      lastEjection: MergeQueueEjectionEvent | null;
+      status: number;
+      message: string | null;
+    }
+  | { ok: false; status: number; message: string | null };
+
+// SUP-15953: a PR's most recent merge-queue ejection PLUS its current head, in
+// one GraphQL round-trip. The ejection `reason` is available ONLY here — the REST
+// timeline omits it — so this read has no REST fallback. `beforeCommit.oid` is
+// the head the queue held when it removed the PR, which is exactly what the
+// re-enqueue predicate compares the live `headRefOid` against.
+const MERGE_QUEUE_EJECTION_QUERY = `query PaperclipMergeQueueEjection($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      headRefOid
+      timelineItems(last: 50, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            reason
+            createdAt
+            beforeCommit {
+              oid
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+async function fetchMergeQueueEjection(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<MergeQueueEjectionFetch> {
+  let response: Response;
+  try {
+    response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-merge-arming",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query: MERGE_QUEUE_EJECTION_QUERY,
+        variables: { owner, repo, number },
+      }),
+    });
+  } catch {
+    return { ok: false, status: 0, message: "network_error" };
+  }
+
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const errors = body?.errors as Array<{ message?: string }> | undefined;
+  if (!response.ok || (errors && errors.length > 0)) {
+    const message =
+      errors?.[0]?.message
+      ?? readString(body?.message)
+      ?? `HTTP ${response.status}`;
+    return { ok: false, status: response.status, message };
+  }
+
+  const data = body?.data as Record<string, unknown> | undefined;
+  const repository = data?.repository as Record<string, unknown> | undefined;
+  const pullRequest = repository?.pullRequest as Record<string, unknown> | undefined;
+  if (!pullRequest) {
+    return { ok: false, status: response.status, message: "pull_request_missing" };
+  }
+  const headRefOid =
+    typeof pullRequest.headRefOid === "string" && pullRequest.headRefOid.length > 0
+      ? pullRequest.headRefOid
+      : null;
+  if (headRefOid === null) {
+    return { ok: false, status: response.status, message: "head_oid_missing" };
+  }
+
+  const timelineItems = pullRequest.timelineItems as Record<string, unknown> | undefined;
+  const nodes = Array.isArray(timelineItems?.nodes)
+    ? (timelineItems!.nodes as Array<Record<string, unknown> | null>)
+    : [];
+  let lastEjection: MergeQueueEjectionEvent | null = null;
+  let lastAt = -Infinity;
+  nodes.forEach((node, index) => {
+    if (!node || typeof node !== "object") return;
+    const createdAt = typeof node.createdAt === "string" ? node.createdAt : null;
+    const parsed = createdAt !== null ? Date.parse(createdAt) : NaN;
+    // `timelineItems(last:)` is chronological, so fall back to array order when a
+    // node has no parseable timestamp.
+    const at = Number.isFinite(parsed) ? parsed : index;
+    if (lastEjection === null || at >= lastAt) {
+      const beforeCommit = node.beforeCommit as Record<string, unknown> | undefined;
+      lastEjection = {
+        reason: typeof node.reason === "string" && node.reason.length > 0 ? node.reason : null,
+        createdAt,
+        beforeCommitOid:
+          typeof beforeCommit?.oid === "string" && beforeCommit.oid.length > 0
+            ? beforeCommit.oid
+            : null,
+      };
+      lastAt = at;
+    }
+  });
+
+  return { ok: true, headRefOid, lastEjection, status: response.status, message: null };
+}
+
+/**
+ * SUP-15953: resolves a PR's current head oid and its most recent
+ * `RemovedFromMergeQueueEvent` across the resolvable token candidates (401/403
+ * advances to the next candidate). A terminal failure returns
+ * `{ ok: false, reason }` so the caller fails closed — it must never re-enqueue
+ * on an assumption about why the queue ejected a PR.
+ */
+export async function fetchLastMergeQueueEjectionViaTokenCandidates(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<MergeQueueEjectionReadResult> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  if (candidates.length === 0) {
+    const tokenResult = await resolveGitHubTokenForRepo(db, companyId, owner, repo);
+    const reason = isGitHubTokenResolution(tokenResult)
+      ? `auth_required: no GitHub token resolvable for ${owner}/${repo}`
+      : `auth_required: ${tokenResult.reason}`;
+    return { ok: false, reason };
+  }
+  let lastStatus = 0;
+  let lastMessage: string | null = null;
+  for (const candidate of candidates) {
+    const result = await fetchMergeQueueEjection(candidate.token, owner, repo, number);
+    if (result.ok) {
+      return { ok: true, headRefOid: result.headRefOid, lastEjection: result.lastEjection };
+    }
+    lastStatus = result.status;
+    lastMessage = result.message;
+    if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) {
+      continue;
+    }
+    break;
+  }
+  if (lastStatus === 404) return { ok: false, reason: "pr_not_found: HTTP 404" };
+  if (lastStatus === 429) return { ok: false, reason: "pr_rate_limited: HTTP 429" };
+  if (lastStatus === 0) return { ok: false, reason: `pr_network: ${lastMessage ?? "network_error"}` };
+  if (lastStatus === 401 || lastStatus === 403) {
+    const scopeDetail =
+      candidates.length === 1
+        ? `(scope=${candidates[0]!.scope}, secretName=${candidates[0]!.secretName})`
+        : `(tried: ${candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ")})`;
+    return { ok: false, reason: `pr_auth: HTTP ${lastStatus} ${lastMessage ?? ""} ${scopeDetail}` };
+  }
+  return { ok: false, reason: `pr_error: HTTP ${lastStatus} ${lastMessage ?? ""}` };
+}
+
+/**
  * SUP-15315: reads one head SHA's commit statuses from the GitHub statuses API
  * (GET, read-only) and reports whether a `paperclip/approved` status with state
  * `success` is present. Uses the shared ghFetch transport — no new HTTP layer.
