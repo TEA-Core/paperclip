@@ -9639,6 +9639,13 @@ export function issueRoutes(
     res.json({ summaries: Object.fromEntries(summaries) });
   });
 
+  router.get("/companies/:companyId/external-objects/stuck", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const objects = await externalObjectsSvc.getStuckObjects(companyId);
+    res.json(objects);
+  });
+
   router.post("/issues/:id/external-objects/refresh", validate(refreshExternalObjectsSchema), async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");

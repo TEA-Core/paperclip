@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, isNotNull, lte, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companies, documents, externalObjectMentions, externalObjects, issueComments, issueDocuments, issues, plugins } from "@paperclipai/db";
 import {
@@ -95,6 +95,25 @@ const DEFAULT_RETRY_AFTER_SECONDS = 300;
 const NO_RESOLVER_BACKOFF_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_REFRESH_LEASE_SECONDS = 300;
 const REFRESH_LEASE_RENEW_INTERVAL_MS = 60_000;
+
+/**
+ * How long an external object may go without a successful resolve before a
+ * current error marks it "stuck" — i.e. failing persistently rather than
+ * transiently. An erroring object whose `lastResolvedAt` is null (never
+ * resolved) or older than this window is considered stuck. Deliberately not a
+ * new column: it is derived from the existing `lastErrorAt` / `lastResolvedAt`
+ * timestamps so the backoff loop stays the sole write path.
+ */
+export const EXTERNAL_OBJECT_STUCK_THRESHOLD_SECONDS = 24 * 60 * 60;
+
+export function isExternalObjectStuck(
+  record: { lastErrorAt: Date | null; lastResolvedAt: Date | null },
+  now: Date = new Date(),
+): boolean {
+  if (!record.lastErrorAt) return false;
+  if (!record.lastResolvedAt) return true;
+  return record.lastResolvedAt.getTime() < now.getTime() - EXTERNAL_OBJECT_STUCK_THRESHOLD_SECONDS * 1000;
+}
 
 function sourceWhere(input: ExternalObjectSourceContext) {
   const conditions = [
@@ -774,6 +793,31 @@ export function externalObjectService(
     return summarizeObjectPayloads(objects, 25);
   }
 
+  async function getStuckObjects(companyId: string, now: Date = new Date()) {
+    if (!(await isEnabled())) return [];
+    // Company-scoped on external_objects directly, never joined through
+    // mentions or issue status — so a row whose only mentions are closed cards
+    // is still reachable here.
+    const stuckCutoff = new Date(now.getTime() - EXTERNAL_OBJECT_STUCK_THRESHOLD_SECONDS * 1000);
+    const rows = await db
+      .select()
+      .from(externalObjects)
+      .where(
+        and(
+          eq(externalObjects.companyId, companyId),
+          isNotNull(externalObjects.lastErrorAt),
+          or(
+            isNull(externalObjects.lastResolvedAt),
+            lt(externalObjects.lastResolvedAt, stuckCutoff),
+          ),
+        ),
+      );
+    return rows
+      .filter((row) => isExternalObjectStuck(row, now))
+      .map((row) => toObjectPayload(row, now))
+      .sort((a, b) => (a.lastResolvedAt?.getTime() ?? 0) - (b.lastResolvedAt?.getTime() ?? 0));
+  }
+
   type RefreshObjectInput = {
     companyId: string;
     actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId">;
@@ -849,12 +893,29 @@ export function externalObjectService(
         .where(refreshOwnerWhere(object, refreshToken))
         .returning();
       if (!updated) return refreshSupersededResult(object, now);
+      const failedObject = updated ?? object;
+      if (isExternalObjectStuck(failedObject, now)) {
+        const stuckKey = `${object.companyId}:${object.id}`;
+        if (!stuckLoggedKeys.has(stuckKey)) {
+          stuckLoggedKeys.add(stuckKey);
+          logger.warn(
+            {
+              companyId: object.companyId,
+              objectId: object.id,
+              providerKey: object.providerKey,
+              lastErrorCode: result.errorCode,
+              url: failedObject.sanitizedCanonicalUrl,
+            },
+            "external object stuck in persistent failure; surfacing once",
+          );
+        }
+      }
       publishLiveEvent({
         companyId: object.companyId,
         type: "external_object.updated",
         payload: { objectId: object.id, liveness: result.liveness },
       });
-      return { object: toObjectPayload(updated ?? object, now), refreshed: true, reason: result.liveness };
+      return { object: toObjectPayload(failedObject, now), refreshed: true, reason: result.liveness };
     }
 
     const snapshot = result.snapshot;
@@ -890,6 +951,7 @@ export function externalObjectService(
       .where(refreshOwnerWhere(object, refreshToken))
       .returning();
     if (!updated) return refreshSupersededResult(object, now);
+    stuckLoggedKeys.delete(`${object.companyId}:${object.id}`);
     const next = updated ?? object;
     if (objectChanged(object, next) && input.actor) {
       await logActivity(db, {
@@ -972,6 +1034,13 @@ export function externalObjectService(
   }
 
   const objectRefreshesInFlight = new Map<string, Promise<Awaited<ReturnType<typeof resolveObjectRefresh>>>>();
+
+  // Objects already surfaced as "stuck" this process lifetime. An object is
+  // logged exactly once per stuck-crossing; a successful resolve drops it so a
+  // later crossing logs again. Kept in memory (no new column) — it only dedups
+  // the ~5-minute sweep spam within a process, which is the failure this card
+  // addresses.
+  const stuckLoggedKeys = new Set<string>();
 
   async function refreshObject(
     objectId: string,
@@ -1105,6 +1174,7 @@ export function externalObjectService(
     getIssueSummary,
     getIssueSummaries,
     getProjectSummary,
+    getStuckObjects,
     refreshObject,
     refreshIssueObjects,
     refreshDueObjects,
