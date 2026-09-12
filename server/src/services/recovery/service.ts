@@ -4010,17 +4010,114 @@ export function recoveryService(
       const participantAgentId = currentParticipant?.type === "agent" ? currentParticipant.agentId : null;
       // A pending stage naming a *user* participant is a deliberate human wait
       // (e.g. a board approval) and keeps its existing treatment; only an armed
-      // stage waiting on an *agent* whose run is gone is "wedged".
+      // stage waiting on an *agent* whose run is gone is "wedged". Restrict to
+      // `review` stages: a pending *approval* stage is a separate shape and must
+      // never be relabelled as a review verdict (SUP-15788 round-1 review).
       const nonReviewArmedExecutionState =
         issue.status !== "in_review" &&
         persistedExecutionState !== null &&
         persistedExecutionState.status === "pending" &&
+        persistedExecutionState.currentStageType === "review" &&
         persistedExecutionState.currentParticipant !== null &&
         persistedExecutionState.currentParticipant.type === "agent" &&
         persistedExecutionState.currentParticipant.agentId !== null
           ? persistedExecutionState
           : null;
       const armedReviewStageOnNonReviewCard = nonReviewArmedExecutionState !== null;
+
+      // An armed *review* stage on a non-`in_review` card. The participant is
+      // engaged and the stage is live, but the card carries no execution run or
+      // monitor, so every status-keyed recovery path would skip it. Mint a
+      // participant-owned action to re-record the verdict.
+      //
+      // Classified BEFORE `agentId` is resolved and before the generic
+      // assignee-recovery paths below (SUP-15788 round-1): on a non-`in_review`
+      // card `agentId` is still `issue.assigneeAgentId`, so a missing or
+      // unavailable original assignee could otherwise mint a `no_live_path_*`
+      // action — or continuation / live-path handling could `continue` — before
+      // the participant-owned action is ever reached. The participant, not the
+      // assignee, is the recovery target; `previousOwnerAgentId` preserves the
+      // source assignment and the stage is left untouched. Do NOT re-arm,
+      // re-assign, or alter the stage: rendering the verdict is the
+      // participant's job and this path must never become a way to bypass a
+      // review gate.
+      if (armedReviewStageOnNonReviewCard) {
+        const armed = nonReviewArmedExecutionState;
+        if (armed === null) {
+          result.skipped += 1;
+          continue;
+        }
+        const armedParticipant = armed.currentParticipant;
+        const participantOwnerAgentId =
+          armedParticipant?.type === "agent" ? armedParticipant.agentId ?? null : null;
+        const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
+        if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+          result.skipped += 1;
+          continue;
+        }
+        const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+        // A board-owned recovery action is already the durable, human-owned path;
+        // do not race that authority by minting a participant action on top of it.
+        if (existingAction?.ownerType === "board") {
+          result.skipped += 1;
+          continue;
+        }
+        // Idempotency is scoped to the exact wedge identity (stage + participant).
+        // A repeat pass over the same wedged card skips; a stage or participant
+        // change no longer matches, so the upsert below reconciles ownership to
+        // the live participant instead of waking a prior one.
+        const fingerprint = `review_stage_armed_stranded:${issue.companyId}:${issue.id}:${armed.currentStageId ?? "none"}:${participantOwnerAgentId ?? "none"}`;
+        if (
+          existingAction?.kind === "review_stage_armed_stranded" &&
+          existingAction.fingerprint === fingerprint
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        await recoveryActionsSvc.upsertSourceScoped({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: "review_stage_armed_stranded",
+          ownerType: "agent",
+          ownerAgentId: participantOwnerAgentId,
+          ownerUserId: null,
+          previousOwnerAgentId: issue.assigneeAgentId ?? null,
+          returnOwnerAgentId: participantOwnerAgentId,
+          cause: "review_stage_armed_stranded",
+          fingerprint,
+          evidence: {
+            identifier: issue.identifier,
+            status: issue.status,
+            msSinceUpdate,
+            currentStageId: armed.currentStageId ?? null,
+            currentStageType: armed.currentStageType ?? null,
+            participantType: armedParticipant?.type ?? null,
+            participantAgentId: participantOwnerAgentId,
+            participantUserId: null,
+          },
+          nextAction: "Re-record the execution review stage verdict as its current participant and deliver it through the normal review path. The stage is already armed; do not re-arm, re-assign, or otherwise alter it.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          maxAttempts: null,
+          lastAttemptAt: now,
+        });
+        result.reviewStageArmedStranded += 1;
+        result.issueIds.push(issue.id);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "issue_graph_liveness_review_stage_armed_stranded",
+          action: "issue.review_stage_armed_stranded_escalated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: "recovery.reconcile_review_stage_armed_stranded",
+            fingerprint,
+          },
+        });
+        continue;
+      }
+
       const agentId = issue.status === "in_review" && participantAgentId
         ? participantAgentId
         : issue.assigneeAgentId;
@@ -4435,72 +4532,6 @@ export function recoveryService(
           }
           continue;
         }
-      }
-
-      if (armedReviewStageOnNonReviewCard) {
-        // An armed review stage on a non-`in_review` card. The participant is
-        // engaged and the stage is live, but the card carries no execution run
-        // or monitor, so every status-keyed recovery path skips it. Mint a
-        // participant-owned action to re-record the verdict. Do NOT re-arm,
-        // re-assign, or alter the stage: rendering the verdict is the
-        // participant's job and this path must never become a way to bypass a
-        // review gate.
-        const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
-        if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
-          result.skipped += 1;
-          continue;
-        }
-        const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
-        if (existingAction?.kind === "review_stage_armed_stranded") {
-          result.skipped += 1;
-          continue;
-        }
-        const armedParticipant = nonReviewArmedExecutionState.currentParticipant;
-        const participantOwnerAgentId =
-          armedParticipant?.type === "agent" ? armedParticipant.agentId ?? null : null;
-        const fingerprint = `review_stage_armed_stranded:${issue.companyId}:${issue.id}`;
-        await recoveryActionsSvc.upsertSourceScoped({
-          companyId: issue.companyId,
-          sourceIssueId: issue.id,
-          kind: "review_stage_armed_stranded",
-          ownerType: "agent",
-          ownerAgentId: participantOwnerAgentId,
-          ownerUserId: null,
-          previousOwnerAgentId: issue.assigneeAgentId ?? null,
-          returnOwnerAgentId: participantOwnerAgentId,
-          cause: "review_stage_armed_stranded",
-          fingerprint,
-          evidence: {
-            identifier: issue.identifier,
-            status: issue.status,
-            msSinceUpdate,
-            currentStageId: nonReviewArmedExecutionState.currentStageId ?? null,
-            currentStageType: nonReviewArmedExecutionState.currentStageType ?? null,
-            participantType: armedParticipant?.type ?? null,
-            participantAgentId: participantOwnerAgentId,
-            participantUserId: null,
-          },
-          nextAction: "Re-record the execution review stage verdict as its current participant and deliver it through the normal review path. The stage is already armed; do not re-arm, re-assign, or otherwise alter it.",
-          wakePolicy: null,
-          monitorPolicy: null,
-          maxAttempts: null,
-          lastAttemptAt: now,
-        });
-        result.reviewStageArmedStranded += 1;
-        result.issueIds.push(issue.id);
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: "system",
-          actorId: "issue_graph_liveness_review_stage_armed_stranded",
-          action: "issue.review_stage_armed_stranded_escalated",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            source: "recovery.reconcile_review_stage_armed_stranded",
-            fingerprint,
-          },
-        });
-        continue;
       }
 
       if (issue.status === "in_review") {
