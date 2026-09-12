@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { issueRecoveryActions, issues, summarySlots } from "@paperclipai/db";
 import {
   SUMMARY_SLOT_REFRESH_ACTOR_ID,
   createSummarySlotRefreshSweepService,
@@ -55,27 +57,87 @@ function generateResponse(overrides: {
   };
 }
 
-/** Builds a fake drizzle db whose discovery select() serves the given candidate rows. */
-function makeDb(rows: Array<Record<string, unknown>>) {
-  return {
+/** Builds a fake drizzle db whose discovery `select()` dispatches by table and whose `update()` records the WHERE and SET. */
+function makeDb(
+  slotRows: Array<Record<string, unknown>>,
+  opts: {
+    issueRows?: Array<Record<string, unknown>>;
+    /**
+     * When provided, the Nth read of the `issues` table returns the Nth entry,
+     * letting a test simulate the linked issue progressing between the classifier's
+     * read and the clear's re-validation read. Falls back to `issueRows` after the
+     * sequence is exhausted.
+     */
+    issueReadSequence?: Array<Array<Record<string, unknown>> | null>;
+    recoveryRows?: Array<Record<string, unknown>>;
+  } = {},
+) {
+  const issueRows = opts.issueRows ?? [];
+  const issueReadSequence = opts.issueReadSequence;
+  const recoveryRows = opts.recoveryRows ?? [];
+  const updateWhereArgs: unknown[] = [];
+  const updateSetArgs: unknown[] = [];
+  let issueReads = 0;
+  const db = {
     select: vi.fn(() => ({
-      from: () => ({
-        where: () => Promise.resolve(rows),
+      from: (table: unknown) => ({
+        where: async () => {
+          if (table === summarySlots) return slotRows;
+          if (table === issues) {
+            if (issueReadSequence) {
+              const rows = issueReads < issueReadSequence.length ? issueReadSequence[issueReads] : issueRows;
+              issueReads += 1;
+              return rows ?? [];
+            }
+            return issueRows;
+          }
+          if (table === issueRecoveryActions) return recoveryRows;
+          return [];
+        },
       }),
     })),
+    update: vi.fn(() => ({
+      set: (setArg: unknown) => ({
+        where: async (whereArg: unknown) => {
+          updateWhereArgs.push(whereArg);
+          updateSetArgs.push(setArg);
+          return [];
+        },
+      }),
+    })),
+    // Captured drizzle WHERE clauses from `clearStaleGenerationLink`, so a test
+    // can prove the recovery write is compare-and-set guarded.
+    updateWhereArgs,
+    // Captured drizzle SET payloads, so a test can prove the candidacy-restore write
+    // marks the slot back into a retried state.
+    updateSetArgs,
   };
+  return db;
 }
 
 /** Wires the sweep service over a fake db. */
 function makeService(
   rows: Array<Record<string, unknown>>,
-  opts: { sweepIntervalMs?: number; now?: () => Date; wakeup?: () => Promise<unknown> } = {},
+  opts: {
+    sweepIntervalMs?: number;
+    now?: () => Date;
+    wakeup?: () => Promise<unknown>;
+    issueRows?: Array<Record<string, unknown>>;
+    issueReadSequence?: Array<Array<Record<string, unknown>> | null>;
+    recoveryRows?: Array<Record<string, unknown>>;
+    wedgedMs?: number;
+  } = {},
 ) {
-  const db = makeDb(rows);
+  const db = makeDb(rows, {
+    issueRows: opts.issueRows,
+    issueReadSequence: opts.issueReadSequence,
+    recoveryRows: opts.recoveryRows,
+  });
   const service = createSummarySlotRefreshSweepService(db as never, {
     now: opts.now ?? (() => new Date("2026-09-10T00:00:00Z")),
     sweepIntervalMs: opts.sweepIntervalMs ?? 0,
     wakeup: opts.wakeup,
+    wedgedMs: opts.wedgedMs,
   });
   return { db, service };
 }
@@ -228,6 +290,299 @@ describe("createSummarySlotRefreshSweepService", () => {
       inFlight: 0,
       failed: 1,
     });
+  });
+
+  it("re-claims a `generating` slot pinned behind a `blocked` issue with an escalated recovery action (AC-4)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-wedged", updatedAt: new Date("2026-09-09T23:00:00Z") },
+    ];
+    // The stale link is cleared first, so `generate` mints a fresh issue
+    // instead of short-circuiting to `alreadyGenerating`.
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "blocked" }],
+      recoveryRows: [{ id: "ra-1", status: "escalated", sourceIssueId: "issue-wedged" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    // Counted in `claimed`, not `inFlight`.
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    // The stale `generating` link was cleared so `generate` re-mints the slot.
+    expect(db.update).toHaveBeenCalledTimes(1);
+    // The re-claim is logged and flagged as a wedged recovery — no longer log-invisible.
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        action: "summary_slot.generate_requested",
+        details: expect.objectContaining({
+          alreadyGenerating: false,
+          source: "summary-slot-refresh-sweep",
+          wedgedRecovery: true,
+          wedgedReason: "blocked_escalated_recovery",
+          supersededGenerationIssueId: "issue-wedged",
+        }),
+      }),
+    );
+  });
+
+  it("leaves a `generating` slot in-flight when its linked `in_review` issue was recently updated, even though the slot row is old (AC-5, no thrash)", async () => {
+    const rows = [
+      // Old slot row — would trip a naive slot-age backstop (CR finding 1) ...
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-live", updatedAt: new Date("2026-09-08T00:00:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      // ... but the generation issue itself made progress 30 minutes ago, so the
+      // age backstop must clock off the issue's timestamp, not the slot's.
+      issueRows: [{ status: "in_review", updatedAt: new Date("2026-09-09T23:30:00Z") }],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 1,
+      failed: 0,
+    });
+    // Not wedged: no stale-link clear and no re-claim audit entry.
+    expect(db.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    // The assignee wake is still re-delivered for the live in-flight issue.
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-claims a `generating` slot whose linked issue has made no progress past the wedged window (age backstop clocked off the issue timestamp)", async () => {
+    const rows = [
+      // The slot row is recent, but the linked generation issue has not
+      // progressed in > 6h, so the age backstop (clocked off the issue) fires.
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-stale", updatedAt: new Date("2026-09-09T23:55:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "in_progress", updatedAt: new Date("2026-09-08T00:00:00Z") }],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        details: expect.objectContaining({
+          wedgedRecovery: true,
+          wedgedReason: "generating_age_exceeded",
+          supersededGenerationIssueId: "issue-stale",
+        }),
+      }),
+    );
+  });
+
+  it("falls back to the slot's own timestamp for the age backstop when the linked issue is missing", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-gone", updatedAt: new Date("2026-09-08T00:00:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      // No linked issue row: the classifier must not crash and must fall back to
+      // the slot's `updatedAt` (2 days old) to decide the recovery.
+      issueRows: [],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        details: expect.objectContaining({ wedgedRecovery: true, wedgedReason: "generating_age_exceeded" }),
+      }),
+    );
+  });
+
+  it("clears the stale link with a compare-and-set guarded by status and generatingIssueId (CR finding 2, no clobber)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-wedged", updatedAt: new Date("2026-09-09T23:00:00Z") },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "blocked", updatedAt: new Date("2026-09-09T23:00:00Z") }],
+      recoveryRows: [{ id: "ra-1", status: "escalated", sourceIssueId: "issue-wedged" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await service.sweep();
+
+    const observed = new Date("2026-09-09T23:00:00Z");
+    // Exactly one recovery write, and its WHERE clause is the compare-and-set:
+    // it must require `status = 'generating'` AND the same generatingIssueId, so
+    // a concurrent write/claim between discovery and the clear matches 0 rows and
+    // the newer state is never clobbered back to `idle`.
+    expect(db.updateWhereArgs).toHaveLength(1);
+    const { sql, params } = new PgDialect().sqlToQuery(db.updateWhereArgs[0] as never);
+    expect(sql).toContain("status");
+    expect(sql).toContain("generating_issue_id");
+    expect(params).toContain("generating");
+    expect(params).toContain("issue-wedged");
+    // CR finding 1 (round 3): the "has the issue progressed since we classified it"
+    // condition is folded into the SAME atomic compare-and-set — not just re-checked
+    // in JS — so the re-read-to-write gap cannot clobber a just-progressed generation.
+    expect(sql).toContain("NOT EXISTS");
+    expect(sql).toContain("issues");
+    expect(sql).toContain("updated_at");
+    // The observed progress timestamp is bound as a parameter (a distinct Date
+    // instance than `observed`, so compare by value, not identity).
+    expect(params.some((p) => p instanceof Date && p.getTime() === observed.getTime())).toBe(true);
+  });
+
+  it("does NOT clobber a generation that progressed between classification and the clear (CR finding 1, round-3 regression)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-wedged", updatedAt: new Date("2026-09-09T23:00:00Z") },
+    ];
+    // `generate` dedupes to in-flight because the slot is still `generating` behind
+    // an active issue — the clear must have been aborted, so no fresh issue is minted.
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      recoveryRows: [{ id: "ra-1", status: "escalated", sourceIssueId: "issue-wedged" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+      // Read #0 (classifier) sees the issue parked/blocked; read #1 (the clear's
+      // re-validation) sees it has since moved to in_progress with a newer
+      // progress timestamp. The clear must therefore no-op.
+      issueReadSequence: [
+        [{ status: "blocked", updatedAt: new Date("2026-09-09T20:00:00Z") }],
+        [{ status: "in_progress", updatedAt: new Date("2026-09-09T23:59:00Z") }],
+      ],
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 1,
+      failed: 0,
+    });
+    // No recovery write at all: the progress-guarded clear aborted before writing,
+    // so the slot stays `generating` and is never clobbered back to `idle`.
+    expect(db.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    // The in-flight live issue still gets its assignee wake re-delivered.
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores candidacy when generate() throws right after a wedged clear (CR finding 2, round-3 regression)", async () => {
+    // A recently-generated slot (non-null, fresh lastGeneratedAt) pinned behind a
+    // wedged issue: without a restore, the clear's `idle` commit plus a generate()
+    // throw would leave it idle with a fresh lastGeneratedAt — excluded from the
+    // idle-staleness arm of the candidate query (a silent strand).
+    const rows = [
+      {
+        ...SCOPES[0],
+        status: "generating",
+        generatingIssueId: "issue-wedged",
+        updatedAt: new Date("2026-09-09T23:00:00Z"),
+        lastGeneratedAt: new Date("2026-09-09T20:00:00Z"),
+      },
+    ];
+    mockGenerate.mockRejectedValue(new Error("generate blew up after the clear"));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "blocked", updatedAt: new Date("2026-09-09T23:00:00Z") }],
+      recoveryRows: [{ id: "ra-1", status: "escalated", sourceIssueId: "issue-wedged" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 0,
+      failed: 1,
+    });
+    // Two recovery writes: (1) the wedged clear to `idle`, (2) the candidacy restore.
+    expect(db.update).toHaveBeenCalledTimes(2);
+    expect(db.updateSetArgs[0]).toMatchObject({ status: "idle" });
+    // The restore marks the slot `failed` (always retried by the candidate query) so
+    // it is re-claimed next sweep instead of stranded.
+    expect(db.updateSetArgs[1]).toMatchObject({
+      status: "failed",
+      generatingIssueId: null,
+      failureReason: expect.stringContaining("wedged re-claim"),
+    });
+    // The restore is compare-and-set guarded on the post-clear `idle` state, so it
+    // can never clobber a slot that already re-claimed (now `generating`).
+    const { sql, params } = new PgDialect().sqlToQuery(db.updateWhereArgs[1] as never);
+    expect(sql).toContain("status");
+    expect(sql).toContain("generating_issue_id");
+    expect(params).toContain("idle");
+  });
+
+  it("does NOT restore candidacy when generate() succeeded (no clobber of a fresh claim)", async () => {
+    // Wedged slot re-claims successfully: the clear commits, generate() mints a fresh
+    // issue and the slot flips back to `generating`. The catch never runs, so no
+    // restore write must be issued that could clobber the fresh claim back to
+    // `failed`.
+    const rows = [
+      {
+        ...SCOPES[0],
+        status: "generating",
+        generatingIssueId: "issue-wedged",
+        updatedAt: new Date("2026-09-09T23:00:00Z"),
+        lastGeneratedAt: new Date("2026-09-09T20:00:00Z"),
+      },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "blocked", updatedAt: new Date("2026-09-09T23:00:00Z") }],
+      recoveryRows: [{ id: "ra-1", status: "escalated", sourceIssueId: "issue-wedged" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    // Only the wedged clear write; no candidacy restore.
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(db.updateSetArgs[0]).toMatchObject({ status: "idle" });
   });
 
   it("records a route-equivalent summary_slot.generate_requested activity entry on a fresh claim", async () => {
