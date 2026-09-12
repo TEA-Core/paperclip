@@ -47,6 +47,11 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+// SUP-15878: both durable missing-approval-stage signals are now written through
+// the transactional logger (logActivityInTransaction), which propagates
+// persistence errors, so the test asserts against that call rather than the
+// fire-and-forget logActivity.
+const mockLogActivityInTransaction = vi.hoisted(() => vi.fn(async () => undefined));
 // Non-`cancelled` child rows the child-count query resolves. Per-test override
 // switches between open children, cancelled-only children, and no children.
 const childRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
@@ -169,6 +174,7 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
+    logActivityInTransaction: mockLogActivityInTransaction,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -319,7 +325,10 @@ function parentIssue(executionPolicy: unknown) {
 }
 
 function gapActivityInputs() {
-  return mockLogActivity.mock.calls
+  // Both durable signals are written through logActivityInTransaction (the
+  // error-propagating, transactional logger). Asserting against that call is what
+  // proves the signals are no longer fire-and-forget.
+  return mockLogActivityInTransaction.mock.calls
     .map((call) => call[1] as Record<string, unknown> | undefined)
     .filter((input): input is Record<string, unknown> =>
       typeof input?.action === "string" && input.action.includes("missing_approval_stage"));
