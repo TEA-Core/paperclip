@@ -27469,12 +27469,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.assigneeAgentId === run.agentId
       ) {
         const configurationIncomplete = isConfigurationIncompleteFailedRun(run);
+        // FOLD 2c: see the matching note on the other live call site below --
+        // upstream #12957's payload argument reached the builder and the dormant
+        // wake-queue glue, but not either of the fork's live call sites, so the
+        // sandbox-provider-plugin wording was unreachable in production.
+        const configurationIncompletePayload = parseObject(
+          parseObject(run.resultJson).configurationIncomplete,
+        );
         return {
           kind: "blocked" as const,
           issue,
           previousStatus: issue.status,
           notice: configurationIncomplete
-            ? buildConfigurationIncompleteRecoveryNoticeSeed()
+            ? buildConfigurationIncompleteRecoveryNoticeSeed(
+                Object.keys(configurationIncompletePayload).length > 0
+                  ? configurationIncompletePayload
+                  : null,
+              )
             : buildWorkspaceValidationRecoveryNoticeSeedForRun({ latestRun: run }),
           recoveryCause: configurationIncomplete
             ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
@@ -28393,10 +28404,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const workspaceValidationFailure = isWorkspaceValidationFailedRun(run);
         const configurationIncompleteFailure = isConfigurationIncompleteFailedRun(run);
         const databaseGrowthLimitFailure = isOpenCodeDatabaseGrowthLimitFailedRun(run);
+        // FOLD 2c: upstream #12957 made this seed payload-aware so a not-ready
+        // sandbox-provider plugin is named in the board notice instead of the
+        // generic secret/env-binding wording. The argument was added to the
+        // builder and is passed by the dormant wake-queue glue
+        // (`buildStrandedRecoveryNoticeForKind`, ~:10231), but this LIVE call
+        // site -- the one the fork actually runs -- was left calling it with no
+        // argument, so the new branch could never be reached. Feed it the same
+        // payload the dormant half does. Every other `configuration_incomplete`
+        // reason still falls through to the fork's secret-binding copy.
+        const configurationIncompletePayload = parseObject(
+          parseObject(run.resultJson).configurationIncomplete,
+        );
         const notice = workspaceValidationFailure
           ? buildWorkspaceValidationRecoveryNoticeSeedForRun({ latestRun: run })
           : configurationIncompleteFailure
-            ? buildConfigurationIncompleteRecoveryNoticeSeed()
+            ? buildConfigurationIncompleteRecoveryNoticeSeed(
+                Object.keys(configurationIncompletePayload).length > 0
+                  ? configurationIncompletePayload
+                  : null,
+              )
             : databaseGrowthLimitFailure
               ? buildOpenCodeDatabaseGrowthLimitRecoveryNoticeSeed()
               : buildImmediateExecutionPathRecoveryNoticeSeed({

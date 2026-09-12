@@ -10673,11 +10673,23 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     tx: DbOrTransaction,
     run: typeof heartbeatRuns.$inferSelect,
   ): Promise<boolean> {
-    const diagnostic = "reviewed_chat_execution_binding_not_authorized";
+    // FOLD 2c: upstream matches the persisted message with `===`. This fork
+    // appends ` (issue: <identifier> <uuid>)` to every setup-failure message
+    // (SUP-15275 gate-3 per-issue attribution, `issueAttributionSuffix` in
+    // heartbeat.ts), so the bare equality could never hold here and this whole
+    // predicate was dead on the fork -- silently denying the retry upstream
+    // allows. Accept the diagnostic with that optional attribution attached and
+    // nothing else: the anchored pattern keeps the "only that exact persisted
+    // failure" strictness the doc comment above demands. The system run event
+    // below is written from the same decorated string, so it is matched the
+    // same way.
+    const diagnosticPattern =
+      /^reviewed_chat_execution_binding_not_authorized(?: \(issue: [^)\n]+\))?$/;
     if (
       run.runtimeMode !== "legacy" ||
       run.errorCode !== "setup_failed" ||
-      run.error !== diagnostic ||
+      run.error === null ||
+      !diagnosticPattern.test(run.error) ||
       [
         run.runtimeModeResolverVersion,
         run.runtimeModeReason,
@@ -10733,7 +10745,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       event.eventType !== "error" ||
       event.stream !== "system" ||
       event.level !== "error" ||
-      event.message !== diagnostic ||
+      !diagnosticPattern.test(event.message ?? "") ||
       event.payload !== null ||
       event.sourceInstanceId !== null ||
       event.sourceEventId !== null ||

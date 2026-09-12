@@ -2199,7 +2199,17 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             .where(eq(heartbeatRuns.id, continuationRunId!));
           expect(deniedRun).toMatchObject({
             status: "failed",
-            error: "reviewed_chat_execution_binding_not_authorized",
+            // Fork divergence (SUP-15275 gate 3): this fork appends
+            // ` (issue: <identifier> <uuid>)` to every setup-failure message
+            // (`issueAttributionSuffix`, heartbeat.ts) so the stack-admin gate-3
+            // per-issue rule can attribute a failure to its card instead of
+            // falling through to a raw count. The denial code upstream asserts
+            // is still the whole message apart from that suffix, which is what
+            // this pattern pins -- deleting the suffix instead would blind gate 3
+            // to exactly this class of failure.
+            error: expect.stringMatching(
+              /^reviewed_chat_execution_binding_not_authorized( \(issue: .+\))?$/,
+            ),
             contextSnapshot: expect.objectContaining({
               interactionId: answered.id,
               sourceRunId,

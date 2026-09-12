@@ -439,7 +439,7 @@ describe("claude remote execution", () => {
           taskKey: null,
         },
         config: {
-        engine: "cli",
+          engine: "cli",
           command: "claude",
           ...config,
         },
@@ -579,7 +579,7 @@ describe("claude remote execution — sanitizeInheritedPaperclipEnv at spawn poi
           sessionDisplayId: null,
           taskKey: null,
         },
-        config: { command: "claude" },
+        config: { engine: "cli", command: "claude" },
         context: {
           paperclipWorkspace: {
             cwd: workspaceDir,

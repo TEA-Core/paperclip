@@ -1428,6 +1428,54 @@ export function recoveryService(
   }
 
   /**
+   * Receipt-EXISTENCE half of `hasCurrentNativePassiveWait`: did this issue's
+   * latest run finalize a native turn into an APPLIED Board / external-chat
+   * passive-wait decision at all?
+   *
+   * Deliberately drops every currency predicate the fuller check adds on top --
+   * finalization `phase`, run status, `issues.lastStatusDecisionId`, the
+   * assignee/run-agent match, source-comment freshness, destination
+   * authorization. Each of those is precisely what one of upstream's
+   * invalidation modes flips, so re-testing any of them here would re-ask the
+   * currency question this predicate exists to avoid asking.
+   *
+   * Used only to tell a parked wait apart from a silent no-live-path strand.
+   */
+  async function hasNativePassiveWaitReceipt(
+    issue: typeof issues.$inferSelect,
+    latestRun: LatestIssueRun,
+  ): Promise<boolean> {
+    if (!latestRun) return false;
+    const [receipt] = await db
+      .select({ id: statusDecisions.id })
+      .from(nativeRunFinalizations)
+      .innerJoin(
+        statusDecisions,
+        and(
+          eq(statusDecisions.id, nativeRunFinalizations.decisionId),
+          eq(statusDecisions.assessmentId, nativeRunFinalizations.assessmentId),
+          eq(statusDecisions.companyId, issue.companyId),
+          eq(statusDecisions.issueId, issue.id),
+          eq(statusDecisions.runId, latestRun.id),
+          eq(statusDecisions.applicationState, "applied"),
+          inArray(statusDecisions.reasonCode, [
+            "board_response_waiting",
+            "external_chat_response_waiting",
+          ]),
+        ),
+      )
+      .where(
+        and(
+          eq(nativeRunFinalizations.companyId, issue.companyId),
+          eq(nativeRunFinalizations.issueId, issue.id),
+          eq(nativeRunFinalizations.runId, latestRun.id),
+        ),
+      )
+      .limit(1);
+    return Boolean(receipt);
+  }
+
+  /**
    * Pausing an agent does not turn an already committed passive response into
    * stranded work. This only preserves the exact current wait; it grants no
    * execution or presentation authority and does not repair historical state.
@@ -3337,7 +3385,23 @@ export function recoveryService(
       recoveryCause,
       preferredOwnerAgentId: input.recoveryOwnerAgentId,
     });
-    const ownerAgentId = routing.ownerAgentId;
+    // FOLD 2c: upstream #12957 reports a not-ready sandbox-provider plugin under
+    // `configuration_incomplete`, but it is not the fork's secret-binding gap --
+    // no agent owner can clear it, only an operator enabling or repairing the
+    // plugin can, which is why the remedy text below says so. The fork's usual
+    // agent-owner reroute therefore has nothing to route to for this sub-cause,
+    // so park it on the board exactly as upstream does. Every other
+    // `configuration_incomplete` cause keeps the reroute (the SUP secret-binding
+    // tests assert it). Nothing is lost by this: the fork's wakePolicy for this
+    // cause is already `manual_repair_required` and
+    // enqueueSourceScopedStrandedRecoveryWake returns early for it, so no owner
+    // was ever woken.
+    const ownerAgentId =
+      recoveryCause === "configuration_incomplete" &&
+      readConfigurationIncompletePayload(input.latestRun)?.reason ===
+        SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON
+        ? null
+        : routing.ownerAgentId;
     const now = new Date();
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
@@ -4780,7 +4844,20 @@ export function recoveryService(
     const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
       source: escalationSource,
       previousStatus: input.previousStatus,
-      extraUpdate: { assigneeAgentId: nextAssigneeAgentId },
+      // Restamp the assignee only when recovery routing actually moves it.
+      // Re-writing the identical id is a value no-op -- issues.update's own
+      // side effects here are all gated on the value CHANGING -- but the mere
+      // PRESENCE of the key flips `shouldValidateNextAssignee`, which runs
+      // assertAssignableAgent and throws 409 for a terminated (or
+      // pending_approval) assignee. That turned "park this card on the board
+      // and preserve its source assignee" into a thrown conflict that aborted
+      // the whole sweep precisely when the owner was un-invokable -- the case
+      // this escalation exists to handle. Omitting the key preserves the source
+      // assignee exactly, which is what the path wants anyway.
+      extraUpdate:
+        nextAssigneeAgentId === input.issue.assigneeAgentId
+          ? {}
+          : { assigneeAgentId: nextAssigneeAgentId },
     });
     if (!updated) return null;
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
@@ -5579,6 +5656,66 @@ export function recoveryService(
         : latestRun;
       if (hasPendingRecoveryMonitor(issue, monitorRun, recoveryNow)) {
         result.skipped += 1;
+        continue;
+      }
+
+      // FOLD 2c: compose upstream's non-invokable-owner arm with SUP-11085's.
+      //
+      // At the merge base -- and still upstream at 5545f6d16 -- a non-invokable
+      // owner on a non-in_review card was an immediate board escalation. The
+      // fork (SUP-11085 / eb383a91c, then SUP-11850 / SUP-11610) replaced that
+      // whole arm with a NO_LIVE_PATH_GRACE_THRESHOLD_MS hold plus a board-owned
+      // `no_live_path_owner_unavailable` action that writes no status, because a
+      // paused agent is very often paused for seconds. Upstream then landed the
+      // paused-passive-wait suppression above (#13239), whose fall-through was
+      // written against the escalate arm the fork no longer has -- so a card
+      // whose committed passive wait is no longer current silently fell into the
+      // 15-minute hold and was never routed anywhere.
+      //
+      // Split the two populations on the one fact that actually separates them:
+      // a card that finalized a native turn into an applied Board/external-chat
+      // passive-wait decision was explicitly PARKED by its agent waiting for an
+      // answer. That answer can never be collected once the owner is not
+      // invokable, and no amount of grace makes it collectable, so upstream's
+      // arm still owns it. Everything else -- every fixture in
+      // recovery-no-live-path-strands.test.ts and both adapted cases in
+      // heartbeat-process-recovery.test.ts, none of which finalize a native run
+      // at all -- stays on SUP-11085's arm below, grace window and no-status-write
+      // guarantee intact.
+      if (
+        issue.status !== "in_review" &&
+        !agentInvokable &&
+        (await hasNativePassiveWaitReceipt(issue, latestRun))
+      ) {
+        const parkedClassification = classifyContinuationFailure(latestRun);
+        if (
+          parkedClassification.kind === "deliberate_wait_without_target" ||
+          readDispositionRepairAttempt(latestRun)
+        ) {
+          const outcome = await reconcileDispositionRepair(issue, latestRun);
+          if (outcome === "escalated") {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+        } else {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: issue.status as StrandedPreviousStatus,
+            latestRun,
+            agentInvokability,
+            comment:
+              "Paperclip cannot safely continue automatic recovery because the original assignee is not invokable. " +
+              "The source assignment is unchanged and the board must choose the next action.",
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+        }
         continue;
       }
 
