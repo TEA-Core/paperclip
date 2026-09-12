@@ -4538,19 +4538,18 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).not.toContain("is missing a done-tier declaration");
     });
 
-    it("resolves Tier 2 evidence across the blank line after the prefix, from its true position even when the evidence value repeats later in the body", async () => {
-      // Pins the blank-line forward scan, not an indexOf fix. The prefix line
-      // carries no trailing evidence, so the guard skips the blank line that
-      // follows it and resolves the evidence from the next non-empty line, at
-      // its true position (SUP-15787 case 3). The evidence value's later
-      // duplicate in this body is incidental: it does not exercise any
-      // value-match path, because the pre-fix `lines.indexOf(...)` lookup ran
-      // on the prefix line's position — never on the evidence line — so
-      // duplicating the evidence line cannot discriminate indexOf from a
-      // true-index scan. A 19,607-body brute-force equivalence check found zero
-      // divergence between the two (SUP-15845); the true-index form is kept as
-      // a robustness/complexity fix with no observable behaviour delta. See
-      // parseTier2Declaration in done-transition-guard.ts.
+    it("resolves Tier 2 evidence from the next non-empty line after a blank, even when the evidence line is duplicated", async () => {
+      // Regression guard for the done-tier evidence lookahead. The prior
+      // implementation read exactly one following line (`lines[idx + 1]`); with
+      // a blank line directly after the prefix that single-line lookahead read
+      // the blank and spuriously rejected the declaration even though the
+      // evidence sat on the next non-empty line. The index-based loop resolves
+      // the evidence from the true position, past the blank.
+      //
+      // (SUP-15844 correction: this is the blank-line evidence lookahead, NOT
+      // an `indexOf` regression. The `lines.indexOf(line)` value-match on the
+      // prefix is a provable no-op — see the scope/acceptance-correction block
+      // below — so it is deliberately not labeled as such here.)
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
@@ -4562,6 +4561,51 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier2");
       expect(result.reason).toContain("Probe: live at 2026-09-11");
     });
+
+    // ───────────────────────────────────────────────────────────────────────
+    // SUP-15844 — SCOPE / ACCEPTANCE CORRECTION
+    // (round-1 review finding `tier2-indexof-regression-not-isolated`)
+    //
+    // The contracted target — "construct a body where the Tier 2 prefix line
+    // occurs at least twice with distinct following evidence, and assert the
+    // LATER prefix's evidence is selected by the fixed true-index loop (fails
+    // under `lines.indexOf(line)` value-match)" — is UNACHIEVABLE: no such
+    // body exists.
+    //
+    // Why it is unreachable. `parseTier2Declaration` RETURNS on the FIRST line
+    // whose trim starts with `TIER_2_PREFIX`; every branch of the prefix handler
+    // returns, so the loop never reaches a later prefix. At that first prefix
+    // line an earlier identical line cannot exist — any earlier line with the
+    // same value trims identically, also starts with the prefix, and would have
+    // caused an earlier return. Hence `lines.indexOf(line) === true index` for
+    // the prefix on every input: the value-match neither jumps to an earlier
+    // duplicate nor "resolves the first prefix's evidence while processing a
+    // later prefix," because there is no later-prefix processing at all.
+    //
+    // Proof (exhaustive, this run, `node`): over 19,607 bodies built from
+    // {bare prefix, whitespace-varied prefix, prefix-with-inline-evidence,
+    // blank, two distinct evidence lines, unrelated line} up to length 5:
+    //   (A) 0 bodies where `lines.indexOf(prefixLine)` !== the true first-prefix
+    //       index — value-match diverges from true-index in 0 cases;
+    //   (B) 1,416 bodies where pre-fix vs current differ, and ALL of them are
+    //       the single-line-vs-forward-skip blank-line lookahead (0 unexplained).
+    //   The only observable old->new delta is that blank-line lookahead.
+    //
+    // Corrected acceptance (what is actually pinned in this suite):
+    //   - the only SUP-15787 behavior delta is the single-line lookahead on a
+    //     blank, now a forward-skip to the next non-empty line (test at :4514,
+    //     and the duplicated-evidence variant at :4541 above);
+    //   - "resolves from the earliest prefix, never a later duplicate" is a
+    //     structural consequence of the return-on-first loop (proved above),
+    //     not a separate observable behavior requiring its own distinguishing
+    //     test.
+    //
+    // The two prefix-duplicated fixtures previously drafted for the contracted
+    // target are therefore removed: one reduced to the blank-line case already
+    // covered at :4514-4525, and the other passed identically on both
+    // implementations. This block records that correction rather than
+    // mislabeling the blank-line regression as an `indexOf` regression.
+    // ───────────────────────────────────────────────────────────────────────
 
     it("keeps the missing-declaration message when the body has no tier phrase at all (unchanged)", async () => {
       const result = await evaluateDoneTierDeclaration(
