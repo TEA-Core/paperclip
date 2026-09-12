@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -2900,6 +2900,205 @@ describe("issue execution policy transitions", () => {
         returnAssignee: { type: "agent", agentId: coderAgentId },
         lastDecisionOutcome: "changes_requested",
       });
+    });
+
+    it("routes changes_requested to a forced return assignee even when returnAssigneeAgentId is set", () => {
+      const policy = policyWithReturnAssignee(returnAgentId);
+      const reviewStageId = policy.stages[0].id;
+      const summarizerAgentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs fixes",
+        forcedReturnAssignee: { type: "agent", agentId: summarizerAgentId, userId: null },
+      });
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(summarizerAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        returnAssignee: { type: "agent", agentId: summarizerAgentId },
+        lastDecisionOutcome: "changes_requested",
+      });
+    });
+
+    it("keeps legacy routing when forcedReturnAssignee is null", () => {
+      const policy = policyWithReturnAssignee(returnAgentId);
+      const reviewStageId = policy.stages[0].id;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs fixes",
+        forcedReturnAssignee: null,
+      });
+
+      expect(result.patch.assigneeAgentId).toBe(returnAgentId);
+    });
+  });
+
+  describe("isReviewChangesRequestedTransition (SUP-15768 gate)", () => {
+    function pendingReviewState(currentStageId: string): IssueExecutionState {
+      return {
+        status: "pending",
+        currentStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+    }
+
+    it("true for the SUP-15750 shape: pending review stage + a request-changes status", () => {
+      const policy = reviewOnlyPolicy();
+      const reviewStageId = policy.stages[0].id;
+      for (const status of ["in_progress", "todo", "blocked"] as const) {
+        expect(
+          isReviewChangesRequestedTransition({
+            policy,
+            executionState: pendingReviewState(reviewStageId),
+            requestedStatus: status,
+          }),
+        ).toBe(true);
+      }
+    });
+
+    it("false when there is no execution state (the comment-reopen regression shape)", () => {
+      const policy = reviewOnlyPolicy();
+      expect(
+        isReviewChangesRequestedTransition({
+          policy,
+          executionState: null,
+          requestedStatus: "todo",
+        }),
+      ).toBe(false);
+    });
+
+    it("false when there is no execution policy", () => {
+      expect(
+        isReviewChangesRequestedTransition({
+          policy: null,
+          executionState: pendingReviewState("stale-stage-id"),
+          requestedStatus: "in_progress",
+        }),
+      ).toBe(false);
+    });
+
+    it("false when the active stage is not pending", () => {
+      const policy = reviewOnlyPolicy();
+      const reviewStageId = policy.stages[0].id;
+      const state = pendingReviewState(reviewStageId);
+      expect(
+        isReviewChangesRequestedTransition({
+          policy,
+          executionState: { ...state, status: "completed" },
+          requestedStatus: "in_progress",
+        }),
+      ).toBe(false);
+    });
+
+    it("false for a re-arm to in_review", () => {
+      const policy = reviewOnlyPolicy();
+      const reviewStageId = policy.stages[0].id;
+      expect(
+        isReviewChangesRequestedTransition({
+          policy,
+          executionState: pendingReviewState(reviewStageId),
+          requestedStatus: "in_review",
+        }),
+      ).toBe(false);
+    });
+
+    it("false for an approval to done", () => {
+      const policy = reviewOnlyPolicy();
+      const reviewStageId = policy.stages[0].id;
+      expect(
+        isReviewChangesRequestedTransition({
+          policy,
+          executionState: pendingReviewState(reviewStageId),
+          requestedStatus: "done",
+        }),
+      ).toBe(false);
+    });
+
+    it("false when no status is requested", () => {
+      const policy = reviewOnlyPolicy();
+      const reviewStageId = policy.stages[0].id;
+      expect(
+        isReviewChangesRequestedTransition({
+          policy,
+          executionState: pendingReviewState(reviewStageId),
+          requestedStatus: undefined,
+        }),
+      ).toBe(false);
+    });
+
+    it("false when the active stage is an approval stage, not a review stage", () => {
+      const policy = makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+        { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+      ]);
+      const approvalStageId = policy.stages[1].id;
+      expect(
+        isReviewChangesRequestedTransition({
+          policy,
+          executionState: pendingReviewState(approvalStageId),
+          requestedStatus: "in_progress",
+        }),
+      ).toBe(false);
+    });
+
+    it("false when the current stage id is not present in the policy (stale)", () => {
+      const policy = reviewOnlyPolicy();
+      expect(
+        isReviewChangesRequestedTransition({
+          policy,
+          executionState: pendingReviewState("00000000-0000-4000-8000-000000000000"),
+          requestedStatus: "in_progress",
+        }),
+      ).toBe(false);
     });
   });
 

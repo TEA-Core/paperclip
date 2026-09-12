@@ -271,6 +271,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   assertPatchableExecutionPolicyWrite,
+  isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -278,6 +279,7 @@ import {
   setIssueExecutionPolicyMonitorScheduledBy,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
+import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -814,6 +816,17 @@ async function applyReviewEscalationDecision(args: {
   const existingState = parseIssueExecutionState(issue.executionState);
   if (!policy || !existingState) return null;
 
+  // Re-opening an escalated review bounces the summary-generation task back to
+  // the Summarizer, never to a policy `returnAssigneeAgentId` (SUP-15768).
+  // Resolve it only when this decision is a pending review changes_requested
+  // bounce, so unrelated decisions never trigger the summary-slot lookup.
+  const summaryForcedReturnAssignee = isReviewChangesRequestedTransition({
+    policy,
+    executionState: existingState,
+    requestedStatus,
+  })
+    ? await resolveSummaryGenerationReturnAssignee(db, issue)
+    : null;
   const transition = applyIssueExecutionPolicyTransition({
     issue,
     policy,
@@ -822,6 +835,7 @@ async function applyReviewEscalationDecision(args: {
     requestedAssigneePatch: {},
     actor,
     commentBody: decisionBody,
+    forcedReturnAssignee: summaryForcedReturnAssignee,
   });
   if (!transition.decision) return null;
   const decisionId = randomUUID();
@@ -839,7 +853,14 @@ async function applyReviewEscalationDecision(args: {
   // A final-stage approval completes every execution stage; the engine leaves the
   // issue status untouched, so route the card back to its return assignee to close.
   if (requestedStatus === "done" && updateFields.status === undefined) {
-    const returnAssignee = existingState.returnAssignee ?? null;
+    // A summary-generation card's approval hand-back must land on the Summarizer
+    // (the only writer of its slot), never on a policy `returnAssigneeAgentId`
+    // (SUP-15768). Ordinary issues resolve to null here, so they keep routing to
+    // their stored return assignee.
+    const returnAssignee =
+      (await resolveSummaryGenerationReturnAssignee(db, issue)) ??
+      existingState.returnAssignee ??
+      null;
     updateFields.status = "in_progress";
     if (returnAssignee?.type === "agent") {
       updateFields.assigneeAgentId = returnAssignee.agentId ?? null;
@@ -12603,11 +12624,26 @@ export function issueRoutes(
       }
     }
 
+    const requestedTransitionStatus =
+      typeof updateFields.status === "string" ? updateFields.status : undefined;
+    // A summary-generation issue must always bounce back to the Summarizer
+    // agent, never to a policy `returnAssigneeAgentId` (SUP-15768). The
+    // forced-return lookup is only meaningful when this PATCH is an active
+    // pending-review changes_requested bounce, so it is skipped for every
+    // other transition (reopen, approve, re-arm, statusless patches) to avoid
+    // an unneeded summary-slot DB query on unrelated paths.
+    const summaryForcedReturnAssignee = isReviewChangesRequestedTransition({
+      policy: nextExecutionPolicy,
+      executionState: parseIssueExecutionState(existing.executionState),
+      requestedStatus: requestedTransitionStatus,
+    })
+      ? await resolveSummaryGenerationReturnAssignee(db, existing)
+      : null;
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
       previousPolicy: previousExecutionPolicy,
-      requestedStatus: typeof updateFields.status === "string" ? updateFields.status : undefined,
+      requestedStatus: requestedTransitionStatus,
       requestedAssigneePatch: {
         assigneeAgentId: normalizedAssigneeAgentId,
         assigneeUserId:
@@ -12621,6 +12657,7 @@ export function issueRoutes(
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
+      forcedReturnAssignee: summaryForcedReturnAssignee,
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {

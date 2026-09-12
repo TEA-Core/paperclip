@@ -21,7 +21,14 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { writeSummarySlotSchema } from "@paperclipai/shared";
-import { summarySlotService } from "../services/summary-slots.ts";
+import {
+  resolveSummaryGenerationReturnAssignee,
+  summarySlotService,
+} from "../services/summary-slots.ts";
+import {
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.ts";
 import { withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
 import { issueService } from "../services/issues.ts";
 
@@ -688,6 +695,116 @@ describeEmbeddedPostgres("summary slot service", () => {
           { agentId: summarizerAgentId, runId: randomUUID() },
         ),
       ).rejects.toMatchObject({ status: 403 });
+    });
+  });
+
+  describe("summary-generation return assignee (SUP-15768)", () => {
+    it("resolves the Summarizer as the forced return assignee for a generation issue", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      const forced = await resolveSummaryGenerationReturnAssignee(db, {
+        id: generated.generatingIssue.id,
+        companyId,
+      });
+      expect(forced).toEqual({ type: "agent", agentId: summarizerAgentId, userId: null });
+    });
+
+    it("routes to the Summarizer even when the built-in is needs_setup (agentId present, status not ready)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      // Simulate the Summarizer losing its adapter config after the generation
+      // task was created. The slot link and generation issue persist, and a
+      // review bounce must still land on the Summarizer (the only writer of the
+      // slot), not on a policy `returnAssigneeAgentId` (SUP-15768 round-2 finding A).
+      await db
+        .update(agents)
+        .set({ adapterConfig: {} })
+        .where(eq(agents.id, summarizerAgentId));
+
+      const forced = await resolveSummaryGenerationReturnAssignee(db, {
+        id: generated.generatingIssue.id,
+        companyId,
+      });
+      expect(forced).toEqual({ type: "agent", agentId: summarizerAgentId, userId: null });
+    });
+
+    it("returns null for an issue that is not a linked generation task", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      await seedPlainAgent(companyId);
+
+      const forced = await resolveSummaryGenerationReturnAssignee(db, {
+        id: randomUUID(),
+        companyId,
+      });
+      expect(forced).toBeNull();
+    });
+
+    it("reproduces the SUP-15750 shape: one bounce lands on the Summarizer, not returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const coderLeAgentId = await seedPlainAgent(companyId);
+      const reviewerAgentId = await seedPlainAgent(companyId);
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const generationIssueId = generated.generatingIssue.id;
+
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderLeAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      })!;
+      const reviewStageId = policy.stages[0].id;
+
+      const forced = await resolveSummaryGenerationReturnAssignee(db, {
+        id: generationIssueId,
+        companyId,
+      });
+      expect(forced).toEqual({ type: "agent", agentId: summarizerAgentId, userId: null });
+
+      const transition = applyIssueExecutionPolicyTransition({
+        issue: {
+          id: generationIssueId,
+          companyId,
+          status: "in_review",
+          assigneeAgentId: reviewerAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: reviewerAgentId },
+            returnAssignee: { type: "agent", agentId: coderLeAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: reviewerAgentId },
+        commentBody: "Needs fixes",
+        forcedReturnAssignee: forced,
+      });
+
+      expect(transition.patch.status).toBe("in_progress");
+      expect(transition.patch.assigneeAgentId).toBe(summarizerAgentId);
+      expect(transition.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        returnAssignee: { type: "agent", agentId: summarizerAgentId },
+      });
     });
   });
 });

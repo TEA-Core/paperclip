@@ -53,6 +53,14 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * When set, a `changes_requested` bounce routes to this principal instead of
+   * the policy/legacy return assignee. The summary-generation issue path uses
+   * it to guarantee the task always bounces back to the Summarizer agent even
+   * when its policy carries a non-Summarizer `returnAssigneeAgentId`
+   * (SUP-15768).
+   */
+  forcedReturnAssignee?: IssueExecutionStagePrincipal | null;
 };
 
 export type ReviewEscalationSignal = {
@@ -902,6 +910,33 @@ function canAutoSkipPendingStage(input: {
     input.stage.participants.every((participant) => principalsEqual(participant, input.returnAssignee));
 }
 
+/**
+ * True when a status transition on this issue can resolve to a review
+ * `changes_requested` bounce: there is an active pending review stage and the
+ * requested status is a request-changes status (not a re-arm to `in_review`,
+ * not an approval to `done`). Summary-generation issues use this to decide
+ * when to resolve the Summarizer as the forced return assignee (SUP-15768):
+ * the lookup is only meaningful on the bounce itself, so it must not run on
+ * unrelated transitions (reopen, approve, re-arm, statusless patches) — those
+ * would issue a summary-slot DB query they do not need and break mocked route
+ * flows. This is a superset of the exact bounce (it does not also require the
+ * actor to be the active participant), which is fine: on the extra cases the
+ * resolver returns the Summarizer only for linked generation issues and `null`
+ * otherwise.
+ */
+export function isReviewChangesRequestedTransition(input: {
+  policy: IssueExecutionPolicy | null;
+  executionState: IssueExecutionState | null;
+  requestedStatus: string | null | undefined;
+}): boolean {
+  if (!input.policy || !input.executionState) return false;
+  if (input.executionState.status !== PENDING_STATUS) return false;
+  if (typeof input.requestedStatus !== "string") return false;
+  if (input.requestedStatus === "in_review" || input.requestedStatus === "done") return false;
+  const activeStage = findStageById(input.policy, input.executionState.currentStageId);
+  return activeStage?.type === "review";
+}
+
 function applyIssueExecutionStageTransition(input: TransitionInput): TransitionResult {
   const patch: Record<string, unknown> = {};
   const existingState = parseIssueExecutionState(input.issue.executionState);
@@ -1146,11 +1181,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
         }
-        const returnAssignee = resolveReturnAssignee({
-          policy: input.policy,
-          existingState,
-          currentAssignee,
-        });
+        const returnAssignee =
+          input.forcedReturnAssignee ??
+          resolveReturnAssignee({
+            policy: input.policy,
+            existingState,
+            currentAssignee,
+          });
         if (!returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
