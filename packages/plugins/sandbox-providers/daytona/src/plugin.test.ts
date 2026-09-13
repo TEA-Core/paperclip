@@ -4856,8 +4856,14 @@ describe("daytona native file-sync hooks", () => {
       syncOutParams({ operationId: "out-active", sourcePath: `${REMOTE_DIR}/out.txt`, targetPath: outboundTarget }),
     );
     // Let both sync calls register on the activity gate and reach their hung
-    // transfer, so teardown sees a refCount of two.
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // transfer, so teardown sees a refCount of two. Poll for the actual upload
+    // and download calls instead of guessing a tick count: on a busier host a
+    // single macrotask tick can fire before syncOut reaches downloadFiles,
+    // leaving releaseDownload unassigned and the release below a TypeError.
+    await vi.waitFor(() => {
+      expect(sandbox.fs.uploadFiles).toHaveBeenCalledTimes(1);
+      expect(sandbox.fs.downloadFiles).toHaveBeenCalledTimes(1);
+    });
 
     const destroyCall = plugin.definition.onEnvironmentDestroyLease?.({
       driverKey: "daytona",

@@ -7,16 +7,19 @@ import {
   companies,
   createDb,
   environmentLeases,
+  executionWorkspaces,
   heartbeatRuns,
   issueComments,
   issues,
+  projectWorkspaces,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
-import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
+import { MAX_ISSUE_REQUEST_DEPTH, type IssueExecutionPolicy } from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
@@ -27,6 +30,8 @@ import {
   PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_FULL_BUDGET_MS,
   productivityReviewService,
 } from "../services/productivity-review.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
+import { applyIssueExecutionPolicyTransition } from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -325,6 +330,153 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak (budget-weighted): 2");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  it("does not inherit the reviewed issue's execution workspace (SUP-15990)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const projectId = randomUUID();
+    const primaryProjectWorkspaceId = randomUUID();
+    const reviewedProjectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    // Isolated workspaces must be enabled for parent→child execution-workspace
+    // inheritance to engage. The reviewed issue is pinned to a *non-primary*
+    // project workspace and its own execution workspace, so both the inherited
+    // execution linkage and the inherited, non-default project linkage are
+    // observable on the card.
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId: seeded.companyId,
+      name: "Productivity Review project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values([
+      {
+        id: primaryProjectWorkspaceId,
+        companyId: seeded.companyId,
+        projectId,
+        name: "Primary workspace",
+        isPrimary: true,
+        sharedWorkspaceKey: "workspace-key-primary",
+      },
+      {
+        id: reviewedProjectWorkspaceId,
+        companyId: seeded.companyId,
+        projectId,
+        name: "Reviewed issue workspace",
+        isPrimary: false,
+        sharedWorkspaceKey: "workspace-key-reviewed",
+      },
+    ]);
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      projectWorkspaceId: reviewedProjectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Reviewed issue worktree",
+      status: "active",
+      providerType: "git_worktree",
+      providerRef: `/tmp/${executionWorkspaceId}`,
+    });
+    await db
+      .update(issues)
+      .set({
+        projectId,
+        projectWorkspaceId: reviewedProjectWorkspaceId,
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+      })
+      .where(eq(issues.id, seeded.issueId));
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.executionWorkspaceId).toBeNull();
+    expect(review?.executionWorkspacePreference).toBeNull();
+    // The card is still project-scoped: it resolves the project's default
+    // workspace, not the reviewed issue's non-default linkage.
+    expect(review?.projectId).toBe(projectId);
+    expect(review?.projectWorkspaceId).toBe(primaryProjectWorkspaceId);
+    // The reviewed issue keeps its own workspace; only the card must not copy it.
+    const [source] = await db
+      .select({ executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId));
+    expect(source?.executionWorkspaceId).toBe(executionWorkspaceId);
+  });
+
+  it("gives the review card a non-blocking policy that never gates on the reviewed agent (SUP-15990)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const policy = review?.executionPolicy as IssueExecutionPolicy | null | undefined;
+    // The card must keep a non-null policy — a null policy would let the
+    // project/company default ladder (which may name the source agent) re-apply
+    // at create time (SUP-10835).
+    expect(policy).not.toBeNull();
+    expect(policy?.mode).toBe("normal");
+    expect(policy?.commentRequired).toBe(true);
+    // A productivity review has no deliverable head, so it carries no review
+    // ladder at all: no stage can ever gate the card on the agent under review.
+    const stages = policy?.stages ?? [];
+    expect(stages).toHaveLength(0);
+    expect(
+      stages.some((stage) =>
+        (stage.participants ?? []).some((participant) => participant.agentId === seeded.coderId),
+      ),
+    ).toBe(false);
+    // `returnAssigneeAgentId` pins the policy non-null without introducing a
+    // stage, so the owning manager closes the card in a single `done` write:
+    // with no pending stage the transition must not coerce the requested
+    // `done` into `in_review` (the SUP-15987 incident). Drive the real
+    // transition to prove the single-write guarantee.
+    expect(policy?.returnAssigneeAgentId).toBe(seeded.managerId);
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "todo",
+        assigneeAgentId: seeded.managerId,
+        assigneeUserId: null,
+        executionPolicy: policy ?? null,
+        executionState: null,
+      },
+      policy: policy ?? null,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: seeded.managerId },
+      commentBody: "Closing the productivity review",
+    });
+    expect(transition.patch.status ?? "done").toBe("done");
+    expect(transition.patch.executionState).toBeUndefined();
   });
 
   it("fires the no-comment-streak trigger for two ceiling-length timed-out runs with zero comments (SUP-13298 shape)", async () => {
