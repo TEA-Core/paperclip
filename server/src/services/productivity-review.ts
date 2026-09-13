@@ -277,11 +277,20 @@ function choosePrimaryTrigger(input: {
  *    and a sweep landing in the fire -> re-arm gap must not score the card as
  *    an idle long-active episode (SUP-16092, measured on SUP-15971).
  *
- * A stale arm does NOT exempt: `cleared` status, a `scheduled` arm with a
- * null/past `nextCheckAt`, or a `triggered` arm whose woken run is no longer
- * live (e.g. cancelled at admission and never re-armed). Those cards are
- * genuinely stuck and remain reviewable.
- */
+  * A stale arm does NOT exempt: `cleared` status, a `scheduled` arm with a
+  * null/past `nextCheckAt`, or a `triggered` arm whose woken run is no longer
+  * live (e.g. cancelled at admission and never re-armed). Those cards are
+  * genuinely stuck and remain reviewable.
+  *
+  * Shape 2 is the bounded trigger for the fire -> re-arm window flagged by
+  * SUP-16117 (measured on SUP-11625). The run lookup is already materialized at
+  * this call site (`latestRuns`), so the exemption is tied to the live woken
+  * run rather than a fixed clock — the issue's fallback to a grace window on
+  * `lastTriggeredAt` only applies when that lookup is unavailable. Tying the
+  * exemption to the run keeps `long_active_duration` the sole detector of a
+  * monitor that fired and was never re-armed: the instant the woken run ends
+  * without re-arming, the card becomes reviewable again.
+  */
 function isIdleBehindArmedMonitor(
   sourceIssue: IssueRow,
   now: Date,

@@ -1250,6 +1250,90 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
+  it("keeps long_active_duration live when the monitor fired hours ago with no re-arm (SUP-16117, wedged watcher)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // Fired 3 hours ago and never re-armed: well past any plausible re-arm
+    // latency, with no live run. `long_active_duration` is the sole detector of
+    // a monitor that fired and was never re-armed, so the card stays reviewable
+    // (SUP-16117 AC2).
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString(),
+          attemptCount: 1,
+        }),
+      ),
+    );
+    // The woken run ended (cancelled at admission) without re-arming, so no run
+    // is in flight to arm the fire -> re-arm exemption.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now,
+      status: "cancelled",
+      durationMs: 2000,
+      withLeases: false,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("does not arm the fire -> re-arm exemption for an active run that predates the fire (SUP-16117, boundary)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // Fired 2 minutes ago. The only active run was created 3 hours before the
+    // fire, so it is not the run woken by THIS fire: the exemption's
+    // `createdAt >= lastTriggeredAt` bound must not be satisfied by it.
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: new Date(now.getTime() - 120 * 1000).toISOString(),
+          attemptCount: 1,
+        }),
+      ),
+    );
+    await insertLiveRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      createdAt: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // The pre-existing active run predates lastTriggeredAt, so it is not the
+    // in-flight re-arm run for this fire and the card stays reviewable.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
   it("still raises no_comment_streak for a triggered-monitor card with a live woken run (SUP-16092, trigger-scoped)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
