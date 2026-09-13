@@ -1043,8 +1043,13 @@ function evaluateReviewLadderSatisfaction(
  * this runs before any GitHub path, and it fails closed on a throw: the
  * transition write targets the same store, so a Postgres error must not be
  * waved through.
+ *
+ * Exported as the canonical shared in-scope predicate: the missing-approval
+ * stage route probe (SUP-15878 / SUP-15958) and mechanisms A and D all count a
+ * card's laddered children through this one helper so their exclusions and the
+ * `>= 2` threshold can never drift.
  */
-async function countLadderedChildren(
+export async function countLadderedChildren(
   db: Db,
   companyId: string,
   parentId: string,
@@ -1061,6 +1066,7 @@ async function countLadderedChildren(
     .select({
       id: issues.id,
       identifier: issues.identifier,
+      status: issues.status,
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
       originKind: issues.originKind,
@@ -1103,6 +1109,13 @@ async function countLadderedChildren(
   const identifiers: string[] = [];
   const excludedChildIdentifiers: string[] = [];
   for (const row of rows) {
+    // SUP-16025: the child scope is non-cancelled qualifying children only.
+    // A cancelled row is not a decomposition signal even when it still carries
+    // a qualifying policy and a completed/skipped stage, so a cancelled-only
+    // parent stays legal on both `done` and `in_review`. Skip it BEFORE the
+    // origin/policy/state/carve-out qualification so it neither counts toward
+    // the `>= 2` threshold nor is recorded in the carve-out audit trail.
+    if (row.status === "cancelled") continue;
     // SUP-15451: only decomposition children count. A platform-generated card
     // parented to this issue (issue_productivity_review, task_watchdog,
     // stale_active_run_evaluation, ...) is not a decomposition signal — it is
