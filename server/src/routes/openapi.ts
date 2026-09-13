@@ -6813,6 +6813,15 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/external-objects/stuck",
+  tags: ["issues"],
+  summary: "List persistently-failing external objects for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/external-objects/refresh",
   tags: ["issues"],
