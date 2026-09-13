@@ -744,6 +744,70 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
       expect(typeof approvalStatus!.approvedAt).toBe("string");
     });
+
+    // SUP-16141 (finding prepublish-anchor-lost-update): the anchor write must be
+    // a live-subtree merge, not a stale read-modify-write. A concurrent writer
+    // that commits a publishFailure between the anchor's read and write must
+    // survive; a SELECT-then-whole-row UPDATE clobbers it. The hook below makes
+    // the anchor's SELECT return the pre-concurrent snapshot while the live row
+    // already carries the field — the deterministic interleaving the embedded
+    // Postgres suite distinguishes.
+    it("SUP-16141: a concurrent publishFailure committed after the anchor's read survives the atomic merge (no lost update)", async () => {
+      const issueId = await insertIssue();
+
+      // The card starts with no executionState. A concurrent writer (a failed
+      // publish outcome / the reconciler) commits a live publishFailure.
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            approvalStatus: {
+              publishFailure: {
+                reason: "status:failed:scope_missing",
+                headSha: APPROVED_HEAD,
+                at: "2026-09-13T10:28:39.441Z",
+              },
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      // Deterministic stale-read hook: the anchor's SELECT returns the snapshot
+      // captured BEFORE that commit (an empty executionState), exactly as a
+      // pre-concurrent SELECT would have. Everything else routes to the real db,
+      // so the anchor's write still lands on the live row.
+      const frozenPreConcurrentExecutionState: Record<string, unknown> = {};
+      const hookDb = new Proxy(db, {
+        get(target, prop) {
+          if (prop === "select") {
+            return () => ({
+              from: () => ({
+                where: () => ({
+                  limit: () =>
+                    Promise.resolve([{ executionState: frozenPreConcurrentExecutionState }]),
+                }),
+              }),
+            });
+          }
+          const value = Reflect.get(target, prop);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      await recordApprovalAnchor(hookDb, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      // The new anchor is written on top of the concurrent field.
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      // The concurrent field SURVIVES — no lost update. This is the assertion a
+      // SELECT-then-whole-row implementation fails: it would clobber the field
+      // with the stale snapshot.
+      expect(approvalStatus!.publishFailure).toMatchObject({
+        reason: "status:failed:scope_missing",
+        headSha: APPROVED_HEAD,
+      });
+    });
   });
 
   // SUP-16081 fix #2: a transient GitHub status-write failure is retried; a

@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { and, eq, ilike, sql } from "drizzle-orm";
+import { and, eq, ilike, sql, type SQL } from "drizzle-orm";
 import {
   externalObjectMentions,
   externalObjects,
@@ -2899,10 +2899,15 @@ export async function recordApprovalPublishOutcome(
  * and `merge-arming/republish` bails with `head_unresolvable` when the card has
  * no published head AND no recorded anchor.
  *
- * This helper does a fresh read of the card's `executionState` and MERGE-writes
- * the anchor into `approvalStatus`, preserving every concurrent field
- * (`publishedHeadSha`, `publishFailure`, `backfillRefusal`, `pendingCandidates`,
- * ...) — it never clobbers the whole `approvalStatus` object and it never
+ * SUP-16141 (finding prepublish-anchor-lost-update): the anchor is merged into
+ * the LIVE `executionState.approvalStatus` subtree atomically on the server —
+ * a `jsonb_set` on the root plus a jsonb `||` on the live subtree, the same
+ * shape the reconciler's `mergeApprovalStatus` uses. The previous
+ * SELECT-then-whole-row UPDATE rebuilt the entire column from a client
+ * snapshot, so a concurrent writer that committed between the SELECT and the
+ * UPDATE (a `publishFailure`, `backfillRefusal`, `publishedHeadSha`, ...) was
+ * silently clobbered. Overwriting only `approvedHeadSha` + `approvedAt` here
+ * preserves every other execution-state and approval-status key and never
  * decides whether a stamp is published. It is safe to call twice (idempotent):
  * the post-publish `recordApprovalPublishOutcome` re-writes the same two fields.
  */
@@ -2911,24 +2916,20 @@ export async function recordApprovalAnchor(
   issueId: string,
   resolvedHeadSha: string,
 ): Promise<void> {
-  const rows = await db
-    .select({ executionState: issues.executionState })
-    .from(issues)
-    .where(eq(issues.id, issueId))
-    .limit(1);
-  const executionState = (rows[0]?.executionState ?? {}) as Record<string, unknown>;
-  const priorApprovalStatus = executionState.approvalStatus;
-  const approvalStatus: Record<string, unknown> =
-    priorApprovalStatus && typeof priorApprovalStatus === "object"
-      ? { ...(priorApprovalStatus as Record<string, unknown>) }
-      : {};
-  approvalStatus.approvedHeadSha = resolvedHeadSha;
-  approvalStatus.approvedAt = new Date().toISOString();
+  const anchorPatch: Record<string, unknown> = {
+    approvedHeadSha: resolvedHeadSha,
+    approvedAt: new Date().toISOString(),
+  };
+  const approvalStatusExpr: SQL = sql`(
+    coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
+    || ${JSON.stringify(anchorPatch)}::jsonb
+  )`;
+  const executionStateExpr: SQL = sql`(
+    jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}', ${approvalStatusExpr})
+  )`;
   await db
     .update(issues)
-    .set({
-      executionState: { ...executionState, approvalStatus },
-    })
+    .set({ executionState: executionStateExpr })
     .where(eq(issues.id, issueId));
 }
 
