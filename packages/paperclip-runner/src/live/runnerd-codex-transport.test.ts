@@ -2740,14 +2740,21 @@ it("refuses the runnerd launch at the per-run process cap before the launcher", 
   const launcher = vi.fn(() => {
     throw new Error("runnerd launcher reached despite cap refusal");
   });
+  const runProcessAdmission = vi.fn(
+    () =>
+      new RunnerdRunProcessCapExceededError({
+        runId: "run-cap",
+        cap: 3,
+        current: 3,
+        processGroupId: 4242,
+      }),
+  );
   const bundle = createCapabilityRunnerdCodexTransport({
     // Any readable local file satisfies the artifact identity hash; the
     // external launcher owns execution, so no real runnerd binary is needed.
     runnerBinary: resolve(import.meta.dirname, "../../package.json"),
     runnerProcessLauncher: launcher,
-    runProcessCap: 3,
-    runProcessGroupCounter: () => 3,
-    runProcessGroupId: 4242,
+    runProcessAdmission,
     prpIdentity: runnerdCapLaunchIdentity(),
     controlPlaneRegistration: runnerdCapLaunchRegistration(
       "/api/runner/v1/connect/run-cap-refusal",
@@ -2781,6 +2788,9 @@ it("refuses the runnerd launch at the per-run process cap before the launcher", 
     // Decided before process creation: the launcher is never reached and no
     // existing group is signalled or killed.
     expect(launcher).not.toHaveBeenCalled();
+    // The injected admission is the single decision point: the transport
+    // evaluates it (rather than an internal mirror of the cap policy).
+    expect(runProcessAdmission).toHaveBeenCalledTimes(1);
     // No signal/kill is sent to the run's existing process group; a negative
     // pid is a process-group signal and the tracked group is 4242.
     expect(
@@ -2801,9 +2811,7 @@ it("admits the runnerd launch one below the per-run process cap", async () => {
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: resolve(import.meta.dirname, "../../package.json"),
     runnerProcessLauncher: launcher,
-    runProcessCap: 3,
-    runProcessGroupCounter: () => 2,
-    runProcessGroupId: 4242,
+    runProcessAdmission: () => null,
     prpIdentity: runnerdCapLaunchIdentity(),
     controlPlaneRegistration: runnerdCapLaunchRegistration(
       "/api/runner/v1/connect/run-cap-admission",
@@ -2851,9 +2859,7 @@ it("refuses the reattach runnerd launch at the cap without signalling the existi
     runnerProcessLauncher: vi.fn(() => {
       throw new Error("seed launcher reached");
     }),
-    runProcessCap: 3,
-    runProcessGroupCounter: () => 0,
-    runProcessGroupId: 4242,
+    runProcessAdmission: () => null,
     controlPlaneRegistration: runnerdCapLaunchRegistration(
       "/api/runner/v1/connect/run-cap-reattach-seed",
     ),
@@ -2881,9 +2887,13 @@ it("refuses the reattach runnerd launch at the cap without signalling the existi
       providerSessionId: "provider-cap-reattach",
     },
     runnerProcessLauncher: launcher,
-    runProcessCap: 3,
-    runProcessGroupCounter: () => 3,
-    runProcessGroupId: 4242,
+    runProcessAdmission: () =>
+      new RunnerdRunProcessCapExceededError({
+        runId: "run-cap-reattach",
+        cap: 3,
+        current: 3,
+        processGroupId: 4242,
+      }),
     controlPlaneRegistration: runnerdCapLaunchRegistration(
       "/api/runner/v1/connect/run-cap-reattach",
     ),

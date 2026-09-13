@@ -47,7 +47,6 @@ import {
   type RunnerProcessHandle,
   type RunnerProcessConnection,
   type RunnerProcessLaunchSpec,
-  type RunnerdRunProcessCapGate,
 } from "../control-plane/durable-prp-control-plane.js";
 import {
   resolveQualifiedAcpxProfile,
@@ -85,79 +84,12 @@ const RUNNERD_P0_RESERVE_BYTES = 1024 * 1024;
 // SUP-16011 — per-run process-cap admission for the runnerd launch path.
 //
 // The runner package is a decoupled leaf: it cannot import
-// `@paperclipai/adapter-utils` (the shared `evaluateRunProcessSpawn` decision
-// and `resolveRunProcessCap` live there), and it has no access to the
-// server-side census counter or the run's tracked process group. So the
-// transport evaluates an equivalent local decision against those injected
-// inputs and hands the resulting gate to `spawnRunner` — the single admission
-// point that already refuses the spawn when the gate returns a refusal.
-//
-// The env key, disabled sentinels, and derived default intentionally mirror
-// `@paperclipai/adapter-utils` (`RUN_PROCESS_CAP_ENV_KEY`,
-// `DEFAULT_RUN_PROCESS_CAP`, `resolveRunProcessCap`); keep them in sync.
-const RUNNERD_RUN_PROCESS_CAP_ENV_KEY = "PAPERCLIP_RUN_PROCESS_CAP";
-const RUNNERD_RUN_PROCESS_CAP_DEFAULT = 512;
-
-type RunnerdRunProcessGroupCounter = (processGroupId: number) => number | null;
-
-function resolveRunnerdRunProcessCap(
-  env: NodeJS.ProcessEnv = process.env,
-): number | null {
-  const raw = env[RUNNERD_RUN_PROCESS_CAP_ENV_KEY];
-  if (raw === undefined || raw.trim() === "") {
-    return RUNNERD_RUN_PROCESS_CAP_DEFAULT;
-  }
-  const normalized = raw.trim().toLowerCase();
-  if (
-    normalized === "0" ||
-    normalized === "off" ||
-    normalized === "none" ||
-    normalized === "disabled"
-  ) {
-    return null;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    return RUNNERD_RUN_PROCESS_CAP_DEFAULT;
-  }
-  return parsed;
-}
-
-// Mirrors `evaluateRunProcessSpawn` from `@paperclipai/adapter-utils` but
-// produces the runner-local `RunnerdRunProcessCapExceededError`. It refuses at
-// the limit (`current >= cap`) and fails open when the cap is disabled, the
-// counter is unwired, the group is unreadable, or the group cannot be measured.
-function evaluateRunnerdRunProcessSpawn(input: {
-  runId: string;
-  cap: number | null;
-  counter: RunnerdRunProcessGroupCounter | null;
-  processGroupId: number | null;
-}): RunnerdRunProcessCapExceededError | null {
-  const { runId, cap, counter, processGroupId } = input;
-  if (
-    cap === null ||
-    counter === null ||
-    processGroupId === null ||
-    processGroupId <= 0
-  ) {
-    return null;
-  }
-  let current: number | null = null;
-  try {
-    current = counter(processGroupId);
-  } catch {
-    current = null;
-  }
-  if (current !== null && current >= cap) {
-    return new RunnerdRunProcessCapExceededError({
-      runId,
-      cap,
-      current,
-      processGroupId,
-    });
-  }
-  return null;
-}
+// `@paperclipai/adapter-utils` (where the cap decision, its env key, and the
+// census counter live) and it has no access to the run's tracked process
+// group. So the server evaluates the decision and injects it here as
+// `runProcessAdmission`. The transport forwards it unchanged to `spawnRunner`,
+// the single admission point that already refuses the spawn when the admission
+// returns a refusal.
 
 function readLocalProcessStartedAt(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -1094,22 +1026,12 @@ export interface CapabilityRunnerdCodexTransportOptions {
     spec: RunnerProcessLaunchSpec,
   ) => RunnerProcessHandle;
   /**
-   * Resolved per-run process cap for the runnerd launch admission. Omitted
-   * (or `undefined`) resolves from `PAPERCLIP_RUN_PROCESS_CAP`; `null` disables
-   * the cap explicitly. Mirrors the derived default in adapter-utils.
+   * Per-run process-cap admission evaluated by the caller, which owns the cap
+   * policy, the census counter, and the run's tracked process group. Returns a
+   * refusal to block the runnerd spawn, or `null` to admit it. Omitted admits
+   * unconditionally (fails open).
    */
-  runProcessCap?: number | null;
-  /**
-   * Census counter measuring the live members of a run's process group. The
-   * server wires this to its own census (no `/proc` walk is introduced here).
-   * Omitted/`null` makes the cap fail open for this transport.
-   */
-  runProcessGroupCounter?: RunnerdRunProcessGroupCounter;
-  /**
-   * The run's currently-tracked process group (`null` when the run has none
-   * yet). Omitted/`null` makes the cap fail open for this transport.
-   */
-  runProcessGroupId?: number | null;
+  runProcessAdmission?: () => RunnerdRunProcessCapExceededError | null;
   /** Durable runner state path in the process owner's filesystem. */
   runnerStateDirectory?: string;
   /** Read the live durable runner state when runnerd owns a remote filesystem. */
@@ -2948,32 +2870,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#publish();
   }
 
-  /**
-   * Build the runnerd launch admission gate from the shared per-run cap
-   * decision.
-   *
-   * The gate is always constructed and handed to both `spawnRunner` call sites
-   * (initial + reattach) — and retained on the restart closure — so the cap
-   * cannot be bypassed by omitting an option. It fails open only when the cap
-   * is disabled, the census counter is unwired, or the run's group is
-   * unmeasurable: the cap's own fail-open semantics.
-   */
-  #runProcessCapGate(): RunnerdRunProcessCapGate {
-    const cap =
-      this.options.runProcessCap !== undefined
-        ? this.options.runProcessCap
-        : resolveRunnerdRunProcessCap(process.env);
-    const counter = this.options.runProcessGroupCounter ?? null;
-    const processGroupId = this.options.runProcessGroupId ?? null;
-    return ({ runId }) =>
-      evaluateRunnerdRunProcessSpawn({
-        runId,
-        cap,
-        counter,
-        processGroupId,
-      });
-  }
-
   async #start(
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
@@ -3392,7 +3288,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ),
       diagnosticsDirectory: resolve(this.#root, "diagnostics"),
       processLauncher: this.options.runnerProcessLauncher,
-      runProcessCapGate: this.#runProcessCapGate(),
+      runProcessCapGate: this.options.runProcessAdmission,
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -3795,7 +3691,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ),
           diagnosticsDirectory: resolve(this.#root, "diagnostics"),
           processLauncher: this.options.runnerProcessLauncher,
-          runProcessCapGate: this.#runProcessCapGate(),
+          runProcessCapGate: this.options.runProcessAdmission,
         });
     if (handle) {
       this.#handle = handle;

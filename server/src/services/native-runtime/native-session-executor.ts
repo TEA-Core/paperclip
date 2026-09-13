@@ -55,6 +55,13 @@ import {
   resolvePaperclipRunnerTransport,
   type PaperclipRunnerTransport,
 } from "@paperclipai/adapter-utils/runner-connectivity";
+import { runningProcesses } from "@paperclipai/adapter-utils/server-utils";
+import {
+  evaluateRunProcessSpawn,
+  getRunProcessGroupCounter,
+  resolveRunProcessCap,
+  type RunProcessCapExceededError,
+} from "@paperclipai/adapter-utils/run-process-cap";
 import type { Db } from "@paperclipai/db";
 import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import {
@@ -7666,6 +7673,59 @@ async function createRunnerdBackendWithinSessionClaim(
     if (!current) throw new Error("native_session_tool_authority_unavailable");
     return current.execute(call);
   };
+  // SUP-16011: the per-run process cap is enforced at the runnerd spawn by a
+  // single admission the server injects into the transport. The run's process
+  // group is read from the durable heartbeat row first (so it survives a
+  // restart or reattach where the in-memory map is cold), falling back to the
+  // in-memory map when that read is unavailable. Remote runner targets execute
+  // on another host whose process table this server cannot census, so the cap
+  // fails open there and the unenforced decision is logged.
+  const runProcessGroupIdFromDurableRow = await (async (): Promise<
+    number | null
+  > => {
+    try {
+      const rows = await input.db
+        .select({ processGroupId: heartbeatRuns.processGroupId })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, input.execution.binding.runId))
+        .limit(1);
+      return rows[0]?.processGroupId ?? null;
+    } catch {
+      return null;
+    }
+  })();
+  const runProcessAdmission = (): RunProcessCapExceededError | null => {
+    if (remoteTarget) {
+      if (input.onLog) {
+        void input
+          .onLog(
+            "stderr",
+            `[paperclip-runner] per-run process cap not enforced for remote runner target (run ${input.execution.binding.runId})\n`,
+          )
+          .catch(() => {});
+      }
+      return null;
+    }
+    return evaluateRunProcessSpawn({
+      runId: input.execution.binding.runId,
+      cap: resolveRunProcessCap(process.env),
+      counter: getRunProcessGroupCounter(),
+      processGroupId:
+        runProcessGroupIdFromDurableRow ??
+        runningProcesses.get(input.execution.binding.runId)?.processGroupId ??
+        null,
+      onMeasureError: (error) => {
+        if (input.onLog) {
+          void input
+            .onLog(
+              "stderr",
+              `[paperclip-runner] per-run process cap census failed for run ${input.execution.binding.runId}: ${error instanceof Error ? error.message : String(error)}\n`,
+            )
+            .catch(() => {});
+        }
+      },
+    });
+  };
   const backend = createNativeSessionBackend(runnerExecution, {
     runnerInstanceId: input.runnerInstanceId,
     environment: effectiveRunnerEnvironment,
@@ -7803,6 +7863,7 @@ async function createRunnerdBackendWithinSessionClaim(
           ? resolveSourceCodexHome(input.runnerEnvironment ?? process.env)
           : undefined,
         runnerProcessLauncher: remoteProcessLauncher,
+        runProcessAdmission,
         runnerReconnectGraceMs: remoteTarget ? 120_000 : undefined,
         adoptExistingRunner: adoptedProcess
           ? {
