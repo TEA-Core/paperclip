@@ -817,6 +817,24 @@ describe("openapi routes", () => {
     ).toBeDefined();
   });
 
+  it("documents the company stuck-external-object read with company-access (not board-only) auth", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/companies/{companyId}/external-objects/stuck"].get;
+
+    expect(operation, "GET /api/companies/{companyId}/external-objects/stuck is registered").toBeDefined();
+    expect(
+      operation.parameters.some((p: { name: string; in: string }) => p.name === "companyId" && p.in === "path"),
+    ).toBe(true);
+    // The handler calls assertCompanyAccess (not assertBoard), so the document must
+    // publish the company-access actor (board_or_agent, AgentBearerAuth offered)
+    // rather than board-only metadata.
+    expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    expect(operation.security.some((req: Record<string, unknown>) => "AgentBearerAuth" in req)).toBe(true);
+    expect(operation.responses["200"]).toBeDefined();
+    expect(operation.responses["401"]).toBeDefined();
+    expect(operation.responses["403"]).toBeDefined();
+  });
+
   it("publishes the Claude browser-code grammar and strict setup-token response shapes", () => {
     const { spec } = loadSpecRoutes();
     const base = "/api/companies/{companyId}/setup-token-login-sessions";
