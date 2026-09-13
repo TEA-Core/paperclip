@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -556,6 +556,57 @@ describeEmbeddedPostgres("summary slot service", () => {
         failureReason: expect.stringContaining("was cancelled before writing a summary"),
       });
     });
+
+    it("classifies an unwritten generation as failed when the inherited write ties its creation millisecond (identity regression)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      // A prior generation's write survives a re-arm: the slot still carries a
+      // document + last_generated_at. We force that timestamp to tie the FRESH
+      // generation's own createdAt so the discriminator is forced to decide on the
+      // shared millisecond alone — a `>=` (timestamp-coincidence) check would
+      // wrongly call this never-written generation as having written.
+      const priorDoc = await db
+        .insert(documents)
+        .values({
+          companyId,
+          format: "markdown",
+          latestBody: "# Prior generation summary",
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const slotRow = await db
+        .select()
+        .from(summarySlots)
+        .where(eq(summarySlots.companyId, companyId))
+        .then((rows) => rows[0]!);
+      const generationIssueRow = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generated.generatingIssue.id))
+        .then((rows) => rows[0]!);
+
+      // Stamp the inherited write at exactly this generation's creation instant.
+      await db
+        .update(summarySlots)
+        .set({ lastGeneratedAt: generationIssueRow.createdAt, documentId: priorDoc.id })
+        .where(eq(summarySlots.id, slotRow.id));
+
+      await issueService(db).update(generated.generatingIssue.id, { status: "cancelled" });
+
+      // A write that ties the generation's creation millisecond cannot be its own
+      // write; the inherited content must surface as `failed`, not `idle`.
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot).toMatchObject({
+        status: "failed",
+        generatingIssueId: null,
+        failureReason: expect.stringContaining("was cancelled before writing a summary"),
+      });
+    });
   });
 
   describe("summarizer writes", () => {
@@ -738,7 +789,24 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(afterTerminal.slot).toMatchObject({ status: "idle", generatingIssueId: null });
       expect(afterTerminal.generatingIssue).toBeNull();
 
-      // A terminal generation task can no longer write the slot.
+      // A terminal generation task that still holds the slot link (a write request
+      // that captured the link just before the terminal transition) must be refused
+      // by the terminal-status guard — NOT the earlier active-link guard. Re-arm the
+      // link to the now-terminal task to model that in-flight race: the guard order
+      // is active-link (5) then terminal-status (6), so only a present link lets the
+      // request reach the terminal-status refusal. Use the resubmission run, the run
+      // that owns the task after the bounce.
+      await db
+        .update(summarySlots)
+        .set({ generatingIssueId: generationIssueId })
+        .where(
+          and(
+            eq(summarySlots.companyId, companyId),
+            eq(summarySlots.scopeKind, "project"),
+            eq(summarySlots.slotKey, "header"),
+            eq(summarySlots.scopeId, projectId),
+          ),
+        );
       await expect(
         svc.write(
           {
@@ -747,9 +815,12 @@ describeEmbeddedPostgres("summary slot service", () => {
             baseRevisionId: second.revision.id,
             generationIssueId,
           },
-          { agentId: summarizerAgentId, runId },
+          { agentId: summarizerAgentId, runId: resubmitRunId },
         ),
-      ).rejects.toMatchObject({ status: 403 });
+      ).rejects.toMatchObject({
+        status: 403,
+        message: "Summary write is not available from a terminal generation task",
+      });
     });
 
     it("returns only the 20 most recent summary revisions", async () => {

@@ -32,9 +32,13 @@ function failureReasonForIssue(issue: TerminalGenerationIssue) {
  * (`upsertSlot` never touches them), so a slot that was summarised before and is
  * then re-armed for a new, never-written generation still carries the prior
  * revision's document and timestamp. The discriminator is that the latest write
- * (`last_generated_at`, stamped only by `write()`) happened at or after this
- * generation task was created: a write can only target the currently-armed
- * generation, so any earlier timestamp belongs to a previous generation.
+ * (`last_generated_at`, stamped only by `write()`) happened strictly after this
+ * generation task was created: a generation cannot write until it exists, is
+ * armed, is run, and produces output, so any write it lands is always stamped
+ * after its own creation. A write at or before that instant — including a tie on
+ * the same normalized millisecond — cannot be attributed to this task; it is
+ * inherited from a previous generation and must mark this one as never having
+ * written.
  *   - a generation that wrote a revision completes to `idle` (fresh content);
  *   - a generation that never wrote — even when a document is inherited from a
  *     prior generation — surfaces as `failed` so the refresh sweep regenerates.
@@ -55,20 +59,25 @@ export async function finalizeSummarySlotsForTerminalIssue(
   const failureReason = failureReasonForIssue(issue);
 
   // True when THIS generation wrote a revision: the most recent write
-  // (last_generated_at, stamped only by write()) happened at or after this
-  // generation task was created. A write can only target the currently-armed
-  // generation, so an earlier timestamp belongs to a prior generation and must
-  // not mark this one as having written. Shared by both CASE branches so the
-  // status and failure_reason can never disagree.
+  // (last_generated_at, stamped only by write()) is STRICTLY AFTER this
+  // generation task was created. A generation cannot write until it exists, is
+  // armed, is run, and produces output, so a write it lands is stamped after its
+  // own creation. A write at or before that creation instant — including a tie on
+  // the same normalized millisecond — is inherited from a prior generation and
+  // must not mark this one as having written. The identity is therefore the
+  // generation's own creation boundary, not a `>=` timestamp coincidence: a prior
+  // write and a later unwritten generation that share a normalized millisecond do
+  // not masquerade as a current-generation write. Shared by both CASE branches so
+  // the status and failure_reason can never disagree.
   //
   // Bound as an ISO string (not a raw Date): drizzle serializes Dates in `.set()`
   // but a Date interpolated into a raw `sql` fragment reaches the driver as a
   // Date object, which its text serializer rejects. Postgres casts the literal
-  // to timestamptz for the `>=` comparison.
-  const createdBeforeOrAt = new Date(issue.createdAt).toISOString();
+  // to timestamptz for the `>` comparison.
+  const createdAfter = new Date(issue.createdAt).toISOString();
   const wroteThisGeneration = sql`(
     ${summarySlots.lastGeneratedAt} IS NOT NULL
-    AND ${summarySlots.lastGeneratedAt} >= ${createdBeforeOrAt}
+    AND ${summarySlots.lastGeneratedAt} > ${createdAfter}
   )`;
 
   return dbOrTx
