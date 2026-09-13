@@ -22,6 +22,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         invalidations.push(input);
       },
       getQueryData: () => undefined,
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -545,6 +546,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         invalidations.push(input);
       },
       getQueryData: () => undefined,
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -591,6 +593,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         }
         return undefined;
       },
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -637,6 +640,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         }
         return undefined;
       },
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -685,6 +689,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         }
         return undefined;
       },
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -1339,6 +1344,76 @@ describe("LiveUpdatesProvider summary slot invalidation", () => {
           (entry as { queryKey: unknown[] }).queryKey[0] === "summary-slots",
       ),
     ).toBe(false);
+  });
+
+  it("invalidates the linked slot when a changes_requested bounce reopens the generation issue", () => {
+    const invalidations: unknown[] = [];
+    const matchingKey = queryKeys.summarySlots.detail("company-1", "project", "header", "project-1");
+    const otherKey = queryKeys.summarySlots.detail("company-1", "project", "body", "project-1");
+    const seeded = [
+      [
+        matchingKey,
+        {
+          slot: { status: "generating", documentId: "doc-1" },
+          document: null,
+          generatingIssue: {
+            id: "gen-issue-1",
+            identifier: "SUP-1",
+            title: "Summarize",
+            status: "in_review",
+          },
+        },
+      ],
+      [
+        otherKey,
+        {
+          slot: { status: "generating", documentId: "doc-2" },
+          document: null,
+          generatingIssue: {
+            id: "gen-issue-2",
+            identifier: "SUP-2",
+            title: "Summarize",
+            status: "in_review",
+          },
+        },
+      ],
+    ] as unknown[];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: () => undefined,
+      getQueriesData: (filter: { queryKey: unknown[] }) =>
+        Array.isArray(filter.queryKey) && filter.queryKey[0] === "summary-slots" ? seeded : [],
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      {
+        entityType: "issue",
+        entityId: "gen-issue-1",
+        action: "issue.updated",
+        details: { previousStatus: "in_review", status: "in_progress" },
+      },
+      { userId: null, agentId: null },
+    );
+
+    // The linked slot's detail + revisions must be invalidated so the mounted
+    // card re-derives its live-generation state and resumes polling.
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.summarySlots.detail("company-1", "project", "header", "project-1"),
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.summarySlots.revisions("company-1", "project", "header", "project-1"),
+    });
+    // A slot whose linked generation issue did not bounce must stay untouched.
+    expect(invalidations).not.toContainEqual({
+      queryKey: queryKeys.summarySlots.detail("company-1", "project", "body", "project-1"),
+    });
+    expect(invalidations).not.toContainEqual({
+      queryKey: queryKeys.summarySlots.revisions("company-1", "project", "body", "project-1"),
+    });
   });
 });
 

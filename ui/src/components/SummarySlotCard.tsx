@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
+  SummarySlot,
   SummarySlotDocument,
   SummarySlotIssueRef,
   SummarySlotKey,
@@ -96,6 +97,38 @@ export function resolveGenerationStatusLine(status: LiveGenerationStatus | null)
 }
 
 /**
+ * True when a summary slot has a LIVE, unwritten generation in flight. This is
+ * the single source of truth for both the "Generating" badge and the 3s poll, so
+ * a slot that has written its summary and whose generation task is parked in
+ * review stops polling instead of re-fetching for the whole review window
+ * (SUP-15773 review: unbounded poll on `generating`). Only an active, not
+ * yet-written run — or a changes_requested bounce back in `in_progress` — keeps
+ * the slot live.
+ */
+export function slotIsLiveGeneration(
+  data: {
+    slot: SummarySlot | null;
+    generatingIssue: SummarySlotIssueRef | null;
+  } | null | undefined,
+): boolean {
+  if (!data) return false;
+  const slot = data.slot;
+  if (!slot || slot.status !== "generating") return false;
+  const issue = data.generatingIssue;
+  if (!issue) return false;
+  if (TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
+  // A successful write keeps the slot armed (`generating`) and the generation
+  // link alive through the review window so a changes_requested bounce can write
+  // a second revision (SUP-15773). `in_review` therefore no longer means
+  // "actively producing": a slot that carries write evidence (`documentId`) with
+  // its linked task parked in review is done producing until it is bounced back.
+  // Only an active, not-yet-written run — or a bounce back in `in_progress` —
+  // keeps the 3s poll.
+  if (issue.status === "in_review" && slot.documentId) return false;
+  return true;
+}
+
+/**
  * Subscribe to the shared LiveUpdates socket and track the generation run's
  * live status derived from `heartbeat.run.progress` events matching the slot's
  * generating issue. Resets whenever the tracked generation changes, and stays
@@ -180,7 +213,7 @@ export function SummarySlotCard({
     queryFn: () => summarySlotsApi.get(selector!),
     enabled: Boolean(selector && summariesEnabled),
     retry: false,
-    refetchInterval: (query) => query.state.data?.slot?.status === "generating" ? 3_000 : false,
+    refetchInterval: (query) => (slotIsLiveGeneration(query.state.data) ? 3_000 : false),
   });
 
   const revisionsQuery = useQuery({
@@ -241,9 +274,7 @@ export function SummarySlotCard({
   // The token-streamed STATUS line is more responsive than the server-derived
   // progress snippet; prefer it and fall back to the Phase 1 status line.
   const generationStatusLine = draftStream.statusLine ?? liveStatusLine;
-  const isGenerating = slotQuery.data?.slot?.status === "generating"
-    && generatingIssue
-    && !TERMINAL_ISSUE_STATUSES.has(generatingIssue.status);
+  const isGenerating = slotIsLiveGeneration(slotQuery.data);
   const generationFailed = slotQuery.data?.slot?.status === "failed";
   const canGenerateFirstSummary = summarizerState?.status === "ready";
 

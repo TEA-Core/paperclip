@@ -17,7 +17,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __liveUpdatesTestUtils } from "@/context/LiveUpdatesProvider";
-import { SummarySlotCard, resolveGenerationStatusLine } from "./SummarySlotCard";
+import { SummarySlotCard, resolveGenerationStatusLine, slotIsLiveGeneration } from "./SummarySlotCard";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -176,6 +176,42 @@ describe("resolveGenerationStatusLine", () => {
     expect(
       resolveGenerationStatusLine({ message: null, currentToolName: null, lastAssistantSnippet: null }),
     ).toBeNull();
+  });
+});
+
+describe("slotIsLiveGeneration", () => {
+  it("keeps polling while a generation is active and unwritten", () => {
+    // An active generation (non-terminal linked task, no write yet) polls.
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue() })).toBe(true);
+    // A changes_requested bounce re-arms the slot: a document already exists from
+    // the prior write, but the linked task is back in in_progress actively
+    // producing — the write evidence alone must not disarm the poll.
+    expect(
+      slotIsLiveGeneration({ slot: slot({ documentId: "doc-1" }), generatingIssue: issue() }),
+    ).toBe(true);
+  });
+
+  it("stops polling a written slot parked in review", () => {
+    // After a successful write the slot stays `generating` and the link survives
+    // through the review window (SUP-15773). The linked task is in_review and the
+    // slot carries write evidence, so generation is no longer active — poll stops.
+    expect(
+      slotIsLiveGeneration({
+        slot: slot({ documentId: "doc-1", lastGeneratedAt: "2026-07-14T01:00:00.000Z" }),
+        generatingIssue: issue({ status: "in_review" }),
+      }),
+    ).toBe(false);
+  });
+
+  it("stops polling when the linked task has reached a terminal status", () => {
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "done" }) })).toBe(false);
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: issue({ status: "cancelled" }) })).toBe(false);
+  });
+
+  it("does not poll when there is no slot, no linked task, or the slot is idle", () => {
+    expect(slotIsLiveGeneration(null)).toBe(false);
+    expect(slotIsLiveGeneration({ slot: slot(), generatingIssue: null })).toBe(false);
+    expect(slotIsLiveGeneration({ slot: slot({ status: "idle" }), generatingIssue: issue() })).toBe(false);
   });
 });
 

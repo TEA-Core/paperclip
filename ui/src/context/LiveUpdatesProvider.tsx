@@ -946,6 +946,36 @@ function invalidateHeartbeatProgressQueries(
   }
 }
 
+function invalidateSummarySlotQueriesForGenerationIssue(
+  queryClient: ReturnType<typeof useQueryClient>,
+  generationIssueId: string,
+) {
+  // A changes_requested bounce flips the linked generation issue back to
+  // in_progress and logs an `issue.updated` activity. The slot link and the
+  // written document intentionally survive the first write (SUP-15773), so a
+  // mounted card's cached detail still reports in_review and slotIsLiveGeneration
+  // never resumes polling for the corrected revision. Reverse-lookup the linked
+  // slot from the cached detail and refresh its detail + revisions so the card
+  // re-derives its live-generation state.
+  const slotQueries = queryClient.getQueriesData<{
+    generatingIssue?: { id?: string | null } | null;
+  }>({ queryKey: ["summary-slots"] });
+  for (const [queryKey, data] of slotQueries) {
+    if (data?.generatingIssue?.id !== generationIssueId) continue;
+    const companyId = readString(queryKey[1]);
+    const scopeKind = readString(queryKey[2]);
+    const slotKey = readString(queryKey[3]);
+    const scopeId = readString(queryKey[4]);
+    if (!companyId || !scopeKind || !slotKey) continue;
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.summarySlots.detail(companyId, scopeKind, slotKey, scopeId ?? null),
+    });
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.summarySlots.revisions(companyId, scopeKind, slotKey, scopeId ?? null),
+    });
+  }
+}
+
 function invalidateActivityQueries(
   queryClient: ReturnType<typeof useQueryClient>,
   companyId: string,
@@ -1046,6 +1076,12 @@ function invalidateActivityQueries(
           // the visible task stale until a full reload.
           queryClient.invalidateQueries({ queryKey: queryKeys.issues.interactions(ref) });
         }
+      }
+      // A changes_requested bounce flips the linked generation issue back to
+      // in_progress via an `issue.updated` activity; refresh the linked slot so
+      // the card's cached detail (still in_review) re-derives and resumes polling.
+      if (action === "issue.updated") {
+        invalidateSummarySlotQueriesForGenerationIssue(queryClient, entityId);
       }
     }
     return;
