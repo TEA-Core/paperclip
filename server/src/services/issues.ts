@@ -926,6 +926,21 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
+/**
+ * The issue a heartbeat run was launched for, read from its own context
+ * snapshot. A run may only own the issue its context names: the wake dispatcher,
+ * the retry scheduler and self-declared runs all scope a run to exactly one
+ * issue, so a pointer to a run whose context names a different issue is a
+ * foreign lock (SUP-16052). Returns null for issue-less (legacy) runs, which
+ * stay on their existing adoption paths.
+ */
+function readRunContextIssueId(contextSnapshot: unknown): string | null {
+  const issueId = parseObject(contextSnapshot).issueId;
+  return typeof issueId === "string" && issueId.trim().length > 0
+    ? issueId.trim()
+    : null;
+}
+
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
 /**
  * Returned on an ownership 409 when the caller is a second live run of the same
@@ -5967,7 +5982,11 @@ export function issueService(db: Db) {
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
         tx
-          .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+          .select({
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+            contextSnapshot: heartbeatRuns.contextSnapshot,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
@@ -5975,6 +5994,15 @@ export function issueService(db: Db) {
       const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status) || isUnstartedScheduledRetry(existingRun);
       const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status) && !isUnstartedScheduledRetry(actorRun);
       if (!stale || !actorLive) {
+        return { adopted: null, latest: lockedIssue };
+      }
+      // A run may only adopt the issue its own context names. Adopting a run
+      // launched for a different issue would stamp this card's execution and
+      // checkout pointers with a foreign run (SUP-16052).
+      const actorRunIssueId = actorRun
+        ? readRunContextIssueId(actorRun.contextSnapshot)
+        : null;
+      if (actorRunIssueId && actorRunIssueId !== input.issueId) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -6032,11 +6060,21 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
       const actorRun = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, input.actorRunId))
         .then((rows) => rows[0] ?? null);
       if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return null;
+
+      // A run may only adopt the issue its own context names. This is the write
+      // path that stamped a foreign run onto a card in production (SUP-16052):
+      // an agent run launched for issue A writing to sibling issue B adopted B
+      // with its own run id, corrupting both of B's pointers.
+      const actorRunIssueId = readRunContextIssueId(actorRun.contextSnapshot);
+      if (actorRunIssueId && actorRunIssueId !== input.issueId) return null;
 
       const now = new Date();
       const adopted = await tx
@@ -9435,8 +9473,38 @@ export function issueService(db: Db) {
         });
       }
 
+      // Self-heal terminal pointers before validating ownership, so a card left
+      // holding a dead run is released even when the acting run turns out to be
+      // foreign and the checkout is refused below.
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
+
+      if (checkoutRunId) {
+        // A card's execution pointers may only be stamped with a run whose own
+        // context names that same card. If the acting run's context names a
+        // different issue, stamping this card would record a foreign run in both
+        // `checkoutRunId` and `executionRunId`, leaving the card in a permanent
+        // false "mid-run" state and letting it falsely occupy the foreign run's
+        // workspace. Fail secure instead of corrupting the pointers.
+        const actingRunContextIssueId = await db
+          .select({ issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'` })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, checkoutRunId),
+              eq(heartbeatRuns.companyId, issueCompany.companyId),
+            ),
+          )
+          .then((rows) => rows[0]?.issueId ?? null);
+        if (actingRunContextIssueId && actingRunContextIssueId !== id) {
+          throw conflict("Issue checkout conflict", {
+            issueId: id,
+            checkoutRunId,
+            actingRunContextIssueId,
+            reason: "run_context_issue_mismatch",
+          });
+        }
+      }
 
       const dependencyReadiness = await listIssueDependencyReadinessMap(db, issueCompany.companyId, [id]);
       const readiness = dependencyReadiness.get(id);
