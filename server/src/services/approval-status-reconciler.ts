@@ -2,11 +2,10 @@ import type { Db } from "@paperclipai/db";
 import {
   externalObjectMentions,
   externalObjects,
-  issueComments,
   issueExecutionDecisions,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, isNull, like, ne, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, ne, sql, type SQL } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import {
@@ -2191,21 +2190,12 @@ export async function persistWorkspaceDiscoveryVerdict(
   });
 }
 
-/**
- * SUP-16032: advisory-lock key for the Guard B arming-refusal comment dedup.
- *
- * One lock per issue, shared by the reconciler path's check-then-insert so two
- * workers (or this path racing the decision-time arming path in routes/issues.ts)
- * cannot both observe "no matching record" and write two refusal records for the
- * same (issue, reason). It is a lock key, NOT a dedup key: the record's dedup
- * remains the reason token embedded in the comment body — the single notion
- * shared with the decision-time path. Issue-level on purpose: it serializes every
- * guard-b refusal write for the card, so a reason change can never interleave
- * with itself.
- */
-export function guardBRefusalCommentLockKey(issueId: string): string {
-  return `issue-comment:guard-b-arming-refusal:${issueId}`;
-}
+// SUP-16032: the per-issue advisory-lock key for the Guard B arming-refusal
+// dedup now lives with the shared check-and-insert boundary
+// (issueService.addGuardBArmingRefusalComment in ./issues.js). Re-export it here
+// so existing imports (and the reconciler test) keep resolving it from this
+// module while the definition has a single home.
+export { guardBRefusalCommentLockKey } from "./issues.js";
 
 /**
  * SUP-16032: surface a Guard B arming refusal from the reconciler path on the
@@ -2213,65 +2203,30 @@ export function guardBRefusalCommentLockKey(issueId: string): string {
  * owner. This mirrors the decision-time refusal (routes/issues.ts
  * runApprovalMergeArming): the same `[Merge-arming]
  * status:skipped:stage_integrity:<reason>: <detail>` system comment, written
- * through the same `issueService.addComment` mechanism — one record format, one
- * dedup key, one notion of what a stage-integrity refusal reads like.
+ * through the SAME shared boundary
+ * (issueService.addGuardBArmingRefusalComment) — one record format, one dedup
+ * key, one database-atomic check-and-insert shared by both producers.
  *
- * Idempotency: the reconciler runs on a schedule, so a still-refused card would
- * otherwise re-comment on every tick. We dedup on the reason token embedded in
- * the record itself — one record per (issue, reason). A card already refused at
- * decision time (which posts the same system comment) is therefore not
- * duplicated, and a card whose refusal reason changes to a different guard-b:*
- * reason gets a new record.
- *
- * Atomicity: the check-then-insert is one transaction guarded by the issue-level
- * advisory lock (guardBRefusalCommentLockKey). A second writer — another
- * reconciler worker, or this path racing the decision-time arming path — takes
- * the same lock, so it blocks until the first insert commits, then re-checks
- * under the lock and skips. This closes the check-then-insert race that the
- * local scheduler's in-process `inFlight` flag cannot: that flag does not cover
- * separate processes or the other call site.
+ * Idempotency + atomicity: the shared boundary dedups on the reason token
+ * embedded in the record (one record per (issue, reason)) and holds the
+ * per-issue advisory lock for the whole check-then-insert, so a card already
+ * refused at decision time is not duplicated, and a concurrent decision-time
+ * producer racing this tick is serialized and re-checked. This closes the
+ * check-then-insert race the local scheduler's in-process `inFlight` flag
+ * cannot: that flag does not cover separate processes or the other call site.
  *
  * Fail-closed: the arming refusal already returned `skipped` in
  * reconcileCandidate, before any GitHub read or write, so a comment write that
- * cannot be made must never change the outcome — it is logged (the transaction
- * rolls back) and the card stays un-armed.
+ * cannot be made must never change the outcome — it is logged (the shared
+ * transaction rolls back) and the card stays un-armed.
  */
 async function surfaceGuardBArmingRefusal(
   db: Db,
   row: CandidateRow,
   integrity: { reason: string; detail: string },
 ): Promise<void> {
-  const needle = `[Merge-arming] status:skipped:stage_integrity:${integrity.reason}:`;
-  const body = `[Merge-arming] status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`;
   try {
-    await db.transaction(async (tx) => {
-      const txDb = tx as unknown as Db;
-      // Hold the issue-level advisory lock for the whole transaction so the
-      // lookup and the insert below are one atomic unit. pg_advisory_xact_lock
-      // is released when the transaction commits/rolls back — the same idiom as
-      // decision-queues.ts updateTriage.
-      await txDb.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${guardBRefusalCommentLockKey(row.id)}, 0))`,
-      );
-      const existing = await txDb
-        .select({ body: issueComments.body })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, row.companyId),
-            eq(issueComments.issueId, row.id),
-            eq(issueComments.authorType, "system"),
-            like(issueComments.body, `%${needle}%`),
-            isNull(issueComments.deletedAt),
-          ),
-        )
-        .limit(1);
-      if (existing.length > 0) return;
-      // Reuse the decision-time mechanism exactly: same call shape (empty actor,
-      // system author) so both paths produce the same record. Running it on the
-      // transaction handle keeps the insert inside the locked section.
-      await issueService(txDb).addComment(row.id, body, {}, { authorType: "system" });
-    });
+    await issueService(db).addGuardBArmingRefusalComment(row.id, integrity.reason, integrity.detail);
   } catch (err) {
     logger.warn(
       { err, issueId: row.id, reason: integrity.reason },

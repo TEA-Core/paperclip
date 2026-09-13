@@ -85,11 +85,32 @@ vi.mock("./github-fetch.js", () => ({
 // `isStrictAncestorIssueIdOf` from this module, so a blank mock would break it.
 const mockAddComment = vi.hoisted(() => vi.fn());
 const realIssueServiceRef = vi.hoisted(() => ({ issueService: null as unknown }));
+// The mocked `issueService` (kept in a hoisted ref so tests can drive the
+// decision-time producer directly WITHOUT a top-level `./issues.js` import —
+// importing the module at the top of this file perturbs the circular-import
+// evaluation order and makes the reconciler bind the REAL `issueService`
+// instead of the mock).
+const mockIssueServiceRef = vi.hoisted(() => ({ issueService: null as unknown }));
 
 vi.mock("./issues.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./issues.js")>();
   realIssueServiceRef.issueService = actual.issueService;
-  return { ...actual, issueService: () => ({ addComment: mockAddComment }) };
+  // Preserve the REAL facade (and its shared Guard B boundary,
+  // addGuardBArmingRefusalComment) so the reconciler's check-then-insert — lock
+  // plus reason-token dedup — runs against the real embedded Postgres; override
+  // ONLY addComment so the final insert stays observable/controllable
+  // (mockAddComment delegates to the real addComment by default). `this.addComment`
+  // inside the shared method resolves to this mock, so the real lock+dedup wraps
+  // the mockable insert.
+  const mockIssueService = (dbArg: Db) => ({
+    ...actual.issueService(dbArg),
+    addComment: mockAddComment,
+  });
+  mockIssueServiceRef.issueService = mockIssueService;
+  return {
+    ...actual,
+    issueService: mockIssueService,
+  };
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -2131,6 +2152,80 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(comments[0]!.body).toBe(refusalBody);
       // The reconciler saw the committed record under the lock and did not write.
       expect(mockAddComment).not.toHaveBeenCalled();
+    });
+
+    it("writes at most one record when the decision-time and reconciler producers race the same refusal (SUP-16032 cross-producer dedup)", async () => {
+      // The race the local scheduler's in-process flag cannot close: the
+      // decision-time arming hook and the scheduled reconciler are two SEPARATE
+      // producers of the same `[Merge-arming] status:skipped:stage_integrity:
+      // <reason>:` record for one card. Pre-fix the decision-time path wrote
+      // straight through addComment with no lock, so both producers could each
+      // observe "no record" and write — leaving two identical refusals. Post-fix
+      // both write through the shared boundary, so the per-issue advisory lock
+      // serializes them and the reason-token dedup re-checks under the lock.
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+
+      const reason = "guard-b:stage-without-decision";
+      const detail = `completed stage ${APPROVAL_STAGE_ID} has no issue_execution_decisions row`;
+
+      // Gate: force both producers into the check-then-insert window. The first
+      // to take the lock passes the empty lookup and pauses at the insert, still
+      // holding the lock with its transaction uncommitted; the second blocks on
+      // that same lock. Opening the gate lets the first commit (insert + lock
+      // release), after which the second re-checks under the lock and skips.
+      let openGate: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        openGate = resolve;
+      });
+      let gatedOnce = false;
+      mockAddComment.mockImplementation(
+        async (issueIdArg: string, body: string, actor: object, options: object) => {
+          const real = realIssueServiceRef.issueService as (d: Db) => {
+            addComment: (i: string, b: string, a: object, o: object) => Promise<unknown>;
+          };
+          if (!gatedOnce) {
+            gatedOnce = true;
+            await gate;
+          }
+          return real(db).addComment(issueIdArg, body, actor, options);
+        },
+      );
+
+      // Decision-time producer: the same shared boundary routes/issues.ts now
+      // calls. Reconciler producer: the scheduled tick. Same (issue, reason).
+      const decisionTime = (
+        mockIssueServiceRef.issueService as (d: Db) => {
+          addGuardBArmingRefusalComment: (
+            issueIdArg: string,
+            reasonArg: string,
+            detailArg: string,
+          ) => Promise<void>;
+        }
+      )(db).addGuardBArmingRefusalComment(issueId, reason, detail);
+      const reconciler = runApprovalStatusReconcilerTick(db);
+
+      // Let both producers start and settle into the lock before releasing.
+      await new Promise((r) => setTimeout(r, 200));
+      openGate();
+
+      const summary = await Promise.all([decisionTime, reconciler]).then(([, s]) => s);
+
+      // The refusal still stands (skipped, not armed/failed) and no GitHub write.
+      expect(summary.skipped[reason]).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      // Exactly one record survives the cross-producer race; the loser re-checked
+      // under the lock and did not write.
+      const comments = await db
+        .select({ body: issueComments.body, authorType: issueComments.authorType })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.authorType).toBe("system");
+      expect(comments[0]!.body).toBe(`[Merge-arming] status:skipped:stage_integrity:${reason}: ${detail}`);
+      // Only ONE producer performed the insert; the other saw the record.
+      expect(mockAddComment).toHaveBeenCalledTimes(1);
     });
 
     it("skips ambiguous cards with several open linked PRs", async () => {

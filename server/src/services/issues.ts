@@ -5059,6 +5059,23 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
+/**
+ * SUP-16032: advisory-lock key for the Guard B arming-refusal comment dedup.
+ *
+ * One lock per issue, shared by the check-then-insert of the Guard B stage-
+ * integrity arming refusal so two producers — the decision-time arming hook
+ * (routes/issues.ts runApprovalMergeArming) and the scheduled approval-status
+ * reconciler — cannot both observe "no matching record" and write two refusal
+ * records for the same (issue, reason), even in separate processes. It is a
+ * lock key, NOT a dedup key: the record's dedup remains the reason token
+ * embedded in the comment body. Issue-level on purpose: it serializes every
+ * guard-b refusal write for the card, so a reason change can never interleave
+ * with itself.
+ */
+export function guardBRefusalCommentLockKey(issueId: string): string {
+  return `issue-comment:guard-b-arming-refusal:${issueId}`;
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -10275,6 +10292,66 @@ export function issueService(db: Db) {
       }
 
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    // SUP-16032: the shared, database-atomic check-and-insert boundary for the
+    // Guard B stage-integrity arming refusal. Both producers — the decision-time
+    // arming hook (routes/issues.ts) and the scheduled approval-status
+    // reconciler — write the refusal through this method, so a card refused by
+    // two concurrent producers gets at most one `[Merge-arming]
+    // status:skipped:stage_integrity:<reason>:` record per (issue, reason).
+    //
+    // The check-then-insert is one transaction guarded by the per-issue advisory
+    // lock (guardBRefusalCommentLockKey): a second writer blocks until the first
+    // commits, re-checks under the lock, and skips. This closes the race the
+    // local scheduler's in-process `inFlight` flag cannot (it does not cover
+    // separate processes or the other call site). The insert reuses the existing
+    // addComment path (empty actor, system author) so both producers emit the
+    // exact same record. A write that cannot be made rolls back the transaction
+    // and is left to the caller's fail-closed handling — the refusal already
+    // stands and the card stays un-armed.
+    addGuardBArmingRefusalComment: async function addGuardBArmingRefusalComment(
+      issueId: string,
+      reason: string,
+      detail: string,
+    ): Promise<void> {
+      const needle = `[Merge-arming] status:skipped:stage_integrity:${reason}:`;
+      const body = `[Merge-arming] status:skipped:stage_integrity:${reason}: ${detail}`;
+      await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        // Hold the per-issue advisory lock for the whole transaction so the
+        // lookup and the insert are one atomic unit. pg_advisory_xact_lock is
+        // released when the transaction commits/rolls back — the same idiom as
+        // the run-authored comment fence above and decision-queues updateTriage.
+        await txDb.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${guardBRefusalCommentLockKey(issueId)}, 0))`,
+        );
+        const issue = await txDb
+          .select({ companyId: issues.companyId })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
+        if (!issue) throw notFound("Issue not found");
+        const existing = await txDb
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, issue.companyId),
+              eq(issueComments.issueId, issueId),
+              eq(issueComments.authorType, "system"),
+              like(issueComments.body, `%${needle}%`),
+              isNull(issueComments.deletedAt),
+            ),
+          )
+          .limit(1);
+        if (existing.length > 0) return;
+        // Reuse the decision-time mechanism exactly: same call shape (empty
+        // actor, system author) so both producers write the same record. Running
+        // it on the transaction handle keeps the insert inside the locked
+        // section.
+        await this.addComment(issueId, body, {}, { authorType: "system" }, tx);
+      });
     },
 
     createAttachment: async (input: {
