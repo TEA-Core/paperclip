@@ -198,6 +198,33 @@ describeEmbeddedPostgres("productivity review service", () => {
     return runs;
   }
 
+  async function insertLiveRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    status: "queued" | "running" | "scheduled_retry";
+    createdAt: Date;
+  }) {
+    const runId = randomUUID();
+    const startedAt = input.createdAt;
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: input.status,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: null,
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      livenessState: "advanced",
+      nextAction: "Continue processing the next batch.",
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+    return runId;
+  }
+
   // Inserts a single run with precise control over whether an environment lease
   // was acquired, so the high-churn lease screen (SUP-15947) can be exercised
   // per-run. A short duration keeps the budget-weighted no-comment streak below
@@ -266,12 +293,13 @@ describeEmbeddedPostgres("productivity review service", () => {
   function armedMonitorState(overrides: {
     status?: "scheduled" | "triggered" | "cleared";
     nextCheckAt?: string | null;
+    lastTriggeredAt?: string | null;
     attemptCount?: number;
   } = {}) {
     return {
       status: overrides.status ?? "scheduled",
       nextCheckAt: overrides.nextCheckAt ?? null,
-      lastTriggeredAt: null,
+      lastTriggeredAt: overrides.lastTriggeredAt ?? null,
       attemptCount: overrides.attemptCount ?? 0,
       notes: null,
       scheduledBy: "assignee" as const,
@@ -1076,6 +1104,177 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("exempts a card in the monitor fire -> re-arm gap when a live woken run exists (SUP-15971)", async () => {
+    // Reconstructs the measured SUP-15971 timeline: monitor fires (triggered,
+    // nextCheckAt null), the woken run is created in flight, and the sweep
+    // lands 2.7s into the gap before the run re-arms the next check.
+    const sweepAt = new Date("2026-09-13T12:05:23.811Z");
+    const fireAt = new Date("2026-09-13T12:05:21.108Z");
+    const runCreatedAt = new Date("2026-09-13T12:05:21.318Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(sweepAt.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: fireAt.toISOString(),
+          attemptCount: 1,
+        }),
+      ),
+    );
+    await insertLiveRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      createdAt: runCreatedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now: sweepAt,
+      companyId: seeded.companyId,
+    });
+
+    // No trigger may fire: the 7h active episode is exempted because the fired
+    // monitor has a live woken run created at/after lastTriggeredAt.
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("keeps long_active_duration live for a triggered monitor whose woken run already ended (abandoned monitor, SUP-16092)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: new Date(now.getTime() - 60 * 1000).toISOString(),
+          attemptCount: 1,
+        }),
+      ),
+    );
+    // The woken run was cancelled at admission and never re-armed the monitor,
+    // so there is no live run: the card is genuinely idle and stays reviewable.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now,
+      status: "cancelled",
+      durationMs: 2000,
+      withLeases: false,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("still raises no_comment_streak for a triggered-monitor card with a live woken run (SUP-16092, trigger-scoped)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: new Date(now.getTime() - 60 * 1000).toISOString(),
+          attemptCount: 1,
+        }),
+      ),
+    );
+    // Terminal no-comment runs reach the streak threshold; the live run only
+    // arms the duration exemption, it must not silence the streak trigger.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await insertLiveRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      createdAt: new Date(now.getTime() - 30 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  it("still raises high_churn for a triggered-monitor card with a live woken run (SUP-16092, trigger-scoped)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await setIssueExecutionState(
+      seeded.issueId,
+      executionStateWithMonitor(
+        armedMonitorState({
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: new Date(now.getTime() - 60 * 1000).toISOString(),
+          attemptCount: 1,
+        }),
+      ),
+    );
+    // Comments on every sampled run keep no_comment_streak at zero, so only
+    // high_churn can fire. The live run arms the duration exemption only.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+      now,
+      withRunComments: true,
+    });
+    await insertLiveRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      createdAt: new Date(now.getTime() - 30 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
   it("skips a long-active candidate while its assignee is paused and reviews it once unpaused", async () => {
