@@ -3715,6 +3715,46 @@ export function issueRoutes(
           { authorType: "system" },
         );
 
+        // SUP-16088 AC#3: persist the per-approval ARMING outcome onto the card so
+        // the next arming miss is diagnosable from GET /api/issues/{id} alone.
+        // Before this, the arming result lived only in an inert [Merge-arming]
+        // system comment; the SUP-16050 miss (armMergeOnApproval returned a
+        // terminal failed:HTTP 502 at 09:15:34Z and was never retried) was only
+        // detectable an hour and three quarters later, from the ABSENCE of a
+        // GitHub merge-queue event, by the hourly backstop. Every miss is now as
+        // observable on the card as the publish outcome. kind mirrors
+        // ArmingOutcome.kind (armed | skipped | failed); a `failed` arming is an
+        // error (e.g. a transient 5xx that survives the retry budget).
+        try {
+          const [armRow] = await db
+            .select({ executionState: issueRows.executionState })
+            .from(issueRows)
+            .where(eq(issueRows.id, issue.id))
+            .limit(1);
+          const armState = (armRow?.executionState ?? {}) as Record<string, unknown>;
+          await db
+            .update(issueRows)
+            .set({
+              executionState: {
+                ...armState,
+                approvalStatus: {
+                  ...((armState.approvalStatus as Record<string, unknown> | null | undefined) ?? {}),
+                  armOutcome: {
+                    kind: armingOutcome.kind,
+                    message: armingOutcome.message,
+                    at: new Date().toISOString(),
+                  },
+                },
+              },
+            })
+            .where(eq(issueRows.id, issue.id));
+        } catch (armOutcomePersistErr) {
+          logger.warn(
+            { err: armOutcomePersistErr, issueId: issue.id },
+            "armOutcome persist failed; arming already attempted",
+          );
+        }
+
         // SUP-15394: a CLOSING transition whose ARMING refused (armingOutcome.kind ===
         // "skipped" — no-pr, unowned-branch, not-pr-owner, owner-not-approved, …)
         // means the publisher DID stamp a PR (statusOutcome was "armed", the only

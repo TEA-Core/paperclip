@@ -876,46 +876,91 @@ export async function fetchGitHubNodeId(
   return { ok: true, status: response.status, message: null, nodeId };
 }
 
+export interface EnableAutoMergeOptions {
+  /** Total attempts for the arming mutation; the first call counts as attempt 1. Defaults to 3. */
+  maxAttempts?: number;
+  /** Base delay between attempts in ms; doubles on each retry. Defaults to 250. */
+  retryDelayMs?: number;
+  /** Injectable sleep, for tests. Defaults to a real setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * SUP-16088: the arming mutation is retried on a TRANSIENT transport failure —
+ * a 5xx gateway error or a 429 rate-limit. The located cause of the SUP-16050
+ * miss was exactly this: a real `HTTP 502` response (not a thrown error) landed
+ * in the `!response.ok` branch as `{ success: false, status: 5xx }` and was
+ * returned to the caller as a terminal `failed:HTTP 502`, so #676 sat stamped
+ * and authorized but unqueued until the hourly backstop re-armed it 1h46m later.
+ *
+ * `enablePullRequestAutoMerge` is idempotent: replaying it on an already-queued
+ * PR returns `alreadyQueued`/success, so retrying a transient 5xx is safe.
+ *
+ * Deliberately NOT retried: 401/403 — the caller's candidate loop rotates tokens
+ * on those, so surfacing them immediately is required; other 4xx — a permanent
+ * client error a retry cannot clear; and status 0 (a thrown ghFetch /
+ * `network_error`) — a hard connection reset is not the located cause, and
+ * retrying it inside the mutation would change the existing `failed:network_error`
+ * contract the tests pin.
+ */
+function isTransientArmingStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
 export async function enableAutoMerge(
   token: string,
   nodeId: string,
+  options: EnableAutoMergeOptions = {},
 ): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {
-  const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
+  const maxAttempts = options.maxAttempts ?? 3;
+  const baseDelay = options.retryDelayMs ?? 250;
+  const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
-  try {
-    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ query }),
-    });
+  const attempt = async (): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> => {
+    const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
 
-    if (!response.ok) {
+    try {
+      const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ query }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+        const errors = body?.errors as Array<{ message?: string }> | undefined;
+        const firstError = errors?.[0]?.message ?? "";
+        if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
+          return { success: true, alreadyQueued: true, error: null, status: response.status };
+        }
+        return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}`, status: response.status };
+      }
+
       const body = await response.json().catch(() => null) as Record<string, unknown> | null;
       const errors = body?.errors as Array<{ message?: string }> | undefined;
-      const firstError = errors?.[0]?.message ?? "";
-      if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-        return { success: true, alreadyQueued: true, error: null, status: response.status };
+      if (errors && errors.length > 0) {
+        const firstError = errors[0]?.message ?? "";
+        if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
+          return { success: true, alreadyQueued: true, error: null, status: response.status };
+        }
+        return { success: false, alreadyQueued: false, error: firstError, status: response.status };
       }
-      return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}`, status: response.status };
-    }
 
-    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-    const errors = body?.errors as Array<{ message?: string }> | undefined;
-    if (errors && errors.length > 0) {
-      const firstError = errors[0]?.message ?? "";
-      if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-        return { success: true, alreadyQueued: true, error: null, status: response.status };
-      }
-      return { success: false, alreadyQueued: false, error: firstError, status: response.status };
+      return { success: true, alreadyQueued: false, error: null, status: response.status };
+    } catch {
+      return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
     }
+  };
 
-    return { success: true, alreadyQueued: false, error: null, status: response.status };
-  } catch {
-    return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
+  let result = await attempt();
+  for (let attemptNo = 1; attemptNo < maxAttempts && isTransientArmingStatus(result.status); attemptNo++) {
+    await sleep(baseDelay * 2 ** (attemptNo - 1));
+    result = await attempt();
   }
+  return result;
 }
 
 export interface MarkPullRequestReadyForReviewResult {

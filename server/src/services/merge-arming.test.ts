@@ -1604,6 +1604,114 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
   });
 
+  // SUP-16088: the SUP-16050 miss. armMergeOnApproval WAS invoked for the
+  // final-stage approval (single review stage completed + approved, PR base
+  // fold/tea-patches-v2026.722.0) but returned a TERMINAL failed:HTTP 502 — a
+  // transient gateway error on the enablePullRequestAutoMerge mutation, never
+  // retried. The PR sat stamped and authorized but unqueued until the hourly
+  // backstop re-armed it 1h46m later. The actuator now retries a transient 5xx
+  // before giving up, so an approval of this shape enqueues the governing PR.
+  describe("SUP-16088: retry a transient 5xx on the arming mutation", () => {
+    const GRAPHQL_URL = "https://api.github.com/graphql";
+    // The SUP-16050 shape: a card whose single review stage is complete and
+    // approved — the final-stage approval that closes the card via status:done.
+    async function insertFinalStageApprovedCard() {
+      const issueId = await insertIssue({ branchName: "SUP-42-branch" });
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            stages: [{ id: "stage-a", type: "review", approvalsNeeded: 1 }],
+          },
+          executionState: {
+            completedStageIds: ["stage-a"],
+            lastDecisionOutcome: "approved",
+          },
+        })
+        .where(eq(issues.id, issueId));
+      return issueId;
+    }
+
+    // The PR this card delivered, certified by publishApprovalStatus: owned by
+    // the card (title + head branch name SUP-42), base the fold branch, node id
+    // already known so the actuator goes straight to the arming mutation.
+    const certifiedPr = {
+      id: "obj-676",
+      owner: OWNER,
+      repo: REPO,
+      number: 676,
+      nodeId: "PR_node_676",
+      headRefName: "SUP-42-branch",
+      displayName: `${OWNER}/${REPO}#676`,
+      title: "Fix continuation gate (SUP-42) [base fold/tea-patches-v2026.722.0]",
+      cachedState: "open",
+      lastErrorCode: null,
+      reviewDecision: "APPROVED",
+    };
+
+    it("enqueues the governing PR after retrying a transient 502 (AC#2, AC#4)", async () => {
+      const issueId = await insertFinalStageApprovedCard();
+      let graphqlCalls = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url === GRAPHQL_URL) {
+          graphqlCalls += 1;
+          // The located cause: the first arming attempt is a transient 502 (a real
+          // HTTP response, no JSON body), then the mutation clears on the retry.
+          if (graphqlCalls === 1) {
+            return { ok: false, status: 502, json: async () => null } as unknown as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ data: { enablePullRequestAutoMerge: { clientMutationId: "mut-676" } } }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+      );
+
+      // The transient 502 was retried and the enqueue WAS made: the mutation ran
+      // twice (502 then success) and the outcome is armed, not a terminal failed.
+      expect(armingOutcome.kind).toBe("armed");
+      expect(armingOutcome.message).toContain("Auto-merge enabled for TEA-Core/paperclip#676");
+      expect(graphqlCalls).toBe(2);
+    });
+
+    it("surfaces a terminal failed after the transient-5xx retry budget is exhausted", async () => {
+      const issueId = await insertFinalStageApprovedCard();
+      // Every arming attempt 502s — the retry budget is exhausted and the miss is
+      // surfaced (and persisted as armOutcome.kind === "failed"), not hung.
+      let graphqlCalls = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url === GRAPHQL_URL) {
+          graphqlCalls += 1;
+          return { ok: false, status: 502, json: async () => null } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+      );
+
+      expect(armingOutcome.kind).toBe("failed");
+      expect(armingOutcome.message).toContain("HTTP 502");
+      expect(graphqlCalls).toBe(3); // 1 initial + 2 retries
+    });
+  });
+
   // ─────────────────────────────────────────────────────────────────────────
   // ADR-091 D1 / SUP-14783: shared_workspace delivery identity.
   //
