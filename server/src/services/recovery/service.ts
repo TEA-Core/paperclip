@@ -3985,20 +3985,205 @@ export function recoveryService(
       skipped: 0,
       noLivePathUnowned: 0,
       reviewStageUnarmed: 0,
+      reviewStageArmedStranded: 0,
       noLivePathOwnerUnavailable: 0,
       issueIds: [] as string[],
     };
 
     for (const issue of candidates) {
       const now = new Date();
-      const executionState = issue.status === "in_review"
-        ? parseIssueExecutionState(issue.executionState)
-        : null;
+      // Parse the persisted execution state once. `executionState`/`pendingExecutionState`
+      // stay gated on `in_review` so every pre-existing status-keyed path below keeps its
+      // exact historical behaviour. The armed-stage detection reads the parse directly
+      // because the truthful discriminator for a live review is the execution state, not
+      // `issue.status`: `deliver.sh` Phase 7b arms the stage and flips the status in two
+      // separate writes, so an interruption between them leaves an armed stage on a
+      // non-`in_review` card, and that shape was invisible to every recovery path
+      // (SUP-15788). SUP-15486 widened the resolve matrix so an action minted against such
+      // a card can still be disposed of.
+      const persistedExecutionState = parseIssueExecutionState(issue.executionState);
+      const executionState = issue.status === "in_review" ? persistedExecutionState : null;
       const pendingExecutionState = executionState?.status === "pending" ? executionState : null;
       const currentParticipant = pendingExecutionState
         ? pendingExecutionState.currentParticipant
         : null;
       const participantAgentId = currentParticipant?.type === "agent" ? currentParticipant.agentId : null;
+      // A pending stage naming a *user* participant is a deliberate human wait
+      // (e.g. a board approval) and keeps its existing treatment; only an armed
+      // stage waiting on an *agent* whose run is gone is "wedged". Restrict to
+      // `review` stages: a pending *approval* stage is a separate shape and must
+      // never be relabelled as a review verdict (SUP-15788 round-1 review).
+      const nonReviewArmedExecutionState =
+        issue.status !== "in_review" &&
+        persistedExecutionState !== null &&
+        persistedExecutionState.status === "pending" &&
+        persistedExecutionState.currentStageType === "review" &&
+        persistedExecutionState.currentParticipant !== null &&
+        persistedExecutionState.currentParticipant.type === "agent" &&
+        persistedExecutionState.currentParticipant.agentId !== null
+          ? persistedExecutionState
+          : null;
+      const armedReviewStageOnNonReviewCard = nonReviewArmedExecutionState !== null;
+
+      // An armed *review* stage on a non-`in_review` card. The participant is
+      // engaged and the stage is live, but the card carries no execution run or
+      // monitor, so every status-keyed recovery path would skip it. Mint a
+      // participant-owned action to re-record the verdict.
+      //
+      // Classified BEFORE `agentId` is resolved and before the generic
+      // assignee-recovery paths below (SUP-15788 round-1): on a non-`in_review`
+      // card `agentId` is still `issue.assigneeAgentId`, so a missing or
+      // unavailable original assignee could otherwise mint a `no_live_path_*`
+      // action — or continuation / live-path handling could `continue` — before
+      // the participant-owned action is ever reached. The participant, not the
+      // assignee, is the recovery target; `previousOwnerAgentId` preserves the
+      // source assignment and the stage is left untouched. Do NOT re-arm,
+      // re-assign, or alter the stage: rendering the verdict is the
+      // participant's job and this path must never become a way to bypass a
+      // review gate.
+      if (armedReviewStageOnNonReviewCard) {
+        const armed = nonReviewArmedExecutionState;
+        if (armed === null) {
+          result.skipped += 1;
+          continue;
+        }
+        const armedParticipant = armed.currentParticipant;
+        const participantOwnerAgentId =
+          armedParticipant?.type === "agent" ? armedParticipant.agentId ?? null : null;
+        // Grace is measured from the IMMUTABLE arm anchor — `pendingSince`, the
+        // moment the review stage entered its pending state — not the mutable
+        // `issue.updatedAt`. Editing the card must not reset the escalation
+        // clock: the wedge is defined by the armed stage, not the card's last
+        // write. `pendingSince` is absent on rows armed before this shipped, so
+        // fall back to `updatedAt` for legacy cards.
+        const pendingSinceMs = armed.pendingSince ? Date.parse(armed.pendingSince) : null;
+        const msSinceArm =
+          now.getTime() - (pendingSinceMs ?? issue.updatedAt.getTime());
+        if (msSinceArm < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+          result.skipped += 1;
+          continue;
+        }
+        // An operator-cancelled latest run stands down ALL automatic recovery:
+        // the board deliberately stopped the agent, so re-waking the participant
+        // or escalating "stranding" would fight the human. Any newer run or wake
+        // supersedes the exemption (isOperatorCancelledRun keys on the latest
+        // run). SUP-15788 round-1 finding: operator-cancel exemption.
+        if (isOperatorCancelledRun(await getLatestIssueRun(issue.companyId, issue.id))) {
+          result.skipped += 1;
+          continue;
+        }
+        // The wedged-review wedge is only actionable when NO other live path already
+        // owns this card. An in-flight run, a future monitor, a queued/deferred/
+        // claimed wake, or a pending continuation interaction is a legitimate
+        // self-resolving path; minting a participant action on top of any of them
+        // would race that authority (SUP-15788 round-2 review finding: live-path
+        // guard). These are the same liveness predicates the generic assignee-
+        // recovery paths below are gated on (hasActiveExecutionPath,
+        // hasLiveIssueWake, hasPendingWakeInteraction, hasFutureMonitorCheck);
+        // checking them here preserves this detector's precedence over those
+        // paths while honouring the guards those paths themselves apply.
+        if (hasFutureMonitorCheck(issue.monitorNextCheckAt)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (await hasActiveExecutionPath(issue.companyId, issue.id, null)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (await hasLiveIssueWake(issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
+        const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+        // A board-owned recovery action is already the durable, human-owned path;
+        // do not race that authority by minting a participant action on top of it.
+        if (existingAction?.ownerType === "board") {
+          result.skipped += 1;
+          continue;
+        }
+        // A subtree pause hold suppresses ALL automatic recovery. The participant is
+        // deliberately parked, so minting a participant-owned action here would let the
+        // stale-wake sweep re-fire it mid-pause and bypass the pause contract
+        // (SUP-15788 round-3 finding: pause-hold guard). This mirrors the same guard
+        // the generic assignee-recovery path below applies before it mints anything.
+        if (
+          await isAutomaticRecoverySuppressedByPauseHold(
+            db,
+            issue.companyId,
+            issue.id,
+            treeControlSvc,
+          )
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        // Idempotency is scoped to the exact wedge identity (stage + participant).
+        // The fingerprint is globally unique among active actions, so equality
+        // pins the wedge on its own — independent of the shared
+        // `review_stage_unarmed` kind that the in_review detector also mints.
+        // A repeat pass over the same wedged card skips; a stage or participant
+        // change no longer matches, so the upsert below reconciles ownership to
+        // the live participant instead of waking a prior one.
+        const fingerprint = `review_stage_armed_stranded:${issue.companyId}:${issue.id}:${armed.currentStageId ?? "none"}:${participantOwnerAgentId ?? "none"}`;
+        if (existingAction?.fingerprint === fingerprint) {
+          result.skipped += 1;
+          continue;
+        }
+        await recoveryActionsSvc.upsertSourceScoped({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: "review_stage_unarmed",
+          ownerType: "agent",
+          ownerAgentId: participantOwnerAgentId,
+          ownerUserId: null,
+          previousOwnerAgentId: issue.assigneeAgentId ?? null,
+          returnOwnerAgentId: participantOwnerAgentId,
+          cause: "review_stage_armed_stranded",
+          fingerprint,
+          evidence: {
+            identifier: issue.identifier,
+            status: issue.status,
+            msSinceArm,
+            pendingSince: armed.pendingSince ?? null,
+            currentStageId: armed.currentStageId ?? null,
+            currentStageType: armed.currentStageType ?? null,
+            participantType: armedParticipant?.type ?? null,
+            participantAgentId: participantOwnerAgentId,
+            participantUserId: null,
+          },
+          nextAction: "Re-record the execution review stage verdict as its current participant and deliver it through the normal review path. The stage is already armed; do not re-arm, re-assign, or otherwise alter it.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          maxAttempts: null,
+          lastAttemptAt: now,
+          // An active agent-owned action minted by another detector/cause for this
+          // card must be atomically cancelled and replaced, never clobbered in
+          // place. In-place clobber leaves the old owner's pending wake and a
+          // ghost audit row (SUP-15788 round-1 finding: collision). The prior
+          // action is cancelled with a resolution note and a fresh row inserted.
+          supersedeOnIdentityChange: true,
+        });
+        result.reviewStageArmedStranded += 1;
+        result.issueIds.push(issue.id);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "issue_graph_liveness_review_stage_armed_stranded",
+          action: "issue.review_stage_armed_stranded_escalated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: "recovery.reconcile_review_stage_armed_stranded",
+            fingerprint,
+          },
+        });
+        continue;
+      }
+
       const agentId = issue.status === "in_review" && participantAgentId
         ? participantAgentId
         : issue.assigneeAgentId;
@@ -4423,7 +4608,14 @@ export function recoveryService(
             continue;
           }
           const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
-          if (existingAction?.kind === "review_stage_unarmed") {
+          // Key on this detector's own fingerprint, not just the shared kind:
+          // the armed-review detector (non-in_review) also mints an agent-owned
+          // `review_stage_unarmed` with a distinct fingerprint, and must not make
+          // the in_review detector skip its own board escalation.
+          if (
+            existingAction?.kind === "review_stage_unarmed" &&
+            existingAction.fingerprint === `review_stage_unarmed:${issue.companyId}:${issue.id}`
+          ) {
             result.skipped += 1;
             continue;
           }
@@ -7292,6 +7484,7 @@ export function recoveryService(
       nonWakeableSkipped: 0,
       skippedTerminalSource: 0,
       skippedBackoff: 0,
+      skippedPauseHold: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -7330,6 +7523,24 @@ export function recoveryService(
       // Nothing left to recover: the source issue is gone or already terminal.
       if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
         result.skippedTerminalSource += 1;
+        continue;
+      }
+
+      // A subtree pause hold suppresses ALL automatic recovery, including this
+      // stale-wake sweep. Re-firing a parked participant mid-pause would bypass
+      // the pause contract (SUP-15788 round-1 finding: stale-wake pause-hold
+      // guard). This mirrors the mint-time guard so a hold placed AFTER the
+      // action was minted also stands the sweep down. Checked before burning any
+      // backoff attempt or re-resolving ownership.
+      if (
+        await isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          candidate.companyId,
+          candidate.sourceIssueId,
+          treeControlSvc,
+        )
+      ) {
+        result.skippedPauseHold += 1;
         continue;
       }
 
