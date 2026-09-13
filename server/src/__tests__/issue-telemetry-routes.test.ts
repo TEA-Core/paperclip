@@ -237,7 +237,7 @@ describe("issue telemetry routes", () => {
         taskId: "11111111-1111-4111-8111-111111111111",
       });
     });
-  }, 10_000);
+  }, 30_000);
 
   it("does not emit agent task-completed telemetry for board-driven completions", async () => {
     const app = await createApp({

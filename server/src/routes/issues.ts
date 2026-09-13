@@ -3707,13 +3707,37 @@ export function issueRoutes(
         .where(eq(companies.id, issue.companyId))
         .then((rows) => rows[0] ?? null);
       if (company?.mergeArmingEnabled) {
-        const armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr);
-        await svc.addComment(
-          issue.id,
-          `[Merge-arming] ${armingOutcome.message}`,
-          {},
-          { authorType: "system" },
-        );
+        // SUP-16088 round-1 finding (arm-outcome-misses-thrown-errors):
+        // armMergeOnApproval catches its own errors and returns a terminal `failed`
+        // ArmingOutcome, but a throw is a residual path — resolveLinkedPullRequests,
+        // a rejecting db.select, or token-candidate resolution can reject before the
+        // outcome is built. Without this, the outer catch ("merge-arming hook failed")
+        // swallows that throw with no durable trace on the card. Normalize it into an
+        // `errored` outcome so the miss is diagnosable from GET /api/issues/{id} alone.
+        let armingOutcome: ArmingOutcome | { kind: "errored"; message: string };
+        try {
+          armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr);
+        } catch (armingErr) {
+          logger.warn({ err: armingErr, issueId: issue.id }, "armMergeOnApproval threw; recording errored outcome");
+          armingOutcome = {
+            kind: "errored",
+            message: `arming threw: ${armingErr instanceof Error ? armingErr.message : String(armingErr)}`,
+          };
+        }
+
+        try {
+          await svc.addComment(
+            issue.id,
+            `[Merge-arming] ${armingOutcome.message}`,
+            {},
+            { authorType: "system" },
+          );
+        } catch (armingCommentErr) {
+          logger.warn(
+            { err: armingCommentErr, issueId: issue.id },
+            "merge-arming outcome comment failed; outcome still persisted",
+          );
+        }
 
         // SUP-16088 AC#3: persist the per-approval ARMING outcome onto the card so
         // the next arming miss is diagnosable from GET /api/issues/{id} alone.
@@ -3723,8 +3747,9 @@ export function issueRoutes(
         // detectable an hour and three quarters later, from the ABSENCE of a
         // GitHub merge-queue event, by the hourly backstop. Every miss is now as
         // observable on the card as the publish outcome. kind mirrors
-        // ArmingOutcome.kind (armed | skipped | failed); a `failed` arming is an
-        // error (e.g. a transient 5xx that survives the retry budget).
+        // ArmingOutcome.kind (armed | skipped | failed), plus `errored` for a
+        // thrown arming (see above); a `failed` arming is a terminal error
+        // (e.g. a transient 5xx that survives the retry budget).
         try {
           const [armRow] = await db
             .select({ executionState: issueRows.executionState })
