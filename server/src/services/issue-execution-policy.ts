@@ -12,6 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -21,6 +22,7 @@ type AssigneeLike = {
 type IssueLike = AssigneeLike & {
   status: string;
   responsibleUserId?: string | null;
+  createdByAgentId?: string | null;
   createdByUserId?: string | null;
   executionPolicy?: IssueExecutionPolicy | Record<string, unknown> | null;
   executionState?: IssueExecutionState | Record<string, unknown> | null;
@@ -739,8 +741,14 @@ function mergeSkippedStageIds(
   return Array.from(new Set([...(previous?.skippedStageIds ?? []), ...(added ?? [])]));
 }
 
-function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
-  const completedStageIds = Array.from(new Set([...(previous?.completedStageIds ?? []), currentStage.id]));
+function buildCompletedState(
+  previous: IssueExecutionState | null,
+  currentStage: IssueExecutionStage,
+  decidedStageIds: readonly string[] = [],
+): IssueExecutionState {
+  const completedStageIds = Array.from(
+    new Set([...(previous?.completedStageIds ?? []), ...decidedStageIds, currentStage.id]),
+  );
   return {
     status: COMPLETED_STATUS,
     currentStageId: null,
@@ -835,13 +843,26 @@ function buildPendingState(input: {
 }
 
 function buildChangesRequestedState(
-  previous: IssueExecutionState,
+  previous: IssueExecutionState | null,
   currentStage: IssueExecutionStage,
   returnAssignee: IssueExecutionStagePrincipal,
   changesRequestedCount: number,
 ): IssueExecutionState {
+  // A null `previous` is the board-override shape: a stuck card that never
+  // entered the pending phase (no executionState row) still has a resolvable
+  // target stage, so the decision must land on a fully-formed state rather than
+  // spreading nothing. The fallback fills every required field so the widened
+  // state satisfies the schema; non-null `previous` keeps its exact prior shape.
   return {
-    ...previous,
+    ...(previous ?? {
+      currentStageIndex: null,
+      currentParticipant: null,
+      deliveryAuthor: null,
+      completedStageIds: [],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      pendingSince: null,
+    }),
     status: CHANGES_REQUESTED_STATUS,
     currentStageId: currentStage.id,
     currentStageType: currentStage.type,
@@ -1653,4 +1674,228 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
   return { patch: applyMonitorTransition(input, {}) };
+}
+
+export type BoardStageDecision = "approved" | "changes_requested";
+
+export interface BoardStageDecisionInput {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  decision: BoardStageDecision;
+  commentBody: string;
+  /**
+   * Stage ids that already carry a durable `approved` decision row. Target
+   * selection consults these alongside the projection's completed/skipped sets,
+   * so a stage whose projection was cleared (e.g. by a board `done` PATCH) is
+   * never silently re-targeted and superseded (SUP-15805 addendum item 3).
+   */
+  decidedStageIds?: readonly string[];
+  /**
+   * The acting board user's id. Used to refuse a board approval of that user's
+   * own delivery — the self-satisfying shape the agent-path Guard B rejects
+   * (SUP-15805 addendum item 4).
+   */
+  actorUserId?: string | null;
+}
+
+export interface BoardStageDecisionResult {
+  patch: Record<string, unknown>;
+  decision: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
+  targetStage: IssueExecutionStage;
+  /**
+   * The stage participant the board is deciding on behalf of (the agent the
+   * decision displaces). Null when the stage has no configured participant.
+   */
+  displacedParticipant: IssueExecutionStagePrincipal | null;
+  workflowControlledAssignment: boolean;
+}
+
+/**
+ * No undecided execution stage remains for a board decision to act on: the
+ * card's policy has no stages, or every stage is already completed or skipped.
+ * The route maps this to `409 { reason: "no_undecided_stage" }` (SUP-15805).
+ */
+export class BoardStageNoUndecidedStageError extends Error {
+  readonly reason = "no_undecided_stage" as const;
+
+  constructor() {
+    super("No undecided execution stage to decide on this issue");
+    this.name = "BoardStageNoUndecidedStageError";
+  }
+}
+
+/**
+ * A board user asked to approve a stage whose return assignee is that same user:
+ * the user would be approving their own delivery. Guard B refuses this shape on
+ * the agent path; the board route must not be a hole (SUP-15805 addendum item 4).
+ * The route maps this to `409 { reason: "self_approval" }`.
+ */
+export class BoardStageSelfApprovalError extends Error {
+  readonly reason = "self_approval" as const;
+
+  constructor() {
+    super("A board user cannot approve their own delivery on this issue");
+    this.name = "BoardStageSelfApprovalError";
+  }
+}
+
+/**
+ * The stage a board decision acts on. The active pending stage when one exists;
+ * otherwise the first policy stage not yet completed or skipped. This covers the
+ * live shape of the stuck cards (SUP-15547 / 13951 / 15638), where the card sits
+ * with a stuck `executionState` (or no executionState at all) and no active
+ * pending stage.
+ */
+function resolveBoardTargetStage(
+  policy: IssueExecutionPolicy,
+  previous: IssueExecutionState | null,
+  decidedStageIds?: readonly string[],
+): IssueExecutionStage | null {
+  const durablyDecided = new Set(decidedStageIds ?? []);
+  // SUP-15851 A2: prefer the current stage for a pending OR changes_requested
+  // card, mirroring the participant path — a policy revision can insert a stage
+  // ahead of the bounced one, so the decision must land on the CURRENT stage, not
+  // the first undecided one. The durable-decided escape and the findStageById null
+  // fall-through are preserved.
+  if (
+    (previous?.status === PENDING_STATUS || previous?.status === CHANGES_REQUESTED_STATUS) &&
+    previous?.currentStageId
+  ) {
+    const active = findStageById(policy, previous.currentStageId);
+    if (active && !durablyDecided.has(active.id)) return active;
+  }
+  const decided = new Set([
+    ...(previous?.completedStageIds ?? []),
+    ...(previous?.skippedStageIds ?? []),
+    ...durablyDecided,
+  ]);
+  return policy.stages.find((stage) => !decided.has(stage.id)) ?? null;
+}
+
+/**
+ * SUP-15805: a board user approves or requests changes on an execution stage on
+ * behalf of an (unresponsive or absent) agent participant. Unlike the PATCH
+ * decision path this function is NOT bound to `principalsEqual(participant,
+ * actor)` — the board decides the stage regardless of who the configured
+ * participant is. The round counter is always reset: a board decision is a human
+ * decision, so the agent↔agent changes-requested cap never escalates here.
+ *
+ * The card is advanced but never closed:
+ * - `approved` on a non-final stage re-pends the next stage (`in_review`);
+ * - `approved` on the final stage completes the execution state and routes the
+ *   card back to its return assignee `in_progress`, mirroring
+ *   `applyReviewEscalationDecision`, rather than stranding it `in_review` with no
+ *   reviewer (the SUP-10525 no-review-path state);
+ * - `changes_requested` lands the card in `todo` (not `in_progress`): a board
+ *   hand-back cannot assume a wake path exists (the live stuck cards return to an
+ *   external-pull agent with `wakeOnDemand` false), so the card is queued for the
+ *   return assignee instead of being stranded mid-flight.
+ *
+ * A board user may not approve their own delivery (the return assignee is that
+ * same user): {@link BoardStageSelfApprovalError}.
+ */
+export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardStageDecisionResult {
+  // SUP-15851 A1: scope the state to the stages the current policy revision
+  // carries before resolving the target, so an orphan completedStageIds /
+  // skippedStageIds entry from a prior revision is not re-persisted (mirrors
+  // applyIssueExecutionPolicyTransition).
+  const previous = pruneExecutionStateForStages(
+    parseIssueExecutionState(input.issue.executionState),
+    input.policy.stages.map((stage) => stage.id),
+  ).state;
+  const currentAssignee = assigneePrincipal(input.issue);
+  const targetStage = resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
+  if (!targetStage) throw new BoardStageNoUndecidedStageError();
+
+  const returnAssignee = resolveReturnAssignee({
+    policy: input.policy,
+    existingState: previous,
+    currentAssignee,
+  });
+  const displacedParticipant =
+    previous?.currentParticipant ??
+    selectStageParticipant(targetStage, { exclude: returnAssignee });
+  const body = input.commentBody.trim();
+
+  if (input.decision === "approved") {
+    if (input.actorUserId) {
+      // SUP-15964: the board self-approval gate is deliberately STRICTER than
+      // Guard B. Guard B resolves one principal through the first-match cascade
+      // (resolveGatedPrincipal); the board path must refuse the board user when
+      // they match ANY stakeholder it is meant to separate — the return assignee
+      // or the delivery author. The union matters because a `returnAssignee`
+      // that resolves to an agent short-circuits the cascade and would otherwise
+      // leave a `deliveryAuthor` board user able to approve their own delivery.
+      // The union is exported from approval-status-reconciler so both stay in
+      // one module; `resolveGatedPrincipal` (Guard B, mechanism D) is unchanged.
+      const gated = resolveSelfApprovalPrincipals(
+        input.policy as unknown as Record<string, unknown>,
+        (previous ?? {}) as Record<string, unknown>,
+        input.issue.createdByAgentId ?? null,
+      );
+      if (gated.userIds.has(input.actorUserId)) {
+        throw new BoardStageSelfApprovalError();
+      }
+    }
+    const completedState = buildCompletedState(previous, targetStage, input.decidedStageIds);
+    const nextStage = nextPendingStageAfter(input.policy, targetStage, completedState);
+    const patch: Record<string, unknown> = {};
+    if (nextStage) {
+      const participant = selectStageParticipant(nextStage, { exclude: returnAssignee });
+      if (!participant) {
+        throw unprocessable(
+          `No eligible ${nextStage.type} participant is configured for this issue (stage ${nextStage.id}); the return assignee is excluded from participant selection`,
+        );
+      }
+      buildPendingStagePatch({
+        patch,
+        previous: completedState,
+        policy: input.policy,
+        stage: nextStage,
+        participant,
+        returnAssignee: returnAssignee ?? null,
+      });
+    } else {
+      // Final stage: complete the ladder and hand the card back to its return
+      // assignee in_progress (never `done`), matching the review-escalation path.
+      // With no return assignee there is no one to hand back to: queue the card
+      // (`todo`, mirroring the changes-requested hand-back) and clear the
+      // workflow-controlled assignee, so it is never left assigned to — or woken
+      // against — the participant the board displaced.
+      patch.executionState = completedState;
+      if (returnAssignee) {
+        patch.status = "in_progress";
+      } else {
+        patch.status = "todo";
+      }
+      Object.assign(patch, patchForPrincipal(returnAssignee));
+    }
+    return {
+      patch,
+      decision: { stageId: targetStage.id, stageType: targetStage.type, outcome: "approved", body },
+      targetStage,
+      displacedParticipant,
+      workflowControlledAssignment: true,
+    };
+  }
+
+  if (!returnAssignee) {
+    throw unprocessable("This execution stage has no return assignee");
+  }
+  const patch: Record<string, unknown> = {};
+  patch.status = "todo";
+  Object.assign(patch, patchForPrincipal(returnAssignee));
+  patch.executionState = buildChangesRequestedState(previous, targetStage, returnAssignee, 0);
+  return {
+    patch,
+    decision: {
+      stageId: targetStage.id,
+      stageType: targetStage.type,
+      outcome: "changes_requested",
+      body,
+    },
+    targetStage,
+    displacedParticipant,
+    workflowControlledAssignment: true,
+  };
 }

@@ -947,6 +947,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
   "POST /api/issues/{id}/merge-arming/republish",
+  "POST /api/issues/{id}/execution-stage/board-decision",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -5461,6 +5462,38 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/execution-stage/board-decision",
+  tags: ["issues"],
+  summary: "Decide an execution stage on a participant's behalf (board override)",
+  description:
+    "Board-only (company owner/admin) decision on a pending execution stage, for a card whose " +
+    "configured agent participant is unresponsive or absent. Flag-gated: unless " +
+    "PAPERCLIP_BOARD_STAGE_OVERRIDE is true/1 the route responds 404 before any read. `approved` " +
+    "completes the stage (and re-pends the next stage when one exists) without closing the card; " +
+    "`changes_requested` returns it to the return assignee and resets the round counter. A policy " +
+    "with no undecided stage returns 409 reason no_undecided_stage.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z.object({
+        decision: z.enum(["approved", "changes_requested"]),
+        comment: z.string().trim().min(1),
+      }),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
