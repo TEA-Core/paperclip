@@ -137,7 +137,6 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   issue_graph_liveness: "Task Needs Next Step",
   no_live_path_unowned: "No Live Path",
   review_stage_unarmed: "Review Stage Unarmed",
-  review_stage_armed_stranded: "Review Verdict Not Recorded",
   no_live_path_owner_unavailable: "Owner Unavailable",
   blocked_without_blockers: "Blocked Without Blockers",
   pending_review_rearm_cap_exhausted: "Review Re-arm Cap Exhausted",
@@ -163,8 +162,6 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "This task has no assigned owner and no live execution path.",
   review_stage_unarmed:
     "This task has an execution review stage configured, but no participant is actively reviewing.",
-  review_stage_armed_stranded:
-    "This task's execution review stage is armed with a current participant, but the card never entered review and no verdict was recorded. The participant has been asked to record it through the normal review path.",
   no_live_path_owner_unavailable:
     "This task's assigned owner is not available and no live execution path exists.",
   blocked_without_blockers:
