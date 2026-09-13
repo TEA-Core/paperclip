@@ -26,6 +26,7 @@ import {
   runApprovalStatusReconcilerTick,
   startApprovalStatusReconciler,
   evaluateStageIntegrity,
+  guardBRefusalCommentLockKey,
   latestDecisionPerStage,
   type ApprovalStatusReconcilerTickSummary,
   type CandidateRow,
@@ -2084,6 +2085,52 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mockAddComment.mock.calls[0]![1]).toBe(
         `[Merge-arming] status:skipped:stage_integrity:guard-b:stage-without-decision: completed stage ${APPROVAL_STAGE_ID} has no issue_execution_decisions row`,
       );
+    });
+
+    it("writes at most one record when a concurrent writer holds the same refusal lock (SUP-16032 atomic dedup)", async () => {
+      // Deterministic probe for the check-then-insert race: a concurrent writer
+      // takes the same issue-level advisory lock, inserts the refusal record,
+      // and holds it (uncommitted) while the reconciler runs. Under the atomic
+      // dedup the reconciler's lookup + insert is one lock-guarded transaction,
+      // so it blocks until the writer commits, re-checks under the lock, and
+      // skips — leaving exactly the writer's record. The old non-atomic path
+      // would read "no record" during that uncommitted window and write a second.
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+
+      const refusalBody = `[Merge-arming] status:skipped:stage_integrity:guard-b:stage-without-decision: completed stage ${APPROVAL_STAGE_ID} has no issue_execution_decisions row`;
+
+      const writer = db.transaction(async (tx) => {
+        const w = tx as unknown as Db;
+        await w.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${guardBRefusalCommentLockKey(issueId)}, 0))`,
+        );
+        await w
+          .insert(issueComments)
+          .values({ companyId, issueId, authorType: "system", body: refusalBody });
+        // Hold the lock past the reconciler's start so the ordering is
+        // deterministic: the non-atomic path would observe "no record" here.
+        await new Promise((r) => setTimeout(r, 500));
+      });
+
+      const summary = await Promise.all([writer, runApprovalStatusReconcilerTick(db)]).then(
+        ([, s]) => s,
+      );
+
+      // The refusal still stands (skipped, not armed/failed) and no GitHub write.
+      expect(summary.skipped["guard-b:stage-without-decision"]).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      // Exactly one record survives the racing concurrent holder — no duplicate.
+      const comments = await db
+        .select({ body: issueComments.body, authorType: issueComments.authorType })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.authorType).toBe("system");
+      expect(comments[0]!.body).toBe(refusalBody);
+      // The reconciler saw the committed record under the lock and did not write.
+      expect(mockAddComment).not.toHaveBeenCalled();
     });
 
     it("skips ambiguous cards with several open linked PRs", async () => {
