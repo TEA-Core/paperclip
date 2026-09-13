@@ -18,11 +18,14 @@ import {
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
+  isTransientHttpStatus,
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
   publishApprovalStatus,
+  recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
+  writeCommitStatusWithRetry,
   type NoPrBranchAnchor,
 } from "./merge-arming.js";
 
@@ -119,6 +122,40 @@ describe("ladderIsTerminallyApproved", () => {
     expect(ladderIsTerminallyApproved(policy, undefined)).toBe(false);
     expect(ladderIsTerminallyApproved(policy, { completedStageIds: [A, B] })).toBe(false);
     expect(ladderIsTerminallyApproved(undefined, undefined)).toBe(false);
+  });
+});
+
+// SUP-16081 fix #2: the transient-vs-deterministic split for a failed status write
+// is a pure predicate (no I/O), so it runs even where embedded Postgres is absent.
+// The transient class is the ONLY class that is ever retried: no response
+// (status 0 = the request never reached GitHub), request-timeout (408),
+// rate-limited (429), and any 5xx server error. Every other 4xx is a
+// deterministic refusal — the same request will refuse again — and must NOT be
+// retried.
+describe("isTransientHttpStatus", () => {
+  it("treats no-response (0), 408, 429, and 5xx as transient", () => {
+    expect(isTransientHttpStatus(0)).toBe(true);
+    expect(isTransientHttpStatus(408)).toBe(true);
+    expect(isTransientHttpStatus(429)).toBe(true);
+    expect(isTransientHttpStatus(500)).toBe(true);
+    expect(isTransientHttpStatus(502)).toBe(true);
+    expect(isTransientHttpStatus(503)).toBe(true);
+    expect(isTransientHttpStatus(599)).toBe(true);
+  });
+
+  it("treats every deterministic 4xx and 2xx/3xx as non-transient", () => {
+    // 403 scope_missing and 422 shape refusal are the canonical operator signals.
+    expect(isTransientHttpStatus(403)).toBe(false);
+    expect(isTransientHttpStatus(422)).toBe(false);
+    // Other deterministic client errors: a bad head, missing scope, a 404 ref.
+    expect(isTransientHttpStatus(400)).toBe(false);
+    expect(isTransientHttpStatus(401)).toBe(false);
+    expect(isTransientHttpStatus(404)).toBe(false);
+    // Success / redirect statuses are not the "failed write" class at all.
+    expect(isTransientHttpStatus(200)).toBe(false);
+    expect(isTransientHttpStatus(301)).toBe(false);
+    // The 5xx band has a hard upper bound.
+    expect(isTransientHttpStatus(600)).toBe(false);
   });
 });
 
@@ -442,6 +479,263 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
     return externalObj;
   }
+
+  async function readApprovalStatus(issueId: string): Promise<Record<string, unknown> | null> {
+    const rows = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const execState = (rows[0]?.executionState ?? null) as Record<string, unknown> | null;
+    const approvalStatus = execState?.approvalStatus as Record<string, unknown> | null | undefined;
+    return approvalStatus ?? null;
+  }
+
+  // SUP-16081 fix #1: the first `paperclip/approved` publish outcome is now TOTAL.
+  // After a closing transition the executionState.approvalStatus key is never
+  // absent: `armed` keeps the success shape, and a `skipped`/`failed` outcome
+  // leaves a named publishSkipped / publishFailure record carrying the
+  // publisher's own refusal vocabulary and the attempted head. A thrown outcome
+  // is caught in the route and recorded the same way (the exact hole SUP-16041
+  // fell through).
+  describe("SUP-16081 recordApprovalPublishOutcome (fix #1: total outcome record)", () => {
+    it("AC1: a thrown first publish leaves a named publishFailure record; the key is never absent", async () => {
+      const issueId = await insertIssue();
+      // The exact call the route's catch-backstop makes when a throw escapes the
+      // first-publish flow: a synthetic internal failure, no resolved head.
+      await recordApprovalPublishOutcome(
+        db,
+        issueId,
+        {},
+        null,
+        { kind: "failed", message: "status:failed:internal: boom" },
+      );
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus).not.toBeNull();
+      // The record is a named failure, not a dropped key.
+      expect(approvalStatus!.publishFailure).toMatchObject({
+        reason: "status:failed:internal: boom",
+        headSha: null,
+      });
+      expect(typeof (approvalStatus!.publishFailure as Record<string, unknown>).at).toBe("string");
+    });
+
+    it("AC1: an armed outcome keeps the success shape (publishedHeadSha + publishedAt)", async () => {
+      const issueId = await insertIssue();
+      // A prior cycle left a stale publishedHeadSha; a resolved head must FRESHEN
+      // the record so the stale anchor cannot survive a new certification.
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            approvalStatus: { publishedHeadSha: "stale000000000000000000000000000000" },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      await recordApprovalPublishOutcome(
+        db,
+        issueId,
+        {},
+        APPROVED_HEAD,
+        { kind: "armed", message: "status:published: written to head", headSha: APPROVED_HEAD },
+      );
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.publishedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.publishedAt).toBe("string");
+      // The positively-resolved head also writes the D-B anchor.
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      // No failure/skip record on a success.
+      expect(approvalStatus!.publishFailure).toBeUndefined();
+      expect(approvalStatus!.publishSkipped).toBeUndefined();
+    });
+
+    it("AC2: a named skip outcome persists its exact refusal reason + attempted head", async () => {
+      const issueId = await insertIssue();
+      const refusal = "status:skipped:not_delivered: branch mismatch";
+      await recordApprovalPublishOutcome(db, issueId, {}, APPROVED_HEAD, {
+        kind: "skipped",
+        message: refusal,
+      });
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      // Reuses the publisher's refusal vocabulary verbatim — no second spelling.
+      expect(approvalStatus!.publishSkipped).toMatchObject({
+        reason: refusal,
+        headSha: APPROVED_HEAD,
+      });
+      expect(typeof (approvalStatus!.publishSkipped as Record<string, unknown>).at).toBe("string");
+    });
+
+    it("AC2: a named failure outcome persists its exact refusal reason + attempted head", async () => {
+      const issueId = await insertIssue();
+      const refusal = "status:failed:scope_missing: HTTP 403 Resource not accessible by integration";
+      await recordApprovalPublishOutcome(db, issueId, {}, APPROVED_HEAD, {
+        kind: "failed",
+        message: refusal,
+      });
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.publishFailure).toMatchObject({
+        reason: refusal,
+        headSha: APPROVED_HEAD,
+      });
+      // A resolved head that then failed still writes the D-B anchor for recovery.
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+    });
+
+    it("AC2: an unresolvable skip with pendingCandidates persists the recovery anchors", async () => {
+      const issueId = await insertIssue();
+      const candidates = [
+        { owner: OWNER, repo: REPO, number: 42, headShaAtApproval: APPROVED_HEAD },
+      ];
+      const refusal = "status:skipped:ambiguous: Multiple linked PRs (2)";
+      await recordApprovalPublishOutcome(db, issueId, {}, null, {
+        kind: "skipped",
+        message: refusal,
+      }, candidates);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.publishSkipped).toMatchObject({ reason: refusal, headSha: null });
+      // No head resolved -> the ambiguous recovery anchors are persisted so the
+      // reconciler can later re-run Guard A once the duplicate closes.
+      expect(approvalStatus!.skipReason).toBe(refusal);
+      expect(Array.isArray(approvalStatus!.pendingCandidates)).toBe(true);
+      expect((approvalStatus!.pendingCandidates as unknown[]).length).toBe(1);
+      expect(typeof approvalStatus!.certifiedAt).toBe("string");
+    });
+  });
+
+  // SUP-16081 fix #2: a transient GitHub status-write failure is retried; a
+  // deterministic refusal is not.
+  describe("SUP-16081 writeCommitStatusWithRetry (fix #2: transient retry)", () => {
+    it("AC3: a transient status-write failure (500) is retried and succeeds on the retry", async () => {
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          if (statusPosts === 1) {
+            return {
+              ok: false,
+              status: 500,
+              json: async () => ({ message: "server exploded" }),
+            } as unknown as Response;
+          }
+          return { ok: true, status: 201, json: async () => ({}) } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await writeCommitStatusWithRetry(
+        GITHUB_TOKEN,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+        "SUP-42",
+        { delay: async () => {} },
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.attempts).toBe(2);
+      expect(statusPosts).toBe(2);
+    });
+
+    it("AC3: a deterministic refusal (403 scope_missing) is NOT retried", async () => {
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          return {
+            ok: false,
+            status: 403,
+            json: async () => ({ message: "Resource not accessible by integration" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await writeCommitStatusWithRetry(
+        GITHUB_TOKEN,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+        "SUP-42",
+        { delay: async () => {} },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.transient).toBe(false);
+      expect(result.attempts).toBe(1);
+      expect(result.error ?? "").toContain("scope_missing");
+      // Operator signal: exactly one attempt, never retried.
+      expect(statusPosts).toBe(1);
+    });
+
+    it("AC3: a transient failure is retried up to the attempt bound, then reported transient", async () => {
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          return {
+            ok: false,
+            status: 503,
+            json: async () => ({ message: "unavailable" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await writeCommitStatusWithRetry(
+        GITHUB_TOKEN,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+        "SUP-42",
+        { attempts: 3, delay: async () => {} },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.transient).toBe(true);
+      expect(result.attempts).toBe(3);
+      expect(statusPosts).toBe(3);
+    });
+
+    it("AC3: a transient status-write inside publishApprovalStatus is retried and arms", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          if (statusPosts === 1) {
+            return {
+              ok: false,
+              status: 500,
+              json: async () => ({ message: "server exploded" }),
+            } as unknown as Response;
+          }
+          return { ok: true, status: 201, json: async () => ({}) } as unknown as Response;
+        }
+        if (u === PR_URL) {
+          return { ok: true, status: 200, json: async () => prHeadBody(APPROVED_HEAD) } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${u}`);
+      });
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+        expectedHeadSha: APPROVED_HEAD,
+      });
+
+      // The transient first write was retried and the card armed on the live head.
+      expect(outcome.kind).toBe("armed");
+      expect(outcome.headSha).toBe(APPROVED_HEAD);
+      expect(postStatusShas()).toEqual([APPROVED_HEAD, APPROVED_HEAD]);
+    });
+  });
 
   describe("resolveApprovalDecisionHead", () => {
     it("resolves the single cached PR head at decision time", async () => {
