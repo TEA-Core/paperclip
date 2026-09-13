@@ -268,7 +268,40 @@ export function isProcessGroupAlive(processGroupId: number | null | undefined) {
   return true;
 }
 
-function readLinuxProcessGroupActivity(processGroupId: number): boolean | null {
+/**
+ * Count the live (non-zombie) processes currently in a process group.
+ *
+ * SUP-16010: this is the census-grade sibling of `isProcessGroupAlive`, shared
+ * through the same `scanLinuxProcessGroup` walk so a run's fan-out can be
+ * measured without introducing a second process-walking primitive.
+ *
+ * Returns `null` when the group cannot be read — a non-Linux platform (no
+ * procfs) or an unreadable `/proc` — so the census can degrade to "skipped"
+ * instead of reporting a fabricated zero. A readable group with no live
+ * members returns `0`.
+ */
+export function countLiveProcessGroupMembers(processGroupId: number | null | undefined): number | null {
+  if (process.platform !== "linux") return null;
+  if (typeof processGroupId !== "number" || !Number.isInteger(processGroupId) || processGroupId <= 0) return null;
+  return scanLinuxProcessGroup(processGroupId)?.liveMembers ?? null;
+}
+
+type LinuxProcessGroupScan = {
+  /** Whether any process currently claims this process group. */
+  foundMember: boolean;
+  /** Members that are neither zombies (`Z`) nor dead (`X`). */
+  liveMembers: number;
+};
+
+/**
+ * Walk `/proc` once and report the members of a process group.
+ *
+ * Both `isProcessGroupAlive` (the boolean liveness probe) and
+ * `countLiveProcessGroupMembers` (the SUP-16010 census count) read through
+ * this single scan, so the two can never disagree about which processes count
+ * as members. A `null` return means `/proc` itself was unreadable.
+ */
+function scanLinuxProcessGroup(processGroupId: number): LinuxProcessGroupScan | null {
   let entries: fsSync.Dirent[];
   try {
     entries = fsSync.readdirSync("/proc", { withFileTypes: true });
@@ -277,6 +310,7 @@ function readLinuxProcessGroupActivity(processGroupId: number): boolean | null {
   }
 
   let foundMember = false;
+  let liveMembers = 0;
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
     try {
@@ -288,16 +322,23 @@ function readLinuxProcessGroupActivity(processGroupId: number): boolean | null {
       const memberProcessGroupId = Number.parseInt(fields[2] ?? "", 10);
       if (memberProcessGroupId !== processGroupId) continue;
       foundMember = true;
-      if (state !== "Z" && state !== "X") return true;
+      if (state !== "Z" && state !== "X") liveMembers += 1;
     } catch {
       // The process can exit while /proc is scanned.
     }
   }
 
+  return { foundMember, liveMembers };
+}
+
+function readLinuxProcessGroupActivity(processGroupId: number): boolean | null {
+  const scan = scanLinuxProcessGroup(processGroupId);
+  if (scan === null) return null;
+  if (scan.liveMembers > 0) return true;
   // kill(-pgid, 0) also succeeds for a group that contains only zombies. Such
   // processes cannot run or own a listener and are waiting only for their
   // parent to reap them, so termination is complete for service-control use.
-  return foundMember ? false : null;
+  return scan.foundMember ? false : null;
 }
 
 function tokenizeCommandLine(value: string) {
