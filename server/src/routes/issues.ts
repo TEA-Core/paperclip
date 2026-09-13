@@ -7597,17 +7597,22 @@ export function issueRoutes(
   //
   // This guard runs when the response ends, so it covers every exit: a success, a
   // rejected mutation, and a thrown error. It reads the final issue status through
-  // a getter. When the issue is null or still terminal, it clears the flag so the
-  // reaper can reclaim the worktree. When the issue left the terminal state, it
-  // does nothing and the reaper clears the flag. The guard never touches the
-  // response, and the underlying clear is idempotent.
+  // a getter, which may be a cached value or a fresh read taken at response end.
+  // When the issue is null or still terminal, it clears the flag so the reaper can
+  // reclaim the worktree. When the issue left the terminal state, it does nothing
+  // and the reaper clears the flag. The guard never touches the response, and the
+  // underlying clear is idempotent.
   function guardReopenedWorkspaceConsumption(input: {
     req: Request;
     res: Response;
     issue: { id: string; companyId: string };
     workspace: Pick<ExecutionWorkspace, "id"> | null;
     generation: number | null;
-    finalIssueStatus: () => string | null | undefined;
+    // The final issue status, read when the response ends. Callers may supply a
+    // cached value or a fresh read from the database (the checkout route re-reads
+    // the row at response end so a close that commits after the reopen still
+    // clears the fence); the getter may therefore be sync or async.
+    finalIssueStatus: () => string | null | undefined | Promise<string | null | undefined>;
   }): void {
     const { req, res, issue, workspace, generation, finalIssueStatus } = input;
     if (!workspace || generation === null) return;
@@ -7645,11 +7650,23 @@ export function issueRoutes(
     // Do not keep the event loop alive for the keepalive alone.
     keepAlive.unref?.();
     let settled = false;
-    const settle = () => {
+    const settle = async () => {
       if (settled) return;
       settled = true;
       clearInterval(keepAlive);
-      const status = finalIssueStatus();
+      // `finalIssueStatus` may be a cached value or a fresh database read at
+      // response end. Await it; if the read itself fails, do not strand the
+      // fence — fall through and clear it so the reaper can reclaim the worktree.
+      let status: string | null | undefined;
+      try {
+        status = await finalIssueStatus();
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, executionWorkspaceId: workspace.id },
+          "failed to read the final issue status when settling the reopen-pending guard; clearing the fence",
+        );
+        status = null;
+      }
       if (typeof status === "string" && !isClosedIssueStatus(status)) return;
       const actor = getActorInfo(req);
       void clearReopenPendingConsumptionWithRetry({
@@ -15040,34 +15057,48 @@ export function issueRoutes(
     let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
     let reopenedGeneration: number | null = null;
     if (closedExecutionWorkspace) {
-      const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
-        req,
-        res,
-        issue,
-        closedExecutionWorkspace,
-      );
-      if (reopenOutcome === null) {
-        return;
-      }
-      // Install the guard only when this request set the reopen-pending flag. A
-      // concurrent request that found the workspace already open must not clear
-      // the flag that the actual reopener still owns.
-      if (reopenOutcome.outcome === "reopened") {
-        reopenedWorkspace = closedExecutionWorkspace;
-        reopenedGeneration = reopenOutcome.generation;
+      // SUP-15888 (round 1): the checkout write persisted, but a concurrent close
+      // can commit between that write and the rebuild below. Re-read the CURRENT
+      // status immediately before reopening; if the card is now terminal (or is
+      // gone), do not publish a rebuilt worktree that nothing will consume. This
+      // makes the reopen conditional on the persisted checkout state still being
+      // live, so a terminal card is never left with an active/pending workspace.
+      const currentBeforeReopen = await svc.getById(id);
+      const stillLiveForReopen =
+        currentBeforeReopen !== null && !isClosedIssueStatus(currentBeforeReopen.status);
+      if (stillLiveForReopen) {
+        const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
+          req,
+          res,
+          issue,
+          closedExecutionWorkspace,
+        );
+        if (reopenOutcome === null) {
+          return;
+        }
+        // Install the guard only when this request set the reopen-pending flag. A
+        // concurrent request that found the workspace already open must not clear
+        // the flag that the actual reopener still owns.
+        if (reopenOutcome.outcome === "reopened") {
+          reopenedWorkspace = closedExecutionWorkspace;
+          reopenedGeneration = reopenOutcome.generation;
+        }
       }
     }
     // Clear the reopen-pending flag if the response ends while the issue is
-    // still terminal, so the rebuilt worktree does not leak. The guard reads
-    // `updated` when the response ends. It clears only the fence this request
-    // installed, keyed by its generation.
+    // still terminal, so the rebuilt worktree does not leak. The final status is
+    // re-read from the database when the response ends: the cached `updated`
+    // status is the value at checkout-write time, so a close that commits after
+    // the pre-reopen read above can still land before this request finishes, and
+    // only a fresh read lets the guard clear the fence. It clears only the fence
+    // this request installed, keyed by its generation.
     guardReopenedWorkspaceConsumption({
       req,
       res,
       issue,
       workspace: reopenedWorkspace,
       generation: reopenedGeneration,
-      finalIssueStatus: () => updated?.status,
+      finalIssueStatus: async () => (await svc.getById(id))?.status ?? null,
     });
     const actor = getActorInfo(req);
     if (updated?.harnessKind === "skill_test") {

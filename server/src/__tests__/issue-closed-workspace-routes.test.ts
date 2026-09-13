@@ -497,6 +497,77 @@ describe.sequential("closed isolated workspace issue routes", () => {
     await assertNoBackgroundClearWithinRetryWindow();
   });
 
+  it("does not reopen the workspace when a close commits after the checkout write but before the reopen (SUP-15888 round 1)", async () => {
+    // Forces the close-after-checkout/before-reopen interleaving at the route
+    // boundary: the initial terminal read saw a live card (todo), the service's
+    // checkout write persisted (in_progress), and then a concurrent close
+    // committed before the route rebuilds the closed worktree. The route must
+    // re-read the CURRENT status immediately before reopening; seeing the card is
+    // now terminal, it must skip the rebuild entirely. No worktree is published,
+    // no reopen-pending flag is set, so nothing is left active/pending for a card
+    // that is closed again.
+    mockIssueService.getById
+      .mockResolvedValueOnce(makeIssue()) // initial read: live
+      .mockResolvedValueOnce({ ...makeIssue(), status: "done" }); // pre-reopen re-read: closed
+    mockIssueService.checkout.mockResolvedValue({ ...makeIssue(), status: "in_progress" });
+
+    const res = await request(createApp())
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked"],
+      });
+
+    // The checkout write happened (200), but the terminal card got no worktree.
+    expect(res.status).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalledTimes(1);
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
+    expect(
+      mockExecutionWorkspaceService.clearReopenPendingConsumptionForUnconsumedReopen,
+    ).not.toHaveBeenCalled();
+    await assertNoBackgroundClearWithinRetryWindow();
+  });
+
+  it("clears the reopen-pending fence when a close commits after the reopen but before the response ends (SUP-15888 round 1)", async () => {
+    // A narrower window the pre-reopen read cannot see: the pre-reopen re-read
+    // still saw a live card (so the route rebuilds the worktree and sets the
+    // reopen-pending flag), but a concurrent close commits after the reopen and
+    // before the response finishes. The cached checkout status is still
+    // in_progress, so only a fresh status read at response end lets the guard
+    // clear the fence; otherwise the rebuilt worktree is left active/pending on
+    // a now-terminal card and the terminal reaper skips it forever.
+    mockIssueService.getById
+      .mockResolvedValueOnce(makeIssue()) // initial read: live
+      .mockResolvedValueOnce(makeIssue()) // pre-reopen re-read: still live -> reopen
+      .mockResolvedValueOnce({ ...makeIssue(), status: "cancelled" }); // settle read: closed
+    mockIssueService.checkout.mockResolvedValue({ ...makeIssue(), status: "in_progress" });
+
+    const res = await request(createApp())
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked"],
+      });
+
+    expect(res.status).toBe(200);
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(
+        mockExecutionWorkspaceService.clearReopenPendingConsumptionForUnconsumedReopen,
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workspaceId: closedWorkspaceId,
+          issue: expect.objectContaining({ id: issueId }),
+          expectedGeneration: 4,
+        }),
+      );
+    }, { timeout: REOPEN_PENDING_WAIT_TIMEOUT_MS });
+  });
+
   it("does not clear the reopen-pending flag when a concurrent request already reopened the workspace", async () => {
     // A concurrent request reopened the workspace first, so this request receives
     // reopened: false and never set the flag. It must not clear the flag that the
