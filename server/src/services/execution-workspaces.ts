@@ -248,7 +248,11 @@ export type ReopenClosedIsolatedExecutionWorkspaceResult =
   // generation, so a stale actor never clears a newer reopen's fence.
   | { ok: true; workspace: ExecutionWorkspace; reopened: true; generation: number }
   | { ok: true; workspace: ExecutionWorkspace; reopened: false; generation: number }
-  | { ok: false; code: "not_reopenable" | "rebuild_failed"; message: string };
+  | {
+      ok: false;
+      code: "not_reopenable" | "rebuild_failed" | "issue_not_live";
+      message: string;
+    };
 
 export type ExecutionWorkspaceServiceOptions = {
   now?: () => Date;
@@ -3313,6 +3317,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       workspaceId: string;
       issue: { id: string; companyId: string; projectId: string | null };
       actor: { agentId: string | null; actorType: string };
+      // When true, the reopen is conditional on the issue still being live at the
+      // reopen boundary: the persisted issue status is re-read inside this same
+      // advisory-locked transaction, and a terminal card refuses the rebuild
+      // (code "issue_not_live") before `active` or the reopen-pending fence is
+      // published. The checkout route passes true, because a checkout keeps the
+      // card live and a terminal close that lands at the boundary must not leave
+      // a rebuilt worktree on a closed card. The comment/update routes omit it:
+      // they reopen a workspace precisely so a terminal card can be moved back to
+      // live by the route mutation that follows.
+      requireLiveIssue?: boolean;
     }): Promise<ReopenClosedIsolatedExecutionWorkspaceResult> => {
       const { issue, actor } = input;
       // Bind the workspace to the issue company and project. A null project on
@@ -3350,6 +3364,39 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             workspace: toExecutionWorkspace(row),
             generation: readExecutionWorkspaceLifecycleGeneration(row.metadata as Record<string, unknown> | null),
           };
+        }
+
+        // SUP-16162 (redo): a checkout may rebuild a closed isolated workspace only
+        // while the persisted checkout state that authorized reopening is still
+        // live at the reopen boundary. The route's pre-reopen status read is a
+        // separate transaction and cannot reserve the issue's live state, so a
+        // terminal close that commits after that read but before the rebuild would
+        // otherwise publish `active` + the reopen-pending fence on a card that is
+        // now closed. Re-read the persisted issue status inside this same
+        // advisory-locked transaction — the very unit that publishes the row — so a
+        // terminal (or gone) card refuses the rebuild before any work is done. This
+        // is the atomic status/reopen boundary the checkout route relies on.
+        if (input.requireLiveIssue) {
+          const liveIssue = await tx
+            .select({ status: issues.status })
+            .from(issues)
+            .where(eq(issues.id, issue.id))
+            .then((rows) => rows[0] ?? null);
+          if (!liveIssue || liveIssue.status === "done" || liveIssue.status === "cancelled") {
+            logger.warn(
+              {
+                event: "execution_workspace.reopen",
+                outcome: "issue_not_live",
+                executionWorkspaceId: row.id,
+                issueId: issue.id,
+                companyId: row.companyId,
+                actorType: actor.actorType,
+                actorAgentId: actor.agentId ?? null,
+              },
+              "execution workspace reopen refused: source issue is not live",
+            );
+            return { ok: false, code: "issue_not_live", message: "The issue is no longer live" };
+          }
         }
 
         const [
