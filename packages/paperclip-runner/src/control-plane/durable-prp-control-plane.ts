@@ -259,6 +259,58 @@ export interface RunnerProcessLaunchSpec {
   environment: NodeJS.ProcessEnv;
 }
 
+/**
+ * SUP-16011 — per-run process-cap refusal type, mirroring the shared shape in
+ * `@paperclipai/adapter-utils` (`RunProcessCapExceededError`). Local to the
+ * runner package because it is a decoupled leaf with no adapter-utils import.
+ */
+export const RUNNERD_RUN_PROCESS_CAP_ERROR_CODE = "run_process_cap_exceeded";
+
+export interface RunnerdRunProcessCapRefusalJson {
+  errorCode: typeof RUNNERD_RUN_PROCESS_CAP_ERROR_CODE;
+  cap: number;
+  current: number;
+  processGroupId: number;
+  runId: string;
+}
+
+export class RunnerdRunProcessCapExceededError extends Error {
+  readonly code: typeof RUNNERD_RUN_PROCESS_CAP_ERROR_CODE =
+    RUNNERD_RUN_PROCESS_CAP_ERROR_CODE;
+  readonly resultJson: RunnerdRunProcessCapRefusalJson;
+
+  constructor(input: {
+    runId: string;
+    cap: number;
+    current: number;
+    processGroupId: number;
+  }) {
+    const { runId, cap, current, processGroupId } = input;
+    super(
+      `[paperclip] run process cap exceeded: cap=${cap} current=${current} group=${processGroupId} runId=${runId}; spawn refused`,
+    );
+    this.name = "RunnerdRunProcessCapExceededError";
+    this.resultJson = {
+      errorCode: RUNNERD_RUN_PROCESS_CAP_ERROR_CODE,
+      cap,
+      current,
+      processGroupId,
+      runId,
+    };
+  }
+}
+
+/**
+ * Injection seam: the caller (transport) evaluates the census counter against
+ * the cap and returns a refusal error when the cap is reached. Returning
+ * `null` means the spawn is allowed. This keeps the runner package
+ * decoupled from the server-side census while enforcing the cap at the
+ * single `spawnRunner` admission point.
+ */
+export type RunnerdRunProcessCapGate = (input: {
+  runId: string;
+}) => RunnerdRunProcessCapExceededError | null;
+
 function domainDigest(domain: string, parts: readonly Buffer[]): Buffer {
   const digest = createHash("sha256")
     .update(domain)
@@ -2100,7 +2152,12 @@ export function spawnRunner(options: {
   environment?: NodeJS.ProcessEnv;
   processLauncher?: (spec: RunnerProcessLaunchSpec) => RunnerProcessHandle;
   diagnosticsDirectory?: string;
+  runProcessCapGate?: RunnerdRunProcessCapGate;
 }): RunnerProcessHandle {
+  if (options.runProcessCapGate !== undefined) {
+    const refusal = options.runProcessCapGate({ runId: options.identity.runId });
+    if (refusal !== null) throw refusal;
+  }
   const connection =
     options.connection ??
     (options.connectUrl
