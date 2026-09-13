@@ -4,6 +4,8 @@
 import type { ChildProcess } from "node:child_process";
 import { logger } from "../middleware/logger.js";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
+import { registerRunProcessGroupCounter } from "@paperclipai/adapter-utils/run-process-cap";
+import { countLiveProcessGroupMembers } from "../services/local-service-supervisor.js";
 export type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 
 type BuildInvocationEnvForLogsOptions = {
@@ -15,6 +17,16 @@ type BuildInvocationEnvForLogsOptions = {
 
 export const runningProcesses: Map<string, { child: ChildProcess; graceSec: number; processGroupId: number | null }> =
   serverUtils.runningProcesses;
+
+// SUP-16011: wire the census-grade `/proc` process-group counter into the
+// run-child seam so the per-run process cap (`PAPERCLIP_RUN_PROCESS_CAP`,
+// derived default 512) can measure a run's existing group before it spawns.
+// The census owns `countLiveProcessGroupMembers`; injecting it here keeps the
+// seam single and introduces no second process-walking primitive. This module
+// is imported early (the census and the process adapter both reach it), so the
+// counter is in place before any run child is created. Stays inert on
+// non-Linux hosts, where the counter returns null and the cap fails open.
+registerRunProcessGroupCounter(countLiveProcessGroupMembers);
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
 export const parseObject = serverUtils.parseObject;
