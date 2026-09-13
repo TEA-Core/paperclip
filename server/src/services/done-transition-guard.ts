@@ -1066,6 +1066,7 @@ export async function countLadderedChildren(
     .select({
       id: issues.id,
       identifier: issues.identifier,
+      status: issues.status,
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
       originKind: issues.originKind,
@@ -1108,6 +1109,13 @@ export async function countLadderedChildren(
   const identifiers: string[] = [];
   const excludedChildIdentifiers: string[] = [];
   for (const row of rows) {
+    // SUP-16025: the child scope is non-cancelled qualifying children only.
+    // A cancelled row is not a decomposition signal even when it still carries
+    // a qualifying policy and a completed/skipped stage, so a cancelled-only
+    // parent stays legal on both `done` and `in_review`. Skip it BEFORE the
+    // origin/policy/state/carve-out qualification so it neither counts toward
+    // the `>= 2` threshold nor is recorded in the carve-out audit trail.
+    if (row.status === "cancelled") continue;
     // SUP-15451: only decomposition children count. A platform-generated card
     // parented to this issue (issue_productivity_review, task_watchdog,
     // stale_active_run_evaluation, ...) is not a decomposition signal — it is

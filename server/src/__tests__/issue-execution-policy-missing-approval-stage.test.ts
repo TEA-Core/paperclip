@@ -280,11 +280,19 @@ const RUN_ID = "55555555-5555-4555-8555-555555555555";
 
 // A decomposition child that counts toward the laddered count: manual origin,
 // a non-null executionPolicy, and at least one completed stage — exactly the
-// row shape `countLadderedChildren` reads from the issues table.
-function ladderedChildRow(id: string, identifier: string, originKind: string = "manual") {
+// row shape `countLadderedChildren` reads from the issues table. `status`
+// defaults to a non-cancelled value; pass "cancelled" to model a row the
+// SUP-16025 non-cancelled-child scope must exclude.
+function ladderedChildRow(
+  id: string,
+  identifier: string,
+  originKind: string = "manual",
+  status: string = "in_review",
+) {
   return {
     id,
     identifier,
+    status,
     executionPolicy: {
       stages: [{ id: "stage-x", type: "review", participants: [{ type: "agent", agentId: AGENT_ID }] }],
     },
@@ -418,13 +426,14 @@ describe("issue execution policy missing approval stage", () => {
       // SUP-15958: `countLadderedChildren` runs up to three indexed reads on the
       // PATCH path. Route each to its own state so the real helper's exclusions
       // are exercised; every other select keeps the hoisted handoff-agent-row
-      // default. The child decomposition is the only 5-key projection on the
+      // default. The child decomposition is the only 6-key projection on the
       // path, so it is matched by signature alone (no table-identity assumption);
       // the carve-out label reads are matched by table + single-key projection.
       const childSignature =
-        keys.length === 5
+        keys.length === 6
         && keys.includes("id")
         && keys.includes("identifier")
+        && keys.includes("status")
         && keys.includes("executionPolicy")
         && keys.includes("executionState")
         && keys.includes("originKind");
@@ -747,6 +756,55 @@ describe("issue execution policy missing approval stage", () => {
     const res = await request(await createApp(agentActor()))
       .patch(`/api/issues/${PARENT_ID}`)
       .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(gapActivityInputs()).toEqual([]);
+  });
+
+  // Distinguishing regression (SUP-15878 R2 / SUP-16025): the child scope is
+  // NON-cancelled qualifying children only. Two cancelled children that still
+  // carry a qualifying policy and a completed stage must NOT arm the diagnosis
+  // — a cancelled row is not a decomposition signal — so both `done` and
+  // `in_review` keep their existing behavior: no typed diagnosis, no
+  // missing-approval activity row. This contrasts with the two non-cancelled
+  // qualifying rows in the tests above, which still produce the diagnosis.
+  it("leaves a cancelled-only child set's done transition unchanged", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2", "manual", "cancelled"),
+      ladderedChildRow("child-b-id", "PAP-3", "manual", "cancelled"),
+    ];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(gapActivityInputs()).toEqual([]);
+  });
+
+  it("leaves a cancelled-only child set's in_review transition unchanged", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2", "manual", "cancelled"),
+      ladderedChildRow("child-b-id", "PAP-3", "manual", "cancelled"),
+    ];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "in_review" });
 
     expect(res.status).toBe(200);
     expect(gapActivityInputs()).toEqual([]);
