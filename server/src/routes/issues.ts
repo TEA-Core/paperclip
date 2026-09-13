@@ -3423,13 +3423,18 @@ export function issueRoutes(
     try {
       const integrity = await evaluateStageIntegrity(db, candidate);
       if (integrity) {
-        const msg = `status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`;
+        // SUP-16032: write the refusal through the SAME shared, database-atomic
+        // boundary the scheduled reconciler uses (issueService
+        // .addGuardBArmingRefusalComment). The per-issue advisory lock serializes
+        // this decision-time producer against the reconciler, and the reason-
+        // token dedup re-checks under the lock — so a card refused by both
+        // producers gets one `[Merge-arming]
+        // status:skipped:stage_integrity:<reason>:` record, not two.
         try {
-          await svc.addComment(
+          await svc.addGuardBArmingRefusalComment(
             issue.id,
-            `[Merge-arming] ${msg}`,
-            {},
-            { authorType: "system" },
+            integrity.reason,
+            integrity.detail,
           );
         } catch (commentErr) {
           // Fail closed: even if the refusal comment cannot be written, the

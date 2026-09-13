@@ -13,6 +13,7 @@ import {
   type GitHubTokenResolution,
 } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { issueService } from "./issues.js";
 import {
   ladderIsTerminallyApproved,
   postPullRequestComment,
@@ -2189,11 +2190,62 @@ export async function persistWorkspaceDiscoveryVerdict(
   });
 }
 
+// SUP-16032: the per-issue advisory-lock key for the Guard B arming-refusal
+// dedup now lives with the shared check-and-insert boundary
+// (issueService.addGuardBArmingRefusalComment in ./issues.js). Re-export it here
+// so existing imports (and the reconciler test) keep resolving it from this
+// module while the definition has a single home.
+export { guardBRefusalCommentLockKey } from "./issues.js";
+
+/**
+ * SUP-16032: surface a Guard B arming refusal from the reconciler path on the
+ * card, so a card the scheduled reconciler refuses to arm is visible to its
+ * owner. This mirrors the decision-time refusal (routes/issues.ts
+ * runApprovalMergeArming): the same `[Merge-arming]
+ * status:skipped:stage_integrity:<reason>: <detail>` system comment, written
+ * through the SAME shared boundary
+ * (issueService.addGuardBArmingRefusalComment) — one record format, one dedup
+ * key, one database-atomic check-and-insert shared by both producers.
+ *
+ * Idempotency + atomicity: the shared boundary dedups on the reason token
+ * embedded in the record (one record per (issue, reason)) and holds the
+ * per-issue advisory lock for the whole check-then-insert, so a card already
+ * refused at decision time is not duplicated, and a concurrent decision-time
+ * producer racing this tick is serialized and re-checked. This closes the
+ * check-then-insert race the local scheduler's in-process `inFlight` flag
+ * cannot: that flag does not cover separate processes or the other call site.
+ *
+ * Fail-closed: the arming refusal already returned `skipped` in
+ * reconcileCandidate, before any GitHub read or write, so a comment write that
+ * cannot be made must never change the outcome — it is logged (the shared
+ * transaction rolls back) and the card stays un-armed.
+ */
+async function surfaceGuardBArmingRefusal(
+  db: Db,
+  row: CandidateRow,
+  integrity: { reason: string; detail: string },
+): Promise<void> {
+  try {
+    await issueService(db).addGuardBArmingRefusalComment(row.id, integrity.reason, integrity.detail);
+  } catch (err) {
+    logger.warn(
+      { err, issueId: row.id, reason: integrity.reason },
+      "guard-b arming refusal comment write failed; still refusing to arm",
+    );
+  }
+}
+
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
   const label = row.identifier ?? row.id;
 
   const integrity = await evaluateStageIntegrity(db, row);
   if (integrity) {
+    // SUP-16032: surface the Guard B arming refusal on the card so a card the
+    // reconciler refuses to arm is visible to its owner — mirroring the
+    // decision-time path (routes/issues.ts runApprovalMergeArming). Idempotent
+    // per (issue, reason); a failed write never arms the card (the refusal
+    // already returns `skipped` below, before any GitHub read or write).
+    await surfaceGuardBArmingRefusal(db, row, integrity);
     return { kind: "skipped", reason: integrity.reason, detail: `guard-b ${integrity.detail}` };
   }
 
