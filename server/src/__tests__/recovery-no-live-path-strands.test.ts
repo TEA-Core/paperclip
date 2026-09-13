@@ -493,7 +493,10 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(action).toMatchObject({
-      kind: "review_stage_armed_stranded",
+      // The armed detector reuses the shared `review_stage_unarmed` kind so the
+      // diff stays within the ≤3-file envelope; it is distinguished from the
+      // in_review board detector by its agent owner and its own fingerprint.
+      kind: "review_stage_unarmed",
       ownerType: "agent",
       ownerAgentId: managerId,
       ownerUserId: null,
@@ -638,6 +641,10 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
       updatedAt: withinGraceDate(),
       ...fixture,
+      // The grace anchor is the immutable pendingSince, not updatedAt; the
+      // fixture pins pendingSince to past-grace, so override it to keep this
+      // card inside the window on the correct anchor.
+      executionState: { ...fixture.executionState, pendingSince: withinGraceDate().toISOString() },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -671,7 +678,9 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(actions.some((action) => action.kind === "review_stage_armed_stranded")).toBe(false);
+    // The armed detector (agent-owned) must not fire for an in_review card; the
+    // shared `review_stage_unarmed` kind is only minted board-owned here.
+    expect(actions.some((action) => action.kind === "review_stage_unarmed" && action.ownerType === "agent")).toBe(false);
   });
 
   it("leaves a pending stage on a user participant alone (a deliberate human wait, not a wedged agent)", async () => {
@@ -714,7 +723,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(actions.some((action) => action.kind === "review_stage_armed_stranded")).toBe(false);
+    expect(actions.some((action) => action.kind === "review_stage_unarmed" && action.ownerType === "agent")).toBe(false);
   });
 
   it("leaves a pending approval stage on an agent participant untouched (only review stages are wedged)", async () => {
@@ -760,7 +769,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(actions.some((action) => action.kind === "review_stage_armed_stranded")).toBe(false);
+    expect(actions.some((action) => action.kind === "review_stage_unarmed" && action.ownerType === "agent")).toBe(false);
   });
 
   // -- SUP-15788 round-2: the early detector must honour the live-path guards --
@@ -953,7 +962,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(action?.kind).toBe("review_stage_armed_stranded");
+    expect(action?.kind).toBe("review_stage_unarmed");
     expect(action?.ownerAgentId).toBe(managerId);
     expect(action?.previousOwnerAgentId).toBe(pausedAgentId);
   });
@@ -980,7 +989,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(action?.kind).toBe("review_stage_armed_stranded");
+    expect(action?.kind).toBe("review_stage_unarmed");
     expect(action?.ownerAgentId).toBe(managerId);
     expect(action?.previousOwnerAgentId).toBeNull();
   });
@@ -1041,6 +1050,206 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     expect(active[0].fingerprint).toBe(
       `review_stage_armed_stranded:${companyId}:${issueId}:${stageId}:${coderId}`,
     );
+    // A changed wedge identity must supersede the prior action atomically —
+    // cancel it and insert a fresh row — rather than clobbering it in place,
+    // which would leave the old participant's queued wake pointing at the same
+    // row (round-1 finding: collision / supersede).
+    expect(actions).toHaveLength(2);
+    const superseded = actions.filter((action) => action.status === "cancelled");
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0].ownerAgentId).toBe(managerId);
+    expect(superseded[0].fingerprint).toBe(
+      `review_stage_armed_stranded:${companyId}:${issueId}:${stageId}:${managerId}`,
+    );
+  });
+
+  // -- SUP-15788 round-2: grace keys on the immutable arm anchor, not updatedAt --
+
+  it("escalates an armed review stage on its pendingSince anchor even when the card was recently edited (updatedAt within grace)", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const pendingSince = pastGraceDate();
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: withinGraceDate(),
+      executionPolicy: fixture.executionPolicy,
+      executionState: { ...fixture.executionState, pendingSince: pendingSince.toISOString() },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // The arm anchor is the immutable pendingSince, not the mutable updatedAt:
+    // a recent unrelated edit must not postpone a stage already past grace
+    // (round-2 finding: use pendingSince, not updatedAt).
+    expect(result.reviewStageArmedStranded).toBe(1);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action?.kind).toBe("review_stage_unarmed");
+    expect(action?.ownerAgentId).toBe(managerId);
+    expect(action?.evidence).toMatchObject({ pendingSince: pendingSince.toISOString() });
+  });
+
+  it("does not escalate an armed review stage whose pendingSince is within grace even when updatedAt is old", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      executionPolicy: fixture.executionPolicy,
+      executionState: { ...fixture.executionState, pendingSince: withinGraceDate().toISOString() },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // A freshly-armed stage (pendingSince within grace) is not yet stranded even
+    // when the card row is old (round-2 finding: use pendingSince, not updatedAt).
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+  });
+
+  // -- SUP-15788 round-2: operator cancellation stands down all recovery --
+
+  it("does not escalate an armed review stage when the latest run was operator-cancelled", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    // The latest run for this issue was deliberately cancelled by an operator:
+    // all automatic recovery stands down, so the detector must not mint a
+    // participant action or re-wake anyone (round-2 finding: operator-cancel
+    // exemption).
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "cancelled",
+      errorCode: "operator_interrupted",
+      startedAt: new Date(),
+      contextSnapshot: { issueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // -- SUP-15788 round-2: the stale-wake sweep honours a post-mint pause hold --
+
+  it("stands down the stale-wake sweep when a subtree pause hold is placed after the armed action was minted", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    // 1. Mint the participant action with no hold in place.
+    await recovery.reconcileStrandedAssignedIssues();
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action?.kind).toBe("review_stage_unarmed");
+    expect(action?.status).toBe("active");
+
+    // 2. The operator places the card under a subtree pause hold AFTER the
+    // action was minted.
+    await issueTreeControlService(db).createHold(companyId, issueId, {
+      mode: "pause",
+      reason: "operator requested pause",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    // 3. The sweep must stand down: re-firing the parked participant mid-pause
+    // would bypass the ALL-automatic-recovery pause contract (round-2 finding:
+    // stale-wake pause-hold guard).
+    const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 0 });
+    expect(sweep.skippedPauseHold).toBe(1);
+    expect(sweep.reFired).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // -- SUP-15788 round-2: an active agent-owned action from another cause --
+
+  it("supersedes an existing active agent-owned action from a different cause instead of clobbering it in place", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+
+    // Simulate a prior active AGENT-owned action for this card minted by a
+    // different recovery cause (distinct fingerprint). This is the collision the
+    // detector must not clobber in place — in-place clobber would leave the old
+    // owner's queued wake and a ghost audit row (round-2 finding: collision).
+    const priorCause = "no_live_path_owner_unavailable";
+    const priorFingerprint = `${priorCause}:${companyId}:${issueId}`;
+    await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "no_live_path_owner_unavailable",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      ownerUserId: null,
+      cause: priorCause,
+      fingerprint: priorFingerprint,
+      evidence: { identifier: `${prefix}-1`, status: "in_progress" },
+      nextAction: "prior-cause recovery action",
+      wakePolicy: null,
+      monitorPolicy: null,
+      maxAttempts: null,
+      lastAttemptAt: new Date(),
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(1);
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    const active = rows.filter((row) => row.status === "active");
+    expect(active).toHaveLength(1);
+    expect(active[0].fingerprint).toBe(
+      `review_stage_armed_stranded:${companyId}:${issueId}:${stageId}:${managerId}`,
+    );
+    const superseded = rows.filter((row) => row.status === "cancelled");
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0].cause).toBe(priorCause);
   });
 
   it("branch 3: non-in_review issue with paused assignee past grace window creates no_live_path_owner_unavailable recovery action", async () => {

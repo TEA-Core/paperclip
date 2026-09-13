@@ -4050,8 +4050,25 @@ export function recoveryService(
         const armedParticipant = armed.currentParticipant;
         const participantOwnerAgentId =
           armedParticipant?.type === "agent" ? armedParticipant.agentId ?? null : null;
-        const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
-        if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+        // Grace is measured from the IMMUTABLE arm anchor — `pendingSince`, the
+        // moment the review stage entered its pending state — not the mutable
+        // `issue.updatedAt`. Editing the card must not reset the escalation
+        // clock: the wedge is defined by the armed stage, not the card's last
+        // write. `pendingSince` is absent on rows armed before this shipped, so
+        // fall back to `updatedAt` for legacy cards.
+        const pendingSinceMs = armed.pendingSince ? Date.parse(armed.pendingSince) : null;
+        const msSinceArm =
+          now.getTime() - (pendingSinceMs ?? issue.updatedAt.getTime());
+        if (msSinceArm < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+          result.skipped += 1;
+          continue;
+        }
+        // An operator-cancelled latest run stands down ALL automatic recovery:
+        // the board deliberately stopped the agent, so re-waking the participant
+        // or escalating "stranding" would fight the human. Any newer run or wake
+        // supersedes the exemption (isOperatorCancelledRun keys on the latest
+        // run). SUP-15788 round-1 finding: operator-cancel exemption.
+        if (isOperatorCancelledRun(await getLatestIssueRun(issue.companyId, issue.id))) {
           result.skipped += 1;
           continue;
         }
@@ -4105,21 +4122,21 @@ export function recoveryService(
           continue;
         }
         // Idempotency is scoped to the exact wedge identity (stage + participant).
+        // The fingerprint is globally unique among active actions, so equality
+        // pins the wedge on its own — independent of the shared
+        // `review_stage_unarmed` kind that the in_review detector also mints.
         // A repeat pass over the same wedged card skips; a stage or participant
         // change no longer matches, so the upsert below reconciles ownership to
         // the live participant instead of waking a prior one.
         const fingerprint = `review_stage_armed_stranded:${issue.companyId}:${issue.id}:${armed.currentStageId ?? "none"}:${participantOwnerAgentId ?? "none"}`;
-        if (
-          existingAction?.kind === "review_stage_armed_stranded" &&
-          existingAction.fingerprint === fingerprint
-        ) {
+        if (existingAction?.fingerprint === fingerprint) {
           result.skipped += 1;
           continue;
         }
         await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
           sourceIssueId: issue.id,
-          kind: "review_stage_armed_stranded",
+          kind: "review_stage_unarmed",
           ownerType: "agent",
           ownerAgentId: participantOwnerAgentId,
           ownerUserId: null,
@@ -4130,7 +4147,8 @@ export function recoveryService(
           evidence: {
             identifier: issue.identifier,
             status: issue.status,
-            msSinceUpdate,
+            msSinceArm,
+            pendingSince: armed.pendingSince ?? null,
             currentStageId: armed.currentStageId ?? null,
             currentStageType: armed.currentStageType ?? null,
             participantType: armedParticipant?.type ?? null,
@@ -4142,6 +4160,12 @@ export function recoveryService(
           monitorPolicy: null,
           maxAttempts: null,
           lastAttemptAt: now,
+          // An active agent-owned action minted by another detector/cause for this
+          // card must be atomically cancelled and replaced, never clobbered in
+          // place. In-place clobber leaves the old owner's pending wake and a
+          // ghost audit row (SUP-15788 round-1 finding: collision). The prior
+          // action is cancelled with a resolution note and a fresh row inserted.
+          supersedeOnIdentityChange: true,
         });
         result.reviewStageArmedStranded += 1;
         result.issueIds.push(issue.id);
@@ -4584,7 +4608,14 @@ export function recoveryService(
             continue;
           }
           const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
-          if (existingAction?.kind === "review_stage_unarmed") {
+          // Key on this detector's own fingerprint, not just the shared kind:
+          // the armed-review detector (non-in_review) also mints an agent-owned
+          // `review_stage_unarmed` with a distinct fingerprint, and must not make
+          // the in_review detector skip its own board escalation.
+          if (
+            existingAction?.kind === "review_stage_unarmed" &&
+            existingAction.fingerprint === `review_stage_unarmed:${issue.companyId}:${issue.id}`
+          ) {
             result.skipped += 1;
             continue;
           }
@@ -7453,6 +7484,7 @@ export function recoveryService(
       nonWakeableSkipped: 0,
       skippedTerminalSource: 0,
       skippedBackoff: 0,
+      skippedPauseHold: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -7491,6 +7523,24 @@ export function recoveryService(
       // Nothing left to recover: the source issue is gone or already terminal.
       if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
         result.skippedTerminalSource += 1;
+        continue;
+      }
+
+      // A subtree pause hold suppresses ALL automatic recovery, including this
+      // stale-wake sweep. Re-firing a parked participant mid-pause would bypass
+      // the pause contract (SUP-15788 round-1 finding: stale-wake pause-hold
+      // guard). This mirrors the mint-time guard so a hold placed AFTER the
+      // action was minted also stands the sweep down. Checked before burning any
+      // backoff attempt or re-resolving ownership.
+      if (
+        await isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          candidate.companyId,
+          candidate.sourceIssueId,
+          treeControlSvc,
+        )
+      ) {
+        result.skippedPauseHold += 1;
         continue;
       }
 
