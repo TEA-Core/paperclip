@@ -5,6 +5,7 @@ import {
   RUN_PROCESS_CAP_ENV_KEY,
   RUN_PROCESS_CAP_EXCEEDED_ERROR_CODE,
   RunProcessCapExceededError,
+  evaluateRunProcessSpawn,
   isRunProcessCapExceededFailure,
   registerRunProcessGroupCounter,
   resolveRunProcessCap,
@@ -68,6 +69,77 @@ describe("shouldRefuseRunProcessSpawn (boundary)", () => {
   it("fails open when the cap is disabled or the group is unreadable", () => {
     expect(shouldRefuseRunProcessSpawn({ cap: null, current: 999 })).toBe(false);
     expect(shouldRefuseRunProcessSpawn({ cap: 5, current: null })).toBe(false);
+  });
+});
+
+describe("evaluateRunProcessSpawn (shared seam admission)", () => {
+  it("allows a run at cap - 1", () => {
+    const refusal = evaluateRunProcessSpawn({
+      runId: "run-x",
+      cap: 5,
+      counter: () => 4,
+      processGroupId: 100,
+    });
+    expect(refusal).toBeNull();
+  });
+
+  it("refuses a run at the cap with the named code and the measured numbers", () => {
+    const refusal = evaluateRunProcessSpawn({
+      runId: "run-x",
+      cap: 5,
+      counter: () => 5,
+      processGroupId: 100,
+    });
+    expect(refusal?.code).toBe(RUN_PROCESS_CAP_EXCEEDED_ERROR_CODE);
+    expect(refusal?.resultJson).toEqual({
+      errorCode: RUN_PROCESS_CAP_EXCEEDED_ERROR_CODE,
+      cap: 5,
+      current: 5,
+      processGroupId: 100,
+      runId: "run-x",
+    });
+  });
+
+  it("fails open when the cap is disabled, the counter is unwired, or the group is missing", () => {
+    expect(
+      evaluateRunProcessSpawn({
+        runId: "r",
+        cap: null,
+        counter: () => 99,
+        processGroupId: 1,
+      }),
+    ).toBeNull();
+    expect(
+      evaluateRunProcessSpawn({
+        runId: "r",
+        cap: 5,
+        counter: null,
+        processGroupId: 1,
+      }),
+    ).toBeNull();
+    expect(
+      evaluateRunProcessSpawn({
+        runId: "r",
+        cap: 5,
+        counter: () => 99,
+        processGroupId: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("reports a measure error and fails open when the counter throws", () => {
+    const onMeasureError = vi.fn();
+    const refusal = evaluateRunProcessSpawn({
+      runId: "r",
+      cap: 5,
+      counter: () => {
+        throw new Error("no such process group");
+      },
+      processGroupId: 1,
+      onMeasureError,
+    });
+    expect(refusal).toBeNull();
+    expect(onMeasureError).toHaveBeenCalledTimes(1);
   });
 });
 

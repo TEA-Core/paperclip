@@ -144,6 +144,55 @@ export function shouldRefuseRunProcessSpawn(input: {
   return input.current >= input.cap;
 }
 
+/**
+ * Single admission decision for spawning a run's top-level child.
+ *
+ * This is the one place that measures the run's *existing* process group and
+ * decides whether the spawn is refused, so every run-child creation path
+ * (the `runChildProcess` seam and the native runner) routes through identical
+ * logic rather than each re-implementing the boundary. `processGroupId` is the
+ * run's currently-tracked group (`null` when the run has none yet); when there
+ * is no cap, no wired counter, or no measurable group, the spawn is allowed —
+ * the cap fails open rather than blocking a run on an unmeasurable host.
+ *
+ * Returns the `RunProcessCapExceededError` to throw (never itself thrown here)
+ * so each seam decides how to surface it (reject a promise vs. throw from an
+ * async function) and whether to log a measure error.
+ */
+export function evaluateRunProcessSpawn(input: {
+  runId: string;
+  cap: number | null;
+  counter: RunProcessGroupCounter | null;
+  processGroupId: number | null;
+  onMeasureError?: (error: unknown) => void;
+}): RunProcessCapExceededError | null {
+  const { runId, cap, counter, processGroupId } = input;
+  if (
+    cap === null ||
+    counter === null ||
+    processGroupId === null ||
+    processGroupId <= 0
+  ) {
+    return null;
+  }
+  let current: number | null = null;
+  try {
+    current = counter(processGroupId);
+  } catch (error) {
+    input.onMeasureError?.(error);
+    current = null;
+  }
+  if (current !== null && shouldRefuseRunProcessSpawn({ cap, current })) {
+    return new RunProcessCapExceededError({
+      runId,
+      cap,
+      current,
+      processGroupId,
+    });
+  }
+  return null;
+}
+
 /** Recognise a cap refusal after it has unwound through an adapter. */
 export function isRunProcessCapExceededFailure(
   error: unknown,
