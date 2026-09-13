@@ -144,6 +144,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     returnAssigneeUserId?: string;
     /** Seed no return assignee at all (a ladder with no recorded owner). */
     nullReturnAssignee?: boolean;
+    /** Seed a delivery-author user, distinct from the return assignee. */
+    deliveryAuthorUserId?: string;
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -238,7 +240,9 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
             currentStageType: "review",
             currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
             returnAssignee: returnAssigneePrincipal,
-            deliveryAuthor: null,
+            deliveryAuthor: opts.deliveryAuthorUserId
+              ? { type: "user", agentId: null, userId: opts.deliveryAuthorUserId }
+              : null,
             completedStageIds: opts.completedStageIds ?? [],
             skippedStageIds: [],
             lastDecisionId: null,
@@ -870,5 +874,234 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .where(eq(issueExecutionDecisions.issueId, issueId));
     expect(decisions).toHaveLength(2);
     expect(new Set(decisions.map((decision) => decision.stageId)).size).toBe(2);
+  });
+
+  it("409s with self_approval when the return assignee is an agent but the board user is the delivery author", async () => {
+    const { companyId, issueId } = await seedIssue({ deliveryAuthorUserId: USER_ID });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving own delivery via the delivery author" });
+
+    // `returnAssignee` is an agent, so Guard B's first-match cascade would stop
+    // there and never consult the delivery-author user. The union guard the board
+    // path calls must still refuse the board user who is the delivery author.
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.reason).toBe("self_approval");
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(0);
+  });
+
+  it("targets a stage whose latest verdict is changes_requested (not its stale approved row)", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    // STAGE_ID was approved then bounced: two durable rows with the LATEST being
+    // changes_requested, and the projection cleared. Before the fix the stale
+    // approved row marked the stage decided, so the board was refused with 409
+    // no_undecided_stage; the latest verdict must win.
+    await db.insert(issueExecutionDecisions).values([
+      {
+        id: "b1000000-0000-4000-8000-000000000001",
+        companyId,
+        issueId,
+        stageId: STAGE_ID,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: USER_ID,
+        outcome: "approved",
+        body: "prior approval",
+        createdByRunId: null,
+        createdAt: new Date("2026-09-01T00:00:00Z"),
+      },
+      {
+        id: "b1000000-0000-4000-8000-000000000002",
+        companyId,
+        issueId,
+        stageId: STAGE_ID,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: USER_ID,
+        outcome: "changes_requested",
+        body: "later bounce",
+        createdByRunId: null,
+        createdAt: new Date("2026-09-01T01:00:00Z"),
+      },
+    ]);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: re-decide the bounced stage" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stageId).toBe(STAGE_ID);
+  });
+
+  it("does not restore a bounced stage into completedStageIds when the board approves the next stage", async () => {
+    const { companyId, issueId } = await seedIssue({ twoStages: true });
+    currentActor = boardActor(companyId);
+    // STAGE_ID's latest verdict is changes_requested (approved then bounced) and
+    // the card sits at the later approval stage. Approving that stage must not
+    // restore the bounced STAGE_ID into completedStageIds.
+    await db.insert(issueExecutionDecisions).values([
+      {
+        id: "b2000000-0000-4000-8000-000000000001",
+        companyId,
+        issueId,
+        stageId: STAGE_ID,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: USER_ID,
+        outcome: "approved",
+        body: "prior approval",
+        createdByRunId: null,
+        createdAt: new Date("2026-09-01T00:00:00Z"),
+      },
+      {
+        id: "b2000000-0000-4000-8000-000000000002",
+        companyId,
+        issueId,
+        stageId: STAGE_ID,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: USER_ID,
+        outcome: "changes_requested",
+        body: "later bounce",
+        createdByRunId: null,
+        createdAt: new Date("2026-09-01T01:00:00Z"),
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          status: "pending",
+          currentStageId: SECOND_STAGE_ID,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: "66666666-6666-4666-8666-666666666666", userId: null },
+          returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444", userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: 0,
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approve the approval stage" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stageId).toBe(SECOND_STAGE_ID);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const completed = (row!.executionState as Record<string, unknown>).completedStageIds as string[];
+    expect(completed).toContain(SECOND_STAGE_ID);
+    expect(completed).not.toContain(STAGE_ID);
+  });
+
+  it("wakes the return assignee on a status-only handback (blocked -> in_progress, assignee unchanged)", async () => {
+    const { companyId, issueId, returnAssigneeAgentId } = await seedIssue({ issueStatus: "blocked" });
+    currentActor = boardActor(companyId);
+    // The card is blocked and already assigned to the return assignee, so the
+    // final-stage handback changes the status (blocked -> in_progress) without
+    // changing the assignee. The wake gate must fire on the status change.
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: returnAssigneeAgentId })
+      .where(eq(issues.id, issueId));
+    const calls: Array<{ agentId: string; reason: string | null }> = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string, options: any) => {
+        calls.push({ agentId, reason: options?.reason ?? null });
+        return { id: "wakeup-test" } as any;
+      },
+    });
+
+    const res = await request(localApp)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: final stage approved on a blocked card" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect(row!.assigneeAgentId).toBe(returnAssigneeAgentId);
+
+    // Exactly one wake, fired on the status transition despite the unchanged
+    // assignee (SUP-15547).
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.agentId).toBe(returnAssigneeAgentId);
+    expect(calls[0]!.reason).toBe("issue_assigned");
+  });
+
+  it("rolls back the decision and the transition when the override activity write fails", async () => {
+    const { companyId, issueId, reviewerAgentId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    const calls: unknown[] = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string, options: any) => {
+        calls.push({ agentId, options });
+        return { id: "wakeup-test" } as any;
+      },
+    });
+    await db.execute(sql.raw(`
+      CREATE OR REPLACE FUNCTION paperclip_test_fail_board_override_activity()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        RAISE EXCEPTION 'forced board-decision override activity failure';
+      END
+      $function$;
+      CREATE TRIGGER paperclip_test_fail_board_override_activity
+      BEFORE INSERT ON activity_log
+      FOR EACH ROW WHEN (NEW.action = 'issue.board_stage_override')
+      EXECUTE FUNCTION paperclip_test_fail_board_override_activity();
+    `));
+    try {
+      const res = await request(localApp)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      // The override audit write shares the decision's transaction. Failing it
+      // must roll the whole mutation back. This is what pins the post-commit
+      // relocation mutant: moving the override audit write AFTER commit would let
+      // the decision and its comment commit while the audit row never lands (a
+      // committed mutation with no audit trail), which is the regression this
+      // test exists to catch. It pins the write's transaction placement, NOT the
+      // choice of helper, so refactoring the helper is free.
+      expect(res.status).toBe(500);
+    } finally {
+      await db.execute(sql.raw(`
+        DROP TRIGGER IF EXISTS paperclip_test_fail_board_override_activity ON activity_log;
+        DROP FUNCTION IF EXISTS paperclip_test_fail_board_override_activity();
+      `));
+    }
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(0);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_review");
+    expect(row!.assigneeAgentId).toBe(reviewerAgentId);
+    expect((row!.executionState as Record<string, unknown>).completedStageIds).not.toContain(STAGE_ID);
+
+    const activity = await db.select().from(activityLog);
+    expect(activity).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    expect(calls).toHaveLength(0);
   });
 });

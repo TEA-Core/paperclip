@@ -167,7 +167,11 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
-import { evaluateStageIntegrity, type CandidateRow } from "../services/approval-status-reconciler.js";
+import {
+  evaluateStageIntegrity,
+  latestDecisionPerStage,
+  type CandidateRow,
+} from "../services/approval-status-reconciler.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
 import { prDeliveryService } from "../services/pr-delivery.js";
 import { emitAgentTaskRun } from "../services/agent-task-run-telemetry.js";
@@ -8781,6 +8785,7 @@ export function issueRoutes(
       nextExecutionState: Record<string, unknown>;
       previousAssigneeAgentId: string | null;
       previousAssigneeUserId: string | null;
+      previousStatus: string;
     };
     let outcome: BoardDecisionTransactionResult | null = null;
 
@@ -8799,6 +8804,7 @@ export function issueRoutes(
         if (!lockedIssue) return null;
         const previousAssigneeAgentId = lockedIssue.assigneeAgentId ?? null;
         const previousAssigneeUserId = lockedIssue.assigneeUserId ?? null;
+        const previousStatus = lockedIssue.status;
 
         // SUP-15805 addendum 1: require a live, non-terminal issue. A done/
         // cancelled card would otherwise be silently reopened by the patch below,
@@ -8826,25 +8832,37 @@ export function issueRoutes(
           );
         }
 
-        // SUP-15805 addendum 3: target selection must consult the durable
-        // decision rows, not only the projection. A stage that already carries an
-        // `approved` row whose projection was cleared (a board `done` PATCH does
-        // exactly this) must never be targeted again and silently superseded.
-        const decidedStageIds = await tx
-          .select({ stageId: issueExecutionDecisions.stageId })
+        // SUP-15805 addendum 3 + SUP-15964: target selection and projection
+        // restoration must consult the LATEST durable verdict per stage, not every
+        // historical `approved` row. A stage that was approved and later bounced
+        // (a board `changes_requested` is a new, later decision row) is no longer
+        // durably decided — it must stay targetable AND must not be restored into
+        // completedStageIds. The latest-per-stage reduction is the one shared with
+        // Guard B so the two cannot drift on ordering or tie-breaks; intersecting
+        // with the locked policy's stage ids keeps any stray out-of-policy row from
+        // poisoning the restored projection. One set feeds both consumers below.
+        const policyStageIdSet = new Set(
+          lockedPolicy.stages
+            .map((stage) => stage.id)
+            .filter((stageId): stageId is string => typeof stageId === "string" && stageId.length > 0),
+        );
+        const decidedRows = await tx
+          .select({
+            stageId: issueExecutionDecisions.stageId,
+            outcome: issueExecutionDecisions.outcome,
+            createdAt: issueExecutionDecisions.createdAt,
+          })
           .from(issueExecutionDecisions)
           .where(
             and(
               eq(issueExecutionDecisions.companyId, lockedIssue.companyId),
               eq(issueExecutionDecisions.issueId, id),
-              eq(issueExecutionDecisions.outcome, "approved"),
             ),
-          )
-          .then((rows) =>
-            rows
-              .map((row) => row.stageId)
-              .filter((stageId): stageId is string => typeof stageId === "string"),
           );
+        const decidedStageIds = Array.from(latestDecisionPerStage(decidedRows).values())
+          .filter((decision) => decision.outcome === "approved")
+          .filter((decision) => policyStageIdSet.has(decision.stageId))
+          .map((decision) => decision.stageId);
 
         let result: ReturnType<typeof applyBoardStageDecision>;
         try {
@@ -8949,6 +8967,7 @@ export function issueRoutes(
           nextExecutionState,
           previousAssigneeAgentId,
           previousAssigneeUserId,
+          previousStatus,
         };
       });
     } catch (err) {
@@ -8996,8 +9015,15 @@ export function issueRoutes(
       const assigneeChanged =
         outcome.updated.assigneeAgentId !== outcome.previousAssigneeAgentId ||
         outcome.updated.assigneeUserId !== outcome.previousAssigneeUserId;
+      // SUP-15964: the final-stage handback can move a card between workflow
+      // statuses WITHOUT changing the agent assignee (e.g. the SUP-15547
+      // blocked -> in_progress handback to the same return assignee). Gate on the
+      // status transition too, so the return assignee is told even when the
+      // assignee is already correct. The nextAssigneeAgentId && !backlog guards
+      // are kept verbatim.
+      const statusChanged = outcome.updated.status !== outcome.previousStatus;
       const nextAssigneeAgentId = outcome.updated.assigneeAgentId ?? null;
-      if (assigneeChanged && nextAssigneeAgentId && outcome.updated.status !== "backlog") {
+      if ((assigneeChanged || statusChanged) && nextAssigneeAgentId && outcome.updated.status !== "backlog") {
         void enqueueExecutionStageWakeup(nextAssigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",

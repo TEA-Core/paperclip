@@ -547,4 +547,179 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
       }),
     ).toThrowError(HttpError);
   });
+
+  it("refuses a board approval when the return assignee is an agent and the delivery author is the board user (union guard)", () => {
+    const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
+    const reviewStage = policy.stages[0];
+    const makeIssue = () => ({
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStage.id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+        deliveryAuthor: { type: "user", agentId: null, userId: ctoUserId },
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        changesRequestedCount: 0,
+      },
+    });
+
+    // `returnAssignee` resolves to an AGENT. Guard B's first-match cascade
+    // (resolveGatedPrincipal) stops there and never consults the delivery-author
+    // user, which would leave the board user free to approve their own delivery.
+    // The union guard must still refuse the delivery-author board user.
+    expect(() =>
+      applyBoardStageDecision({
+        issue: makeIssue(),
+        policy,
+        decision: "approved",
+        commentBody: "board: approving my own delivery via the delivery author",
+        actorUserId: ctoUserId,
+      }),
+    ).toThrowError(BoardStageSelfApprovalError);
+
+    // A different board user is not the delivery author and may approve.
+    expect(() =>
+      applyBoardStageDecision({
+        issue: makeIssue(),
+        policy,
+        decision: "approved",
+        commentBody: "board: approving someone else's delivery",
+        actorUserId: "a-different-board-user",
+      }),
+    ).not.toThrow();
+  });
+
+  it("does not restore a durably-bounced stage into completedStageIds when the board approves the next stage", () => {
+    const policy = twoStagePolicy();
+    const reviewStage = policy.stages[0];
+    const approvalStage = policy.stages[1];
+
+    // The review stage was approved then bounced; its LATEST verdict is not an
+    // approval, so the route excludes it from decidedStageIds. The board approves
+    // the (final) approval stage; the bounced review stage must NOT be restored
+    // into completedStageIds by the projection restoration.
+    const result = applyBoardStageDecision({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: approvalStage.id,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "user", userId: ctoUserId, agentId: null },
+          returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        },
+      },
+      policy,
+      decision: "approved",
+      commentBody: "board: approve the approval stage",
+      // reviewStage is deliberately NOT passed in decidedStageIds.
+      decidedStageIds: [],
+    });
+
+    expect(result.targetStage.id).toBe(approvalStage.id);
+    const completed = (result.patch.executionState as Record<string, unknown>).completedStageIds as string[];
+    expect(completed).toContain(approvalStage.id);
+    expect(completed).not.toContain(reviewStage.id);
+  });
+
+  it("re-decides a stage not marked durably decided even after a prior approval", () => {
+    const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
+    const reviewStage = policy.stages[0];
+
+    // The stage's latest verdict is changes_requested (a prior approval was
+    // bounced), so it is NOT in decidedStageIds and must remain targetable — the
+    // inverse of the "skips a stage carrying a durable approved row" case.
+    const result = applyBoardStageDecision({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStage.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: 1,
+        },
+      },
+      policy,
+      decision: "approved",
+      commentBody: "board: the latest verdict is changes_requested, so this stage is re-decidable",
+      // decidedStageIds omits the stage (its latest verdict is not an approval).
+    });
+
+    expect(result.targetStage.id).toBe(reviewStage.id);
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [reviewStage.id],
+    });
+  });
+
+  it("hands the final-stage card back in_progress with the same agent when the card was blocked", () => {
+    const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
+    const reviewStage = policy.stages[0];
+
+    // The SUP-15547 shape: the card is blocked and ALREADY assigned to the return
+    // assignee. The board's final-stage approval hands it back to the same agent
+    // (assignee unchanged) while the status moves blocked -> in_progress. This is
+    // the service-side precondition for the route's status-only wake gate.
+    const result = applyBoardStageDecision({
+      issue: {
+        status: "blocked",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStage.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        },
+      },
+      policy,
+      decision: "approved",
+      commentBody: "board: final stage approved on a blocked card",
+    });
+
+    // Status changes (blocked -> in_progress) but the agent assignee is unchanged
+    // (already the return assignee).
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({ status: "completed" });
+  });
 });

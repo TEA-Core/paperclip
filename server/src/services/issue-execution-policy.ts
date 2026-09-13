@@ -12,7 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
-import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
+import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -1804,12 +1804,16 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
 
   if (input.decision === "approved") {
     if (input.actorUserId) {
-      // SUP-15805 redo: resolve the gated principal through the canonical
-      // resolver so the board path refuses the same principals Guard B does —
-      // including a `deliveryAuthor` fallback when no return assignee is set.
-      // Comparing only `returnAssignee` left the delivery-author shape (the
-      // exact self-satisfying hole this guard exists to close) unrefused.
-      const gated = resolveGatedPrincipal(
+      // SUP-15964: the board self-approval gate is deliberately STRICTER than
+      // Guard B. Guard B resolves one principal through the first-match cascade
+      // (resolveGatedPrincipal); the board path must refuse the board user when
+      // they match ANY stakeholder it is meant to separate — the return assignee
+      // or the delivery author. The union matters because a `returnAssignee`
+      // that resolves to an agent short-circuits the cascade and would otherwise
+      // leave a `deliveryAuthor` board user able to approve their own delivery.
+      // The union is exported from approval-status-reconciler so both stay in
+      // one module; `resolveGatedPrincipal` (Guard B, mechanism D) is unchanged.
+      const gated = resolveSelfApprovalPrincipals(
         input.policy as unknown as Record<string, unknown>,
         (previous ?? {}) as Record<string, unknown>,
         input.issue.createdByAgentId ?? null,

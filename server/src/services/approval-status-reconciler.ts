@@ -994,6 +994,81 @@ export function resolveGatedPrincipal(
 }
 
 /**
+ * SUP-15964: the board self-approval gate is deliberately STRICTER than Guard B.
+ * Where {@link resolveGatedPrincipal} resolves to the FIRST non-empty principal
+ * in the cascade (return assignee, else delivery author, else creator), this
+ * returns the UNION of the two principals the board gate exists to separate —
+ * `policy.returnAssigneeAgentId`/`state.returnAssignee` and
+ * `state.deliveryAuthor` — with no cascade short-circuit. The short-circuit is
+ * exactly the hole this closes: when `returnAssignee` resolves to an agent, the
+ * cascade stops and never consults a `deliveryAuthor` user, leaving a board user
+ * who is that delivery author free to approve their own delivery. The union also
+ * carries `createdByAgentId` (the creator is a stake too) and takes the same
+ * `(policy, state, createdByAgentId)` argument shape as {@link resolveGatedPrincipal}
+ * so the board guard is a drop-in. `resolveGatedPrincipal` is left
+ * byte-for-byte unchanged so Guard B and mechanism D keep their behavior; this
+ * union lives in the same module so the two stay co-located and reviewable.
+ */
+export function resolveSelfApprovalPrincipals(
+  policy: Record<string, unknown>,
+  state: Record<string, unknown>,
+  createdByAgentId: string | null,
+): GatedPrincipal {
+  const agentIds = new Set<string>();
+  const userIds = new Set<string>();
+  if (typeof policy.returnAssigneeAgentId === "string" && policy.returnAssigneeAgentId) {
+    agentIds.add(policy.returnAssigneeAgentId);
+  }
+  if (createdByAgentId) {
+    agentIds.add(createdByAgentId);
+  }
+  const returnAssignee = state.returnAssignee as
+    | { type?: unknown; agentId?: unknown; userId?: unknown }
+    | null
+    | undefined;
+  if (returnAssignee && typeof returnAssignee === "object") {
+    if (returnAssignee.type === "agent" && typeof returnAssignee.agentId === "string") {
+      agentIds.add(returnAssignee.agentId);
+    } else if (returnAssignee.type === "user" && typeof returnAssignee.userId === "string") {
+      userIds.add(returnAssignee.userId);
+    }
+  }
+  const deliveryAuthor = state.deliveryAuthor as
+    | { type?: unknown; agentId?: unknown; userId?: unknown }
+    | null
+    | undefined;
+  if (deliveryAuthor && typeof deliveryAuthor === "object") {
+    if (deliveryAuthor.type === "agent" && typeof deliveryAuthor.agentId === "string") {
+      agentIds.add(deliveryAuthor.agentId);
+    } else if (deliveryAuthor.type === "user" && typeof deliveryAuthor.userId === "string") {
+      userIds.add(deliveryAuthor.userId);
+    }
+  }
+  return { agentIds, userIds };
+}
+
+/**
+ * SUP-15964: the latest durable decision per stage for a set of decision rows,
+ * reducing on `createdAt` with the last-iterated row winning ties (a later row
+ * with an equal timestamp overwrites the earlier one). Shared by Guard B
+ * ({@link evaluateStageIntegrity}) and the board decision route so the two
+ * cannot drift on ordering or tie-breaks. Returns the full rows so each caller
+ * keeps only the fields it needs.
+ */
+export function latestDecisionPerStage<T extends { stageId: string; createdAt: Date }>(
+  decisions: readonly T[],
+): Map<string, T> {
+  const latestByStage = new Map<string, T>();
+  for (const decision of decisions) {
+    const existing = latestByStage.get(decision.stageId);
+    if (!existing || decision.createdAt.getTime() >= existing.createdAt.getTime()) {
+      latestByStage.set(decision.stageId, decision);
+    }
+  }
+  return latestByStage;
+}
+
+/**
  * ADR-073 / ADR-092 stage-integrity audit of the recorded approval. Returns a
  * skip verdict when the "approved" record is not backed by a real, non-self
  * decision: an auto-skipped review stage writes no decision row and lands in
@@ -1101,17 +1176,11 @@ export async function evaluateStageIntegrity(
       ),
     );
 
-  const latestByStage = new Map<string, { actorAgentId: string | null; actorUserId: string | null; createdAt: Date }>();
-  for (const decision of decisions) {
-    const existing = latestByStage.get(decision.stageId);
-    if (!existing || decision.createdAt.getTime() >= existing.createdAt.getTime()) {
-      latestByStage.set(decision.stageId, {
-        actorAgentId: decision.actorAgentId,
-        actorUserId: decision.actorUserId,
-        createdAt: decision.createdAt,
-      });
-    }
-  }
+  // SUP-15964: latest-per-stage reduction shared with the board decision route
+  // (one helper, one ordering and one tie-break) so Guard B and target
+  // selection cannot drift. The decision rows carry the actor fields Guard B
+  // reads below.
+  const latestByStage = latestDecisionPerStage(decisions);
   for (const stageId of completedStageIds) {
     if (!latestByStage.has(stageId)) {
       return {
