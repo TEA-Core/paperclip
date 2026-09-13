@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { conflict } from "../errors.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
@@ -296,6 +297,15 @@ describe.sequential("closed isolated workspace issue routes", () => {
         expectedStatuses: ["todo", "backlog", "blocked"],
       });
 
+    expect(mockIssueService.checkout).toHaveBeenCalledTimes(1);
+    // SUP-15888: the service's conditional write is the race-safe
+    // status/reopen boundary. The route must only rebuild the closed
+    // worktree AFTER the checkout write has persisted, so a checkout the
+    // service refuses cannot publish a rebuilt worktree that nothing
+    // consumes.
+    expect(mockIssueService.checkout.mock.invocationCallOrder[0]).toBeLessThan(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mock.invocationCallOrder[0],
+    );
     expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).toHaveBeenCalledTimes(1);
     // The closed-workspace dead end is gone: the checkout is accepted.
     expect(res.status).toBe(200);
@@ -355,7 +365,14 @@ describe.sequential("closed isolated workspace issue routes", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
-  it("returns 503 and blocks the checkout when the rebuild fails", async () => {
+  it("returns 503 when the rebuild fails after the checkout write persisted", async () => {
+    // SUP-15888 round-1: the service's conditional write now lands before the
+    // route rebuilds the closed worktree, so a failed rebuild can no longer
+    // keep the card in its pre-checkout status. The card is already
+    // in_progress; the 503 tells the caller to retry, and the retry adopts
+    // the in_progress card and re-runs the rebuild. The failed rebuild never
+    // set the reopen-pending flag, so nothing needs clearing.
+    mockIssueService.checkout.mockResolvedValue({ ...makeIssue(), status: "in_progress" });
     mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
       ok: false,
       code: "rebuild_failed",
@@ -370,7 +387,8 @@ describe.sequential("closed isolated workspace issue routes", () => {
       });
 
     expect(res.status).toBe(503);
-    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+    expect(mockIssueService.checkout).toHaveBeenCalledTimes(1);
+    await assertNoBackgroundClearWithinRetryWindow();
   });
 
   it("does not reopen the workspace when a checkout fails the run-id gate", async () => {
@@ -424,11 +442,24 @@ describe.sequential("closed isolated workspace issue routes", () => {
     }, { timeout: REOPEN_PENDING_WAIT_TIMEOUT_MS });
   });
 
-  it("clears the reopen-pending flag when the checkout throws after a reopen", async () => {
-    // SUP-15888: a terminal card is now refused at the route before any reopen,
-    // so this flag path is exercised with a live card whose workspace was archived.
+  it("performs no workspace work when the service refuses after a concurrent close commits (SUP-15888)", async () => {
+    // Forces the race interleaving at the route boundary: the route's terminal
+    // read saw a live card (todo), then a concurrent close committed before the
+    // service's conditional write. The service's write misses, its post-write
+    // recheck sees the committed terminal status, and it returns the distinct
+    // terminal refusal. Because the route only rebuilds the closed worktree
+    // AFTER the write persists, the refusal performs no workspace work at all:
+    // the reopen is never attempted, so no rebuilt worktree is published and no
+    // reopen-pending flag is set that would need clearing. The workspace row
+    // is left byte-identical to how the close left it.
     mockIssueService.getById.mockResolvedValue(makeIssue());
-    mockIssueService.checkout.mockRejectedValue(new Error("checkout failed"));
+    mockIssueService.checkout.mockRejectedValue(
+      conflict("Issue cannot be checked out because it is already closed", {
+        code: "checkout_refused_terminal_status",
+        issueId: issueId,
+        status: "done",
+      }),
+    );
 
     const res = await request(createApp())
       .post(`/api/issues/${issueId}/checkout`)
@@ -437,18 +468,14 @@ describe.sequential("closed isolated workspace issue routes", () => {
         expectedStatuses: ["todo", "backlog", "blocked"],
       });
 
-    expect(res.status).toBe(500);
-    await vi.waitFor(() => {
-      expect(
-        mockExecutionWorkspaceService.clearReopenPendingConsumptionForUnconsumedReopen,
-      ).toHaveBeenCalledWith(
-        expect.objectContaining({
-          workspaceId: closedWorkspaceId,
-          issue: expect.objectContaining({ id: issueId }),
-          expectedGeneration: 4,
-        }),
-      );
-    }, { timeout: REOPEN_PENDING_WAIT_TIMEOUT_MS });
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({
+      code: "checkout_refused_terminal_status",
+      details: { code: "checkout_refused_terminal_status", status: "done" },
+    });
+    expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
+    expect(mockExecutionWorkspaceService.clearReopenPendingConsumptionForUnconsumedReopen).not.toHaveBeenCalled();
+    await assertNoBackgroundClearWithinRetryWindow();
   });
 
   it("does not clear the reopen-pending flag when the checkout leaves the issue live", async () => {

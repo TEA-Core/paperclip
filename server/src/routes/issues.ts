@@ -14996,9 +14996,12 @@ export function issueRoutes(
     // closed; refusing here, before any workspace work, keeps a terminal
     // checkout a true no-op. This throws the same distinct 409 the service
     // raises, so the refusal is byte-identical whether caught at the route or
-    // the service. The service re-checks terminal status again after a failed
-    // write, so a close that commits between this read and the write is also
-    // refused with the same distinct code.
+    // the service. A close that commits after this read cannot slip past the
+    // service: its conditional write misses and its post-write recheck sees
+    // the committed terminal status and refuses with the same distinct code.
+    // The route only rebuilds a closed workspace AFTER that write has
+    // persisted (below), so a refused checkout — whether caught here or in the
+    // service — performs no workspace work at all.
     if (issue.status === "done" || issue.status === "cancelled") {
       throw conflict("Issue cannot be checked out because it is already closed", {
         code: "checkout_refused_terminal_status",
@@ -15012,8 +15015,28 @@ export function issueRoutes(
     const checkoutRunId = await requireAgentRunId(req, res, { checkoutRunId: issue.checkoutRunId });
     if (req.actor.type === "agent" && !checkoutRunId) return;
 
-    // Reopen the closed isolated workspace only after the run-id gate passes. A
-    // rejected checkout must not rebuild and republish the workspace as active.
+    // SUP-15888: the service's conditional write is the race-safe status/reopen
+    // boundary. A close that commits between the terminal read above and the
+    // write makes the write miss; the service then re-reads the committed
+    // status and returns the distinct terminal refusal. Only after that write
+    // has persisted does this route rebuild the closed worktree, so a refused
+    // checkout never publishes a rebuilt worktree that nothing consumes.
+    let updated: Awaited<ReturnType<typeof svc.checkout>> | undefined;
+    try {
+      updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+    } catch (error) {
+      if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+        res.status(409).json({
+          error: "Another execution for this routine is already in progress",
+        });
+        return;
+      }
+      throw error;
+    }
+
+    // Reopen the closed isolated workspace only once the checkout write has
+    // persisted, so a rejected checkout must not rebuild and republish the
+    // workspace as active.
     let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
     let reopenedGeneration: number | null = null;
     if (closedExecutionWorkspace) {
@@ -15034,11 +15057,10 @@ export function issueRoutes(
         reopenedGeneration = reopenOutcome.generation;
       }
     }
-    let updated: Awaited<ReturnType<typeof svc.checkout>> | undefined;
-    // Clear the reopen-pending flag if the checkout leaves the issue terminal, so
-    // the rebuilt worktree does not leak. The guard reads `updated` when the
-    // response ends, so it covers a null return and a thrown error. It clears only
-    // the fence this request installed, keyed by its generation.
+    // Clear the reopen-pending flag if the response ends while the issue is
+    // still terminal, so the rebuilt worktree does not leak. The guard reads
+    // `updated` when the response ends. It clears only the fence this request
+    // installed, keyed by its generation.
     guardReopenedWorkspaceConsumption({
       req,
       res,
@@ -15047,17 +15069,6 @@ export function issueRoutes(
       generation: reopenedGeneration,
       finalIssueStatus: () => updated?.status,
     });
-    try {
-      updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
-    } catch (error) {
-      if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
-        res.status(409).json({
-          error: "Another execution for this routine is already in progress",
-        });
-        return;
-      }
-      throw error;
-    }
     const actor = getActorInfo(req);
     if (updated?.harnessKind === "skill_test") {
       await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);
