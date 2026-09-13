@@ -1048,22 +1048,30 @@ export function resolveSelfApprovalPrincipals(
 }
 
 /**
- * SUP-15964: the latest durable decision per stage for a set of decision rows,
- * reducing on `createdAt` with the last-iterated row winning ties (a later row
- * with an equal timestamp overwrites the earlier one). Shared by Guard B
- * ({@link evaluateStageIntegrity}) and the board decision route so the two
- * cannot drift on ordering or tie-breaks. Returns the full rows so each caller
- * keeps only the fields it needs.
+ * SUP-15964: the latest durable decision per stage for a set of decision rows.
+ * A later `createdAt` always wins; a same-timestamp tie resolves deterministically
+ * on the larger `id` (independent of row enumeration order — SUP-15851 C1), so
+ * Guard B ({@link evaluateStageIntegrity}) and the board decision route cannot
+ * drift on ordering or tie-breaks. Returns the full rows so each caller keeps
+ * only the fields it needs.
  */
-export function latestDecisionPerStage<T extends { stageId: string; createdAt: Date }>(
+export function latestDecisionPerStage<T extends { stageId: string; createdAt: Date; id: string }>(
   decisions: readonly T[],
 ): Map<string, T> {
   const latestByStage = new Map<string, T>();
   for (const decision of decisions) {
     const existing = latestByStage.get(decision.stageId);
-    if (!existing || decision.createdAt.getTime() >= existing.createdAt.getTime()) {
-      latestByStage.set(decision.stageId, decision);
+    if (existing) {
+      const delta = decision.createdAt.getTime() - existing.createdAt.getTime();
+      // SUP-15851 C1: a same-timestamp tie must resolve deterministically on the
+      // larger id (independent of row enumeration order), matching the
+      // latest-decision ordering in done-transition-guard.
+      if (delta > 0 || (delta === 0 && decision.id > existing.id)) {
+        latestByStage.set(decision.stageId, decision);
+      }
+      continue;
     }
+    latestByStage.set(decision.stageId, decision);
   }
   return latestByStage;
 }

@@ -598,7 +598,10 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     ).not.toThrow();
   });
 
-  it("does not restore a durably-bounced stage into completedStageIds when the board approves the next stage", () => {
+  it("[regression guard] does not restore a durably-bounced stage into completedStageIds when the board approves the next stage", () => {
+    // Regression guard for the original board-decision projection hardening
+    // (a06c3983e / 446842e79); green against the preceding source. It is NOT
+    // evidence for the carrier's bea526711 fix (A1/A2/B1/C1).
     const policy = twoStagePolicy();
     const reviewStage = policy.stages[0];
     const approvalStage = policy.stages[1];
@@ -641,7 +644,10 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     expect(completed).not.toContain(reviewStage.id);
   });
 
-  it("re-decides a stage not marked durably decided even after a prior approval", () => {
+  it("[regression guard] re-decides a stage not marked durably decided even after a prior approval", () => {
+    // Regression guard for the original "a durable non-approval row must not
+    // freeze a stage" behavior (a06c3983e / 446842e79); green against the
+    // preceding source. Not evidence for the carrier's bea526711 fix.
     const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
     const reviewStage = policy.stages[0];
 
@@ -682,7 +688,9 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     });
   });
 
-  it("hands the final-stage card back in_progress with the same agent when the card was blocked", () => {
+  it("[regression guard] hands the final-stage card back in_progress with the same agent when the card was blocked", () => {
+    // Regression guard for the SUP-15547 blocked-card hand-back; green against
+    // the preceding source. Not evidence for the carrier's bea526711 fix.
     const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
     const reviewStage = policy.stages[0];
 

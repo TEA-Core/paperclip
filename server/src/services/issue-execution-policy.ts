@@ -1752,7 +1752,15 @@ function resolveBoardTargetStage(
   decidedStageIds?: readonly string[],
 ): IssueExecutionStage | null {
   const durablyDecided = new Set(decidedStageIds ?? []);
-  if (previous?.status === PENDING_STATUS && previous.currentStageId) {
+  // SUP-15851 A2: prefer the current stage for a pending OR changes_requested
+  // card, mirroring the participant path — a policy revision can insert a stage
+  // ahead of the bounced one, so the decision must land on the CURRENT stage, not
+  // the first undecided one. The durable-decided escape and the findStageById null
+  // fall-through are preserved.
+  if (
+    (previous?.status === PENDING_STATUS || previous?.status === CHANGES_REQUESTED_STATUS) &&
+    previous?.currentStageId
+  ) {
     const active = findStageById(policy, previous.currentStageId);
     if (active && !durablyDecided.has(active.id)) return active;
   }
@@ -1787,7 +1795,14 @@ function resolveBoardTargetStage(
  * same user): {@link BoardStageSelfApprovalError}.
  */
 export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardStageDecisionResult {
-  const previous = parseIssueExecutionState(input.issue.executionState);
+  // SUP-15851 A1: scope the state to the stages the current policy revision
+  // carries before resolving the target, so an orphan completedStageIds /
+  // skippedStageIds entry from a prior revision is not re-persisted (mirrors
+  // applyIssueExecutionPolicyTransition).
+  const previous = pruneExecutionStateForStages(
+    parseIssueExecutionState(input.issue.executionState),
+    input.policy.stages.map((stage) => stage.id),
+  ).state;
   const currentAssignee = assigneePrincipal(input.issue);
   const targetStage = resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
   if (!targetStage) throw new BoardStageNoUndecidedStageError();

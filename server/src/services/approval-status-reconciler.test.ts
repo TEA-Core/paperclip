@@ -25,9 +25,40 @@ import {
   runApprovalStatusReconcilerTick,
   startApprovalStatusReconciler,
   evaluateStageIntegrity,
+  latestDecisionPerStage,
   type ApprovalStatusReconcilerTickSummary,
   type CandidateRow,
 } from "./approval-status-reconciler.js";
+
+// SUP-15851 C1: `latestDecisionPerStage` is a pure helper (rows in, one Map by
+// stage out); this probe needs no DB and runs regardless of embedded-Postgres
+// support on the host. It pins the deterministic same-timestamp tie-break.
+describe("latestDecisionPerStage (SUP-15851 C1: deterministic tie-break)", () => {
+  type Row = { stageId: string; createdAt: Date; id: string };
+  const sameTs = new Date("2026-09-01T00:00:00Z");
+  const earlier = "11111111-1111-4111-8111-111111111111";
+  const later = "99999999-9999-4999-8999-999999999999";
+
+  it("breaks a same-createdAt tie on the larger id, independent of row order", () => {
+    const a: Row = { stageId: "s1", createdAt: sameTs, id: earlier };
+    const b: Row = { stageId: "s1", createdAt: sameTs, id: later };
+
+    // The larger-id row must win no matter which one is enumerated first.
+    expect(latestDecisionPerStage<Row>([a, b]).get("s1")!.id).toBe(later);
+    expect(latestDecisionPerStage<Row>([b, a]).get("s1")!.id).toBe(later);
+  });
+
+  it("still prefers a strictly later createdAt over the id ordering", () => {
+    const old: Row = { stageId: "s1", createdAt: new Date(sameTs.getTime() - 1000), id: later };
+    const newer: Row = { stageId: "s1", createdAt: new Date(sameTs.getTime() + 1000), id: earlier };
+    expect(latestDecisionPerStage<Row>([old, newer]).get("s1")!.id).toBe(earlier);
+    expect(latestDecisionPerStage<Row>([newer, old]).get("s1")!.id).toBe(earlier);
+  });
+
+  it("returns an empty map when there are no decision rows", () => {
+    expect(latestDecisionPerStage<Row>([]).size).toBe(0);
+  });
+});
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());

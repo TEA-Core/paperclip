@@ -146,6 +146,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     nullReturnAssignee?: boolean;
     /** Seed a delivery-author user, distinct from the return assignee. */
     deliveryAuthorUserId?: string;
+    /** Seed a changes_requested card parked on this current stage (A2: current-stage precedence). */
+    changesRequestedStageId?: string;
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -216,6 +218,11 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
         ? { type: "user" as const, agentId: null, userId: opts.returnAssigneeUserId }
         : { type: "agent" as const, agentId: returnAssigneeAgentId, userId: null };
 
+    const changesRequestedStage = opts.changesRequestedStageId
+      ? stages.find((s) => s.id === opts.changesRequestedStageId) ?? null
+      : null;
+    const changesRequestedParticipant = changesRequestedStage?.participants[0] ?? null;
+
     const executionState = opts.noExecutionState
       ? null
       : opts.terminalState
@@ -233,7 +240,26 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
             lastDecisionOutcome: "approved",
             changesRequestedCount: 0,
           }
-        : {
+        : changesRequestedStage
+          ? {
+            status: "changes_requested",
+            currentStageId: changesRequestedStage.id,
+            currentStageIndex: stages.indexOf(changesRequestedStage),
+            currentStageType: changesRequestedStage.type,
+            currentParticipant: {
+              type: changesRequestedParticipant?.userId ? "user" : "agent",
+              agentId: changesRequestedParticipant?.agentId ?? null,
+              userId: changesRequestedParticipant?.userId ?? null,
+            },
+            returnAssignee: returnAssigneePrincipal,
+            deliveryAuthor: null,
+            completedStageIds: opts.completedStageIds ?? [],
+            skippedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: "changes_requested",
+            changesRequestedCount: 1,
+          }
+          : {
             status: "pending",
             currentStageId: STAGE_ID,
             currentStageIndex: 0,
@@ -440,6 +466,49 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(decisions[0]!.actorUserId).toBe(USER_ID);
   });
 
+  it("A1: prunes a completed-stage id that no longer maps to a policy stage on a board decision", async () => {
+    // A policy revision can drop a stage that a live card still carries in
+    // completedStageIds. Board-decision must not re-persist that orphan id.
+    const orphanStageId = "aaaa0000-0000-4000-8000-0000000000a1";
+    const { companyId, issueId } = await seedIssue({ completedStageIds: [orphanStageId] });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approving the active stage" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const persisted = (row!.executionState as Record<string, unknown>).completedStageIds as string[];
+    expect(persisted).toContain(STAGE_ID);
+    expect(persisted).not.toContain(orphanStageId);
+  });
+
+  it("A2: targets the changes_requested current stage, not an earlier still-undecided stage", async () => {
+    // A policy revision inserted a stage ahead of the bounced card's current
+    // stage. currentStageId is the LATER stage; the earlier stage is still
+    // undecided. The board decision must write to the CURRENT stage, not the
+    // first undecided one.
+    const { companyId, issueId } = await seedIssue({
+      twoStages: true,
+      changesRequestedStageId: SECOND_STAGE_ID,
+    });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approve the current stage" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stageId).toBe(SECOND_STAGE_ID);
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.stageId).toBe(SECOND_STAGE_ID);
+  });
+
   it("after a board approval, a board PATCH to done is no longer refused by the stage guard", async () => {
     const { companyId, issueId } = await seedIssue();
     currentActor = boardActor(companyId);
@@ -595,6 +664,29 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .send({ decision: "approved", comment: "board: approving" });
 
     expect(res.status).toBe(403);
+    // B1: a concrete-user 403 must commit ZERO decision/comment/activity rows.
+    // This pins "no committed write after the 403" (the guard sits before the
+    // commit boundary); it does not — and cannot — assert the read phase is empty.
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(0);
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.board_stage_override"),
+        ),
+      );
+    expect(activity).toHaveLength(0);
   });
 
   it("enqueues the next-stage wake when a board approval advances the ladder", async () => {

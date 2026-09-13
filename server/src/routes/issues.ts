@@ -8848,6 +8848,7 @@ export function issueRoutes(
         );
         const decidedRows = await tx
           .select({
+            id: issueExecutionDecisions.id,
             stageId: issueExecutionDecisions.stageId,
             outcome: issueExecutionDecisions.outcome,
             createdAt: issueExecutionDecisions.createdAt,
