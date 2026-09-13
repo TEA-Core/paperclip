@@ -4050,6 +4050,19 @@ export function recoveryService(
         const armedParticipant = armed.currentParticipant;
         const participantOwnerAgentId =
           armedParticipant?.type === "agent" ? armedParticipant.agentId ?? null : null;
+        // The wedge is defined by holding NO live execution or checkout lease — the
+        // acceptance criteria name it `executionRunId: null`. hasActiveExecutionPath
+        // below only keys on runs still in the active set; a run that just
+        // terminalized is no longer "active", but its lease pointer may not have
+        // been cleared yet (the stale-lock sweeper clears terminal lease fields on a
+        // separate cadence). Minting a participant action on a card that still holds
+        // a lease races that checkout (SUP-15788 board rejection: "terminal checkout
+        // race"). Stand down on any card still holding either lease; the next pass,
+        // once the lease is released/cleared, detects the genuine wedge.
+        if (issue.checkoutRunId || issue.executionRunId) {
+          result.skipped += 1;
+          continue;
+        }
         // Grace is measured from the IMMUTABLE arm anchor — `pendingSince`, the
         // moment the review stage entered its pending state — not the mutable
         // `issue.updatedAt`. Editing the card must not reset the escalation

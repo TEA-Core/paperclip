@@ -809,6 +809,90 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("does not mint review_stage_armed_stranded while the card still holds a terminal execution lease (terminal checkout race)", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    // The reviewer's run just terminalized but the execution-lease pointer has
+    // not been cleared yet (the stale-lock sweeper clears terminal lease fields
+    // on a separate cadence). hasActiveExecutionPath no longer sees an active
+    // run, so the only guard that must stand the detector down is the still-set
+    // lease pointer (SUP-15788 board rejection: "terminal checkout race").
+    const terminalRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: terminalRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "manual",
+      status: "succeeded",
+      startedAt: new Date(Date.now() - 60_000),
+      finishedAt: new Date(Date.now() - 30_000),
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: terminalRunId })
+      .where(eq(issues.id, issueId));
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not mint review_stage_armed_stranded while the card still holds a terminal checkout lease (terminal checkout race)", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participantId = randomUUID();
+    const fixture = armedReviewStageFixture(stageId, participantId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+      ...fixture,
+    });
+    // A checkout lease that terminalized but has not been released leaves
+    // checkoutRunId set; minting a participant action on top of it would race the
+    // checkout (SUP-15788 board rejection: "terminal checkout race").
+    const terminalRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: terminalRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "manual",
+      status: "succeeded",
+      startedAt: new Date(Date.now() - 60_000),
+      finishedAt: new Date(Date.now() - 30_000),
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: terminalRunId })
+      .where(eq(issues.id, issueId));
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewStageArmedStranded).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("does not mint review_stage_armed_stranded while a wake is queued for the issue (live wake path)", async () => {
     const { companyId, managerId, coderId, prefix } = await seedCompany();
     const stageId = randomUUID();
