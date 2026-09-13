@@ -66,6 +66,41 @@ vi.mock("../services/approval-status-reconciler.js", async (importOriginal) => {
   };
 });
 
+// SUP-16081 (comment a78bf2d2): the anchor must be written BEFORE the publish
+// attempt. To exercise the WIRING in runApprovalMergeArming (issues.ts) without
+// seeding a full GitHub delivery identity + token + PR head, we drive
+// resolveApprovalDecisionHead to a resolved head and stub publishApprovalStatus
+// to fail / throw — while keeping the REAL recordApprovalAnchor and
+// recordApprovalPublishOutcome (spread from the module) so the anchor write and
+// the outcome record run exactly as in production.
+const mergeArmingControl = vi.hoisted(() => ({
+  publishMode: "fail" as "fail" | "throw",
+  headSha: "approved00000000000000000000000000000000001",
+}));
+
+vi.mock("../services/merge-arming.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/merge-arming.js")>();
+  return {
+    ...actual,
+    resolveApprovalDecisionHead: async () => ({
+      kind: "resolved",
+      headSha: mergeArmingControl.headSha,
+      displayName: "TEA-Core/paperclip#448",
+    }),
+    publishApprovalStatus: async () => {
+      if (mergeArmingControl.publishMode === "throw") {
+        throw new Error("injected first-publish exception");
+      }
+      return {
+        kind: "failed",
+        message:
+          "status:failed:scope_missing: HTTP 403 Resource not accessible by integration",
+        headSha: mergeArmingControl.headSha,
+      } as unknown as import("../services/merge-arming.js").ArmingOutcome;
+    },
+  };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
 
@@ -118,6 +153,7 @@ describeEmbeddedPostgres("runApprovalMergeArming pre-publish guards record every
 
   beforeEach(async () => {
     guardControl.mode = "pass";
+    mergeArmingControl.publishMode = "fail";
     await db.delete(issueExecutionDecisions);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -361,5 +397,65 @@ describeEmbeddedPostgres("runApprovalMergeArming pre-publish guards record every
     expect(skipped).toBeDefined();
     expect(String(skipped!.reason)).toMatch(/^status:skipped:non-terminal-ladder:/);
     expect(skipped!.headSha).toBeNull();
+  });
+
+  // SUP-16081 (comment a78bf2d2): the approval anchor (approvedHeadSha +
+  // approvedAt) must be written durably BEFORE the first-publish status write is
+  // attempted. On SUP-16041 a dropped/failed publish left approvedHeadSha absent,
+  // so both recovery paths (backfill D-B fallback, merge-arming/republish) were
+  // structurally unable to run. Stubbing the status write to fail must still leave
+  // a real anchor on the card.
+  it("a failing first publish still leaves the approval anchor on the card (a78bf2d2: anchor before publish)", async () => {
+    guardControl.mode = "pass";
+    mergeArmingControl.publishMode = "fail";
+    const { companyId, issueId } = await seedLiveCard();
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "Approved by board" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe("approved");
+
+    const executionState = await readApprovalStatus(issueId);
+    const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+    expect(approvalStatus).toBeDefined();
+    // The anchor was written BEFORE the publish attempt and survived its failure.
+    expect(approvalStatus!.approvedHeadSha).toBe(mergeArmingControl.headSha);
+    expect(typeof approvalStatus!.approvedAt).toBe("string");
+    // The failed publish is recorded as a named failure, not silently dropped.
+    const failure = approvalStatus!.publishFailure as Record<string, unknown> | undefined;
+    expect(failure).toBeDefined();
+    expect(String(failure!.reason)).toMatch(/^status:failed:/);
+    expect(failure!.headSha).toBe(mergeArmingControl.headSha);
+    // No published head — the stamp never landed.
+    expect(approvalStatus!.publishedHeadSha).toBeUndefined();
+  });
+
+  it("a throwing first publish still leaves the approval anchor on the card (a78bf2d2: hard-kill backstop)", async () => {
+    guardControl.mode = "pass";
+    mergeArmingControl.publishMode = "throw";
+    const { companyId, issueId } = await seedLiveCard();
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "Approved by board" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe("approved");
+
+    const executionState = await readApprovalStatus(issueId);
+    const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+    expect(approvalStatus).toBeDefined();
+    // The pre-publish anchor write ran before the throw; the catch backstop
+    // rewrites the same head, so approvedHeadSha is present either way.
+    expect(approvalStatus!.approvedHeadSha).toBe(mergeArmingControl.headSha);
+    expect(typeof approvalStatus!.approvedAt).toBe("string");
+    const failure = approvalStatus!.publishFailure as Record<string, unknown> | undefined;
+    expect(failure).toBeDefined();
+    expect(String(failure!.reason)).toMatch(/^status:failed:internal:/);
+    expect(String(failure!.reason)).toContain("injected first-publish exception");
   });
 });

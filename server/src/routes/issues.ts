@@ -157,6 +157,7 @@ import {
   armMergeOnApproval,
   parseRepoUrl,
   publishApprovalStatus,
+  recordApprovalAnchor,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   resolveIssueRepoContext,
@@ -3551,6 +3552,12 @@ export function issueRoutes(
     // the wrong company's) and returns skipped:no-pr instead of certifying the
     // card. issue.identifier is authoritative (stored issuePrefix-issueNumber).
     const issueIdentifier = issue.identifier ?? `SUP-${issue.issueNumber}`;
+    // SUP-16081 (comment a78bf2d2): the decision head we resolved, captured
+    // before the publish attempt. The catch below uses it so a post-anchor
+    // throw still rewrites the anchor (never leaves approvedHeadSha absent),
+    // keeping both recovery paths alive for a hard-kill between decision and
+    // publish.
+    let recordedHeadSha: string | null = null;
     try {
       // ADR-091 D2a: pin the FIRST publish to the head the approving decision
       // was rendered against. Resolve it up front, then hand it to
@@ -3569,6 +3576,16 @@ export function issueRoutes(
       );
       let statusOutcome: ArmingOutcome;
       if (decisionHead.kind === "resolved") {
+        // SUP-16081 (comment a78bf2d2): write the approval anchor durably
+        // BEFORE the status write is attempted. SUP-16041's drop left
+        // approvedHeadSha absent (it was only written after a successful
+        // publish), so both recovery paths — backfill's D-B fallback and
+        // merge-arming/republish — were structurally unable to run. With the
+        // anchor present up front, a dropped/throwing publish still leaves a
+        // real anchor both paths can recover. recordApprovalAnchor merge-writes
+        // the card's approvalStatus, so it never clobbers concurrent fields.
+        recordedHeadSha = decisionHead.headSha;
+        await recordApprovalAnchor(db, issue.id, decisionHead.headSha);
         // SUP-13831: the zero-mention-row live-discovery in publishApprovalStatus
         // is a delivery probe. It must only run when the transition CLOSes the
         // issue (effectiveStatus === "done"), not when a stage approval redirects
@@ -3743,7 +3760,7 @@ export function issueRoutes(
             db,
             issue.id,
             (issue.executionState ?? {}) as Record<string, unknown>,
-            null,
+            recordedHeadSha,
             {
               kind: "failed",
               message: `status:failed:internal: ${err instanceof Error ? err.message : String(err)}`,

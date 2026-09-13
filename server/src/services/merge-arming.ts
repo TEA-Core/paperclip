@@ -2888,6 +2888,50 @@ export async function recordApprovalPublishOutcome(
     .where(eq(issues.id, issueId));
 }
 
+/**
+ * SUP-16081 (comment a78bf2d2): write the approval anchor — `approvedHeadSha`
+ * + `approvedAt` — durably BEFORE the first-publish status write is attempted.
+ *
+ * On SUP-16041 the anchor was only written AFTER the publish succeeded (or in
+ * the post-publish `recordApprovalPublishOutcome` call), so a dropped/throwing
+ * status write left `approvedHeadSha` absent and BOTH recovery paths were
+ * structurally unable to run: the backfill D-B fallback needs `approvedHeadSha`,
+ * and `merge-arming/republish` bails with `head_unresolvable` when the card has
+ * no published head AND no recorded anchor.
+ *
+ * This helper does a fresh read of the card's `executionState` and MERGE-writes
+ * the anchor into `approvalStatus`, preserving every concurrent field
+ * (`publishedHeadSha`, `publishFailure`, `backfillRefusal`, `pendingCandidates`,
+ * ...) — it never clobbers the whole `approvalStatus` object and it never
+ * decides whether a stamp is published. It is safe to call twice (idempotent):
+ * the post-publish `recordApprovalPublishOutcome` re-writes the same two fields.
+ */
+export async function recordApprovalAnchor(
+  db: Db,
+  issueId: string,
+  resolvedHeadSha: string,
+): Promise<void> {
+  const rows = await db
+    .select({ executionState: issues.executionState })
+    .from(issues)
+    .where(eq(issues.id, issueId))
+    .limit(1);
+  const executionState = (rows[0]?.executionState ?? {}) as Record<string, unknown>;
+  const priorApprovalStatus = executionState.approvalStatus;
+  const approvalStatus: Record<string, unknown> =
+    priorApprovalStatus && typeof priorApprovalStatus === "object"
+      ? { ...(priorApprovalStatus as Record<string, unknown>) }
+      : {};
+  approvalStatus.approvedHeadSha = resolvedHeadSha;
+  approvalStatus.approvedAt = new Date().toISOString();
+  await db
+    .update(issues)
+    .set({
+      executionState: { ...executionState, approvalStatus },
+    })
+    .where(eq(issues.id, issueId));
+}
+
 export interface PostPullRequestCommentResult {
   success: boolean;
   status: number;

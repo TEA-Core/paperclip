@@ -22,6 +22,7 @@ import {
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
   publishApprovalStatus,
+  recordApprovalAnchor,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
@@ -605,6 +606,58 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(Array.isArray(approvalStatus!.pendingCandidates)).toBe(true);
       expect((approvalStatus!.pendingCandidates as unknown[]).length).toBe(1);
       expect(typeof approvalStatus!.certifiedAt).toBe("string");
+    });
+  });
+
+  // SUP-16081 (comment a78bf2d2): the approval anchor must be written BEFORE the
+  // publish attempt. recordApprovalAnchor is the pre-publish writer: it
+  // merge-writes approvedHeadSha + approvedAt onto the card's approvalStatus,
+  // preserving every concurrent field, so a dropped/throwing publish still leaves
+  // a real anchor both recovery paths (backfill D-B fallback,
+  // merge-arming/republish) can run.
+  describe("SUP-16081 recordApprovalAnchor (a78bf2d2: anchor before publish)", () => {
+    it("writes approvedHeadSha + approvedAt when approvalStatus is absent", async () => {
+      const issueId = await insertIssue();
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus).not.toBeNull();
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+    });
+
+    it("merge-writes the anchor, preserving concurrent fields (never clobbers)", async () => {
+      const issueId = await insertIssue();
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            approvalStatus: {
+              publishedHeadSha: "stale000000000000000000000000000000",
+              backfillRefusal: { reason: "head_moved" },
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      // Concurrent fields survive the anchor write.
+      expect(approvalStatus!.publishedHeadSha).toBe("stale000000000000000000000000000000");
+      expect(approvalStatus!.backfillRefusal).toMatchObject({ reason: "head_moved" });
+    });
+
+    it("is idempotent: a second call rewrites the same anchor without error", async () => {
+      const issueId = await insertIssue();
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
     });
   });
 
