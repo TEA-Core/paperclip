@@ -148,9 +148,19 @@ describeEmbeddedPostgres("summary slot service", () => {
     return agentId;
   }
 
-  async function seedRun(companyId: string, agentId: string) {
+  async function seedRun(companyId: string, agentId: string, issueId?: string) {
     const runId = randomUUID();
-    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running" });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      // Finalization attributes the slot's surviving revision back to the issue that
+      // drove it via the writing run's context snapshot (see
+      // summary-slot-finalization.ts). Name the driving issue so a real write is
+      // correctly classified as this generation's own.
+      contextSnapshot: issueId ? { issueId } : {},
+    });
     return runId;
   }
 
@@ -557,49 +567,53 @@ describeEmbeddedPostgres("summary slot service", () => {
       });
     });
 
-    it("classifies an unwritten generation as failed when the inherited write ties its creation millisecond (identity regression)", async () => {
+    it("classifies an unwritten generation as failed when it inherits a prior generation's real write (identity regression)", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
-      await seedSummarizer(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
       const svc = summarySlotService(db);
 
-      // A prior generation's write survives a re-arm: the slot still carries a
-      // document + last_generated_at. We force that timestamp to tie the FRESH
-      // generation's own createdAt so the discriminator is forced to decide on the
-      // shared millisecond alone — a `>=` (timestamp-coincidence) check would
-      // wrongly call this never-written generation as having written.
-      const priorDoc = await db
-        .insert(documents)
-        .values({
-          companyId,
-          format: "markdown",
-          latestBody: "# Prior generation summary",
-        })
-        .returning()
-        .then((rows) => rows[0]!);
+      // A PRIOR generation lands a REAL write: a document + revision + a writing run
+      // whose context snapshot names that prior generation issue. This is the
+      // surviving revision the next generation will inherit.
+      const first = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const priorRunId = await seedRun(companyId, summarizerAgentId, first.generatingIssue.id);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: priorRunId })
+        .where(eq(issues.id, first.generatingIssue.id));
+      const priorWrite = await svc.write(
+        {
+          ...projectSelector(companyId, projectId),
+          markdown: "# Prior generation summary",
+          generationIssueId: first.generatingIssue.id,
+        },
+        { agentId: summarizerAgentId, runId: priorRunId },
+      );
+      expect(priorWrite.revision.revisionNumber).toBe(1);
 
-      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
-      const slotRow = await db
+      // The prior generation finished and DID write, so it finalizes to idle, leaving
+      // the real revision + document that survive across generations.
+      await issueService(db).update(first.generatingIssue.id, { status: "done" });
+      const afterFirst = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(afterFirst.slot).toMatchObject({ status: "idle", documentId: afterFirst.document!.id });
+
+      // Arm a FRESH generation over the inherited slot, then cancel it without writing.
+      const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const armed = await db
         .select()
         .from(summarySlots)
         .where(eq(summarySlots.companyId, companyId))
         .then((rows) => rows[0]!);
-      const generationIssueRow = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, generated.generatingIssue.id))
-        .then((rows) => rows[0]!);
+      // The new generation inherited the prior document but wrote nothing.
+      expect(armed.documentId).toBe(afterFirst.document!.id);
+      expect(armed.status).toBe("generating");
 
-      // Stamp the inherited write at exactly this generation's creation instant.
-      await db
-        .update(summarySlots)
-        .set({ lastGeneratedAt: generationIssueRow.createdAt, documentId: priorDoc.id })
-        .where(eq(summarySlots.id, slotRow.id));
+      await issueService(db).update(second.generatingIssue.id, { status: "cancelled" });
 
-      await issueService(db).update(generated.generatingIssue.id, { status: "cancelled" });
-
-      // A write that ties the generation's creation millisecond cannot be its own
-      // write; the inherited content must surface as `failed`, not `idle`.
+      // The surviving revision was created by the PRIOR generation's run, not this
+      // one. Identity must mark this never-written generation `failed`, not `idle` —
+      // no timestamp can tell the inherited write from a current-generation write.
       const result = await svc.getSlot(projectSelector(companyId, projectId));
       expect(result.slot).toMatchObject({
         status: "failed",
@@ -613,7 +627,7 @@ describeEmbeddedPostgres("summary slot service", () => {
     async function startGeneration(companyId: string, projectId: string, summarizerAgentId: string) {
       const svc = summarySlotService(db);
       const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
-      const runId = await seedRun(companyId, summarizerAgentId);
+      const runId = await seedRun(companyId, summarizerAgentId, generated.generatingIssue.id);
       // Simulate the summarizer run checking out its linked generation task.
       await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, generated.generatingIssue.id));
       return { svc, generationIssueId: generated.generatingIssue.id, runId };
@@ -639,7 +653,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const nextGeneration = await svc.generate(projectSelector(companyId, projectId), {
         userId: "board-user",
       });
-      const nextRunId = await seedRun(companyId, summarizerAgentId);
+      const nextRunId = await seedRun(companyId, summarizerAgentId, nextGeneration.generatingIssue.id);
       await db
         .update(issues)
         .set({ checkoutRunId: nextRunId })
@@ -834,7 +848,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       // The bounce hands the task back to the summarizer on a fresh run; the
       // execution engine re-checks out the task, re-stamping checkoutRunId.
       // Mirror that so the write guard's run-match holds.
-      const resubmitRunId = await seedRun(companyId, summarizerAgentId);
+      const resubmitRunId = await seedRun(companyId, summarizerAgentId, generationIssueId);
       await db
         .update(issues)
         .set({ checkoutRunId: resubmitRunId })
@@ -935,7 +949,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const second = await summarySlotService(db).generate(projectSelector(companyId, projectId), {
         userId: "board-user",
       });
-      const runId2 = await seedRun(companyId, summarizerAgentId);
+      const runId2 = await seedRun(companyId, summarizerAgentId, second.generatingIssue.id);
       await db.update(issues).set({ checkoutRunId: runId2 }).where(eq(issues.id, second.generatingIssue.id));
 
       await expect(

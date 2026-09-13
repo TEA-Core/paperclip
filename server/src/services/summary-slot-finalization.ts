@@ -1,6 +1,11 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { summarySlots } from "@paperclipai/db";
+import {
+  documents,
+  documentRevisions,
+  heartbeatRuns,
+  summarySlots,
+} from "@paperclipai/db";
 import type { IssueStatus } from "@paperclipai/shared";
 
 const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
@@ -26,22 +31,37 @@ function failureReasonForIssue(issue: TerminalGenerationIssue) {
  * status (done/cancelled). The link is cleared exactly once, here, so a terminal
  * task can no longer write to the slot (SUP-15773).
  *
- * Whether the slot completes to `idle` or `failed` is decided by whether THIS
- * generation produced a revision — NOT merely whether a document exists.
- * `document_id` and `last_generated_at` both survive across generations
- * (`upsertSlot` never touches them), so a slot that was summarised before and is
- * then re-armed for a new, never-written generation still carries the prior
- * revision's document and timestamp. The discriminator is that the latest write
- * (`last_generated_at`, stamped only by `write()`) happened strictly after this
- * generation task was created: a generation cannot write until it exists, is
- * armed, is run, and produces output, so any write it lands is always stamped
- * after its own creation. A write at or before that instant — including a tie on
- * the same normalized millisecond — cannot be attributed to this task; it is
- * inherited from a previous generation and must mark this one as never having
- * written.
- *   - a generation that wrote a revision completes to `idle` (fresh content);
+ * Whether the slot completes to `idle` or `failed` is decided by GENERATION
+ * IDENTITY — whether THIS generation issue is the one that wrote the slot's
+ * current revision — NOT by a timestamp. `document_id` and `last_generated_at`
+ * both survive across generations (`upsertSlot` never touches them), so a slot
+ * that was summarised before and is then re-armed for a new, never-written
+ * generation still carries the prior revision's document. A write at or before
+ * this generation's creation instant can share a normalized millisecond with it,
+ * so a `last_generated_at > created_at` test cannot tell an inherited prior write
+ * from this generation's own write. Identity can: the slot's current revision is
+ * created by a run, and that run's context snapshot names the issue that drove
+ * it.
+ *
+ * The identity chain is:
+ *   summary_slots.document_id
+ *     -> documents.latest_revision_id          (the surviving/successful revision)
+ *     -> document_revisions.created_by_run_id
+ *     -> heartbeat_runs.context_snapshot       (issueId / paperclipIssue.id)
+ * A write can only land while the slot is armed for that generation (the write
+ * guard binds the writing run to the armed issue's checkout/execution run), so
+ * the surviving revision's writing run always belongs to a single generation.
+ * Tracing it back to this issue therefore proves THIS generation produced the
+ * current content:
+ *   - a generation whose write survived completes to `idle` (fresh content);
  *   - a generation that never wrote — even when a document is inherited from a
- *     prior generation — surfaces as `failed` so the refresh sweep regenerates.
+ *     prior generation, a bare document has no revision, or the revision's
+ *     writing run belongs to a different issue — surfaces as `failed` so the
+ *     refresh sweep regenerates. Failing closed (regenerate) is the safe side:
+ *     it can never strand a slot that was actually written.
+ *
+ * `last_generated_at` remains stamped by `write()` and is retained as a
+ * supplementary signal only; it is NOT the discriminator.
  *
  * The status/failure_reason choice is computed in a SINGLE atomic UPDATE bound to
  * one shared predicate, so no interleaving can strand a still-terminal-linked
@@ -58,26 +78,35 @@ export async function finalizeSummarySlotsForTerminalIssue(
   const now = new Date();
   const failureReason = failureReasonForIssue(issue);
 
-  // True when THIS generation wrote a revision: the most recent write
-  // (last_generated_at, stamped only by write()) is STRICTLY AFTER this
-  // generation task was created. A generation cannot write until it exists, is
-  // armed, is run, and produces output, so a write it lands is stamped after its
-  // own creation. A write at or before that creation instant — including a tie on
-  // the same normalized millisecond — is inherited from a prior generation and
-  // must not mark this one as having written. The identity is therefore the
-  // generation's own creation boundary, not a `>=` timestamp coincidence: a prior
-  // write and a later unwritten generation that share a normalized millisecond do
-  // not masquerade as a current-generation write. Shared by both CASE branches so
-  // the status and failure_reason can never disagree.
+  // True when THIS generation issue is the one that wrote the slot's current
+  // (surviving) revision — i.e. the slot's document's latest revision was created
+  // by a run whose context snapshot names this issue. This is the
+  // generation-identity discriminator: it does not compare timestamps, so a prior
+  // write and a later unwritten generation that share a normalized millisecond
+  // cannot masquerade as a current-generation write. The dual-key match
+  // (issueId, or nested paperclipIssue.id) mirrors run-secret-redaction's
+  // run-set resolution. A slot with no document, a bare document with no
+  // revision, a revision with no writing run, or a run that does not name this
+  // issue all resolve to NOT written -> `failed`. Shared by both CASE branches
+  // so status and failure_reason can never disagree.
   //
-  // Bound as an ISO string (not a raw Date): drizzle serializes Dates in `.set()`
-  // but a Date interpolated into a raw `sql` fragment reaches the driver as a
-  // Date object, which its text serializer rejects. Postgres casts the literal
-  // to timestamptz for the `>` comparison.
-  const createdAfter = new Date(issue.createdAt).toISOString();
+  // Correlated on summary_slots.document_id so each slot checks its OWN document
+  // (a generation task can arm more than one slot). Postgres resolves the
+  // target-table reference to its pre-UPDATE value; document_id is not modified
+  // here, so that is exactly the value we want.
   const wroteThisGeneration = sql`(
-    ${summarySlots.lastGeneratedAt} IS NOT NULL
-    AND ${summarySlots.lastGeneratedAt} > ${createdAfter}
+    EXISTS (
+      SELECT 1
+      FROM ${documents} AS doc
+      JOIN ${documentRevisions} AS rev ON rev.id = doc.latest_revision_id
+      JOIN ${heartbeatRuns} AS hr ON hr.id = rev.created_by_run_id
+      WHERE doc.id = ${summarySlots.documentId}
+        AND hr.company_id = ${issue.companyId}
+        AND (
+          hr.context_snapshot ->> 'issueId' = ${issue.id}
+          OR (hr.context_snapshot -> 'paperclipIssue') ->> 'id' = ${issue.id}
+        )
+    )
   )`;
 
   return dbOrTx
