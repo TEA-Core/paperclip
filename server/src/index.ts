@@ -87,6 +87,7 @@ import { createMergedOperatorMergeCardSweepService } from "./services/merged-ope
 import { createBranchPrReconcilerSweepService } from "./services/branch-pr-reconciler.js";
 import { prDeliveryService } from "./services/pr-delivery.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
+import { runProcessCensusSweep } from "./services/run-process-census.js";
 import {
   armSweepLiveness,
   sweepLivenessTracker,
@@ -1177,6 +1178,25 @@ export async function startServer(): Promise<StartedServer> {
         logger.error({ err }, "periodic opencode log rotation failed");
       }), { name: "openCodeLogRotation" });
   };
+  // SUP-16010: sample every tracked run's live child-process count and publish
+  // the distribution on /health under
+  // sweepLiveness.sweeps.runProcessCensus.lastResult. Observe-only, and like
+  // the log rotation it runs in both interval callbacks: a quiesced dispatch is
+  // exactly when the container sits closest to its process/memory ceiling, so
+  // the census must not stop for a drain.
+  const scheduleRunProcessCensusSweep = () => {
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(runProcessCensusSweep()
+      .then((result) => {
+        if (result.unreadable > 0) {
+          logger.warn({ ...result }, "run-process census could not read a run process group");
+        }
+        return result;
+      })
+      .catch((err) => {
+        logger.error({ err }, "run-process census sweep failed");
+      }), { name: "runProcessCensus" });
+  };
   const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
     if (heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(externalObjects
@@ -1995,6 +2015,7 @@ export async function startServer(): Promise<StartedServer> {
           }));
 
         scheduleOpenCodeLogRotationSweep();
+        scheduleRunProcessCensusSweep();
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
@@ -2130,6 +2151,7 @@ export async function startServer(): Promise<StartedServer> {
     startHeartbeatSchedulerInterval(() => {
       scheduleExternalObjectRefreshSweep(new Date());
       scheduleOpenCodeLogRotationSweep();
+      scheduleRunProcessCensusSweep();
       scheduleEnvironmentLeaseCleanupSweep();
       scheduleGitHubConnectionEventPoll();
       scheduleGitHubConnectionContinuitySweep();
