@@ -676,11 +676,19 @@ export function summarySlotService(db: Db) {
 
     const now = new Date();
     const result = await db.transaction(async (tx) => {
+      // The linked slot row is the serialization boundary for document
+      // revision allocation. Hold a row lock so concurrent writers for the
+      // same slot queue up and re-read the latest document state only after
+      // the lock is acquired; otherwise two writers both read the same
+      // latestRevisionNumber, both compute the same next revision, and one's
+      // insert leaks as an uncontrolled document_revisions_document_revision_uq
+      // violation instead of a deterministic, serialized result.
       const currentSlot = slotRow
         ? await tx
             .select()
             .from(summarySlots)
             .where(eq(summarySlots.id, slotRow.id))
+            .for("update")
             .then((rows) => rows[0] ?? null)
         : null;
       if (!currentSlot || currentSlot.generatingIssueId !== input.generationIssueId) {
