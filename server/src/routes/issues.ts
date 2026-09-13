@@ -13414,38 +13414,36 @@ export function issueRoutes(
         // so the durable refusal signal is written in its own awaited
         // transaction. Awaiting — through the transactional logger, which
         // propagates persistence errors — means the 409 is only sent after the
-        // row is durably recorded; a failure here is logged rather than silently
-        // swallowed, so a refused close is never left without its durable signal.
-        try {
-          await db.transaction(async (tx) => {
-            await logActivityInTransaction(tx as unknown as Db, {
-              companyId: existing.companyId,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId,
-              runId: actor.runId,
-              agentApiKeyId: actor.agentApiKeyId,
-              responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-              action: "issue.done_missing_approval_stage_refused",
-              entityType: "issue",
-              entityId: existing.id,
-              issueId: existing.id,
-              details: {
-                identifier: existing.identifier ?? null,
-                ladderedChildCount: missingApprovalStageGap.ladderedChildCount,
-                ladderedChildIdentifiers: missingApprovalStageGap.ladderedChildIdentifiers,
-                excludedChildIdentifiers: missingApprovalStageGap.excludedChildIdentifiers,
-                stageTypes: missingApprovalStageGap.stageTypes,
-                source: "done",
-              },
-            });
+        // row is durably recorded. The row is REQUIRED durable evidence, so a
+        // persistence failure here must NOT be swallowed and the original 409
+        // rethrown: that would report the missing-stage diagnosis as emitted
+        // while no `issue.done_missing_approval_stage_refused` row committed.
+        // The failure is propagated instead, so the route errors out (5xx)
+        // rather than returning a successful-looking 409 with missing durable
+        // evidence.
+        await db.transaction(async (tx) => {
+          await logActivityInTransaction(tx as unknown as Db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+            action: "issue.done_missing_approval_stage_refused",
+            entityType: "issue",
+            entityId: existing.id,
+            issueId: existing.id,
+            details: {
+              identifier: existing.identifier ?? null,
+              ladderedChildCount: missingApprovalStageGap.ladderedChildCount,
+              ladderedChildIdentifiers: missingApprovalStageGap.ladderedChildIdentifiers,
+              excludedChildIdentifiers: missingApprovalStageGap.excludedChildIdentifiers,
+              stageTypes: missingApprovalStageGap.stageTypes,
+              source: "done",
+            },
           });
-        } catch (logErr) {
-          logger.warn(
-            { err: logErr, issueId: id },
-            "failed to write missing approval stage refusal audit log",
-          );
-        }
+        });
       }
       throw err;
     }

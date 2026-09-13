@@ -517,6 +517,41 @@ describe("issue execution policy missing approval stage", () => {
     });
   });
 
+  // Distinguishing regression (SUP-15878 R2 / SUP-16024): the durable refusal
+  // row is REQUIRED evidence, not best-effort. If its write cannot persist, the
+  // route must fail closed — it may not return the typed 409 (which claims the
+  // signal was emitted) when no `issue.done_missing_approval_stage_refused`
+  // row actually committed. Forcing the transactional logger to reject proves
+  // the persistence error is surfaced as a 5xx rather than swallowed and the
+  // original 409 rethrown. The normal 409 path above already pins the
+  // committed-row success behaviour.
+  it("fails closed with an error (not the typed 409) when the refusal audit row cannot persist", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockLogActivityInTransaction.mockRejectedValueOnce(new Error("audit row insert failed"));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    // No successful-looking 409 may coexist with a missing durable row: the
+    // persistence error surfaces as a 5xx and the missing-stage diagnosis is
+    // not claimed as emitted.
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.body.code).not.toBe("done_transition_missing_approval_stage");
+    expect(res.body.error).not.toContain("no approval stage");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   // Regression: a `done` request that does not otherwise require a transaction
   // (no execution policy at all, so no decision, no relay stop, no review
   // activity) must STILL be refused with the typed signal. Pre-fix this took the
