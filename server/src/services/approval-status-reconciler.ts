@@ -1336,8 +1336,20 @@ function extractHeadEvidence(event: Record<string, unknown>): HeadEvidence | nul
 }
 
 type TimelineHeadEvents =
-  | { kind: "ok"; headAtApproval: string | null; sawCommittedHeadEvent: boolean; sawPostApprovalForcePush: boolean }
-  | { kind: "truncated"; headAtApproval: string | null; sawCommittedHeadEvent: boolean; sawPostApprovalForcePush: boolean }
+  | {
+      kind: "ok";
+      headAtApproval: string | null;
+      sawCommittedHeadEvent: boolean;
+      sawPostApprovalForcePush: boolean;
+      committedAfterAnchor: boolean;
+    }
+  | {
+      kind: "truncated";
+      headAtApproval: string | null;
+      sawCommittedHeadEvent: boolean;
+      sawPostApprovalForcePush: boolean;
+      committedAfterAnchor: boolean;
+    }
   | { kind: "failed"; detail: string }
   | { kind: "unparseable"; detail: string };
 
@@ -1351,6 +1363,17 @@ type TimelineHeadEvents =
  * head. A bounded fan-out that exhausts its pages without reaching the end of the
  * timeline (or passing the approval time via a force-push) is reported
  * `truncated` so the caller refuses rather than anchoring a head it cannot prove.
+ *
+ * SUP-16080: `committedAfterAnchor` reports whether a `committed` head event was
+ * seen in timeline order AFTER the newest at/before-approval force-push that
+ * pinned `headAtApproval`. That proves the force-push anchor is STALE, not
+ * authoritative — an ordinary push moved the head past it, so the pinned
+ * `headAtApproval` sha no longer equals the live head even though the head
+ * moved BEFORE the approval. The caller must NOT refuse that shape with
+ * `head-moved-since-approval` (the SUP-16041 / PR #448 false refusal); instead
+ * it falls through to the server-timed sha-existence proof. The flag is reset on
+ * each newer at/before-approval force-push, so it only reflects a committed that
+ * follows the NEWEST such push.
  */
 async function readPrTimelineHeadEvents(
   db: Db,
@@ -1363,6 +1386,11 @@ async function readPrTimelineHeadEvents(
   let headAtApproval: string | null = null;
   let sawCommittedHeadEvent = false;
   let sawPostApprovalForcePush = false;
+  // SUP-16080: true when a `committed` head event was seen in timeline order
+  // AFTER the newest at/before-approval force-push that pinned headAtApproval.
+  // That force-push anchor is then stale, not authoritative, and the pinned
+  // head must not be compared against the live head as `head-moved-since-approval`.
+  let committedAfterAnchor = false;
   let complete = false;
 
   outer: for (let page = 1; page <= MAX_BACKFILL_TIMELINE_PAGES; page++) {
@@ -1396,11 +1424,21 @@ async function readPrTimelineHeadEvents(
       }
       if (info.kind === "committed") {
         sawCommittedHeadEvent = true;
+        // SUP-16080: a committed event that follows a force-push already pinned
+        // as the head-at-approval proves that force-push no longer anchors the
+        // live head (an ordinary push moved the head past it, before the
+        // approval).
+        if (headAtApproval !== null) {
+          committedAfterAnchor = true;
+        }
         continue;
       }
       // force_pushed — the only events with a trustworthy server timestamp.
       if (info.timeMs <= cutoffMs) {
         headAtApproval = info.sha;
+        // A newer at/before-approval force-push supersedes any earlier anchor and
+        // any committed-after-anchor signal set before it.
+        committedAfterAnchor = false;
       } else {
         sawPostApprovalForcePush = true;
         complete = true;
@@ -1414,8 +1452,8 @@ async function readPrTimelineHeadEvents(
   }
 
   return complete
-    ? { kind: "ok", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush }
-    : { kind: "truncated", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush };
+    ? { kind: "ok", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush, committedAfterAnchor }
+    : { kind: "truncated", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush, committedAfterAnchor };
 }
 
 type ShaServerTimestampResult =
@@ -1831,6 +1869,14 @@ type TemporalBackfillOutcome =
  * temporal refusal to the content-identity proof before deciding what to
  * persist. `transient` mirrors the old "report a skip but do NOT persist"
  * branches (a failed / unreadable read that the next tick should retry).
+ *
+ * SUP-16080: when the timeline pins a `headAtApproval` from an at/before-approval
+ * force-push but a later `committed` event moved the head past it BEFORE the
+ * approval (a stale anchor), the pinned sha is not authoritative. That case is
+ * routed into the same server-timed sha-existence proof as the no-force-push
+ * case, certifying the LIVE head when it is branch-bound and server-attested
+ * at/before the approval — instead of the false `head-moved-since-approval`
+ * refusal the pinned-sha comparison produced (the SUP-16041 / PR #448 strand).
  */
 async function temporalBackfillOutcome(
   db: Db,
@@ -1880,7 +1926,21 @@ async function temporalBackfillOutcome(
     };
   }
 
-  if (timeline.headAtApproval === null) {
+  // SUP-16080: a STALE anchor — headAtApproval is pinned by an at/before-approval
+  // force-push, but a committed event followed it in the timeline, moving the
+  // head past it BEFORE the approval. The pinned anchor is then stale, not
+  // authoritative, so the live head need not equal it. Route that shape into the
+  // same server-timed sha-existence proof as the no-force-push case instead of
+  // the (false) head-moved-since-approval refusal. committedAfterAnchor is true
+  // only when a committed event was seen after the newest such force-push, so the
+  // sawPostApprovalForcePush guard below still refuses a post-approval force-push
+  // (the push-A/push-B/force-push-back-to-A hole stays closed).
+  const anchorStale = timeline.headAtApproval !== null && timeline.committedAfterAnchor;
+
+  if (timeline.headAtApproval === null || anchorStale) {
+    // The no-force-push case may have no head-mutating event at all; the stale
+    // case always carries one (the committed after the anchor), so this no-event
+    // check only fires for the genuine no-head-mutating-event shape.
     if (!timeline.sawCommittedHeadEvent) {
       return {
         kind: "refused",

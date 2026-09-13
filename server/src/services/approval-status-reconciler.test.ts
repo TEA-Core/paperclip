@@ -218,6 +218,36 @@ const TIMELINE_UNPARSEABLE_FORCE_PUSH_BODY = [
   { event: "head_ref_force_pushed", commit_id: null, created_at: "2026-08-19T10:00:00Z" },
 ];
 
+// SUP-16080: PR #448's exact event shape. The branch force-pushes (the only
+// server-timed head event) at 07:51:55Z and then receives ordinary pushes —
+// client-timed `committed` events — before the 10:28:39.433Z approval. The
+// newest at/before-approval force-push pins headAtApproval to STALE_ANCHOR_SHA,
+// but the ordinary pushes moved the live head (NEW_HEAD) past it BEFORE the
+// approval. Without the stale-anchor fall-through this is a false
+// `backfill:head-moved-since-approval`; with it, the live head is certified via
+// the server-timed sha-existence proof.
+const STALE_ANCHOR_SHA = "047c10c2";
+const EARLIEST_COMMIT_SHA = "22fd3630";
+const INTERMEDIATE_COMMIT_SHA = "53028971";
+// PR #448's actual approval decision time.
+const PR448_APPROVAL_AT = "2026-09-13T10:28:39.433Z";
+const TIMELINE_STALE_ANCHOR_BODY = [
+  { event: "committed", sha: EARLIEST_COMMIT_SHA, committer: { date: "2026-09-13T07:00:00Z" }, author: { date: "2026-09-13T07:00:00Z" } },
+  { event: "committed", sha: STALE_ANCHOR_SHA, committer: { date: "2026-09-13T07:30:00Z" }, author: { date: "2026-09-13T07:30:00Z" } },
+  { event: "head_ref_force_pushed", commit_id: STALE_ANCHOR_SHA, created_at: "2026-09-13T07:51:55Z" },
+  { event: "committed", sha: INTERMEDIATE_COMMIT_SHA, committer: { date: "2026-09-13T09:00:00Z" }, author: { date: "2026-09-13T09:00:00Z" } },
+  { event: "committed", sha: NEW_HEAD, committer: { date: "2026-09-13T09:59:39Z" }, author: { date: "2026-09-13T09:59:39Z" } },
+];
+// Same stale-anchor shape, but a post-approval force-push follows: the
+// push-A/push-B/force-push-back-to-A hole. A committed after the anchor proves
+// the anchor is stale, yet the post-approval force-push makes the head-at-approval
+// ambiguous, so the fall-through must still refuse head-unverifiable.
+const TIMELINE_STALE_ANCHOR_POST_APPROVAL_BODY = [
+  { event: "head_ref_force_pushed", commit_id: STALE_ANCHOR_SHA, created_at: "2026-09-13T07:51:55Z" },
+  { event: "committed", sha: NEW_HEAD, committer: { date: "2026-09-13T09:00:00Z" }, author: { date: "2026-09-13T09:00:00Z" } },
+  { event: "head_ref_force_pushed", commit_id: MOVED_HEAD, created_at: "2026-09-13T12:00:00Z" },
+];
+
 // SUP-15017: a certified `no-pr` branch anchor + the commit-detail reads the
 // content-identity proof makes. The certified anchor is the branch head sha
 // read at approval time (pre-DB approval); the live head is the post-approval
@@ -2953,6 +2983,132 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
       expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
       expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+    });
+
+    it("backfills and anchors the live head when a stale force-push anchor was followed by ordinary pushes before the approval (SUP-16080, PR #448 shape)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      // PR #448's actual approval decision time.
+      await insertDecision(issueId, { createdAt: new Date(PR448_APPROVAL_AT) });
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_STALE_ANCHOR_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          // The live head's check run, GitHub-triggered on this PR's head branch,
+          // with a server-assigned created_at at/before the approval: NEW_HEAD
+          // provably existed on this branch at/before the approval even though the
+          // timeline's force-push anchor (STALE_ANCHOR_SHA) is stale.
+          body: {
+            total_count: 1,
+            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-09-13T09:59:39Z" }],
+          },
+        },
+        { url: POST_STATUS_URL, body: { id: 12350 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // AC1: the live head is certified and anchored, NOT the false
+      // head-moved-since-approval refusal the pinned-stale-anchor comparison
+      // produced.
+      expect(summary.backfilled).toBe(1);
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["backfill:head-moved-since-approval"]).toBeUndefined();
+      expect(Object.keys(summary.skipped)).toEqual([]);
+      expect(postStatusCalls()).toHaveLength(1);
+      expect(postStatusBodies()[0]).toMatchObject({ state: "success", context: PAPERCLIP_APPROVED });
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
+      expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+    });
+
+    it("still refuses head-unverifiable when a stale anchor's live head has no branch-bound server evidence at/before the approval (SUP-16080, fail closed)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId, { createdAt: new Date(PR448_APPROVAL_AT) });
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_STALE_ANCHOR_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          // The live head's only server-timed evidence is AFTER the approval: the
+          // fall-through adds a proof path, never a bypass. With no branch-bound
+          // evidence at/before the approval the head cannot be certified.
+          body: {
+            total_count: 1,
+            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-09-13T12:00:00Z" }],
+          },
+        },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:head-moved-since-approval"]).toBeUndefined();
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      // The deterministic refusal is persisted as a stable refusal; no anchor is
+      // stamped.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(null);
+      expect(approvalStatus.publishedHeadSha).toBe(null);
+      expect((approvalStatus as Record<string, unknown>).backfillRefusal).toMatchObject({
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: NEW_HEAD,
+      });
+    });
+
+    it("still refuses head-unverifiable when a stale anchor is followed by a post-approval force-push (SUP-16080, hole stays closed)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId, { createdAt: new Date(PR448_APPROVAL_AT) });
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        // A committed after the at/before-approval anchor makes the anchor stale,
+        // but the post-approval force-push makes the head-at-approval ambiguous
+        // (push-A/push-B/force-push-back-to-A), so the fall-through is
+        // short-circuited by sawPostApprovalForcePush — the check-runs read is
+        // never reached.
+        { url: TIMELINE_URL, body: TIMELINE_STALE_ANCHOR_POST_APPROVAL_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(null);
+      expect(approvalStatus.publishedHeadSha).toBe(null);
     });
 
     it("reports a transient skip and does not persist when check-runs read fails (SUP-14844)", async () => {
