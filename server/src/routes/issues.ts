@@ -3430,6 +3430,36 @@ export function issueRoutes(
     // backstop so a thrown outcome records a publishFailure instead of dropping
     // the key entirely (the exact hole SUP-16041 fell through).
     let outcomeRecorded = false;
+    // SUP-16081 fix #2 (round-1 support-CR, finding
+    // total-publish-outcome-skips-prepublish-guards): every pre-publish refusal /
+    // guard exception below must leave the SAME durable, named record on
+    // executionState.approvalStatus that the happy path and the catch backstop
+    // leave. A guard that refuses to stamp/arm without recording is the exact
+    // silent-drop SUP-16041 suffered: a card with no existing approvalStatus
+    // could close with the key still absent, violating the total-outcome
+    // contract (AC1). This one finalizer routes all three pre-publish guard
+    // refusals through recordApprovalPublishOutcome with a null head (a guard
+    // fires before any head is resolved), so the total-record contract holds on
+    // the FIRST publish path too.
+    const recordGuardOutcome = async (
+      kind: "skipped" | "failed",
+      message: string,
+    ): Promise<void> => {
+      try {
+        await recordApprovalPublishOutcome(
+          db,
+          issue.id,
+          (issue.executionState ?? {}) as Record<string, unknown>,
+          null,
+          { kind, message },
+        );
+      } catch (recordErr) {
+        logger.error(
+          { err: recordErr, issueId: issue.id, companyId: issue.companyId },
+          "failed to record pre-publish guard refusal on the card",
+        );
+      }
+    };
     try {
       const integrity = await evaluateStageIntegrity(db, candidate);
       if (integrity) {
@@ -3454,6 +3484,14 @@ export function issueRoutes(
             "stage-integrity refusal comment write failed; still refusing to stamp/arm",
           );
         }
+        // SUP-16081 fix #2: record the refusal before returning (total outcome).
+        // The base #674 path now writes the card comment via the shared
+        // addGuardBArmingRefusalComment boundary (reason + detail), so the recorded
+        // message mirrors that same `status:skipped:stage_integrity:<reason>:` token.
+        await recordGuardOutcome(
+          "skipped",
+          `status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`,
+        );
         return;
       }
     } catch (err) {
@@ -3463,6 +3501,12 @@ export function issueRoutes(
       logger.warn(
         { err, issueId: issue.id },
         "stage-integrity check at decision time threw; refusing to stamp/arm (fail-closed)",
+      );
+      // SUP-16081 fix #2: a guard exception is a fail-closed refusal — record it
+      // as a named failure so the card is never left without an outcome.
+      await recordGuardOutcome(
+        "failed",
+        `status:failed:stage_integrity_check_threw: ${err instanceof Error ? err.message : String(err)}`,
       );
       return;
     }
@@ -3495,6 +3539,8 @@ export function issueRoutes(
           "non-terminal-ladder refusal comment write failed; still refusing to stamp/arm",
         );
       }
+      // SUP-16081 fix #2: record the refusal before returning (total outcome).
+      await recordGuardOutcome("skipped", msg);
       return;
     }
     // SUP-14602: the live-discovery / decision-head needle must be the issue's
