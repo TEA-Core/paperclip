@@ -600,6 +600,23 @@ describeEmbeddedPostgres("summary slot service", () => {
 
       // Arm a FRESH generation over the inherited slot, then cancel it without writing.
       const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      // COLLISION SETUP: place the later generation's creation instant in the prior
+      // write's normalized millisecond — its `created_at` sits immediately before the
+      // surviving revision's `last_generated_at`. Under the rejected strict
+      // `last_generated_at > created_at` discriminator that ordering reads as "this
+      // generation wrote" and would classify it `idle`; only generation identity can
+      // tell the inherited prior write from a current-generation write. The write
+      // evidence (`last_generated_at`, stamped by `write()`) is NOT mutated — only the
+      // later generation's creation boundary is arranged, exactly the same-millisecond
+      // collision a resubmit race produces.
+      const lastWrittenAt = afterFirst.slot.lastGeneratedAt!;
+      expect(lastWrittenAt).toBeInstanceOf(Date);
+      await db
+        .update(issues)
+        .set({ createdAt: new Date(lastWrittenAt.getTime() - 1) })
+        .where(eq(issues.id, second.generatingIssue.id));
+
       const armed = await db
         .select()
         .from(summarySlots)
@@ -613,7 +630,8 @@ describeEmbeddedPostgres("summary slot service", () => {
 
       // The surviving revision was created by the PRIOR generation's run, not this
       // one. Identity must mark this never-written generation `failed`, not `idle` —
-      // no timestamp can tell the inherited write from a current-generation write.
+      // a timestamp in the same normalized millisecond as the inherited write cannot
+      // tell the two apart, but the writing run's context snapshot can.
       const result = await svc.getSlot(projectSelector(companyId, projectId));
       expect(result.slot).toMatchObject({
         status: "failed",
