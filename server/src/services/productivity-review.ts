@@ -868,14 +868,15 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     }
     // A review card is a management decision by the owning manager, not a
     // deliverable off the reviewed card: it must not inherit the source
-    // issue's execution workspace, and its close ladder must never gate the
-    // card on the agent under review (SUP-15990). The single review stage
-    // names the owning manager so the card has a defined path to closure; when
-    // the owner is the source agent itself (a self-owned card) no ladder is
-    // attached, leaving the project/company default in place as before rather
-    // than self-gating the card.
-    const reviewParticipantAgentIds =
-      ownerAgentId === evidence.sourceAgent.id ? [] : [ownerAgentId];
+    // issue's execution workspace, and its policy must neither gate the card
+    // on the agent under review nor deflect the owning manager's close
+    // (SUP-15990). A productivity review has no deliverable head, so the card
+    // carries no review ladder at all: an empty stage list means the manager's
+    // `done` write is never coerced to `in_review`, and no stage can ever name
+    // the source agent. `returnAssigneeAgentId` is pinned to the owning manager
+    // only so the policy survives normalization as non-null; a null policy
+    // would let the project/company default (which may name the source agent)
+    // re-apply at create time.
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
@@ -889,22 +890,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         billingCode: evidence.sourceIssue.billingCode,
         assigneeAgentId: ownerAgentId,
         skipExecutionWorkspaceInheritance: true,
-        ...(reviewParticipantAgentIds.length > 0
-          ? {
-              executionPolicy: {
-                mode: "normal" as const,
-                stages: [
-                  {
-                    type: "review" as const,
-                    participants: reviewParticipantAgentIds.map((agentId) => ({
-                      type: "agent" as const,
-                      agentId,
-                    })),
-                  },
-                ],
-              },
-            }
-          : {}),
+        executionPolicy: {
+          mode: "normal" as const,
+          returnAssigneeAgentId: ownerAgentId,
+        },
         originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
         originId: evidence.sourceIssue.id,
         originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),

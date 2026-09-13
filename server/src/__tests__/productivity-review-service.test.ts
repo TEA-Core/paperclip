@@ -31,6 +31,7 @@ import {
   productivityReviewService,
 } from "../services/productivity-review.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { applyIssueExecutionPolicyTransition } from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -420,7 +421,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(source?.executionWorkspaceId).toBe(executionWorkspaceId);
   });
 
-  it("names only the owning manager in the review card's close ladder (SUP-15990)", async () => {
+  it("gives the review card a non-blocking policy that never gates on the reviewed agent (SUP-15990)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
     await insertRuns({
@@ -439,20 +440,43 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     const policy = review?.executionPolicy as IssueExecutionPolicy | null | undefined;
-    // The card must have a close ladder at all — a null policy would mean no
-    // path to a terminal state (SUP-10835) or the company default re-applying.
+    // The card must keep a non-null policy — a null policy would let the
+    // project/company default ladder (which may name the source agent) re-apply
+    // at create time (SUP-10835).
     expect(policy).not.toBeNull();
     expect(policy?.mode).toBe("normal");
     expect(policy?.commentRequired).toBe(true);
+    // A productivity review has no deliverable head, so it carries no review
+    // ladder at all: no stage can ever gate the card on the agent under review.
     const stages = policy?.stages ?? [];
-    expect(stages).toHaveLength(1);
-    expect(stages[0]?.type).toBe("review");
-    const participants = stages[0]?.participants ?? [];
-    expect(participants).toHaveLength(1);
-    expect(participants[0]?.type).toBe("agent");
-    expect(participants[0]?.agentId).toBe(seeded.managerId);
-    // The agent under review is the subject of the card, never a gate on it.
-    expect(participants.some((participant) => participant.agentId === seeded.coderId)).toBe(false);
+    expect(stages).toHaveLength(0);
+    expect(
+      stages.some((stage) =>
+        (stage.participants ?? []).some((participant) => participant.agentId === seeded.coderId),
+      ),
+    ).toBe(false);
+    // `returnAssigneeAgentId` pins the policy non-null without introducing a
+    // stage, so the owning manager closes the card in a single `done` write:
+    // with no pending stage the transition must not coerce the requested
+    // `done` into `in_review` (the SUP-15987 incident). Drive the real
+    // transition to prove the single-write guarantee.
+    expect(policy?.returnAssigneeAgentId).toBe(seeded.managerId);
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "todo",
+        assigneeAgentId: seeded.managerId,
+        assigneeUserId: null,
+        executionPolicy: policy ?? null,
+        executionState: null,
+      },
+      policy: policy ?? null,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: seeded.managerId },
+      commentBody: "Closing the productivity review",
+    });
+    expect(transition.patch.status ?? "done").toBe("done");
+    expect(transition.patch.executionState).toBeUndefined();
   });
 
   it("fires the no-comment-streak trigger for two ceiling-length timed-out runs with zero comments (SUP-13298 shape)", async () => {
