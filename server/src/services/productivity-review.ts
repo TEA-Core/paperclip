@@ -216,24 +216,50 @@ function choosePrimaryTrigger(input: {
 }
 
 /**
- * True when the issue is parked `in_progress` behind an armed monitor whose
- * next check is still in the future — the harness's sanctioned resting state
- * for a recurring watcher. Such a card's active episode is unbounded *by
- * design*, so the `long_active_duration` trigger (a plain 6h elapsed clock
- * from `startedAt`) latches true permanently and re-fires on every generator
- * pass as a structural false positive. This exemption is trigger-scoped: it
- * silences only `long_active_duration`; `no_comment_streak` and `high_churn`
- * stay live so a watcher that stops posting digests or starts thrashing is
- * still caught. A stale arm (status not `scheduled`, or a null/past
- * `nextCheckAt`) does NOT exempt.
+ * True when the issue is parked `in_progress` behind a monitor whose next wake
+ * is still pending — the harness's sanctioned resting state for a recurring
+ * watcher. Such a card's active episode is unbounded *by design*, so the
+ * `long_active_duration` trigger (a plain 6h elapsed clock from `startedAt`)
+ * latches true permanently and re-fires on every generator pass as a
+ * structural false positive. This exemption is trigger-scoped: it silences
+ * only `long_active_duration`; `no_comment_streak` and `high_churn` stay live
+ * so a watcher that stops posting digests or starts thrashing is still caught.
+ *
+ * Two armed shapes qualify:
+ * 1. `scheduled` with a future `nextCheckAt` — the steady resting state.
+ * 2. `triggered` with a live issue run (`queued` / `running` /
+ *    `scheduled_retry`) created at or after `lastTriggeredAt`. A monitor fire
+ *    flips the state to `triggered` and nulls `nextCheckAt`; until the woken
+ *    run re-arms the next check, the card is legitimately parked on that run,
+ *    and a sweep landing in the fire -> re-arm gap must not score the card as
+ *    an idle long-active episode (SUP-16092, measured on SUP-15971).
+ *
+ * A stale arm does NOT exempt: `cleared` status, a `scheduled` arm with a
+ * null/past `nextCheckAt`, or a `triggered` arm whose woken run is no longer
+ * live (e.g. cancelled at admission and never re-armed). Those cards are
+ * genuinely stuck and remain reviewable.
  */
-function isIdleBehindArmedMonitor(sourceIssue: IssueRow, now: Date): boolean {
+function isIdleBehindArmedMonitor(
+  sourceIssue: IssueRow,
+  now: Date,
+  issueRunSamples: readonly Pick<ProductivityRunSample, "status" | "createdAt">[],
+): boolean {
   if (sourceIssue.status !== "in_progress") return false;
   const monitor = parseIssueExecutionState(sourceIssue.executionState)?.monitor;
-  if (monitor?.status !== "scheduled") return false;
-  if (!monitor.nextCheckAt) return false;
-  const nextCheckAtMs = Date.parse(monitor.nextCheckAt);
-  return Number.isFinite(nextCheckAtMs) && nextCheckAtMs > now.getTime();
+  if (!monitor) return false;
+  if (monitor.status === "scheduled") {
+    if (!monitor.nextCheckAt) return false;
+    const nextCheckAtMs = Date.parse(monitor.nextCheckAt);
+    return Number.isFinite(nextCheckAtMs) && nextCheckAtMs > now.getTime();
+  }
+  if (monitor.status !== "triggered" || !monitor.lastTriggeredAt) return false;
+  const lastTriggeredAtMs = Date.parse(monitor.lastTriggeredAt);
+  if (!Number.isFinite(lastTriggeredAtMs)) return false;
+  return issueRunSamples.some((run) => {
+    if (!ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number])) return false;
+    const createdAtMs = coerceDate(run.createdAt)?.getTime();
+    return typeof createdAtMs === "number" && createdAtMs >= lastTriggeredAtMs;
+  });
 }
 
 function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
@@ -608,7 +634,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     // design, so the duration trigger is structurally meaningless for it; the
     // no-comment and churn triggers remain live (see isIdleBehindArmedMonitor).
     const longActive =
-      !isIdleBehindArmedMonitor(sourceIssue, now) &&
+      !isIdleBehindArmedMonitor(sourceIssue, now, latestRuns) &&
       elapsedMs !== null &&
       elapsedMs >= thresholds.longActiveMs;
     const highChurn =
