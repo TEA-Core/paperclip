@@ -17492,6 +17492,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         handoffAgentId: string | null;
       };
 
+  // SUP-16050: whether the card's *structured* state shows the executor is
+  // genuinely parked awaiting a reviewer decision — the only basis on which the
+  // stale-queued-run gate may cancel a continuation wake. A parking summary is
+  // prose and must never override card state. Two shapes qualify: the card is in
+  // the review stage, or its review stage is pending with a current participant
+  // who is not the issue's agent assignee. The SUP-15899 shape
+  // (in_progress + changes_requested + returnAssignee == assignee) is
+  // deliberately excluded so the executor's continuation is not cancelled from a
+  // misleading summary.
+  function isContinuationAwaitingReviewerDecision(
+    issue: Pick<
+      typeof issues.$inferSelect,
+      "status" | "assigneeAgentId" | "executionState"
+    >,
+  ): boolean {
+    if (issue.status === "in_review") return true;
+    const executionState = parseIssueExecutionState(issue.executionState);
+    if (!executionState || executionState.status !== "pending") return false;
+    const currentParticipant = executionState.currentParticipant;
+    if (!currentParticipant) return false;
+    if (currentParticipant.type === "agent") {
+      return Boolean(
+        currentParticipant.agentId &&
+          currentParticipant.agentId !== issue.assigneeAgentId,
+      );
+    }
+    // A user holds the ball; the agent executor is never that participant.
+    return true;
+  }
+
   async function evaluateQueuedRunStaleness(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
@@ -17570,7 +17600,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (
-      issue.status === "in_progress" &&
+      (issue.status === "in_progress" || issue.status === "in_review") &&
       !wakeCommentId &&
       !hasResolvedInteractionEvidence &&
       (wakeReason === "issue_continuation_needed" ||
@@ -17587,17 +17617,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
       const continuationSummaryBody =
         queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
-      if (continuationSummaryParksExecutor(continuationSummaryBody)) {
+      // SUP-16050: a parking summary is prose, not card state. Only cancel when
+      // the structured state independently confirms the executor is parked
+      // awaiting a reviewer decision; otherwise the summary overrode unambiguous
+      // card state (in_progress + changes_requested + returnAssignee == assignee)
+      // and destroyed the only remaining wake path for the executor.
+      if (
+        continuationSummaryParksExecutor(continuationSummaryBody) &&
+        isContinuationAwaitingReviewerDecision(issue)
+      ) {
+        const executionStateStatus =
+          parseIssueExecutionState(issue.executionState)?.status ?? null;
         return {
           stale: true,
           errorCode: "issue_continuation_waiting_on_review",
           reason:
-            "Cancelled because the continuation summary says the executor should wait for reviewer feedback or approval before more work starts",
+            "Cancelled because the issue is awaiting a reviewer decision and the continuation summary says the executor should wait for reviewer feedback or approval before more work starts",
           details: {
             issueId,
             wakeReason,
             retryReason,
             nextAction: continuationSummaryBody,
+            issueStatus: issue.status,
+            executionStateStatus,
+            assigneeAgentId: issue.assigneeAgentId,
           },
           handoffAgentId: null,
         };
@@ -17787,6 +17830,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: staleness.reason,
       payload: staleness.details,
     });
+
+    // SUP-16050: this cancel used to be silent on the issue timeline — it lived
+    // only in the run row and the run event. Surface it as issue activity so the
+    // "why did this stop?" trail is diagnosable without reading run internals.
+    if (staleness.errorCode === "issue_continuation_waiting_on_review") {
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "issue.continuation_cancelled_waiting_on_review",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: {
+          runId: run.id,
+          gate: "stale_queued_run_gate",
+          stopReason: "issue_continuation_waiting_on_review",
+          issueStatus: (staleness.details.issueStatus as string | null) ?? null,
+          executionStateStatus:
+            (staleness.details.executionStateStatus as string | null) ?? null,
+          wakeReason: (staleness.details.wakeReason as string | null) ?? null,
+        },
+      });
+    }
 
     return cancelled;
   }
