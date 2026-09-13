@@ -9,6 +9,7 @@ import {
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
+  issueComments,
   issueExecutionDecisions,
   issues,
   projects,
@@ -76,6 +77,19 @@ vi.mock("./github-fetch.js", () => ({
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
+
+// SUP-16032: the reconciler now surfaces a Guard B arming refusal by reusing the
+// decision-time path's `issueService.addComment`. Mock ONLY `issueService` and
+// preserve every other export via importOriginal spread — merge-arming imports
+// `isStrictAncestorIssueIdOf` from this module, so a blank mock would break it.
+const mockAddComment = vi.hoisted(() => vi.fn());
+const realIssueServiceRef = vi.hoisted(() => ({ issueService: null as unknown }));
+
+vi.mock("./issues.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./issues.js")>();
+  realIssueServiceRef.issueService = actual.issueService;
+  return { ...actual, issueService: () => ({ addComment: mockAddComment }) };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -383,6 +397,19 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       .returning();
     companyId = companyRows[0]!.id;
     await db.insert(agents).values({ id: AGENT_CREATOR, companyId, name: "Creator" });
+
+    // SUP-16032 default: route the reconciler's refusal comment through the REAL
+    // issueService so the record is written exactly as the decision-time path
+    // writes it. `vi.resetAllMocks` above clears implementations, so this is set
+    // fresh each test; the fail-closed test overrides it with a rejection.
+    mockAddComment.mockImplementation(
+      (issueId: string, body: string, actor: object, options: object) => {
+        const real = realIssueServiceRef.issueService as (d: Db) => {
+          addComment: (i: string, b: string, a: object, o: object) => Promise<unknown>;
+        };
+        return real(db).addComment(issueId, body, actor, options);
+      },
+    );
   });
 
   afterEach(async () => {
@@ -1942,6 +1969,121 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.skipped["guard-b:stage-not-in-policy"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
       expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a Guard B arming refusal on the card as a [Merge-arming] system comment (SUP-16032)", async () => {
+      // No decision row for the completed approval stage -> guard-b:stage-without-decision.
+      // The guard-b gate runs before any GitHub I/O, so no routes are needed.
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // Refusal set/counts are UNCHANGED by the surfacing (bullet: unmodified set):
+      // exactly one refusal, same reason, and no arming happened.
+      expect(summary.skipped["guard-b:stage-without-decision"]).toBe(1);
+      expect(Object.keys(summary.skipped)).toEqual(["guard-b:stage-without-decision"]);
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+
+      // The refusal is now issue-visible: exactly one system comment, byte-for-byte
+      // the decision-time record shape, written via issueService.addComment.
+      const comments = await db
+        .select({ body: issueComments.body, authorType: issueComments.authorType, issueId: issueComments.issueId })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.issueId).toBe(issueId);
+      expect(comments[0]!.authorType).toBe("system");
+      expect(comments[0]!.body).toBe(
+        `[Merge-arming] status:skipped:stage_integrity:guard-b:stage-without-decision: completed stage ${APPROVAL_STAGE_ID} has no issue_execution_decisions row`,
+      );
+    });
+
+    it("does not add a second record on a re-run over the same still-refused card (SUP-16032 idempotency)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+
+      await runApprovalStatusReconcilerTick(db);
+      const afterFirst = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(afterFirst).toHaveLength(1);
+
+      const summary2 = await runApprovalStatusReconcilerTick(db);
+      expect(summary2.skipped["guard-b:stage-without-decision"]).toBe(1);
+      const afterSecond = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(afterSecond).toHaveLength(1); // no second record for the same reason
+    });
+
+    it("adds a new record when the refusal reason changes to a different guard-b reason (SUP-16032)", async () => {
+      // Tick 1 shape: a skipped stage -> guard-b:skipped-stage (fires first).
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          completedStageIds: [APPROVAL_STAGE_ID],
+          skippedStageIds: [REVIEW_STAGE_ID],
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      const s1 = await runApprovalStatusReconcilerTick(db);
+      expect(s1.skipped["guard-b:skipped-stage"]).toBe(1);
+      const c1 = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(c1).toHaveLength(1);
+      expect(c1[0]!.body).toContain("stage_integrity:guard-b:skipped-stage:");
+
+      // Flip the refusal reason: drop the skip and drop the decision row so the
+      // completed approval stage now has no decision row -> a different reason.
+      await db
+        .update(issues)
+        .set({ executionState: approvedState({ completedStageIds: [APPROVAL_STAGE_ID] }) })
+        .where(eq(issues.id, issueId));
+      await db.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+
+      const s2 = await runApprovalStatusReconcilerTick(db);
+      expect(s2.skipped["guard-b:stage-without-decision"]).toBe(1);
+      const c2 = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(c2).toHaveLength(2);
+      expect(c2.some((c) => c.body.includes("stage_integrity:guard-b:skipped-stage:"))).toBe(true);
+      expect(c2.some((c) => c.body.includes("stage_integrity:guard-b:stage-without-decision:"))).toBe(true);
+    });
+
+    it("still refuses to arm and stays skipped when the refusal comment write fails (SUP-16032 fail-closed)", async () => {
+      mockAddComment.mockRejectedValueOnce(new Error("simulated comment write failure"));
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // The refusal still stands (skipped, not armed/failed) and no GitHub write.
+      expect(summary.skipped["guard-b:stage-without-decision"]).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      // No record was written because the write failed.
+      const comments = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(0);
+      // The write was attempted exactly once, with the decision-time record shape.
+      expect(mockAddComment).toHaveBeenCalledTimes(1);
+      expect(mockAddComment.mock.calls[0]![1]).toBe(
+        `[Merge-arming] status:skipped:stage_integrity:guard-b:stage-without-decision: completed stage ${APPROVAL_STAGE_ID} has no issue_execution_decisions row`,
+      );
     });
 
     it("skips ambiguous cards with several open linked PRs", async () => {

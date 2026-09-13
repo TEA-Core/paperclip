@@ -2,10 +2,11 @@ import type { Db } from "@paperclipai/db";
 import {
   externalObjectMentions,
   externalObjects,
+  issueComments,
   issueExecutionDecisions,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, ne, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, isNull, like, ne, sql, type SQL } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import {
@@ -13,6 +14,7 @@ import {
   type GitHubTokenResolution,
 } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { issueService } from "./issues.js";
 import {
   ladderIsTerminallyApproved,
   postPullRequestComment,
@@ -2189,11 +2191,69 @@ export async function persistWorkspaceDiscoveryVerdict(
   });
 }
 
+/**
+ * SUP-16032: surface a Guard B arming refusal from the reconciler path on the
+ * card, so a card the scheduled reconciler refuses to arm is visible to its
+ * owner. This mirrors the decision-time refusal (routes/issues.ts
+ * runApprovalMergeArming): the same `[Merge-arming]
+ * status:skipped:stage_integrity:<reason>: <detail>` system comment, written
+ * through the same `issueService.addComment` mechanism — one record format, one
+ * dedup key, one notion of what a stage-integrity refusal reads like.
+ *
+ * Idempotency: the reconciler runs on a schedule, so a still-refused card would
+ * otherwise re-comment on every tick. We dedup on the reason token embedded in
+ * the record itself — one record per (issue, reason). A card already refused at
+ * decision time (which posts the same system comment) is therefore not
+ * duplicated, and a card whose refusal reason changes to a different guard-b:*
+ * reason gets a new record.
+ *
+ * Fail-closed: the arming refusal already returned `skipped` in
+ * reconcileCandidate, before any GitHub read or write, so a comment write that
+ * cannot be made must never change the outcome — it is logged and the card stays
+ * un-armed.
+ */
+async function surfaceGuardBArmingRefusal(
+  db: Db,
+  row: CandidateRow,
+  integrity: { reason: string; detail: string },
+): Promise<void> {
+  const needle = `[Merge-arming] status:skipped:stage_integrity:${integrity.reason}:`;
+  const body = `[Merge-arming] status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`;
+  try {
+    const existing = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, row.companyId),
+          eq(issueComments.issueId, row.id),
+          eq(issueComments.authorType, "system"),
+          like(issueComments.body, `%${needle}%`),
+          isNull(issueComments.deletedAt),
+        ),
+      )
+      .limit(1);
+    if (existing.length > 0) return;
+    await issueService(db).addComment(row.id, body, {}, { authorType: "system" });
+  } catch (err) {
+    logger.warn(
+      { err, issueId: row.id, reason: integrity.reason },
+      "guard-b arming refusal comment write failed; still refusing to arm",
+    );
+  }
+}
+
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
   const label = row.identifier ?? row.id;
 
   const integrity = await evaluateStageIntegrity(db, row);
   if (integrity) {
+    // SUP-16032: surface the Guard B arming refusal on the card so a card the
+    // reconciler refuses to arm is visible to its owner — mirroring the
+    // decision-time path (routes/issues.ts runApprovalMergeArming). Idempotent
+    // per (issue, reason); a failed write never arms the card (the refusal
+    // already returns `skipped` below, before any GitHub read or write).
+    await surfaceGuardBArmingRefusal(db, row, integrity);
     return { kind: "skipped", reason: integrity.reason, detail: `guard-b ${integrity.detail}` };
   }
 
