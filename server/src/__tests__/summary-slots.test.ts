@@ -20,7 +20,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { writeSummarySlotSchema } from "@paperclipai/shared";
+import { writeSummarySlotSchema, type WriteSummarySlotResponse } from "@paperclipai/shared";
 import {
   resolveSummaryGenerationReturnAssignee,
   summarySlotService,
@@ -670,6 +670,78 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(revisions.revisions[0]!.id).toBe(written.revision.id);
       expect(revisions.revisions[1]!.id).toBe(initial.revision.id);
       expect(revisions.revisions[1]!.body).toContain("First summary for this scope.");
+    });
+
+    it("serializes concurrent writes for the same slot into sequential revisions instead of leaking a revision unique-index violation", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
+
+      // Pre-seed a document at revision 1 and point the still-generating slot at it so
+      // both concurrent writers read the same latestRevisionNumber and both compute the
+      // same next revision (the document_revisions_document_revision_uq shape). Because
+      // the slot stays armed after a write (SUP-15773), both writes target this document.
+      const seedDocumentId = randomUUID();
+      await db.insert(documents).values({
+        id: seedDocumentId,
+        companyId,
+        latestBody: "# Seeded",
+        latestRevisionNumber: 1,
+      });
+      await db.insert(documentRevisions).values({
+        companyId,
+        documentId: seedDocumentId,
+        revisionNumber: 1,
+        body: "# Seeded",
+      });
+      await db
+        .update(summarySlots)
+        .set({ documentId: seedDocumentId })
+        .where(
+          and(
+            eq(summarySlots.companyId, companyId),
+            eq(summarySlots.scopeKind, "project"),
+            eq(summarySlots.scopeId, projectId),
+            eq(summarySlots.slotKey, "header"),
+          ),
+        );
+
+      const makeWrite = (markdown: string) =>
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown, generationIssueId },
+          { agentId: summarizerAgentId, runId },
+        );
+
+      const settled = await Promise.allSettled([
+        makeWrite("# Concurrent write A"),
+        makeWrite("# Concurrent write B"),
+      ]);
+
+      const fulfilled = settled.filter(
+        (r): r is PromiseFulfilledResult<WriteSummarySlotResponse> => r.status === "fulfilled",
+      );
+      const rejected = settled.filter(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+
+      // The slot row lock serializes the two writers: both land, each computing its
+      // next revision from the latest document state — never the same revision number.
+      // No raw unique-index error is exposed.
+      expect(rejected).toHaveLength(0);
+      expect(fulfilled).toHaveLength(2);
+
+      const revisionNumbers = fulfilled.map((r) => r.value.revision.revisionNumber).sort((a, b) => a - b);
+      expect(revisionNumbers).toEqual([2, 3]);
+
+      // Both revisions land on the same (seeded) document.
+      expect(new Set(fulfilled.map((r) => r.value.document.id)).size).toBe(1);
+      expect(fulfilled[0]!.value.document.id).toBe(seedDocumentId);
+
+      const revisions = await svc.listRevisions(projectSelector(companyId, projectId));
+      expect(revisions.revisions).toHaveLength(3);
+      expect(revisions.revisions[0]!.revisionNumber).toBe(3);
+      expect(revisions.revisions[2]!.revisionNumber).toBe(1);
     });
 
     it("allows a second write for the same generation task after a changes_requested bounce, then releases the link only at terminal", async () => {
