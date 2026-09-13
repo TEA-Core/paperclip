@@ -602,8 +602,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
 
       // COLLISION SETUP: place the later generation's creation instant in the prior
-      // write's normalized millisecond — its `created_at` sits immediately before the
-      // surviving revision's `last_generated_at`. Under the rejected strict
+      // write's normalized millisecond — its `created_at` matches the surviving
+      // revision's `last_generated_at`. Under the rejected strict
       // `last_generated_at > created_at` discriminator that ordering reads as "this
       // generation wrote" and would classify it `idle`; only generation identity can
       // tell the inherited prior write from a current-generation write. The write
@@ -614,8 +614,14 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(lastWrittenAt).toBeInstanceOf(Date);
       await db
         .update(issues)
-        .set({ createdAt: new Date(lastWrittenAt.getTime() - 1) })
+        .set({ createdAt: new Date(lastWrittenAt.getTime()) })
         .where(eq(issues.id, second.generatingIssue.id));
+      const laterGeneration = await db
+        .select({ createdAt: issues.createdAt })
+        .from(issues)
+        .where(eq(issues.id, second.generatingIssue.id))
+        .then((rows) => rows[0]!);
+      expect(laterGeneration.createdAt.getTime()).toBe(lastWrittenAt.getTime());
 
       const armed = await db
         .select()
