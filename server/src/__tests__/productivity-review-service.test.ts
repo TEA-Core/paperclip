@@ -135,6 +135,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     withRunComments?: boolean;
     withLeases?: boolean;
     status?: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+    errorCode?: string | null;
     durationMs?: number;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
@@ -149,6 +150,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
+        errorCode: input.errorCode ?? null,
         startedAt: createdAt,
         finishedAt: new Date(createdAt.getTime() + durationMs),
         contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
@@ -533,6 +535,66 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(review?.description).toContain("No-comment completed-run streak (budget-weighted): 2");
     expect(hold.held).toBe(true);
+  });
+
+  it("reports a run-timeout streak as runs dying, not a missing status comment (SUP-16095)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Mirror the SUP-15807 source instance: two ceiling-length adapter
+    // timeouts, zero run-created comments, no run ever succeeded.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 2,
+      status: "timed_out",
+      errorCode: "timeout",
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const description = review?.description ?? "";
+    expect(description).toContain("Primary trigger: `no_comment_streak`");
+    // The trigger reason names the run outcomes, not the "no comment" sentence.
+    expect(description).toContain("ended without a successful run (2 timed_out (timeout), 0 succeeded)");
+    expect(description).not.toContain("had no run-created issue comment");
+    // The Evidence block reports the streak's run-outcome mix including errorCode.
+    expect(description).toContain("Streak composition: 2 timed_out (timeout), 0 succeeded");
+    // The Manager Decision menu carries a runs-are-being-killed remedy.
+    expect(description).toContain("clear the wedge (a blocked or dead-end state) or shrink the task");
+  });
+
+  it("keeps the existing wording and threshold for a succeeded run streak (SUP-16095 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // A streak of `succeeded` runs that simply did not comment is the
+    // working-but-silent case: it must fire no_comment_streak with the
+    // existing wording and the existing budget-weighted threshold.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      status: "succeeded",
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const description = review?.description ?? "";
+    expect(description).toContain("Primary trigger: `no_comment_streak`");
+    expect(description).toContain("budget-equivalent consecutive completed issue-linked runs had no run-created issue comment");
+    expect(description).toContain("No-comment completed-run streak (budget-weighted): 2");
+    // The outcome mix is reported but shows the runs completing; the
+    // runs-are-dying decision bullet must NOT appear.
+    expect(description).toContain("Streak composition: 2 succeeded");
+    expect(description).not.toContain("ended without a successful run");
+    expect(description).not.toContain("clear the wedge (a blocked or dead-end state)");
   });
 
   it("does not fire the no-comment-streak trigger for four cheap cancelled runs (seconds each)", async () => {

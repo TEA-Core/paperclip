@@ -49,7 +49,7 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 // result_json/context_snapshot for up to MAX_RUNS_FOR_STREAK runs per issue.
 type ProductivityRunSample = Pick<
   HeartbeatRunRow,
-  "id" | "agentId" | "status" | "livenessState" | "startedAt" | "finishedAt" | "createdAt" | "nextAction" | "usageJson"
+  "id" | "agentId" | "status" | "livenessState" | "errorCode" | "startedAt" | "finishedAt" | "createdAt" | "nextAction" | "usageJson"
 >;
 type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
 
@@ -72,6 +72,8 @@ type ProductivityReviewEvidence = {
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
   noCommentStreak: number;
+  noCommentStreakOutcomeMix: string;
+  noCommentStreakHasSuccess: boolean;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -133,6 +135,47 @@ function runBudgetWeight(run: Pick<HeartbeatRunRow, "startedAt" | "finishedAt">)
 
 function formatBudgetWeightedStreak(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
+}
+
+/**
+ * Human-readable outcome mix of the no-comment streak's runs, e.g.
+ * `2 timed_out (timeout), 0 succeeded`. Groups the streak by run `status`,
+ * surfaces the `errorCode` when a status carries a single consistent one, and
+ * always reports the `succeeded` count (even zero) so the reader can see that
+ * no run in the streak actually completed. This is evidence-only: it never
+ * alters the streak's budget-weighted arithmetic.
+ */
+function buildStreakOutcomeMix(
+  streakRuns: Array<Pick<HeartbeatRunRow, "status" | "errorCode">>,
+): string {
+  if (streakRuns.length === 0) return "none";
+  const counts = new Map<string, number>();
+  const errorCodesByStatus = new Map<string, Set<string>>();
+  for (const run of streakRuns) {
+    counts.set(run.status, (counts.get(run.status) ?? 0) + 1);
+    if (run.errorCode) {
+      const codes = errorCodesByStatus.get(run.status) ?? new Set<string>();
+      codes.add(run.errorCode);
+      errorCodesByStatus.set(run.status, codes);
+    }
+  }
+  const statuses = new Set(counts.keys());
+  statuses.add("succeeded");
+  // Sort by count descending, then status ascending; the always-present
+  // `succeeded` anchor sorts to the end when nothing succeeded.
+  const sorted = [...statuses].sort((a, b) => {
+    const countDiff = (counts.get(b) ?? 0) - (counts.get(a) ?? 0);
+    if (countDiff !== 0) return countDiff;
+    return a.localeCompare(b);
+  });
+  return sorted
+    .map((status) => {
+      const count = counts.get(status) ?? 0;
+      const codes = errorCodesByStatus.get(status);
+      const code = codes && codes.size === 1 ? [...codes][0] : undefined;
+      return code ? `${count} ${status} (${code})` : `${count} ${status}`;
+    })
+    .join(", ");
 }
 
 function issueUiLink(issue: { identifier: string | null; id: string }, prefix: string) {
@@ -539,6 +582,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
         livenessState: heartbeatRuns.livenessState,
+        errorCode: heartbeatRuns.errorCode,
         startedAt: heartbeatRuns.startedAt,
         finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
@@ -578,10 +622,19 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
     let noCommentStreak = 0;
+    const streakRuns: ProductivityRunSample[] = [];
     for (const run of terminalRuns) {
       if (commentRunIds.has(run.id)) break;
+      streakRuns.push(run);
       noCommentStreak += runBudgetWeight(run);
     }
+    // The no-comment streak fires on `timed_out`/`failed` runs too. A streak
+    // with no `succeeded` run is a "runs are dying" pattern (the adapter keeps
+    // killing the run at its budget ceiling), not a "working but silent" one —
+    // so the card must say which it saw. Neither signal changes the threshold
+    // or the budget-weighted arithmetic above.
+    const noCommentStreakHasSuccess = streakRuns.some((run) => run.status === "succeeded");
+    const noCommentStreakOutcomeMix = buildStreakOutcomeMix(streakRuns);
 
     const [
       runCountLastHour,
@@ -646,7 +699,13 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
-    if (noComment) triggerReasons.push(`${formatBudgetWeightedStreak(noCommentStreak)} budget-equivalent consecutive completed issue-linked runs had no run-created issue comment`);
+    if (noComment) {
+      if (noCommentStreakHasSuccess) {
+        triggerReasons.push(`${formatBudgetWeightedStreak(noCommentStreak)} budget-equivalent consecutive completed issue-linked runs had no run-created issue comment`);
+      } else {
+        triggerReasons.push(`${formatBudgetWeightedStreak(noCommentStreak)} budget-equivalent consecutive completed issue-linked runs ended without a successful run (${noCommentStreakOutcomeMix})`);
+      }
+    }
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
@@ -660,6 +719,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       sourceIssue,
       sourceAgent,
       noCommentStreak,
+      noCommentStreakOutcomeMix,
+      noCommentStreakHasSuccess,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -754,6 +815,18 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const usage = evidence.usageSamples.length > 0
       ? evidence.usageSamples.map((sample) => `- \`${sample.runId}\`: \`${JSON.stringify(sample.usageJson).slice(0, 500)}\``).join("\n")
       : "- no usage payloads on sampled runs";
+    const managerDecision: string[] = [
+      "- Close as productive if this pattern is expected.",
+      "- Continue with a snooze window if the current work should keep running without repeat review spam.",
+    ];
+    if (evidence.trigger === "no_comment_streak" && !evidence.noCommentStreakHasSuccess) {
+      managerDecision.push(
+        "- Every run in the streak ended without success: clear the wedge (a blocked or dead-end state) or shrink the task so a run can finish before its budget ceiling, instead of asking the agent to comment on work that never completes.",
+      );
+    }
+    managerDecision.push(
+      "- Request decomposition, reroute, block with an unblock owner, or stop/cancel the source work if the work is inefficient.",
+    );
     return [
       "Paperclip detected an unusual productivity/progression pattern on an assigned issue.",
       "",
@@ -771,6 +844,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak (budget-weighted): ${formatBudgetWeightedStreak(evidence.noCommentStreak)}`,
+      `- Streak composition: ${evidence.noCommentStreakOutcomeMix}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
@@ -798,9 +872,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       "## Manager Decision",
       "",
-      "- Close as productive if this pattern is expected.",
-      "- Continue with a snooze window if the current work should keep running without repeat review spam.",
-      "- Request decomposition, reroute, block with an unblock owner, or stop/cancel the source work if the work is inefficient.",
+      ...managerDecision,
     ].join("\n");
   }
 
