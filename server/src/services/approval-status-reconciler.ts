@@ -2024,6 +2024,24 @@ async function temporalBackfillOutcome(
     };
   }
 
+  // SUP-16080 round-1 (post-approval-force-push-return-to-anchor): headAtApproval
+  // equals the live head, so the comparison above passes and we are about to
+  // certify it. But a post-approval force-push — even one back to THIS same
+  // anchor sha — rewrites branch history AFTER the approval, so the timeline
+  // cannot certify the head-at-approval. Refuse fail-closed. This is the only
+  // remaining shape that could otherwise certify despite a post-approval
+  // force-push: the fallback path (headAtApproval === null || anchorStale) is
+  // already guarded by sawPostApprovalForcePush, and the head-moved path above
+  // refuses whenever the anchor differs from the live head.
+  if (timeline.sawPostApprovalForcePush) {
+    return {
+      kind: "refused",
+      reason: "backfill:head-unverifiable",
+      transient: false,
+      detail: `backfill: ${target.displayName} shows a post-approval force-push event (even back to the anchor ${timeline.headAtApproval.slice(0, 7)}); the head-at-approval cannot be trusted from the timeline (the push-A/push-B/force-push-back-to-A hole); refusing to anchor an unverifiable head`,
+    };
+  }
+
   return {
     kind: "backfilled",
     anchorHeadSha: timeline.headAtApproval,

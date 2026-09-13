@@ -247,6 +247,18 @@ const TIMELINE_STALE_ANCHOR_POST_APPROVAL_BODY = [
   { event: "committed", sha: NEW_HEAD, committer: { date: "2026-09-13T09:00:00Z" }, author: { date: "2026-09-13T09:00:00Z" } },
   { event: "head_ref_force_pushed", commit_id: MOVED_HEAD, created_at: "2026-09-13T12:00:00Z" },
 ];
+// SUP-16080 round-1 (post-approval-force-push-return-to-anchor): a force-push at
+// PR #448's approval time pins headAtApproval to the anchor, then — with NO
+// intervening committed event (so committedAfterAnchor stays false and the anchor
+// is NOT stale) — a SECOND force-push of the SAME sha after the approval. The
+// ordinary headAtApproval === currentHeadSha comparison would then certify the
+// anchor even though branch history was rewritten AFTER the approval. Both
+// force-pushes carry the live head (NEW_HEAD, the PR head ref) so the anchor
+// equals the live head.
+const TIMELINE_POST_APPROVAL_FORCE_PUSH_BACK_TO_ANCHOR_BODY = [
+  { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-09-13T07:51:55Z" },
+  { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-09-13T12:00:00Z" },
+];
 
 // SUP-15017: a certified `no-pr` branch anchor + the commit-detail reads the
 // content-identity proof makes. The certified anchor is the branch head sha
@@ -3109,6 +3121,45 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
       expect(approvalStatus.approvedHeadSha).toBe(null);
       expect(approvalStatus.publishedHeadSha).toBe(null);
+    });
+
+    it("refuses head-unverifiable when a post-approval force-push returns to a pre-approval anchor with no intervening push (SUP-16080 round-1, force-push-back-to-anchor)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId, { createdAt: new Date(PR448_APPROVAL_AT) });
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        // No committed event follows the anchor, so committedAfterAnchor stays
+        // false and headAtApproval stays pinned to NEW_HEAD (the live head). The
+        // post-approval force-push back to the SAME sha must still refuse
+        // head-unverifiable — the ordinary headAtApproval === currentHeadSha
+        // comparison must not certify it. The check-runs read is never reached.
+        { url: TIMELINE_URL, body: TIMELINE_POST_APPROVAL_FORCE_PUSH_BACK_TO_ANCHOR_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(summary.skipped["backfill:head-moved-since-approval"]).toBeUndefined();
+      expect(postStatusCalls()).toHaveLength(0);
+
+      // No anchor stamped; the deterministic refusal is persisted.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(null);
+      expect(approvalStatus.publishedHeadSha).toBe(null);
+      expect((approvalStatus as Record<string, unknown>).backfillRefusal).toMatchObject({
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: NEW_HEAD,
+      });
     });
 
     it("reports a transient skip and does not persist when check-runs read fails (SUP-14844)", async () => {
