@@ -30,19 +30,6 @@ import {
   GITHUB_TOKEN_SECRET_NAMES,
 } from "../services/github-credential.js";
 
-// SUP-16130: exercise the REAL `armMergeOnApproval` actuator end-to-end. The
-// round-1 refusal test (finding `final-stage-route-regression-not-exercised`)
-// mocks `armMergeOnApproval` itself, so it cannot catch a regression where the
-// actuator never fires the `enablePullRequestAutoMerge` GraphQL mutation. This
-// file keeps the actuator, head resolver, and publisher REAL and mocks only the
-// two boundaries they funnel through:
-//   - `../services/github-fetch.js` -> ghFetch + gitHubApiBase
-//   - `../services/secrets.js`      -> secretService (getByName + resolveSecretValue)
-//
-// Fixture: a terminal two-stage ladder driven to `done` through the real PATCH
-// decision door, with a delivery-linked PR on the card's own branch that names
-// `SUP-676` in both title and head ref (the `SUP-\d+` ownership check, SUP-13361).
-// Asserts the mutation hit the transport AND `armOutcome.kind === "armed"` persisted.
 const mockGetByName = vi.hoisted(() => vi.fn());
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
@@ -60,7 +47,7 @@ vi.mock("../services/github-fetch.js", () => ({
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
 
-const GITHUB_TOKEN = "ghp_real_transport_test_token";
+const GITHUB_TOKEN = "test-token";
 const OWNER = "TEA-Core";
 const REPO = "paperclip";
 const PR_NUMBER = 676;
@@ -104,9 +91,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     mockGetByName.mockReset();
     mockResolveSecretValue.mockReset();
 
-    // Skip the GitHub App installation arm (no private key) and resolve the
-    // company-scope GITHUB_TOKEN the way a real deployment would — the single
-    // token candidate the actuator's candidate loop will use.
     mockGetByName.mockImplementation(async (_companyId: string, name: string) => {
       if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) return null;
       if ((GITHUB_TOKEN_SECRET_NAMES as readonly string[]).includes(name)) {
@@ -116,10 +100,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     });
     mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
 
-    // Default transport: the PR head read (decision pin + publish) and the
-    // commit-status write succeed; the GraphQL arming mutation succeeds and is
-    // recorded. Any URL not matched here fails loudly so an unexpected transport
-    // call is a regression, not a silent 200.
     mockGhFetch.mockImplementation(async (url: string) => {
       if (url === PR_URL) {
         return {
@@ -158,12 +138,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     return { type: "agent", agentId, companyId, source: "agent_key", runId };
   }
 
-  /**
-   * Seeds a terminal two-stage ladder parked on the pending final stage, bound to
-   * an execution workspace whose delivery branch is `SUP-676-branch` on
-   * `TEA-Core/paperclip`, plus a delivery-linked open PR that names `SUP-676` in
-   * both title and head ref and carries a known node id.
-   */
   async function seedFinalStageCard() {
     const companyId = randomUUID();
     const reviewerAgentId = randomUUID();
@@ -300,9 +274,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
 
-    // The pre-completed first stage must be backed by a decision row or
-    // evaluateStageIntegrity (guard-b:stage-without-decision) refuses the card
-    // before the arming hook.
     await db.insert(issueExecutionDecisions).values({
       companyId,
       issueId,
@@ -316,9 +287,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       updatedAt: now,
     });
 
-    // Delivery-linked open PR on the card's own branch in the project repo,
-    // naming SUP-676 in both title and head ref, with a known node id so the
-    // actuator goes straight to the arming mutation (no node-id REST fetch).
     const [externalObj] = await db
       .insert(externalObjects)
       .values({
@@ -364,7 +332,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     return rows[0]?.status;
   }
 
-  /** The `armOutcome` the real arming hook persisted onto executionState. */
   async function armOutcomeOf(issueId: string): Promise<{ kind: string; message: string; at: string } | undefined> {
     const rows = await db
       .select({ executionState: issues.executionState })
@@ -375,7 +342,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     return approvalStatus.armOutcome as { kind: string; message: string; at: string } | undefined;
   }
 
-  /** All `[Merge-arming]` comments the hook posted for the issue. */
   async function mergeArmingComments(issueId: string) {
     const rows = await db
       .select({ body: issueComments.body })
@@ -384,12 +350,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     return rows.filter((r) => typeof r.body === "string" && r.body.startsWith("[Merge-arming]"));
   }
 
-  /**
-   * The GraphQL arming mutation the real actuator made against the transport.
-   * The route also issues OTHER GraphQL round-trips on the same endpoint during
-   * the transition (e.g. a `prReviewDecision` read), so filter to the calls
-   * whose body is specifically the `enablePullRequestAutoMerge` mutation.
-   */
   function graphqlArmCalls() {
     return mockGhFetch.mock.calls.filter((call) => {
       const url = String(call[0]);
@@ -413,26 +373,17 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(issueId)).toBe("done");
 
-    // The REAL actuator fired the enablePullRequestAutoMerge mutation against
-    // the transport — this is the regression the round-1 mock could not catch.
-    // The route also issues an unrelated `prReviewDecision` GraphQL read on the
-    // same endpoint during the transition, so the helper filters to the arming
-    // mutation specifically. Exactly one arming round-trip reaches the transport,
-    // and it targets the delivered PR's node id.
     const armCalls = graphqlArmCalls();
     expect(armCalls).toHaveLength(1);
     const armBody = JSON.parse(String(armCalls[0]![1]!.body)) as { query: string };
     expect(armBody.query).toContain("enablePullRequestAutoMerge");
     expect(armBody.query).toContain(NODE_ID);
 
-    // The arming outcome was persisted onto the card as `armed`, with a durable
-    // ISO timestamp — diagnosable from GET /api/issues/{id} alone.
     const outcome = await armOutcomeOf(issueId);
     expect(outcome?.kind).toBe("armed");
     expect(outcome?.message).toContain("Auto-merge enabled");
     expect(outcome?.at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
 
-    // The hook's [Merge-arming] trace records the armed result too.
     const comments = await mergeArmingComments(issueId);
     expect(comments.some((c) => c.body!.includes("armed"))).toBe(true);
   });
