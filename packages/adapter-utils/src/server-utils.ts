@@ -12,6 +12,12 @@ import {
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import {
+  getRunProcessGroupCounter,
+  resolveRunProcessCap,
+  RunProcessCapExceededError,
+  shouldRefuseRunProcessSpawn,
+} from "./run-process-cap.js";
+import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   resolvePaperclipRunnerModel,
 } from "./paperclip-runner-permissions.js";
@@ -3997,6 +4003,56 @@ export async function runChildProcess(
           childEnv.PWD = spawnCwd;
           delete childEnv.OLDPWD;
         }
+
+        // SUP-16011: per-run process cap — refuse the spawn at the limit.
+        // Measure the run's *existing* process group through the census-grade
+        // counter before creating its top-level child, and refuse once the group
+        // has reached the cap. This is the single seam where run children are
+        // created, so no adapter can bypass it. Fails open when the cap is
+        // disabled or the group is unreadable (non-Linux / counter unwired), so
+        // an unmeasurable host never blocks a legitimate run.
+        const runProcessCap = resolveRunProcessCap(process.env);
+        const runProcessGroupCounter = getRunProcessGroupCounter();
+        if (runProcessCap !== null && runProcessGroupCounter) {
+          const existingProcess = runningProcesses.get(runId);
+          const existingGroupId =
+            existingProcess && typeof existingProcess.processGroupId === "number"
+              ? existingProcess.processGroupId
+              : null;
+          let currentRunProcessCount: number | null = null;
+          if (existingGroupId !== null && existingGroupId > 0) {
+            try {
+              currentRunProcessCount = runProcessGroupCounter(existingGroupId);
+            } catch (err) {
+              onLogError(
+                err,
+                runId,
+                "failed to measure run process group for the process cap",
+              );
+              currentRunProcessCount = null;
+            }
+          }
+          if (
+            existingGroupId !== null &&
+            shouldRefuseRunProcessSpawn({
+              cap: runProcessCap,
+              current: currentRunProcessCount,
+            })
+          ) {
+            // currentRunProcessCount is a number here: shouldRefuse is only true
+            // when it is non-null.
+            const refusal = new RunProcessCapExceededError({
+              runId,
+              cap: runProcessCap,
+              current: currentRunProcessCount as number,
+              processGroupId: existingGroupId,
+            });
+            onLogError(null, runId, refusal.message);
+            reject(refusal);
+            return;
+          }
+        }
+
         const child = spawn(target.command, target.args, {
           cwd: spawnCwd,
           env: childEnv,

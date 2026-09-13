@@ -469,6 +469,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isRunProcessCapExceededFailure } from "@paperclipai/adapter-utils/run-process-cap";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -24260,11 +24261,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         )
           ? outerErr
           : null;
+        // SUP-16011: a per-run process-cap refusal is a dispatch-time failure,
+        // not a setup crash. Recognise it explicitly so it keeps its own
+        // attributable code instead of collapsing to `setup_failed`.
+        const runProcessCapExceededFailure = isRunProcessCapExceededFailure(
+          outerErr,
+        )
+          ? outerErr
+          : null;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(
             (await getRun(runId).catch(() => null))?.errorCode,
           );
         const setupFailureErrorCode =
+          runProcessCapExceededFailure?.code ??
           workspaceValidationSetupFailure?.code ??
           configurationIncompleteSetupFailure?.code ??
           (unresolvedBaseRefSetupFailure
@@ -24305,6 +24315,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     errorCode: setupFailureErrorCode,
                     errorMessage: message,
                     resultJson:
+                      runProcessCapExceededFailure?.resultJson ??
                       workspaceValidationSetupFailure?.resultJson ??
                       configurationIncompleteSetupFailure?.resultJson ??
                       (unresolvedBaseRefSetupFailure
