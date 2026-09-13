@@ -5,13 +5,6 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import {
-  evaluateRunProcessSpawn,
-  getRunProcessGroupCounter,
-  resolveRunProcessCap,
-  type RunProcessCapExceededError,
-} from "@paperclipai/adapter-utils/run-process-cap";
-import { runningProcesses } from "@paperclipai/adapter-utils/server-utils";
 import type { Db } from "@paperclipai/db";
 
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
@@ -179,34 +172,6 @@ async function stopChild(
   }
 }
 
-/**
- * SUP-16011: admit or refuse a native run-child spawn at the per-run process
- * cap. Mirrors the `runChildProcess` seam: measure the run's currently-tracked
- * process group and refuse the spawn once it has reached the cap. The native
- * runner spawns `paperclip-runnerd` directly rather than through
- * `runChildProcess`, so without this check its run children could grow past
- * the cap; routing through the shared `evaluateRunProcessSpawn` keeps the
- * boundary identical to the seam. Fails open when the cap is disabled, the
- * counter is unwired, or the run has no tracked group yet. Exported so the
- * native boundary can be covered in tests without spawning the binary.
- */
-export function admitNativeRunnerSpawnCap(input: {
-  runId: string;
-  env?: NodeJS.ProcessEnv;
-}): RunProcessCapExceededError | null {
-  const trackedProcess = runningProcesses.get(input.runId);
-  const processGroupId =
-    trackedProcess && typeof trackedProcess.processGroupId === "number"
-      ? trackedProcess.processGroupId
-      : null;
-  return evaluateRunProcessSpawn({
-    runId: input.runId,
-    cap: resolveRunProcessCap(input.env ?? process.env),
-    counter: getRunProcessGroupCounter(),
-    processGroupId,
-  });
-}
-
 export async function executeNativeCodexRunner(input: {
   db: Db;
   companyId: string;
@@ -238,18 +203,6 @@ export async function executeNativeCodexRunner(input: {
     startedAt: string;
   }) => Promise<void>;
 }): Promise<AdapterExecutionResult> {
-  // SUP-16011: refuse the native spawn at the per-run process cap before any
-  // setup, so a run that has already reached the cap is not admitted to spawn
-  // its runnerd. Throwing the cap error (rather than returning a result) keeps
-  // the refusal universal: it unwinds the dispatch and the heartbeat's cap
-  // recognition records the attributable code on the run.
-  const runProcessCapRefusal = admitNativeRunnerSpawnCap({ runId: input.runId });
-  if (runProcessCapRefusal) {
-    await input
-      .onLog("stderr", `${runProcessCapRefusal.message}\n`)
-      .catch(() => {});
-    throw runProcessCapRefusal;
-  }
   const binary = input.runnerBinary ?? resolvePaperclipRunnerBinary();
   const runnerDigest = `sha256:${createHash("sha256").update(readFileSync(binary)).digest("hex")}`;
   const runtimeRoot = input.runtimeRoot

@@ -88,7 +88,7 @@ let injectedRunProcessGroupCounter: RunProcessGroupCounter | null = null;
 
 /**
  * Install the server's process-group counter into the seam. Called once at
- * server startup (`server/src/adapters/utils.ts`) with
+ * server startup (`startServer` in `server/src/index.ts`) with
  * `countLiveProcessGroupMembers`. Passing `null` unwires it (tests, or a host
  * that must not enforce the cap).
  */

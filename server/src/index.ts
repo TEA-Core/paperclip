@@ -88,6 +88,8 @@ import { createBranchPrReconcilerSweepService } from "./services/branch-pr-recon
 import { prDeliveryService } from "./services/pr-delivery.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
 import { runProcessCensusSweep } from "./services/run-process-census.js";
+import { countLiveProcessGroupMembers } from "./services/local-service-supervisor.js";
+import { registerRunProcessGroupCounter } from "@paperclipai/adapter-utils/run-process-cap";
 import {
   armSweepLiveness,
   sweepLivenessTracker,
@@ -183,6 +185,13 @@ export async function startServer(): Promise<StartedServer> {
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 
   process.umask(0o002);
+  // SUP-16011: wire the census-grade process-group counter into the run-child
+  // seam before any run child can be created. This is the single, explicit
+  // registration point (moved out of the adapters/utils.ts import-time side
+  // effect) so the per-run process cap measures the run's existing group.
+  // Inert on non-Linux hosts, where the counter returns null and the cap fails
+  // open.
+  registerRunProcessGroupCounter(countLiveProcessGroupMembers);
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
