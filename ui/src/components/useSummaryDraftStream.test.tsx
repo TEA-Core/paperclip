@@ -413,4 +413,49 @@ describe("useSummaryDraftStream", () => {
     await settleNow();
     expect(captured.current?.draft).toBe("second");
   });
+
+  it("resets when the active-run endpoint loses the tracked run, then rediscovers a later one", async () => {
+    vi.useFakeTimers();
+    const subscribers = new Set<CompanyLiveEventHandler>();
+    // Endpoint reports run-1 as the issue's active run; the hook adopts it.
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue({ id: "run-1", adapterType: "claude-local" });
+    ({ root } = renderHarness(issue("1"), subscribers));
+    await settleNow();
+    expect(captured.current?.runId).toBe("run-1");
+
+    // Stream a closed draft for the tracked run.
+    await act(async () => {
+      dispatchLiveEventToSubscribers(
+        subscribers,
+        "company-1",
+        logEvent("run-1", 1, "<<<SUMMARY-DRAFT>>>\nold\n<<<END-SUMMARY-DRAFT>>>"),
+      );
+    });
+    await settleNow();
+    expect(captured.current?.draft).toBe("old");
+
+    // The endpoint loses the run (its terminal event was missed). A fresh 4s poll
+    // must stop the log poller and clear the run id + draft. Advance well past one
+    // discovery interval so a refetch is guaranteed to fire and land.
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+    await advanceTimers(4000 * 2);
+    await settleNow();
+    expect(captured.current?.runId).toBeNull();
+    expect(captured.current?.draft).toBeNull();
+    expect(captured.current?.hasStream).toBe(false);
+
+    // Poller is torn down: more time passes without any further persisted-log reads.
+    const readsAfterReset = mockHeartbeatsApi.log.mock.calls.length;
+    await advanceTimers(4000 * 2);
+    await settleNow();
+    expect(mockHeartbeatsApi.log.mock.calls.length).toBe(readsAfterReset);
+
+    // A later run for the same issue is rediscovered and starts from a clean slate.
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue({ id: "run-2", adapterType: "claude-local" });
+    await advanceTimers(4000 * 2);
+    await settleNow();
+    expect(captured.current?.runId).toBe("run-2");
+    expect(captured.current?.draft).toBeNull();
+    expect(captured.current?.hasStream).toBe(false);
+  });
 });
