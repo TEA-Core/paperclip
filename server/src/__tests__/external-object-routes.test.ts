@@ -26,6 +26,7 @@ const mockAgentService = vi.hoisted(() => ({
 const mockExternalObjectsService = vi.hoisted(() => ({
   getIssueSummary: vi.fn(),
   getIssueSummaries: vi.fn(),
+  getStuckObjects: vi.fn(),
   listForIssue: vi.fn(),
   refreshIssueObjects: vi.fn(),
 }));
@@ -195,6 +196,9 @@ describe("external object routes", () => {
       new Map(issueIds.map((id) => [id, { total: 1, objects: [] }])),
     );
     mockExternalObjectsService.listForIssue.mockResolvedValue([]);
+    mockExternalObjectsService.getStuckObjects.mockResolvedValue([
+      { id: "77777777-7777-4777-8777-777777777777", providerKey: "github", liveness: "auth_required" },
+    ]);
     mockExternalObjectsService.refreshIssueObjects.mockResolvedValue([
       { object: { id: "77777777-7777-4777-8777-777777777777" }, refreshed: false, reason: "no_resolver" },
     ]);
@@ -277,6 +281,26 @@ describe("external object routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockExternalObjectsService.getIssueSummaries).not.toHaveBeenCalled();
+  });
+
+  it("allows board users to read company-scoped stuck external objects", async () => {
+    const app = await createApp(boardActor());
+
+    const res = await request(app).get(`/api/companies/${companyId}/external-objects/stuck`);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(1);
+    expect(mockExternalObjectsService.getStuckObjects).toHaveBeenCalledWith(companyId);
+  });
+
+  it("enforces company access on the company-scoped stuck external object read", async () => {
+    const app = await createApp({ ...ownerActor(), companyId: "other-company" });
+
+    const res = await request(app).get(`/api/companies/${companyId}/external-objects/stuck`);
+
+    expect(res.status).toBe(403);
+    expect(mockExternalObjectsService.getStuckObjects).not.toHaveBeenCalled();
   });
 
   it("requires active checkout ownership for agent manual refresh", async () => {

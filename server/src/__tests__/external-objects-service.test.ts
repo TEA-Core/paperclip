@@ -19,7 +19,9 @@ import {
 import {
   createExternalObjectDetectorRegistry,
   createExternalObjectResolverRegistry,
+  EXTERNAL_OBJECT_STUCK_THRESHOLD_SECONDS,
   externalObjectService,
+  isExternalObjectStuck,
   type ExternalObjectResolver,
 } from "../services/external-objects.js";
 import { canonicalizeExternalObjectUrl, extractExternalObjectCanonicalUrls } from "@paperclipai/shared/external-objects-server";
@@ -157,6 +159,38 @@ describe("external object registries", () => {
     expect(registry.find({ providerKey: "github", objectType: "pull_request" })).toBe(pullRequestResolver);
     expect(registry.find({ providerKey: "github", objectType: "issue" })).toBe(fallbackResolver);
     expect(registry.find({ providerKey: "linear", objectType: "issue" })).toBeNull();
+  });
+});
+
+describe("isExternalObjectStuck", () => {
+  const base = new Date("2026-09-12T00:00:00Z");
+  const HOUR = 60 * 60 * 1000;
+
+  it("exposes the threshold as a positive named constant", () => {
+    expect(EXTERNAL_OBJECT_STUCK_THRESHOLD_SECONDS).toBeGreaterThan(0);
+  });
+
+  it("is not stuck when there is no current error", () => {
+    expect(isExternalObjectStuck({ lastErrorAt: null, lastResolvedAt: null }, base)).toBe(false);
+    expect(isExternalObjectStuck({ lastErrorAt: null, lastResolvedAt: base }, base)).toBe(false);
+  });
+
+  it("is not stuck when the last resolve is inside the threshold", () => {
+    expect(
+      isExternalObjectStuck({ lastErrorAt: base, lastResolvedAt: new Date(base.getTime() - 30 * 60 * 1000) }, base),
+    ).toBe(false);
+  });
+
+  it("is stuck when it never resolved but is erroring", () => {
+    expect(isExternalObjectStuck({ lastErrorAt: base, lastResolvedAt: null }, base)).toBe(true);
+  });
+
+  it("is stuck when the last resolve is older than the threshold", () => {
+    expect(isExternalObjectStuck({ lastErrorAt: base, lastResolvedAt: new Date(base.getTime() - 25 * HOUR) }, base)).toBe(true);
+  });
+
+  it("stays stuck just past the threshold boundary", () => {
+    expect(isExternalObjectStuck({ lastErrorAt: base, lastResolvedAt: new Date(base.getTime() - (EXTERNAL_OBJECT_STUCK_THRESHOLD_SECONDS + 1) * 1000) }, base)).toBe(true);
   });
 });
 
@@ -1234,5 +1268,137 @@ describeEmbeddedPostgres("externalObjectService", () => {
       lastErrorCode: null,
     });
     expect(JSON.stringify(refreshed)).not.toContain("ghp_stale");
+  });
+
+  it("logs a stuck external object once per crossing and again after a successful resolve clears it", async () => {
+    const { companyId, issueId } = await createIssue();
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve: vi
+        .fn()
+        .mockResolvedValueOnce({ ok: false, liveness: "auth_required", errorCode: "github_auth_required", retryAfterSeconds: 60 })
+        .mockResolvedValueOnce({ ok: false, liveness: "auth_required", errorCode: "github_auth_required", retryAfterSeconds: 60 })
+        .mockResolvedValueOnce({ ok: true, snapshot: { statusCategory: "open", statusTone: "info", statusKey: "open", statusLabel: "Open", ttlSeconds: 60 } })
+        .mockResolvedValueOnce({ ok: false, liveness: "auth_required", errorCode: "github_auth_required", retryAfterSeconds: 60 }),
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const stuckMessage = "external object stuck in persistent failure; surfacing once";
+    const stuckLogCount = () => warnSpy.mock.calls.filter((call) => call[1] === stuckMessage).length;
+
+    const crossAt = new Date("2026-09-12T00:00:00Z");
+    // Never resolved recently: last success is far outside the threshold.
+    await db.update(externalObjects).set({ lastResolvedAt: new Date(crossAt.getTime() - 30 * 60 * 60 * 1000), lastErrorAt: null }).where(eq(externalObjects.id, object.id));
+
+    await svc.refreshObject(object.id, { companyId, force: true, now: crossAt });
+    expect(stuckLogCount()).toBe(1);
+    await svc.refreshObject(object.id, { companyId, force: true, now: new Date(crossAt.getTime() + 300 * 1000) });
+    expect(stuckLogCount()).toBe(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        companyId,
+        objectId: object.id,
+        providerKey: "url",
+        lastErrorCode: "github_auth_required",
+        url: object.sanitizedCanonicalUrl,
+      }),
+      stuckMessage,
+    );
+
+    // A successful resolve clears the stuck state, so a later crossing logs again.
+    const resolvedAt = new Date(crossAt.getTime() + 60 * 60 * 1000);
+    await svc.refreshObject(object.id, { companyId, force: true, now: resolvedAt });
+    expect(stuckLogCount()).toBe(1);
+    await svc.refreshObject(object.id, { companyId, force: true, now: new Date(resolvedAt.getTime() + 25 * 60 * 60 * 1000) });
+    expect(stuckLogCount()).toBe(2);
+  });
+
+  it("does not log or surface external objects that fail below the stuck threshold", async () => {
+    const { companyId, issueId } = await createIssue();
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve: vi.fn(async () => ({ ok: false, liveness: "unreachable", errorCode: "network", retryAfterSeconds: 60 })),
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const now = new Date("2026-09-12T00:00:00Z");
+    // Resolved recently: the current error is a transient, not a persistent failure.
+    await db.update(externalObjects).set({ lastResolvedAt: new Date(now.getTime() - 30 * 60 * 1000), lastErrorAt: null }).where(eq(externalObjects.id, object.id));
+
+    await svc.refreshObject(object.id, { companyId, force: true, now });
+
+    const stuckMessages = warnSpy.mock.calls.filter((call) => call[1] === "external object stuck in persistent failure; surfacing once").length;
+    expect(stuckMessages).toBe(0);
+    expect(await svc.getStuckObjects(companyId, now)).toEqual([]);
+  });
+
+  it("surfaces stuck objects company-scoped even when mentioned only by closed cards", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // The only card mentioning this object is already closed.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    const stuckAt = new Date("2026-09-01T00:00:00Z");
+    await db
+      .update(externalObjects)
+      .set({ lastErrorAt: stuckAt, lastErrorCode: "github_auth_required", lastResolvedAt: null, liveness: "auth_required" })
+      .where(eq(externalObjects.id, object.id));
+
+    const stuck = await svc.getStuckObjects(companyId, new Date("2026-09-12T00:00:00Z"));
+
+    expect(stuck.map((entry) => entry.id)).toContain(object.id);
+    expect(stuck.find((entry) => entry.id === object.id)).toMatchObject({
+      liveness: "auth_required",
+      lastErrorCode: "github_auth_required",
+      lastResolvedAt: null,
+    });
+  });
+
+  it("never exposes raw provider error bodies or token-like values on the company stuck read", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // Persist a raw provider error body the write-path sanitizer did not
+    // fully redact, to prove the read boundary is independent of it.
+    await db
+      .update(externalObjects)
+      .set({
+        lastErrorAt: new Date("2026-09-01T00:00:00Z"),
+        lastErrorCode: "github_provider_error",
+        lastErrorMessage: '{"message":"provider body token=secret-value"}',
+        lastResolvedAt: null,
+        liveness: "auth_required",
+      })
+      .where(eq(externalObjects.id, object.id));
+
+    const stuck = await svc.getStuckObjects(companyId, new Date("2026-09-12T00:00:00Z"));
+    const entry = stuck.find((found) => found.id === object.id)!;
+
+    // Identity/status fields are retained ...
+    expect(entry).toMatchObject({
+      id: object.id,
+      liveness: "auth_required",
+      lastErrorCode: "github_provider_error",
+      lastResolvedAt: null,
+    });
+    // ... but the persisted raw provider body and token-like value never reach the response.
+    const serialized = JSON.stringify(stuck);
+    expect(serialized).not.toContain("provider body");
+    expect(serialized).not.toContain("secret-value");
+    expect("lastErrorMessage" in entry).toBe(false);
+    expect("data" in entry).toBe(false);
+    expect("refreshToken" in entry).toBe(false);
   });
 });
