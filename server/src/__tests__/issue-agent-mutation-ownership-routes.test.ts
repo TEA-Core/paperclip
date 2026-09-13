@@ -2103,18 +2103,60 @@ describe("agent issue mutation checkout ownership", () => {
       );
     });
 
-    it("rejects a re-provision while the card has an active execution run (409)", async () => {
+    it("rejects a re-provision while the card holds a running execution run (409)", async () => {
       mockIssueService.getById.mockResolvedValue(
-        pinnedCard({ executionRunId: "66666666-6666-4666-8666-666666666666" }),
+        pinnedCard({ executionRunId: "88888888-8888-4888-8888-888888888888" }),
       );
+      // A started run actually holds the issue (it leased an environment and a
+      // process is live), so it must still block the re-provision.
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        status: "running",
+        startedAt: new Date(),
+      });
       const res = await request(await createApp(ancestorActor()))
         .patch(`/api/issues/${issueId}`)
         .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
 
       expect(res.status).toBe(409);
       expect(res.body.code).toBe("issue_workspace_reprovision_run_active");
+      expect(res.body.details.executionRunStatus).toBe("running");
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).not.toHaveBeenCalled();
+    });
+
+    it("lets an ancestor re-provision a card pinned to a workspace whose executionRunId is an unstarted scheduled_retry run (SUP-16051)", async () => {
+      // SUP-16046 observed failure: a card deferred by workspace contention sits in
+      // `scheduled_retry` — it never leased an environment and no process started —
+      // yet still carries an executionRunId. That run must NOT block the correction;
+      // the card leaves its pinned carrier and is re-provisioned.
+      mockIssueService.getById.mockResolvedValue(
+        pinnedCard({ executionRunId: "88888888-8888-4888-8888-888888888888" }),
+      );
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        status: "scheduled_retry",
+        startedAt: null,
+      });
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          parentId: null,
+          executionWorkspacePreference: "isolated_workspace",
+          executionWorkspaceId: null,
+        }),
+        expect.anything(),
+      );
+      expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).toHaveBeenCalledWith(
+        pinnedWorkspaceId,
+        { companyId },
+        expect.anything(),
+      );
     });
 
     it("still 403s when a correction field is mixed with a forbidden substance field", async () => {

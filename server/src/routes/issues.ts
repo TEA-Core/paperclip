@@ -13103,23 +13103,36 @@ export function issueRoutes(
           parentChanged || preferenceChanged || settingsChanged || execWsIdChanged;
         if (reprovisionRequested) {
           // Precondition (acceptance §3): a re-provision is only legal while the
-          // card is not mid-run and its vehicle is not in provisioning/closing.
-          // The "provisioning/closing" vehicle state has no dedicated status in
-          // this build; an in-flight run is the concrete live signal, so the
-          // active-run guard is the operative check. A row already in a closed
-          // status is a no-op inside the close service call.
+          // card does not hold a live, in-flight run and its vehicle is not in
+          // provisioning/closing. The "provisioning/closing" vehicle state has no
+          // dedicated status in this build; an in-flight run is the concrete live
+          // signal, so the active-run guard is the operative check. A row already
+          // in a closed status is a no-op inside the close service call.
+          //
+          // A run is "active" only when it actually holds the issue. A run that has
+          // never leased an environment — a deferred `scheduled_retry` (deferred by
+          // workspace contention, no process ever started), a not-yet-started
+          // `queued` run, or a run that already reached a terminal status — is NOT
+          // in flight and does not block: it is exactly the stuck, never-leased card
+          // this correction path exists to un-wedge. Only a started `running` run
+          // blocks re-provision, so the running protection is not weakened.
           if (existing.executionRunId != null) {
-            res.status(409).json({
-              error: "Cannot re-provision the execution workspace while a run is active on this issue; wait for the run to finish before correcting the card's workspace",
-              code: "issue_workspace_reprovision_run_active",
-              details: {
-                issueId: existing.id,
-                identifier: existing.identifier ?? null,
-                executionRunId: existing.executionRunId,
-                pinnedExecutionWorkspaceId: oldPinnedWorkspaceId,
-              },
-            });
-            return;
+            const activeRun = await heartbeat.getRun(existing.executionRunId);
+            const activeRunStatus = activeRun?.status ?? null;
+            if (activeRunStatus === "running") {
+              res.status(409).json({
+                error: "Cannot re-provision the execution workspace while a run is active on this issue; wait for the run to finish before correcting the card's workspace",
+                code: "issue_workspace_reprovision_run_active",
+                details: {
+                  issueId: existing.id,
+                  identifier: existing.identifier ?? null,
+                  executionRunId: existing.executionRunId,
+                  executionRunStatus: activeRunStatus,
+                  pinnedExecutionWorkspaceId: oldPinnedWorkspaceId,
+                },
+              });
+              return;
+            }
           }
           // SUP-15543 (round-1 fix): fail-closed precondition on the pinned vehicle.
           // Refuse, and commit nothing, when the pinned row is not in a state the
