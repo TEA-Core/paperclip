@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -20,7 +20,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { writeSummarySlotSchema } from "@paperclipai/shared";
+import { writeSummarySlotSchema, type WriteSummarySlotResponse } from "@paperclipai/shared";
 import {
   resolveSummaryGenerationReturnAssignee,
   summarySlotService,
@@ -148,9 +148,19 @@ describeEmbeddedPostgres("summary slot service", () => {
     return agentId;
   }
 
-  async function seedRun(companyId: string, agentId: string) {
+  async function seedRun(companyId: string, agentId: string, issueId?: string) {
     const runId = randomUUID();
-    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running" });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      // Finalization attributes the slot's surviving revision back to the issue that
+      // drove it via the writing run's context snapshot (see
+      // summary-slot-finalization.ts). Name the driving issue so a real write is
+      // correctly classified as this generation's own.
+      contextSnapshot: issueId ? { issueId } : {},
+    });
     return runId;
   }
 
@@ -473,7 +483,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const failed = await svc.getSlot(projectSelector(companyId, projectId));
       expect(failed.slot).toMatchObject({
         status: "failed",
-        generatingIssueId: first.generatingIssue.id,
+        generatingIssueId: null,
         failureReason: expect.stringContaining("finished without writing a summary"),
       });
 
@@ -502,7 +512,142 @@ describeEmbeddedPostgres("summary slot service", () => {
       const result = await svc.getSlot(projectSelector(companyId, projectId));
       expect(result.slot).toMatchObject({
         status: "failed",
-        generatingIssueId: generated.generatingIssue.id,
+        generatingIssueId: null,
+        failureReason: expect.stringContaining("was cancelled before writing a summary"),
+      });
+    });
+
+    it("classifies a new generation over an inherited document as failed when it never writes (stale-document regression)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      // A PRIOR generation wrote and finished, leaving a document + last_generated_at
+      // that survive across generations (upsertSlot never clears them).
+      const priorDoc = await db
+        .insert(documents)
+        .values({
+          companyId,
+          format: "markdown",
+          latestBody: "# Prior generation summary",
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+      await db.insert(summarySlots).values({
+        companyId,
+        scopeKind: "project",
+        slotKey: "header",
+        scopeId: projectId,
+        documentId: priorDoc.id,
+        status: "idle",
+        generatingIssueId: null,
+        lastGeneratedAt: new Date("2020-01-01T00:00:00.000Z"),
+      });
+
+      // Arm a FRESH generation over the inherited slot, then cancel it without writing.
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const armed = await db
+        .select()
+        .from(summarySlots)
+        .where(eq(summarySlots.companyId, companyId))
+        .then((rows) => rows[0]!);
+      // The new generation inherited the prior document + timestamp but is fresh.
+      expect(armed.documentId).toBe(priorDoc.id);
+      expect(armed.status).toBe("generating");
+
+      await issueService(db).update(generated.generatingIssue.id, { status: "cancelled" });
+
+      // A present document must NOT mark this never-written generation as `idle`.
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot).toMatchObject({
+        status: "failed",
+        generatingIssueId: null,
+        failureReason: expect.stringContaining("was cancelled before writing a summary"),
+      });
+    });
+
+    it("classifies an unwritten generation as failed when it inherits a prior generation's real write (identity regression)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      // A PRIOR generation lands a REAL write: a document + revision + a writing run
+      // whose context snapshot names that prior generation issue. This is the
+      // surviving revision the next generation will inherit.
+      const first = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const priorRunId = await seedRun(companyId, summarizerAgentId, first.generatingIssue.id);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: priorRunId })
+        .where(eq(issues.id, first.generatingIssue.id));
+      const priorWrite = await svc.write(
+        {
+          ...projectSelector(companyId, projectId),
+          markdown: "# Prior generation summary",
+          generationIssueId: first.generatingIssue.id,
+        },
+        { agentId: summarizerAgentId, runId: priorRunId },
+      );
+      expect(priorWrite.revision.revisionNumber).toBe(1);
+
+      // The prior generation finished and DID write, so it finalizes to idle, leaving
+      // the real revision + document that survive across generations.
+      await issueService(db).update(first.generatingIssue.id, { status: "done" });
+      const afterFirst = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(afterFirst.slot).toMatchObject({ status: "idle", documentId: afterFirst.document!.id });
+
+      // Arm a FRESH generation over the inherited slot, then cancel it without writing.
+      const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      // COLLISION SETUP: place the later generation's creation instant one millisecond
+      // before the surviving revision's `last_generated_at`, in the prior write's
+      // normalized millisecond. Under the rejected strict
+      // `last_generated_at > created_at` discriminator that ordering reads as "this
+      // generation wrote" and would classify it `idle`; only generation identity can
+      // tell the inherited prior write from a current-generation write. The write
+      // evidence (`last_generated_at`, stamped by `write()`) is NOT mutated — only the
+      // later generation's creation boundary is arranged, the boundary a resubmit
+      // race can produce. Setting it equal to the write (the prior review's mutated
+      // setup) would make the strict `>` false and let the rejected heuristic also
+      // pass, so the boundary must sit strictly before the write.
+      const lastWrittenAt = afterFirst.slot.lastGeneratedAt!;
+      expect(lastWrittenAt).toBeInstanceOf(Date);
+      await db
+        .update(issues)
+        .set({ createdAt: new Date(lastWrittenAt.getTime() - 1) })
+        .where(eq(issues.id, second.generatingIssue.id));
+      const laterGeneration = await db
+        .select({ createdAt: issues.createdAt })
+        .from(issues)
+        .where(eq(issues.id, second.generatingIssue.id))
+        .then((rows) => rows[0]!);
+      // Read-back proves the normalized boundary is strictly before the write, i.e.
+      // `last_generated_at > created_at` holds: the rejected strict heuristic would
+      // classify this unwritten generation `idle` (wrong); identity classifies it
+      // `failed` (right).
+      expect(lastWrittenAt.getTime()).toBeGreaterThan(laterGeneration.createdAt.getTime());
+
+      const armed = await db
+        .select()
+        .from(summarySlots)
+        .where(eq(summarySlots.companyId, companyId))
+        .then((rows) => rows[0]!);
+      // The new generation inherited the prior document but wrote nothing.
+      expect(armed.documentId).toBe(afterFirst.document!.id);
+      expect(armed.status).toBe("generating");
+
+      await issueService(db).update(second.generatingIssue.id, { status: "cancelled" });
+
+      // The surviving revision was created by the PRIOR generation's run, not this
+      // one. Identity must mark this never-written generation `failed`, not `idle` —
+      // a timestamp in the same normalized millisecond as the inherited write cannot
+      // tell the two apart, but the writing run's context snapshot can.
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot).toMatchObject({
+        status: "failed",
+        generatingIssueId: null,
         failureReason: expect.stringContaining("was cancelled before writing a summary"),
       });
     });
@@ -512,13 +657,13 @@ describeEmbeddedPostgres("summary slot service", () => {
     async function startGeneration(companyId: string, projectId: string, summarizerAgentId: string) {
       const svc = summarySlotService(db);
       const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
-      const runId = await seedRun(companyId, summarizerAgentId);
+      const runId = await seedRun(companyId, summarizerAgentId, generated.generatingIssue.id);
       // Simulate the summarizer run checking out its linked generation task.
       await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, generated.generatingIssue.id));
       return { svc, generationIssueId: generated.generatingIssue.id, runId };
     }
 
-    it("writes a board-readable revision, preserves the previous revision, and clears the generating state", async () => {
+    it("writes a board-readable revision, preserves the previous revision, and keeps the slot armed for the live generation task", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
       const summarizerAgentId = await seedSummarizer(companyId);
@@ -538,7 +683,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const nextGeneration = await svc.generate(projectSelector(companyId, projectId), {
         userId: "board-user",
       });
-      const nextRunId = await seedRun(companyId, summarizerAgentId);
+      const nextRunId = await seedRun(companyId, summarizerAgentId, nextGeneration.generatingIssue.id);
       await db
         .update(issues)
         .set({ checkoutRunId: nextRunId })
@@ -558,8 +703,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(written.revision.revisionNumber).toBe(2);
       expect(written.document.body).toMatch(/^\*\*Decide:\*\*[\s\S]*\*\*I suggest:\*\*/m);
       expect(written.document.body).not.toMatch(/^Issues: /m);
-      expect(written.slot.status).toBe("idle");
-      expect(written.slot.generatingIssueId).toBeNull();
+      expect(written.slot.status).toBe("generating");
+      expect(written.slot.generatingIssueId).toBe(generationIssueId);
       expect(written.slot.documentId).toBe(written.document.id);
       expect(written.slot.lastGeneratedByAgentId).toBe(summarizerAgentId);
       expect(written.slot.lastModel).toBe("cheap-model");
@@ -569,6 +714,229 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(revisions.revisions[0]!.id).toBe(written.revision.id);
       expect(revisions.revisions[1]!.id).toBe(initial.revision.id);
       expect(revisions.revisions[1]!.body).toContain("First summary for this scope.");
+    });
+
+    it("serializes concurrent writes for the same slot into sequential revisions instead of leaking a revision unique-index violation", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
+
+      // Pre-seed a document at revision 1 and point the still-generating slot at it so
+      // both concurrent writers read the same latestRevisionNumber and both compute the
+      // same next revision (the document_revisions_document_revision_uq shape). Because
+      // the slot stays armed after a write (SUP-15773), both writes target this document.
+      const seedDocumentId = randomUUID();
+      await db.insert(documents).values({
+        id: seedDocumentId,
+        companyId,
+        latestBody: "# Seeded",
+        latestRevisionNumber: 1,
+      });
+      await db.insert(documentRevisions).values({
+        companyId,
+        documentId: seedDocumentId,
+        revisionNumber: 1,
+        body: "# Seeded",
+      });
+      await db
+        .update(summarySlots)
+        .set({ documentId: seedDocumentId })
+        .where(
+          and(
+            eq(summarySlots.companyId, companyId),
+            eq(summarySlots.scopeKind, "project"),
+            eq(summarySlots.scopeId, projectId),
+            eq(summarySlots.slotKey, "header"),
+          ),
+        );
+
+      const makeWrite = (markdown: string) =>
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown, generationIssueId },
+          { agentId: summarizerAgentId, runId },
+        );
+
+      const settled = await Promise.allSettled([
+        makeWrite("# Concurrent write A"),
+        makeWrite("# Concurrent write B"),
+      ]);
+
+      const fulfilled = settled.filter(
+        (r): r is PromiseFulfilledResult<WriteSummarySlotResponse> => r.status === "fulfilled",
+      );
+      const rejected = settled.filter(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+
+      // The slot row lock serializes the two writers: both land, each computing its
+      // next revision from the latest document state — never the same revision number.
+      // No raw unique-index error is exposed.
+      expect(rejected).toHaveLength(0);
+      expect(fulfilled).toHaveLength(2);
+
+      const revisionNumbers = fulfilled.map((r) => r.value.revision.revisionNumber).sort((a, b) => a - b);
+      expect(revisionNumbers).toEqual([2, 3]);
+
+      // Both revisions land on the same (seeded) document.
+      expect(new Set(fulfilled.map((r) => r.value.document.id)).size).toBe(1);
+      expect(fulfilled[0]!.value.document.id).toBe(seedDocumentId);
+
+      const revisions = await svc.listRevisions(projectSelector(companyId, projectId));
+      expect(revisions.revisions).toHaveLength(3);
+      expect(revisions.revisions[0]!.revisionNumber).toBe(3);
+      expect(revisions.revisions[2]!.revisionNumber).toBe(1);
+    });
+
+    it("allows a second write for the same generation task after a changes_requested bounce, then releases the link only at terminal", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
+
+      // First revision lands; the slot must stay armed for the still-active task.
+      const first = await svc.write(
+        { ...projectSelector(companyId, projectId), markdown: "# Summary v1", generationIssueId },
+        { agentId: summarizerAgentId, runId },
+      );
+      expect(first.revision.revisionNumber).toBe(1);
+      expect(first.slot.status).toBe("generating");
+      expect(first.slot.generatingIssueId).toBe(generationIssueId);
+
+      // The summarizer submits the summary for review. Arm a single review stage
+      // whose participant is a board reviewer and whose return assignee is the
+      // summarizer — the agent that owns the slot write — so the bounce lands the
+      // task back on the same principal that can write the slot.
+      const reviewStageId = randomUUID();
+      const reviewerUserId = "board-reviewer";
+      await issueService(db).update(generationIssueId, {
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          returnAssigneeAgentId: summarizerAgentId,
+          stages: [
+            {
+              id: reviewStageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ id: randomUUID(), type: "user", userId: reviewerUserId }],
+            },
+          ],
+        },
+        status: "in_review",
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "user", userId: reviewerUserId },
+          returnAssignee: { type: "agent", agentId: summarizerAgentId },
+          deliveryAuthor: { type: "agent", agentId: summarizerAgentId },
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      });
+
+      // Drive the ACTUAL review-bounce through the execution engine: the reviewer
+      // requests changes and the engine bounces the SAME generation task back to
+      // the summarizer (executionState.status = "changes_requested", issue back
+      // in_progress). This is the transition a real changes_requested verdict
+      // performs — not a comment, so the regression cannot be faked by a stale
+      // slot link.
+      const armedIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generationIssueId))
+        .then((rows) => rows[0]!);
+      const policy = normalizeIssueExecutionPolicy(armedIssue.executionPolicy ?? null);
+      const bounce = applyIssueExecutionPolicyTransition({
+        issue: armedIssue,
+        policy,
+        previousPolicy: policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { userId: reviewerUserId },
+        commentBody: "Lead with the decision; the draft buries it.",
+      });
+      expect(bounce.decision?.outcome).toBe("changes_requested");
+      await issueService(db).update(
+        generationIssueId,
+        bounce.patch as Partial<typeof issues.$inferInsert>,
+      );
+      const bouncedIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generationIssueId))
+        .then((rows) => rows[0]!);
+      expect(bouncedIssue.status).toBe("in_progress");
+      expect(bouncedIssue.assigneeAgentId).toBe(summarizerAgentId);
+      expect(bouncedIssue.executionState).toMatchObject({
+        status: "changes_requested",
+        lastDecisionOutcome: "changes_requested",
+      });
+
+      // The bounce hands the task back to the summarizer on a fresh run; the
+      // execution engine re-checks out the task, re-stamping checkoutRunId.
+      // Mirror that so the write guard's run-match holds.
+      const resubmitRunId = await seedRun(companyId, summarizerAgentId, generationIssueId);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: resubmitRunId })
+        .where(eq(issues.id, generationIssueId));
+
+      // After the real bounce the SAME generation task writes a corrected revision
+      // with no board re-arm in between (SUP-15773).
+      const second = await svc.write(
+        {
+          ...projectSelector(companyId, projectId),
+          markdown: "# Summary v2 (corrected)",
+          baseRevisionId: first.revision.id,
+          generationIssueId,
+        },
+        { agentId: summarizerAgentId, runId: resubmitRunId },
+      );
+      expect(second.revision.revisionNumber).toBe(2);
+      expect(second.slot.status).toBe("generating");
+      expect(second.slot.generatingIssueId).toBe(generationIssueId);
+
+      // The link is cleared exactly once, at the terminal transition.
+      await issueService(db).update(generationIssueId, { status: "done" });
+      const afterTerminal = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(afterTerminal.slot).toMatchObject({ status: "idle", generatingIssueId: null });
+      expect(afterTerminal.generatingIssue).toBeNull();
+
+      // A terminal generation task that still holds the slot link (a write request
+      // that captured the link just before the terminal transition) must be refused
+      // by the terminal-status guard — NOT the earlier active-link guard. Re-arm the
+      // link to the now-terminal task to model that in-flight race: the guard order
+      // is active-link (5) then terminal-status (6), so only a present link lets the
+      // request reach the terminal-status refusal. Use the resubmission run, the run
+      // that owns the task after the bounce.
+      await db
+        .update(summarySlots)
+        .set({ generatingIssueId: generationIssueId })
+        .where(
+          and(
+            eq(summarySlots.companyId, companyId),
+            eq(summarySlots.scopeKind, "project"),
+            eq(summarySlots.slotKey, "header"),
+            eq(summarySlots.scopeId, projectId),
+          ),
+        );
+      await expect(
+        svc.write(
+          {
+            ...projectSelector(companyId, projectId),
+            markdown: "# Too late",
+            baseRevisionId: second.revision.id,
+            generationIssueId,
+          },
+          { agentId: summarizerAgentId, runId: resubmitRunId },
+        ),
+      ).rejects.toMatchObject({
+        status: 403,
+        message: "Summary write is not available from a terminal generation task",
+      });
     });
 
     it("returns only the 20 most recent summary revisions", async () => {
@@ -611,7 +979,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const second = await summarySlotService(db).generate(projectSelector(companyId, projectId), {
         userId: "board-user",
       });
-      const runId2 = await seedRun(companyId, summarizerAgentId);
+      const runId2 = await seedRun(companyId, summarizerAgentId, second.generatingIssue.id);
       await db.update(issues).set({ checkoutRunId: runId2 }).where(eq(issues.id, second.generatingIssue.id));
 
       await expect(

@@ -629,6 +629,9 @@ export function summarySlotService(db: Db) {
     if (!issueRef.row) {
       throw forbidden("Linked generation task not found");
     }
+    if (!isIssueActive(issueRef.row)) {
+      throw forbidden("Summary write is not available from a terminal generation task");
+    }
     const payloadMatch = issueRef.row.description?.match(/```json\n([\s\S]*?)\n```/);
     let payload: Record<string, unknown> | null = null;
     try {
@@ -673,11 +676,19 @@ export function summarySlotService(db: Db) {
 
     const now = new Date();
     const result = await db.transaction(async (tx) => {
+      // The linked slot row is the serialization boundary for document
+      // revision allocation. Hold a row lock so concurrent writers for the
+      // same slot queue up and re-read the latest document state only after
+      // the lock is acquired; otherwise two writers both read the same
+      // latestRevisionNumber, both compute the same next revision, and one's
+      // insert leaks as an uncontrolled document_revisions_document_revision_uq
+      // violation instead of a deterministic, serialized result.
       const currentSlot = slotRow
         ? await tx
             .select()
             .from(summarySlots)
             .where(eq(summarySlots.id, slotRow.id))
+            .for("update")
             .then((rows) => rows[0] ?? null)
         : null;
       if (!currentSlot || currentSlot.generatingIssueId !== input.generationIssueId) {
@@ -768,11 +779,17 @@ export function summarySlotService(db: Db) {
           .returning();
       }
 
+      // A successful write does NOT release the generation link: the task may
+      // still be in review and get a changes_requested bounce, so the slot must
+      // stay armed for a second write against the same generationIssueId. The
+      // link is released exactly once, at the issue's terminal transition, by
+      // finalizeSummarySlotsForTerminalIssue (SUP-15773). We therefore keep
+      // `status` at "generating" and leave `generatingIssueId` untouched here
+      // (the WHERE clause below pins it to the active generation task).
       const slotPatch = {
         documentId: documentRow.id,
-        status: "idle" as const,
+        status: "generating" as const,
         failureReason: null,
-        generatingIssueId: null,
         lastGeneratedAt: now,
         lastGeneratedByAgentId: actor.agentId ?? null,
         lastModel: input.model ?? null,
