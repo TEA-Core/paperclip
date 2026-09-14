@@ -326,14 +326,25 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     return rows[0]?.status;
   }
 
-  /** All `[Merge-arming]` comments the hook posted for the issue. */
-  async function mergeArmingComments(issueId: string) {
-    const rows = await db
-      .select({ body: issueComments.body })
-      .from(issueComments)
-      .where(eq(issueComments.issueId, issueId));
-    return rows.filter((r) => typeof r.body === "string" && r.body.startsWith("[Merge-arming]"));
-  }
+   /** All `[Merge-arming]` comments the hook posted for the issue. */
+   async function mergeArmingComments(issueId: string) {
+     const rows = await db
+       .select({ body: issueComments.body })
+       .from(issueComments)
+       .where(eq(issueComments.issueId, issueId));
+     return rows.filter((r) => typeof r.body === "string" && r.body.startsWith("[Merge-arming]"));
+   }
+
+   /** The `armOutcome` the hook persisted onto executionState.approvalStatus, if any. */
+   async function armOutcomeOf(issueId: string): Promise<{ kind: string; message: string; at: string } | undefined> {
+     const rows = await db
+       .select({ executionState: issues.executionState })
+       .from(issues)
+       .where(eq(issues.id, issueId));
+     const state = (rows[0]?.executionState ?? {}) as Record<string, unknown>;
+     const approvalStatus = (state.approvalStatus ?? {}) as Record<string, unknown>;
+     return approvalStatus.armOutcome as { kind: string; message: string; at: string } | undefined;
+   }
 
   /** Approves the card's current pending stage through the PATCH decision door. */
   async function approveCurrentStage(identifier: string) {
@@ -442,6 +453,77 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     expect(comments).toHaveLength(2);
     expect(comments[0]!.body).toContain("status:published:");
     expect(comments[1]!.body).toContain("armed:");
+  });
+
+  it("SUP-16088 route regression (final-stage done, fold base): the hook persists armOutcome kind=armed on the card", async () => {
+    // The SUP-16050 shape driven end-to-end through the REAL route hook: a terminal
+    // card on a fold base whose final review stage is approved resolves to `done`,
+    // stamps, and arms. Round-1 findings 1+2 ask for the route-level assertion that
+    // the persisted per-approval armOutcome is present (the service test in
+    // services/merge-arming.test.ts only calls armMergeOnApproval directly, which
+    // never reaches the persist block in this hook).
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DARM1", {
+      preCompleted: 1,
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#676",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({
+      kind: "armed",
+      message: "status:published: paperclip/approved status written to TEA-Core/paperclip#676 head deadbee",
+      headSha: "deadbeefcafe",
+    });
+    mockArmMergeOnApproval.mockResolvedValue({
+      kind: "armed",
+      message: "armed: Auto-merge enabled for TEA-Core/paperclip#676",
+    });
+
+    const res = await approveCurrentStage(identifier);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+
+    expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(1);
+    const armOutcome = await armOutcomeOf(issueId);
+    expect(armOutcome?.kind).toBe("armed");
+    expect(armOutcome?.message).toContain("armed:");
+    expect(typeof armOutcome?.at).toBe("string");
+  });
+
+  it("SUP-16088 route regression (armMergeOnApproval throws): a thrown arming persists armOutcome kind=errored and does not break the done transition", async () => {
+    // Round-1 finding 1 (arm-outcome-misses-thrown-errors): a residual arming throw
+    // (token-candidate resolution / a rejecting db.select / resolveLinkedPullRequests)
+    // must still leave a durable trace on the card instead of being swallowed by the
+    // outer "merge-arming hook failed" catch. The closing transition must survive.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DARM2", {
+      preCompleted: 1,
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#676",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({
+      kind: "armed",
+      message: "status:published: paperclip/approved status written to TEA-Core/paperclip#676 head deadbee",
+      headSha: "deadbeefcafe",
+    });
+    mockArmMergeOnApproval.mockRejectedValueOnce(new Error("simulated token-candidate resolution failure"));
+
+    const res = await approveCurrentStage(identifier);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // The arming miss must not break the closing transition.
+    expect(await statusOf(issueId)).toBe("done");
+
+    const armOutcome = await armOutcomeOf(issueId);
+    expect(armOutcome?.kind).toBe("errored");
+    expect(armOutcome?.message).toContain("arming threw:");
+    expect(typeof armOutcome?.at).toBe("string");
   });
 
   it("SUP-15163 mid-ladder card: approving stage 1 of 2 refuses -> no stamp, no arm, exactly one non-terminal-ladder comment, card stays in_review", async () => {
