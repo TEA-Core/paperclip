@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { and, eq, ilike, sql } from "drizzle-orm";
+import { and, eq, ilike, sql, type SQL } from "drizzle-orm";
 import {
   externalObjectMentions,
   externalObjects,
@@ -1697,7 +1697,15 @@ export async function publishApprovalStatus(
           headSha,
         };
       }
-      const result = await writeCommitStatus(pr.candidate.token, pr.owner, pr.repo, headSha, issueIdentifier);
+      // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
+      // recording a failure; a deterministic refusal returns after one attempt.
+      const result = await writeCommitStatusWithRetry(
+        pr.candidate.token,
+        pr.owner,
+        pr.repo,
+        headSha,
+        issueIdentifier,
+      );
       if (result.success) {
         return {
           kind: "armed",
@@ -1822,7 +1830,9 @@ export async function publishApprovalStatus(
         headSha,
       };
     }
-    const result = await writeCommitStatus(token, pr.owner, pr.repo, headSha, issueIdentifier);
+    // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
+    // recording a failure; a deterministic refusal returns after one attempt.
+    const result = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier);
     if (result.success) {
       return {
         kind: "armed",
@@ -2665,7 +2675,7 @@ async function writeCommitStatus(
   repo: string,
   headSha: string,
   issueIdentifier: string,
-): Promise<{ success: boolean; error: string | null }> {
+): Promise<{ success: boolean; error: string | null; status: number; transient: boolean }> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/statuses/${encodeURIComponent(headSha)}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
@@ -2689,22 +2699,269 @@ async function writeCommitStatus(
       body,
     });
   } catch {
-    return { success: false, error: "network_error" };
+    // No response at all — the request never reached GitHub. Transient by
+    // definition: the network path is the only thing standing between us and a
+    // write, so a retry is warranted (SUP-16081 fix #2).
+    return { success: false, error: "network_error", status: 0, transient: true };
   }
 
   if (response.ok) {
-    return { success: true, error: null };
+    return { success: true, error: null, status: response.status, transient: false };
   }
 
   const responseBody = await response.json().catch(() => null) as Record<string, unknown> | null;
   const message = responseBody?.message as string | undefined;
 
   if (response.status === 403 || response.status === 422) {
+    // A scope/permission/shape refusal is a deterministic operator signal — the
+    // same token and payload will refuse again, so retrying is wrong.
     const detail = message ?? "";
-    return { success: false, error: `scope_missing: HTTP ${response.status} ${detail}` };
+    return {
+      success: false,
+      error: `scope_missing: HTTP ${response.status} ${detail}`,
+      status: response.status,
+      transient: false,
+    };
   }
 
-  return { success: false, error: message ?? `HTTP ${response.status}` };
+  return {
+    success: false,
+    error: message ?? `HTTP ${response.status}`,
+    status: response.status,
+    transient: isTransientHttpStatus(response.status),
+  };
+}
+
+/**
+ * SUP-16081 fix #2. Transient-vs-deterministic split for a failed GitHub status
+ * write. Transient = the write may succeed if retried: no response (network
+ * error, status 0), rate-limited (429), server-error (5xx), or request-timeout
+ * (408). Every other 4xx (401/403/404/422/400/...) is a deterministic refusal —
+ * the same request will refuse again — and must NOT be retried: it is operator
+ * signal (a missing scope, a bad head, a forbidden path).
+ */
+export function isTransientHttpStatus(status: number): boolean {
+  if (status === 0) return true;
+  if (status === 408 || status === 429) return true;
+  return status >= 500 && status <= 599;
+}
+
+export interface WriteCommitStatusRetryOptions {
+  /** Total attempts (default 3). */
+  attempts?: number;
+  /** Milliseconds between attempts (default 1000). */
+  delayMs?: number;
+  /** Injectable delay seam for tests (defaults to a real setTimeout). */
+  delay?: (ms: number) => Promise<void>;
+}
+
+export interface WriteCommitStatusResult {
+  success: boolean;
+  error: string | null;
+  /** The last attempt's HTTP status code (0 = network error / no response). */
+  status: number;
+  /** Whether the last attempt's failure was transient. */
+  transient: boolean;
+  /** How many attempts were actually made (1 for a deterministic refusal). */
+  attempts: number;
+}
+
+/**
+ * SUP-16081 fix #2. Wrap {@link writeCommitStatus} with a bounded retry over the
+ * transient class only. A deterministic refusal (403 scope_missing, 404, 422,
+ * ...) returns after the first attempt — it is operator signal and must not be
+ * retried. A transient failure (network error, 429, 5xx, 408) is retried up to
+ * `attempts` total times with `delayMs` between attempts; the moment a write
+ * succeeds or a deterministic refusal is observed, the loop stops.
+ */
+export async function writeCommitStatusWithRetry(
+  token: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+  issueIdentifier: string,
+  options: WriteCommitStatusRetryOptions = {},
+): Promise<WriteCommitStatusResult> {
+  const attempts = Math.max(1, options.attempts ?? 3);
+  const delayMs = options.delayMs ?? 1000;
+  const delay =
+    options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier);
+  let made = 1;
+  while (!result.success && result.transient && made < attempts) {
+    await delay(delayMs);
+    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier);
+    made += 1;
+  }
+  return { ...result, attempts: made };
+}
+
+/**
+ * SUP-16081 fix #1. Persist the outcome of a FIRST `paperclip/approved` publish
+ * to `issues.executionState.approvalStatus` so a dropped publish is never silent.
+ *
+ * The record is TOTAL: after a closing transition the `approvalStatus` key is
+ * never absent. Every terminating outcome leaves a named record carrying the
+ * publisher's own refusal vocabulary, the attempted/certified head, and a
+ * timestamp:
+ *
+ *   - `armed`   -> `publishedHeadSha` + `publishedAt` (the success shape, as today)
+ *   - `skipped` -> `publishSkipped` { reason, headSha, at }; when
+ *                  `pendingCandidates` is supplied (an unresolvable ambiguous or
+ *                  no-pr-head outcome) it additionally persists
+ *                  `pendingCandidates` / `skipReason` / `certifiedAt` so the
+ *                  reconciler can later recover it
+ *   - `failed`  -> `publishFailure` { reason, headSha, at }
+ *
+ * A positively-resolved head (`resolvedHeadSha !== null`) additionally writes the
+ * SUP-14715 D-B anchor `approvedHeadSha` + `approvedAt`, exactly as the previous
+ * inline block did. When the head resolved, the record is a FRESH object (a stale
+ * `publishedHeadSha` from a prior cycle must not survive a new certification);
+ * when it did not resolve, the record MERGES into any existing `approvalStatus`
+ * so a prior `pendingCandidates` / `backfillRefusal` is preserved. `pendingCandidates`
+  * is only ever written when no head resolved — matching the prior inline block.
+  *
+  * SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
+  * record is written atomically against the LIVE `executionState.approvalStatus`
+  * subtree (`jsonb_set` on the root + a jsonb `||`/replace on the subtree), the
+  * same shape {@link recordApprovalAnchor} and the reconciler's
+  * `mergeApprovalStatus` use. The `baseExecutionState` argument is the route's
+  * client snapshot and is no longer read — rebuilding the whole column from it
+  * reverted every root key a concurrent writer committed after the snapshot.
+  *
+  * This helper only WRITES the card's durable record. It does not decide whether
+  * a stamp is published (that stays in {@link publishApprovalStatus} / the
+  * consume-contract) and it never itself re-stamps.
+  */
+export async function recordApprovalPublishOutcome(
+  db: Db,
+  issueId: string,
+  baseExecutionState: Record<string, unknown> | null | undefined,
+  resolvedHeadSha: string | null,
+  outcome: ArmingOutcome,
+  pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor> | null,
+): Promise<void> {
+  // SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): write
+  // against the LIVE executionState.approvalStatus subtree, not the route's
+  // stale client snapshot. This helper is reached from the post-publish record,
+  // the catch backstop, and four guard-refusal paths (recordGuardOutcome in
+  // routes/issues.ts), each of which used to rebuild the entire executionState
+  // column from `baseExecutionState` — silently reverting every root key a
+  // concurrent writer committed after that snapshot (monitor, currentStageId,
+  // completedStageIds, pendingSince). Touching ONLY the approvalStatus key via
+  // the same atomic jsonb_set + subtree shape recordApprovalAnchor and the
+  // reconciler's mergeApprovalStatus already use keeps those root siblings
+  // live. baseExecutionState is retained for call-site stability; it is no
+  // longer read — the live subtree is authoritative.
+  const nowIso = new Date().toISOString();
+
+  // Outcome-specific fields, computed in JS so the record shape is identical to
+  // the previous inline block (every value is JSON-serializable).
+  const patch: Record<string, unknown> = {};
+  switch (outcome.kind) {
+    case "armed":
+      if (typeof outcome.headSha === "string") {
+        patch.publishedHeadSha = outcome.headSha;
+        patch.publishedAt = nowIso;
+      }
+      break;
+    case "skipped":
+      patch.publishSkipped = {
+        reason: outcome.message,
+        headSha: resolvedHeadSha,
+        at: nowIso,
+      };
+      if (
+        resolvedHeadSha === null &&
+        Array.isArray(pendingCandidates) &&
+        pendingCandidates.length > 0
+      ) {
+        patch.pendingCandidates = pendingCandidates;
+        patch.skipReason = outcome.message;
+        patch.certifiedAt = nowIso;
+      }
+      break;
+    case "failed":
+      patch.publishFailure = {
+        reason: outcome.message,
+        headSha: resolvedHeadSha,
+        at: nowIso,
+      };
+      break;
+  }
+
+  // A positively-resolved head FRESHENS the subtree (a stale publishedHeadSha
+  // from a prior cycle must not survive a new certification); an unresolvable
+  // outcome MERGES into the live subtree so a prior pendingCandidates /
+  // backfillRefusal is preserved. Either way only approvalStatus is rewritten.
+  let approvalStatusExpr: SQL;
+  if (resolvedHeadSha !== null) {
+    const freshSubtree: Record<string, unknown> = {
+      approvedHeadSha: resolvedHeadSha,
+      approvedAt: nowIso,
+      ...patch,
+    };
+    approvalStatusExpr = sql`${JSON.stringify(freshSubtree)}::jsonb`;
+  } else {
+    approvalStatusExpr = sql`(
+      coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
+      || ${JSON.stringify(patch)}::jsonb
+    )`;
+  }
+
+  const executionStateExpr: SQL = sql`(
+    jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}', ${approvalStatusExpr})
+  )`;
+  await db
+    .update(issues)
+    .set({ executionState: executionStateExpr })
+    .where(eq(issues.id, issueId));
+}
+
+/**
+ * SUP-16081 (comment a78bf2d2): write the approval anchor — `approvedHeadSha`
+ * + `approvedAt` — durably BEFORE the first-publish status write is attempted.
+ *
+ * On SUP-16041 the anchor was only written AFTER the publish succeeded (or in
+ * the post-publish `recordApprovalPublishOutcome` call), so a dropped/throwing
+ * status write left `approvedHeadSha` absent and BOTH recovery paths were
+ * structurally unable to run: the backfill D-B fallback needs `approvedHeadSha`,
+ * and `merge-arming/republish` bails with `head_unresolvable` when the card has
+ * no published head AND no recorded anchor.
+ *
+ * SUP-16141 (finding prepublish-anchor-lost-update): the anchor is merged into
+ * the LIVE `executionState.approvalStatus` subtree atomically on the server —
+ * a `jsonb_set` on the root plus a jsonb `||` on the live subtree, the same
+ * shape the reconciler's `mergeApprovalStatus` uses. The previous
+ * SELECT-then-whole-row UPDATE rebuilt the entire column from a client
+ * snapshot, so a concurrent writer that committed between the SELECT and the
+ * UPDATE (a `publishFailure`, `backfillRefusal`, `publishedHeadSha`, ...) was
+ * silently clobbered. Overwriting only `approvedHeadSha` + `approvedAt` here
+ * preserves every other execution-state and approval-status key and never
+ * decides whether a stamp is published. It is safe to call twice (idempotent):
+ * the post-publish `recordApprovalPublishOutcome` re-writes the same two fields.
+ */
+export async function recordApprovalAnchor(
+  db: Db,
+  issueId: string,
+  resolvedHeadSha: string,
+): Promise<void> {
+  const anchorPatch: Record<string, unknown> = {
+    approvedHeadSha: resolvedHeadSha,
+    approvedAt: new Date().toISOString(),
+  };
+  const approvalStatusExpr: SQL = sql`(
+    coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
+    || ${JSON.stringify(anchorPatch)}::jsonb
+  )`;
+  const executionStateExpr: SQL = sql`(
+    jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}', ${approvalStatusExpr})
+  )`;
+  await db
+    .update(issues)
+    .set({ executionState: executionStateExpr })
+    .where(eq(issues.id, issueId));
 }
 
 export interface PostPullRequestCommentResult {

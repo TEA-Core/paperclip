@@ -173,6 +173,15 @@ export interface ApprovalStatusReconcilerTickSummary {
   backfilled: number;
   /** Bounded "IDENTIFIER: detail" backfill outcomes. */
   backfilledDetails: string[];
+  /**
+   * SUP-16081 fix #3: stranded cards observed this tick — a terminal `done` card
+   * with a terminally-approved ladder, exactly one linked open PR, and no
+   * `publishedHeadSha` after the reconciler had its chance. Each is surfaced at
+   * error level (an alarm, not a log line buried in details) and counted here.
+   */
+  stranded: number;
+  /** Bounded "IDENTIFIER: detail" stranded-card alarm outcomes. */
+  strandedDetails: string[];
 }
 
 export interface CandidateRow {
@@ -2699,6 +2708,71 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   return { kind: "failed", detail: `publish failed: ${truncated}`, backfilledDetail };
 }
 
+/**
+ * SUP-16081 fix #3. Detect a STRANDED card: a terminal `done` close whose ladder
+ * is fully reviewed + approved, which carries exactly one linked open PR, yet has
+ * no `publishedHeadSha` after the reconciler has had its chance. That is the
+ * SUP-16041 shape — the first `paperclip/approved` publish dropped (or its
+ * outcome was never recorded), the card closed clean, and the PR silently cannot
+ * enter the merge queue behind a required, fail-closed check. Nothing about it
+ * raises an alarm, and no fleet agent holds a grant that can re-stamp it
+ * (merge-arming/republish is board-only).
+ *
+ * This is OBSERVABILITY ONLY: it returns a reason string for the caller to log
+ * at error level. It does not re-stamp, comment, or otherwise remediate —
+ * re-stamping stays the board-gated `merge-arming/republish` judgment call.
+ *
+ * Returns `null` when the card is not stranded (any guard missing), so the
+ * caller only raises an alarm for the precise, non-recoverable shape.
+ */
+export async function findStrandedCardAlarm(
+  db: Db,
+  row: CandidateRow,
+): Promise<{ pr: string; reason: string } | null> {
+  // Guard 1: only a terminal close is "stranded" — a live ladder is still in
+  // play and will get its own publish on the next approval transition. Read the
+  // status directly: reconciler candidates intentionally leave `row.status`
+  // unset so their `isLiveLadder` behavior is unchanged (see evaluateStageIntegrity).
+  const [card] = await db
+    .select({ status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.id, row.id), eq(issues.companyId, row.companyId)));
+  if (card?.status !== "done") return null;
+
+  // Guard 2: the ladder must be terminally approved — fully reviewed + approved.
+  // A card that closed without a terminal approval is not the drop shape.
+  const ladderPolicy = row.executionPolicy as { stages?: Array<{ id: string }> } | null;
+  const ladderState = row.executionState as
+    | { completedStageIds?: string[]; lastDecisionOutcome?: string | null }
+    | null;
+  if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) return null;
+
+  // Guard 3: no paperclip/approved was ever minted on a head. publishedHeadSha is
+  // the authoritative "the stamp was written" anchor (the D-B approvedHeadSha is
+  // only a certification, not a write) — its absence is the drop.
+  const approvalStatus = (row.executionState ?? null) as Record<string, unknown> | null;
+  const publishedHeadSha = (approvalStatus?.approvalStatus as Record<string, unknown> | null | undefined)
+    ?.publishedHeadSha;
+  if (typeof publishedHeadSha === "string" && publishedHeadSha.length > 0) return null;
+
+  // Guard 4: exactly one linked open PR — a genuinely single-PR card. A card
+  // with several open PRs is the ambiguous shape (recoverable once a duplicate
+  // closes), and one with none has no PR to strand.
+  const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id);
+  const openPrs = linked.filter((pr) => pr.cachedState === "open");
+  if (openPrs.length !== 1) return null;
+
+  const pr = openPrs[0]!;
+  return {
+    pr: pr.displayName,
+    reason:
+      `stranded: card closed done with a terminally-approved ladder, ${pr.displayName} is ` +
+      `open, but paperclip/approved was never minted on its head — the PR cannot enter ` +
+      `the merge queue behind a required fail-closed check and no agent can re-stamp it ` +
+      `(board-gated merge-arming/republish)`,
+  };
+}
+
 export async function runApprovalStatusReconcilerTick(
   db: Db,
   options: ApprovalStatusReconcilerTickOptions = {},
@@ -2730,6 +2804,8 @@ export async function runApprovalStatusReconcilerTick(
     voidWarningDetails: [],
     backfilled: 0,
     backfilledDetails: [],
+    stranded: 0,
+    strandedDetails: [],
   };
 
   for (const row of batch) {
@@ -2762,6 +2838,36 @@ export async function runApprovalStatusReconcilerTick(
           summary.backfilledDetails.push(`${label}: ${result.backfilledDetail}`);
         }
       }
+      if (result.kind !== "republished") {
+        // SUP-16081 fix #3: the reconciler had its chance this tick and did not
+        // (re)publish. If the card is the stranded shape (done + terminally
+        // approved + exactly one linked open PR + no publishedHeadSha), raise an
+        // error-level alarm so it is visible without reading the PR checks tab.
+        // Observability only — this never re-stamps.
+        try {
+          const stranded = await findStrandedCardAlarm(db, row);
+          if (stranded) {
+            summary.stranded += 1;
+            if (summary.strandedDetails.length < MAX_DETAIL_ENTRIES) {
+              summary.strandedDetails.push(`${label}: ${stranded.reason} [PR ${stranded.pr}]`);
+            }
+            logger.error(
+              {
+                issueId: row.id,
+                identifier: label,
+                pr: stranded.pr,
+                reason: stranded.reason,
+              },
+              "stranded approval card: done + terminally approved + one linked open PR, no publishedHeadSha",
+            );
+          }
+        } catch (strandedErr) {
+          logger.warn(
+            { err: strandedErr, issueId: row.id },
+            "stranded-card detection failed; continuing tick",
+          );
+        }
+      }
     } catch (err) {
       summary.failed += 1;
       if (summary.failedDetails.length < MAX_DETAIL_ENTRIES) {
@@ -2785,6 +2891,8 @@ export async function runApprovalStatusReconcilerTick(
       voidWarningDetails: summary.voidWarningDetails,
       backfilled: summary.backfilled,
       backfilledDetails: summary.backfilledDetails,
+      stranded: summary.stranded,
+      strandedDetails: summary.strandedDetails,
     },
     "approval status reconciler tick",
   );

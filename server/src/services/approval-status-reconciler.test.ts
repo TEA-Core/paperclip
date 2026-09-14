@@ -65,6 +65,12 @@ describe("latestDecisionPerStage (SUP-15851 C1: deterministic tie-break)", () =>
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
+const mockLogger = vi.hoisted(() => ({
+  warn: vi.fn(),
+  info: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
 
 vi.mock("./secrets.js", () => ({
   secretService: () => ({
@@ -112,6 +118,12 @@ vi.mock("./issues.js", async (importOriginal) => {
     issueService: mockIssueService,
   };
 });
+
+// SUP-16081 fix #3: the stranded-card alarm logs at error level. Mock the logger
+// so the alarm is observable (no-op for every other logger call in the tick).
+vi.mock("../middleware/logger.js", () => ({
+  logger: mockLogger,
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -342,6 +354,8 @@ function zeroSummary(): ApprovalStatusReconcilerTickSummary {
     voidWarningDetails: [],
     backfilled: 0,
     backfilledDetails: [],
+    stranded: 0,
+    strandedDetails: [],
   };
 }
 
@@ -2911,6 +2925,143 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.skipped["backfill:no-head-mutating-event"]).toBe(1);
       expect(summary.backfilled).toBe(0);
       expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    // SUP-16081 fix #3: a card that closed `done` with a terminally-approved
+    // ladder, exactly one linked open PR, and no publishedHeadSha is the stranded
+    // shape. The reconciler's chance to (re)publish has passed; when it does not
+    // publish, the tick must raise an error-level alarm naming the card + PR so the
+    // drop is visible without opening the PR checks tab. The alarm is observability
+    // only — it never re-stamps.
+    describe("SUP-16081 stranded-card alarm + SUP-16041 reconstruction (fix #3)", () => {
+      it("AC4: a done + terminally-approved card with one open PR and no publishedHeadSha raises a stranded-card alarm without re-stamping", async () => {
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // The card was scanned, not republished, and deterministically refused
+        // backfill (no head-mutating event at/before the approval).
+        expect(summary.scanned).toBe(1);
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["backfill:no-head-mutating-event"]).toBe(1);
+        expect(summary.backfilled).toBe(0);
+        // The stranded-card alarm fired for exactly this card.
+        expect(summary.stranded).toBe(1);
+        expect(summary.strandedDetails).toHaveLength(1);
+        expect(summary.strandedDetails[0]).toContain("SUP-42");
+        expect(summary.strandedDetails[0]).toContain("TEA-Core/paperclip#42");
+        // Observability only — the alarm never re-stamps a status.
+        expect(postStatusCalls()).toHaveLength(0);
+        // The alarm is an error-level log naming the identifier, the PR, and the reason.
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+        const [errorMeta] = mockLogger.error.mock.calls[0] as [Record<string, unknown>];
+        expect(errorMeta.identifier).toBe("SUP-42");
+        expect(errorMeta.pr).toBe("TEA-Core/paperclip#42");
+        expect(errorMeta.reason).toMatch(/^stranded:/);
+      });
+
+      it("AC4 (negative control): a live (in_review) card in the same shape does NOT alarm", async () => {
+        const issueId = await insertIssue({
+          status: "in_review",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // Same deterministic backfill refusal, but a live ladder is still in play,
+        // so the card is not the stranded shape and no error alarm is raised.
+        expect(summary.skipped["backfill:no-head-mutating-event"]).toBe(1);
+        expect(summary.stranded).toBe(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("AC5: reconstructs the SUP-16041 drop — persists a durable backfillRefusal AND raises the alarm", async () => {
+        // The SUP-16041 incident card: SUP-16041 delivered PR #448, approved at
+        // 10:28:39.433Z; the first publish's status write was dropped, so the card
+        // closed done with no publishedHeadSha and an unverifiable head.
+        const SUP_16041_ID = "SUP-16041";
+        const PR_448_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/448";
+        const TIMELINE_448_URL = `https://api.github.com/repos/TEA-Core/paperclip/issues/448/timeline?per_page=100&page=1`;
+        const OPEN_PR_448_BODY = {
+          state: "open",
+          merged: false,
+          head: { ref: "SUP-16041-branch", sha: NEW_HEAD },
+          base: { ref: "main", sha: BASE_SHA },
+        };
+        const APPROVAL_TIME = new Date("2026-09-10T10:28:39.433Z");
+
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: SUP_16041_ID,
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId, { createdAt: APPROVAL_TIME });
+        await insertMention(issueId, { number: 448 });
+        await seedDeliveryIdentity(issueId, "SUP-16041-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_448_URL, body: OPEN_PR_448_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_448_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // The stranded-card alarm fired for SUP-16041 / PR #448.
+        expect(summary.stranded).toBe(1);
+        expect(summary.strandedDetails[0]).toContain("SUP-16041");
+        expect(summary.strandedDetails[0]).toContain("TEA-Core/paperclip#448");
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+        const [errorMeta] = mockLogger.error.mock.calls[0] as [Record<string, unknown>];
+        expect(errorMeta.identifier).toBe("SUP-16041");
+        expect(errorMeta.pr).toBe("TEA-Core/paperclip#448");
+        expect(errorMeta.reason).toMatch(/^stranded:/);
+
+        // The DROPPED outcome is no longer silent: the deterministic backfill
+        // refusal is persisted on the card (the durable record AC5 requires),
+        // keyed on the live head and the approval time.
+        const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        const backfillRefusal = approvalStatus.backfillRefusal as Record<string, unknown>;
+        expect(backfillRefusal.reason).toBe("backfill:no-head-mutating-event");
+        expect(backfillRefusal.observedHeadSha).toBe(NEW_HEAD);
+        // Keyed on the approval time so a re-approval at a later time invalidates
+        // the cache (backfill-repeat-fanout); tolerate sub-millisecond DB precision.
+        expect(typeof backfillRefusal.approvedAtMs).toBe("number");
+        expect(Math.abs((backfillRefusal.approvedAtMs as number) - APPROVAL_TIME.getTime())).toBeLessThanOrEqual(1);
+        expect(typeof backfillRefusal.observedAt).toBe("string");
+        // Observability only — no re-stamp.
+        expect(postStatusCalls()).toHaveLength(0);
+      });
     });
 
     it("refuses the backfill when the head is provable only through committed (client-timed) events and the earliest server timestamp is after the approval, writing no anchor (SUP-14747 D-E, backfill-committed-event-timing)", async () => {

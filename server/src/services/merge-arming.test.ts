@@ -1,13 +1,21 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
+  activityLog,
+  agentWakeupRequests,
+  agents,
   companies,
+  companyMemberships,
   createDb,
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
+  issueExecutionDecisions,
   issues,
+  projectWorkspaces,
   projects,
   type Db,
 } from "@paperclipai/db";
@@ -18,13 +26,24 @@ import {
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
+  isTransientHttpStatus,
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
   publishApprovalStatus,
+  recordApprovalAnchor,
+  recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
+  writeCommitStatusWithRetry,
   type NoPrBranchAnchor,
 } from "./merge-arming.js";
+// SUP-16140 (relocation of the SUP-16081 fix #2 route-level guard regression from
+// the now-deleted server/src/__tests__/merge-arming-guard-outcome.test.ts): the
+// guard-outcome suite drives the POST /issues/:id/execution-stage/board-decision
+// route (which calls runApprovalMergeArming post-commit), so it needs the route
+// harness. These imports are used only by that suite.
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -42,6 +61,76 @@ vi.mock("./github-fetch.js", () => ({
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
+
+// SUP-16140 (relocation): the guard-outcome route suite drives runApprovalMergeArming
+// (in routes/issues.ts) with a controlled evaluateStageIntegrity and, for the
+// anchor-before-publish cases, stubs resolveApprovalDecisionHead /
+// publishApprovalStatus while keeping the REAL recordApprovalAnchor and
+// recordApprovalPublishOutcome. This file's OWN tests call the REAL
+// resolveApprovalDecisionHead / publishApprovalStatus, so every override below is
+// gated on `guardRouteControl.active` (false by default, true only inside the
+// guard-outcome suite) and delegates to the real export otherwise — a single file,
+// two mock postures, no test sees the wrong one.
+const guardRouteControl = vi.hoisted(() => ({
+  active: false,
+  stageIntegrity: "pass" as "pass" | "finding" | "throw",
+  publishMode: "fail" as "fail" | "throw",
+  headSha: "approved00000000000000000000000000000000001",
+}));
+
+vi.mock("./approval-status-reconciler.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./approval-status-reconciler.js")>();
+  return {
+    ...actual,
+    evaluateStageIntegrity: (
+      ...args: Parameters<typeof actual.evaluateStageIntegrity>
+    ) => {
+      if (!guardRouteControl.active) {
+        return actual.evaluateStageIntegrity(...args);
+      }
+      if (guardRouteControl.stageIntegrity === "throw") {
+        return Promise.reject(new Error("injected stage-integrity guard exception"));
+      }
+      if (guardRouteControl.stageIntegrity === "finding") {
+        return Promise.resolve({
+          reason: "guard-c:test-finding",
+          detail: "injected stage-integrity finding",
+        });
+      }
+      return Promise.resolve(null);
+    },
+  };
+});
+
+vi.mock("./merge-arming.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./merge-arming.js")>();
+  return {
+    ...actual,
+    resolveApprovalDecisionHead: (
+      ...args: Parameters<typeof actual.resolveApprovalDecisionHead>
+    ) =>
+      guardRouteControl.active
+        ? Promise.resolve({
+            kind: "resolved" as const,
+            headSha: guardRouteControl.headSha,
+            displayName: "TEA-Core/paperclip#448",
+          })
+        : actual.resolveApprovalDecisionHead(...args),
+    publishApprovalStatus: (
+      ...args: Parameters<typeof actual.publishApprovalStatus>
+    ) =>
+      guardRouteControl.active
+        ? guardRouteControl.publishMode === "throw"
+          ? Promise.reject(new Error("injected first-publish exception"))
+          : Promise.resolve({
+              kind: "failed" as const,
+              message:
+                "status:failed:scope_missing: HTTP 403 Resource not accessible by integration",
+              headSha: guardRouteControl.headSha,
+            } as unknown as ReturnType<typeof actual.publishApprovalStatus>)
+        : actual.publishApprovalStatus(...args),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -119,6 +208,40 @@ describe("ladderIsTerminallyApproved", () => {
     expect(ladderIsTerminallyApproved(policy, undefined)).toBe(false);
     expect(ladderIsTerminallyApproved(policy, { completedStageIds: [A, B] })).toBe(false);
     expect(ladderIsTerminallyApproved(undefined, undefined)).toBe(false);
+  });
+});
+
+// SUP-16081 fix #2: the transient-vs-deterministic split for a failed status write
+// is a pure predicate (no I/O), so it runs even where embedded Postgres is absent.
+// The transient class is the ONLY class that is ever retried: no response
+// (status 0 = the request never reached GitHub), request-timeout (408),
+// rate-limited (429), and any 5xx server error. Every other 4xx is a
+// deterministic refusal — the same request will refuse again — and must NOT be
+// retried.
+describe("isTransientHttpStatus", () => {
+  it("treats no-response (0), 408, 429, and 5xx as transient", () => {
+    expect(isTransientHttpStatus(0)).toBe(true);
+    expect(isTransientHttpStatus(408)).toBe(true);
+    expect(isTransientHttpStatus(429)).toBe(true);
+    expect(isTransientHttpStatus(500)).toBe(true);
+    expect(isTransientHttpStatus(502)).toBe(true);
+    expect(isTransientHttpStatus(503)).toBe(true);
+    expect(isTransientHttpStatus(599)).toBe(true);
+  });
+
+  it("treats every deterministic 4xx and 2xx/3xx as non-transient", () => {
+    // 403 scope_missing and 422 shape refusal are the canonical operator signals.
+    expect(isTransientHttpStatus(403)).toBe(false);
+    expect(isTransientHttpStatus(422)).toBe(false);
+    // Other deterministic client errors: a bad head, missing scope, a 404 ref.
+    expect(isTransientHttpStatus(400)).toBe(false);
+    expect(isTransientHttpStatus(401)).toBe(false);
+    expect(isTransientHttpStatus(404)).toBe(false);
+    // Success / redirect statuses are not the "failed write" class at all.
+    expect(isTransientHttpStatus(200)).toBe(false);
+    expect(isTransientHttpStatus(301)).toBe(false);
+    // The 5xx band has a hard upper bound.
+    expect(isTransientHttpStatus(600)).toBe(false);
   });
 });
 
@@ -442,6 +565,480 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
     return externalObj;
   }
+
+  async function readApprovalStatus(issueId: string): Promise<Record<string, unknown> | null> {
+    const rows = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const execState = (rows[0]?.executionState ?? null) as Record<string, unknown> | null;
+    const approvalStatus = execState?.approvalStatus as Record<string, unknown> | null | undefined;
+    return approvalStatus ?? null;
+  }
+
+  // SUP-16081 fix #1: the first `paperclip/approved` publish outcome is now TOTAL.
+  // After a closing transition the executionState.approvalStatus key is never
+  // absent: `armed` keeps the success shape, and a `skipped`/`failed` outcome
+  // leaves a named publishSkipped / publishFailure record carrying the
+  // publisher's own refusal vocabulary and the attempted head. A thrown outcome
+  // is caught in the route and recorded the same way (the exact hole SUP-16041
+  // fell through).
+  describe("SUP-16081 recordApprovalPublishOutcome (fix #1: total outcome record)", () => {
+    it("AC1: a thrown first publish leaves a named publishFailure record; the key is never absent", async () => {
+      const issueId = await insertIssue();
+      // The exact call the route's catch-backstop makes when a throw escapes the
+      // first-publish flow: a synthetic internal failure, no resolved head.
+      await recordApprovalPublishOutcome(
+        db,
+        issueId,
+        {},
+        null,
+        { kind: "failed", message: "status:failed:internal: boom" },
+      );
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus).not.toBeNull();
+      // The record is a named failure, not a dropped key.
+      expect(approvalStatus!.publishFailure).toMatchObject({
+        reason: "status:failed:internal: boom",
+        headSha: null,
+      });
+      expect(typeof (approvalStatus!.publishFailure as Record<string, unknown>).at).toBe("string");
+    });
+
+    it("AC1: an armed outcome keeps the success shape (publishedHeadSha + publishedAt)", async () => {
+      const issueId = await insertIssue();
+      // A prior cycle left a stale publishedHeadSha; a resolved head must FRESHEN
+      // the record so the stale anchor cannot survive a new certification.
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            approvalStatus: { publishedHeadSha: "stale000000000000000000000000000000" },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      await recordApprovalPublishOutcome(
+        db,
+        issueId,
+        {},
+        APPROVED_HEAD,
+        { kind: "armed", message: "status:published: written to head", headSha: APPROVED_HEAD },
+      );
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.publishedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.publishedAt).toBe("string");
+      // The positively-resolved head also writes the D-B anchor.
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      // No failure/skip record on a success.
+      expect(approvalStatus!.publishFailure).toBeUndefined();
+      expect(approvalStatus!.publishSkipped).toBeUndefined();
+    });
+
+    it("AC2: a named skip outcome persists its exact refusal reason + attempted head", async () => {
+      const issueId = await insertIssue();
+      const refusal = "status:skipped:not_delivered: branch mismatch";
+      await recordApprovalPublishOutcome(db, issueId, {}, APPROVED_HEAD, {
+        kind: "skipped",
+        message: refusal,
+      });
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      // Reuses the publisher's refusal vocabulary verbatim — no second spelling.
+      expect(approvalStatus!.publishSkipped).toMatchObject({
+        reason: refusal,
+        headSha: APPROVED_HEAD,
+      });
+      expect(typeof (approvalStatus!.publishSkipped as Record<string, unknown>).at).toBe("string");
+    });
+
+    it("AC2: a named failure outcome persists its exact refusal reason + attempted head", async () => {
+      const issueId = await insertIssue();
+      const refusal = "status:failed:scope_missing: HTTP 403 Resource not accessible by integration";
+      await recordApprovalPublishOutcome(db, issueId, {}, APPROVED_HEAD, {
+        kind: "failed",
+        message: refusal,
+      });
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.publishFailure).toMatchObject({
+        reason: refusal,
+        headSha: APPROVED_HEAD,
+      });
+      // A resolved head that then failed still writes the D-B anchor for recovery.
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+    });
+
+    it("AC2: an unresolvable skip with pendingCandidates persists the recovery anchors", async () => {
+      const issueId = await insertIssue();
+      const candidates = [
+        { owner: OWNER, repo: REPO, number: 42, headShaAtApproval: APPROVED_HEAD },
+      ];
+      const refusal = "status:skipped:ambiguous: Multiple linked PRs (2)";
+      await recordApprovalPublishOutcome(db, issueId, {}, null, {
+        kind: "skipped",
+        message: refusal,
+      }, candidates);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.publishSkipped).toMatchObject({ reason: refusal, headSha: null });
+      // No head resolved -> the ambiguous recovery anchors are persisted so the
+      // reconciler can later re-run Guard A once the duplicate closes.
+      expect(approvalStatus!.skipReason).toBe(refusal);
+      expect(Array.isArray(approvalStatus!.pendingCandidates)).toBe(true);
+      expect((approvalStatus!.pendingCandidates as unknown[]).length).toBe(1);
+      expect(typeof approvalStatus!.certifiedAt).toBe("string");
+    });
+
+    // SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
+    // record is written atomically against the LIVE approvalStatus subtree, so a
+    // stale client snapshot passed by the route can no longer clobber the card's
+    // root executionState keys (monitor, currentStageId, completedStageIds,
+    // pendingSince) or a concurrent approvalStatus field. The previous
+    // SELECT-then-whole-row UPDATE rebuilt the whole column from that snapshot
+    // and dropped every root key the snapshot lacked.
+    it("stage-3: a stale-snapshot outcome write preserves the live root executionState keys (no lost update)", async () => {
+      const issueId = await insertIssue();
+      // The card already carries live root keys + a concurrent approvalStatus
+      // field committed AFTER the route captured its snapshot.
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            currentStageId: "stage-3",
+            completedStageIds: ["stage-1", "stage-2"],
+            monitor: { armed: true, nextCheckAt: "2026-09-13T10:29:00.000Z" },
+            pendingSince: "2026-09-13T10:28:00.000Z",
+            approvalStatus: {
+              backfillRefusal: { reason: "head_moved" },
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      // The route's stale client snapshot — captured before that commit, so it
+      // carries NONE of the root keys and NONE of the concurrent approvalStatus
+      // field. This is the exact interleaving that clobbered state on the old
+      // whole-row shape.
+      const staleSnapshot: Record<string, unknown> = {};
+
+      await recordApprovalPublishOutcome(db, issueId, staleSnapshot, null, {
+        kind: "skipped",
+        message: "status:skipped:not_delivered: branch mismatch",
+      });
+
+      const rows = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      const execState = rows[0]?.executionState as Record<string, unknown>;
+      const approvalStatus = execState.approvalStatus as Record<string, unknown>;
+
+      // The named outcome record is present (the record stays total).
+      expect(approvalStatus.publishSkipped).toMatchObject({
+        reason: "status:skipped:not_delivered: branch mismatch",
+        headSha: null,
+      });
+      // The concurrently-committed approvalStatus field survives the merge.
+      expect(approvalStatus.backfillRefusal).toMatchObject({ reason: "head_moved" });
+      // No anchor on an unresolvable outcome.
+      expect(approvalStatus.approvedHeadSha).toBeUndefined();
+      // Every live root key SURVIVES the outcome write — the assertion the old
+      // whole-row shape fails (it rebuilt the column from the empty snapshot).
+      expect(execState.currentStageId).toBe("stage-3");
+      expect(execState.completedStageIds).toEqual(["stage-1", "stage-2"]);
+      expect(execState.monitor).toMatchObject({ armed: true });
+      expect(execState.pendingSince).toBe("2026-09-13T10:28:00.000Z");
+    });
+
+    it("stage-3: a stale-snapshot RESOLVED-head write freshens the subtree but preserves the live root keys", async () => {
+      const issueId = await insertIssue();
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            currentStageId: "stage-4",
+            monitor: { armed: true, nextCheckAt: "2026-09-13T10:30:00.000Z" },
+            approvalStatus: { publishedHeadSha: "stale000000000000000000000000000000" },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      // A positively-resolved head (post-publish armed record) with a stale
+      // snapshot that carries no root keys.
+      await recordApprovalPublishOutcome(
+        db,
+        issueId,
+        {},
+        APPROVED_HEAD,
+        { kind: "armed", message: "status:published: written to head", headSha: APPROVED_HEAD },
+      );
+
+      const rows = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      const execState = rows[0]?.executionState as Record<string, unknown>;
+      const approvalStatus = execState.approvalStatus as Record<string, unknown>;
+
+      // A resolved head FRESHENS the subtree: the success shape + anchor are
+      // written, and the stale prior publishedHeadSha does not survive.
+      expect(approvalStatus.publishedHeadSha).toBe(APPROVED_HEAD);
+      expect(approvalStatus.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(approvalStatus.publishFailure).toBeUndefined();
+      // The live root keys still survive the freshen (only the subtree is replaced).
+      expect(execState.currentStageId).toBe("stage-4");
+      expect(execState.monitor).toMatchObject({ armed: true });
+    });
+  });
+
+  // SUP-16081 (comment a78bf2d2): the approval anchor must be written BEFORE the
+  // publish attempt. recordApprovalAnchor is the pre-publish writer: it
+  // merge-writes approvedHeadSha + approvedAt onto the card's approvalStatus,
+  // preserving every concurrent field, so a dropped/throwing publish still leaves
+  // a real anchor both recovery paths (backfill D-B fallback,
+  // merge-arming/republish) can run.
+  describe("SUP-16081 recordApprovalAnchor (a78bf2d2: anchor before publish)", () => {
+    it("writes approvedHeadSha + approvedAt when approvalStatus is absent", async () => {
+      const issueId = await insertIssue();
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus).not.toBeNull();
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+    });
+
+    it("merge-writes the anchor, preserving concurrent fields (never clobbers)", async () => {
+      const issueId = await insertIssue();
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            approvalStatus: {
+              publishedHeadSha: "stale000000000000000000000000000000",
+              backfillRefusal: { reason: "head_moved" },
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      // Concurrent fields survive the anchor write.
+      expect(approvalStatus!.publishedHeadSha).toBe("stale000000000000000000000000000000");
+      expect(approvalStatus!.backfillRefusal).toMatchObject({ reason: "head_moved" });
+    });
+
+    it("is idempotent: a second call rewrites the same anchor without error", async () => {
+      const issueId = await insertIssue();
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+      await recordApprovalAnchor(db, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+    });
+
+    // SUP-16141 (finding prepublish-anchor-lost-update): the anchor write must be
+    // a live-subtree merge, not a stale read-modify-write. A concurrent writer
+    // that commits a publishFailure between the anchor's read and write must
+    // survive; a SELECT-then-whole-row UPDATE clobbers it. The hook below makes
+    // the anchor's SELECT return the pre-concurrent snapshot while the live row
+    // already carries the field — the deterministic interleaving the embedded
+    // Postgres suite distinguishes.
+    it("SUP-16141: a concurrent publishFailure committed after the anchor's read survives the atomic merge (no lost update)", async () => {
+      const issueId = await insertIssue();
+
+      // The card starts with no executionState. A concurrent writer (a failed
+      // publish outcome / the reconciler) commits a live publishFailure.
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            approvalStatus: {
+              publishFailure: {
+                reason: "status:failed:scope_missing",
+                headSha: APPROVED_HEAD,
+                at: "2026-09-13T10:28:39.441Z",
+              },
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      // Deterministic stale-read hook: the anchor's SELECT returns the snapshot
+      // captured BEFORE that commit (an empty executionState), exactly as a
+      // pre-concurrent SELECT would have. Everything else routes to the real db,
+      // so the anchor's write still lands on the live row.
+      const frozenPreConcurrentExecutionState: Record<string, unknown> = {};
+      const hookDb = new Proxy(db, {
+        get(target, prop) {
+          if (prop === "select") {
+            return () => ({
+              from: () => ({
+                where: () => ({
+                  limit: () =>
+                    Promise.resolve([{ executionState: frozenPreConcurrentExecutionState }]),
+                }),
+              }),
+            });
+          }
+          const value = Reflect.get(target, prop);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      await recordApprovalAnchor(hookDb, issueId, APPROVED_HEAD);
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      // The new anchor is written on top of the concurrent field.
+      expect(approvalStatus!.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      // The concurrent field SURVIVES — no lost update. This is the assertion a
+      // SELECT-then-whole-row implementation fails: it would clobber the field
+      // with the stale snapshot.
+      expect(approvalStatus!.publishFailure).toMatchObject({
+        reason: "status:failed:scope_missing",
+        headSha: APPROVED_HEAD,
+      });
+    });
+  });
+
+  // SUP-16081 fix #2: a transient GitHub status-write failure is retried; a
+  // deterministic refusal is not.
+  describe("SUP-16081 writeCommitStatusWithRetry (fix #2: transient retry)", () => {
+    it("AC3: a transient status-write failure (500) is retried and succeeds on the retry", async () => {
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          if (statusPosts === 1) {
+            return {
+              ok: false,
+              status: 500,
+              json: async () => ({ message: "server exploded" }),
+            } as unknown as Response;
+          }
+          return { ok: true, status: 201, json: async () => ({}) } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await writeCommitStatusWithRetry(
+        GITHUB_TOKEN,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+        "SUP-42",
+        { delay: async () => {} },
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.attempts).toBe(2);
+      expect(statusPosts).toBe(2);
+    });
+
+    it("AC3: a deterministic refusal (403 scope_missing) is NOT retried", async () => {
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          return {
+            ok: false,
+            status: 403,
+            json: async () => ({ message: "Resource not accessible by integration" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await writeCommitStatusWithRetry(
+        GITHUB_TOKEN,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+        "SUP-42",
+        { delay: async () => {} },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.transient).toBe(false);
+      expect(result.attempts).toBe(1);
+      expect(result.error ?? "").toContain("scope_missing");
+      // Operator signal: exactly one attempt, never retried.
+      expect(statusPosts).toBe(1);
+    });
+
+    it("AC3: a transient failure is retried up to the attempt bound, then reported transient", async () => {
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          return {
+            ok: false,
+            status: 503,
+            json: async () => ({ message: "unavailable" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await writeCommitStatusWithRetry(
+        GITHUB_TOKEN,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+        "SUP-42",
+        { attempts: 3, delay: async () => {} },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.transient).toBe(true);
+      expect(result.attempts).toBe(3);
+      expect(statusPosts).toBe(3);
+    });
+
+    it("AC3: a transient status-write inside publishApprovalStatus is retried and arms", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+      let statusPosts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/statuses") && init?.method === "POST") {
+          statusPosts += 1;
+          if (statusPosts === 1) {
+            return {
+              ok: false,
+              status: 500,
+              json: async () => ({ message: "server exploded" }),
+            } as unknown as Response;
+          }
+          return { ok: true, status: 201, json: async () => ({}) } as unknown as Response;
+        }
+        if (u === PR_URL) {
+          return { ok: true, status: 200, json: async () => prHeadBody(APPROVED_HEAD) } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${u}`);
+      });
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+        expectedHeadSha: APPROVED_HEAD,
+      });
+
+      // The transient first write was retried and the card armed on the live head.
+      expect(outcome.kind).toBe("armed");
+      expect(outcome.headSha).toBe(APPROVED_HEAD);
+      expect(postStatusShas()).toEqual([APPROVED_HEAD, APPROVED_HEAD]);
+    });
+  });
 
   describe("resolveApprovalDecisionHead", () => {
     it("resolves the single cached PR head at decision time", async () => {
@@ -1546,3 +2143,378 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
   });
 
 });
+
+// ============================================================================
+// runApprovalMergeArming pre-publish guards: record every outcome (SUP-16081 fix
+// #2). Relocated from the deleted server/src/__tests__/merge-arming-guard-outcome.test.ts
+// per the SUP-16140 scope-compliance redo. Drives the POST .../board-decision route
+// (which calls runApprovalMergeArming post-commit) with a controlled
+// evaluateStageIntegrity to fire each pre-publish guard, then reads the persisted
+// card back to prove the named approvalStatus record landed:
+//   - stage-integrity finding  -> publishSkipped (status:skipped:stage_integrity:*)
+//   - stage-integrity throw    -> publishFailure (status:failed:stage_integrity_check_threw:*)
+//   - non-terminal ladder      -> publishSkipped (status:skipped:non-terminal-ladder:*)
+// The two anchor-before-publish cases additionally prove the approval anchor
+// (approvedHeadSha/approvedAt) is written durably before the first publish attempt
+// and survives a failing/throwing publish (SUP-16081 comment a78bf2d2).
+// ============================================================================
+const describeGuardRoute = embeddedPostgresSupport.supported
+  ? describe.sequential
+  : describe.skip;
+
+describeGuardRoute(
+  "runApprovalMergeArming pre-publish guards record every outcome (SUP-16081 fix #2, SUP-16140 relocation)",
+  () => {
+    // issue_execution_decisions.stage_id is a uuid column, so stage ids must be
+    // valid UUIDs (they are also the JSONB keys shared with
+    // executionPolicy.stages / executionState.completedStageIds).
+    const STAGE_A = "22222222-2222-4222-8222-222222222222";
+    const STAGE_B = "33333333-3333-4333-8333-333333333333";
+    const USER_ID = "board-user-1";
+
+    let db: Db;
+    let app: express.Express;
+    let currentActor: Express.Request["actor"];
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+    let previousSchedulingSuppression: string | undefined;
+    let previousBoardOverride: string | undefined;
+
+    beforeAll(async () => {
+      previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
+      previousBoardOverride = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+      tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-guard-");
+      db = createDb(tempDb.connectionString);
+      app = createApp();
+    }, 60_000);
+
+    afterAll(async () => {
+      guardRouteControl.active = false;
+      await tempDb?.cleanup();
+      if (previousSchedulingSuppression === undefined) {
+        delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+      } else {
+        process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+      }
+      if (previousBoardOverride === undefined) {
+        delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      } else {
+        process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previousBoardOverride;
+      }
+    });
+
+    beforeEach(async () => {
+      guardRouteControl.active = true;
+      guardRouteControl.stageIntegrity = "pass";
+      guardRouteControl.publishMode = "fail";
+      await db.delete(issueExecutionDecisions);
+      await db.delete(issues);
+      await db.delete(executionWorkspaces);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(activityLog);
+      // The board-decision route enqueues an assignment wakeup referencing the card's
+      // assignee agent; clear it before the agent rows it references.
+      await db.delete(agentWakeupRequests);
+      await db.delete(agents);
+      await db.delete(companyMemberships);
+      await db.delete(companies);
+    });
+
+    afterEach(() => {
+      guardRouteControl.active = false;
+    });
+
+    function createApp() {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = currentActor;
+        next();
+      });
+      app.use("/api", issueRoutes(db, {} as never));
+      app.use(errorHandler);
+      return app;
+    }
+
+    function boardActor(companyId: string): Express.Request["actor"] {
+      return {
+        type: "board",
+        userId: USER_ID,
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+      } as unknown as Express.Request["actor"];
+    }
+
+    /**
+     * Seed a live card in `in_review` sitting on stage A of a review ladder, with a
+     * declared return assignee DISTINCT from the stage participant (so the board
+     * self-approval gate passes — the board user is neither the return assignee nor
+     * a delivery author). `twoStages` appends stage B so the ladder is non-terminal
+     * after approving A.
+     */
+    async function seedLiveCard(opts: { twoStages?: boolean } = {}) {
+      const companyId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const returnAssigneeAgentId = randomUUID();
+      const issueId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const now = new Date();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Guard Outcome Co",
+        issuePrefix: "SUP",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: USER_ID,
+        status: "active",
+        membershipRole: "owner",
+        updatedAt: now,
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Guard Outcome/paperclip",
+        status: "in_progress",
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary",
+        cwd: "/tmp/test",
+        isPrimary: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(agents).values({
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(agents).values({
+        id: returnAssigneeAgentId,
+        companyId,
+        name: "Return Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated",
+        strategyType: "git_worktree",
+        name: "card-workspace",
+        status: "active",
+        branchName: "SUP-16081-delivery",
+        repoUrl: "https://github.com/TEA-Core/paperclip",
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const participant = { type: "agent" as const, agentId: reviewerAgentId };
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        identifier: "SUP-16081-1",
+        issueNumber: 1,
+        title: "Guard outcome card",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: reviewerAgentId,
+        createdByUserId: USER_ID,
+        projectId,
+        projectWorkspaceId,
+        executionWorkspaceId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          returnAssigneeAgentId,
+          stages: [
+            { id: STAGE_A, type: "review", approvalsNeeded: 1, participants: [participant] },
+            ...(opts.twoStages
+              ? [{ id: STAGE_B, type: "review", approvalsNeeded: 1, participants: [participant] }]
+              : []),
+          ],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: STAGE_A,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: participant,
+          returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: null,
+          changesRequestedCount: 0,
+        },
+      });
+
+      return { companyId, issueId };
+    }
+
+    async function readApprovalStatus(issueId: string) {
+      const [row] = await db
+        .select({ executionState: issues.executionState, status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(row).toBeTruthy();
+      return (row!.executionState ?? {}) as Record<string, unknown>;
+    }
+
+    it("records a stage-integrity finding refusal as a publishSkipped record (guard refusal)", async () => {
+      guardRouteControl.stageIntegrity = "finding";
+      const { companyId, issueId } = await seedLiveCard();
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Approved by board" });
+
+      expect(res.status).toBe(200);
+      // The guard refusal happens post-commit: the decision still succeeds (the card
+      // is never refused to close — ADR-073 D3 / ADR-092 D5), only the stamp/arm is
+      // skipped.
+      expect(res.body.outcome).toBe("approved");
+
+      const executionState = await readApprovalStatus(issueId);
+      const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+      // The total-record contract: the key is PRESENT and names the refusal.
+      expect(approvalStatus).toBeDefined();
+      const skipped = approvalStatus!.publishSkipped as Record<string, unknown> | undefined;
+      expect(skipped).toBeDefined();
+      expect(String(skipped!.reason)).toMatch(/^status:skipped:stage_integrity:/);
+      expect(String(skipped!.reason)).toContain("guard-c:test-finding");
+      expect(skipped!.headSha).toBeNull();
+    });
+
+    it("records an injected stage-integrity guard throw as a publishFailure record (guard exception)", async () => {
+      guardRouteControl.stageIntegrity = "throw";
+      const { companyId, issueId } = await seedLiveCard();
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Approved by board" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("approved");
+
+      const executionState = await readApprovalStatus(issueId);
+      const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+      expect(approvalStatus).toBeDefined();
+      const failure = approvalStatus!.publishFailure as Record<string, unknown> | undefined;
+      expect(failure).toBeDefined();
+      expect(String(failure!.reason)).toMatch(/^status:failed:stage_integrity_check_threw:/);
+      expect(String(failure!.reason)).toContain("injected stage-integrity guard exception");
+      expect(failure!.headSha).toBeNull();
+    });
+
+    it("records a non-terminal-ladder refusal as a publishSkipped record (ladder not terminal)", async () => {
+      guardRouteControl.stageIntegrity = "pass";
+      // Two stages: approving A leaves B outstanding, so the ladder is not terminally
+      // approved and the first publish is refused as a skip (not a failure).
+      const { companyId, issueId } = await seedLiveCard({ twoStages: true });
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Approved by board" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("approved");
+
+      const executionState = await readApprovalStatus(issueId);
+      const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+      expect(approvalStatus).toBeDefined();
+      const skipped = approvalStatus!.publishSkipped as Record<string, unknown> | undefined;
+      expect(skipped).toBeDefined();
+      expect(String(skipped!.reason)).toMatch(/^status:skipped:non-terminal-ladder:/);
+      expect(skipped!.headSha).toBeNull();
+    });
+
+    // SUP-16081 (comment a78bf2d2): the approval anchor (approvedHeadSha +
+    // approvedAt) must be written durably BEFORE the first-publish status write is
+    // attempted. On SUP-16041 a dropped/failed publish left approvedHeadSha absent,
+    // so both recovery paths (backfill D-B fallback, merge-arming/republish) were
+    // structurally unable to run. Stubbing the status write to fail must still leave
+    // a real anchor on the card.
+    it("a failing first publish still leaves the approval anchor on the card (a78bf2d2: anchor before publish)", async () => {
+      guardRouteControl.stageIntegrity = "pass";
+      guardRouteControl.publishMode = "fail";
+      const { companyId, issueId } = await seedLiveCard();
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Approved by board" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("approved");
+
+      const executionState = await readApprovalStatus(issueId);
+      const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+      expect(approvalStatus).toBeDefined();
+      // The anchor was written BEFORE the publish attempt and survived its failure.
+      expect(approvalStatus!.approvedHeadSha).toBe(guardRouteControl.headSha);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      // The failed publish is recorded as a named failure, not silently dropped.
+      const failure = approvalStatus!.publishFailure as Record<string, unknown> | undefined;
+      expect(failure).toBeDefined();
+      expect(String(failure!.reason)).toMatch(/^status:failed:/);
+      expect(failure!.headSha).toBe(guardRouteControl.headSha);
+      // No published head — the stamp never landed.
+      expect(approvalStatus!.publishedHeadSha).toBeUndefined();
+    });
+
+    it("a throwing first publish still leaves the approval anchor on the card (a78bf2d2: hard-kill backstop)", async () => {
+      guardRouteControl.stageIntegrity = "pass";
+      guardRouteControl.publishMode = "throw";
+      const { companyId, issueId } = await seedLiveCard();
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Approved by board" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("approved");
+
+      const executionState = await readApprovalStatus(issueId);
+      const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+      expect(approvalStatus).toBeDefined();
+      // The pre-publish anchor write ran before the throw; the catch backstop
+      // rewrites the same head, so approvedHeadSha is present either way.
+      expect(approvalStatus!.approvedHeadSha).toBe(guardRouteControl.headSha);
+      expect(typeof approvalStatus!.approvedAt).toBe("string");
+      const failure = approvalStatus!.publishFailure as Record<string, unknown> | undefined;
+      expect(failure).toBeDefined();
+      expect(String(failure!.reason)).toMatch(/^status:failed:internal:/);
+      expect(String(failure!.reason)).toContain("injected first-publish exception");
+    });
+  },
+);

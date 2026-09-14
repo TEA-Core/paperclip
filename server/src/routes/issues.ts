@@ -157,6 +157,8 @@ import {
   armMergeOnApproval,
   parseRepoUrl,
   publishApprovalStatus,
+  recordApprovalAnchor,
+  recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
@@ -3424,6 +3426,41 @@ export function issueRoutes(
       executionState: (issue.executionState ?? {}) as Record<string, unknown>,
       executionPolicy: issue.executionPolicy,
     };
+    // SUP-16081 fix #1: true once the first-publish outcome has been durably
+    // recorded on executionState.approvalStatus. The catch below uses it as a
+    // backstop so a thrown outcome records a publishFailure instead of dropping
+    // the key entirely (the exact hole SUP-16041 fell through).
+    let outcomeRecorded = false;
+    // SUP-16081 fix #2 (round-1 support-CR, finding
+    // total-publish-outcome-skips-prepublish-guards): every pre-publish refusal /
+    // guard exception below must leave the SAME durable, named record on
+    // executionState.approvalStatus that the happy path and the catch backstop
+    // leave. A guard that refuses to stamp/arm without recording is the exact
+    // silent-drop SUP-16041 suffered: a card with no existing approvalStatus
+    // could close with the key still absent, violating the total-outcome
+    // contract (AC1). This one finalizer routes all three pre-publish guard
+    // refusals through recordApprovalPublishOutcome with a null head (a guard
+    // fires before any head is resolved), so the total-record contract holds on
+    // the FIRST publish path too.
+    const recordGuardOutcome = async (
+      kind: "skipped" | "failed",
+      message: string,
+    ): Promise<void> => {
+      try {
+        await recordApprovalPublishOutcome(
+          db,
+          issue.id,
+          (issue.executionState ?? {}) as Record<string, unknown>,
+          null,
+          { kind, message },
+        );
+      } catch (recordErr) {
+        logger.error(
+          { err: recordErr, issueId: issue.id, companyId: issue.companyId },
+          "failed to record pre-publish guard refusal on the card",
+        );
+      }
+    };
     try {
       const integrity = await evaluateStageIntegrity(db, candidate);
       if (integrity) {
@@ -3448,6 +3485,14 @@ export function issueRoutes(
             "stage-integrity refusal comment write failed; still refusing to stamp/arm",
           );
         }
+        // SUP-16081 fix #2: record the refusal before returning (total outcome).
+        // The base #674 path now writes the card comment via the shared
+        // addGuardBArmingRefusalComment boundary (reason + detail), so the recorded
+        // message mirrors that same `status:skipped:stage_integrity:<reason>:` token.
+        await recordGuardOutcome(
+          "skipped",
+          `status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`,
+        );
         return;
       }
     } catch (err) {
@@ -3457,6 +3502,12 @@ export function issueRoutes(
       logger.warn(
         { err, issueId: issue.id },
         "stage-integrity check at decision time threw; refusing to stamp/arm (fail-closed)",
+      );
+      // SUP-16081 fix #2: a guard exception is a fail-closed refusal — record it
+      // as a named failure so the card is never left without an outcome.
+      await recordGuardOutcome(
+        "failed",
+        `status:failed:stage_integrity_check_threw: ${err instanceof Error ? err.message : String(err)}`,
       );
       return;
     }
@@ -3489,6 +3540,8 @@ export function issueRoutes(
           "non-terminal-ladder refusal comment write failed; still refusing to stamp/arm",
         );
       }
+      // SUP-16081 fix #2: record the refusal before returning (total outcome).
+      await recordGuardOutcome("skipped", msg);
       return;
     }
     // SUP-14602: the live-discovery / decision-head needle must be the issue's
@@ -3499,6 +3552,12 @@ export function issueRoutes(
     // the wrong company's) and returns skipped:no-pr instead of certifying the
     // card. issue.identifier is authoritative (stored issuePrefix-issueNumber).
     const issueIdentifier = issue.identifier ?? `SUP-${issue.issueNumber}`;
+    // SUP-16081 (comment a78bf2d2): the decision head we resolved, captured
+    // before the publish attempt. The catch below uses it so a post-anchor
+    // throw still rewrites the anchor (never leaves approvedHeadSha absent),
+    // keeping both recovery paths alive for a hard-kill between decision and
+    // publish.
+    let recordedHeadSha: string | null = null;
     try {
       // ADR-091 D2a: pin the FIRST publish to the head the approving decision
       // was rendered against. Resolve it up front, then hand it to
@@ -3517,6 +3576,16 @@ export function issueRoutes(
       );
       let statusOutcome: ArmingOutcome;
       if (decisionHead.kind === "resolved") {
+        // SUP-16081 (comment a78bf2d2): write the approval anchor durably
+        // BEFORE the status write is attempted. SUP-16041's drop left
+        // approvedHeadSha absent (it was only written after a successful
+        // publish), so both recovery paths — backfill's D-B fallback and
+        // merge-arming/republish — were structurally unable to run. With the
+        // anchor present up front, a dropped/throwing publish still leaves a
+        // real anchor both paths can recover. recordApprovalAnchor merge-writes
+        // the card's approvalStatus, so it never clobbers concurrent fields.
+        recordedHeadSha = decisionHead.headSha;
+        await recordApprovalAnchor(db, issue.id, decisionHead.headSha);
         // SUP-13831: the zero-mention-row live-discovery in publishApprovalStatus
         // is a delivery probe. It must only run when the transition CLOSes the
         // issue (effectiveStatus === "done"), not when a stage approval redirects
@@ -3545,11 +3614,14 @@ export function issueRoutes(
         };
       }
 
-      // SUP-13714 Guard A persistence + SUP-14715 D-B: record which head this
-      // approval certified so the reconciler can verify content identity before
-      // subsequent re-publishes. Stored in issues.executionState (no migration;
-      // the stage machine only rebuilds this blob on a subsequent transition,
-      // which for an approved card is a new review cycle and is re-persisted).
+      // SUP-13714 Guard A persistence + SUP-14715 D-B + SUP-16081 fix #1: record
+      // which head this approval certified AND the outcome of the FIRST publish
+      // itself, so a dropped publish is never silent. The helper is total: an
+      // `armed` outcome keeps the success shape, and a `skipped`/`failed`
+      // outcome leaves a named publishSkipped / publishFailure record (the
+      // publisher's refusal vocabulary + the attempted head) plus, when a head
+      // resolved, the D-B anchor. The key is never absent after a closing
+      // transition; a thrown outcome is caught and recorded below.
       //
       // D-B: approvedHeadSha is written on EVERY outcome that positively
       // resolved a head, so a skipped/failed FIRST publish leaves a real anchor
@@ -3557,72 +3629,28 @@ export function issueRoutes(
       // and treats that first publish as a delivery-identity-gated write. It is
       // deliberately distinct from publishedHeadSha: "certified at this head"
       // (approvedHeadSha) vs "the paperclip/approved status was actually
-      // written at this head" (publishedHeadSha). A refusal that resolved no
-      // head (delivery_identity_unresolved, not_delivered, no-pr, ambiguous,
-      // ...) records nothing — an unverifiable head must not be anchored.
+      // written at this head" (publishedHeadSha). An unresolvable outcome that
+      // certifies no head anchors nothing, but it still records the named skip.
       const resolvedHeadSha = decisionHead.kind === "resolved" ? decisionHead.headSha : null;
-      if (resolvedHeadSha !== null) {
-        const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
-        const approvalStatus: Record<string, unknown> = {
-          approvedHeadSha: resolvedHeadSha,
-          approvedAt: new Date().toISOString(),
-        };
-        if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
-          approvalStatus.publishedHeadSha = statusOutcome.headSha;
-          approvalStatus.publishedAt = new Date().toISOString();
-        }
-        await db
-          .update(issueRows)
-          .set({
-            executionState: {
-              ...currentState,
-              approvalStatus,
-            },
-          })
-          .where(eq(issueRows.id, issue.id));
-      } else {
-        // SUP-14602: an ambiguous decision cannot resolve a single certifiable
-        // head, but the certification the producer had in hand must not be
-        // discarded. Two sources carry the candidate heads: the decision-time
-        // resolver (ADR-091 D2a intercepts ambiguity BEFORE publishApprovalStatus
-        // runs, so the candidates come from decisionHead.pendingCandidates) and
-        // the publisher itself (ambiguity reached only at write time ->
-        // statusOutcome.skipCandidates). Persist the per-candidate approval-time
-        // heads so that, once the ambiguity resolves (a human or agent closes the
-        // duplicate PR), the approval-status reconciler can re-run the unmodified
-        // Guard A diff-vs-base check against a certified head instead of failing
-        // closed forever on guard-a:no-approved-head. publishedHeadSha semantics
-        // are untouched — it still means "published", never "considered".
-        const pendingCandidates =
-          statusOutcome.kind === "skipped" &&
-          Array.isArray(statusOutcome.skipCandidates) &&
-          statusOutcome.skipCandidates.length > 0
-            ? statusOutcome.skipCandidates
-            : decisionHead.kind === "unresolvable" &&
-                Array.isArray(decisionHead.pendingCandidates) &&
-                decisionHead.pendingCandidates.length > 0
-              ? decisionHead.pendingCandidates
-              : null;
-        if (pendingCandidates !== null) {
-          const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
-          const existingApprovalStatus =
-            (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
-          await db
-            .update(issueRows)
-            .set({
-              executionState: {
-                ...currentState,
-                approvalStatus: {
-                  ...existingApprovalStatus,
-                  pendingCandidates,
-                  skipReason: statusOutcome.message,
-                  certifiedAt: new Date().toISOString(),
-                },
-              },
-            })
-            .where(eq(issueRows.id, issue.id));
-        }
-      }
+      const pendingCandidates =
+        statusOutcome.kind === "skipped" &&
+        Array.isArray(statusOutcome.skipCandidates) &&
+        statusOutcome.skipCandidates.length > 0
+          ? statusOutcome.skipCandidates
+          : decisionHead.kind === "unresolvable" &&
+              Array.isArray(decisionHead.pendingCandidates) &&
+              decisionHead.pendingCandidates.length > 0
+            ? decisionHead.pendingCandidates
+            : null;
+      await recordApprovalPublishOutcome(
+        db,
+        issue.id,
+        (issue.executionState ?? {}) as Record<string, unknown>,
+        resolvedHeadSha,
+        statusOutcome,
+        pendingCandidates,
+      );
+      outcomeRecorded = true;
 
       await svc.addComment(
         issue.id,
@@ -3721,6 +3749,30 @@ export function issueRoutes(
       }
     } catch (err) {
       logger.warn({ err, issueId: issue.id, companyId: issue.companyId }, "merge-arming hook failed");
+      // SUP-16081 fix #1: an uncaught exception in the first-publish flow must
+      // leave a durable, named failure on the card — an uncaught error that
+      // leaves executionState.approvalStatus absent is exactly the silent drop
+      // SUP-16041 suffered. Only record when the outcome write itself did not
+      // already complete, so we do not clobber a real outcome with "internal".
+      if (!outcomeRecorded) {
+        try {
+          await recordApprovalPublishOutcome(
+            db,
+            issue.id,
+            (issue.executionState ?? {}) as Record<string, unknown>,
+            recordedHeadSha,
+            {
+              kind: "failed",
+              message: `status:failed:internal: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          );
+        } catch (recordErr) {
+          logger.error(
+            { err: recordErr, issueId: issue.id, companyId: issue.companyId },
+            "failed to record merge-arming internal first-publish failure on the card",
+          );
+        }
+      }
     }
   };
 
