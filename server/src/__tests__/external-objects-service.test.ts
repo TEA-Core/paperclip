@@ -5,11 +5,13 @@ import {
   companies,
   createDb,
   activityLog,
+  executionWorkspaces,
   externalObjectMentions,
   externalObjects,
   issueComments,
   issues,
   plugins,
+  projects,
 } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
@@ -26,8 +28,30 @@ import { canonicalizeExternalObjectUrl, extractExternalObjectCanonicalUrls } fro
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { createGitHubExternalObjectProvider } from "../services/github-external-object-provider.js";
-import { resolveCardPullRequest, resolveLinkedPullRequests } from "../services/merge-arming.js";
+import { resolveApprovalDecisionHead, resolveCardPullRequest, resolveLinkedPullRequests } from "../services/merge-arming.js";
+import { GITHUB_TOKEN_SECRET_NAMES } from "../services/github-credential.js";
 import { logger } from "../middleware/logger.js";
+
+// SUP-16283 (round 1): the delivery-identity gate (resolveApprovalDecisionHead) reads a
+// GitHub token via secretService and the PR head via ghFetch. Mock both so the gate test
+// can drive the real gate end to end. The external-object service tests inject their own
+// `fetch`/`tokenProvider`, so only the gate path reaches these mocks.
+const mockGhFetch = vi.hoisted(() => vi.fn());
+const mockGetByName = vi.hoisted(() => vi.fn());
+const mockResolveSecretValue = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({
+    getByName: mockGetByName,
+    resolveSecretValue: mockResolveSecretValue,
+  }),
+}));
+
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: mockGhFetch,
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -484,6 +508,8 @@ describeEmbeddedPostgres("externalObjectService", () => {
     await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(plugins);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
     vi.restoreAllMocks();
   });
@@ -964,6 +990,30 @@ describeEmbeddedPostgres("externalObjectService", () => {
 
   it("clears the not_found poison so the delivery-identity gate recovers once the row hydrates (SUP-16283)", async () => {
     const { companyId, issueId } = await createIssue();
+    // Delivery-identity fixture (ADR-091 D1): the card's own execution-workspace
+    // branch + project repo. The gate narrows the cached linked PR to the one
+    // delivered on THIS branch in THIS repo, so the delivery branch/repo must
+    // match the hydrated PR head (SUP-16041-delivery @ acme/app).
+    const [projectRow] = await db
+      .insert(projects)
+      .values({ id: randomUUID(), companyId, name: "acme/app", status: "in_progress" })
+      .returning();
+    const [ewRow] = await db
+      .insert(executionWorkspaces)
+      .values({
+        id: randomUUID(),
+        companyId,
+        projectId: projectRow!.id,
+        mode: "isolated",
+        strategyType: "git_worktree",
+        name: "card-workspace",
+        status: "active",
+        branchName: "SUP-16041-delivery",
+        repoUrl: "https://github.com/acme/app",
+      })
+      .returning();
+    await db.update(issues).set({ executionWorkspaceId: ewRow!.id }).where(eq(issues.id, issueId));
+
     const fetch = vi.fn(async () => notFoundPullRequestResponse());
     const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
     await svc.syncIssue(issueId);
@@ -983,6 +1033,13 @@ describeEmbeddedPostgres("externalObjectService", () => {
     const poisonedCard = await resolveCardPullRequest(db, companyId, issueId, "SUP-16041");
     expect(poisonedCard).toMatchObject({ kind: "single", headRefName: null });
 
+    // Acceptance 4: the gate itself refuses not_delivered while headRef is null.
+    const poisonedGate = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-16041", true);
+    expect(poisonedGate.kind).toBe("unresolvable");
+    if (poisonedGate.kind === "unresolvable") {
+      expect(poisonedGate.reason).toMatch(/^not_delivered:/);
+    }
+
     // A later sweep re-resolves and hydrates the row (head.ref carries the branch).
     fetch.mockImplementation(async () => openPullRequestResponse());
     const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 400_000));
@@ -995,6 +1052,23 @@ describeEmbeddedPostgres("externalObjectService", () => {
     expect(hydratedLinked[0]!.cachedState).toBe("open");
     const hydratedCard = await resolveCardPullRequest(db, companyId, issueId, "SUP-16041");
     expect(hydratedCard).toMatchObject({ kind: "single", headRefName: "SUP-16041-delivery" });
+
+    // Acceptance 4: the same gate now RESOLVES the single delivered PR head.
+    mockGetByName.mockImplementation(async (_cid: string, name: string) =>
+      (GITHUB_TOKEN_SECRET_NAMES as readonly string[]).includes(name) ? { id: "secret-1", name } : null,
+    );
+    mockResolveSecretValue.mockResolvedValue("ghp_test_token_value");
+    mockGhFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ head: { ref: "SUP-16041-delivery", sha: "approved-head-sha" } }),
+    } as unknown as Response);
+    const hydratedGate = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-16041", true);
+    expect(hydratedGate.kind).toBe("resolved");
+    if (hydratedGate.kind === "resolved") {
+      expect(hydratedGate.headSha).toBe("approved-head-sha");
+      expect(hydratedGate.displayName).toBe("acme/app#42");
+    }
   });
 
   it("refreshes due objects in nextRefreshAt order so the backlog is not starved", async () => {
