@@ -683,5 +683,93 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       const promoted = await runsForWakeup(companyId, wakeId);
       expect(promoted).toHaveLength(1);
     });
+
+    it("promotes deferred retries for two sibling issues without cross-stamping pointers", async () => {
+      const { companyId, agentId, issueId: issueAId } = await seedCompanyAgentIssue();
+      const issueBId = randomUUID();
+      await db.insert(issues).values({
+        id: issueBId,
+        companyId,
+        title: "Sibling mission",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      });
+
+      // One terminal run per sibling, each scoped to its own issue.
+      const endingRunAId = await seedTerminalRun({
+        companyId,
+        agentId,
+        issueId: issueAId,
+        finishedSecondsAgo: 0,
+      });
+      const endingRunBId = await seedTerminalRun({
+        companyId,
+        agentId,
+        issueId: issueBId,
+        finishedSecondsAgo: 0,
+      });
+
+      // One deferred wake per sibling, each carrying its own issue in both the
+      // payload issueId the promotion selects on and the wake context the
+      // promoted run inherits.
+      const wakeAId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId: issueAId,
+        requestedByActorType: "user",
+        wakeContext: { issueId: issueAId, wakeReason: "issue_reopened_via_comment" },
+      });
+      const wakeBId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId: issueBId,
+        requestedByActorType: "user",
+        wakeContext: { issueId: issueBId, wakeReason: "issue_reopened_via_comment" },
+      });
+
+      const [endingA] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunAId));
+      const [endingB] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunBId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingA);
+      await heartbeat.releaseIssueExecutionAndPromote(endingB);
+
+      const promotedA = await runsForWakeup(companyId, wakeAId);
+      const promotedB = await runsForWakeup(companyId, wakeBId);
+      expect(promotedA).toHaveLength(1);
+      expect(promotedB).toHaveLength(1);
+
+      const contextIssueOf = async (runId: string) => {
+        const run = await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return ((run?.contextSnapshot ?? {}) as Record<string, unknown>).issueId ?? null;
+      };
+
+      // Each promoted run is bound to the sibling whose deferred wake produced
+      // it — never to the other sibling the same agent is working.
+      expect(await contextIssueOf(promotedA[0].id)).toBe(issueAId);
+      expect(await contextIssueOf(promotedB[0].id)).toBe(issueBId);
+
+      // Settle the promoted executions, then assert the durable invariant: any
+      // surviving execution/checkout pointer names a run scoped to that card.
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const cards = await db
+        .select({
+          id: issues.id,
+          executionRunId: issues.executionRunId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(eq(issues.companyId, companyId));
+      for (const card of cards) {
+        for (const runId of [card.executionRunId, card.checkoutRunId]) {
+          if (!runId) continue;
+          expect(await contextIssueOf(runId)).toBe(card.id);
+        }
+      }
+    });
   });
 });
