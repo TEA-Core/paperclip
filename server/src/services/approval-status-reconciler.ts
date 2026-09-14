@@ -1461,27 +1461,37 @@ type ShaServerTimestampResult =
   | { ok: false; transient: boolean; detail: string };
 
 /**
- * SUP-14844 (round 1): read `/commits/{sha}/check-runs` and return the minimum
- * server-assigned `created_at` across the check runs GitHub triggered on this
- * PR's own head branch (`check_suite.head_branch === headRefName`). That is the
+ * SUP-14844 (round 1) / SUP-16122 (round 2): read
+ * `/commits/{sha}/check-suites` and return the minimum server-assigned
+ * `created_at` across the check suites GitHub triggered on this PR's own head
+ * branch (`suite.head_branch === headRefName`). That is the
  * server-attested evidence that the sha existed on this branch at/before that
  * time.
  *
+ * SUP-16122 D-B: the proof originally read `/commits/{sha}/check-runs`, but the
+ * check-runs LIST response does not carry the two fields it needs — `check_suite`
+ * is a minimal object (id only) and check runs expose `started_at`/`completed_at`
+ * (not `created_at`). Measured live, every run was skipped and the function
+ * returned a DETERMINISTIC `head-unverifiable` for every card. The check-SUITES
+ * endpoint returns both `head_branch` and a server `created_at`, so the same
+ * branch-bound, server-timed proof is read from there.
+ *
  * Two guards keep the proof honest (round-1 review findings):
- *   - `check_run.started_at` is CLIENT-supplied and is deliberately ignored;
- *     only the server-assigned `check_run.created_at` counts.
- *   - A check run only counts as THIS PR's evidence when its check suite's head
- *     branch equals the card's PR head ref. A commit reachable from another
- *     branch otherwise lends its older, unrelated cross-branch check-run
- *     timestamps to this sha and would wrongly anchor it (the laundering trace:
- *     head A approved, branch fast-forwarded to a pre-existing sha B whose CI
- *     ran on a different branch before the approval).
+ *   - A client-supplied timestamp is deliberately ignored; only the
+ *     server-assigned `created_at` counts.
+ *   - A suite only counts as THIS PR's evidence when its head branch equals the
+ *     card's PR head ref. A commit reachable from another branch otherwise lends
+ *     its older, unrelated cross-branch suite timestamps to this sha and would
+ *     wrongly anchor it (the laundering trace: head A approved, branch
+ *     fast-forwarded to a pre-existing sha B whose CI ran on a different branch
+ *     before the approval).
  *
  * A read failure (HTTP / network error) or an unreadable head ref is TRANSIENT
  * (`transient: true`): reported as a skip, not persisted, so the next tick
  * retries. The ABSENCE of any branch-bound server-timed evidence is a
- * DETERMINISTIC refusal (`transient: false`) — the check runs for a given sha on
- * a given branch are immutable history, so it is persisted as a stable refusal.
+ * DETERMINISTIC refusal (`transient: false`) — the check suites for a given sha
+ * on a given branch are immutable history, so it is persisted as a stable
+ * refusal.
  */
 async function readShaServerTimestamp(
   db: Db,
@@ -1491,46 +1501,47 @@ async function readShaServerTimestamp(
   sha: string,
   headRefName: string | null,
 ): Promise<ShaServerTimestampResult> {
-  // Without the PR's head ref we cannot prove a check run belongs to this
+  // Without the PR's head ref we cannot prove a check suite belongs to this
   // branch, so the binding cannot be established. Treat as transient: the
   // cached head ref may populate on the next external-object refresh.
   if (headRefName === null || headRefName === "") {
     return {
       ok: false,
       transient: true,
-      detail: "sha-branch-binding: PR head ref is unavailable; cannot establish branch-bound check-run evidence",
+      detail: "sha-branch-binding: PR head ref is unavailable; cannot establish branch-bound check-suite evidence",
     };
   }
 
-  const checkRunsRead = await ghReadJson(
+  const checkSuitesRead = await ghReadJson(
     db,
     companyId,
     owner,
     repo,
-    `/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`,
+    `/commits/${encodeURIComponent(sha)}/check-suites?per_page=100`,
   );
-  if (!checkRunsRead.ok) {
+  if (!checkSuitesRead.ok) {
     return {
       ok: false,
       transient: true,
-      detail: `check-runs-read-failed: HTTP ${checkRunsRead.status} ${checkRunsRead.message ?? ""}`.trim(),
+      detail: `check-suites-read-failed: HTTP ${checkSuitesRead.status} ${checkSuitesRead.message ?? ""}`.trim(),
     };
   }
 
   let minTimestampMs: number | null = null;
-  let sawBranchBoundRun = false;
+  let sawBranchBoundSuite = false;
 
-  const checkRunsBody = checkRunsRead.body as Record<string, unknown> | null;
-  const checkRuns = Array.isArray(checkRunsBody?.check_runs)
-    ? (checkRunsBody!.check_runs as Array<Record<string, unknown>>)
+  const checkSuitesBody = checkSuitesRead.body as Record<string, unknown> | null;
+  const checkSuites = Array.isArray(checkSuitesBody?.check_suites)
+    ? (checkSuitesBody!.check_suites as Array<Record<string, unknown>>)
     : [];
-  for (const run of checkRuns) {
-    const suite = run.check_suite as Record<string, unknown> | null | undefined;
-    const runHeadBranch = suite && typeof suite.head_branch === "string" ? suite.head_branch : null;
-    if (runHeadBranch !== headRefName) continue;
-    sawBranchBoundRun = true;
-    // Only the server-assigned created_at counts; started_at is client-supplied.
-    const createdAt = typeof run.created_at === "string" ? run.created_at : null;
+  for (const suite of checkSuites) {
+    const suiteHeadBranch =
+      suite && typeof suite.head_branch === "string" ? suite.head_branch : null;
+    if (suiteHeadBranch !== headRefName) continue;
+    sawBranchBoundSuite = true;
+    // Only the server-assigned created_at counts; a client-supplied timestamp
+    // (e.g. a check run's started_at) must never anchor the sha.
+    const createdAt = typeof suite.created_at === "string" ? suite.created_at : null;
     if (!createdAt) continue;
     const ms = Date.parse(createdAt);
     if (!Number.isNaN(ms) && (minTimestampMs === null || ms < minTimestampMs)) {
@@ -1538,24 +1549,25 @@ async function readShaServerTimestamp(
     }
   }
 
-  if (!sawBranchBoundRun) {
-    // No check run triggered on this PR's head branch for this sha: we cannot
+  if (!sawBranchBoundSuite) {
+    // No check suite triggered on this PR's head branch for this sha: we cannot
     // show the sha existed on this branch, so the binding cannot be shown. This
-    // is deterministic (immutable check-run history), not a read failure.
+    // is deterministic (immutable check-suite history), not a read failure.
     return {
       ok: false,
       transient: false,
-      detail: `sha-branch-binding: no check run on the PR head branch (${headRefName}) found for head sha ${sha.slice(0, 7)}`,
+      detail: `sha-branch-binding: no check suite on the PR head branch (${headRefName}) found for head sha ${sha.slice(0, 7)}`,
     };
   }
 
   if (minTimestampMs === null) {
-    // Branch-bound runs exist but carry no parseable server created_at: treat as
-    // a read/parse blip to retry rather than strand the card (fail toward retry).
+    // Branch-bound suites exist but carry no parseable server created_at: treat
+    // as a read/parse blip to retry rather than strand the card (fail toward
+    // retry).
     return {
       ok: false,
       transient: true,
-      detail: "sha-server-timestamp: no parseable server created_at on the branch-bound check runs",
+      detail: "sha-server-timestamp: no parseable server created_at on the branch-bound check suites",
     };
   }
 
@@ -1746,13 +1758,27 @@ type BackfillOutcome =
  * skip but NOT persisted, so the next tick retries the read instead of stranding
  * a recoverable card on one transient error (backfill-refusal-caches-transient-
  * failures).
+ *
+ * SUP-16122 D-A: the cached refusal is a verdict from a particular version of
+ * the refusal logic, so the persisted entry is stamped with
+ * `cacheVersion`. A refusal written by superseded logic — including every
+ * pre-fix entry, which carries no version at all — is a cache MISS. Without
+ * this, a false refusal minted by the buggy comparison permanently suppressed
+ * the corrected re-read for that code's own victims (SUP-16041 / PR #448): both
+ * key components (`observedHeadSha`, `approvedAtMs`) are immutable on a done
+ * card, so the cache hit forever.
  */
-type BackfillRefusal = {
+const BACKFILL_REFUSAL_CACHE_VERSION = 1;
+
+/** The refusal fields a caller derives; the cache version is stamped on write. */
+type BackfillRefusalInput = {
   reason: string;
   observedHeadSha: string;
   approvedAtMs: number;
   observedAt: string;
 };
+
+type BackfillRefusal = BackfillRefusalInput & { cacheVersion: number };
 
 function readBackfillRefusal(row: CandidateRow): BackfillRefusal | null {
   const approvalStatus =
@@ -1761,6 +1787,12 @@ function readBackfillRefusal(row: CandidateRow): BackfillRefusal | null {
   const raw = approvalStatus.backfillRefusal;
   if (!raw || typeof raw !== "object") return null;
   const obj = raw as Record<string, unknown>;
+  // Fail toward a fresh read: an entry lacking the current version marker was
+  // written by superseded logic and must never short-circuit the corrected
+  // comparison.
+  if (obj.cacheVersion !== BACKFILL_REFUSAL_CACHE_VERSION) {
+    return null;
+  }
   if (
     typeof obj.reason !== "string" ||
     typeof obj.observedHeadSha !== "string" ||
@@ -1780,6 +1812,7 @@ function readBackfillRefusal(row: CandidateRow): BackfillRefusal | null {
     observedHeadSha: obj.observedHeadSha,
     approvedAtMs: obj.approvedAtMs,
     observedAt: typeof obj.observedAt === "string" ? obj.observedAt : "",
+    cacheVersion: BACKFILL_REFUSAL_CACHE_VERSION,
   };
 }
 
@@ -1848,11 +1881,18 @@ export async function mergeApprovalStatus(
 export async function persistBackfillRefusal(
   db: Db,
   row: CandidateRow,
-  refusal: BackfillRefusal,
+  refusal: BackfillRefusalInput,
 ): Promise<void> {
-  await mergeApprovalStatus(db, row, { backfillRefusal: refusal }, {
-    source: "approval-status-reconciler.persist_backfill_refusal",
-  });
+  await mergeApprovalStatus(
+    db,
+    row,
+    // SUP-16122 D-A: stamp the current cache version so this refusal is only
+    // honoured by the logic that wrote it.
+    { backfillRefusal: { ...refusal, cacheVersion: BACKFILL_REFUSAL_CACHE_VERSION } },
+    {
+      source: "approval-status-reconciler.persist_backfill_refusal",
+    },
+  );
 }
 
 type TemporalBackfillOutcome =
@@ -1961,7 +2001,7 @@ async function temporalBackfillOutcome(
 
     // SUP-14844: the timeline carries only committed (client-timed) head events
     // at/before the approval — no force-push. Attempt the server-timed,
-    // branch-bound sha existence proof: if the live head sha has a check run
+    // branch-bound sha existence proof: if the live head sha has a check suite
     // GitHub triggered on THIS PR's head branch (check_suite.head_branch === the
     // card's PR head ref) whose server-assigned created_at is at/before the
     // approval time, the sha provably existed on this branch at that time and no

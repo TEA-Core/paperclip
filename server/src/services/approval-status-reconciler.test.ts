@@ -147,6 +147,11 @@ const APPROVED_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compa
 const LIVE_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${NEW_HEAD}`;
 const COMMENT_LIST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments?per_page=100&direction=desc";
 const COMMENT_POST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments";
+// SUP-16122 D-B: the sha-existence proof reads check-SUITES (which carry
+// `head_branch` + a server `created_at`), NOT check-runs (whose LIST response
+// carries neither). The check-runs URL below is kept only to assert the code no
+// longer reads it.
+const CHECK_SUITES_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/check-suites?per_page=100`;
 const CHECK_RUNS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/check-runs?per_page=100`;
 const CLOSED_43_BODY = { state: "closed", merged: false, head: { ref: "dup-branch", sha: "closed430000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
 const MERGED_44_BODY = { state: "closed", merged: true, head: { ref: "dup-branch-44", sha: "merged440000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
@@ -258,6 +263,29 @@ const TIMELINE_STALE_ANCHOR_POST_APPROVAL_BODY = [
 const TIMELINE_POST_APPROVAL_FORCE_PUSH_BACK_TO_ANCHOR_BODY = [
   { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-09-13T07:51:55Z" },
   { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-09-13T12:00:00Z" },
+];
+
+// SUP-16122: PR #448's real head sha and approval-decision time (the exact
+// `approvedAtMs` in SUP-16041's persisted pre-fix refusal), plus the measured
+// PR shape: force-push anchor at 07:51:55Z, two later pre-approval `committed`
+// events, no post-approval force-push. Replays the strand end to end.
+const PR448_HEAD_SHA = "64bf4c62f3485a1a43a1793129f8989d4560f911";
+const PR448_APPROVAL_MS = 1_789_295_319_433;
+const PR448_COMBINED_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${PR448_HEAD_SHA}/status`;
+const PR448_POST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/statuses/${PR448_HEAD_SHA}`;
+const PR448_CHECK_SUITES_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${PR448_HEAD_SHA}/check-suites?per_page=100`;
+const PR448_PR_BODY = {
+  state: "open",
+  merged: false,
+  head: { ref: "some-branch-name", sha: PR448_HEAD_SHA },
+  base: { ref: "main", sha: BASE_SHA },
+};
+const TIMELINE_PR448_STALE_ANCHOR_BODY = [
+  { event: "committed", sha: EARLIEST_COMMIT_SHA, committer: { date: "2026-09-13T07:00:00Z" }, author: { date: "2026-09-13T07:00:00Z" } },
+  { event: "committed", sha: STALE_ANCHOR_SHA, committer: { date: "2026-09-13T07:30:00Z" }, author: { date: "2026-09-13T07:30:00Z" } },
+  { event: "head_ref_force_pushed", commit_id: STALE_ANCHOR_SHA, created_at: "2026-09-13T07:51:55Z" },
+  { event: "committed", sha: INTERMEDIATE_COMMIT_SHA, committer: { date: "2026-09-13T09:00:00Z" }, author: { date: "2026-09-13T09:00:00Z" } },
+  { event: "committed", sha: PR448_HEAD_SHA, committer: { date: "2026-09-13T09:59:39Z" }, author: { date: "2026-09-13T09:59:39Z" } },
 ];
 
 // SUP-15017: a certified `no-pr` branch anchor + the commit-detail reads the
@@ -993,7 +1021,9 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         const state = await readIssueState(issueId);
         expect(state.currentStageIndex).toBe(2);
         const approvalStatus = state.approvalStatus as Record<string, unknown>;
-        expect(approvalStatus.backfillRefusal).toEqual(refusal);
+        // SUP-16122 D-A: the refusal is stamped with the current cache version
+        // so a refusal written by superseded logic is never honoured.
+        expect(approvalStatus.backfillRefusal).toEqual({ ...refusal, cacheVersion: 1 });
         expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
 
         const audit = await lastAuditFor(issueId);
@@ -2898,13 +2928,13 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
-          // A check run GitHub triggered on this PR's head branch, whose
+          url: CHECK_SUITES_URL,
+          // A check suite GitHub triggered on this PR's head branch, whose
           // server-assigned created_at is AFTER the approval: no branch-bound
           // evidence at/before the approval, so the head is unverifiable.
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-20T01:00:00Z" }],
           },
         },
       ]);
@@ -2970,13 +3000,13 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
-          // A check run GitHub triggered on this PR's head branch, whose
+          url: CHECK_SUITES_URL,
+          // A check suite GitHub triggered on this PR's head branch, whose
           // server-assigned created_at is BEFORE the approval: the sha
           // provably existed on this branch at/before the approval.
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-19T12:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-19T12:00:00Z" }],
           },
         },
         { url: POST_STATUS_URL, body: { id: 12348 } },
@@ -3013,14 +3043,14 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_STALE_ANCHOR_BODY },
         {
-          url: CHECK_RUNS_URL,
-          // The live head's check run, GitHub-triggered on this PR's head branch,
+          url: CHECK_SUITES_URL,
+          // The live head's check suite, GitHub-triggered on this PR's head branch,
           // with a server-assigned created_at at/before the approval: NEW_HEAD
           // provably existed on this branch at/before the approval even though the
           // timeline's force-push anchor (STALE_ANCHOR_SHA) is stale.
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-09-13T09:59:39Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-09-13T09:59:39Z" }],
           },
         },
         { url: POST_STATUS_URL, body: { id: 12350 } },
@@ -3045,6 +3075,123 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
     });
 
+    it("re-reads the timeline and backfills when the persisted refusal predates the cache-version marker, replaying SUP-16041 / PR #448 end to end (SUP-16122 D-A+D-B, AC1+AC3)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            approvedHeadSha: null,
+            publishedHeadSha: null,
+            // SUP-16041's persisted refusal, exactly as re-read live: written by
+            // the pre-SUP-16122 logic and therefore carrying no cacheVersion
+            // marker. Its observedHeadSha is the real PR head and its
+            // approvedAtMs is the real decision time, so a version-less cache
+            // hit would have short-circuited the corrected comparison.
+            backfillRefusal: {
+              reason: "backfill:head-moved-since-approval",
+              observedHeadSha: PR448_HEAD_SHA,
+              approvedAtMs: PR448_APPROVAL_MS,
+              observedAt: "2026-09-13T10:34:25.429Z",
+            },
+          },
+        }),
+      });
+      // PR #448's actual approval decision time, matching the stub above.
+      await insertDecision(issueId, { createdAt: new Date(PR448_APPROVAL_MS) });
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: PR448_PR_BODY },
+        { url: PR448_COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_PR448_STALE_ANCHOR_BODY },
+        {
+          url: PR448_CHECK_SUITES_URL,
+          // Measured shape: one branch-bound suite, server created_at
+          // 09:59:39Z — 29 minutes before the 10:28:39.433Z approval.
+          body: {
+            total_count: 1,
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-09-13T09:59:39Z" }],
+          },
+        },
+        { url: PR448_POST_STATUS_URL, body: { id: 12351 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // AC1: the version-less refusal was a cache miss — the timeline was
+      // re-read rather than short-circuiting the corrected comparison.
+      const timelineReads = mockGhFetch.mock.calls.filter(
+        (call) => String(call[0]) === TIMELINE_URL,
+      ).length;
+      expect(timelineReads).toBeGreaterThan(0);
+
+      // AC3: the live head certifies on the branch-bound server-timed evidence;
+      // the anchor + stamp are written and the prior refusal cleared.
+      expect(summary.backfilled).toBe(1);
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["backfill:head-moved-since-approval"]).toBeUndefined();
+      expect(Object.keys(summary.skipped)).toEqual([]);
+      expect(postStatusCalls()).toHaveLength(1);
+      expect(postStatusBodies()[0]).toMatchObject({ state: "success", context: PAPERCLIP_APPROVED });
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(PR448_HEAD_SHA);
+      expect(approvalStatus.approvedAt).toBe(new Date(PR448_APPROVAL_MS).toISOString());
+      expect(approvalStatus.publishedHeadSha).toBe(PR448_HEAD_SHA);
+      expect(approvalStatus.backfillRefusal).toBeUndefined();
+    });
+
+    it("reads the proof from check-SUITES: a real-shape check-RUNS payload no longer yields sha-branch-binding / head-unverifiable (SUP-16122 D-B, AC2)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        // The real measured check-runs LIST shape: `check_suite` is `{id}` only
+        // with no `head_branch`, and no run-level `created_at`. A code path that
+        // still read check-runs would skip every run and deterministically
+        // refuse head-unverifiable.
+        {
+          url: CHECK_RUNS_URL,
+          body: {
+            total_count: 1,
+            check_runs: [{ name: "ci", created_at: null, check_suite: { id: 94118652167 } }],
+          },
+        },
+        // The branch binding + server timestamp live on the check-suites read.
+        {
+          url: CHECK_SUITES_URL,
+          body: {
+            total_count: 1,
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-19T12:00:00Z" }],
+          },
+        },
+        { url: POST_STATUS_URL, body: { id: 12352 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.backfilled).toBe(1);
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBeUndefined();
+      expect(postStatusCalls()).toHaveLength(1);
+
+      const urls = mockGhFetch.mock.calls.map((call) => String(call[0]));
+      expect(urls).not.toContain(CHECK_RUNS_URL);
+      expect(urls).toContain(CHECK_SUITES_URL);
+    });
+
     it("still refuses head-unverifiable when a stale anchor's live head has no branch-bound server evidence at/before the approval (SUP-16080, fail closed)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
@@ -3060,13 +3207,13 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_STALE_ANCHOR_BODY },
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           // The live head's only server-timed evidence is AFTER the approval: the
           // fall-through adds a proof path, never a bypass. With no branch-bound
           // evidence at/before the approval the head cannot be certified.
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-09-13T12:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-09-13T12:00:00Z" }],
           },
         },
       ]);
@@ -3176,7 +3323,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
-        { url: CHECK_RUNS_URL, body: {}, ok: false, status: 500 },
+        { url: CHECK_SUITES_URL, body: {}, ok: false, status: 500 },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -3211,10 +3358,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         // timestamp would wrongly anchor the sha, but it is not this PR's
         // evidence, so the binding cannot be shown and the head is unverifiable.
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "other-branch" }, created_at: "2026-08-19T01:00:00Z" }],
+            check_suites: [{ head_branch: "other-branch", created_at: "2026-08-19T01:00:00Z" }],
           },
         },
       ]);
@@ -3256,12 +3403,12 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         // in; branch-binding keeps only the this-branch run, which is
         // post-approval, so the head is unverifiable.
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           body: {
             total_count: 2,
-            check_runs: [
-              { check_suite: { head_branch: "other-branch" }, created_at: "2026-08-19T01:00:00Z" },
-              { check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T05:00:00Z" },
+            check_suites: [
+              { head_branch: "other-branch", created_at: "2026-08-19T01:00:00Z" },
+              { head_branch: "some-branch-name", created_at: "2026-08-20T05:00:00Z" },
             ],
           },
         },
@@ -3296,12 +3443,12 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           // A branch-bound check run whose server created_at is post-approval:
           // a deterministic head-unverifiable refusal to drive the repeat-fanout.
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-20T01:00:00Z" }],
           },
         },
       ]);
@@ -3508,10 +3655,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         // run), so the content-identity proof is reached as the fallback.
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-20T01:00:00Z" }],
           },
         },
         // The two commit-detail reads: the certified anchor commit and the live
@@ -3549,10 +3696,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-20T01:00:00Z" }],
           },
         },
         // The live head changes the same files but one differs in its resulting
@@ -3587,10 +3734,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-20T01:00:00Z" }],
           },
         },
         // The live head's changed-file set is a strict superset of the certified
@@ -3625,10 +3772,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-20T01:00:00Z" }],
           },
         },
         // The certified anchor commit is gone (gc'd): a DETERMINISTIC refusal,
@@ -3701,10 +3848,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
         {
-          url: CHECK_RUNS_URL,
+          url: CHECK_SUITES_URL,
           body: {
             total_count: 1,
-            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+            check_suites: [{ head_branch: "some-branch-name", created_at: "2026-08-20T01:00:00Z" }],
           },
         },
         // A transient 500 on the anchor commit read (NOT a lost-anchor 404): the
