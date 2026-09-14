@@ -214,11 +214,21 @@ describeEmbeddedPostgres("checkout reopen boundary is atomic with the persisted 
     // checkout state that authorizes the reopen.
     const issueId = await seedIssue({ companyId, projectId, workspaceId, status: "in_progress", issueNumber: 4201 });
 
-    // The concurrent close commits to the real persistence boundary. A pre-reopen
-    // observation would have seen in_progress; by the time the reopen runs, the
-    // card is terminal. This is the exact interleaving the route-level read could
-    // not guard against.
-    await db
+    // Real persisted pre-reopen observation: read the status straight back from the
+    // database (not the seed input) and prove the checkout state is live. This is
+    // the observation a checkout would have made before rebuilding the closed
+    // workspace — the reopen is only authorized while this stays live.
+    const liveRead = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(liveRead?.status).toBe("in_progress");
+
+    // A concurrent terminal close commits on an independent connection, in the
+    // window after that live observation and before the reopen runs. Driven on the
+    // second pool (db2) the way a different server process would close the card.
+    await db2
       .update(issues)
       .set({ status: "done", completedAt: new Date(), updatedAt: new Date() })
       .where(eq(issues.id, issueId));
@@ -250,6 +260,10 @@ describeEmbeddedPostgres("checkout reopen boundary is atomic with the persisted 
     expect(row?.closedAt).not.toBeNull();
     expect(row?.cleanupReason).toBe("issue_terminal");
     expect(metadataHasReopenPendingConsumption(row?.metadata as Record<string, unknown> | null)).toBe(false);
+    // The refusal happens before the lifecycle-generation bump, so the generation
+    // is exactly the value the closed workspace was seeded with — the reopen did
+    // not touch the row at all.
+    expect(readExecutionWorkspaceLifecycleGeneration(row?.metadata as Record<string, unknown> | null)).toBe(3);
 
     // The card is still terminal; the reopen did not re-open it or republish it.
     const issueRow = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
