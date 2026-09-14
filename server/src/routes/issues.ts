@@ -7677,15 +7677,26 @@ export function issueRoutes(
     res: Response,
     issue: { id: string; companyId: string; projectId?: string | null },
     workspace: Pick<ExecutionWorkspace, "id">,
-  ): Promise<{ outcome: "reopened" | "already-open"; generation: number } | null> {
+    options: { requireLiveIssue?: boolean } = {},
+  ): Promise<{ outcome: "reopened" | "already-open" | "terminal-noop"; generation: number | null } | null> {
     const actor = getActorInfo(req);
     const result = await executionWorkspacesSvc.reopenClosedIsolatedExecutionWorkspaceForIssue({
       workspaceId: workspace.id,
       issue: { id: issue.id, companyId: issue.companyId, projectId: issue.projectId ?? null },
       actor: { agentId: actor.agentId, actorType: actor.actorType },
+      requireLiveIssue: options.requireLiveIssue,
     });
     if (result.ok) {
       return { outcome: result.reopened ? "reopened" : "already-open", generation: result.generation };
+    }
+    // SUP-16162 (redo): the persisted checkout state that authorized the reopen is
+    // no longer live — a terminal close committed at the reopen boundary. The
+    // service refused atomically, before publishing `active` or the reopen-pending
+    // fence, so publish no workspace work. This is a no-op, not an error: the
+    // checkout write already persisted, so the route responds normally and the card
+    // stays closed with no active/pending worktree.
+    if (result.code === "issue_not_live") {
+      return { outcome: "terminal-noop", generation: null };
     }
     if (result.code === "not_reopenable") {
       res.status(409).json({ error: "This issue is linked to a closed workspace that cannot be reopened." });
@@ -7714,17 +7725,22 @@ export function issueRoutes(
   //
   // This guard runs when the response ends, so it covers every exit: a success, a
   // rejected mutation, and a thrown error. It reads the final issue status through
-  // a getter. When the issue is null or still terminal, it clears the flag so the
-  // reaper can reclaim the worktree. When the issue left the terminal state, it
-  // does nothing and the reaper clears the flag. The guard never touches the
-  // response, and the underlying clear is idempotent.
+  // a getter, which may be a cached value or a fresh read taken at response end.
+  // When the issue is null or still terminal, it clears the flag so the reaper can
+  // reclaim the worktree. When the issue left the terminal state, it does nothing
+  // and the reaper clears the flag. The guard never touches the response, and the
+  // underlying clear is idempotent.
   function guardReopenedWorkspaceConsumption(input: {
     req: Request;
     res: Response;
     issue: { id: string; companyId: string };
     workspace: Pick<ExecutionWorkspace, "id"> | null;
     generation: number | null;
-    finalIssueStatus: () => string | null | undefined;
+    // The final issue status, read when the response ends. Callers may supply a
+    // cached value or a fresh read from the database (the checkout route re-reads
+    // the row at response end so a close that commits after the reopen still
+    // clears the fence); the getter may therefore be sync or async.
+    finalIssueStatus: () => string | null | undefined | Promise<string | null | undefined>;
   }): void {
     const { req, res, issue, workspace, generation, finalIssueStatus } = input;
     if (!workspace || generation === null) return;
@@ -7762,11 +7778,23 @@ export function issueRoutes(
     // Do not keep the event loop alive for the keepalive alone.
     keepAlive.unref?.();
     let settled = false;
-    const settle = () => {
+    const settle = async () => {
       if (settled) return;
       settled = true;
       clearInterval(keepAlive);
-      const status = finalIssueStatus();
+      // `finalIssueStatus` may be a cached value or a fresh database read at
+      // response end. Await it; if the read itself fails, do not strand the
+      // fence — fall through and clear it so the reaper can reclaim the worktree.
+      let status: string | null | undefined;
+      try {
+        status = await finalIssueStatus();
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, executionWorkspaceId: workspace.id },
+          "failed to read the final issue status when settling the reopen-pending guard; clearing the fence",
+        );
+        status = null;
+      }
       if (typeof status === "string" && !isClosedIssueStatus(status)) return;
       const actor = getActorInfo(req);
       void clearReopenPendingConsumptionWithRetry({
@@ -15104,46 +15132,41 @@ export function issueRoutes(
       });
     }
 
+    // SUP-15888 / SUP-15832: a card whose CURRENT status is terminal (done /
+    // cancelled) must never be re-opened by checkout, and — critically — the
+    // route must not rebuild and republish a closed execution worktree for a
+    // checkout that will be refused. The schema already refuses a body that
+    // *names* a terminal status, but a valid non-terminal body (e.g.
+    // expectedStatuses: ["in_progress"]) still passes when the card is already
+    // closed; refusing here, before any workspace work, keeps a terminal
+    // checkout a true no-op. This throws the same distinct 409 the service
+    // raises, so the refusal is byte-identical whether caught at the route or
+    // the service. A close that commits after this read cannot slip past the
+    // service: its conditional write misses and its post-write recheck sees
+    // the committed terminal status and refuses with the same distinct code.
+    // The route only rebuilds a closed workspace AFTER that write has
+    // persisted (below), so a refused checkout — whether caught here or in the
+    // service — performs no workspace work at all.
+    if (issue.status === "done" || issue.status === "cancelled") {
+      throw conflict("Issue cannot be checked out because it is already closed", {
+        code: "checkout_refused_terminal_status",
+        issueId: issue.id,
+        status: issue.status,
+      });
+    }
+
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
 
     const checkoutRunId = await requireAgentRunId(req, res, { checkoutRunId: issue.checkoutRunId });
     if (req.actor.type === "agent" && !checkoutRunId) return;
 
-    // Reopen the closed isolated workspace only after the run-id gate passes. A
-    // rejected checkout must not rebuild and republish the workspace as active.
-    let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
-    let reopenedGeneration: number | null = null;
-    if (closedExecutionWorkspace) {
-      const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
-        req,
-        res,
-        issue,
-        closedExecutionWorkspace,
-      );
-      if (reopenOutcome === null) {
-        return;
-      }
-      // Install the guard only when this request set the reopen-pending flag. A
-      // concurrent request that found the workspace already open must not clear
-      // the flag that the actual reopener still owns.
-      if (reopenOutcome.outcome === "reopened") {
-        reopenedWorkspace = closedExecutionWorkspace;
-        reopenedGeneration = reopenOutcome.generation;
-      }
-    }
+    // SUP-15888: the service's conditional write is the race-safe status/reopen
+    // boundary. A close that commits between the terminal read above and the
+    // write makes the write miss; the service then re-reads the committed
+    // status and returns the distinct terminal refusal. Only after that write
+    // has persisted does this route rebuild the closed worktree, so a refused
+    // checkout never publishes a rebuilt worktree that nothing consumes.
     let updated: Awaited<ReturnType<typeof svc.checkout>> | undefined;
-    // Clear the reopen-pending flag if the checkout leaves the issue terminal, so
-    // the rebuilt worktree does not leak. The guard reads `updated` when the
-    // response ends, so it covers a null return and a thrown error. It clears only
-    // the fence this request installed, keyed by its generation.
-    guardReopenedWorkspaceConsumption({
-      req,
-      res,
-      issue,
-      workspace: reopenedWorkspace,
-      generation: reopenedGeneration,
-      finalIssueStatus: () => updated?.status,
-    });
     try {
       updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
     } catch (error) {
@@ -15155,6 +15178,55 @@ export function issueRoutes(
       }
       throw error;
     }
+
+    // Reopen the closed isolated workspace only once the checkout write has
+    // persisted, so a rejected checkout must not rebuild and republish the
+    // workspace as active. The service's reopen is the atomic status/reopen
+    // boundary: it re-reads the persisted issue status inside the same
+    // advisory-locked transaction that publishes the active row, so a terminal
+    // close that commits between this checkout write and the rebuild is refused
+    // there, before `active` or the reopen-pending fence is set. A standalone
+    // route-level status read cannot reserve the issue's live state; only the
+    // in-transaction check can.
+    let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
+    let reopenedGeneration: number | null = null;
+    if (closedExecutionWorkspace) {
+      const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
+        req,
+        res,
+        issue,
+        closedExecutionWorkspace,
+        { requireLiveIssue: true },
+      );
+      if (reopenOutcome === null) {
+        return;
+      }
+      // Install the guard only when this request set the reopen-pending flag. A
+      // concurrent request that found the workspace already open must not clear
+      // the flag that the actual reopener still owns. A terminal-noop (the card
+      // closed at the boundary) sets no flag, so it installs no guard and leaves
+      // the card with no active/pending worktree.
+      if (reopenOutcome.outcome === "reopened") {
+        reopenedWorkspace = closedExecutionWorkspace;
+        reopenedGeneration = reopenOutcome.generation;
+      }
+    }
+    // Clear the reopen-pending flag if the response ends while the issue is
+    // still terminal, so a rebuilt worktree does not leak. The service's reopen
+    // succeeded only because the card was live at the reopen boundary, so a
+    // narrower close can still commit after the reopen and before this response
+    // ends; the cached `updated` status is the value at checkout-write time and
+    // would not see it. Re-reading the status at response end lets the guard
+    // clear the fence. It clears only the fence this request installed, keyed by
+    // its generation.
+    guardReopenedWorkspaceConsumption({
+      req,
+      res,
+      issue,
+      workspace: reopenedWorkspace,
+      generation: reopenedGeneration,
+      finalIssueStatus: async () => (await svc.getById(id))?.status ?? null,
+    });
     const actor = getActorInfo(req);
     if (updated?.harnessKind === "skill_test") {
       await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);
