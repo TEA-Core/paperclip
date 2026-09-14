@@ -26,6 +26,7 @@ import { canonicalizeExternalObjectUrl, extractExternalObjectCanonicalUrls } fro
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { createGitHubExternalObjectProvider } from "../services/github-external-object-provider.js";
+import { resolveCardPullRequest, resolveLinkedPullRequests } from "../services/merge-arming.js";
 import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -34,6 +35,30 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres external object tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+// SUP-16283: a GitHub API 404 (transient or genuinely absent). The provider turns
+// this into a `not_found` snapshot written isTerminal:true.
+function notFoundPullRequestResponse() {
+  return new Response("", { status: 404, headers: { etag: '"nf"' } });
+}
+
+// A healthy open PR whose head ref carries the delivery branch. This is the body
+// the provider writes to `data.headRef` once a not_found row hydrates.
+function openPullRequestResponse() {
+  return new Response(
+    JSON.stringify({
+      state: "open",
+      draft: false,
+      merged: false,
+      title: "SUP-16041 delivery branch",
+      updated_at: "2026-09-14T01:00:00Z",
+      user: { login: "octocat" },
+      head: { ref: "SUP-16041-delivery", sha: "abc123def456" },
+      base: { ref: "main" },
+    }),
+    { status: 200, headers: { "content-type": "application/json", etag: '"open-1"' } },
   );
 }
 
@@ -877,6 +902,99 @@ describeEmbeddedPostgres("externalObjectService", () => {
 
     expect(refreshed).toEqual([]);
     expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-resolves a not_found external object on a backoff instead of leaving it terminal forever (SUP-16283)", async () => {
+    const { companyId, issueId } = await createIssue();
+    const fetch = vi.fn(async () => notFoundPullRequestResponse());
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // First resolve 404s (transient) → the provider writes a not_found row, isTerminal:true.
+    await svc.refreshObject(object.id, { companyId, force: true });
+    const poisoned = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    expect(poisoned.statusKey).toBe("not_found");
+    expect(poisoned.isTerminal).toBe(true);
+    expect(poisoned.data.notFoundRetries).toBe(1);
+    expect(poisoned.data.headRef).toBeUndefined();
+
+    // A later sweep must re-resolve it even though isTerminal is true.
+    fetch.mockImplementation(async () => openPullRequestResponse());
+    const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 400_000));
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0]!.refreshed).toBe(true);
+
+    // Hydrate fully and clear the terminal flag; the transient-404 counter is dropped.
+    const hydrated = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    expect(hydrated.statusKey).toBe("open");
+    expect(hydrated.isTerminal).toBe(false);
+    expect(hydrated.data.state).toBe("open");
+    expect(hydrated.data.headRef).toBe("SUP-16041-delivery");
+    expect(hydrated.data.headSha).toBe("abc123def456");
+    expect(hydrated.data.notFoundRetries).toBeUndefined();
+  });
+
+  it("stops re-reading a genuinely-absent GitHub object after the bounded not_found cap (SUP-16283)", async () => {
+    const { companyId, issueId } = await createIssue();
+    const fetch = vi.fn(async () => notFoundPullRequestResponse());
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // First resolve (force) → not_found, counter 1.
+    await svc.refreshObject(object.id, { companyId, force: true });
+    // Drive the sweep past the 300s backoff until it stops re-resolving.
+    let clock = Date.now();
+    for (let i = 0; i < 12; i++) {
+      clock += 400_000;
+      const results = await svc.refreshDueObjects(companyId, 50, new Date(clock));
+      if (results.length === 0) break;
+    }
+
+    // The object was re-resolved exactly NOT_FOUND_MAX_RETRIES times in total.
+    expect(fetch).toHaveBeenCalledTimes(5);
+    const row = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    expect(row.data.notFoundRetries).toBe(5);
+    expect(row.isTerminal).toBe(true);
+    // Past its budget, the sweep leaves the row alone.
+    clock += 400_000;
+    expect(await svc.refreshDueObjects(companyId, 50, new Date(clock))).toEqual([]);
+  });
+
+  it("clears the not_found poison so the delivery-identity gate recovers once the row hydrates (SUP-16283)", async () => {
+    const { companyId, issueId } = await createIssue();
+    const fetch = vi.fn(async () => notFoundPullRequestResponse());
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // Transient 404 → not_found row with no headRef.
+    await svc.refreshObject(object.id, { companyId, force: true });
+
+    // SUP-16041 shape: the not_found row still surfaces as a linked PR but with a
+    // null headRef. That null is exactly what merge-arming.isDeliveredByCard
+    // requires to be non-null, so the ADR-091 D1 delivery-identity gate refuses
+    // the card with not_delivered while the row is poisoned.
+    const poisonedLinked = await resolveLinkedPullRequests(db, companyId, issueId);
+    expect(poisonedLinked).toHaveLength(1);
+    expect(poisonedLinked[0]!.headRefName).toBeNull();
+    expect(poisonedLinked[0]!.cachedState).toBeNull();
+    const poisonedCard = await resolveCardPullRequest(db, companyId, issueId, "SUP-16041");
+    expect(poisonedCard).toMatchObject({ kind: "single", headRefName: null });
+
+    // A later sweep re-resolves and hydrates the row (head.ref carries the branch).
+    fetch.mockImplementation(async () => openPullRequestResponse());
+    const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 400_000));
+    expect(refreshed[0]!.refreshed).toBe(true);
+
+    // The same sequence now resolves to the delivery branch: the gate can arm.
+    const hydratedLinked = await resolveLinkedPullRequests(db, companyId, issueId);
+    expect(hydratedLinked).toHaveLength(1);
+    expect(hydratedLinked[0]!.headRefName).toBe("SUP-16041-delivery");
+    expect(hydratedLinked[0]!.cachedState).toBe("open");
+    const hydratedCard = await resolveCardPullRequest(db, companyId, issueId, "SUP-16041");
+    expect(hydratedCard).toMatchObject({ kind: "single", headRefName: "SUP-16041-delivery" });
   });
 
   it("refreshes due objects in nextRefreshAt order so the backlog is not starved", async () => {

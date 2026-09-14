@@ -96,6 +96,21 @@ const NO_RESOLVER_BACKOFF_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_REFRESH_LEASE_SECONDS = 300;
 const REFRESH_LEASE_RENEW_INTERVAL_MS = 60_000;
 
+// SUP-16283: a `not_found` resolve is written `isTerminal: true` by the provider
+// (github-external-object-provider.ts `notFoundSnapshot`), which would exclude
+// the row from the automatic sweep forever. A 404 is frequently TRANSIENT
+// (rate-limit, token blip, replication lag on a just-opened PR), and a
+// permanently-404 row carries no `data.headRef`, so `merge-arming.headRefFromData`
+// returns null and the ADR-091 D1 delivery-identity gate refuses `not_delivered`.
+// So a `not_found` row stays eligible for the sweep on a BOUNDED backoff instead
+// of being terminal forever:
+//   backoff: nextRefreshAt advances by the refresh TTL (300s) after each re-check
+//   cap:     after NOT_FOUND_MAX_RETRIES `not_found` re-resolves the row is
+//            treated as genuinely absent and stops being swept.
+// The counter lives in `data.notFoundRetries`; a later successful resolve carries
+// the provider's data (which drops the counter) and clears `isTerminal`.
+const NOT_FOUND_MAX_RETRIES = 5;
+
 function sourceWhere(input: ExternalObjectSourceContext) {
   const conditions = [
     eq(externalObjectMentions.companyId, input.companyId),
@@ -147,6 +162,14 @@ function sanitizeErrorMessage(message: string | null | undefined) {
   return message
     .replace(/https?:\/\/[^\s<>()]+/gi, "[redacted-url]")
     .replace(/\b(token|key|secret|authorization|bearer)=\S+/gi, "$1=[redacted]");
+}
+
+// Number of `not_found` re-resolves already observed for a row (SUP-16283). The
+// value lives in `data.notFoundRetries`; rows that were never `not_found` (or
+// carry a malformed value) read as 0.
+function readNotFoundRetries(data: Record<string, unknown> | null | undefined): number {
+  const value = data?.notFoundRetries;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 function genericUrlDetector(): ExternalObjectDetector {
@@ -858,17 +881,27 @@ export function externalObjectService(
     }
 
     const snapshot = result.snapshot;
+    // SUP-16283: track how many times a `not_found` resolve has been observed so
+    // the sweep can keep the row eligible on a bounded backoff (NOT_FOUND_MAX_RETRIES)
+    // instead of treating the first transient 404 as terminal forever. A later
+    // successful resolve carries the provider's `data` (which drops the counter)
+    // and clears `isTerminal`.
+    const nextStatusKey = snapshot.statusKey ?? object.statusKey;
+    const isNotFoundResolve = nextStatusKey === "not_found";
+    const nextData = isNotFoundResolve
+      ? { ...(snapshot.data ?? object.data), notFoundRetries: readNotFoundRetries(object.data) + 1 }
+      : snapshot.data ?? object.data;
     const patch = {
       displayKey: snapshot.displayKey ?? object.displayKey,
       iconKey: snapshot.iconKey ?? object.iconKey,
       displayTitle: snapshot.displayTitle ?? object.displayTitle,
-      statusKey: snapshot.statusKey ?? object.statusKey,
+      statusKey: nextStatusKey,
       statusLabel: snapshot.statusLabel ?? object.statusLabel,
       statusIconKey: snapshot.statusIconKey ?? object.statusIconKey,
       statusCategory: snapshot.statusCategory,
       statusTone: snapshot.statusTone,
       isTerminal: snapshot.isTerminal ?? object.isTerminal,
-      data: snapshot.data ?? object.data,
+      data: nextData,
       remoteVersion: snapshot.remoteVersion ?? object.remoteVersion,
       etag: snapshot.etag ?? object.etag,
       liveness: "fresh" as ExternalObjectLivenessState,
@@ -1044,7 +1077,19 @@ export function externalObjectService(
       .where(
         and(
           eq(externalObjects.companyId, companyId),
-          eq(externalObjects.isTerminal, false),
+          // SUP-16283: refreshable = non-terminal, OR a `not_found` row still
+          // within its bounded re-resolve budget. A `not_found` row is written
+          // isTerminal:true by the provider but is often a transient 404; without
+          // this it would be excluded forever and the row's missing headRef would
+          // permanently disarm the delivery-identity gate. Genuinely-absent
+          // objects stop after NOT_FOUND_MAX_RETRIES re-resolves.
+          or(
+            eq(externalObjects.isTerminal, false),
+            and(
+              eq(externalObjects.statusKey, "not_found"),
+              sql`(coalesce((${externalObjects.data} ->> 'notFoundRetries')::int, 0) < ${NOT_FOUND_MAX_RETRIES})`,
+            ),
+          ),
           lte(externalObjects.nextRefreshAt, now),
           or(
             isNull(externalObjects.refreshStartedAt),
