@@ -2820,12 +2820,20 @@ export async function writeCommitStatusWithRetry(
  * `publishedHeadSha` from a prior cycle must not survive a new certification);
  * when it did not resolve, the record MERGES into any existing `approvalStatus`
  * so a prior `pendingCandidates` / `backfillRefusal` is preserved. `pendingCandidates`
- * is only ever written when no head resolved — matching the prior inline block.
- *
- * This helper only WRITES the card's durable record. It does not decide whether
- * a stamp is published (that stays in {@link publishApprovalStatus} / the
- * consume-contract) and it never itself re-stamps.
- */
+  * is only ever written when no head resolved — matching the prior inline block.
+  *
+  * SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
+  * record is written atomically against the LIVE `executionState.approvalStatus`
+  * subtree (`jsonb_set` on the root + a jsonb `||`/replace on the subtree), the
+  * same shape {@link recordApprovalAnchor} and the reconciler's
+  * `mergeApprovalStatus` use. The `baseExecutionState` argument is the route's
+  * client snapshot and is no longer read — rebuilding the whole column from it
+  * reverted every root key a concurrent writer committed after the snapshot.
+  *
+  * This helper only WRITES the card's durable record. It does not decide whether
+  * a stamp is published (that stays in {@link publishApprovalStatus} / the
+  * consume-contract) and it never itself re-stamps.
+  */
 export async function recordApprovalPublishOutcome(
   db: Db,
   issueId: string,
@@ -2834,29 +2842,32 @@ export async function recordApprovalPublishOutcome(
   outcome: ArmingOutcome,
   pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor> | null,
 ): Promise<void> {
-  const currentState = (baseExecutionState ?? {}) as Record<string, unknown>;
+  // SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): write
+  // against the LIVE executionState.approvalStatus subtree, not the route's
+  // stale client snapshot. This helper is reached from the post-publish record,
+  // the catch backstop, and four guard-refusal paths (recordGuardOutcome in
+  // routes/issues.ts), each of which used to rebuild the entire executionState
+  // column from `baseExecutionState` — silently reverting every root key a
+  // concurrent writer committed after that snapshot (monitor, currentStageId,
+  // completedStageIds, pendingSince). Touching ONLY the approvalStatus key via
+  // the same atomic jsonb_set + subtree shape recordApprovalAnchor and the
+  // reconciler's mergeApprovalStatus already use keeps those root siblings
+  // live. baseExecutionState is retained for call-site stability; it is no
+  // longer read — the live subtree is authoritative.
   const nowIso = new Date().toISOString();
 
-  let approvalStatus: Record<string, unknown>;
-  if (resolvedHeadSha !== null) {
-    approvalStatus = {};
-    approvalStatus.approvedHeadSha = resolvedHeadSha;
-    approvalStatus.approvedAt = nowIso;
-  } else {
-    approvalStatus = {
-      ...((currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {}),
-    };
-  }
-
+  // Outcome-specific fields, computed in JS so the record shape is identical to
+  // the previous inline block (every value is JSON-serializable).
+  const patch: Record<string, unknown> = {};
   switch (outcome.kind) {
     case "armed":
       if (typeof outcome.headSha === "string") {
-        approvalStatus.publishedHeadSha = outcome.headSha;
-        approvalStatus.publishedAt = nowIso;
+        patch.publishedHeadSha = outcome.headSha;
+        patch.publishedAt = nowIso;
       }
       break;
     case "skipped":
-      approvalStatus.publishSkipped = {
+      patch.publishSkipped = {
         reason: outcome.message,
         headSha: resolvedHeadSha,
         at: nowIso,
@@ -2866,13 +2877,13 @@ export async function recordApprovalPublishOutcome(
         Array.isArray(pendingCandidates) &&
         pendingCandidates.length > 0
       ) {
-        approvalStatus.pendingCandidates = pendingCandidates;
-        approvalStatus.skipReason = outcome.message;
-        approvalStatus.certifiedAt = nowIso;
+        patch.pendingCandidates = pendingCandidates;
+        patch.skipReason = outcome.message;
+        patch.certifiedAt = nowIso;
       }
       break;
     case "failed":
-      approvalStatus.publishFailure = {
+      patch.publishFailure = {
         reason: outcome.message,
         headSha: resolvedHeadSha,
         at: nowIso,
@@ -2880,11 +2891,31 @@ export async function recordApprovalPublishOutcome(
       break;
   }
 
+  // A positively-resolved head FRESHENS the subtree (a stale publishedHeadSha
+  // from a prior cycle must not survive a new certification); an unresolvable
+  // outcome MERGES into the live subtree so a prior pendingCandidates /
+  // backfillRefusal is preserved. Either way only approvalStatus is rewritten.
+  let approvalStatusExpr: SQL;
+  if (resolvedHeadSha !== null) {
+    const freshSubtree: Record<string, unknown> = {
+      approvedHeadSha: resolvedHeadSha,
+      approvedAt: nowIso,
+      ...patch,
+    };
+    approvalStatusExpr = sql`${JSON.stringify(freshSubtree)}::jsonb`;
+  } else {
+    approvalStatusExpr = sql`(
+      coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
+      || ${JSON.stringify(patch)}::jsonb
+    )`;
+  }
+
+  const executionStateExpr: SQL = sql`(
+    jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}', ${approvalStatusExpr})
+  )`;
   await db
     .update(issues)
-    .set({
-      executionState: { ...currentState, approvalStatus },
-    })
+    .set({ executionState: executionStateExpr })
     .where(eq(issues.id, issueId));
 }
 

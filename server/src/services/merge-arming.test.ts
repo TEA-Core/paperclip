@@ -692,6 +692,107 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect((approvalStatus!.pendingCandidates as unknown[]).length).toBe(1);
       expect(typeof approvalStatus!.certifiedAt).toBe("string");
     });
+
+    // SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
+    // record is written atomically against the LIVE approvalStatus subtree, so a
+    // stale client snapshot passed by the route can no longer clobber the card's
+    // root executionState keys (monitor, currentStageId, completedStageIds,
+    // pendingSince) or a concurrent approvalStatus field. The previous
+    // SELECT-then-whole-row UPDATE rebuilt the whole column from that snapshot
+    // and dropped every root key the snapshot lacked.
+    it("stage-3: a stale-snapshot outcome write preserves the live root executionState keys (no lost update)", async () => {
+      const issueId = await insertIssue();
+      // The card already carries live root keys + a concurrent approvalStatus
+      // field committed AFTER the route captured its snapshot.
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            currentStageId: "stage-3",
+            completedStageIds: ["stage-1", "stage-2"],
+            monitor: { armed: true, nextCheckAt: "2026-09-13T10:29:00.000Z" },
+            pendingSince: "2026-09-13T10:28:00.000Z",
+            approvalStatus: {
+              backfillRefusal: { reason: "head_moved" },
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      // The route's stale client snapshot — captured before that commit, so it
+      // carries NONE of the root keys and NONE of the concurrent approvalStatus
+      // field. This is the exact interleaving that clobbered state on the old
+      // whole-row shape.
+      const staleSnapshot: Record<string, unknown> = {};
+
+      await recordApprovalPublishOutcome(db, issueId, staleSnapshot, null, {
+        kind: "skipped",
+        message: "status:skipped:not_delivered: branch mismatch",
+      });
+
+      const rows = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      const execState = rows[0]?.executionState as Record<string, unknown>;
+      const approvalStatus = execState.approvalStatus as Record<string, unknown>;
+
+      // The named outcome record is present (the record stays total).
+      expect(approvalStatus.publishSkipped).toMatchObject({
+        reason: "status:skipped:not_delivered: branch mismatch",
+        headSha: null,
+      });
+      // The concurrently-committed approvalStatus field survives the merge.
+      expect(approvalStatus.backfillRefusal).toMatchObject({ reason: "head_moved" });
+      // No anchor on an unresolvable outcome.
+      expect(approvalStatus.approvedHeadSha).toBeUndefined();
+      // Every live root key SURVIVES the outcome write — the assertion the old
+      // whole-row shape fails (it rebuilt the column from the empty snapshot).
+      expect(execState.currentStageId).toBe("stage-3");
+      expect(execState.completedStageIds).toEqual(["stage-1", "stage-2"]);
+      expect(execState.monitor).toMatchObject({ armed: true });
+      expect(execState.pendingSince).toBe("2026-09-13T10:28:00.000Z");
+    });
+
+    it("stage-3: a stale-snapshot RESOLVED-head write freshens the subtree but preserves the live root keys", async () => {
+      const issueId = await insertIssue();
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            currentStageId: "stage-4",
+            monitor: { armed: true, nextCheckAt: "2026-09-13T10:30:00.000Z" },
+            approvalStatus: { publishedHeadSha: "stale000000000000000000000000000000" },
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      // A positively-resolved head (post-publish armed record) with a stale
+      // snapshot that carries no root keys.
+      await recordApprovalPublishOutcome(
+        db,
+        issueId,
+        {},
+        APPROVED_HEAD,
+        { kind: "armed", message: "status:published: written to head", headSha: APPROVED_HEAD },
+      );
+
+      const rows = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      const execState = rows[0]?.executionState as Record<string, unknown>;
+      const approvalStatus = execState.approvalStatus as Record<string, unknown>;
+
+      // A resolved head FRESHENS the subtree: the success shape + anchor are
+      // written, and the stale prior publishedHeadSha does not survive.
+      expect(approvalStatus.publishedHeadSha).toBe(APPROVED_HEAD);
+      expect(approvalStatus.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(approvalStatus.publishFailure).toBeUndefined();
+      // The live root keys still survive the freshen (only the subtree is replaced).
+      expect(execState.currentStageId).toBe("stage-4");
+      expect(execState.monitor).toMatchObject({ armed: true });
+    });
   });
 
   // SUP-16081 (comment a78bf2d2): the approval anchor must be written BEFORE the
