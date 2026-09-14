@@ -3327,6 +3327,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // they reopen a workspace precisely so a terminal card can be moved back to
       // live by the route mutation that follows.
       requireLiveIssue?: boolean;
+      // Test-only seam at the rebuild boundary. When provided, it is awaited inside
+      // the open transaction, after the live-status row-lock read and before the
+      // workspace is published. Inert in production (every call site omits it); a
+      // regression uses it to hold the reopen open at the boundary so a concurrent
+      // terminal close can be observed to block on the issue row lock.
+      rebuildBarrier?: () => Promise<void>;
     }): Promise<ReopenClosedIsolatedExecutionWorkspaceResult> => {
       const { issue, actor } = input;
       // Bind the workspace to the issue company and project. A null project on
@@ -3377,12 +3383,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // terminal (or gone) card refuses the rebuild before any work is done. This
         // is the atomic status/reopen boundary the checkout route relies on.
         if (input.requireLiveIssue) {
-          const liveIssue = await tx
-            .select({ status: issues.status })
-            .from(issues)
-            .where(eq(issues.id, issue.id))
-            .then((rows) => rows[0] ?? null);
-          if (!liveIssue || liveIssue.status === "done" || liveIssue.status === "cancelled") {
+          // Row-locking read (FOR SHARE) of the source issue row, held for the
+          // remainder of this transaction. The terminal close takes an exclusive row
+          // lock on the same issues row before it writes done/cancelled, so the two
+          // serialize on that row: a close that wins first commits and this read
+          // observes the terminal status; a close that lands after this read blocks
+          // until this transaction ends, so the card is live at the boundary. A
+          // plain read carries no ordering authority under READ COMMITTED — the
+          // share lock is what makes this check an atomic boundary with the close.
+          const liveRows = Array.from(
+            await tx.execute(
+              sql`select ${issues.status} from ${issues} where ${issues.id} = ${issue.id} for share`,
+            ),
+          );
+          const liveIssue = liveRows[0] as { status?: string } | undefined;
+          if (!liveIssue?.status || liveIssue.status === "done" || liveIssue.status === "cancelled") {
             logger.warn(
               {
                 event: "execution_workspace.reopen",
@@ -3457,6 +3472,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           companyId: row.companyId,
           executionWorkspaceId: row.id,
         });
+
+        // Test-only rebuild-boundary seam: hold the open transaction (and the issue
+        // row lock acquired above) here so a concurrent close can be observed to
+        // block. No-op in production.
+        await input.rebuildBarrier?.();
 
         let rebuildError: string | null = null;
         try {
