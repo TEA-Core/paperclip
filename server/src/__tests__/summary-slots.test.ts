@@ -601,27 +601,33 @@ describeEmbeddedPostgres("summary slot service", () => {
       // Arm a FRESH generation over the inherited slot, then cancel it without writing.
       const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
 
-      // COLLISION SETUP: place the later generation's creation instant in the prior
-      // write's normalized millisecond — its `created_at` matches the surviving
-      // revision's `last_generated_at`. Under the rejected strict
+      // COLLISION SETUP: place the later generation's creation instant one millisecond
+      // before the surviving revision's `last_generated_at`, in the prior write's
+      // normalized millisecond. Under the rejected strict
       // `last_generated_at > created_at` discriminator that ordering reads as "this
       // generation wrote" and would classify it `idle`; only generation identity can
       // tell the inherited prior write from a current-generation write. The write
       // evidence (`last_generated_at`, stamped by `write()`) is NOT mutated — only the
-      // later generation's creation boundary is arranged, exactly the same-millisecond
-      // collision a resubmit race produces.
+      // later generation's creation boundary is arranged, the boundary a resubmit
+      // race can produce. Setting it equal to the write (the prior review's mutated
+      // setup) would make the strict `>` false and let the rejected heuristic also
+      // pass, so the boundary must sit strictly before the write.
       const lastWrittenAt = afterFirst.slot.lastGeneratedAt!;
       expect(lastWrittenAt).toBeInstanceOf(Date);
       await db
         .update(issues)
-        .set({ createdAt: new Date(lastWrittenAt.getTime()) })
+        .set({ createdAt: new Date(lastWrittenAt.getTime() - 1) })
         .where(eq(issues.id, second.generatingIssue.id));
       const laterGeneration = await db
         .select({ createdAt: issues.createdAt })
         .from(issues)
         .where(eq(issues.id, second.generatingIssue.id))
         .then((rows) => rows[0]!);
-      expect(laterGeneration.createdAt.getTime()).toBe(lastWrittenAt.getTime());
+      // Read-back proves the normalized boundary is strictly before the write, i.e.
+      // `last_generated_at > created_at` holds: the rejected strict heuristic would
+      // classify this unwritten generation `idle` (wrong); identity classifies it
+      // `failed` (right).
+      expect(lastWrittenAt.getTime()).toBeGreaterThan(laterGeneration.createdAt.getTime());
 
       const armed = await db
         .select()
