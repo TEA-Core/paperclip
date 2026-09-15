@@ -1546,7 +1546,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(run).toMatchObject({ status: "failed", error: "Adapter failed" });
     expect(runtime?.lastError).toBe("Adapter failed");
-    expect(recoveryRun).toMatchObject({ retryOfRunId: runId, scheduledRetryAttempt: 1 });
+    // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release turns this failed
+    // conversation run into a `conversation_retry_requested` effect, i.e. a counted bounded retry
+    // (scheduledRetryAttempt 1). This fold keeps the fork's in-file releaseIssueExecutionAndPromote
+    // as the live release (operator decision 2026-09-15), which queues an uncounted immediate
+    // issue_continuation_needed recovery run instead. The conversation is still not blocked.
+    // Inverted rather than deleted so the divergence stays guarded; restore upstream's assertions in the change that makes the wake-queue module release live.
+    expect(recoveryRun).toMatchObject({
+      retryOfRunId: runId,
+      scheduledRetryAttempt: 0,
+      contextSnapshot: expect.objectContaining({
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      }),
+    });
     expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
     const missingCommentWakeups = await db
       .select({ id: agentWakeupRequests.id })
@@ -1558,6 +1571,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       );
     expect(missingCommentWakeups).toHaveLength(0);
+    await heartbeat.waitForRunExecutionDrain(recoveryRun!.id);
+    await waitForHeartbeatIdle(db);
   });
 
   it("does not immediately continue a low-trust preflight setup failure", async () => {
@@ -2919,12 +2934,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runIds: [runId],
     });
     await heartbeat.reapOrphanedRuns();
-    expect(
-      await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.agentId, agentId)),
-    ).toHaveLength(1);
+    // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release takes its legacy
+    // reconciliation exit for a legacy run whose provider outcome is unknown, so the board
+    // `legacy_execution_requires_reconciliation` hold is the ONLY follow-up. This fold keeps the
+    // fork's in-file releaseIssueExecutionAndPromote live (operator decision 2026-09-15), which
+    // does not consult that hold and also queues an immediate issue_continuation_needed recovery
+    // run. The board action below is created on both paths. Inverted rather than deleted so the divergence stays guarded; restore upstream's assertions in the change that makes the wake-queue module release live.
+    const runsAfterReap = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runsAfterReap).toHaveLength(2);
+    expect(runsAfterReap).toContainEqual(expect.objectContaining({ id: runId, status: "failed" }));
+    expect(runsAfterReap).toContainEqual(
+      expect.objectContaining({
+        retryOfRunId: runId,
+        contextSnapshot: expect.objectContaining({ wakeReason: "issue_continuation_needed" }),
+      }),
+    );
     const actions = await db
       .select()
       .from(issueRecoveryActions)
@@ -2936,6 +2963,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         cause: "legacy_execution_requires_reconciliation",
       }),
     ]);
+    await waitForHeartbeatIdle(db);
   });
 
   it("does not retry a lost monitor dispatch while another monitor wake remains scheduled", async () => {
@@ -4408,13 +4436,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
     await heartbeat.reapOrphanedRuns();
     await heartbeat.reconcileStrandedAssignedIssues();
-    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release takes its legacy
+    // reconciliation exit for a legacy run whose provider outcome is unknown, so the board
+    // `legacy_execution_requires_reconciliation` hold is the ONLY follow-up. This fold keeps the
+    // fork's in-file releaseIssueExecutionAndPromote live (operator decision 2026-09-15), which
+    // does not consult that hold and also queues an immediate issue_continuation_needed recovery
+    // run. The board action below is created on both paths. Inverted rather than deleted so the divergence stays guarded; restore upstream's assertions in the change that makes the wake-queue module release live.
+    // The source run itself is never re-executed (the recovery run is a new run and may already
+    // be dispatching, so a bare not.toHaveBeenCalled would race it).
     expect(
-      await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.agentId, agentId)),
-    ).toEqual([expect.objectContaining({ id: runId, status: "failed" })]);
+      mockAdapterExecute.mock.calls.some(
+        ([input]) => (input as { runId?: string } | undefined)?.runId === runId,
+      ),
+    ).toBe(false);
+    const runsAfterReconcile = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runsAfterReconcile).toHaveLength(2);
+    expect(runsAfterReconcile).toContainEqual(expect.objectContaining({ id: runId, status: "failed" }));
+    expect(runsAfterReconcile).toContainEqual(
+      expect.objectContaining({
+        retryOfRunId: runId,
+        contextSnapshot: expect.objectContaining({ wakeReason: "issue_continuation_needed" }),
+      }),
+    );
     expect(
       await db
         .select()
@@ -4426,6 +4472,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         returnOwnerAgentId: agentId,
       }),
     ]);
+    await waitForHeartbeatIdle(db);
   });
 
   it("blocks failed recovery work in place during immediate terminal-run cleanup", async () => {
@@ -7751,21 +7798,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [deferred] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution",
       payload: { issueId, commentId: pending!.id, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [pending!.id] } },
     }).returning();
+    // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release keeps deferred input
+    // parked on an acknowledged Stop (its executionCancellationAcknowledged exit) until the next
+    // explicit comment adopts it. This fold keeps the fork's in-file releaseIssueExecutionAndPromote
+    // live (operator decision 2026-09-15), which promotes the parked input into a run at Stop. The
+    // next explicit comment is then saved behind that live run and delivered exactly once when it
+    // ends. Hold the promoted run in the adapter so that ordering is deterministic.
+    // Inverted rather than deleted so the divergence stays guarded; restore upstream's assertions in the change that makes the wake-queue module release live.
+    let releasePromoted!: () => void;
+    const promotedHeld = new Promise<void>((resolve) => {
+      releasePromoted = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await promotedHeld;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Handled parked input", provider: "test", model: "test-model" };
+    });
     await heartbeat.cancelRun(runId, "Operator Stop", { resultJson: {
       executionCancellation: { state: "acknowledged" },
       executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" },
     } });
     await heartbeat.reconcileStrandedAssignedIssues();
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+    const runsAfterStop = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runsAfterStop).toHaveLength(2);
+    const promotedRun = runsAfterStop.find((run) => run.id !== runId)!;
+    expect(promotedRun.contextSnapshot?.wakeCommentIds).toEqual([pending!.id]);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
-    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)))[0]?.status).toBe("deferred_issue_execution");
+    const [promotedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id));
+    expect(promotedWake?.status).not.toBe("deferred_issue_execution");
+    expect(promotedWake?.runId).toBe(promotedRun.id);
     const [go] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "go" }).returning();
     const next = await heartbeat.wakeup(agentId, { source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
       payload: { issueId, commentId: go!.id }, contextSnapshot: { issueId, commentId: go!.id, wakeReason: "issue_commented" },
     });
-    expect(next?.contextSnapshot?.wakeCommentIds).toEqual([pending!.id, go!.id]);
-    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)))[0]).toMatchObject({ status: "coalesced", runId: next!.id });
-    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+    expect(next).toBeNull();
+    expect(
+      await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      )),
+    ).toEqual([expect.objectContaining({ payload: expect.objectContaining({ commentId: go!.id }) })]);
+    releasePromoted();
+    await vi.waitFor(async () => {
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.filter((run) => (run.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(go!.id))).toHaveLength(1);
+    }, { timeout: 10_000 });
+    await heartbeat.drainActiveRunExecutions();
+    const finalRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(finalRuns.filter((run) => (run.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(go!.id))).toHaveLength(1);
+    expect(finalRuns.filter((run) => (run.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(pending!.id))).toHaveLength(1);
   });
 
   it.each(["dedicated deferred donor", "non-coalescing recipient"] as const)(
@@ -7874,19 +7954,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             ...(dedicatedDonor ? {} : interaction),
           },
         });
-        expect(next).not.toBeNull();
-        expect(next?.contextSnapshot?.wakeCommentIds).toEqual([go!.id]);
-        if (!dedicatedDonor)
-          expect(next?.contextSnapshot).toMatchObject(interaction);
-        const [retained] = await db
+        // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release keeps the donor
+        // parked on an acknowledged Stop, so this explicit wake gets its own run with only the fresh
+        // comment. This fold keeps the fork's in-file releaseIssueExecutionAndPromote live (operator
+        // decision 2026-09-15), which promotes the donor into its own run at Stop; the explicit wake
+        // is then saved behind that live run. What the case protects still holds on the fork: the
+        // promoted run carries only the earlier comment and the saved queue only the fresh one, so
+        // neither adopts the other's input.
+        // Inverted rather than deleted so the divergence stays guarded; restore upstream's assertions in the change that makes the wake-queue module release live.
+        expect(next).toBeNull();
+        const [promotedDonor] = await db
           .select()
           .from(agentWakeupRequests)
           .where(eq(agentWakeupRequests.id, deferred!.id));
-        expect(retained).toMatchObject({
-          status: "deferred_issue_execution",
-          runId: null,
-        });
-        expect(retained?.payload).toEqual(deferredPayload);
+        expect(promotedDonor?.status).not.toBe("deferred_issue_execution");
+        expect(promotedDonor?.runId).toBeTruthy();
+        const promotedRun = await heartbeat.getRun(promotedDonor!.runId!);
+        expect(promotedRun?.contextSnapshot?.wakeCommentIds).toEqual([pending!.id]);
+        if (dedicatedDonor)
+          expect(promotedRun?.contextSnapshot).toMatchObject(interaction);
+        const savedFreshInput = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            ),
+          );
+        expect(savedFreshInput).toEqual([
+          expect.objectContaining({ payload: expect.objectContaining({ commentId: go!.id }) }),
+        ]);
       } finally {
         // Keep this fixture's parked donor from being scheduled during teardown.
         await db
@@ -7894,6 +7992,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           .set({ status: "paused" })
           .where(eq(agents.id, agentId));
         release();
+        await heartbeat.drainActiveRunExecutions();
         if (next!)
           await vi.waitFor(async () =>
             expect((await heartbeat.getRun(next!.id))?.status).not.toBe(

@@ -989,15 +989,31 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
       gateway.releaseFirstWait();
       await heartbeat.reconcileStrandedAssignedIssues();
-      expect(gateway.getAgentPayloads()).toHaveLength(1);
+      // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release answers a cancel
+      // with an unknown provider outcome with its legacy-reconciliation release, which KEEPS the
+      // queued comment deferred for the board. This fold keeps the fork's in-file
+      // releaseIssueExecutionAndPromote as the live release (operator decision 2026-09-15), and it
+      // promotes the queued comment into a successor run at cancel time. The board
+      // reconciliation action and the comment itself are the same on both paths. Inverted rather
+      // than deleted so the divergence stays guarded; restore upstream's assertions (one run, the
+      // wake still deferred) in the change that makes the module release live.
+      expect(gateway.getAgentPayloads().length).toBeGreaterThanOrEqual(1);
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-      expect(runs).toEqual([expect.objectContaining({ id: firstRun!.id, status: "cancelled" })]);
+      expect(runs).toHaveLength(2);
+      expect(runs).toContainEqual(expect.objectContaining({ id: firstRun!.id, status: "cancelled" }));
+      const promotedRun = runs.find((run) => run.id !== firstRun!.id)!;
+      expect(promotedRun.contextSnapshot).toMatchObject({
+        wakeReason: "issue_commented",
+        wakeCommentIds: [queuedComment.id],
+      });
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
       expect(action).toMatchObject({ cause: "legacy_execution_requires_reconciliation", ownerType: "board", returnOwnerAgentId: agentId });
       const [retained] = await db.select().from(issueComments).where(eq(issueComments.id, queuedComment.id));
       expect(retained?.body).toBe("Queued follow-up");
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
-      expect(wakes.some(wake => wake.payload?.commentId === queuedComment.id && wake.status === "deferred_issue_execution")).toBe(true);
+      expect(wakes.some(wake => wake.payload?.commentId === queuedComment.id && wake.status === "deferred_issue_execution")).toBe(false);
+      expect(wakes).toContainEqual(expect.objectContaining({ reason: "issue_execution_promoted", runId: promotedRun.id }));
+      await waitFor(async () => !["queued", "running"].includes((await heartbeat.getRun(promotedRun.id))?.status ?? ""));
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();
@@ -2110,9 +2126,16 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             eq(issueRecoveryActions.companyId, companyId),
             eq(issueRecoveryActions.sourceIssueId, issueId),
           ));
-          expect(incidents).toEqual([expect.objectContaining({
-            cause: "native_continuation_requires_reconciliation",
-          })]);
+          // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release records a board
+          // `native_continuation_requires_reconciliation` incident for this cancelled native source
+          // (recordNativeTerminalRecoveryIfNeeded in the module glue). The fork's in-file release,
+          // kept live by the D9 deferral (operator decision 2026-09-15), releases the execution lock
+          // without that incident. Nothing is woken or dispatched on either path. Restore upstream's
+          // incident assertion in the change that makes the module release live.
+          expect(incidents).toEqual([]);
+          expect(
+            await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId)),
+          ).toEqual([{ executionRunId: null }]);
           expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
           expect(gateway.getAgentPayloads()).toHaveLength(0);
           return;
@@ -2218,7 +2241,42 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           expect(deniedRun?.contextSnapshot).not.toHaveProperty(
             "paperclipExternalChatQuestionResponse",
           );
-          expect(gateway.getAgentPayloads()).toHaveLength(0);
+          // Fork divergence (D9 deferred, slice 2c; D12): the denial finalizes the continuation as
+          // `setup_failed`. Upstream's wake-queue release blocks that on the first strike
+          // (isImmediateRecoverySourceBlocked -> classifyContinuationFailure, where setup_failed is
+          // non-retryable), so nothing reaches the gateway. Here the fork's in-file release is still
+          // the live path (D9 deferred), and D12 (operator decision 2026-09-15) keeps setup_failed's
+          // one immediate retry (SUP-15589). So the agent IS re-dispatched on the issue: a plain
+          // issue_continuation_needed retry of the denied run, then the fork's source-scoped
+          // recovery wake once that retry fails. What this case protects still holds: no dispatched
+          // run carries the revoked answer or the reviewed-chat binding. Restore upstream's
+          // zero-payload assertion in the change that makes the module release live.
+          const deliveredRuns = await Promise.all(
+            gateway.getAgentPayloads().map((payload) =>
+              db
+                .select()
+                .from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, String(payload.idempotencyKey)))
+                .then((rows) => rows[0] ?? null),
+            ),
+          );
+          expect(deliveredRuns.length).toBeGreaterThan(0);
+          for (const deliveredRun of deliveredRuns) {
+            expect(deliveredRun).not.toBeNull();
+            expect(deliveredRun!.id).not.toBe(continuationRunId);
+            expect(["issue_continuation_needed", "source_scoped_recovery_action"]).toContain(
+              deliveredRun!.contextSnapshot?.wakeReason,
+            );
+            expect(deliveredRun!.contextSnapshot).not.toHaveProperty("paperclipExternalChatQuestionResponse");
+            expect(deliveredRun!.contextSnapshot).not.toHaveProperty("paperclipExternalChatExecutionBound");
+          }
+          expect(
+            await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, continuationRunId!)),
+          ).toEqual([
+            expect.objectContaining({
+              contextSnapshot: expect.objectContaining({ wakeReason: "issue_continuation_needed" }),
+            }),
+          ]);
           return;
         }
         await waitFor(() => gateway.getAgentPayloads().length === 1, 30_000);
