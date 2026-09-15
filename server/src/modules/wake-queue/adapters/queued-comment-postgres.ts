@@ -9,7 +9,13 @@ import {
   withQueuedCommentIdsInRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
-import { logActivity as persistActivityLogRow, type ActivityPublication } from "../../../services/activity-log.js";
+// Fold 2c / SUP-9856 (fork audit contract since 77ad35d95): the fork's `logActivity` is
+// best-effort and swallows failures, which is only right after a commit. This audit write runs
+// inside `withLockedQueue`'s transaction, so it must share the mutation's fate: with the
+// swallowing variant a failed audit commits the queued-comment mutation unaudited and hands the
+// route an undefined publication to publish. Upstream's `logActivity` propagates, so upstream
+// imports it here; revisit if the fork's split between the two variants is ever dropped.
+import { logActivityInTransaction as persistActivityLogRow, type ActivityPublication } from "../../../services/activity-log.js";
 import { decideQueuedCommentWakeLookup } from "../domain/policy.js";
 import { parseObject, readNonEmptyString } from "../domain/values.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
