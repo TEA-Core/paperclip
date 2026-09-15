@@ -39,6 +39,7 @@ import {
   prepareGitHubExecutionEnvironment,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
+import { prepareGitExecutionEnvironmentWithHostFallback } from "./git-context-probe-fallback.js";
 import { agentService } from "./agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
@@ -23480,7 +23481,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } else {
         delete context.paperclipScratch;
       }
-      const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
+      // TEA-Core fork (fold 2c, decision D3): in host GitHub mode a Git-context probe
+      // failure (timeout / missing cwd / spawn failure / unreadable output) must not
+      // fail the run. Continue with the runtime env + PAPERCLIP_GITHUB_AUTH_MODE=host,
+      // warn, and surface it in run events + the context snapshot. Managed mode stays fatal.
+      delete context.githubExecutionContextProbe;
+      const gitExecutionPrepared = await prepareGitExecutionEnvironmentWithHostFallback({
         target: executionTarget,
         cwd: executionWorkspace.cwd,
         env: Object.fromEntries(
@@ -23494,7 +23500,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         networkAccess:
           trustPreset.kind === "standard" &&
           process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
-      });
+      }, { prepare: prepareGitHubExecutionEnvironment });
+      const gitExecutionEnv = gitExecutionPrepared.env;
+      if (gitExecutionPrepared.fallback) {
+        const { error: probeError, ...probeFallback } = gitExecutionPrepared.fallback;
+        logger.warn(
+          { err: probeError, runId: run.id, issueId, agentId: agent.id, ...probeFallback },
+          "git execution context probe failed in host GitHub mode; continuing with runtime env",
+        );
+        // The raw error stays out of the event and the snapshot: its message embeds the probe script.
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: `Git context probe failed (${probeFallback.reason}); continuing in host GitHub mode without Git metadata roots`,
+          payload: { code: "git_context_probe_failed", fallback: "runtime_env_host_mode", ...probeFallback },
+        }).catch(() => undefined);
+        context.githubExecutionContextProbe = {
+          status: "fallback",
+          ...probeFallback,
+          at: new Date().toISOString(),
+        };
+      }
       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";

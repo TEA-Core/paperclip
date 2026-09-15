@@ -114,7 +114,9 @@ describe("fold decision D1 call-site guard", () => {
         "services/heartbeat.ts": 2,
         "services/native-runtime/runtime-context.ts": 1,
       },
-      prepareGitHubExecutionEnvironment: { "services/heartbeat.ts": 1 },
+      // D3: executeRun reaches the probe only through prepareGitExecutionEnvironmentWithHostFallback,
+      // which receives the binding by reference (see git-context-probe-fallback.test.ts).
+      prepareGitHubExecutionEnvironment: {},
       prepareGitHubOperationLaunchers: { "services/heartbeat.ts": 1 },
       forkForcesHostGitHub: {
         "services/git-credentials.ts": 1,
