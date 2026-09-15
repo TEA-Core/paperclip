@@ -568,7 +568,7 @@ describe("durable inbound chat scheduler receipts", () => {
     ]);
   });
 
-  it.each([false, true])("preserves the exact retry column and comment batch during promotion (execution hold=%s)", async (held) => {
+  it.each([false, true])("Fork divergence (D9 deferred, slice 2c): preserves the exact retry column and comment batch during promotion (execution hold=%s)", async (held) => {
     const f = await retryFixture(true);
     const clearHold = held ? await executionHold(f) : null;
     f.register();
@@ -598,9 +598,20 @@ describe("durable inbound chat scheduler receipts", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.wakeupRequestId, f.actionId));
+    // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue promotion (#13038,
+    // finalizePromotedWake for an authorized failed-chat retry) stamps the promoted run's
+    // retryOfRunId COLUMN with the failed run. This fold keeps the fork's in-file
+    // releaseIssueExecutionAndPromote as the live release (operator decision 2026-09-15). Its
+    // promotion inserts the run without that column. The fold-2c Q2 fence does add upstream's
+    // promotion-phase authority check (phases asserted below). What this case protects still
+    // holds on the fork: the promoted run carries the exact comment batch and retry lineage in
+    // its context snapshot (retryOfRunId and the chatFailedRunRetry selector that the
+    // execution-phase check reads), and the receipt is promoted once. Inverted rather than
+    // deleted so the divergence stays guarded. Restore upstream's retryOfRunId assertion in the
+    // change that makes the wake-queue module release live.
     expect(run).toMatchObject({
       status: "queued",
-      retryOfRunId: f.failedRunId,
+      retryOfRunId: null,
       contextSnapshot: f.context,
     });
     const [receipt] = await db
