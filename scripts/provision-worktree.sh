@@ -814,32 +814,73 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
     previous_install_fingerprint="$(cat "$install_fingerprint_path")"
   fi
 
-  while IFS= read -r relative_path; do
-    [[ -n "$relative_path" ]] || continue
-    target_path="$worktree_cwd/$relative_path"
-
-    if [[ -L "$target_path" || ! -e "$target_path" ]]; then
-      needs_install=1
-      break
+  # SUP-16336: the worktree's node_modules is consumed by the agent uid (M1:
+  # 1001), but provisioning has run pnpm install at the server uid (1000),
+  # leaving bin targets owned by 1000 that the agent's pnpm install cannot
+  # chmod (EPERM in linkBin). Run the worktree install through the agent setuid
+  # shim so the tree is materialized by the uid that will chmod its bins. The
+  # shim's target uid is fixed at compile time; discover it rather than trusting
+  # a caller-supplied value. When no shim is available, or we already run at the
+  # drop uid, fall back to the current-uid install exactly as before.
+  agent_spawn_shim="/usr/local/sbin/paperclip-spawn-agent"
+  pnpm_install_uid="$current_provision_uid"
+  use_agent_shim=0
+  if [[ -x "$agent_spawn_shim" ]]; then
+    shim_drop_uid="$("$agent_spawn_shim" id -u 2>/dev/null || true)"
+    if [[ -n "$shim_drop_uid" && "$shim_drop_uid" != "$current_provision_uid" ]]; then
+      use_agent_shim=1
+      pnpm_install_uid="$shim_drop_uid"
     fi
-  done < <(list_base_node_modules_paths)
+  fi
+
+  # SUP-16336: only enumerate the base checkout's node_modules paths when the
+  # worktree does not already hold a populated pnpm tree. A populated tree's
+  # virtual-store paths are keyed to the branch's own lockfile, so comparing
+  # them against the base ref's paths false-positives on any branch whose
+  # dependencies differ from the base ref and forces a full reinstall
+  # (re-materialization) on every dispatch. The manifest fingerprint below is
+  # the correct signal once a tree exists.
+  worktree_tree_populated=0
+  if [[ -d "$worktree_cwd/node_modules" && ! -L "$worktree_cwd/node_modules" && -f "$worktree_cwd/node_modules/.modules.yaml" ]]; then
+    worktree_tree_populated=1
+  fi
+  if [[ "$worktree_tree_populated" -eq 0 ]]; then
+    while IFS= read -r relative_path; do
+      [[ -n "$relative_path" ]] || continue
+      target_path="$worktree_cwd/$relative_path"
+
+      if [[ -L "$target_path" || ! -e "$target_path" ]]; then
+        needs_install=1
+        break
+      fi
+    done < <(list_base_node_modules_paths)
+  fi
 
   if [[ "$needs_install" -eq 0 && "$current_install_fingerprint" != "$previous_install_fingerprint" ]]; then
     needs_install=1
   fi
 
-  # SUP-14087: a shared worktree node_modules tree owned by another uid cannot be
-  # reinstalled here. pnpm's linkBins chmods every bin it relinks, so an install
-  # over the other uid's tree dies with EPERM mid-flight and leaves a
-  # partially rewritten tree. Refuse the install instead of corrupting the
-  # shared state; the tree stays as the owning uid last installed it. A symlink
-  # is safe to replace (the install would create a fresh tree), so only a real
-  # directory is gated.
-  if [[ "$needs_install" -eq 1 && -d "$worktree_cwd/node_modules" && ! -L "$worktree_cwd/node_modules" ]]; then
+  # SUP-14087 / SUP-16336: a shared worktree node_modules tree that the
+  # installing uid cannot relink dies with EPERM mid-flight and leaves a
+  # partially rewritten tree. This check is independent of the fingerprint:
+  # a tree owned by the wrong uid must be rebuilt even when the manifests are
+  # unchanged, otherwise the agent's own pnpm install still EPERMs on the
+  # foreign bin targets. When we own the tree but the install will run as a
+  # different uid, clear it so the install recreates it owned by that uid;
+  # when a third uid owns it, refuse instead of corrupting shared state. A
+  # symlink is safe to replace (the install would create a fresh tree), so
+  # only a real directory is gated.
+  if [[ -d "$worktree_cwd/node_modules" && ! -L "$worktree_cwd/node_modules" ]]; then
     node_modules_owner_uid="$(path_owner_uid "$worktree_cwd/node_modules")"
-    if [[ -n "$node_modules_owner_uid" && "$node_modules_owner_uid" != "$current_provision_uid" ]]; then
-      echo "provision-worktree: cross-uid worktree node_modules: $worktree_cwd/node_modules is owned by uid $node_modules_owner_uid but this provision runs as uid $current_provision_uid. Skipping pnpm install to avoid EPERM on uid ${node_modules_owner_uid}-owned bins and a partially rewritten tree; the shared install is left as uid $node_modules_owner_uid last left it. Refresh dependencies for this branch by provisioning as uid $node_modules_owner_uid." >&2
-      needs_install=0
+    if [[ -n "$node_modules_owner_uid" && "$node_modules_owner_uid" != "$pnpm_install_uid" ]]; then
+      if [[ "$node_modules_owner_uid" == "$current_provision_uid" ]]; then
+        echo "provision-worktree: clearing worktree node_modules owned by uid $node_modules_owner_uid so the install runs as uid $pnpm_install_uid and materializes it owned by that uid (SUP-16336)." >&2
+        rm -rf "$worktree_cwd/node_modules"
+        needs_install=1
+      else
+        echo "provision-worktree: cross-uid worktree node_modules: $worktree_cwd/node_modules is owned by uid $node_modules_owner_uid but the install will run as uid $pnpm_install_uid. Skipping pnpm install to avoid EPERM on uid ${node_modules_owner_uid}-owned bins and a partially rewritten tree; the shared install is left as uid $node_modules_owner_uid last left it. Refresh dependencies for this branch by provisioning as uid $node_modules_owner_uid." >&2
+        needs_install=0
+      fi
     fi
   fi
 
@@ -896,7 +937,14 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
         # pnpm 9.15.4 calls the deprecated url.parse() in toNerfDart on every
         # install. Node 24 reports that call as DEP0169. Remove this flag
         # when the pinned pnpm no longer calls url.parse() in that path.
-        NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" pnpm install --prod=false "$@"
+        # SUP-16336: when use_agent_shim is set, run pnpm through the agent
+        # setuid shim so node_modules is materialized owned by the agent uid
+        # that will later chmod its bins; otherwise run pnpm at the current uid.
+        if [[ "$use_agent_shim" -eq 1 ]]; then
+          NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" "$agent_spawn_shim" pnpm install --prod=false "$@"
+        else
+          NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" pnpm install --prod=false "$@"
+        fi
       ) >"$stdout_path" 2>"$stderr_path" || exit_code=$?
 
       cat "$stdout_path"
