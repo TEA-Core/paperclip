@@ -34,8 +34,9 @@
  *   - a back-to-back pair -- block, gap, block -- that a parent already holds as
  *     often as the merge does (one side added a test that repeats a query the
  *     other side already repeats, so every block count rises by one);
- *   - a pair near-identical to one BOTH parents already hold, where each side
- *     edited its two copies differently and the composed text matches neither.
+ *   - near-identical pairs BOTH parents already hold at least as often as the
+ *     merge does, where each side edited its two copies differently and the
+ *     composed text matches neither.
  *
  * Keeping both sides of a conflict yields a pair that no parent held, so none of
  * the three discounts can hide that defect.
@@ -214,11 +215,6 @@ function blobAt(ref, path) {
   return git(["show", `${ref}:${path}`], { allowFailure: true });
 }
 
-function normalizedTextAt(ref, path) {
-  const text = blobAt(ref, path);
-  return text === null ? null : normalize(text).map((l) => l.text);
-}
-
 /** Paths renamed between `from` and `commit`, keyed by their path in `commit`. */
 function renamesInto(from, commit) {
   const map = new Map();
@@ -275,8 +271,18 @@ export function findMergeDuplication(commit, options = {}) {
     // Rule 2: a column-0 declaration the merge now holds more copies of than
     // either parent. Catches the copies the adjacency rule cannot -- the two
     // `pendingCleanupAttemptsSql` bodies sit 14k lines apart in heartbeat.ts.
+    // A fold re-stamps (renames) migrations, so the same file sits under another
+    // path in a parent. Follow the rename for both rules, or the parent reads as
+    // empty and the file's own declarations and repetition read as merge-introduced.
+    const parentTexts = parents.map((p, i) => {
+      const direct = blobAt(p, path);
+      if (direct !== null) return direct;
+      const source = renameSources[i].get(path);
+      return source ? blobAt(p, source) : null;
+    });
+
     const mergedDecls = countDeclarations(mergedText);
-    const parentDecls = parents.map((p) => countDeclarations(blobAt(p, path)));
+    const parentDecls = parentTexts.map((text) => countDeclarations(text));
     for (const [name, count] of mergedDecls) {
       if (count < 2) continue;
       const parentCounts = parentDecls.map((d) => d.get(name) ?? 0);
@@ -289,15 +295,7 @@ export function findMergeDuplication(commit, options = {}) {
     const repeats = findAdjacentRepeats(mergedLines, options);
     if (repeats.length === 0) continue;
 
-    // A fold re-stamps (renames) migrations, so the same file sits under another
-    // path in a parent. Follow the rename, or the parent reads as empty and the
-    // file's own internal repetition reads as merge-introduced.
-    const parentLines = parents.map((p, i) => {
-      const direct = normalizedTextAt(p, path);
-      if (direct !== null) return direct;
-      const source = renameSources[i].get(path);
-      return (source ? normalizedTextAt(p, source) : null) ?? [];
-    });
+    const parentLines = parentTexts.map((text) => (text === null ? [] : normalize(text).map((l) => l.text)));
     for (const { start, length, gap } of repeats) {
       const block = mergedLines.slice(start, start + length);
       const mergeCount = countOccurrences(mergedLines, block);
@@ -310,9 +308,12 @@ export function findMergeDuplication(commit, options = {}) {
       if (parentLines.some((lines) => countOccurrences(lines, pair) >= pairCount)) continue;
       // A composed block: BOTH parents already hold an adjacent repeat of a
       // near-identical block and each side edited its copies differently, so the
-      // merged text matches neither verbatim. Keeping both sides of a conflict
-      // yields a pair no parent had, so this discount cannot hide that defect.
-      if (parentLines.every((lines) => similarAdjacentPairs(lines, block, options) >= pairCount)) continue;
+      // merged text matches neither verbatim. Compare against every near-identical
+      // pair the MERGE holds, not the candidate alone: an unrelated similar pair the
+      // parents held is still in the merge, so a new duplicate beside it leaves the
+      // merge one pair ahead of both parents and is still reported.
+      const mergedSimilarPairs = similarAdjacentPairs(mergedLines, block, options);
+      if (parentLines.every((lines) => similarAdjacentPairs(lines, block, options) >= mergedSimilarPairs)) continue;
       findings.push({
         path,
         firstCopy: [merged[start].line, merged[start + length - 1].line],
