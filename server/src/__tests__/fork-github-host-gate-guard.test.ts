@@ -160,5 +160,7 @@ describe("fold decision D1 call-site guard", () => {
     const gitCredentials = sources.get("services/git-credentials.ts")!;
     expect(gitCredentials).toContain("if (!hostGitHub && db && context?.heartbeatRunId && context.agentId)");
     expect(gitCredentials).not.toContain("managedExecutionEnabled(env) && db");
+    // D1-b (operator accepted, amends I2): host mode skips the provider's managed-identity arm.
+    expect(gitCredentials).toContain("managedPromise ??= db && !hostGitHub");
   });
 });

@@ -259,7 +259,9 @@ describe("createGitRemoteAuthProvider", () => {
     const secrets = buildSecretsFake({ GH_TOKEN: "agent-b-legacy-token" });
     const provider = createGitRemoteAuthProvider(db, "company-1", { agentId: "agent-b" }, {
       secrets,
-      env: {},
+      // TEA-Core fork (fold 2c D1-b): host mode skips the managed arm entirely; the opt-in keeps
+      // this upstream case exercising it.
+      env: { PAPERCLIP_GITHUB_MANAGED_EXECUTION: "on" },
       // TEA-Core fork: without an injected probe the SUP-13224 probe calls api.github.com with
       // this fake token, gets a 401 when online, and falls through to no credential.
       probeToken: async () => true,
@@ -391,6 +393,68 @@ describe("fork host-mode gate (D1)", () => {
     expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("");
     expect(invocation?.env.GIT_AUTHOR_NAME).toBe("");
     expect(secrets.getByName).not.toHaveBeenCalled();
+  });
+});
+
+describe("fork host-mode gate (D1-b)", () => {
+  const githubUrl = "https://github.com/example/repo.git";
+
+  // An enabled, active, company-installed GitHub connection with no grant for this run.
+  function installedConnectionWithoutGrantDb() {
+    const query = (rows: unknown[]) => ({
+      from: () => ({ where: async () => rows }),
+    });
+    return {
+      select: vi.fn()
+        .mockReturnValueOnce(query([{
+          id: "github-connection",
+          companyId: "company-1",
+          enabled: true,
+          status: "active",
+          config: { sourceTemplateKey: "github" },
+        }]))
+        .mockReturnValueOnce(query([{
+          connectionId: "github-connection",
+          companyId: "company-1",
+          targetType: "company",
+          targetId: "company-1",
+        }]))
+        // grants, then the ownerless-run standing delegations
+        .mockReturnValueOnce(query([]))
+        .mockReturnValueOnce(query([])),
+    } as unknown as Db & { select: ReturnType<typeof vi.fn> };
+  }
+
+  it("host mode skips the managed-identity arm: an installed GitHub connection with no grant does not throw for a local run", async () => {
+    const db = installedConnectionWithoutGrantDb();
+    const provider = createGitRemoteAuthProvider(
+      db,
+      "company-1",
+      { agentId: "agent-1", environmentDriver: "local" },
+      { secrets: buildSecretsFake({ GITHUB_TOKEN: "host-token" }), env: {}, probeToken: async () => true },
+    );
+
+    const invocation = await provider(githubUrl);
+
+    expect(invocation?.source).toBe("company_secret");
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("host-token");
+    expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it("with the opt-in on, the same fixture keeps I2's fail-closed managed-identity order", async () => {
+    const db = installedConnectionWithoutGrantDb();
+    const provider = createGitRemoteAuthProvider(
+      db,
+      "company-1",
+      { agentId: "agent-1", environmentDriver: "local" },
+      {
+        secrets: buildSecretsFake({ GITHUB_TOKEN: "host-token" }),
+        env: { PAPERCLIP_GITHUB_MANAGED_EXECUTION: "on" },
+        probeToken: async () => true,
+      },
+    );
+
+    await expect(provider(githubUrl)).rejects.toThrow("No managed GitHub identity is available for this run");
   });
 });
 

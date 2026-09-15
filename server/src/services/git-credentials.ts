@@ -349,7 +349,11 @@ export function createGitRemoteAuthProvider(
     // secrets and the server env. `resolveGitHubOperationCredentials`, the tool gateway and
     // connection intents deliberately do NOT set it: upstream #13005/#13022 require a revoked or
     // disabled dedicated identity to fail closed there rather than substitute a personal one.
-    managedPromise ??= db
+    //
+    // In host mode (fold decision D1-b, amends invariant I2) the managed arm is skipped, so an
+    // installed GitHub connection never signs, or takes offline, server-side git for a
+    // local/SSH run; "managed identity first, fail closed" holds for sandbox drivers and the opt-in.
+    managedPromise ??= db && !hostGitHub
       ? resolveManagedGitHubCredential(db, secrets, companyId, { ...(context ?? {}), requireEnabledConnection: true })
       : Promise.resolve({ configured: false as const });
     const managed = await managedPromise;
