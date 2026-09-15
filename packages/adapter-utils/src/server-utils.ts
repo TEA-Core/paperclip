@@ -1710,6 +1710,10 @@ export function renderPaperclipWakePrompt(
     switch (recovery?.cause) {
       case "process_lost":
         return `Your previous run on this issue was lost (${recovery.failureSummary ?? "no failure summary available"}). Try again — resume from durable progress; don't redo completed steps. Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.`;
+      // Routed to the original agent like process_lost, but the run was admitted without
+      // ever launching a child process or environment lease, so there is nothing to resume.
+      case "dispatch_unlaunched":
+        return `Your previous run on this issue never launched (${recovery.failureSummary ?? "no failure summary available"}): no process or environment lease was started, so nothing executed. Try again — start the current step from the beginning; don't redo steps completed by earlier runs. Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.`;
       case "successful_run_missing_state":
       case "successful_run_missing_issue_disposition":
         return "Your run completed but left no final disposition. Post a comment summarizing the state and set the correct disposition (`done` / `in_review` / `blocked` / `in_progress` with a live path). Do not start new work.";

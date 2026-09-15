@@ -1569,6 +1569,10 @@ describe("renderPaperclipWakePrompt", () => {
       "Try again — resume from durable progress; don't redo completed steps.",
     ],
     [
+      "dispatch_unlaunched",
+      "Your previous run on this issue never launched",
+    ],
+    [
       "successful_run_missing_state",
       "Your run completed but left no final disposition.",
     ],
@@ -1672,6 +1676,42 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain(
       "Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.",
     );
+  });
+
+  // dispatch_unlaunched recovery is routed to the original agent (owner and return
+  // owner), exactly like process_lost, so its wake must tell that agent to retry
+  // rather than render the default "fix it and hand it back" takeover instruction.
+  it("asks never-launched dispatch retries to start the current step over instead of handing the work back", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "source_scoped_recovery_action",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-14092",
+        title: "Recover work",
+        status: "blocked",
+      },
+      recovery: {
+        cause: "dispatch_unlaunched",
+        failureSummary: "run admitted with no child process or environment lease",
+        originalAssignee: { id: "agent-1", name: "Coder" },
+        attemptCount: 1,
+        nextAction: "Retry the original assignee from durable progress.",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain(
+      "Your previous run on this issue never launched (run admitted with no child process or environment lease)",
+    );
+    expect(prompt).toContain("so nothing executed");
+    expect(prompt).toContain("start the current step from the beginning");
+    expect(prompt).toContain(
+      "Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.",
+    );
+    expect(prompt).not.toContain("Fix the underlying problem");
+    expect(prompt).not.toContain("You DO NOT do the work");
   });
 
   it("asks restored source owners to lead with work instead of narrating recovery", () => {
