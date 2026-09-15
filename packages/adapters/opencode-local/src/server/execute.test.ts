@@ -1530,6 +1530,36 @@ describe("execute — GitHub App run-env gates (SUP-14869)", () => {
     expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
   });
 
+  it("keeps credential helper and gh wrapper wiring when config env is host-mode probe output (fold 2c D4)", async () => {
+    process.env.PAPERCLIP_AGENT_GH_WRAPPER = "on";
+    process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
+    await runOnce({
+      PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "safe.directory",
+      GIT_CONFIG_VALUE_0: "/paperclip/vaults/tsp",
+      PAPERCLIP_GITHUB_AUTH_MODE: "host",
+      PAPERCLIP_GITHUB_HOST_HOME: "/paperclip",
+      PAPERCLIP_GIT_METADATA_ROOTS: "[]",
+      PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
+      PAPERCLIP_RUNNER_NETWORK_ACCESS: "enabled",
+    });
+    const env = spawnEnv();
+    expect(env.GIT_CONFIG_COUNT).toBe("4");
+    expect(env.GIT_CONFIG_KEY_0).toBe("safe.directory");
+    expect([env.GIT_CONFIG_KEY_1, env.GIT_CONFIG_KEY_2, env.GIT_CONFIG_KEY_3]).toEqual([
+      "credential.helper",
+      "credential.https://github.com.helper",
+      "credential.https://www.github.com.helper",
+    ]);
+    expect(env.PATH?.startsWith(`${path.join(scratchDir, "bin")}${path.delimiter}`)).toBe(true);
+    expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
+    expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
+    expect(env.GH_CONFIG_DIR).toBeUndefined();
+    // gh is isolated in this lane by the per-call opencode config home, not by GH_CONFIG_DIR.
+    expect(env.XDG_CONFIG_HOME).toEqual(expect.any(String));
+  });
+
   it("installs the git credential helper config when the credential helper flag is on (AC3)", async () => {
     process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
     await runOnce({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });

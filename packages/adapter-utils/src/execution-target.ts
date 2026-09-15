@@ -1586,6 +1586,25 @@ async function githubOperationLauncherBasePath(
   return remotePath;
 }
 
+/**
+ * TEA-Core fork (fold 2c D4). Local host discovery runs inside the control-plane process, so the
+ * env it copies is the SERVER's. Server GitHub tokens are not copied into a run's config env
+ * (agents use the App-broker credential helper and gh wrapper, fork I4/I5), and GH_CONFIG_DIR is
+ * not pinned to the server's $HOME/.config/gh. Agent env bindings (input.env) still apply.
+ * Remote (SSH/sandbox) discovery reads the TARGET's env and is not filtered. This only governs
+ * config env: lanes that spawn via runChildProcess still inherit the server environment
+ * (sanitizeInheritedPaperclipEnv does not strip these keys); the ACP lane does not.
+ * Keep the five token keys aligned with heartbeat.ts MANAGED_GITHUB_TOKEN_KEYS.
+ */
+export const LOCAL_HOST_DISCOVERY_EXCLUDED_ENV_KEYS: readonly string[] = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
+  "PAPERCLIP_GIT_TOKEN",
+  "GH_CONFIG_DIR",
+];
+
 /** Read only execution-target Git context; never import the controller's credentials into SSH. */
 export async function prepareGitHubExecutionEnvironment(input: {
   target: AdapterExecutionTarget | null | undefined;
@@ -1691,6 +1710,8 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
     const result = await promisify(execFile)(process.execPath, args, { cwd: input.cwd, env: sanitizeInheritedPaperclipEnv(process.env), timeout: 15_000, maxBuffer: 1024 * 1024 });
     try { discovered = JSON.parse(result.stdout.split("\0")[1] ?? ""); }
     catch { throw new Error("Could not read execution-target Git context"); }
+    // TEA-Core fork (fold 2c D4): see LOCAL_HOST_DISCOVERY_EXCLUDED_ENV_KEYS.
+    for (const key of LOCAL_HOST_DISCOVERY_EXCLUDED_ENV_KEYS) delete discovered[key];
   }
   // Controller-derived roots and mode must not be replaced by agent bindings.
   return { ...discovered, ...input.env,

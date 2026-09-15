@@ -8347,6 +8347,52 @@ describe("acpx-engine — GitHub App run-env gates (SUP-14869)", () => {
     expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
   });
 
+  // TEA-Core fork (fold 2c D4, I4/I5): after D1 every local run carries host-mode probe output.
+  const hostProbeEnv = (scratch: string): Record<string, string> => ({
+    PAPERCLIP_RUN_SCRATCH_DIR: scratch,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "safe.directory",
+    GIT_CONFIG_VALUE_0: "/paperclip/vaults/tsp",
+    PAPERCLIP_GITHUB_AUTH_MODE: "host",
+    PAPERCLIP_GITHUB_HOST_HOME: "/paperclip",
+    PAPERCLIP_GIT_METADATA_ROOTS: "[]",
+    PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
+    PAPERCLIP_RUNNER_NETWORK_ACCESS: "enabled",
+  });
+
+  it("keeps credential helper and gh wrapper wiring when config env is host-mode probe output (fold 2c D4)", async () => {
+    process.env.PAPERCLIP_AGENT_GH_WRAPPER = "on";
+    process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
+    const env = await sessionEnv(hostProbeEnv(scratchDir));
+    expect(env.GIT_CONFIG_COUNT).toBe("4");
+    expect(env.GIT_CONFIG_KEY_0).toBe("safe.directory");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("/paperclip/vaults/tsp");
+    expect([env.GIT_CONFIG_KEY_1, env.GIT_CONFIG_KEY_2, env.GIT_CONFIG_KEY_3]).toEqual([
+      "credential.helper",
+      "credential.https://github.com.helper",
+      "credential.https://www.github.com.helper",
+    ]);
+    expect((env.PATH ?? "").split(path.delimiter)[0]).toBe(path.join(scratchDir, "bin"));
+    expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
+    expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
+    expect(env.GH_TOKEN).toBeUndefined();
+    expect(env.GH_CONFIG_DIR).toBeUndefined();
+  });
+
+  it("keeps a server GH_TOKEN out of the ACP child env in host mode (fold 2c D4, I9)", async () => {
+    process.env.PAPERCLIP_AGENT_GH_WRAPPER = "on";
+    process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
+    const previous = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = "server-token";
+    try {
+      const env = await sessionEnv(hostProbeEnv(scratchDir));
+      expect(env.GH_TOKEN).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previous;
+    }
+  });
+
   it("installs the git credential helper config when the credential helper flag is on (AC3)", async () => {
     process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
     const env = await sessionEnv({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });

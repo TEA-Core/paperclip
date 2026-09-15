@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,10 +9,12 @@ import * as ssh from "./ssh.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  LOCAL_HOST_DISCOVERY_EXCLUDED_ENV_KEYS,
   prepareGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
   runAdapterExecutionTargetProcess,
 } from "./execution-target.js";
+import { applyPaperclipGhWrapperGate, applyPaperclipGitHubCredentialHelperGate } from "./server-utils.js";
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -126,6 +129,7 @@ describe("managed GitHub launcher environment", () => {
     expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
     expect(env.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe("enabled");
     expect(env.PAPERCLIP_GITHUB_HOST_HOME).toBe(fixture.root);
+    // TEA-Core fork (fold 2c D4) filters only LOCAL discovery; remote discovery keeps the target's GH_CONFIG_DIR.
     expect(env.GH_CONFIG_DIR).toBe(path.join(fixture.root, ".config/gh"));
     expect(env.GH_TOKEN).toBeUndefined();
     expect(env.PAPERCLIP_GITHUB_LAUNCHER_DIR).toBeUndefined();
@@ -138,7 +142,9 @@ describe("managed GitHub launcher environment", () => {
     await writeFile(path.join(root, ".gitconfig"), '[credential]\n  helper = store\n');
     await exec("git", ["init", path.join(root, "repo")]);
     const env = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: {}, hostCredentials: true, networkAccess: true });
-    expect(env.GH_TOKEN).toBe("legacy-token");
+    // TEA-Core fork (fold 2c D4): local host discovery does not copy server GitHub tokens.
+    expect(env.GH_TOKEN).toBeUndefined();
+    expect(env.GH_CONFIG_DIR).toBeUndefined();
     expect(env.GIT_CONFIG_GLOBAL).toBeUndefined();
     expect(env.PAPERCLIP_GIT_METADATA_ROOTS).toContain("/repo/.git");
     const config = await exec("git", ["config", "credential.helper"], { cwd: root, env: { ...process.env, ...env } });
@@ -147,6 +153,104 @@ describe("managed GitHub launcher environment", () => {
     expect(isolated.GH_TOKEN).toBeUndefined();
     expect(isolated.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe("disabled");
     expect(isolated.PAPERCLIP_GITHUB_HOST_HOME).toBeUndefined();
+  });
+
+  it("pins the local host discovery exclusion list (fold 2c D4)", () => {
+    expect([...LOCAL_HOST_DISCOVERY_EXCLUDED_ENV_KEYS]).toEqual([
+      "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN", "GH_CONFIG_DIR",
+    ]);
+  });
+
+  it.each([...LOCAL_HOST_DISCOVERY_EXCLUDED_ENV_KEYS])("local host discovery does not copy the server's %s (fold 2c D4)", async (key) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-host-discovery-")); roots.push(root);
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("XDG_CONFIG_HOME", "");
+    vi.stubEnv(key, "/server-value");
+    await exec("git", ["init", path.join(root, "repo")]);
+    const env = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: {}, hostCredentials: true, networkAccess: true });
+    expect(env[key]).toBeUndefined();
+    expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
+    expect(env.PAPERCLIP_GITHUB_HOST_HOME).toBe(root);
+    expect(env.PAPERCLIP_GITHUB_LAUNCHER_DIR).toBeUndefined();
+    expect(env.PAPERCLIP_GIT_METADATA_ROOTS).toContain("/repo/.git");
+  });
+
+  it("local host discovery keeps server GIT_CONFIG_* entries and agent bindings while dropping server tokens (fold 2c D4)", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-host-discovery-shape-")); roots.push(root);
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("GIT_CONFIG_COUNT", "1");
+    vi.stubEnv("GIT_CONFIG_KEY_0", "safe.directory");
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "/paperclip/vaults/tsp");
+    vi.stubEnv("GH_TOKEN", "server");
+    vi.stubEnv("GH_CONFIG_DIR", "/shared/gh");
+    const cwd = path.join(root, "repo");
+    await exec("git", ["init", cwd]);
+
+    const bound = await prepareGitHubExecutionEnvironment({
+      target: null, cwd, env: { GH_TOKEN: "bound", GH_CONFIG_DIR: "/bound/gh" }, hostCredentials: true, networkAccess: true,
+    });
+    expect(bound).toMatchObject({
+      GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "safe.directory", GIT_CONFIG_VALUE_0: "/paperclip/vaults/tsp",
+      GH_TOKEN: "bound", GH_CONFIG_DIR: "/bound/gh",
+    });
+
+    const unbound = await prepareGitHubExecutionEnvironment({ target: null, cwd, env: {}, hostCredentials: true, networkAccess: true });
+    expect(unbound.GH_TOKEN).toBeUndefined();
+    expect(unbound.GH_CONFIG_DIR).toBeUndefined();
+    expect(unbound.GIT_CONFIG_COUNT).toBe("1");
+
+    const managed = await prepareGitHubExecutionEnvironment({ target: null, cwd, env: {}, hostCredentials: false, networkAccess: true });
+    expect(managed.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(managed.GH_TOKEN).toBeUndefined();
+  });
+
+  it("credential helper and gh wrapper survive host-mode local discovery (fold 2c D4, I4/I5)", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-host-discovery-gates-")); roots.push(root);
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("GIT_CONFIG_COUNT", "1");
+    vi.stubEnv("GIT_CONFIG_KEY_0", "safe.directory");
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "/paperclip/vaults/tsp");
+    vi.stubEnv("GH_TOKEN", "server");
+    const repo = path.join(root, "repo");
+    await exec("git", ["init", repo]);
+    const scratch = path.join(root, "scratch");
+    const fakeGhDir = path.join(root, "gh-bin");
+    await mkdir(scratch);
+    await mkdir(fakeGhDir);
+    await writeFile(path.join(fakeGhDir, "gh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    const hostEnv = await prepareGitHubExecutionEnvironment({ target: null, cwd: repo, env: {}, hostCredentials: true, networkAccess: true });
+    const env: Record<string, string> = { ...hostEnv, PAPERCLIP_RUN_SCRATCH_DIR: scratch };
+    applyPaperclipGitHubCredentialHelperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on" }, moduleDir: root, existsSync: () => true,
+    });
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: root,
+      // Must include the real PATH, or the real git exec below cannot find git.
+      basePath: `${fakeGhDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      existsSync: (candidate) => candidate.endsWith("paperclip-gh-wrapper.sh") || existsSync(candidate),
+    });
+
+    expect(env).toMatchObject({
+      GIT_CONFIG_COUNT: "4",
+      GIT_CONFIG_KEY_0: "safe.directory",
+      GIT_CONFIG_KEY_1: "credential.helper",
+      GIT_CONFIG_VALUE_1: "",
+      GIT_CONFIG_KEY_2: "credential.https://github.com.helper",
+      GIT_CONFIG_KEY_3: "credential.https://www.github.com.helper",
+      GIT_TERMINAL_PROMPT: "0",
+      PAPERCLIP_GH_REAL: path.join(fakeGhDir, "gh"),
+      PAPERCLIP_GITHUB_AUTH_MODE: "host",
+    });
+    expect(env.PATH!.split(path.delimiter)[0]).toBe(path.join(scratch, "bin"));
+    expect(env.GH_TOKEN).toBeUndefined();
+    expect(env.GH_CONFIG_DIR).toBeUndefined();
+
+    const helper = await exec("git", ["config", "--get-all", "credential.https://github.com.helper"], { cwd: repo, env: { ...process.env, ...env } });
+    expect(helper.stdout.trim()).toBe(env.GIT_CONFIG_VALUE_2);
+    const safeDirectory = await exec("git", ["config", "--get-all", "safe.directory"], { cwd: repo, env: { ...process.env, ...env } });
+    expect(safeDirectory.stdout).toContain("/paperclip/vaults/tsp");
   });
 
   it("local probe child does not inherit control-plane secrets (fold 2c D3b)", async () => {
