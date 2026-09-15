@@ -803,13 +803,32 @@ describe("openapi auth parity (SUP-14798)", () => {
     expect(hasAgentBearerAuth(route), `${route} must not offer AgentBearerAuth`).toBe(false);
     expect(op?.security, `${route} security`).toEqual(BOARD_SECURITY);
 
-    // The advertised board-only requirement matches what the handler enforces: a
-    // non-board actor is rejected with 403 before any generation runs.
+    // The advertised board-only requirement must match what the handler enforces.
+    // Bind to the generate route's registration block (not the whole file), so the
+    // test fails if the route stops invoking its board-only guard.
+    const block = authRouteBlocks.get(route);
+    expect(
+      block,
+      `${route}: could not locate its route registration in server/src/routes (cannot bind guard)`,
+    ).toBeDefined();
+    expect(
+      block?.text,
+      `${route}: handler must invoke the board-only guard assertCanGenerateSummary inline`,
+    ).toMatch(/assertCanGenerateSummary\s*\(\s*req\s*,\s*companyId\s*\)/);
+
+    // …and the guard it invokes must itself be board-only: it rejects any
+    // non-board actor with 403 before generation runs.
     const source = fs.readFileSync(path.join(ROUTES_DIR, "summary-slots.ts"), "utf8");
-    expect(source, "handler must still enforce the board-only guard").toMatch(
-      /req\.actor\.type\s*!==\s*["'`]board["'`]/,
-    );
-    expect(source).toContain("Only board operators can generate summaries.");
+    const guardBody = source.match(/async function assertCanGenerateSummary\b[\s\S]*?\n  \}/)?.[0];
+    expect(
+      guardBody,
+      "assertCanGenerateSummary helper not found in summary-slots.ts",
+    ).toBeDefined();
+    expect(
+      guardBody,
+      "assertCanGenerateSummary must reject a non-board actor with 403",
+    ).toMatch(/req\.actor\.type\s*!==\s*["'`]board["'`]/);
+    expect(guardBody).toContain("Only board operators can generate summaries.");
   });
 
   it("registers the previously-duplicated stalled-review-decision path exactly once", () => {
