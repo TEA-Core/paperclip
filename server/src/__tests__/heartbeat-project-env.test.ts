@@ -581,6 +581,37 @@ describe("resolveExecutionRunAdapterConfig", () => {
     });
   });
 
+  // TEA-Core fork (fold 2c D5/D6): pins why executeRun passes the PAT binding only in host mode
+  // (`pushCredentialBindingRequired && useHostGitHub`): managed stripping removes the bound
+  // GH_TOKEN/GITHUB_TOKEN and, with the projection gone, nothing else can satisfy it.
+  it("a managed execution cannot satisfy the push credential binding without a projection (fold 2c D5/D6)", async () => {
+    const secretsSvc = {
+      resolveAdapterConfigForRuntime: vi.fn(),
+      resolveEnvBindings: vi.fn(),
+      collectMissingRuntimeBindings: vi.fn().mockResolvedValue([]),
+    };
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      projectId: "project-1",
+      managedGitHubCredentials: true,
+      executionRunConfig: { env: { GH_TOKEN: "pat" } },
+      projectEnv: { GITHUB_TOKEN: "pat" },
+      requiredScopedEnvBinding: {
+        keys: ["GH_TOKEN", "GITHUB_TOKEN"],
+        consumerScopes: ["agent", "project"],
+        reason: "push_write_credential_missing",
+        remediation: "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+      },
+      secretsSvc: secretsSvc as any,
+    })).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: { configurationIncomplete: { reason: "push_write_credential_missing" } },
+    });
+    expect(secretsSvc.resolveAdapterConfigForRuntime).not.toHaveBeenCalled();
+  });
+
   it("passes push-capability preflight when a project-scoped GitHub credential is configured", async () => {
     const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
       config: { env: { AGENT_ONLY: "agent-only" } },

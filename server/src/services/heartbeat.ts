@@ -164,7 +164,6 @@ import {
   resolveManagedGitHubIdentitySelection,
   describeGitAuthFailure,
   filterResolvedGitHubConnectionsForRun,
-  GIT_CREDENTIAL_TOKEN_ENV_KEY,
   scrubGitCredentialText,
   type GitRemoteAuthProvider,
 } from "./git-credentials.js";
@@ -22799,27 +22798,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterConfig: executionRunConfig,
         flagEnv: process.env, // spawn-env-guard: read-only — only the broker rollout flags are read; nothing reaches a child env
       });
-      // Fork policy: agents run on HOST git credentials. Upstream #12843 projects a
-      // resolved GitHub credential into the run env, and that projection both
-      // overrides GH_TOKEN/GITHUB_TOKEN and clears ambient credential helpers
-      // (GIT_CONFIG credential.helper=). A host-backed run (local or SSH environment)
-      // therefore never gets it; only a sandbox-class environment, which has no host
-      // credentials to clear, receives the projected credential.
-      const githubRunAuthEnvironmentDriver =
-        selectedEnvironmentForConfig?.driver ?? "local";
-      const githubRunAuth =
-        githubRunAuthEnvironmentDriver === "local" ||
-        githubRunAuthEnvironmentDriver === "ssh"
-          ? null
-          : await createGitRemoteAuthProvider(db, agent.companyId, {
-              issueId,
-              heartbeatRunId: run.id,
-              responsibleUserId,
-              agentId: agent.id,
-              environmentDriver: githubRunAuthEnvironmentDriver,
-            })("https://github.com/paperclipai/credential-probe.git");
-      // Fold decision D1: local/SSH runs are always host unless PAPERCLIP_GITHUB_MANAGED_EXECUTION=on,
+      // Fork policy (slice 2b; fold 2c D1/D6): agents run on HOST git credentials.
+      // Local and SSH runs stay in host mode unless PAPERCLIP_GITHUB_MANAGED_EXECUTION=on,
       // whatever the trust preset (settled 2026-09-12: no active low_trust_review work).
+      // They get no run-env GitHub credential projection: a projection overrides
+      // GH_TOKEN/GITHUB_TOKEN and clears ambient credential helpers (GIT_CONFIG
+      // credential.helper=), which would break the fork's credential helper and gh
+      // wrapper wiring (I4/I5). Upstream #13005 removed the projection; sandbox-class
+      // runs take the managed broker launcher below.
       const forkHostGitHub = forkForcesHostGitHub(
         selectedEnvironmentForConfig?.driver ?? "local",
       );
@@ -22861,17 +22847,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           routineEnv: routineEnvContext.env,
           secretsSvc,
           trustPreset,
-          ...(githubRunAuth
-            ? {
-                trustedEnvProjection: githubRunAuth.env,
-                trustedEnvSecretKeys: [
-                  "GH_TOKEN",
-                  "GITHUB_TOKEN",
-                  GIT_CREDENTIAL_TOKEN_ENV_KEY,
-                ],
-              }
-            : {}),
-          requiredScopedEnvBinding: pushCredentialBindingRequired
+          // Fold 2c D5: the PAT binding is a host-mode requirement. A managed run strips
+          // GH_TOKEN/GITHUB_TOKEN bindings and, with no projection (D6), could never satisfy it.
+          requiredScopedEnvBinding: pushCredentialBindingRequired && useHostGitHub
             ? {
                 keys: [...PUSH_CAPABILITY_ENV_KEYS],
                 consumerScopes: ["agent", "project"],

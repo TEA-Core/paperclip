@@ -91,7 +91,8 @@ describe("fold decision D1 call-site guard", () => {
   it("pins production call counts for the GitHub credential and identity surface", () => {
     const expected: Record<string, Record<string, number>> = {
       createGitRemoteAuthProvider: {
-        "services/heartbeat.ts": 5,
+        // D6 removed executeRun's sandbox-only credential probe (5 -> 4).
+        "services/heartbeat.ts": 4,
         "services/execution-workspace-provisioning.ts": 1,
         "services/execution-workspaces.ts": 1,
         "routes/execution-workspaces.ts": 1,
@@ -164,5 +165,33 @@ describe("fold decision D1 call-site guard", () => {
     expect(gitCredentials).not.toContain("managedExecutionEnabled(env) && db");
     // D1-b (operator accepted, amends I2): host mode skips the provider's managed-identity arm.
     expect(gitCredentials).toContain("managedPromise ??= db && !hostGitHub");
+  });
+
+  // Fold decision D6 (+ D5): upstream #13005 removed the run-env GitHub credential projection.
+  // The fork's sandbox-only copy is gone; a clean resurrection by a later fold or rebase fails here.
+  it("executeRun carries no run-env GitHub credential projection and gates the PAT binding on host mode", () => {
+    const heartbeat = sources.get("services/heartbeat.ts")!;
+    expect(heartbeat).not.toContain("credential-probe.git");
+    expect(heartbeat).not.toContain("githubRunAuth");
+    expect(heartbeat.match(/\bGIT_CREDENTIAL_TOKEN_ENV_KEY\b/g)).toBeNull();
+    const start = heartbeat.indexOf("const pushCredentialBindingRequired = requiresPushCredentialBinding({");
+    const end = heartbeat.indexOf("if (secretManifest.length > 0) {", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const slice = heartbeat.slice(start, end);
+    expect(slice.split("resolveExecutionRunAdapterConfig({").length - 1).toBe(1);
+    expect(slice).not.toContain("trustedEnvProjection");
+    expect(slice).not.toContain("createGitRemoteAuthProvider(");
+    expect(slice.split("managedGitHubCredentials: !useHostGitHub").length - 1).toBeLessThanOrEqual(1);
+    expect(slice).toMatch(/requiredScopedEnvBinding:\s*pushCredentialBindingRequired && useHostGitHub/);
+  });
+
+  // Fold decision D7 / invariant I8: the push-remote checkout validation is never waived and was
+  // dropped once by an upstream relocation; it must stay exactly one production call.
+  it("keeps the push-remote checkout validation call exactly once outside __tests__", () => {
+    expect(
+      literalCounts(sources, "await assertPushCapabilityCheckoutValid("),
+      "a change requires re-checking I8 (SUP-15639): the checkout validation must run on every push-capable local run",
+    ).toEqual({ "services/heartbeat.ts": 1 });
   });
 });
