@@ -42,6 +42,14 @@ export function formatRetryReason(reason: string | null | undefined) {
   return RETRY_REASON_LABELS[normalized] ?? normalized.replace(/_/g, " ");
 }
 
+// Failed runs the server can resume from their own session ids. A never-launched dispatch
+// (`dispatch_unlaunched`) is the run shape that used to be reaped as `process_lost`.
+const RESUMABLE_LOST_RUN_ERROR_CODES = new Set(["process_lost", "dispatch_unlaunched"]);
+
+export function isResumableLostRun(run: { status: string; errorCode?: string | null }) {
+  return run.status === "failed" && RESUMABLE_LOST_RUN_ERROR_CODES.has(run.errorCode ?? "");
+}
+
 export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary | null {
   const attempt =
     typeof run.scheduledRetryAttempt === "number" && Number.isFinite(run.scheduledRetryAttempt) && run.scheduledRetryAttempt > 0
