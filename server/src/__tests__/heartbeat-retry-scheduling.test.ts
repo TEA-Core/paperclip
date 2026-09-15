@@ -449,12 +449,27 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     return { companyId, agentId, issueId, runId, now };
   }
 
-  it("bounds interrupted conversations across restarts and concurrent scheduling", async () => {
-    const { companyId, issueId, runId, now } = await seedMaxTurnFixture();
+  // Fork divergence (source-scoped owner wake kept, slice 2c): upstream #13237 (b1efd65ed) expects
+  // exactly three runs because upstream #11961 (f572e0867) deleted
+  // enqueueSourceScopedStrandedRecoveryWake. On upstream, the stranded sweep escalates the exhausted
+  // chain to a recovery action and dispatches nothing. The fork kept that owner wake when it folded
+  // #11961 (merge 1446a58c0: "the fork's manager-ladder wake (`source_scoped_recovery_action`) is
+  // kept for the initial stranded-action route"), and it is still live in this fold. Here the
+  // sweep's "No live execution path (2x attempts)" arm (recovery/service.ts
+  // reconcileStrandedAssignedIssues -> escalateStrandedAssignedIssue) blocks the issue and enqueues
+  // exactly one status_only owner wake for the recovery action. That wake is the fourth run. The D12
+  // same-agent owner-wake suppression (50849af15) does not apply, because it is release-path-only by
+  // operator decision 2026-09-15. The bounded chain itself matches upstream: one child per attempt
+  // across restarts and concurrent scheduling, exhausted after attempt 2. The extra run is
+  // positively identified, so a duplicate retry or a second dispatch still fails this test. Revisit,
+  // and restore upstream's three-run assertion, if the fork drops the source-scoped owner wake.
+  it("Fork divergence (source-scoped owner wake kept, slice 2c): bounds interrupted conversations across restarts and concurrent scheduling", async () => {
+    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture();
     const resultJson = { conversationContinuation: "continue_conversation_v1" };
     await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "server_shutdown_interrupted", resultJson })
       .where(eq(heartbeatRuns.id, runId));
     let predecessor = runId;
+    const retryChainRunIds = [runId];
     for (const attempt of [1, 2]) {
       const restarted = heartbeatService(db);
       const outcomes = await Promise.all([
@@ -466,13 +481,45 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(children).toHaveLength(1);
       expect(children[0]).toMatchObject({ scheduledRetryAttempt: attempt });
       predecessor = children[0]!.id;
+      retryChainRunIds.push(predecessor);
       await db.update(heartbeatRuns).set({ status: "interrupted", finishedAt: now, resultJson })
         .where(eq(heartbeatRuns.id, predecessor));
     }
     expect(await heartbeatService(db).scheduleBoundedRetry(predecessor, { now }))
       .toMatchObject({ outcome: "retry_exhausted" });
     await heartbeatService(db).reconcileStrandedAssignedIssues();
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(3);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(4);
+    const ownerWakeRuns = runs.filter(run => !retryChainRunIds.includes(run.id));
+    expect(ownerWakeRuns).toHaveLength(1);
+    const { issueRecoveryActions } = await import("@paperclipai/db");
+    const recoveryActions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toEqual([
+      expect.objectContaining({ kind: "stranded_assigned_issue", ownerType: "agent", ownerAgentId: agentId }),
+    ]);
+    const recoveryActionId = recoveryActions[0]!.id;
+    expect(ownerWakeRuns[0]).toMatchObject({
+      agentId,
+      invocationSource: "assignment",
+      retryOfRunId: null,
+      scheduledRetryAttempt: 0,
+      contextSnapshot: expect.objectContaining({
+        wakeReason: "source_scoped_recovery_action",
+        source: "issue_recovery_action",
+        recoveryActionId,
+        strandedRunId: predecessor,
+        recoveryIntent: "status_only",
+      }),
+    });
+    const ownerWakes = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+    ));
+    expect(ownerWakes).toEqual([expect.objectContaining({
+      id: ownerWakeRuns[0]!.wakeupRequestId,
+      idempotencyKey: `source_scoped_recovery_action:${recoveryActionId}:1`,
+    })]);
     // Exhaustion leaves the task available to a new explicit request.
     const { getExecutionBlocker } = await import("../services/execution-blocker.js");
     expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
