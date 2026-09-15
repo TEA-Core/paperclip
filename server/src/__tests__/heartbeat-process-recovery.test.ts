@@ -3067,6 +3067,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  // A never-launched run registered no child process, so the reaper's process-loss retry gate
+  // (a recorded pid/group, or a lost monitor dispatch) cannot stamp it `retryReason: "process_lost"`.
+  // These pin that: the plain reap queues no process-loss retry, and the monitor reap's retry
+  // records `issue_continuation_needed`.
+  it("never records a process_lost retry reason for a never-launched reap", async () => {
+    const recent = new Date(Date.now() - 60_000);
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      agentStatus: "idle",
+      startedAt: recent,
+      updatedAt: recent,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id === runId)?.errorCode).toBe("dispatch_unlaunched");
+    const retryReasons = runs.map(
+      (row) => (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ?? null,
+    );
+    expect(retryReasons).not.toContain("process_lost");
+  });
+
+  it("records issue_continuation_needed, not process_lost, when a never-launched monitor dispatch is retried", async () => {
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      contextSnapshot: {
+        wakeReason: "issue_monitor_due",
+        nextCheckAt: "2026-03-19T00:00:00.000Z",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const failedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(failedRun?.errorCode).toBe("dispatch_unlaunched");
+
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.retryOfRunId, runId),
+        ),
+      );
+    expect(retries).toHaveLength(1);
+    expect(retries[0]?.contextSnapshot).toMatchObject({
+      wakeReason: "process_lost_retry",
+      retryReason: "issue_continuation_needed",
+    });
+    expect(retries[0]?.contextSnapshot).not.toMatchObject({ retryReason: "process_lost" });
+  });
+
   it("does not reap a healthy dispatch still inside the launch grace", async () => {
     // No child and no lease yet, but only just admitted: still dispatching, not a launch failure.
     const recent = new Date(Date.now() - 5_000);
