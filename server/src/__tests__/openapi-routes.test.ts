@@ -1320,7 +1320,7 @@ function thenBranchHalts(text: string, ifIndex: number): boolean {
     }
     body = text.slice(i, j);
   }
-  const halts = /\bthrow\b/.test(body) || /res\.status\s*\(\s*4/.test(body);
+  const halts = /\bthrow\b/.test(body) || /res\s*\.status\s*\(\s*4/.test(body);
   const noNestedControlFlow = !/\b(?:if|for|while|switch)\s*\(/.test(body);
   return halts && noNestedControlFlow;
 }
