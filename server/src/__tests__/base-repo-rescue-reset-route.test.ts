@@ -3,10 +3,11 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * SUP-15614: the sanctioned operator path for a base-repo rescue reset.
- * These tests pin the route wiring: board-only, targetRef resolution, the
- * refusal → 409 mapping, and that every attempt is audit-logged with the
- * repo, prior tip, target and actor. The git invariants themselves are covered
+ * SUP-15614 / SUP-15722: the sanctioned operator path for a base-repo rescue reset.
+ * These tests pin the route wiring: board-only, targetRef resolution, the lease-backed
+ * `resetProjectBaseRepoWithRescue({ repoRoot, baseRef })` call, the refusal → 409
+ * mapping over `BaseRepoRescueResetResult`, and that every attempt is audit-logged
+ * with the repo, prior tip, target and actor. The git invariants themselves are covered
  * by base-repo-rescue-reset.test.ts against a real repo.
  */
 
@@ -126,23 +127,26 @@ describe("POST /projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", ()
 
   it("resets with the workspace defaultRef and audits the operator action", async () => {
     mockReset.mockResolvedValue({
-      reset: true,
+      ok: true,
+      alreadyAtTarget: false,
+      resetToSha: "aaaaaaaaaaaa",
+      previousTip: "bbbbbbbbbbbb",
       rescueRef: "refs/paperclip/rescue/base-repo/x/head",
-      priorTip: "bbbbbbbbbbbb",
-      targetRef: "origin/main",
-      targetSha: "aaaaaaaaaaaa",
-      refused: null,
-      warnings: [],
+      aheadCount: 2,
+      warning: null,
     });
     const app = await createApp(BOARD);
     const res = await request(app).post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset");
 
     expect(res.status).toBe(200);
-    expect(res.body.reset).toBe(true);
+    expect(res.body.alreadyAtTarget).toBe(false);
+    expect(res.body.resetToSha).toBe("aaaaaaaaaaaa");
+    expect(res.body.previousTip).toBe("bbbbbbbbbbbb");
     expect(res.body.rescueRef).toBe("refs/paperclip/rescue/base-repo/x/head");
+    // SUP-15722 lease-backed contract: the destructive primitive is keyed by baseRef.
     expect(mockReset).toHaveBeenCalledWith({
       repoRoot: "/srv/projects/paperclip",
-      targetRef: "origin/main",
+      baseRef: "origin/main",
     });
     // F3: two-phase audit — attempt before mutation, result after.
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
@@ -171,38 +175,46 @@ describe("POST /projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", ()
     expect(mockLogActivity.mock.calls[1][1].details).toMatchObject({
       repo: "/srv/projects/paperclip",
       targetRef: "origin/main",
-      targetSha: "aaaaaaaaaaaa",
-      priorTip: "bbbbbbbbbbbb",
+      ok: true,
+      alreadyAtTarget: false,
+      resetToSha: "aaaaaaaaaaaa",
+      previousTip: "bbbbbbbbbbbb",
       rescueRef: "refs/paperclip/rescue/base-repo/x/head",
-      reset: true,
       phase: "result",
     });
   });
 
   it("honours an explicit targetRef from the body over defaultRef", async () => {
-    mockReset.mockResolvedValue({ reset: true, rescueRef: null, priorTip: "bbbb", targetRef: "v1.2.3", targetSha: "aaaa", refused: null, warnings: [] });
+    mockReset.mockResolvedValue({ ok: true, alreadyAtTarget: false, resetToSha: "aaaa", previousTip: "bbbb", rescueRef: null, aheadCount: 1, warning: null });
     const app = await createApp(BOARD);
     const res = await request(app)
       .post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset")
       .send({ targetRef: "v1.2.3" });
     expect(res.status).toBe(200);
-    expect(mockReset).toHaveBeenCalledWith({ repoRoot: "/srv/projects/paperclip", targetRef: "v1.2.3" });
+    expect(mockReset).toHaveBeenCalledWith({ repoRoot: "/srv/projects/paperclip", baseRef: "v1.2.3" });
   });
 
   it("maps a refusal to 409 and still records the attempt", async () => {
-    mockReset.mockResolvedValue({ reset: false, rescueRef: null, priorTip: null, targetRef: "origin/main", targetSha: null, refused: "base repo has 2 uncommitted tracked change(s) and 0 unmerged path(s); refusing reset to avoid data loss", warnings: [] });
+    mockReset.mockResolvedValue({
+      ok: false,
+      reason: "dirty_or_unmerged",
+      detail:
+        "Base repository at /srv/projects/paperclip has 2 modified tracked path(s) and 0 unmerged path(s); a reset --hard would discard uncommitted work, so the reset was refused and nothing was moved.",
+    });
     const app = await createApp(BOARD);
     const res = await request(app).post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset");
     expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/uncommitted tracked change/);
+    expect(res.body.error).toMatch(/uncommitted work/);
+    expect(res.body.reason).toBe("dirty_or_unmerged");
     // F3: both phases are recorded even on refusal.
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
     expect(mockLogActivity.mock.calls[0][1].details.phase).toBe("attempt");
     expect(mockLogActivity.mock.calls[1][1].details.phase).toBe("result");
+    expect(mockLogActivity.mock.calls[1][1].details.reason).toBe("dirty_or_unmerged");
   });
 
   it("is board-only: an agent key gets 403", async () => {
-    mockReset.mockResolvedValue({ reset: true, rescueRef: null, priorTip: null, targetRef: "x", targetSha: null, refused: null, warnings: [] });
+    mockReset.mockResolvedValue({ ok: true, alreadyAtTarget: false, resetToSha: "x", previousTip: null, rescueRef: null, aheadCount: 0, warning: null });
     const app = await createApp(AGENT);
     const res = await request(app).post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset");
     expect(res.status).toBe(403);
@@ -234,7 +246,7 @@ describe("POST /projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", ()
   });
 
   it("F6: 400 when targetRef is not a string", async () => {
-    mockReset.mockResolvedValue({ reset: true, rescueRef: null, priorTip: null, targetRef: "x", targetSha: null, refused: null, warnings: [] });
+    mockReset.mockResolvedValue({ ok: true, alreadyAtTarget: false, resetToSha: "x", previousTip: null, rescueRef: null, aheadCount: 0, warning: null });
     const app = await createApp(BOARD);
     const res = await request(app)
       .post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset")
