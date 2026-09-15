@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeRunRetryState, formatRetryReason } from "./runRetryState";
+import { describeRunRetryState, formatRetryReason, isResumableLostRun } from "./runRetryState";
 
 describe("runRetryState", () => {
   it("formats internal retry reasons for operators", () => {
@@ -56,5 +56,15 @@ describe("runRetryState", () => {
       detail: "Attempt 4 · Transient failure · Automatic retries exhausted",
       secondary: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued Manual intervention required.",
     });
+  });
+
+  // A never-launched dispatch used to be reaped as process_lost, and the server resumes it
+  // the same way (from the run's session-before id), so it keeps the Resume action.
+  it("offers resume for failed lost and never-launched runs only", () => {
+    expect(isResumableLostRun({ status: "failed", errorCode: "process_lost" })).toBe(true);
+    expect(isResumableLostRun({ status: "failed", errorCode: "dispatch_unlaunched" })).toBe(true);
+    expect(isResumableLostRun({ status: "running", errorCode: "dispatch_unlaunched" })).toBe(false);
+    expect(isResumableLostRun({ status: "failed", errorCode: "adapter_failed" })).toBe(false);
+    expect(isResumableLostRun({ status: "failed", errorCode: null })).toBe(false);
   });
 });

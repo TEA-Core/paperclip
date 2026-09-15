@@ -61,7 +61,7 @@ import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-
 import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { cn } from "../lib/utils";
-import { describeRunRetryState } from "../lib/runRetryState";
+import { describeRunRetryState, isResumableLostRun } from "../lib/runRetryState";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs } from "@/components/ui/tabs";
@@ -3264,7 +3264,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId, run.agentId) });
     },
   });
-  const canResumeLostRun = run.errorCode === "process_lost" && run.status === "failed";
+  const canResumeLostRun = isResumableLostRun(run);
   const resumePayload = useMemo(() => {
     const payload: Record<string, unknown> = {
       resumeFromRunId: run.id,

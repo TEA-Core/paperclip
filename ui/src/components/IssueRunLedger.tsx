@@ -327,6 +327,7 @@ function stopReasonLabel(run: RunForIssue) {
   if (stopReason === "cancelled") return "cancelled";
   if (stopReason === "paused") return "paused by board";
   if (stopReason === "process_lost") return "process lost";
+  if (stopReason === "dispatch_unlaunched") return "dispatch never launched";
   if (stopReason === "unmanaged_background_task_stopped")
     return "unmanaged background task stopped";
   if (stopReason === "adapter_failed") return "adapter failed";

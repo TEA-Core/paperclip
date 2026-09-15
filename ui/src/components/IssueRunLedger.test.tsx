@@ -386,6 +386,11 @@ describe("IssueRunLedger", () => {
           resultJson: { stopReason: "paused" },
           createdAt: "2026-04-18T19:55:00.000Z",
         }),
+        createRun({
+          runId: "run-dispatch-unlaunched",
+          resultJson: { stopReason: "dispatch_unlaunched" },
+          createdAt: "2026-04-18T19:54:30.000Z",
+        }),
       ],
     });
 
@@ -394,6 +399,7 @@ describe("IssueRunLedger", () => {
     expect(container.textContent).toContain("budget paused");
     expect(container.textContent).toContain("unmanaged background task stopped");
     expect(container.textContent).toContain("paused by board");
+    expect(container.textContent).toContain("Stop dispatch never launched");
   });
 
   it("surfaces active and completed child issue summaries", () => {
