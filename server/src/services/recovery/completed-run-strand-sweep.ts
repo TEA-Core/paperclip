@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
+import { isChatDrivenWake } from "./successful-run-handoff.js";
 import {
   buildStrandedRecoveryEscalationNotice,
   type StrandedRecoveryNoticeSeed,
@@ -28,6 +29,10 @@ import {
 //     status (`succeeded` — the API displays this as `completed`) — a `failed`
 //     run is the host-restart sweep's domain, and `cancelled`/`interrupted`/
 //     `timed_out`/`running` did not finish on the success path;
+//   - not a chat conversation turn: a `chat_channel` card whose latest run was a
+//     correlated chat wake is waiting on the next chat message, not stranded
+//     (fold 2c: the same predicate the successful-run handoff treats as a valid
+//     path, "chat conversation already owns the next action");
 //   - idle: now - run anchor >= idle threshold (default 30 min);
 //   - not already escalated for this run.
 //
@@ -54,6 +59,7 @@ export interface CompletedRunStrandCandidate {
   status: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  originKind?: string | null;
 }
 
 export interface CompletedRunStrandLatestRun {
@@ -64,18 +70,21 @@ export interface CompletedRunStrandLatestRun {
   finishedAt: Date | null;
   updatedAt: Date | null;
   createdAt: Date | null;
+  contextSnapshot?: Record<string, unknown> | null;
 }
 
 export interface CompletedRunStrandFacts {
   hasLiveRun: boolean;
   latestRun: CompletedRunStrandLatestRun | null;
   alreadyEscalated: boolean;
+  chatConversationOwnsNextAction?: boolean;
 }
 
 export type CompletedRunStrandDecision =
   | { action: "skip-not-scope" }
   | { action: "skip-live" }
   | { action: "skip-run-not-completed" }
+  | { action: "skip-chat-conversation" }
   | { action: "skip-already-escalated" }
   | { action: "skip-within-threshold" }
   | { action: "escalate" };
@@ -123,6 +132,7 @@ export function decideCompletedRunStrandEscalation(input: {
   hasLiveRun: boolean;
   alreadyEscalated: boolean;
   latestRun: CompletedRunStrandLatestRun | null;
+  chatConversationOwnsNextAction?: boolean;
   now: Date;
   idleThresholdMs: number;
 }): CompletedRunStrandDecision {
@@ -133,6 +143,8 @@ export function decideCompletedRunStrandEscalation(input: {
   if (!input.latestRun || !isCompletedRunStatus(input.latestRun.status)) {
     return { action: "skip-run-not-completed" };
   }
+  // Fold 2c: a chat conversation card idles in_progress between turns by design.
+  if (input.chatConversationOwnsNextAction) return { action: "skip-chat-conversation" };
   // Idempotency guard: a system notice already keyed to this run means a prior
   // pass handled the card. Never double-post.
   if (input.alreadyEscalated) return { action: "skip-already-escalated" };
@@ -193,6 +205,7 @@ export interface CompletedRunStrandSkip {
   notScope: string[];
   liveRun: string[];
   runNotCompleted: string[];
+  chatConversation: string[];
   alreadyEscalated: string[];
   withinThreshold: string[];
   capExceeded: string[];
@@ -224,6 +237,7 @@ export function planCompletedRunStrandEscalations(input: {
     notScope: [],
     liveRun: [],
     runNotCompleted: [],
+    chatConversation: [],
     alreadyEscalated: [],
     withinThreshold: [],
     capExceeded: [],
@@ -240,6 +254,7 @@ export function planCompletedRunStrandEscalations(input: {
       hasLiveRun: facts.hasLiveRun,
       alreadyEscalated: facts.alreadyEscalated,
       latestRun: facts.latestRun,
+      chatConversationOwnsNextAction: facts.chatConversationOwnsNextAction,
       now: input.now,
       idleThresholdMs: input.idleThresholdMs,
     });
@@ -253,6 +268,9 @@ export function planCompletedRunStrandEscalations(input: {
         continue;
       case "skip-run-not-completed":
         skipped.runNotCompleted.push(candidate.id);
+        continue;
+      case "skip-chat-conversation":
+        skipped.chatConversation.push(candidate.id);
         continue;
       case "skip-already-escalated":
         skipped.alreadyEscalated.push(candidate.id);
@@ -310,6 +328,7 @@ function emptySkipped(): CompletedRunStrandSkip {
     notScope: [],
     liveRun: [],
     runNotCompleted: [],
+    chatConversation: [],
     alreadyEscalated: [],
     withinThreshold: [],
     capExceeded: [],
@@ -455,6 +474,7 @@ export async function sweepCompletedRunStrandedIssues(
       status: issues.status,
       assigneeAgentId: issues.assigneeAgentId,
       assigneeUserId: issues.assigneeUserId,
+      originKind: issues.originKind,
     })
     .from(issues)
     .where(candidateWhere(input.companyId ?? null))
@@ -481,6 +501,7 @@ export async function sweepCompletedRunStrandedIssues(
         finishedAt: heartbeatRuns.finishedAt,
         updatedAt: heartbeatRuns.updatedAt,
         createdAt: heartbeatRuns.createdAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
       .where(issueRunCondition(candidate.companyId, candidate.id))
@@ -497,6 +518,7 @@ export async function sweepCompletedRunStrandedIssues(
           finishedAt: latestRunRow.finishedAt ?? null,
           updatedAt: latestRunRow.updatedAt ?? null,
           createdAt: latestRunRow.createdAt ?? null,
+          contextSnapshot: latestRunRow.contextSnapshot ?? null,
         }
       : null;
 
@@ -515,7 +537,14 @@ export async function sweepCompletedRunStrandedIssues(
           .then((rows) => rows.length > 0)
       : false;
 
-    facts.set(candidate.id, { hasLiveRun: liveRun, latestRun, alreadyEscalated });
+    const chatConversationOwnsNextAction = latestRun
+      ? isChatDrivenWake(
+          { contextSnapshot: latestRun.contextSnapshot ?? null },
+          { originKind: candidate.originKind ?? null },
+        )
+      : false;
+
+    facts.set(candidate.id, { hasLiveRun: liveRun, latestRun, alreadyEscalated, chatConversationOwnsNextAction });
   }
 
   const plan = planCompletedRunStrandEscalations({ candidates, facts, now, idleThresholdMs, cap });

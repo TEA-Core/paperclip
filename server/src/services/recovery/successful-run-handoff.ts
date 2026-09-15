@@ -417,7 +417,12 @@ export function selectSuccessfulRunProgressSummary(input: {
   ].find((candidate): candidate is string => Boolean(candidate)) ?? null;
 }
 
-function isChatDrivenWake(run: HeartbeatRunRow, issue: IssueRow) {
+// Exported for the fork completed-run strand sweep (#695), which must honour the
+// same chat-conversation ownership this handoff decision treats as a valid path.
+export function isChatDrivenWake(
+  run: Pick<HeartbeatRunRow, "contextSnapshot">,
+  issue: { originKind?: string | null },
+) {
   if (issue.originKind !== "chat_channel") return false;
   const context = readRecord(run.contextSnapshot);
   const source = readString(context.source);
