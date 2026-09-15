@@ -1555,8 +1555,8 @@ describe("execute — GitHub App run-env gates (SUP-14869)", () => {
     expect(env.PATH?.startsWith(`${path.join(scratchDir, "bin")}${path.delimiter}`)).toBe(true);
     expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
     expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
-    expect(env.GH_CONFIG_DIR).toBeUndefined();
-    // gh is isolated in this lane by the per-call opencode config home, not by GH_CONFIG_DIR.
+    // D4b: the gh wrapper gate gives the run its own gh config dir.
+    expect(env.GH_CONFIG_DIR).toBe(path.join(scratchDir, "gh-config"));
     expect(env.XDG_CONFIG_HOME).toEqual(expect.any(String));
   });
 

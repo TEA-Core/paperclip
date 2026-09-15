@@ -8376,7 +8376,52 @@ describe("acpx-engine — GitHub App run-env gates (SUP-14869)", () => {
     expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
     expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
     expect(env.GH_TOKEN).toBeUndefined();
-    expect(env.GH_CONFIG_DIR).toBeUndefined();
+    // D4b: the gh wrapper gate gives the run its own gh config dir.
+    expect(env.GH_CONFIG_DIR).toBe(path.join(scratchDir, "gh-config"));
+  });
+
+  it("keeps the per-run GH_CONFIG_DIR out of the session fingerprint while each run gets its own (fold 2c D4b)", async () => {
+    process.env.PAPERCLIP_AGENT_GH_WRAPPER = "on";
+    process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const otherScratch = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acpx-gh-scratch-other-"));
+    try {
+      const run = async (dir: string) => {
+        const outcome = await runExecutor(
+          {
+            agentCommand: "node ./fake-acp.js",
+            stateDir,
+            env: {
+              ...hostProbeEnv(dir),
+              PAPERCLIP_TASK_SCRATCH_DIR: dir,
+              PAPERCLIP_SCRATCH_DIR: dir,
+              PAPERCLIP_TMPDIR: dir,
+            },
+          },
+          {
+            context: {
+              taskId: "issue-1",
+              wakeReason: "issue_assigned",
+              paperclipScratch: { type: "heartbeat_run", dir, tempKeysApplied: [] },
+            },
+          },
+        );
+        const env = (outcome.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+        return {
+          fingerprint: (outcome.result.sessionParams as { configFingerprint?: string } | undefined)?.configFingerprint,
+          ghConfigDir: env.GH_CONFIG_DIR,
+        };
+      };
+      const first = await run(scratchDir);
+      const second = await run(otherScratch);
+      expect(first.ghConfigDir).toBe(path.join(scratchDir, "gh-config"));
+      expect(second.ghConfigDir).toBe(path.join(otherScratch, "gh-config"));
+      expect(first.fingerprint).toBeDefined();
+      expect(second.fingerprint).toBe(first.fingerprint);
+    } finally {
+      await fs.rm(otherScratch, { recursive: true, force: true });
+    }
   });
 
   it("keeps a server GH_TOKEN out of the ACP child env in host mode (fold 2c D4, I9)", async () => {

@@ -1,7 +1,7 @@
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, existsSync, mkdirSync, rmSync, symlinkSync, promises as fs, type Dirent } from "node:fs";
+import { chmodSync, constants as fsConstants, existsSync, mkdirSync, rmSync, symlinkSync, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
@@ -3485,6 +3485,11 @@ function resolveRealGhFromPath(
  *     traversable), `PAPERCLIP_GH_REAL` is set to the real binary, and
  *     `<scratch>/bin` is prepended to `env.PATH`. The scratch dir is removed by
  *     run teardown, so the shim is cleaned up with the run.
+ *   - TEA-Core fork (fold 2c D4b): unless a binding already set it, `GH_CONFIG_DIR`
+ *     points at a run-owned, group-writable `<scratch>/gh-config`, so gh stops
+ *     sharing the server's `$HOME/.config/gh` across agents. Callers apply this
+ *     gate after computing their session hash inputs, so the per-run path never
+ *     enters a session fingerprint.
  */
 export function applyPaperclipGhWrapperGate(
   env: Record<string, string>,
@@ -3549,6 +3554,22 @@ export function applyPaperclipGhWrapperGate(
   }
 
   env.PAPERCLIP_GH_REAL = realGh;
+  // TEA-Core fork (fold 2c D4b): a run-owned gh config dir unless a binding set one. Without it gh
+  // in the ACP and process lanes falls back to $HOME/.config/gh, shared by every agent. The ACP
+  // lane applies this gate after its adapterEnvHash loop, so GH_CONFIG_DIR never enters that hash.
+  if (!env.GH_CONFIG_DIR?.trim()) {
+    const ghConfigDir = path.join(scratchDir, "gh-config");
+    try {
+      mkdirSync(ghConfigDir, { recursive: true, mode: 0o775 });
+      // Defeat the umask; setgid keeps the scratch dir's shared group for uid-split writes.
+      chmodSync(ghConfigDir, 0o2775);
+      env.GH_CONFIG_DIR = ghConfigDir;
+    } catch {
+      input.onWarn?.(
+        "PAPERCLIP_AGENT_GH_WRAPPER is on but the run gh config dir could not be created; gh uses its default config dir.",
+      );
+    }
+  }
   const priorPath = env.PATH || input.basePath;
   env.PATH = [binDir, priorPath].filter(Boolean).join(path.delimiter);
   return env;

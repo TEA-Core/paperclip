@@ -5017,6 +5017,49 @@ describe("applyPaperclipGhWrapperGate (GH-APP-7)", () => {
     ).toBeNull();
   });
 
+  it("AC2b (fold 2c D4b): sets a run-owned, group-writable GH_CONFIG_DIR under the scratch dir, one per run", async () => {
+    const gateInput = {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p: string) => p === serverDistWrapper || p === fakeGhPath,
+    };
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    applyPaperclipGhWrapperGate(env, gateInput);
+
+    const ghConfigDir = path.join(scratchDir, "gh-config");
+    expect(env.GH_CONFIG_DIR).toBe(ghConfigDir);
+    const stat = await fs.stat(ghConfigDir);
+    expect(stat.isDirectory()).toBe(true);
+    expect(stat.mode & 0o070).toBe(0o070);
+    // The wrapper itself is still wired.
+    expect(env.PATH?.split(path.delimiter)[0]).toBe(path.join(scratchDir, "bin"));
+    expect(env.PAPERCLIP_GH_REAL).toBe(fakeGhPath);
+
+    const otherScratch = await fs.mkdtemp(path.join(os.tmpdir(), "pc-gh-wrapper-scratch-other-"));
+    try {
+      const other: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: otherScratch };
+      applyPaperclipGhWrapperGate(other, gateInput);
+      expect(other.GH_CONFIG_DIR).toBe(path.join(otherScratch, "gh-config"));
+      expect(other.GH_CONFIG_DIR).not.toBe(env.GH_CONFIG_DIR);
+    } finally {
+      await fs.rm(otherScratch, { recursive: true, force: true });
+    }
+  });
+
+  it("AC2b (fold 2c D4b): leaves a bound GH_CONFIG_DIR alone and creates no gh-config dir", () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir, GH_CONFIG_DIR: "/bound/gh" };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    expect(env.GH_CONFIG_DIR).toBe("/bound/gh");
+    expect(fsExistsSync(path.join(scratchDir, "gh-config"))).toBe(false);
+    expect(env.PAPERCLIP_GH_REAL).toBe(fakeGhPath);
+  });
+
   it("ships the gh wrapper from a committed source of truth at scripts/", async () => {
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
     const repoScript = path.join(repoRoot, "scripts", PAPERCLIP_GH_WRAPPER_FILENAME);

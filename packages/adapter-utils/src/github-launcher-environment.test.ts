@@ -245,7 +245,8 @@ describe("managed GitHub launcher environment", () => {
     });
     expect(env.PATH!.split(path.delimiter)[0]).toBe(path.join(scratch, "bin"));
     expect(env.GH_TOKEN).toBeUndefined();
-    expect(env.GH_CONFIG_DIR).toBeUndefined();
+    // D4 drops the server's GH_CONFIG_DIR; D4b gives the run its own under the scratch dir.
+    expect(env.GH_CONFIG_DIR).toBe(path.join(scratch, "gh-config"));
 
     const helper = await exec("git", ["config", "--get-all", "credential.https://github.com.helper"], { cwd: repo, env: { ...process.env, ...env } });
     expect(helper.stdout.trim()).toBe(env.GIT_CONFIG_VALUE_2);
