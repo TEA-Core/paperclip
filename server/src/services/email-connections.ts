@@ -13,7 +13,12 @@ import { badRequest, forbidden, notFound } from "../errors.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 import { agentmailApi } from "./agentmail-api.js";
-import { logActivity } from "./activity-log.js";
+// Fold 2c / SUP-9856 (fork audit contract since 77ad35d95): the fork's `logActivity` is
+// best-effort and swallows failures, which is only right after a commit. Audits written inside a
+// transaction use the propagating `logActivityInTransaction` so a failed audit rolls the mutation
+// back instead of committing it unaudited; upstream's single `logActivity` already propagates.
+// Sites are marked "Fold 2c / SUP-9856". Revisit if the fork drops the two-variant split.
+import { logActivityInTransaction } from "./activity-log.js";
 import type { EmailActor } from "./email-channels.js";
 
 export function emailConnectionService(
@@ -241,7 +246,8 @@ export function emailConnectionService(
           actorSource: actor.localImplicit ? "local_implicit" : "session",
         },
       );
-      await logActivity(db, {
+      // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+      await logActivityInTransaction(db, {
         companyId,
         actorType: "user",
         actorId: actor.userId ?? "board",
@@ -304,7 +310,8 @@ export function emailConnectionService(
           actorSource: actor.localImplicit ? "local_implicit" : "session",
         },
       );
-      await logActivity(db, {
+      // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+      await logActivityInTransaction(db, {
         companyId,
         actorType: "user",
         actorId: actor.userId ?? "board",

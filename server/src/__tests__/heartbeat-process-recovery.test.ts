@@ -16278,6 +16278,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(1);
   });
 
+  it("rolls back the native blocked wait when its audit write fails", async () => {
+    // Fold 2c / SUP-9856: repairNativeBlockedWait audits inside its transaction. The fault is not a
+    // query error, so a swallowing (best-effort) logger would commit the repair unaudited.
+    const { companyId, issueId } = await seedNativeBlockedBoardRequest();
+    const before = await db.select().from(issues).where(eq(issues.id, issueId));
+    const failure = new Error("native_blocked_wait_audit_fault");
+    const transaction = db.transaction.bind(db);
+    let sawAudit = false;
+    const transactionSpy = vi
+      .spyOn(db, "transaction")
+      .mockImplementation((callback, config) =>
+        transaction(async (tx) => {
+          const insert = tx.insert.bind(tx);
+          const insertSpy = vi
+            .spyOn(tx, "insert")
+            .mockImplementation((table) => {
+              const builder = insert(table);
+              if (table !== activityLog) return builder;
+              const values = builder.values.bind(builder);
+              return Object.assign(builder, {
+                values: (row: Parameters<typeof values>[0]) => {
+                  const source = (row as { details?: { source?: unknown } })
+                    .details?.source;
+                  if (source === "recovery.native_blocked_wait") {
+                    sawAudit = true;
+                    throw failure;
+                  }
+                  return values(row);
+                },
+              });
+            });
+          try {
+            return await callback(tx);
+          } finally {
+            insertSpy.mockRestore();
+          }
+        }, config),
+      );
+    try {
+      await expect(
+        heartbeatService(db).reconcileStrandedAssignedIssues(),
+      ).rejects.toBe(failure);
+    } finally {
+      transactionSpy.mockRestore();
+    }
+    expect(sawAudit).toBe(true);
+    expect(
+      await db.select().from(issues).where(eq(issues.id, issueId)),
+    ).toEqual(before);
+    expect(
+      await db
+        .select()
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, issueId),
+            eq(issueComments.authorType, "system"),
+          ),
+        ),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            sql`${activityLog.details}->>'source' = 'recovery.native_blocked_wait'`,
+          ),
+        ),
+    ).toHaveLength(0);
+  });
+
   it("allows one productive-terminal recovery after regular continuation recovery made progress", async () => {
     const { agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",

@@ -79,8 +79,14 @@ import {
 } from "../local-service-supervisor.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
+// Fold 2c / SUP-9856 (fork audit contract since 77ad35d95): the fork's `logActivity` is
+// best-effort and swallows failures, which is only right after a commit. Audits written inside a
+// transaction use the propagating `logActivityInTransaction` so a failed audit rolls the mutation
+// back instead of committing it unaudited; upstream's single `logActivity` already propagates.
+// Sites are marked "Fold 2c / SUP-9856". Revisit if the fork drops the two-variant split.
 import {
   logActivity,
+  logActivityInTransaction,
   publishActivity,
   redactActivityDetails,
   type ActivityPublication,
@@ -1993,7 +1999,8 @@ export function recoveryService(
         },
         tx,
       );
-      await logActivity(
+      // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+      await logActivityInTransaction(
         tx as unknown as Db,
         {
           companyId: current.companyId,

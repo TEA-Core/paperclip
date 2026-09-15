@@ -205,6 +205,11 @@ import type {
   ChatSdkStatePersistence,
   ChatSdkStateScope,
 } from "./chat-sdk-state.js";
+// Fold 2c / SUP-9856 (fork audit contract since 77ad35d95): the fork's `logActivity` is
+// best-effort and swallows failures, which is only right after a commit. Audits written inside a
+// transaction use the propagating `logActivityInTransaction` so a failed audit rolls the mutation
+// back instead of committing it unaudited; upstream's single `logActivity` already propagates.
+// Sites are marked "Fold 2c / SUP-9856". Revisit if the fork drops the two-variant split.
 import {
   logActivity,
   logActivityInTransaction,
@@ -6001,7 +6006,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             .update(chatEndpoints)
             .set(values)
             .where(eq(chatEndpoints.id, endpointId));
-          await logActivity(tx as unknown as Db, {
+          // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: existing.endpoint.companyId,
             actorType: "user",
             actorId: actorUserId ?? "board",
@@ -6846,8 +6852,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           rotated: rotatingConfiguredApp,
           replacedPrevious: replacedExistingSecret,
         };
+        // Fold 2c / SUP-9856: the default logger must propagate. The rotation_started intent
+        // below is the fail-closed audit boundary; the failure-path use keeps its own .catch.
         const writeSetupSecretActivity =
-          options.setupSecretActivityLogger ?? logActivity;
+          options.setupSecretActivityLogger ?? logActivityInTransaction;
         // This durable intent is the audit boundary. If it cannot be written,
         // fail before changing state or refs so retry is safe. Endpoint/tool
         // state moves fail-closed before ref replacement. Once refs change, only
@@ -7600,7 +7608,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               eq(chatEndpoints.id, endpointId),
             ),
           );
-        await logActivity(tx as unknown as Db, {
+        // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: scope.companyId,
           actorType: "system",
           actorId: "system",
@@ -8749,7 +8758,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const auditWebhookSync = async (action: string) => {
           await db.transaction(async (tx) => {
             await credentialLease.assertOwned(tx);
-            await logActivity(tx as unknown as Db, {
+            // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: endpoint.companyId,
               actorType: "user",
               actorId: actorUserId ?? "board",
@@ -8887,7 +8897,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
     await db.transaction(async (tx) => {
       await credentialLease.assertOwned(tx);
-      await logActivity(tx as unknown as Db, {
+      // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: endpoint.companyId,
         actorType: "user",
         actorId: actorUserId ?? "board",
@@ -11869,7 +11880,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         updatedAt: now,
       })
       .returning();
-    await logActivity(tx as Db, {
+    // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+    await logActivityInTransaction(tx as Db, {
       companyId: input.companyId,
       actorType: "user",
       actorId: input.initiatedByUserId,
@@ -18300,7 +18312,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       // now-redundant provider action and must not fabricate a second external
       // resolution event attributed to the board winner.
       if (resolvedByThisProviderAction) {
-        await logActivity(tx as unknown as Db, {
+        // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: issue.companyId,
           actorType: "user",
           actorId: resolvedByUserId,
@@ -19674,7 +19687,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   ),
                 ),
               );
-            await logActivity(tx as unknown as Db, {
+            // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "user",
               actorId: principal.userId!,
@@ -20392,7 +20406,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   ),
                 ),
               );
-            await logActivity(tx as unknown as Db, {
+            // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "user",
               actorId: principal.userId!,
@@ -21795,7 +21810,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             .onConflictDoNothing()
             .returning({ id: chatActions.id });
           if (!inserted.length) throw authorityChanged;
-          await logActivity(tx as unknown as Db, {
+          // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: scope.companyId,
             actorType: authorization.userId ? "user" : "system",
             actorId: authorization.userId ?? `chat:${principal.principal.id}`,
@@ -24828,7 +24844,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             updatedAt: now,
           })
           .where(eq(chatActions.id, current.id));
-        await logActivity(tx as unknown as Db, {
+        // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: current.companyId,
           actorType: actorUserId ? "user" : "system",
           actorId: actorUserId ?? "slack-session-stop",
@@ -25192,7 +25209,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           )
           .returning({ id: chatActions.id });
         if (!settled) return;
-        await logActivity(tx as unknown as Db, {
+        // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: action.companyId,
           actorType: "user",
           actorId: claim.userId,
@@ -25501,7 +25519,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   updatedAt: verifiedAt,
                 })
                 .where(eq(chatEndpoints.id, endpoint.id));
-              await logActivity(tx as unknown as Db, {
+              // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+              await logActivityInTransaction(tx as unknown as Db, {
                 companyId: current.endpoint.companyId,
                 actorType: "system",
                 actorId: "github-webhook",
@@ -27584,7 +27603,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 throw resolutionRequired();
               throw error;
             }
-            await logActivity(tx as unknown as Db, {
+            // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: publication.companyId,
               actorType: "user",
               actorId: userId,
@@ -27787,7 +27807,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               now,
             );
           }
-          await logActivity(tx as unknown as Db, {
+          // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: publication.companyId,
             actorType: "user",
             actorId: userId,
@@ -27931,7 +27952,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 code: "chat_action_resolution_conflict",
               });
             }
-            await logActivity(tx as unknown as Db, {
+            // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: action.companyId,
               actorType: "user",
               actorId: userId,
@@ -28090,7 +28112,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               .set({ lastEventAt: now, updatedAt: now })
               .where(eq(chatEndpoints.id, endpointId));
           }
-          await logActivity(tx as unknown as Db, {
+          // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: action.companyId,
             actorType: "user",
             actorId: userId,
@@ -28220,7 +28243,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   eq(chatActions.status, "delivery_unknown"),
                 ),
               );
-            await logActivity(tx as unknown as Db, {
+            // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: action.companyId,
               actorType: "user",
               actorId: userId,
@@ -28514,7 +28538,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               ),
             )
             .returning();
-          await logActivity(tx as unknown as Db, {
+          // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: current.companyId,
             actorType: "user",
             actorId: userId,
@@ -29010,7 +29035,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         );
         terminalPublication = attachmentPublication;
       }
-      await logActivity(tx as unknown as Db, {
+      // Fold 2c / SUP-9856: in-transaction audit shares the mutation's fate.
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: conversation.companyId,
         actorType: "user",
         actorId: userId,
