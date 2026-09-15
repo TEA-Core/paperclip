@@ -789,6 +789,29 @@ describe("openapi auth parity (SUP-14798)", () => {
     expect(violations, `board-only routes published as agent-callable:\n${violations.join("\n")}`).toEqual([]);
   });
 
+  it("publishes board-only auth for the summary-slots generate route (SUP-16339)", () => {
+    // The generate handler enforces board-only through a named helper
+    // (assertCanGenerateSummary: `if (req.actor.type !== "board") throw
+    // forbidden("Only board operators can generate summaries.")`). That guard is
+    // invisible to the assertBoard-based detector above, so the route would
+    // silently default to board_or_agent + AgentBearerAuth unless pinned here.
+    const route = "POST /api/companies/{companyId}/summary-slots/{scopeKind}/{slotKey}/generate";
+    const [method, routePath] = splitAuthRoute(route);
+    const op = operation(method, routePath);
+    expect(op, `${route} must be present in the OpenAPI document`).toBeDefined();
+    expect(op?.["x-paperclip-authorization"], `${route} actor`).toEqual({ actor: "board" });
+    expect(hasAgentBearerAuth(route), `${route} must not offer AgentBearerAuth`).toBe(false);
+    expect(op?.security, `${route} security`).toEqual(BOARD_SECURITY);
+
+    // The advertised board-only requirement matches what the handler enforces: a
+    // non-board actor is rejected with 403 before any generation runs.
+    const source = fs.readFileSync(path.join(ROUTES_DIR, "summary-slots.ts"), "utf8");
+    expect(source, "handler must still enforce the board-only guard").toMatch(
+      /req\.actor\.type\s*!==\s*["'`]board["'`]/,
+    );
+    expect(source).toContain("Only board operators can generate summaries.");
+  });
+
   it("registers the previously-duplicated stalled-review-decision path exactly once", () => {
     const source = fs.readFileSync(path.join(ROUTES_DIR, "openapi.ts"), "utf8");
     const needle = 'path: "/api/issues/{id}/stalled-review-decision"';

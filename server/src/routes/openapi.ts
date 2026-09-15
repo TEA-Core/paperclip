@@ -1101,6 +1101,11 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/import/transfers/{transferId}",
   "POST /api/companies/import/transfers/{transferId}/preview",
   "POST /api/companies/import/transfers/{transferId}/apply",
+  // SUP-16339: the handler enforces board-only via a named helper
+  // (assertCanGenerateSummary -> `if (req.actor.type !== "board")`), which the
+  // assertBoard-based detector cannot see, so it was silently published as
+  // board_or_agent + AgentBearerAuth. Manual generate is a board/user action.
+  "POST /api/companies/{companyId}/summary-slots/{scopeKind}/{slotKey}/generate",
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
