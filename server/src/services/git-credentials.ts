@@ -37,14 +37,29 @@ export const GIT_CREDENTIAL_TOKEN_ENV_KEY = "PAPERCLIP_GIT_TOKEN";
 /**
  * Opt-in for upstream's managed run-identity GitHub projection (#13005). The fork runs local
  * and SSH lanes in host mode (fold decision D1) with managed execution off (D2 i): the fleet
- * GitHub App broker, not an OAuth account, is what signs the fork's git operations. Until a
- * slice needs sandbox or managed lanes, the run-identity branch stays behind this flag so a
- * half-configured managed connection cannot silently strip host credentials from a run.
+ * GitHub App broker, not an OAuth account, is what signs the fork's git operations. The gate is
+ * driver-aware (`forkForcesHostGitHub`): local and SSH runs stay in host mode behind this flag
+ * so a half-configured managed connection cannot silently strip host credentials from a run,
+ * while sandbox-class drivers keep upstream semantics.
  */
 export const GITHUB_MANAGED_EXECUTION_FLAG = "PAPERCLIP_GITHUB_MANAGED_EXECUTION";
 
 function managedExecutionEnabled(env: NodeJS.ProcessEnv): boolean {
   return env[GITHUB_MANAGED_EXECUTION_FLAG]?.trim().toLowerCase() === "on";
+}
+
+/**
+ * Fold decision D1: local and SSH runs, and an absent driver (which is local), are always host
+ * mode unless PAPERCLIP_GITHUB_MANAGED_EXECUTION=on. Sandbox, plugin and kubernetes drivers keep
+ * upstream #13005 semantics. `driver` is the ENVIRONMENT driver (environments.driver), never
+ * heartbeat_runs.driver_kind.
+ */
+export function forkForcesHostGitHub(
+  driver: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const d = driver ?? "local";
+  return (d === "local" || d === "ssh") && !managedExecutionEnabled(env);
 }
 
 // `!`-prefixed helpers run via `sh -c` with the credential action appended as "$1". Only the
@@ -270,7 +285,8 @@ async function probeGitHubTokenUsable(token: string, owner: string, repo: string
  * operators, then null. The managed-identity lookup runs at most once per provider instance;
  * the legacy chain is memoized per owner/repo, so one run performs at most one credential
  * resolution (and writes at most one audit event) per repository no matter how many git
- * operations it authenticates.
+ * operations it authenticates. Host mode (`forkForcesHostGitHub` on context.environmentDriver)
+ * skips the run-identity projection.
  */
 export function createGitRemoteAuthProvider(
   db: Db,
@@ -280,6 +296,11 @@ export function createGitRemoteAuthProvider(
     heartbeatRunId?: string | null;
     responsibleUserId?: string | null;
     agentId?: string | null;
+    /**
+     * Environment driver of the run this provider serves (fold decision D1). Absent = local =
+     * host mode. Run-bearing callers MUST pass it; fork-github-host-gate-guard.test.ts enforces that.
+     */
+    environmentDriver?: string | null;
   },
   deps?: {
     secrets?: GitCredentialSecretsDeps;
@@ -291,6 +312,7 @@ export function createGitRemoteAuthProvider(
 ): GitRemoteAuthProvider {
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
+  const hostGitHub = forkForcesHostGitHub(context?.environmentDriver, env);
   const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
   const probeToken = deps?.probeToken ?? probeGitHubTokenUsable;
   const accessContext = {
@@ -389,8 +411,10 @@ export function createGitRemoteAuthProvider(
     // execution off (D2 i), so that branch is opt-in: without the opt-in a stale or broken
     // managed connection would strip host credentials from every git call in the run
     // instead of falling through to the App installation token, company secrets and the
-    // server env. Flip PAPERCLIP_GITHUB_MANAGED_EXECUTION=on to take upstream semantics.
-    if (managedExecutionEnabled(env) && db && context?.heartbeatRunId && context.agentId) {
+    // server env. Host mode is `forkForcesHostGitHub` on the environment driver: local/SSH/absent
+    // driver unless PAPERCLIP_GITHUB_MANAGED_EXECUTION=on; sandbox-class drivers take
+    // upstream semantics.
+    if (!hostGitHub && db && context?.heartbeatRunId && context.agentId) {
       const [run] = await db.select({ contextId: heartbeatRuns.activeIdentityContextId }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, context.heartbeatRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, context.agentId),
       ));

@@ -159,6 +159,7 @@ import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
+  forkForcesHostGitHub,
   resolveManagedGitHubIdentitySelection,
   describeGitAuthFailure,
   filterResolvedGitHubConnectionsForRun,
@@ -12778,7 +12779,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null },
+    opts?: { useProjectWorkspace?: boolean | null; executionEnvironmentDriver?: string | null },
   ): Promise<ResolvedAnchorWorkspaceForRun> {
     const issueId =
       readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -12789,6 +12790,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(context.responsibleUserId) ??
         readNonEmptyString(context.responsible_user_id),
       agentId: agent.id,
+      environmentDriver: opts?.executionEnvironmentDriver ?? null,
     });
     const contextProjectId = readNonEmptyString(context.projectId);
     const contextProjectWorkspaceId = readNonEmptyString(
@@ -13059,6 +13061,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(context.responsibleUserId) ??
         readNonEmptyString(context.responsible_user_id),
       agentId: agent.id,
+      environmentDriver: executionEnvironmentDriver,
     });
     const { additionalWorkspaces, warnings, failures } =
       await resolveAdditionalRunWorkspaces(issueId, anchor.projectId, {
@@ -22812,8 +22815,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               heartbeatRunId: run.id,
               responsibleUserId,
               agentId: agent.id,
+              environmentDriver: githubRunAuthEnvironmentDriver,
             })("https://github.com/paperclipai/credential-probe.git");
-      const githubSelection = await resolveManagedGitHubIdentitySelection(
+      // Fold decision D1: local/SSH runs are always host unless PAPERCLIP_GITHUB_MANAGED_EXECUTION=on,
+      // whatever the trust preset (settled 2026-09-12: no active low_trust_review work).
+      const forkHostGitHub = forkForcesHostGitHub(
+        selectedEnvironmentForConfig?.driver ?? "local",
+      );
+      const githubSelection = forkHostGitHub
+        ? { configured: false as const }
+        : await resolveManagedGitHubIdentitySelection(
         db,
         agent.companyId,
         {
@@ -22823,11 +22834,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       );
       const useHostGitHub =
+        forkHostGitHub ||
+        (
         !githubSelection.configured &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
-        );
+        ));
       const { resolvedConfig, secretKeys, secretManifest } =
         await resolveExecutionRunAdapterConfig({
           managedGitHubCredentials: !useHostGitHub,

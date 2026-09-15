@@ -3,16 +3,26 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Db } from "@paperclipai/db";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
   GIT_CREDENTIAL_TOKEN_ENV_KEY,
   buildGitAuthInvocation,
   createGitRemoteAuthProvider,
   describeGitAuthFailure,
+  forkForcesHostGitHub,
   isGitHubHttpsRemoteUrl,
   scrubGitCredentialText,
 } from "../services/git-credentials.ts";
+
+// TEA-Core fork (fold 2c D1): the provider's run-identity branch imports this module lazily.
+// Tests that never reach that branch (null db or no heartbeatRunId) never call it.
+const { mockResolveOperationCredentials } = vi.hoisted(() => ({
+  mockResolveOperationCredentials: vi.fn(),
+}));
+vi.mock("../services/github-operation-credentials.js", () => ({
+  resolveGitHubOperationCredentials: mockResolveOperationCredentials,
+}));
 
 const { mockResolveAppInstallationToken } = vi.hoisted(() => ({
   mockResolveAppInstallationToken: vi.fn(
@@ -261,6 +271,126 @@ describe("createGitRemoteAuthProvider", () => {
     expect(invocation?.secretName).toBe("GH_TOKEN");
     expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("agent-b-legacy-token");
     expect(db.select).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("forkForcesHostGitHub", () => {
+  it("forces host for local, ssh and an absent driver unless PAPERCLIP_GITHUB_MANAGED_EXECUTION=on", () => {
+    for (const driver of ["local", "ssh", null, undefined]) {
+      expect(forkForcesHostGitHub(driver, {})).toBe(true);
+      expect(forkForcesHostGitHub(driver, { PAPERCLIP_GITHUB_MANAGED_EXECUTION: "on" })).toBe(false);
+      expect(forkForcesHostGitHub(driver, { PAPERCLIP_GITHUB_MANAGED_EXECUTION: " ON " })).toBe(false);
+      for (const value of ["off", "1", "true", ""]) {
+        expect(forkForcesHostGitHub(driver, { PAPERCLIP_GITHUB_MANAGED_EXECUTION: value })).toBe(true);
+      }
+    }
+    for (const driver of ["sandbox", "plugin", "kubernetes"]) {
+      expect(forkForcesHostGitHub(driver, {})).toBe(false);
+      expect(forkForcesHostGitHub(driver, { PAPERCLIP_GITHUB_MANAGED_EXECUTION: "on" })).toBe(false);
+    }
+  });
+});
+
+describe("fork host-mode gate (D1)", () => {
+  const githubUrl = "https://github.com/example/repo.git";
+
+  // A fake db that answers by table: the run row carries an identity context, every other
+  // table (the managed-identity arm's tool connections) is empty.
+  function tableDb() {
+    const tables: unknown[] = [];
+    const db = {
+      select: vi.fn(() => ({
+        from: (table: unknown) => {
+          tables.push(table);
+          return { where: async () => (table === heartbeatRuns ? [{ contextId: "ctx-1" }] : []) };
+        },
+      })),
+    } as unknown as Db;
+    return { db, tables };
+  }
+
+  beforeEach(() => {
+    mockResolveOperationCredentials.mockReset();
+  });
+
+  it.each(["local", "ssh", null])(
+    "a %s run with an identity context never reaches the run-identity projection",
+    async (environmentDriver) => {
+      const { db, tables } = tableDb();
+      const provider = createGitRemoteAuthProvider(
+        db,
+        "company-1",
+        { heartbeatRunId: "run-1", agentId: "agent-1", environmentDriver },
+        { secrets: buildSecretsFake({ GITHUB_TOKEN: "host-token" }), env: {}, probeToken: async () => true },
+      );
+
+      const invocation = await provider(githubUrl);
+
+      expect(mockResolveOperationCredentials).not.toHaveBeenCalled();
+      expect(tables).not.toContain(heartbeatRuns);
+      expect(invocation?.source).toBe("company_secret");
+      expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("host-token");
+      // Server-side workspace git for a local run never gets upstream's anonymous projection.
+      expect(invocation?.env.GIT_CONFIG_GLOBAL).toBeUndefined();
+      expect(invocation?.env.GIT_CONFIG_SYSTEM).toBeUndefined();
+    },
+  );
+
+  it("absent arm: with the opt-in on, an absent run identity falls back to the owner/repo-scoped chain and memoizes per repo", async () => {
+    const { db } = tableDb();
+    mockResolveOperationCredentials.mockResolvedValue({ status: "absent", env: {} });
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "t-a", GH_TOKEN: "t-b" });
+    const probeToken = vi.fn(async (token: string, owner: string, repo: string) =>
+      !(token === "t-a" && owner === "example" && repo === "other"));
+    const provider = createGitRemoteAuthProvider(
+      db,
+      "company-1",
+      { heartbeatRunId: "run-1", agentId: "agent-1", environmentDriver: "local" },
+      { secrets, env: { PAPERCLIP_GITHUB_MANAGED_EXECUTION: "on" }, probeToken },
+    );
+
+    const first = await provider(githubUrl);
+    const second = await provider("git@github.com:example/other.git");
+    const getByNameCalls = secrets.getByName.mock.calls.length;
+    const third = await provider(githubUrl);
+
+    expect(mockResolveOperationCredentials).toHaveBeenCalledTimes(3);
+    for (const call of mockResolveOperationCredentials.mock.calls) {
+      expect(call[1]).toEqual({ companyId: "company-1", runId: "run-1", agentId: "agent-1" });
+    }
+    expect(first?.secretName).toBe("GITHUB_TOKEN");
+    expect(second?.secretName).toBe("GH_TOKEN");
+    expect(probeToken.mock.calls).toContainEqual(["t-a", "example", "other"]);
+    expect(probeToken.mock.calls).toContainEqual(["t-b", "example", "other"]);
+    expect(third?.secretName).toBe("GITHUB_TOKEN");
+    expect(secrets.getByName.mock.calls.length).toBe(getByNameCalls);
+    for (const invocation of [first, second, third]) {
+      expect(invocation?.env.GIT_CONFIG_GLOBAL).toBeUndefined();
+    }
+  });
+
+  it.each([
+    { label: "opt-in on, local driver", env: { PAPERCLIP_GITHUB_MANAGED_EXECUTION: "on" }, environmentDriver: "local" },
+    { label: "sandbox driver, no opt-in", env: {}, environmentDriver: "sandbox" },
+  ])("$label keeps upstream's fail-closed anonymous invocation for a configured-but-unusable identity", async ({ env, environmentDriver }) => {
+    const { db } = tableDb();
+    mockResolveOperationCredentials.mockResolvedValue({ status: "unavailable", env: { GH_TOKEN: "" } });
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "host-token" });
+    const provider = createGitRemoteAuthProvider(
+      db,
+      "company-1",
+      { heartbeatRunId: "run-1", agentId: "agent-1", environmentDriver },
+      { secrets, env, probeToken: async () => true },
+    );
+
+    const invocation = await provider(githubUrl);
+
+    expect(mockResolveOperationCredentials).toHaveBeenCalledTimes(1);
+    expect(invocation?.env.GIT_CONFIG_GLOBAL).toBe("/dev/null");
+    expect(invocation?.env.GIT_CONFIG_SYSTEM).toBe("/dev/null");
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("");
+    expect(invocation?.env.GIT_AUTHOR_NAME).toBe("");
+    expect(secrets.getByName).not.toHaveBeenCalled();
   });
 });
 

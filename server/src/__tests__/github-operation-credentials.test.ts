@@ -232,6 +232,34 @@ const support = await getEmbeddedPostgresTestSupport();
         .where(eq(runIdentityContexts.runId, input.runId));
       expect(JSON.stringify(history)).not.toContain("test-token-");
     });
+    // TEA-Core fork I3 (fold 2c D1): only the git credential provider sets requireEnabledConnection.
+    it("fork I3: requireEnabledConnection drops a disabled or non-active GitHub connection only when the git provider asks", async () => {
+      for (const disable of [{ enabled: false }, { status: "disabled", enabled: true }]) {
+        const input = await seed();
+        const { connectionId } = await grant(input, "robot", true);
+        await db
+          .update(toolConnections)
+          .set(disable)
+          .where(eq(toolConnections.id, connectionId));
+        const context = { agentId: input.agentId, responsibleUserId: null };
+        expect(
+          await resolveManagedGitHubIdentitySelection(db, input.companyId, {
+            ...context,
+            requireEnabledConnection: true,
+          }),
+        ).toEqual({ configured: false });
+        const upstream = await resolveManagedGitHubIdentitySelection(
+          db,
+          input.companyId,
+          context,
+        );
+        expect(upstream).toMatchObject({
+          configured: true,
+          identitySource: "dedicated",
+        });
+        expect(upstream.error).toEqual(expect.any(String));
+      }
+    });
     it("returns no credential for unconnected users, removed membership, or ambiguous personal accounts", async () => {
       const input = await seed();
       await grant(input, "A");
