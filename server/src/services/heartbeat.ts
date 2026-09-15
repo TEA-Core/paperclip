@@ -415,6 +415,7 @@ import {
   recoveryService,
 } from "./recovery/service.js";
 import { sweepHostRestartStrandedIssues as runHostRestartStrandSweep } from "./recovery/host-restart-strand-sweep.js";
+import { sweepCompletedRunStrandedIssues as runCompletedRunStrandSweep } from "./recovery/completed-run-strand-sweep.js";
 import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
@@ -19471,6 +19472,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return runHostRestartStrandSweep({ db });
   }
 
+  // Detect cards left in `in_progress` by a run that finished on the success
+  // path without writing a terminal disposition (the gap no failure-keyed sweep
+  // covers). Detect-and-escalate only: no auto-heal.
+  async function reconcileCompletedRunStrandIssues() {
+    return runCompletedRunStrandSweep({ db });
+  }
+
   async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
     return recovery.reconcileCancelledOnlyBlockerDependents({ issueCreatedAtGte: await getWorktreeExecutionCutoff(), ...(opts ?? {}) });
   }
@@ -28680,6 +28688,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStillbornAssignedBacklog,
 
     sweepHostRestartStrandedIssues,
+
+    reconcileCompletedRunStrandIssues,
 
     reconcileCancelledOnlyBlockerDependents,
 
