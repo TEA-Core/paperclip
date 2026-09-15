@@ -727,8 +727,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   if (configuredHomeIsManaged && configuredCodexHome) {
     const seedEnv = connectorSkillDigest ? {
+      // Fold 2c (SUP-12105 spawn-env guard): upstream 2083bf6f9 / f12b647ae build this env only
+      // for seedManagedCodexHome, which does filesystem work and never spawns a process.
+      // spawn-env-guard: read-only. The seed reads CODEX_HOME (the shared source home) and
+      // PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID (isCodexAuthCachePath, its credential-store-entry
+      // guard) out of this env. sanitizeInheritedPaperclipEnv strips both PAPERCLIP_* keys, so a
+      // sanitized copy would stop recognising a bound credential-store entry under a non-default
+      // PAPERCLIP_HOME and re-seed over its stored auth.json. Nothing here reaches a child env.
       ...process.env, CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
-    } : process.env;
+    } : process.env; // spawn-env-guard: read-only — same seed-only read as above (the fork tip passed this env to the seed too)
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
