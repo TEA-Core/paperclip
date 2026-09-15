@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   afterAll,
   afterEach,
@@ -63,7 +66,23 @@ suite(
     let db: ReturnType<typeof createDb>;
     let temporary:
       Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
+    let keyDir: string | undefined;
     beforeAll(async () => {
+      // Fork divergence (SUP-12882 env/file master-key agreement, slice 2c):
+      // the fork's local_encrypted provider refuses an env master key that
+      // disagrees with a key file already at PAPERCLIP_SECRETS_MASTER_KEY_FILE.
+      // Upstream stubs only the env key, so this suite inherited whatever key
+      // path the run shares; once another suite auto-generated a key there,
+      // every seal failed ("Teams private state could not be sealed"). Pin an
+      // empty private key path, as the fork's other secret suites do, so the
+      // stubbed env key is the only key this suite can see.
+      keyDir = mkdtempSync(
+        path.join(os.tmpdir(), "paperclip-teams-transfers-keys-"),
+      );
+      vi.stubEnv(
+        "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+        path.join(keyDir, "master.key"),
+      );
       vi.stubEnv(
         "PAPERCLIP_SECRETS_MASTER_KEY",
         Buffer.alloc(32, 79).toString("base64"),
@@ -80,6 +99,7 @@ suite(
       await db?.$client.end();
       await temporary?.cleanup();
       vi.unstubAllEnvs();
+      if (keyDir) rmSync(keyDir, { recursive: true, force: true });
     });
     afterEach(() => vi.restoreAllMocks());
 
