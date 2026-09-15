@@ -27691,6 +27691,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (!deferred) break;
 
+        // Fold 2c / Q2 (operator decision 2026-09-15, FENCE): upstream #13038 re-checks an exact
+        // failed-chat retry's live authority at promotion (wake-queue findNextDeferredWake,
+        // phase "promotion"). The authority is resolved from the wake's durable failed_run_retry
+        // chat action. A proven denial cancels the retry before any reopen or comment rewrite,
+        // leaving its batch and the task untouched. Any other error propagates and rolls this
+        // release back, so authorized work is never discarded. The fork's in-file promotion,
+        // live while D9 is deferred, promoted a revoked retry that then failed at dispatch and
+        // reopened a finished task. A wake with no failed_run_retry action returns false here
+        // without consulting any authority, so ordinary deferred wakes are unaffected. The D9 port
+        // replaces this with the module's check; delete it in that change.
+        try {
+          await authorizeFailedChatRunRetryWake(db, tx as unknown as Db, {
+            phase: "promotion",
+            wakeupRequestId: deferred.id,
+            companyId: issue.companyId,
+            agentId: deferred.agentId,
+            issueId: issue.id,
+            contextSnapshot: parseObject(
+              parseObject(deferred.payload)[DEFERRED_WAKE_CONTEXT_KEY],
+            ),
+          });
+        } catch (error) {
+          if (
+            !(error instanceof FailedChatRunRetryAuthorizationError) &&
+            !(error instanceof HttpError && error.status >= 400 && error.status < 500)
+          ) {
+            throw error;
+          }
+          const deniedAt = new Date();
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: deniedAt,
+              error:
+                "The exact failed chat request is no longer authorized. Send a new request in the current connected conversation.",
+              updatedAt: deniedAt,
+            })
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.id, deferred.id),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ),
+            );
+          continue;
+        }
+
         const queuedCommentIds = queuedCommentIdsFromWakePayload(
           deferred.payload,
         );
