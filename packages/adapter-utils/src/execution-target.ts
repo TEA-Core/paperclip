@@ -76,6 +76,7 @@ import {
   ensureCommandResolvable,
   resolveCommandForLogs,
   runChildProcess,
+  sanitizeInheritedPaperclipEnv,
   type RunProcessResult,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
@@ -1685,7 +1686,9 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
     discovered.PAPERCLIP_GIT_METADATA_ROOTS = JSON.stringify([...new Set(roots)]);
     discovered.PAPERCLIP_RUNNER_NETWORK_ROOTS = JSON.stringify([...new Set(networkRoots)]);
   } else {
-    const result = await promisify(execFile)(process.execPath, args, { cwd: input.cwd, timeout: 15_000, maxBuffer: 1024 * 1024 });
+    // TEA-Core fork (fold 2c, D3b): the probe needs host Git/gh discovery keys, not control-plane
+    // secrets. Its git runs inside an agent-writable worktree and reads that worktree's .git/config.
+    const result = await promisify(execFile)(process.execPath, args, { cwd: input.cwd, env: sanitizeInheritedPaperclipEnv(process.env), timeout: 15_000, maxBuffer: 1024 * 1024 });
     try { discovered = JSON.parse(result.stdout.split("\0")[1] ?? ""); }
     catch { throw new Error("Could not read execution-target Git context"); }
   }

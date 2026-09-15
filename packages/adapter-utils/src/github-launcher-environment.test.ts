@@ -149,6 +149,34 @@ describe("managed GitHub launcher environment", () => {
     expect(isolated.PAPERCLIP_GITHUB_HOST_HOME).toBeUndefined();
   });
 
+  it("local probe child does not inherit control-plane secrets (fold 2c D3b)", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-env-")); roots.push(root);
+    // A fake git first on PATH records the environment the probe's real git process receives.
+    const fakeBin = path.join(root, "bin");
+    await mkdir(fakeBin, { recursive: true });
+    const envDump = path.join(root, "git-env.txt");
+    await writeFile(path.join(fakeBin, "git"), `#!/bin/sh\nenv > '${envDump}'\nexit 1\n`, { mode: 0o755 });
+    await mkdir(path.join(root, "repo"));
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("PATH", `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`);
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "probe-master-key-value");
+    vi.stubEnv("BETTER_AUTH_SECRET", "probe-auth-secret-value");
+    vi.stubEnv("DATABASE_URL", "postgres://probe-database-url");
+    vi.stubEnv("GH_TOKEN", "legacy-token");
+
+    const env = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: {}, hostCredentials: true, networkAccess: true });
+
+    const childEnv = await readFile(envDump, "utf8");
+    expect(childEnv).not.toContain("probe-master-key-value");
+    expect(childEnv).not.toContain("probe-auth-secret-value");
+    expect(childEnv).not.toContain("postgres://probe-database-url");
+    // Host discovery keys still reach the probe.
+    expect(childEnv).toContain(`HOME=${root}`);
+    expect(childEnv).toContain("GH_TOKEN=legacy-token");
+    expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
+    expect(env.PAPERCLIP_GITHUB_HOST_HOME).toBe(root);
+  });
+
   it.each(["nvm/current/bin", "usr/local/bin", "tools with 'quotes'/bin"])(
     "preserves %s CLIs and keeps GitHub wrappers first in child shells",
     async (layout) => {
