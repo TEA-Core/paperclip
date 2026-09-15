@@ -10194,7 +10194,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // recorded exhaustion once; this callback only needs the answer, which is "no retry".
       // Mirrors the writer's own test for the default (transient_failure) budget exactly:
       // exhausted iff executionFailureRetryCount(run) + 1 > max.
-      if (executionFailureRetryCount(run) >= BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS) return null;
+      // Record-once, not record-never (upstream 667c79ded parity): a chain can reach this sweep
+      // exhausted WITHOUT a finalize-time exhaustion event (e.g. a conversation run whose last
+      // counted attempt failed non-transiently, so no finalize caller re-entered the writer). The
+      // attention feed and getRetryExhaustedReason only see an exhausted run through that event,
+      // so let the writer record it the first time and skip it once it exists.
+      if (executionFailureRetryCount(run) >= BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS) {
+        const [recordedExhaustion] = await db
+          .select({ id: heartbeatRunEvents.id })
+          .from(heartbeatRunEvents)
+          .where(
+            and(
+              eq(heartbeatRunEvents.companyId, run.companyId),
+              eq(heartbeatRunEvents.runId, run.id),
+              eq(heartbeatRunEvents.eventType, "lifecycle"),
+              sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+            ),
+          )
+          .limit(1);
+        if (recordedExhaustion) return null;
+      }
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
     },

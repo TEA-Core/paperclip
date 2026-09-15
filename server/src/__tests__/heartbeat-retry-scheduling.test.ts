@@ -524,6 +524,47 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(3);
   });
 
+  // Same loop-stopper, other half: record-once, not record-never. When no finalize-time caller
+  // re-entered the writer for the last counted attempt, the sweep is the only place exhaustion
+  // gets recorded, and the attention feed / retryExhaustedReason only see an exhausted run
+  // through that event (upstream 667c79ded records it exactly once).
+  it("records retry exhaustion exactly once when the stranded sweep is the first to reach an exhausted chain", async () => {
+    const { companyId, runId, now } = await seedMaxTurnFixture({ issueStatus: "todo" });
+    const resultJson = { conversationContinuation: "continue_conversation_v1" };
+    await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "server_shutdown_interrupted", resultJson })
+      .where(eq(heartbeatRuns.id, runId));
+    let predecessor = runId;
+    for (const attempt of [1, 2]) {
+      const scheduled = await heartbeatService(db).scheduleBoundedRetry(predecessor, { now, random: () => 0 });
+      expect(scheduled).toMatchObject({ outcome: "scheduled" });
+      const [child] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, predecessor));
+      expect(child).toMatchObject({ scheduledRetryAttempt: attempt });
+      predecessor = child!.id;
+      await db.update(heartbeatRuns).set({ status: "interrupted", finishedAt: now, resultJson })
+        .where(eq(heartbeatRuns.id, predecessor));
+    }
+    const exhaustionEventCount = () =>
+      db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(and(
+          eq(heartbeatRunEvents.runId, predecessor),
+          eq(heartbeatRunEvents.eventType, "lifecycle"),
+          sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+        ))
+        .then((rows) => rows.length);
+    // No finalize-time exhaustion call: the chain is exhausted but nothing has recorded it yet.
+    expect(await exhaustionEventCount()).toBe(0);
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      await heartbeatService(db).reconcileStrandedAssignedIssues();
+    }
+
+    expect(await exhaustionEventCount()).toBe(1);
+    expect(await heartbeatService(db).getRetryExhaustedReason(predecessor)).toContain("Bounded retry exhausted");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(3);
+  });
+
   it.each(["dependency", "disabled", "reassigned"])("respects the %s gate for interrupted conversations", async gate => {
     const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture();
     await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "process_lost",
