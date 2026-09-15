@@ -1706,7 +1706,16 @@ export function renderPaperclipWakePrompt(
   const originalAssigneeLabel = recovery?.originalAssignee?.name ??
     recovery?.originalAssignee?.id ??
     "the original assignee";
+  // process_lost and dispatch_unlaunched recovery is routed to the original agent, who retries
+  // the work. When that agent is not invokable the recovery service falls back to the manager
+  // ladder and records routingFallbackReason; that owner is not the original assignee, so it
+  // keeps the takeover restriction and gets the default instruction instead of the retry.
+  const originalAgentRetryCause =
+    recovery?.cause === "process_lost" || recovery?.cause === "dispatch_unlaunched";
+  const originalAgentRetry = originalAgentRetryCause && !recovery?.routingFallbackReason;
+  const takeoverInstruction = `Fix the underlying problem (auth, config, adapter, budget…) so the task can run again, then hand it back to ${originalAssigneeLabel}. You DO NOT do the work. Doing the deliverable yourself requires an explicit escalation note explaining why no assignee path works.`;
   const recoveryInstruction = (() => {
+    if (originalAgentRetryCause && !originalAgentRetry) return takeoverInstruction;
     switch (recovery?.cause) {
       case "process_lost":
         return `Your previous run on this issue was lost (${recovery.failureSummary ?? "no failure summary available"}). Try again — resume from durable progress; don't redo completed steps. Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.`;
@@ -1724,7 +1733,7 @@ export function renderPaperclipWakePrompt(
       case "workspace_validation_failed":
         return `Recover/fix the workspace (worktree, branch, workspace link), then hand the issue back to ${originalAssigneeLabel} for the actual work. Do not do the deliverable work.`;
       default:
-        return `Fix the underlying problem (auth, config, adapter, budget…) so the task can run again, then hand it back to ${originalAssigneeLabel}. You DO NOT do the work. Doing the deliverable yourself requires an explicit escalation note explaining why no assignee path works.`;
+        return takeoverInstruction;
     }
   })();
   const principalLabel = (principal: PaperclipWakeExecutionPrincipal | null) => {
@@ -1754,7 +1763,9 @@ export function renderPaperclipWakePrompt(
 
   const executionContractLines = recoveryScoped
     ? [
-        "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
+        originalAgentRetry
+          ? "Recovery contract: resume work on this task using the cause-specific instruction below."
+          : "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
         `Cause-specific instruction: ${recoveryInstruction}`,
         ...(recovery?.cause === "successful_run_missing_state" ||
             recovery?.cause === "successful_run_missing_issue_disposition"
