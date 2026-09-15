@@ -52,7 +52,23 @@ index 243c9d1..6d53177 100644
  		stdio: [
  			"pipe",
  			"pipe",
-@@ -3957,9 +3958,26 @@ var AcpClient = class {
+@@ -3724,10 +3725,13 @@ function resolveClientCapabilities(params) {
+ 		},
+ 		terminal: params.terminal
+ 	};
+-	if (!params.devinAcp) return baseCapabilities;
++	const typedSessionFailureMeta = {
++		jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } }
++	};
++	if (!params.devinAcp) return { ...baseCapabilities, _meta: typedSessionFailureMeta };
+ 	return {
+ 		...baseCapabilities,
+-		_meta: DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META
++		_meta: { ...typedSessionFailureMeta, ...DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META }
+ 	};
+ }
+ function isDevinRequestDiagnosticsMethod(method) {
+@@ -3957,9 +3961,26 @@ var AcpClient = class {
  		this.lastAgentExit = void 0;
  		this.lastKnownPid = child.pid ?? void 0;
  		this.attachAgentLifecycleObservers(child);
@@ -79,7 +95,7 @@ index 243c9d1..6d53177 100644
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -3986,15 +4004,22 @@ var AcpClient = class {
+@@ -3986,15 +4007,22 @@ var AcpClient = class {
  		let args = resolvedBuiltInLaunch?.args ?? configuredCommand.args;
  		args = await resolveGeminiCommandArgs(spawnCommand, args);
  		if (isQoderAcpCommand(spawnCommand, args)) args = buildQoderAcpCommandArgs(args, this.options);
@@ -105,6 +121,44 @@ index 243c9d1..6d53177 100644
  		};
  	}
  	logAgentLaunch(plan) {
+@@ -6070,6 +6098,27 @@ async function withConnectedSession(options) {
+ //#region src/runtime/engine/prompt-turn.ts
+ const SESSION_REPLY_IDLE_MS = 1e3;
+ const SESSION_REPLY_DRAIN_TIMEOUT_MS = 5e3;
++const TYPED_SESSION_FAILURE_CATEGORIES = /* @__PURE__ */ new Set([
++	"connection",
++	"access",
++	"limit",
++	"service",
++	"request",
++	"unknown"
++]);
++function typedTerminalSessionFailureCategory(response) {
++	if (response === null || typeof response !== "object" || Array.isArray(response)) return null;
++	const meta = response._meta;
++	if (meta === null || typeof meta !== "object" || Array.isArray(meta)) return null;
++	const jetbrains = meta.jetbrains;
++	if (jetbrains === null || typeof jetbrains !== "object" || Array.isArray(jetbrains)) return null;
++	const air = jetbrains.air;
++	if (air === null || typeof air !== "object" || Array.isArray(air)) return null;
++	if (!Number.isInteger(air.version) || air.version < 1) return null;
++	const failure = air.sessionFailure;
++	if (failure === null || typeof failure !== "object" || Array.isArray(failure) || failure.severity !== "error") return null;
++	return typeof failure.category === "string" && TYPED_SESSION_FAILURE_CATEGORIES.has(failure.category) ? failure.category : "unknown";
++}
+ async function runPromptTurn(params) {
+ 	try {
+ 		const promptPromise = params.client.prompt(params.sessionId, params.prompt);
+@@ -6079,6 +6128,9 @@ async function runPromptTurn(params) {
+ 			idleMs: SESSION_REPLY_IDLE_MS,
+ 			timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS
+ 		}).catch(() => {});
++		const terminalFailureCategory = typedTerminalSessionFailureCategory(response);
++		if (terminalFailureCategory !== null)
++			throw new Error(`ACP agent reported a terminal ${terminalFailureCategory} failure.`);
+ 		recordPromptResponseUsage(params.conversation, response.usage, params.promptMessageId);
+ 		return {
+ 			stopReason: response.stopReason,
 diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
 index ccdbe5b..e11d12a 100644
 --- a/dist/runtime.d.ts

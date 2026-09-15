@@ -51,6 +51,10 @@ const mockHeartbeatService = vi.hoisted(() => ({
 const mockProjectService = vi.hoisted(() => ({
   getById: vi.fn(async () => null),
 }));
+const mockRunnerGoalService = vi.hoisted(() => ({
+  projection: vi.fn(async () => null),
+  act: vi.fn(),
+}));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
@@ -89,6 +93,12 @@ function registerServiceMocks() {
 
   vi.doMock("../services/projects.js", () => ({
     projectService: () => mockProjectService,
+  }));
+
+  vi.doMock("../services/runner-goals.js", () => ({
+    runnerGoalService: () => mockRunnerGoalService,
+    RunnerGoalActionError: class RunnerGoalActionError extends Error {},
+    RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
   }));
 
   vi.doMock("../services/index.js", () => ({

@@ -25,11 +25,15 @@ function createSelectChain(rows: SelectRow[]) {
   };
   return {
     from() {
-      return {
+      const query = {
+        innerJoin() {
+          return query;
+        },
         where() {
           return terminal;
         },
       };
+      return query;
     },
   };
 }
@@ -171,8 +175,12 @@ describe("issueThreadInteractionService", () => {
       updatedAt: new Date("2026-04-20T10:00:00.000Z"),
     };
 
+    let selectCallCount = 0;
     const db: any = {
-      select: vi.fn(() => createSelectChain([existingRow])),
+      select: vi.fn(() => {
+        selectCallCount += 1;
+        return createSelectChain(selectCallCount <= 2 ? [existingRow] : []);
+      }),
       insert: vi.fn(),
       update: vi.fn(),
     };

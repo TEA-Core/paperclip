@@ -104,7 +104,6 @@ import {
 } from "./process-activity-monitor.js";
 import {
   createCodexAcpExecutor,
-  formatCodexAcpFallbackMessage,
   resolveCodexExecutionEngineForRun,
 } from "./acp.js";
 
@@ -598,20 +597,20 @@ export async function ensureCodexSkillsInjected(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
-  if (engineSelection.engine === "acp") {
-    try {
-      return await executeCodexAcp(ctx);
-    } catch (err) {
-      if (engineSelection.explicit) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      await ctx.onLog(
-        "stderr",
-        formatCodexAcpFallbackMessage(`Codex ACP startup failed: ${reason}`),
-      );
-    }
+  if (engineSelection.unavailableReason) {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_engine_unavailable",
+      errorMessage: engineSelection.unavailableReason,
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    };
   }
-  if (!engineSelection.explicit && engineSelection.fallbackReason) {
-    await ctx.onLog("stderr", formatCodexAcpFallbackMessage(engineSelection.fallbackReason));
+  if (engineSelection.engine === "acp") {
+    return executeCodexAcp(ctx);
   }
 
   const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } = ctx;
@@ -662,10 +661,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   const envConfig = parseObject(config.env);
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
-  const configuredCodexHome =
+  let configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
       : null;
+  const connectorSourceHome = configuredCodexHome;
+  const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
+    && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
+  if (connectorSkillDigest) {
+    // Never mount assignment-specific skills into the shared company/user home.
+    // A different skill revision gets a new home, so revoked/changed resources
+    // cannot survive as stale symlinks or bleed into another agent's session.
+    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
+      "connector-runtimes", agent.id, connectorSkillDigest);
+  }
   const codexSkillEntries = (await readPaperclipRuntimeSkillEntries(config, __moduleDir))
     // A missing-source entry would become a dangling skill symlink; skip it.
     .filter((entry) => !isPaperclipSkillSourceMissing(entry));
@@ -711,12 +720,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void error;
     });
   }
-  if (configuredCodexHome == null) {
+  if (configuredCodexHome == null || (connectorSkillDigest && connectorSourceHome == null)) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
     });
-  } else if (configuredHomeIsManaged) {
-    await seedManagedCodexHome(configuredCodexHome, process.env, onLog, {
+  }
+  if (configuredHomeIsManaged && configuredCodexHome) {
+    const seedEnv = connectorSkillDigest ? {
+      // Fold 2c (SUP-12105 spawn-env guard): upstream 2083bf6f9 / f12b647ae build this env only
+      // for seedManagedCodexHome, which does filesystem work and never spawns a process.
+      // spawn-env-guard: read-only. The seed reads CODEX_HOME (the shared source home) and
+      // PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID (isCodexAuthCachePath, its credential-store-entry
+      // guard) out of this env. sanitizeInheritedPaperclipEnv strips both PAPERCLIP_* keys, so a
+      // sanitized copy would stop recognising a bound credential-store entry under a non-default
+      // PAPERCLIP_HOME and re-seed over its stored auth.json. Nothing here reaches a child env.
+      ...process.env, CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+    } : process.env; // spawn-env-guard: read-only — same seed-only read as above (the fork tip passed this env to the seed too)
+    await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
   }
@@ -1289,6 +1309,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         {
           resumeSessionId,
           skipGitRepoCheck: executionTargetIsSandbox,
+          networkAccess: env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
         },
       );
       const args = execArgs.args;
@@ -1635,6 +1656,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (
         sessionId &&
         !initial.proc.timedOut &&
+        !initial.proc.signal &&
+        // A started session can emit stale-rollout warnings for other threads.
+        // After Ctrl-C those warnings must not restart the cancelled turn.
+        !initial.parsed.sessionId &&
         (initial.proc.exitCode ?? 0) !== 0 &&
         isCodexUnknownSessionError(initial.proc.stdout, initial.rawStderr)
       ) {

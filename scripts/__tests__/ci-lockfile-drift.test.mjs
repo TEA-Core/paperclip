@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const prWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
-const dockerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker.yml"), "utf8");
+const dockerWorkflows = [".github/workflows/docker.yml", ".github/workflows/docker-cloud.yml"].map(
+  relativePath => ({ path: relativePath, text: readFileSync(path.join(repoRoot, relativePath), "utf8") }),
+);
 
 // `pnpm-lock.yaml` is CI-owned: pr.yml's policy job rejects a PR that commits it.
 // Every install-bearing job therefore runs `pnpm install --frozen-lockfile` against
@@ -90,9 +92,18 @@ test("every install-bearing pr.yml job restores the regenerated lockfile before 
   }
 });
 
-test("every docker.yml job that builds an image refreshes the lockfile for the build context", () => {
-  for (const [name, body] of jobs(dockerWorkflow)) {
+// Both image workflows: upstream 5c660a32f relocated the cloud image build
+// out of docker.yml into docker-cloud.yml, which left this guard reading a
+// file the cloud build no longer lives in — green, and blind to the job it
+// was written for.
+test("every job that builds an image refreshes the lockfile for the build context", () => {
+  const imageJobs = dockerWorkflows.flatMap(workflow =>
+    [...jobs(workflow.text)].map(([name, body]) => [`${workflow.path}:${name}`, body]),
+  );
+  let checked = 0;
+  for (const [name, body] of imageJobs) {
     if (!body.includes("docker/build-push-action")) continue;
+    checked += 1;
 
     // Upstream #12829 moved the lock-repair paths to `--resolution-only` (still a full
     // resolution pass, without the unrelated platform-metadata churn `--lockfile-only`
@@ -109,4 +120,7 @@ test("every docker.yml job that builds an image refreshes the lockfile for the b
       `job \`${name}\` must refresh the lockfile before the image build reads the build context`,
     );
   }
+  // Guards the guard: if a rename or relocation leaves no image-building job
+  // in either workflow, the loop above would pass vacuously.
+  assert.ok(checked > 0, "no image-building job was found in the docker workflows");
 });
