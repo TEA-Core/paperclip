@@ -68,6 +68,21 @@ const {
       skipped: 0,
       issueIds: [],
     })),
+    // SUP-16427: startup + periodic sweep for in_progress cards abandoned by a
+    // run that completed without a terminal disposition. Neutral result keeps
+    // the startup-wiring assertions on what they assert.
+    reconcileCompletedRunStrandIssues: vi.fn(async () => ({
+      considered: 0,
+      escalated: [],
+      skipped: {
+        notScope: [],
+        liveRun: [],
+        runNotCompleted: [],
+        alreadyEscalated: [],
+        withinThreshold: [],
+        capExceeded: [],
+      },
+    })),
     reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
     // TEA-Core fork: startup schedules the issue-graph liveness orchestrator, which runs the
     // dependency-wake backstop plus the fork sweeps that share its timer.
