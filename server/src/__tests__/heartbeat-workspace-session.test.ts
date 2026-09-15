@@ -2762,6 +2762,93 @@ describe("effective run session config freshness", () => {
     });
   });
 
+  // Fold 2c / Q1 (operator decision 2026-09-15): upstream 2083bf6f9 (#13256) makes
+  // applyConnectorSkills put paperclipConnectorSkillDigest into every effective adapter config,
+  // null when the agent has no connector assignments (all of production). A null or absent
+  // digest must leave the adapterConfig category unchanged, or every stored task session rotates
+  // once at deploy; a real digest must still rotate it.
+  const connectorFreeAdapterConfig = {
+    command: "codex",
+    model: "gpt-5.4-mini",
+    paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/paperclip"] },
+    paperclipRuntimeSkills: [
+      {
+        key: "paperclipai/paperclip/paperclip",
+        runtimeName: "paperclip",
+        source: "/tmp/paperclip/runtime-skills/paperclip",
+        sourceStatus: "available",
+      },
+    ],
+  };
+  // The adapterConfig category fingerprint the fork production tip c1ba2e894 computes for
+  // connectorFreeAdapterConfig. projectSessionAdapterConfigCategoryValue,
+  // buildSessionConfigCategoryValues and effective-run-config-fingerprints.ts are unchanged from
+  // c1ba2e894, so this is the value a pre-fold session stored.
+  const PRE_FOLD_ADAPTER_CONFIG_CATEGORY_FINGERPRINT =
+    "v2:sha256:3d22967d99f8aa61c663c54debc9a9d1fef772e9327417a4f5503e449aa894f2";
+
+  it("keeps a pre-fold session fresh when the connector skill digest is null (Fold 2c / Q1)", async () => {
+    const preFold = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: connectorFreeAdapterConfig,
+    });
+    const nullDigest = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { ...connectorFreeAdapterConfig, paperclipConnectorSkillDigest: null },
+    });
+
+    expect(preFold.categoryFingerprints.adapterConfig).toBe(PRE_FOLD_ADAPTER_CONFIG_CATEGORY_FINGERPRINT);
+    expect(nullDigest.categoryFingerprints.adapterConfig).toBe(PRE_FOLD_ADAPTER_CONFIG_CATEGORY_FINGERPRINT);
+    expect(nullDigest.fingerprint).toBe(preFold.fingerprint);
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        taskSessionParams: sessionParamsWithConfigMetadata(preFold),
+        configMetadata: nullDigest,
+      }),
+    ).toMatchObject({ reset: false, changedCategories: [], reasons: [] });
+  });
+
+  it("rotates the session when a connector assignment supplies a digest (Fold 2c / Q1)", async () => {
+    const absent = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: connectorFreeAdapterConfig,
+    });
+    const nullDigest = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { ...connectorFreeAdapterConfig, paperclipConnectorSkillDigest: null },
+    });
+    const assigned = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { ...connectorFreeAdapterConfig, paperclipConnectorSkillDigest: "a".repeat(64) },
+    });
+
+    expect(assigned.categoryFingerprints.adapterConfig).not.toBe(absent.categoryFingerprints.adapterConfig);
+    expect(assigned.categoryFingerprints.adapterConfig).not.toBe(nullDigest.categoryFingerprints.adapterConfig);
+    for (const previous of [absent, nullDigest]) {
+      expect(
+        resolveTaskSessionConfigFreshness({
+          hasTaskSession: true,
+          taskSessionParams: sessionParamsWithConfigMetadata(previous),
+          configMetadata: assigned,
+        }),
+      ).toMatchObject({ reset: true, changedCategories: ["adapterConfig"] });
+    }
+  });
+
+  it("rotates the session when the connector skill digest changes (Fold 2c / Q1)", async () => {
+    const before = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { ...connectorFreeAdapterConfig, paperclipConnectorSkillDigest: "a".repeat(64) },
+    });
+    const after = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { ...connectorFreeAdapterConfig, paperclipConnectorSkillDigest: "b".repeat(64) },
+    });
+
+    expect(after.categoryFingerprints.adapterConfig).not.toBe(before.categoryFingerprints.adapterConfig);
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        taskSessionParams: sessionParamsWithConfigMetadata(before),
+        configMetadata: after,
+      }),
+    ).toMatchObject({ reset: true, changedCategories: ["adapterConfig"] });
+  });
+
   it("freshens legacy task sessions that lack versioned config metadata", async () => {
     const metadata = await buildSessionConfigMetadata();
 

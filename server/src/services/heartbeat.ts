@@ -7048,11 +7048,26 @@ const SESSION_ADAPTER_CONFIG_MODEL_SELECTION_KEYS = new Set([
   "thinkingEffort",
 ]);
 
+// Fold 2c / Q1 (operator decision 2026-09-15): upstream 2083bf6f9 (#13256) has
+// applyConnectorSkills write `paperclipConnectorSkillDigest` into every effective adapter
+// config, and the value is null whenever the agent has no connector assignments. A null key
+// still reaches the canonical hash, so it rotated EVERY stored task session once at deploy
+// although nothing the session depends on changed (production has no connectors). The key is
+// dropped from this projection only while it is null or absent, so pre-fold stored
+// fingerprints stay fresh. A non-null digest (a real connector assignment) is still hashed and
+// still rotates the session when the assigned connector skill changes. Revisit if upstream
+// stops writing the null digest, or if connectors are enabled in production.
+const SESSION_ADAPTER_CONFIG_CONNECTOR_SKILL_DIGEST_KEY = "paperclipConnectorSkillDigest";
+
 function projectSessionAdapterConfigCategoryValue(
   adapterConfig: Record<string, unknown>,
 ): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(adapterConfig).filter(([key]) => !SESSION_ADAPTER_CONFIG_MODEL_SELECTION_KEYS.has(key)),
+    Object.entries(adapterConfig).filter(
+      ([key, value]) =>
+        !SESSION_ADAPTER_CONFIG_MODEL_SELECTION_KEYS.has(key) &&
+        !(key === SESSION_ADAPTER_CONFIG_CONNECTOR_SKILL_DIGEST_KEY && (value === null || value === undefined)),
+    ),
   );
 }
 
