@@ -699,88 +699,105 @@ describe("durable inbound chat scheduler receipts", () => {
     },
   );
 
-  it.each([
+  const ownershipFenceScopes = [
     { withDeferredInput: false, sourceKind: "inbound_wakeup" },
     { withDeferredInput: true, sourceKind: "inbound_wakeup" },
     { withDeferredInput: false, sourceKind: "unrelated_action" },
     { withDeferredInput: false, sourceKind: "missing" },
-  ].flatMap((scope) => [false, true].map((preProvider) => ({ ...scope, preProvider }))))(
+  ].flatMap((scope) => [false, true].map((preProvider) => ({ ...scope, preProvider })));
+  const isForkD9LegacyReleaseScope = (scope: (typeof ownershipFenceScopes)[number]) =>
+    scope.sourceKind !== "inbound_wakeup" && !scope.withDeferredInput && !scope.preProvider;
+
+  async function runOwnershipFenceScenario({
+    withDeferredInput,
+    sourceKind,
+    preProvider,
+  }: (typeof ownershipFenceScopes)[number]) {
+    const f = await retryFixture();
+    await db
+      .update(agents)
+      .set({ adapterType: "durable_chat_retry_test" })
+      .where(eq(agents.id, f.agentId));
+    await db
+      .update(chatActions)
+      .set({ kind: sourceKind, payload: { issueId: f.issueId } })
+      .where(eq(chatActions.id, f.actionId));
+    if (sourceKind === "missing")
+      await db.delete(chatActions).where(eq(chatActions.id, f.actionId));
+    const { failedRunRetry: _retry, ...ordinaryRequest } = f.request;
+    const wakeOriginal = (id: string, commentId: string) =>
+      f.heartbeat.wakeup(f.agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "chat_message_received",
+        requestedByActorType: "user",
+        requestedByActorId: "board-user",
+        payload: {
+          issueId: f.issueId,
+          wakeCommentId: commentId,
+          wakeCommentIds: [commentId],
+        },
+        contextSnapshot: {
+          issueId: f.issueId,
+          taskKey: f.context.taskKey,
+          source: "chat:slack",
+          wakeCommentId: commentId,
+          wakeCommentIds: [commentId],
+        },
+        durableChatRequest: createDurableChatWakeupRequest({
+          ...ordinaryRequest,
+          id,
+          commentId,
+        }),
+        allowRunCoalescing: false,
+      });
+    if (preProvider) {
+      execute.mockResolvedValueOnce({
+        exitCode: 1, signal: null, timedOut: false,
+        summary: "Fixture failed before provider work",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      });
+    } else {
+      execute.mockRejectedValueOnce(new Error("Original chat provider outcome is unknown"));
+    }
+    const original = await wakeOriginal(f.actionId, f.commentIds[1]);
+    const deferredId = randomUUID();
+    if (withDeferredInput) {
+      const [owner] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, f.actionId));
+      await db.insert(chatActions).values({
+        ...owner,
+        id: deferredId,
+        providerActionId: `wakeup:${deferredId}`,
+      });
+      expect(await wakeOriginal(deferredId, f.commentIds[0])).toBeNull();
+      const [receipt] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredId));
+      expect(receipt.status).toBe("deferred_issue_execution");
+    }
+    await f.heartbeat.cancelRun(
+      f.activeRunId,
+      "Fixture execution slot released",
+      { suppressImmediateRecovery: true },
+    );
+    await f.heartbeat.drainActiveRunExecutions();
+    return { f, original, deferredId };
+  }
+
+  it.each(ownershipFenceScopes.filter((scope) => !isForkD9LegacyReleaseScope(scope)))(
     "fences generic recovery by actual original chat ownership ($sourceKind, deferred=$withDeferredInput, pre-provider=$preProvider)",
     async ({ withDeferredInput, sourceKind, preProvider }) => {
-      const f = await retryFixture();
-      await db
-        .update(agents)
-        .set({ adapterType: "durable_chat_retry_test" })
-        .where(eq(agents.id, f.agentId));
-      await db
-        .update(chatActions)
-        .set({ kind: sourceKind, payload: { issueId: f.issueId } })
-        .where(eq(chatActions.id, f.actionId));
-      if (sourceKind === "missing")
-        await db.delete(chatActions).where(eq(chatActions.id, f.actionId));
+      const { f, original, deferredId } = await runOwnershipFenceScenario({
+        withDeferredInput,
+        sourceKind,
+        preProvider,
+      });
       const genericRecoveryExpected = preProvider && sourceKind !== "inbound_wakeup";
       const nextExecutionExpected = preProvider && (withDeferredInput || genericRecoveryExpected);
-      const { failedRunRetry: _retry, ...ordinaryRequest } = f.request;
-      const wakeOriginal = (id: string, commentId: string) =>
-        f.heartbeat.wakeup(f.agentId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "chat_message_received",
-          requestedByActorType: "user",
-          requestedByActorId: "board-user",
-          payload: {
-            issueId: f.issueId,
-            wakeCommentId: commentId,
-            wakeCommentIds: [commentId],
-          },
-          contextSnapshot: {
-            issueId: f.issueId,
-            taskKey: f.context.taskKey,
-            source: "chat:slack",
-            wakeCommentId: commentId,
-            wakeCommentIds: [commentId],
-          },
-          durableChatRequest: createDurableChatWakeupRequest({
-            ...ordinaryRequest,
-            id,
-            commentId,
-          }),
-          allowRunCoalescing: false,
-        });
-      if (preProvider) {
-        execute.mockResolvedValueOnce({
-          exitCode: 1, signal: null, timedOut: false,
-          summary: "Fixture failed before provider work",
-          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
-        });
-      } else {
-        execute.mockRejectedValueOnce(new Error("Original chat provider outcome is unknown"));
-      }
-      const original = await wakeOriginal(f.actionId, f.commentIds[1]);
-      const deferredId = randomUUID();
-      if (withDeferredInput) {
-        const [owner] = await db
-          .select()
-          .from(chatActions)
-          .where(eq(chatActions.id, f.actionId));
-        await db.insert(chatActions).values({
-          ...owner,
-          id: deferredId,
-          providerActionId: `wakeup:${deferredId}`,
-        });
-        expect(await wakeOriginal(deferredId, f.commentIds[0])).toBeNull();
-        const [receipt] = await db
-          .select()
-          .from(agentWakeupRequests)
-          .where(eq(agentWakeupRequests.id, deferredId));
-        expect(receipt.status).toBe("deferred_issue_execution");
-      }
-      await f.heartbeat.cancelRun(
-        f.activeRunId,
-        "Fixture execution slot released",
-        { suppressImmediateRecovery: true },
-      );
-      await f.heartbeat.drainActiveRunExecutions();
       const [run] = await db
         .select()
         .from(heartbeatRuns)
@@ -840,6 +857,88 @@ describe("durable inbound chat scheduler receipts", () => {
           },
         });
       }
+    },
+  );
+
+  // Fork divergence (D9 deferred, slice 2c): these two cases are a legacy original chat run that
+  // failed with an unknown provider outcome and is NOT chat-owned (its chat_actions row is an
+  // unrelated_action, or is gone). The shared legacy terminalization creates the board
+  // `legacy_execution_requires_reconciliation` hold on both paths. Upstream then releases the run
+  // through the generic legacy pre-drain exit of its wake-queue module release (as of 5545f6d,
+  // the #13275 era; decidePreDrain: legacyExecutionNeedsReconciliation -> released, since #13132),
+  // which applies to EVERY legacy run, so nothing executes after the original. That module release
+  // is dormant under D9: this fold keeps the fork's in-file releaseIssueExecutionAndPromote live
+  // (operator decision 2026-09-15), which does not consult the hold and queues and executes an
+  // uncounted immediate issue_continuation_needed recovery run. The fold-2c Q2 fence (20494e0e6)
+  // mirrors upstream's exit for chat-owned runs only, which is why the inbound_wakeup cases above
+  // pass unedited. 84a537085 inverted the same class for non-chat runs in
+  // heartbeat-process-recovery.test.ts ('does not bypass unknown process outcomes through immediate
+  // continuation recovery' and siblings). What still holds on the fork: the original run fails
+  // without retry lineage, no chat-owner block is placed, the recovery run carries none of the chat
+  // input, and the execution lock is released. Inverted rather than deleted so the divergence stays
+  // guarded (operator ruling Q2, 2026-09-15). The D9 port must restore upstream's assertions (put
+  // these two cases back in the it.each above) and delete this block.
+  it.each(ownershipFenceScopes.filter(isForkD9LegacyReleaseScope))(
+    "Fork divergence (D9 deferred, slice 2c): fences generic recovery by actual original chat ownership ($sourceKind, deferred=$withDeferredInput, pre-provider=$preProvider)",
+    async (scope) => {
+      const { f, original } = await runOwnershipFenceScenario(scope);
+      const [run] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, original!.id));
+      expect(run).toMatchObject({
+        status: "failed",
+        retryOfRunId: null,
+        wakeupRequestId: f.actionId,
+      });
+      expect(
+        await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, f.issueId)),
+      ).toEqual([
+        expect.objectContaining({
+          ownerType: "board",
+          cause: "legacy_execution_requires_reconciliation",
+          status: "active",
+          returnOwnerAgentId: f.agentId,
+          fingerprint: `legacy-execution:${original!.id}`,
+        }),
+      ]);
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(runs).toHaveLength(4);
+      const recoveryRuns = runs.filter(
+        (entry) =>
+          (entry.contextSnapshot as Record<string, unknown>)?.source ===
+          "issue.continuation_recovery",
+      );
+      expect(recoveryRuns).toEqual([
+        expect.objectContaining({
+          status: "succeeded",
+          retryOfRunId: original!.id,
+          scheduledRetryAttempt: 0,
+          contextSnapshot: expect.objectContaining({
+            wakeReason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            retryOfRunId: original!.id,
+          }),
+        }),
+      ]);
+      expect(recoveryRuns[0]!.contextSnapshot).not.toHaveProperty("wakeCommentIds");
+      expect(recoveryRuns[0]!.contextSnapshot).not.toHaveProperty("chatFailedRunRetry");
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(execute.mock.calls.map(([input]) => input.runId)).toEqual([
+        original!.id,
+        recoveryRuns[0]!.id,
+      ]);
+      const [issue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, f.issueId));
+      expect(issue).toMatchObject({ status: "done", executionRunId: null });
     },
   );
 
