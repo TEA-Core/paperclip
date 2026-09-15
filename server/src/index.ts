@@ -1779,6 +1779,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep escalated issues");
         }
 
+        const completedRunStrand = await heartbeat.reconcileCompletedRunStrandIssues();
+        if (completedRunStrand.escalated.length > 0) {
+          logger.warn({ ...completedRunStrand }, "startup completed-run strand sweep escalated issues");
+        }
+
         const pendingReviewRearm = await heartbeat.reconcilePendingReviewRearm();
         if (pendingReviewRearm.reArmed > 0) {
           logger.warn({ ...pendingReviewRearm }, "startup pending-review-rearm sweep re-surfaced undecided review stages");
@@ -2114,6 +2119,15 @@ export async function startServer(): Promise<StartedServer> {
               const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
               if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
                 logger.warn({ ...staleWakes }, "periodic stale recovery action wake sweep re-fired wakes");
+              }
+            })
+            .then(async () => {
+              const completedRunStrand = await heartbeat.reconcileCompletedRunStrandIssues();
+              if (completedRunStrand.escalated.length > 0) {
+                logger.warn(
+                  { ...completedRunStrand },
+                  "periodic completed-run strand sweep escalated issues",
+                );
               }
             })
             .then(async () => {
