@@ -26,6 +26,21 @@
  *      parents -- so pre-existing duplication, and duplication that only one
  *      side introduced, are self-baselining and never reported.
  *
+ * Three shapes a fold produces on its own are discounted, because each one is a
+ * parent's repetition carried through rather than a copy the merge added:
+ *
+ *   - a file a parent holds under another path (`fold:restamp` renames every
+ *     folded migration) is compared against that path, not against nothing;
+ *   - a back-to-back pair -- block, gap, block -- that a parent already holds as
+ *     often as the merge does (one side added a test that repeats a query the
+ *     other side already repeats, so every block count rises by one);
+ *   - near-identical pairs BOTH parents already hold at least as often as the
+ *     merge does, where each side edited its two copies differently and the
+ *     composed text matches neither.
+ *
+ * Keeping both sides of a conflict yields a pair that no parent held, so none of
+ * the three discounts can hide that defect.
+ *
  * Usage:
  *   node scripts/check-fold-duplication.mjs [<head>] [<base>]
  *
@@ -200,9 +215,38 @@ function blobAt(ref, path) {
   return git(["show", `${ref}:${path}`], { allowFailure: true });
 }
 
-function normalizedTextAt(ref, path) {
-  const text = blobAt(ref, path);
-  return text === null ? null : normalize(text).map((l) => l.text);
+/** Paths renamed between `from` and `commit`, keyed by their path in `commit`. */
+function renamesInto(from, commit) {
+  const map = new Map();
+  const out = git(["diff", "-M", "-z", "--name-status", "--diff-filter=R", from, commit], { allowFailure: true });
+  if (!out) return map;
+  const parts = out.split("\u0000");
+  for (let i = 0; i + 2 < parts.length; i += 3) {
+    if (!parts[i].startsWith("R")) break;
+    map.set(parts[i + 2], parts[i + 1]);
+  }
+  return map;
+}
+
+/** Share of `b`'s lines (as a multiset) that `a` also holds, over the longer length. */
+export function lineOverlap(a, b) {
+  const counts = new Map();
+  for (const l of a) counts.set(l, (counts.get(l) ?? 0) + 1);
+  let shared = 0;
+  for (const l of b) {
+    const c = counts.get(l) ?? 0;
+    if (c > 0) { shared += 1; counts.set(l, c - 1); }
+  }
+  return shared / Math.max(a.length, b.length);
+}
+
+/** Adjacent repeats in `lines` whose block is near-identical to `block`. */
+export function similarAdjacentPairs(lines, block, { minLines, maxGap, threshold = 0.75 } = {}) {
+  let pairs = 0;
+  for (const { start, length } of findAdjacentRepeats(lines, { minLines, maxGap })) {
+    if (lineOverlap(lines.slice(start, start + length), block) >= threshold) pairs += 1;
+  }
+  return pairs;
 }
 
 export function findMergeDuplication(commit, options = {}) {
@@ -217,6 +261,7 @@ export function findMergeDuplication(commit, options = {}) {
     && CODE_EXTENSIONS.has(f.split(".").pop())
     && !GENERATED_PATHS.has(f.split("/").pop()));
 
+  const renameSources = parents.map((p) => renamesInto(p, commit));
   const findings = [];
   const redeclarations = [];
   for (const path of resolved) {
@@ -226,8 +271,18 @@ export function findMergeDuplication(commit, options = {}) {
     // Rule 2: a column-0 declaration the merge now holds more copies of than
     // either parent. Catches the copies the adjacency rule cannot -- the two
     // `pendingCleanupAttemptsSql` bodies sit 14k lines apart in heartbeat.ts.
+    // A fold re-stamps (renames) migrations, so the same file sits under another
+    // path in a parent. Follow the rename for both rules, or the parent reads as
+    // empty and the file's own declarations and repetition read as merge-introduced.
+    const parentTexts = parents.map((p, i) => {
+      const direct = blobAt(p, path);
+      if (direct !== null) return direct;
+      const source = renameSources[i].get(path);
+      return source ? blobAt(p, source) : null;
+    });
+
     const mergedDecls = countDeclarations(mergedText);
-    const parentDecls = parents.map((p) => countDeclarations(blobAt(p, path)));
+    const parentDecls = parentTexts.map((text) => countDeclarations(text));
     for (const [name, count] of mergedDecls) {
       if (count < 2) continue;
       const parentCounts = parentDecls.map((d) => d.get(name) ?? 0);
@@ -240,12 +295,25 @@ export function findMergeDuplication(commit, options = {}) {
     const repeats = findAdjacentRepeats(mergedLines, options);
     if (repeats.length === 0) continue;
 
-    const parentLines = parents.map((p) => normalizedTextAt(p, path) ?? []);
+    const parentLines = parentTexts.map((text) => (text === null ? [] : normalize(text).map((l) => l.text)));
     for (const { start, length, gap } of repeats) {
       const block = mergedLines.slice(start, start + length);
       const mergeCount = countOccurrences(mergedLines, block);
       const parentCounts = parentLines.map((lines) => countOccurrences(lines, block));
       if (!parentCounts.every((c) => mergeCount > c)) continue;
+      // The back-to-back pair itself -- block, gap, block -- already present as
+      // often in a parent: the merge carried that parent's own repetition.
+      const pair = mergedLines.slice(start, start + 2 * length + gap);
+      const pairCount = countOccurrences(mergedLines, pair);
+      if (parentLines.some((lines) => countOccurrences(lines, pair) >= pairCount)) continue;
+      // A composed block: BOTH parents already hold an adjacent repeat of a
+      // near-identical block and each side edited its copies differently, so the
+      // merged text matches neither verbatim. Compare against every near-identical
+      // pair the MERGE holds, not the candidate alone: an unrelated similar pair the
+      // parents held is still in the merge, so a new duplicate beside it leaves the
+      // merge one pair ahead of both parents and is still reported.
+      const mergedSimilarPairs = similarAdjacentPairs(mergedLines, block, options);
+      if (parentLines.every((lines) => similarAdjacentPairs(lines, block, options) >= mergedSimilarPairs)) continue;
       findings.push({
         path,
         firstCopy: [merged[start].line, merged[start + length - 1].line],

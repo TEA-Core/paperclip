@@ -258,3 +258,255 @@ test("workflow YAML is in scope, both extensions, and generated lockfiles are no
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A six-line block for the fold-shape tests. Every line is substantive, so the
+// adjacency rule sees it at minLines 5.
+const QUERY = [
+  "SELECT \"id\",",
+  "first_value(\"id\") OVER (",
+  "PARTITION BY \"company_id\", \"idempotency_key\"",
+  "ORDER BY \"created_at\" ASC",
+  ") AS \"keeper_id\"",
+  "FROM \"chat_interactions\";",
+].join("\n");
+
+const filler = (tag, n) => Array.from({ length: n }, (_, i) => `const ${tag}Filler${i} = ${i};`).join("\n");
+
+test("findMergeDuplication follows a rename so a re-stamped file's own repetition is not reported", () => {
+  // fold:restamp renames 0260_x.sql to 0275_x.sql inside the fold merge. Matched
+  // by path, both parents read as empty and the file's internal repeat reads as new.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "README.md"), "base\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "fork.ts"), "export const FORK_FLAG = true;\n");
+    git("add", "-A");
+    git("commit", "-qm", "fork side");
+
+    git("checkout", "-q", "base");
+    writeFileSync(path.join(dir, "0260_x.sql"), `${QUERY}\n${QUERY}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "upstream adds a migration that repeats a query");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    git("mv", "0260_x.sql", "0275_x.sql");
+    git("commit", "-qm", "fold merge that re-stamps the migration");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.equal(result.skipped, false);
+    assert.deepEqual(result.findings, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findMergeDuplication still flags a renamed file the merge duplicated", () => {
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "README.md"), "base\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "fork.ts"), "export const FORK_FLAG = true;\n");
+    git("add", "-A");
+    git("commit", "-qm", "fork side");
+
+    git("checkout", "-q", "base");
+    writeFileSync(path.join(dir, "0260_x.sql"), `${QUERY}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "upstream adds a migration with the query once");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    git("mv", "0260_x.sql", "0275_x.sql");
+    writeFileSync(path.join(dir, "0275_x.sql"), `${QUERY}\n${QUERY}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "fold merge that re-stamps and doubles the query");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].path, "0275_x.sql");
+    assert.equal(result.findings[0].mergeCount, 2);
+    // Parent 1 is the upstream side that added 0260_x.sql; the rename is followed there.
+    assert.deepEqual(result.findings[0].parentCounts, [1, 0]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findMergeDuplication stays quiet when a parent already holds the back-to-back pair", () => {
+  // The counting artifact: base repeats a query back to back; each side adds one
+  // more lone copy elsewhere. Every block count rises past both parents, but the
+  // pair itself is the base's own.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    const pair = `${filler("a", 6)}\n${QUERY}\n${QUERY}\n${filler("b", 6)}\n`;
+    writeFileSync(path.join(dir, "suite.test.ts"), pair);
+    git("add", "-A");
+    git("commit", "-qm", "base repeats the query in one test");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "suite.test.ts"), `${pair}${filler("fork", 6)}\n${QUERY}\n`);
+    git("commit", "-qam", "fork adds a test that runs the query once");
+
+    git("checkout", "-q", "base");
+    writeFileSync(path.join(dir, "suite.test.ts"), `${filler("up", 6)}\n${QUERY}\n${pair}`);
+    git("commit", "-qam", "upstream adds a test that runs the query once");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    writeFileSync(
+      path.join(dir, "suite.test.ts"),
+      `${filler("up", 6)}\n${QUERY}\n${pair}${filler("fork", 6)}\n${QUERY}\n`,
+    );
+    git("add", "-A");
+    git("commit", "-qm", "merge takes both added tests");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.deepEqual(result.findings, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findMergeDuplication stays quiet on a composed block both parents already repeat", () => {
+  // Both parents hold the same mock body twice; each side adds a different key to
+  // both copies. The merged copies carry both keys and match neither parent verbatim.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    const twice = (extra) => {
+      const body = `${QUERY}\n${extra}`;
+      return `${body}\n\n${body}\n`;
+    };
+    writeFileSync(path.join(dir, "routes.test.ts"), twice(""));
+    git("add", "-A");
+    git("commit", "-qm", "base repeats a mock body");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "routes.test.ts"), twice("forkService: () => mockForkService,"));
+    git("commit", "-qam", "fork adds a key to both copies");
+
+    git("checkout", "-q", "base");
+    writeFileSync(path.join(dir, "routes.test.ts"), twice("upstreamService: () => mockUpstreamService,"));
+    git("commit", "-qam", "upstream adds a different key to both copies");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    writeFileSync(
+      path.join(dir, "routes.test.ts"),
+      twice("forkService: () => mockForkService,\nupstreamService: () => mockUpstreamService,"),
+    );
+    git("add", "-A");
+    git("commit", "-qm", "merge composes both keys into both copies");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.deepEqual(result.findings, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findMergeDuplication still flags a composed block the merge kept twice when each parent held it once", () => {
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "routes.ts"), `${QUERY}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "base holds the block once");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "routes.ts"), `${QUERY}\nforkService: () => mockForkService,\n`);
+    git("commit", "-qam", "fork edits the block");
+
+    git("checkout", "-q", "base");
+    writeFileSync(path.join(dir, "routes.ts"), `${QUERY}\nupstreamService: () => mockUpstreamService,\n`);
+    git("commit", "-qam", "upstream edits the block");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    const composed = `${QUERY}\nforkService: () => mockForkService,\nupstreamService: () => mockUpstreamService,`;
+    writeFileSync(path.join(dir, "routes.ts"), `${composed}\n${composed}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "merge keeps both sides, composed twice");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].path, "routes.ts");
+    assert.deepEqual(result.findings[0].parentCounts, [0, 0]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findMergeDuplication still flags a composed duplicate beside an unrelated similar pair both parents hold", () => {
+  // Both parents already repeat a near-identical block elsewhere in the file. That
+  // pair must not excuse a NEW composed duplicate: the merge keeps the old pair and
+  // adds the new one, so it holds one more similar pair than either parent.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    const other = `${QUERY}\notherService: () => mockOtherService,`;
+    const prefix = `${other}\n\n${other}\n${filler("mid", 6)}\n`;
+    writeFileSync(path.join(dir, "routes.ts"), `${prefix}${QUERY}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "base: an unrelated similar pair, and the block once");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "routes.ts"), `${prefix}${QUERY}\nforkService: () => mockForkService,\n`);
+    git("commit", "-qam", "fork edits the block");
+
+    git("checkout", "-q", "base");
+    writeFileSync(path.join(dir, "routes.ts"), `${prefix}${QUERY}\nupstreamService: () => mockUpstreamService,\n`);
+    git("commit", "-qam", "upstream edits the block");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    const composed = `${QUERY}\nforkService: () => mockForkService,\nupstreamService: () => mockUpstreamService,`;
+    writeFileSync(path.join(dir, "routes.ts"), `${prefix}${composed}\n${composed}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "merge keeps both sides, composed twice, beside the old pair");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.equal(result.findings.length, 1);
+    assert.deepEqual(result.findings[0].parentCounts, [0, 0]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findMergeDuplication follows a rename for declaration counts", () => {
+  // Overload signatures repeat a column-0 declaration by design. Matched by path,
+  // a renamed file's parents read as empty and every overload reads as a redeclaration.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "README.md"), "base\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "fork.ts"), "export const FORK_FLAG = true;\n");
+    git("add", "-A");
+    git("commit", "-qm", "fork side");
+
+    git("checkout", "-q", "base");
+    writeFileSync(
+      path.join(dir, "old-name.ts"),
+      [
+        "export function parse(input: string): string;",
+        "export function parse(input: number): number;",
+        "export function parse(input: string | number) {",
+        "  return input;",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    git("add", "-A");
+    git("commit", "-qm", "upstream adds overloads");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    git("mv", "old-name.ts", "new-name.ts");
+    git("commit", "-qm", "fold merge that renames the file");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.deepEqual(result.redeclarations, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
