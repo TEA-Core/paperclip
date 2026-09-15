@@ -224,6 +224,7 @@ import {
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
@@ -1851,6 +1852,113 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(
       await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
     ).toHaveLength(0);
+  });
+
+  // Fold 2c saved-message strand guard (operator decision 2026-09-15; upstream repair df984cbc2
+  // is not in this fold). executeRun releases the issue lock at finalize but holds the run's
+  // environment lease until its finally. A comment landing in that window meets
+  // getConversationOwnershipBlocker ("has not released its environment lease") and is saved as a
+  // deferred_issue_execution wake with no owner left to promote it. The guard re-runs the fork's
+  // in-file drain right after the lease is released.
+  it("promotes a comment deferred between run release and environment lease release exactly once", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    // A persisted monitor makes the finishing run's release take the plain "released" exit, so the
+    // issue has no execution owner and no immediate-recovery run when the comment arrives.
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60_000) })
+      .where(eq(issues.id, issueId));
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Adapter failed",
+      provider: "test",
+      model: "test-model",
+    } as never);
+    const runtime = environmentRuntimeService(db);
+    let windowWakeResult: unknown = undefined;
+    let windowIssueExecutionRunId: string | null | undefined = undefined;
+    let deferredWakeId: string | null = null;
+    const heartbeat: ReturnType<typeof heartbeatService> = heartbeatService(db, {
+      environmentRuntime: {
+        ...runtime,
+        releaseRunLeases: async (...args: Parameters<typeof runtime.releaseRunLeases>) => {
+          if (args[0] === runId && windowWakeResult === undefined) {
+            windowIssueExecutionRunId = await db
+              .select({ executionRunId: issues.executionRunId })
+              .from(issues)
+              .where(eq(issues.id, issueId))
+              .then((rows) => rows[0]?.executionRunId ?? null);
+            const [comment] = await db
+              .insert(issueComments)
+              .values({
+                companyId,
+                issueId,
+                authorUserId: "responsible-user",
+                body: "Saved while the finished run was still cleaning up",
+              })
+              .returning();
+            windowWakeResult = await heartbeat.wakeup(agentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: { issueId, commentId: comment!.id },
+              contextSnapshot: {
+                issueId,
+                taskId: issueId,
+                commentId: comment!.id,
+                wakeReason: "issue_commented",
+              },
+              requestedByActorType: "user",
+              requestedByActorId: "responsible-user",
+            });
+            deferredWakeId = await db
+              .select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .where(
+                and(
+                  eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                ),
+              )
+              .then((rows) => rows[0]?.id ?? null);
+          }
+          return runtime.releaseRunLeases(...args);
+        },
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 8_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    // The window really opened: lock already released, comment saved instead of dispatched.
+    expect(windowIssueExecutionRunId).toBeNull();
+    expect(windowWakeResult).toBeNull();
+    expect(deferredWakeId).not.toBeNull();
+    const successorsFor = () =>
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, deferredWakeId!));
+    const successors = await waitForValue(async () => {
+      const rows = await successorsFor();
+      return rows.length > 0 ? rows : null;
+    });
+    expect(successors).toHaveLength(1);
+    const [promotedWake] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId!));
+    expect(promotedWake?.status).not.toBe("deferred_issue_execution");
+    expect(promotedWake?.runId).toBe(successors![0]!.id);
+
+    // Idempotent: another pass over the same finished run has nothing left to promote.
+    await heartbeat.releaseIssueExecutionAndPromote((await heartbeat.getRun(runId))!, {
+      suppressImmediateRecovery: true,
+    });
+    expect(await successorsFor()).toHaveLength(1);
+    await heartbeat.waitForRunExecutionDrain(successors![0]!.id);
+    await waitForHeartbeatIdle(db);
+    expect(await successorsFor()).toHaveLength(1);
   });
 
   it("does not queue immediate recovery when the failed run's issue is hidden", async () => {

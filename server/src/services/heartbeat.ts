@@ -27178,6 +27178,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
         });
         await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+        // Fold 2c saved-message strand guard; see promoteDeferredWakesStrandedByLeaseRelease.
+        await promoteDeferredWakesStrandedByLeaseRelease(latestRun).catch((err) => {
+          logger.error({ err, runId: run.id }, "failed to promote deferred comments after environment lease release");
+        });
       }
       if (
         runScratch &&
@@ -27358,6 +27362,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
     return buildExecutionReviewParticipantRecoveryNoticeSeed();
+  }
+
+  // Fold 2c saved-message strand guard (operator decision 2026-09-15), until upstream repair
+  // df984cbc2 (#13315) is folded. executeRun releases the issue lock at finalize but keeps the
+  // run's environment lease until its finally. A comment that lands in between meets
+  // getConversationOwnershipBlocker ("has not released its environment lease") and is saved as a
+  // deferred_issue_execution wake -- and the drain that would promote it already ran. Re-run the
+  // fork's own in-file drain once the lease is gone. It is safe to repeat: the release takes the
+  // issue row lock, promotes nothing when the issue already has another owner, and keeps the
+  // SUP-14737 drain/damp, pause-hold and invokability gates. suppressImmediateRecovery keeps this
+  // pass from queueing a recovery run the finalize-time release already decided on.
+  async function promoteDeferredWakesStrandedByLeaseRelease(
+    latestRun: typeof heartbeatRuns.$inferSelect | null | undefined,
+  ) {
+    if (!latestRun || latestRun.runtimeMode !== "legacy") return;
+    if (!["failed", "timed_out", "interrupted", "cancelled"].includes(latestRun.status)) return;
+    // #13275's post-cleanup block below owns an interrupted queue (and its restriction).
+    if (
+      latestRun.status === "cancelled" &&
+      readNonEmptyString(parseObject(latestRun.resultJson).queuedCommentInterruptQueueId)
+    ) {
+      return;
+    }
+    const issueId = readNonEmptyString(parseObject(latestRun.contextSnapshot).issueId);
+    if (!issueId) return;
+    const [issue] = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(and(eq(issues.companyId, latestRun.companyId), eq(issues.id, issueId)))
+      .limit(1);
+    // Still owned by this run: its own release has not run yet and will drain the queue itself.
+    if (!issue || issue.executionRunId === latestRun.id) return;
+    const [pending] = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, latestRun.companyId),
+          eq(agentWakeupRequests.agentId, latestRun.agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .limit(1);
+    if (!pending) return;
+    await releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true });
   }
 
   // Fold D9: upstream #13275 narrowed this to Pick<"id" | "companyId"> because its body delegates
