@@ -27630,6 +27630,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      // Fold 2c / Q2 (operator decision 2026-09-15, FENCE): upstream #13038 fences chat recovery
+      // by the finishing run's ACTUAL original chat ownership -- its wakeupRequestId is a durable
+      // inbound_wakeup or failed_run_retry chat action (wake-queue isImmediateRecoverySourceBlocked).
+      // A "chat:*" context source or a chat receipt key does not count. With D9 deferred this
+      // in-file release is the live path and had no such fence, so a chat-owned failed run got a
+      // generic continuation run or promoted separately queued chat input. Two narrow fences
+      // mirror upstream for chat-owned runs ONLY; for any other run the lookup finds no row and
+      // the fork's D9-deferred behaviour is unchanged:
+      //   1. here, before deferred promotion (upstream's pre-drain order): a chat-owned legacy run
+      //      whose provider outcome is unknown releases the lock and does nothing else, as the
+      //      module's legacyExecutionNeedsReconciliation exit does. The board reconciliation hold
+      //      decides what happens next, and separately queued chat input stays deferred. Upstream
+      //      takes that exit for EVERY legacy run; the fork keeps it chat-owned-only until D9.
+      //   2. at shouldBlockImmediately below: any other chat-owned failed run is blocked instead
+      //      of receiving generic continuation recovery (upstream sourceRequiresExplicitRecovery).
+      // The D9 port replaces both with the module's rules; delete them in that change.
+      const findChatOwnedRecoverySource = () =>
+        run.wakeupRequestId
+          ? tx
+              .select({ id: chatActions.id })
+              .from(chatActions)
+              .where(
+                and(
+                  eq(chatActions.id, run.wakeupRequestId),
+                  eq(chatActions.companyId, run.companyId),
+                  inArray(chatActions.kind, ["inbound_wakeup", "failed_run_retry"]),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null)
+          : Promise.resolve(null);
+      if (legacyExecutionNeedsReconciliation(run) && (await findChatOwnedRecoverySource())) {
+        return { kind: "released" as const };
+      }
+
       // Upstream #13275, ported from the dormant wake-queue postgres adapter (fold D9): a legacy
       // queue interrupt authorizes only its original pending queue for the interrupted agent.
       // Replays after dispatch, a discarded queue, or a stale queue id cannot launch other work.
@@ -28529,6 +28564,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      // Fold 2c / Q2 fence 2 (see the chat-ownership note before deferred promotion above):
+      // computed only after the same exits upstream checks first.
+      const chatOwnedRecoverySource = Boolean(await findChatOwnedRecoverySource());
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
@@ -28539,6 +28577,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // placed after the suppress / existing-path / monitor / blocker / pause-hold /
         // stranded-origin exits above, which is upstream's evaluation order.
         nonRetryablePreflightFailure ||
+        // Fold 2c / Q2: upstream's chat-owner disjunct of the same predicate. Its
+        // chat_failed_run_retry_not_authorized disjunct is already in the D12 code set.
+        chatOwnedRecoverySource ||
         preAdapterSetupLoopBounded ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
       if (shouldBlockImmediately) {
