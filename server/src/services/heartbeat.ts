@@ -888,19 +888,26 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
 // started, so no agent could post an issue comment. The setup catch writes one
 // of these codes when a failure happens before `adapter.execute`.
 //
-// Fold note (2c): #13038 widened this set with NON_RETRYABLE_PREFLIGHT_FAILURE_CODES,
-// and that widening is kept deliberately. The fork's SUP-15589 streak counter
-// (countConsecutivePreAdapterSetupFailures, below) reads this same set, so the
-// membership change reaches the three-strike bound as well as the
-// missing-comment gate. It is not a change to the fork's streak semantics: none
-// of the seven added codes could ever reach `heartbeat_runs.error_code` before
-// this fold, because the only producer that maps them onto a run is #13038's own
-// `nonRetryablePreflightFailureCode` (a fork low-trust 422 finalized as
-// `adapter_failed`). The codes and the widening therefore arrive together, and
-// refusing further automatic re-dispatch after three consecutive refusals that
-// upstream itself labels NON-RETRYABLE is the wanted outcome — keeping the fork's
-// narrower set would instead let those new codes loop unbounded through the
-// immediate-recovery retry in releaseIssueExecutionAndPromote.
+// Fold note (2c / D12, operator decision 2026-09-15): #13038 widened this set with
+// NON_RETRYABLE_PREFLIGHT_FAILURE_CODES. None of the seven could reach
+// `heartbeat_runs.error_code` before this fold (the only producer is #13038's own
+// `nonRetryablePreflightFailureCode`), so the codes and the widening arrive together.
+// Upstream blocks those codes on the FIRST failure (wake-queue
+// isImmediateRecoverySourceBlocked -> sourceRequiresExplicitRecovery). The fork does
+// the same in releaseIssueExecutionAndPromote: isNonRetryablePreflightFailedRun is a
+// disjunct of shouldBlockImmediately, so none of the seven ever gets an
+// immediate-recovery run. They stay in THIS set for two other readers:
+//   - the missing-comment gate (a pre-adapter failure cannot post a comment), and
+//   - the SUP-15589 streak (countConsecutivePreAdapterSetupFailures), which bounds the
+//     stale-run handoff in enqueueStaleRunHandoffWake. The handoff dispatches a
+//     DIFFERENT agent, so it is not a retry of the refused run, and is not first-strike.
+// The SUP-15589 three-strike bound therefore remains the release-path refusal for
+// `setup_failed` (after its one immediate retry). configuration_incomplete and
+// workspace_validation_failed already block on the first failure in the release path,
+// so the streak only bounds them on the handoff path. Do NOT replace the disjunct with
+// upstream's `classifyContinuationFailure(run).kind === "non_retryable"`: that set
+// contains `setup_failed` and would make SUP-15589 dead code on the release path (see
+// the D9 note at the wake-queue glue).
 const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
   "setup_failed",
   CONFIGURATION_INCOMPLETE_FAILURE_CODE,
@@ -2919,6 +2926,15 @@ function isOpenCodeDatabaseGrowthLimitFailedRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
 ) {
   return run?.errorCode === OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE;
+}
+
+// Fold 2c / D12 (operator decision 2026-09-15): upstream first-strike. A run that failed
+// with a preflight refusal upstream labels non-retryable gets no immediate-recovery run;
+// see the note above PRE_ADAPTER_SETUP_FAILURE_CODES.
+function isNonRetryablePreflightFailedRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
+) {
+  return run?.errorCode != null && NON_RETRYABLE_PREFLIGHT_FAILURE_CODES.has(run.errorCode);
 }
 
 function readWorkspaceValidationPayloadFromRun(
@@ -10366,6 +10382,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // same change, delete whichever half it does not keep -- this block,
     // `loadStrandedEscalationRows`, `buildStrandedRecoveryNoticeForKind` and
     // `applyWakeQueuePostCommitEffects` (all dormant for the same reason).
+    // D12 (2026-09-15) contract for that port: first-strike (blocked, no retry run) iff the
+    // run's errorCode is in NON_RETRYABLE_PREFLIGHT_FAILURE_CODES; `setup_failed` is NEVER
+    // first-strike (SUP-15589: one immediate retry, then didAutomaticRecoveryFail / streak
+    // >= 3). The module's isImmediateRecoverySourceBlocked uses classifyContinuationFailure,
+    // whose non_retryable set contains setup_failed, so the port must change that predicate
+    // and move the Set to a leaf module the adapter can import without a cycle.
     recovery: {
       escalateStrandedAssignedIssue: async (input) => {
         const rows = await loadStrandedEscalationRows(input);
@@ -27365,6 +27387,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : 0;
     const preAdapterSetupLoopBounded =
       preAdapterSetupFailureStreak >= PRE_ADAPTER_SETUP_FAILURE_MAX_ATTEMPTS;
+    // Fold 2c / D12: upstream first-strike for non-retryable preflight refusals. Computed
+    // before the tx so the post-commit event gate below can read it.
+    const nonRetryablePreflightFailure = isNonRetryablePreflightFailedRun(run);
 
     const promotionResult = await db.transaction(async (tx) => {
       // Lock the context issue (if any) AND every issue that still references this run.
@@ -28416,6 +28441,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
         isOpenCodeDatabaseGrowthLimitFailedRun(run) ||
+        // Fold 2c / D12: first-strike (upstream sourceRequiresExplicitRecovery). Deliberately
+        // placed after the suppress / existing-path / monitor / blocker / pause-hold /
+        // stranded-origin exits above, which is upstream's evaluation order.
+        nonRetryablePreflightFailure ||
         preAdapterSetupLoopBounded ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
       if (shouldBlockImmediately) {
@@ -28580,7 +28609,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (promotionResult?.kind === "blocked") {
-      if (preAdapterSetupLoopBounded) {
+      // Fold 2c / D12: a block produced by the first-strike disjunct is a refusal, not a
+      // retry exhaustion. Keyed on recoveryCause as well as the code: the review-participant
+      // and workspace/config blocks always set a cause and keep their SUP-15589 event.
+      const firstStrikeRefusal =
+        nonRetryablePreflightFailure && promotionResult.recoveryCause === undefined;
+      if (firstStrikeRefusal) {
+        // Deliberately NOT prefixed "Bounded retry exhausted": getRetryExhaustedReason
+        // matches that prefix, and no retry happened here.
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: `Automatic re-dispatch refused: ${run.errorCode} is a non-retryable preflight failure`,
+          payload: {
+            issueId: contextIssueId,
+            errorCode: run.errorCode,
+          },
+        });
+      }
+      if (preAdapterSetupLoopBounded && !firstStrikeRefusal) {
         // SUP-15589: record a non-null retryExhaustedReason (getRetryExhaustedReason
         // matches this lifecycle message) on the run whose re-dispatch was refused.
         await appendRunEvent(run, {
@@ -28614,6 +28662,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : promotionResult.recoveryCause === OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
                 ? OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
               : undefined,
+        suppressOwnerWakeForRefusedAgent: firstStrikeRefusal,
       });
       return;
     }

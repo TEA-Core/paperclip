@@ -4796,6 +4796,9 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
     agentInvokability?: AgentInvokability | null;
+    // Fold 2c / D12: set only by releaseIssueExecutionAndPromote for a first-strike
+    // non-retryable preflight refusal. See the owner-wake call below.
+    suppressOwnerWakeForRefusedAgent?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -5038,12 +5041,25 @@ export function recoveryService(
       },
     });
 
-    await enqueueSourceScopedStrandedRecoveryWake({
-      action: recoveryAction,
-      issue: input.issue,
-      latestRun: input.latestRun,
-      recoveryCause,
-    });
+    // Fold 2c / D12 (operator decision 2026-09-15): upstream first-strike means "no automatic
+    // re-dispatch" for the seven non-retryable preflight refusals. Upstream #11961 deleted this
+    // owner wake outright; the fork keeps it, but when the owner IS the refused run's agent the
+    // wake re-dispatches the same agent onto the same issue policy, which refuses it again
+    // (a structural refusal, not a transient one). A different owner can legitimately pass
+    // (e.g. low_trust_boundary_mismatch keys on allowedAgentIds), so only the same-agent wake
+    // is skipped. The recovery action and the blocked status still stand.
+    const ownerWakeWouldRedispatchRefusedAgent =
+      input.suppressOwnerWakeForRefusedAgent === true &&
+      recoveryAction.ownerAgentId != null &&
+      recoveryAction.ownerAgentId === input.latestRun?.agentId;
+    if (!ownerWakeWouldRedispatchRefusedAgent) {
+      await enqueueSourceScopedStrandedRecoveryWake({
+        action: recoveryAction,
+        issue: input.issue,
+        latestRun: input.latestRun,
+        recoveryCause,
+      });
+    }
 
     if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
       const [currentIssue] = await db

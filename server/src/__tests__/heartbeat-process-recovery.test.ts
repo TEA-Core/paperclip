@@ -1632,6 +1632,227 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).resolves.toEqual({ status: "idle", errorReason: null });
   });
 
+  // Fold 2c / D12 (operator decision 2026-09-15): upstream first-strike for the seven
+  // non-retryable preflight codes; SUP-15589's three-strike bound stays for setup_failed.
+  // Driven through the public release hook so these hold on either side of the deferred D9
+  // wake-queue port.
+  async function failFixtureRunForRelease(runId: string, errorCode: string) {
+    const finishedAt = new Date("2026-03-19T00:01:00.000Z");
+    const [failed] = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        errorCode,
+        error: `preflight refused: ${errorCode}`,
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning();
+    return failed!;
+  }
+
+  async function seedEarlierIssueRunFailures(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    errorCode: string;
+    count: number;
+  }) {
+    for (let index = 0; index < input.count; index += 1) {
+      // Strictly older than the fixture run (2026-03-19T00:00Z): the streak orders by createdAt.
+      const createdAt = new Date(Date.parse("2026-03-18T23:50:00.000Z") + index * 60_000);
+      await db.insert(heartbeatRuns).values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: input.errorCode,
+        contextSnapshot: { issueId: input.issueId, wakeReason: "issue_assigned" },
+        finishedAt: createdAt,
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+  }
+
+  async function lifecycleMessagesForRun(runId: string, prefix: string) {
+    return db
+      .select({ message: heartbeatRunEvents.message })
+      .from(heartbeatRunEvents)
+      .where(
+        and(
+          eq(heartbeatRunEvents.runId, runId),
+          eq(heartbeatRunEvents.eventType, "lifecycle"),
+          sql`${heartbeatRunEvents.message} like ${`${prefix}%`}`,
+        ),
+      );
+  }
+
+  it.each([
+    "low_trust_isolation_unavailable",
+    "low_trust_requires_isolated_workspace",
+    "low_trust_boundary_mismatch",
+    "low_trust_requires_sandbox_environment",
+    "low_trust_runtime_services_denied",
+    "chat_failed_run_retry_not_authorized",
+    CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
+  ])("blocks on the first %s failure without queueing a recovery run (D12 first-strike)", async (errorCode) => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const run = await failFixtureRunForRelease(runId, errorCode);
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.releaseIssueExecutionAndPromote(run);
+
+    expect(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+    ).toEqual({ status: "blocked", executionRunId: null });
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actions).toEqual([
+      expect.objectContaining({ status: "active", ownerAgentId: agentId }),
+    ]);
+    // The fork keeps the source-scoped owner wake upstream #11961 deleted, but for a
+    // structural refusal whose owner is the refused agent that wake would re-dispatch the
+    // same refusal, so D12 suppresses it.
+    const ownerWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+        ),
+      );
+    expect(ownerWakes).toHaveLength(0);
+    expect(await lifecycleMessagesForRun(runId, "Automatic re-dispatch refused")).toHaveLength(1);
+    expect(await heartbeat.getRetryExhaustedReason(runId)).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    await waitForHeartbeatIdle(db);
+  });
+
+  it("still queues one immediate recovery for a first setup_failed pre-adapter failure (SUP-15589 bound, not first-strike)", async () => {
+    const { runId, issueId } = await seedQueuedIssueRunFixture();
+    const run = await failFixtureRunForRelease(runId, "setup_failed");
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.releaseIssueExecutionAndPromote(run);
+
+    // Do not assert the recovery run's status or the issue lock: post-commit
+    // startNextQueuedRunForAgent launches it immediately.
+    const recoveryRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(recoveryRuns).toHaveLength(1);
+    expect(recoveryRuns[0]!.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      wakeReason: "issue_continuation_needed",
+    });
+    expect(await lifecycleMessagesForRun(runId, "Automatic re-dispatch refused")).toHaveLength(0);
+    expect(await heartbeat.getRetryExhaustedReason(runId)).toBeNull();
+    await heartbeat.waitForRunExecutionDrain(recoveryRuns[0]!.id);
+    await waitForHeartbeatIdle(db);
+  });
+
+  it("refuses setup_failed re-dispatch at the SUP-15589 streak bound and records retry exhaustion", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await seedEarlierIssueRunFailures({ companyId, agentId, issueId, errorCode: "setup_failed", count: 2 });
+    const run = await failFixtureRunForRelease(runId, "setup_failed");
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.releaseIssueExecutionAndPromote(run);
+
+    expect(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("blocked");
+    expect(await heartbeat.getRetryExhaustedReason(runId)).toContain(
+      "Bounded retry exhausted after 3 consecutive pre-adapter setup failures",
+    );
+    expect(await lifecycleMessagesForRun(runId, "Automatic re-dispatch refused")).toHaveLength(0);
+    await waitForHeartbeatIdle(db);
+  });
+
+  it("records a first-strike refusal, not SUP-15589 retry exhaustion, when a non-retryable preflight streak is at the bound", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await seedEarlierIssueRunFailures({
+      companyId,
+      agentId,
+      issueId,
+      errorCode: "low_trust_isolation_unavailable",
+      count: 2,
+    });
+    const run = await failFixtureRunForRelease(runId, "low_trust_isolation_unavailable");
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.releaseIssueExecutionAndPromote(run);
+
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("blocked");
+    // No retry happened, so nothing may surface as retryExhaustedReason.
+    expect(await lifecycleMessagesForRun(runId, "Bounded retry exhausted")).toHaveLength(0);
+    expect(await heartbeat.getRetryExhaustedReason(runId)).toBeNull();
+    expect(await lifecycleMessagesForRun(runId, "Automatic re-dispatch refused")).toHaveLength(1);
+    await waitForHeartbeatIdle(db);
+  });
+
+  it("releases a non-retryable preflight failure instead of first-strike blocking under suppressImmediateRecovery (D12 ordering)", async () => {
+    const { companyId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const run = await failFixtureRunForRelease(runId, "low_trust_isolation_unavailable");
+
+    await heartbeatService(db).releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true });
+
+    expect(
+      await db
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+    ).toEqual({ status: "in_progress", executionRunId: null });
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, companyId),
+            eq(issueRecoveryActions.sourceIssueId, issueId),
+          ),
+        ),
+    ).toHaveLength(0);
+    expect(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
+    ).toHaveLength(0);
+  });
+
   it("does not queue immediate recovery when the failed run's issue is hidden", async () => {
     mockAdapterExecute.mockResolvedValueOnce({
       exitCode: 1,
