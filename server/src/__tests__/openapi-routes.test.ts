@@ -550,7 +550,56 @@ const DISCOVERED_BOARD_ROUTES = [
   "POST /api/companies/import/transfers/{transferId}/apply",
 ];
 
-const BOARD_ROUTES = [...ISSUE_BOARD_ROUTES, ...DISCOVERED_BOARD_ROUTES];
+// SUP-16341: 38 board-reject-guard routes the extended detector surfaced as
+// mis-published (agent-callable in the spec) across access/agents/built-in-
+// agents/decision-training/environments/issues/folders/inbox-agent-policy/
+// inbox-dismissals. Kept as a separate array (mirrors the
+// BOARD_ONLY_OPERATIONS block in openapi.ts) so the per-route parity
+// assertions below cover them alongside the regression-guard sweep. The
+// summary-slot /generate route was already corrected by SUP-16339 and is not
+// duplicated here.
+const SUP16341_BOARD_ROUTES = [
+  "POST /api/cli-auth/challenges/{id}/approve",
+  "POST /api/cli-auth/revoke-current",
+  "PATCH /api/agents/{id}/instructions-path",
+  "POST /api/companies/{companyId}/built-in-agents/{key}/routines/{routineKey}/enable",
+  "POST /api/companies/{companyId}/built-in-agents/{key}/routines/{routineKey}/disable",
+  "POST /api/companies/{companyId}/built-in-agents/{key}/routines/{routineKey}/run",
+  "POST /api/companies/{companyId}/decision-training",
+  "POST /api/companies/{companyId}/decision-training/preview",
+  "PATCH /api/decision-training/{id}",
+  "DELETE /api/decision-training/{id}",
+  "GET /api/environments/{environmentId}/custom-image-template",
+  "DELETE /api/environments/{environmentId}/custom-image-template",
+  "POST /api/environments/{environmentId}/custom-image-setup-sessions",
+  "POST /api/environments/{environmentId}/custom-image-template/relink",
+  "POST /api/environments/{environmentId}/custom-image-template/rollback",
+  "GET /api/environments/{id}/delete-blast-radius",
+  "GET /api/environments/{id}/secret-refs",
+  "POST /api/environments/{id}/probe",
+  "POST /api/companies/{companyId}/environments/probe-config",
+  "GET /api/environment-custom-image-setup-sessions/{sessionId}",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/cancel",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/finish",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/terminal-session-token",
+  "DELETE /api/issues/{id}/read",
+  "POST /api/issues/{id}/read",
+  "GET /api/issues/{id}/feedback-votes",
+  "GET /api/issues/{id}/feedback-traces",
+  "GET /api/feedback-traces/{traceId}",
+  "GET /api/feedback-traces/{traceId}/bundle",
+  "POST /api/issues/{id}/admin/force-release",
+  "POST /api/issues/{id}/documents/{key}/lock",
+  "POST /api/issues/{id}/documents/{key}/unlock",
+  "POST /api/companies/{companyId}/inbox-dismissals",
+  "GET /api/companies/{companyId}/inbox-dismissals",
+  "DELETE /api/companies/{companyId}/inbox-dismissals/{itemKey}",
+  "GET /api/companies/{companyId}/users/me/inbox-agent-policy",
+  "PUT /api/companies/{companyId}/users/me/inbox-agent-policy",
+  "POST /api/companies/{companyId}/folders/ensure-my",
+];
+
+const BOARD_ROUTES = [...ISSUE_BOARD_ROUTES, ...DISCOVERED_BOARD_ROUTES, ...SUP16341_BOARD_ROUTES];
 const INSTANCE_ADMIN_ROUTES = ISSUE_INSTANCE_ADMIN_ROUTES;
 
 // A route registration line: `router.<method>(` (path may be on this line or the
@@ -663,10 +712,208 @@ function buildAuthRouteBlocks(): { byRoute: Map<string, AuthBlock>; unresolvedBa
   return { byRoute, unresolvedBareConstants };
 }
 
-// Derive the expected auth level from a route handler's base assertion.
+// ── req.actor.type !== "board" reject-guard detection (SUP-16341) ──────────
+//
+// The SUP-14798 detector above only recognises the canonical
+// assertBoard / assertBoardOrgAccess / assertInstanceAdmin helpers. A
+// board-only route can instead reject non-board actors with
+// `if (req.actor.type !== "board") { 403 }` — inline in the handler, or inside
+// a same-file helper the handler calls (e.g. requireBoardUser in
+// inbox-dismissals.ts). Neither is a base assert call, so the earlier detector
+// returned null and the route published as board_or_agent + AgentBearerAuth.
+//
+// A *hard* board reject is one the route takes on every agent request: the
+// `req.actor.type !== "board"` check sits at the top level of an `if`
+// condition — as the whole clause or OR-ed onto it — and its then-branch halts
+// the request (throw / 4xx response / return). A check AND-ed behind another
+// condition (`x === "me" && req.actor.type !== "board"`) is a per-request
+// filter, not a route-level guard, and `!== "board" && !== "agent"` lets
+// agents through — so neither is a hard reject.
+
+const BOARD_REJECT_NEEDLE = /req\.actor\.type\s*!==\s*["'`]board["'`]/g;
+
+// Index of the paren that closes the paren opened at openIdx, or -1.
+function matchingParen(text: string, openIdx: number): number {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i];
+    if (c === "(") depth += 1;
+    else if (c === ")") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+// Index of the brace that closes the brace opened at openIdx, or -1.
+function matchingBrace(text: string, openIdx: number): number {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i];
+    if (c === "{") depth += 1;
+    else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+// Paren depth at (not including) position pos.
+function parenDepthUpTo(s: string, pos: number): number {
+  let depth = 0;
+  for (let i = 0; i < pos && i < s.length; i++) {
+    if (s[i] === "(") depth += 1;
+    else if (s[i] === ")") depth -= 1;
+  }
+  return depth;
+}
+
+// The `||`/`&&` that connects the current top-level clause to the one before it,
+// scanning `s[0..pos)` at paren depth 0; null when the clause is the first.
+function lastTopLevelOperatorBefore(s: string, pos: number): "||" | "&&" | null {
+  let depth = 0;
+  let lastOp: "||" | "&&" | null = null;
+  for (let i = 0; i < pos; i++) {
+    if (s[i] === "(") depth += 1;
+    else if (s[i] === ")") depth -= 1;
+    else if (depth === 0) {
+      if (s.startsWith("||", i)) {
+        lastOp = "||";
+        i += 1;
+      } else if (s.startsWith("&&", i)) {
+        lastOp = "&&";
+        i += 1;
+      }
+    }
+  }
+  return lastOp;
+}
+
+// True when `cond` has a top-level clause that is exactly
+// `req.actor.type !== "board"` OR-ed in (or the sole clause). Such a clause is
+// true for every agent, so the enclosing `if` rejects agents on every request.
+function conditionIsHardBoardReject(cond: string): boolean {
+  for (const m of cond.matchAll(BOARD_REJECT_NEEDLE)) {
+    const pos = m.index ?? 0;
+    if (parenDepthUpTo(cond, pos) !== 0) continue;
+    const op = lastTopLevelOperatorBefore(cond, pos);
+    if (op === null || op === "||") return true;
+  }
+  return false;
+}
+
+// The then-branch of `if (…)` at ifIndex: does it reject the request
+// unconditionally? A genuine board reject sends a 4xx or throws directly. A bare
+// `return` is not counted: from a helper it is a no-op that lets agents through
+// (e.g. `assertBoardCanAssignTasks` skips the board-only task check for agents),
+// and nested control flow means the reject is conditional, not a route-level
+// guard.
+function thenBranchHalts(text: string, ifIndex: number): boolean {
+  const openParen = text.indexOf("(", ifIndex);
+  if (openParen === -1) return false;
+  const closeParen = matchingParen(text, openParen);
+  if (closeParen === -1) return false;
+  let i = closeParen + 1;
+  while (i < text.length && /\s/.test(text[i])) i += 1;
+  if (i >= text.length) return false;
+  let body: string;
+  if (text[i] === "{") {
+    const closeBrace = matchingBrace(text, i);
+    body = closeBrace === -1 ? text.slice(i) : text.slice(i, closeBrace);
+  } else {
+    let depth = 0;
+    let j = i;
+    for (; j < text.length; j++) {
+      const c = text[j];
+      if (c === "{" || c === "(" || c === "[") depth += 1;
+      else if (c === "}" || c === ")" || c === "]") depth = Math.max(0, depth - 1);
+      else if ((c === ";" || c === "\n") && depth === 0) break;
+    }
+    body = text.slice(i, j);
+  }
+  const halts = /\bthrow\b/.test(body) || /res\.status\s*\(\s*4/.test(body);
+  const noNestedControlFlow = !/\b(?:if|for|while|switch)\s*\(/.test(body);
+  return halts && noNestedControlFlow;
+}
+
+// Brace depth at (not including) position pos in s.
+function braceDepthUpTo(s: string, pos: number): number {
+  let depth = 0;
+  for (let i = 0; i < pos && i < s.length; i++) {
+    if (s[i] === "{") depth += 1;
+    else if (s[i] === "}") depth -= 1;
+  }
+  return depth;
+}
+
+// True when, within `block`, an `if` sitting at brace depth `depth` (starting the
+// scan at fromIdx) is a hard board reject: a top-level clause that rejects board
+// and a then-branch that halts unconditionally. Only the top-level depth matches,
+// so a board-reject nested inside a sub-branch (`if (param === "me") { if
+// (req.actor.type !== "board") … }`) is a per-request filter, not a route-level
+// guard, and is ignored.
+function hardBoardRejectAtDepth(block: string, depth: number, fromIdx: number): boolean {
+  for (const m of block.matchAll(/\bif\s*\(/g)) {
+    const ifPos = m.index!;
+    if (ifPos < fromIdx) continue;
+    if (braceDepthUpTo(block, ifPos) !== depth) continue;
+    const open = ifPos + m[0].length - 1;
+    const close = matchingParen(block, open);
+    if (close === -1) continue;
+    const cond = block.slice(open + 1, close);
+    if (conditionIsHardBoardReject(cond) && thenBranchHalts(block, ifPos)) return true;
+  }
+  return false;
+}
+
+// Same-file `function NAME(` / `async function NAME(` bodies, memoized. First
+// definition wins; names are unique per file in the route modules.
+const fileFunctionBodies = new Map<string, Map<string, string>>();
+function extractFunctionBodies(source: string): Map<string, string> {
+  const bodies = new Map<string, string>();
+  const declRe = /\b(?:async\s+function|function)\s+([A-Za-z_$][\w$]*)\s*\(/g;
+  for (const m of source.matchAll(declRe)) {
+    const name = m[1];
+    if (bodies.has(name)) continue;
+    const openParen = m.index! + m[0].length - 1;
+    const closeParen = matchingParen(source, openParen);
+    if (closeParen === -1) continue;
+    let i = closeParen + 1;
+    while (i < source.length && !/[{;]/.test(source[i])) i += 1;
+    if (i >= source.length || source[i] !== "{") continue;
+    const closeBrace = matchingBrace(source, i);
+    if (closeBrace === -1) continue;
+    bodies.set(name, source.slice(i, closeBrace + 1));
+  }
+  return bodies;
+}
+function functionBodies(file: string): Map<string, string> {
+  let cached = fileFunctionBodies.get(file);
+  if (!cached) {
+    cached = extractFunctionBodies(fs.readFileSync(path.join(ROUTES_DIR, file), "utf8"));
+    fileFunctionBodies.set(file, cached);
+  }
+  return cached;
+}
+
+// A "board-guard" helper rejects board at the top level of its own body (depth 1):
+// `requireBoardUser`, `requireHumanUser`, `assertCanControlBuiltInRoutine`, …
+function isBoardGuardHelper(helperBody: string): boolean {
+  return hardBoardRejectAtDepth(helperBody, 1, 0);
+}
+
+// Derive the expected auth level from a route handler.
 //   assertInstanceAdmin -> instance_admin
 //   assertBoard / assertBoardOrgAccess -> board
+//   a top-level `req.actor.type !== "board"` reject in the handler body, or a
+//   top-level call to a board-guard helper -> board
 //   otherwise -> null (agent-callable, or gated by a domain-specific helper)
+//
+// Only top-of-body gates count: a board-reject reached only through a sub-branch
+// (e.g. `if (filter === "me")`) or an agent-success path leaves the route
+// agent-callable, so it is not classified board-only.
 function deriveAuthLevel(block: AuthBlock | undefined): "instance_admin" | "board" | null {
   if (!block) return null;
   const text = block.text.replace(AGENT_ALLOW_GUARD, " ");
@@ -676,10 +923,53 @@ function deriveAuthLevel(block: AuthBlock | undefined): "instance_admin" | "boar
   if (IA_ASSERT.test(text)) sawIa = true;
   if (sawIa) return "instance_admin";
   if (sawBoard) return "board";
+
+  const raw = block.text;
+  const arrow = raw.lastIndexOf("=>");
+  if (arrow === -1) return null;
+  const bodyOpen = raw.indexOf("{", arrow);
+  if (bodyOpen === -1) return null;
+  const bodyDepth = braceDepthUpTo(raw, bodyOpen) + 1;
+
+  if (hardBoardRejectAtDepth(raw, bodyDepth, bodyOpen)) return "board";
+
+  const bodies = functionBodies(block.file);
+  for (const m of raw.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const callPos = m.index!;
+    if (callPos < bodyOpen) continue;
+    if (braceDepthUpTo(raw, callPos) !== bodyDepth) continue;
+    if (bodies.has(m[1]) && isBoardGuardHelper(bodies.get(m[1])!)) return "board";
+  }
   return null;
 }
 
 const { byRoute: authRouteBlocks, unresolvedBareConstants } = buildAuthRouteBlocks();
+
+// ── Design decision (SUP-16341, AC#5) ──────────────────────────────────────
+//
+// Two designs were considered for keeping the spec's auth metadata honest:
+//
+//   Design A (chosen): keep the spec's auth level data-driven (the
+//   BOARD_ONLY_OPERATIONS / INSTANCE_ADMIN_OPERATIONS / PUBLIC_OPERATIONS sets
+//   in openapi.ts) and extend this test's detector so it FAILS whenever a
+//   handler enforces a board/instance-admin guard that the spec no longer
+//   reflects. Drift is caught at the boundary: the detector classifies each
+//   handler, the spec publishes its own level, and the regression guard below
+//   asserts the two agree.
+//
+//   Design B (deferred): make the guard itself the single source of truth —
+//   annotate each route with an explicit `auth: "board" | "agent" | …` that
+//   both the runtime guard and the OpenAPI generator read, so the two can
+//   never diverge.
+//
+// Design B is the more durable fix (one source of truth, no detector
+// heuristics, no allowlist to keep in sync). It was deferred because it touches
+// the route-registration surface across every route file plus the OpenAPI
+// generator and the guard, which exceeds this ticket's bounded footprint
+// (≤5 files, one PR). Design A closes the concrete over-promise (board-reject
+// routes advertising AgentBearerAuth) and adds a CI guard so future drift of
+// this class fails the build. Revisit Design B when the route-registration
+// layer gets a broader refactor that can absorb a per-route auth annotation.
 
 describe("openapi auth parity (SUP-14798)", () => {
   const spec = buildOpenApiSpec();
@@ -709,6 +999,7 @@ describe("openapi auth parity (SUP-14798)", () => {
     expect(ISSUE_BOARD_ROUTES).toHaveLength(54);
     expect(ISSUE_INSTANCE_ADMIN_ROUTES).toHaveLength(7);
     expect(DISCOVERED_BOARD_ROUTES).toHaveLength(10);
+    expect(SUP16341_BOARD_ROUTES).toHaveLength(38);
   });
 
   it("resolves every bare-constant route registration (no silent skips)", () => {

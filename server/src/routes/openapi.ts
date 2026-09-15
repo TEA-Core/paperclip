@@ -1106,6 +1106,52 @@ const BOARD_ONLY_OPERATIONS = new Set([
   // assertBoard-based detector cannot see, so it was silently published as
   // board_or_agent + AgentBearerAuth. Manual generate is a board/user action.
   "POST /api/companies/{companyId}/summary-slots/{scopeKind}/{slotKey}/generate",
+  // SUP-16341: board-reject guards detected by the extended SUP-14798 regression
+  // guard. Each handler hard-rejects every non-board actor — either an inline
+  // top-level `if (req.actor.type !== "board") { reject }` or a top-level call to
+  // a board-guard helper (requireBoardUser, requireHumanUser,
+  // assertCanAccessInstanceEnvironments, assertCustomImageCompanyAccess,
+  // assertCanControlBuiltInRoutine, assertCanGenerateSummary, selfUserId, …).
+  // Publishing them as agent-callable contradicted the guard; they stay
+  // board-only in the spec. Metadata only — no runtime authorization change.
+  "POST /api/cli-auth/challenges/{id}/approve",
+  "POST /api/cli-auth/revoke-current",
+  "PATCH /api/agents/{id}/instructions-path",
+  "POST /api/companies/{companyId}/built-in-agents/{key}/routines/{routineKey}/enable",
+  "POST /api/companies/{companyId}/built-in-agents/{key}/routines/{routineKey}/disable",
+  "POST /api/companies/{companyId}/built-in-agents/{key}/routines/{routineKey}/run",
+  "POST /api/companies/{companyId}/decision-training",
+  "POST /api/companies/{companyId}/decision-training/preview",
+  "PATCH /api/decision-training/{id}",
+  "DELETE /api/decision-training/{id}",
+  "GET /api/environments/{environmentId}/custom-image-template",
+  "DELETE /api/environments/{environmentId}/custom-image-template",
+  "POST /api/environments/{environmentId}/custom-image-setup-sessions",
+  "POST /api/environments/{environmentId}/custom-image-template/relink",
+  "POST /api/environments/{environmentId}/custom-image-template/rollback",
+  "GET /api/environments/{id}/delete-blast-radius",
+  "GET /api/environments/{id}/secret-refs",
+  "POST /api/environments/{id}/probe",
+  "POST /api/companies/{companyId}/environments/probe-config",
+  "GET /api/environment-custom-image-setup-sessions/{sessionId}",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/cancel",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/finish",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/terminal-session-token",
+  "DELETE /api/issues/{id}/read",
+  "POST /api/issues/{id}/read",
+  "GET /api/issues/{id}/feedback-votes",
+  "GET /api/issues/{id}/feedback-traces",
+  "GET /api/feedback-traces/{traceId}",
+  "GET /api/feedback-traces/{traceId}/bundle",
+  "POST /api/issues/{id}/admin/force-release",
+  "POST /api/issues/{id}/documents/{key}/lock",
+  "POST /api/issues/{id}/documents/{key}/unlock",
+  "POST /api/companies/{companyId}/inbox-dismissals",
+  "GET /api/companies/{companyId}/inbox-dismissals",
+  "DELETE /api/companies/{companyId}/inbox-dismissals/{itemKey}",
+  "GET /api/companies/{companyId}/users/me/inbox-agent-policy",
+  "PUT /api/companies/{companyId}/users/me/inbox-agent-policy",
+  "POST /api/companies/{companyId}/folders/ensure-my",
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
