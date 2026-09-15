@@ -207,6 +207,7 @@ import type {
 } from "./chat-sdk-state.js";
 import {
   logActivity,
+  logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
@@ -26414,8 +26415,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   eq(chatEndpointResources.id, entry.id),
                 ),
               );
+          // Fold 2c / SUP-9856 (fork audit contract since 77ad35d95): the fork's `logActivity`
+          // swallows failures (right only after a commit). This audit is inside the transaction
+          // and must share the resource write's fate, so use the propagating variant; upstream's
+          // `logActivity` already propagates. Revisit if the fork drops the two-variant split.
           if (changes.length > 0)
-            await logActivity(
+            await logActivityInTransaction(
               tx as unknown as Db,
               {
                 companyId: endpoint.companyId,
