@@ -1569,6 +1569,10 @@ describe("renderPaperclipWakePrompt", () => {
       "Try again — resume from durable progress; don't redo completed steps.",
     ],
     [
+      "dispatch_unlaunched",
+      "Your previous run on this issue never launched",
+    ],
+    [
       "successful_run_missing_state",
       "Your run completed but left no final disposition.",
     ],
@@ -1619,9 +1623,16 @@ describe("renderPaperclipWakePrompt", () => {
         { includeExecutionContract: true },
       );
 
-      expect(prompt).toContain(
-        "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
-      );
+      if (cause === "process_lost" || cause === "dispatch_unlaunched") {
+        expect(prompt).toContain(
+          "Recovery contract: resume work on this task using the cause-specific instruction below.",
+        );
+        expect(prompt).not.toContain("Do not produce the deliverable yourself.");
+      } else {
+        expect(prompt).toContain(
+          "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
+        );
+      }
       expect(prompt).toContain(instruction);
       expect(prompt).toContain(
         "Fallback preference order: (1) send back to Coder",
@@ -1673,6 +1684,87 @@ describe("renderPaperclipWakePrompt", () => {
       "Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.",
     );
   });
+
+  // dispatch_unlaunched recovery is routed to the original agent (owner and return
+  // owner), exactly like process_lost, so its wake must tell that agent to retry
+  // rather than render the default "fix it and hand it back" takeover instruction.
+  it("asks never-launched dispatch retries to start the current step over instead of handing the work back", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "source_scoped_recovery_action",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-14092",
+        title: "Recover work",
+        status: "blocked",
+      },
+      recovery: {
+        cause: "dispatch_unlaunched",
+        failureSummary: "run admitted with no child process or environment lease",
+        originalAssignee: { id: "agent-1", name: "Coder" },
+        attemptCount: 1,
+        nextAction: "Retry the original assignee from durable progress.",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain(
+      "Your previous run on this issue never launched (run admitted with no child process or environment lease)",
+    );
+    expect(prompt).toContain("so nothing executed");
+    expect(prompt).toContain("start the current step from the beginning");
+    expect(prompt).toContain(
+      "Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.",
+    );
+    expect(prompt).toContain(
+      "Recovery contract: resume work on this task using the cause-specific instruction below.",
+    );
+    expect(prompt).not.toContain("Do not produce the deliverable yourself.");
+    expect(prompt).not.toContain("Fix the underlying problem");
+    expect(prompt).not.toContain("You DO NOT do the work");
+  });
+
+  // When the original agent is not invokable, the recovery service routes these causes to
+  // the manager ladder and records routingFallbackReason. That owner is not the original
+  // assignee, so it keeps the takeover restriction instead of the retry instruction.
+  it.each(["process_lost", "dispatch_unlaunched"])(
+    "keeps the takeover restriction for a %s recovery that fell back to the manager ladder",
+    (cause) => {
+      const routingFallbackReason =
+        "The original assignee is not invokable; recovery fell through to the manager ladder.";
+      const prompt = renderPaperclipWakePrompt({
+        reason: "source_scoped_recovery_action",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-14092",
+          title: "Recover work",
+          status: "blocked",
+        },
+        recovery: {
+          cause,
+          failureSummary: "adapter stopped",
+          originalAssignee: { id: "agent-1", name: "Coder" },
+          attemptCount: 1,
+          nextAction: "Retry the original assignee from durable progress.",
+          routingFallbackReason,
+        },
+        commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+        comments: [],
+        fallbackFetchNeeded: false,
+      });
+
+      expect(prompt).toContain(
+        "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
+      );
+      expect(prompt).toContain(
+        "Fix the underlying problem (auth, config, adapter, budget…) so the task can run again, then hand it back to Coder. You DO NOT do the work.",
+      );
+      expect(prompt).toContain(`- routing fallback: ${routingFallbackReason}`);
+      expect(prompt).not.toContain("resume work on this task");
+      expect(prompt).not.toContain("Try again");
+    },
+  );
 
   it("asks restored source owners to lead with work instead of narrating recovery", () => {
     const prompt = renderPaperclipWakePrompt({
