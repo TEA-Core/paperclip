@@ -4276,8 +4276,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       );
     expect(retries).toHaveLength(1);
+    // Upstream #13075 (35fdc0c66) removed the `process_lost_retry` wake: enqueueProcessLossRetry now
+    // defers to scheduleBoundedRetryForRun, which declines a legacy run whose provider outcomes are
+    // unknown. This retry is therefore the fork's in-file release continuation (D9 deferred; see
+    // "requires reconciliation for a lost monitor whose provider outcomes are unknown"), whose wake
+    // reason is `issue_continuation_needed`. The invariant pinned here is unchanged: the retry never
+    // records `retryReason: "process_lost"`.
     expect(retries[0]?.contextSnapshot).toMatchObject({
-      wakeReason: "process_lost_retry",
+      wakeReason: "issue_continuation_needed",
       retryReason: "issue_continuation_needed",
     });
     expect(retries[0]?.contextSnapshot).not.toMatchObject({ retryReason: "process_lost" });
