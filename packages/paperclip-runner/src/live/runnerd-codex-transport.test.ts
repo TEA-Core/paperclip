@@ -15,7 +15,10 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, it, vi } from "vitest";
-import type { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
+import {
+  RunnerdRunProcessCapExceededError,
+  type DurablePrpControlPlane,
+} from "../control-plane/durable-prp-control-plane.js";
 
 import {
   NATIVE_RUNTIME_ASSET_SCHEMA,
@@ -2695,6 +2698,228 @@ it("probes an exact-authority resume and confirms its live provider identity", a
       ),
     ).toHaveLength(priorResumeEvents + 1);
   } finally {
+    await resumed.transport.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+// SUP-16064 (SUP-16011) — production-transport admission boundary.
+//
+// The control-plane seam test proves `spawnRunner` applies a gate it is given;
+// it does not prove the production transport ever supplies one. These cases
+// drive the real `createCapabilityRunnerdCodexTransport` launch path (the same
+// path the native session executor uses) and assert the shared per-run cap
+// decision is evaluated before the process launcher: a run one below the cap
+// reaches the launcher, a run at the cap is refused and creates no process.
+function runnerdCapLaunchIdentity() {
+  return {
+    runnerInstanceId: "runner-cap",
+    environmentLeaseId: "lease-cap",
+    runId: "run-cap",
+    normalizedSessionId: "session-cap",
+    turnId: "turn-cap",
+    itemId: "item-cap",
+  };
+}
+
+function runnerdCapLaunchRegistration(listenPath: string) {
+  return async () => ({
+    connection: {
+      mode: "listen" as const,
+      listenAddress: "0.0.0.0",
+      listenPort: 43_128,
+      listenPath,
+    },
+    ready: () => new Promise<void>(() => undefined),
+    startupFailureCode: "runner_ingress_unavailable" as const,
+    release: () => undefined,
+  });
+}
+
+it("refuses the runnerd launch at the per-run process cap before the launcher", async () => {
+  const launcher = vi.fn(() => {
+    throw new Error("runnerd launcher reached despite cap refusal");
+  });
+  const runProcessAdmission = vi.fn(
+    () =>
+      new RunnerdRunProcessCapExceededError({
+        runId: "run-cap",
+        cap: 3,
+        current: 3,
+        processGroupId: 4242,
+      }),
+  );
+  const bundle = createCapabilityRunnerdCodexTransport({
+    // Any readable local file satisfies the artifact identity hash; the
+    // external launcher owns execution, so no real runnerd binary is needed.
+    runnerBinary: resolve(import.meta.dirname, "../../package.json"),
+    runnerProcessLauncher: launcher,
+    runProcessAdmission,
+    prpIdentity: runnerdCapLaunchIdentity(),
+    controlPlaneRegistration: runnerdCapLaunchRegistration(
+      "/api/runner/v1/connect/run-cap-refusal",
+    ),
+  });
+  bundle.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
+  const killSpy = vi.spyOn(process, "kill");
+  try {
+    let refusal: unknown;
+    try {
+      await bundle.transport.request("thread/start", {
+        cwd: tmpdir(),
+        dynamicTools: [],
+      });
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(RunnerdRunProcessCapExceededError);
+    const capRefusal = refusal as RunnerdRunProcessCapExceededError;
+    expect(capRefusal.code).toBe("run_process_cap_exceeded");
+    expect(capRefusal.resultJson).toEqual({
+      errorCode: "run_process_cap_exceeded",
+      cap: 3,
+      current: 3,
+      processGroupId: 4242,
+      runId: "run-cap",
+    });
+    // Decided before process creation: the launcher is never reached and no
+    // existing group is signalled or killed.
+    expect(launcher).not.toHaveBeenCalled();
+    // The injected admission is the single decision point: the transport
+    // evaluates it (rather than an internal mirror of the cap policy).
+    expect(runProcessAdmission).toHaveBeenCalledTimes(1);
+    // No signal/kill is sent to the run's existing process group; a negative
+    // pid is a process-group signal and the tracked group is 4242.
+    expect(
+      killSpy.mock.calls.some(
+        ([pid]) => typeof pid === "number" && pid < 0,
+      ),
+    ).toBe(false);
+  } finally {
+    killSpy.mockRestore();
+    await bundle.transport.close();
+  }
+});
+
+it("admits the runnerd launch one below the per-run process cap", async () => {
+  const launcher = vi.fn(() => {
+    throw new Error("runnerd launcher reached");
+  });
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: resolve(import.meta.dirname, "../../package.json"),
+    runnerProcessLauncher: launcher,
+    runProcessAdmission: () => null,
+    prpIdentity: runnerdCapLaunchIdentity(),
+    controlPlaneRegistration: runnerdCapLaunchRegistration(
+      "/api/runner/v1/connect/run-cap-admission",
+    ),
+  });
+  bundle.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
+  try {
+    await expect(
+      bundle.transport.request("thread/start", {
+        cwd: tmpdir(),
+        dynamicTools: [],
+      }),
+    ).rejects.toThrow("runnerd launcher reached");
+    expect(launcher).toHaveBeenCalledTimes(1);
+  } finally {
+    await bundle.transport.close();
+  }
+});
+
+it("refuses the reattach runnerd launch at the cap without signalling the existing group", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-cap-reattach-"));
+  const identity = {
+    runnerInstanceId: "runner-cap-reattach",
+    environmentLeaseId: "lease-cap-reattach",
+    runId: "run-cap-reattach",
+    normalizedSessionId: "session-cap-reattach",
+    turnId: "turn-cap-reattach",
+    itemId: "item-cap-reattach",
+  };
+  const shared = {
+    runnerBinary: resolve(import.meta.dirname, "../../package.json"),
+    stateDirectory,
+    prpIdentity: identity,
+    // A non-local state owner skips the local runner-state quarantine on the
+    // exact-authority resume path.
+    runnerStateDirectory: join(stateDirectory, "runner-state"),
+  };
+  // Seed the exact durable authority through a first admitted launch attempt:
+  // the transport persists the control-plane state before the launcher runs.
+  const seed = createCapabilityRunnerdCodexTransport({
+    ...shared,
+    runnerProcessLauncher: vi.fn(() => {
+      throw new Error("seed launcher reached");
+    }),
+    runProcessAdmission: () => null,
+    controlPlaneRegistration: runnerdCapLaunchRegistration(
+      "/api/runner/v1/connect/run-cap-reattach-seed",
+    ),
+  });
+  seed.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
+  await expect(
+    seed.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [],
+    }),
+  ).rejects.toThrow("seed launcher reached");
+  await seed.transport.close();
+
+  const killSpy = vi.spyOn(process, "kill");
+  const launcher = vi.fn(() => {
+    throw new Error("reattach launcher reached despite cap refusal");
+  });
+  const resumed = createCapabilityRunnerdCodexTransport({
+    ...shared,
+    resumeProviderSession: {
+      driverSessionId: "driver-cap-reattach",
+      providerSessionId: "provider-cap-reattach",
+    },
+    runnerProcessLauncher: launcher,
+    runProcessAdmission: () =>
+      new RunnerdRunProcessCapExceededError({
+        runId: "run-cap-reattach",
+        cap: 3,
+        current: 3,
+        processGroupId: 4242,
+      }),
+    controlPlaneRegistration: runnerdCapLaunchRegistration(
+      "/api/runner/v1/connect/run-cap-reattach",
+    ),
+  });
+  resumed.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
+  try {
+    let refusal: unknown;
+    try {
+      await resumed.transport.request("thread/read", {});
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(RunnerdRunProcessCapExceededError);
+    expect(launcher).not.toHaveBeenCalled();
+    // Refusal must not signal/kill the run's existing process group (a
+    // negative pid is a process-group signal; the tracked group is 4242).
+    expect(
+      killSpy.mock.calls.some(
+        ([pid]) => typeof pid === "number" && pid < 0,
+      ),
+    ).toBe(false);
+  } finally {
+    killSpy.mockRestore();
     await resumed.transport.close();
     await rm(stateDirectory, { recursive: true, force: true });
   }

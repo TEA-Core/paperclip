@@ -15,6 +15,10 @@ type BuildInvocationEnvForLogsOptions = {
 
 export const runningProcesses: Map<string, { child: ChildProcess; graceSec: number; processGroupId: number | null }> =
   serverUtils.runningProcesses;
+
+// SUP-16011: the census-grade process-group counter is wired explicitly at
+// server startup (server/src/index.ts), not as an import-time side effect of
+// this module, so the single registration point is observable.
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
 export const parseObject = serverUtils.parseObject;

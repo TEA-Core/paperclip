@@ -41,6 +41,7 @@ import type {
 import {
   DurablePrpControlPlane,
   durableRecoveryInternals,
+  RunnerdRunProcessCapExceededError,
   spawnRunner,
   waitForProcess,
   type RunnerProcessHandle,
@@ -79,6 +80,16 @@ const RUNNER_CLIENT_VERSION = "0.3.0";
 const RUNNER_BOOTSTRAP_TICKET_TTL_MS = 60_000;
 const RUNNERD_MAX_OUTBOX_BYTES = 16 * 1024 * 1024;
 const RUNNERD_P0_RESERVE_BYTES = 1024 * 1024;
+
+// SUP-16011 — per-run process-cap admission for the runnerd launch path.
+//
+// The runner package is a decoupled leaf: it cannot import
+// `@paperclipai/adapter-utils` (where the cap decision, its env key, and the
+// census counter live) and it has no access to the run's tracked process
+// group. So the server evaluates the decision and injects it here as
+// `runProcessAdmission`. The transport forwards it unchanged to `spawnRunner`,
+// the single admission point that already refuses the spawn when the admission
+// returns a refusal.
 
 function readLocalProcessStartedAt(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -1014,6 +1025,13 @@ export interface CapabilityRunnerdCodexTransportOptions {
   runnerProcessLauncher?: (
     spec: RunnerProcessLaunchSpec,
   ) => RunnerProcessHandle;
+  /**
+   * Per-run process-cap admission evaluated by the caller, which owns the cap
+   * policy, the census counter, and the run's tracked process group. Returns a
+   * refusal to block the runnerd spawn, or `null` to admit it. Omitted admits
+   * unconditionally (fails open).
+   */
+  runProcessAdmission?: () => RunnerdRunProcessCapExceededError | null;
   /** Durable runner state path in the process owner's filesystem. */
   runnerStateDirectory?: string;
   /** Read the live durable runner state when runnerd owns a remote filesystem. */
@@ -3270,6 +3288,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ),
       diagnosticsDirectory: resolve(this.#root, "diagnostics"),
       processLauncher: this.options.runnerProcessLauncher,
+      runProcessCapGate: this.options.runProcessAdmission,
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -3672,6 +3691,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ),
           diagnosticsDirectory: resolve(this.#root, "diagnostics"),
           processLauncher: this.options.runnerProcessLauncher,
+          runProcessCapGate: this.options.runProcessAdmission,
         });
     if (handle) {
       this.#handle = handle;

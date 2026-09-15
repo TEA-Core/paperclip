@@ -12,6 +12,11 @@ import {
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import {
+  evaluateRunProcessSpawn,
+  getRunProcessGroupCounter,
+  resolveRunProcessCap,
+} from "./run-process-cap.js";
+import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   resolvePaperclipRunnerModel,
 } from "./paperclip-runner-permissions.js";
@@ -3997,6 +4002,33 @@ export async function runChildProcess(
           childEnv.PWD = spawnCwd;
           delete childEnv.OLDPWD;
         }
+
+        // SUP-16011: per-run process cap — refuse the spawn at the limit.
+        // Measure the run's *existing* process group through the census-grade
+        // counter before creating its top-level child, and refuse once the group
+        // has reached the cap. This is the single seam where run children are
+        // created, so no adapter can bypass it. Fails open when the cap is
+        // disabled or the group is unreadable (non-Linux / counter unwired), so
+        // an unmeasurable host never blocks a legitimate run. The decision is
+        // shared with the native runner (evaluateRunProcessSpawn).
+        const runProcessCapRefusal = evaluateRunProcessSpawn({
+          runId,
+          cap: resolveRunProcessCap(process.env),
+          counter: getRunProcessGroupCounter(),
+          processGroupId: runningProcesses.get(runId)?.processGroupId ?? null,
+          onMeasureError: (err) =>
+            onLogError(
+              err,
+              runId,
+              "failed to measure run process group for the process cap",
+            ),
+        });
+        if (runProcessCapRefusal) {
+          onLogError(null, runId, runProcessCapRefusal.message);
+          reject(runProcessCapRefusal);
+          return;
+        }
+
         const child = spawn(target.command, target.args, {
           cwd: spawnCwd,
           env: childEnv,
