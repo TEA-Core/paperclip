@@ -10185,6 +10185,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!run) return null;
       const agent = await getAgent(run.agentId);
       if (!agent || agent.companyId !== run.companyId) return null;
+      // Fold 2c #13075 loop-stopper (operator decision 2026-09-15), until upstream 667c79ded is
+      // folded. The stranded-issue sweep calls this on every heartbeat tick for an issue whose
+      // latest run is a failed legacy run, and scheduleBoundedRetryForRun appends a fresh
+      // "Bounded retry exhausted" lifecycle event every time it is re-entered for a spent budget
+      // (the fork's writer has no receipt idempotency). That grew one event per issue per tick and
+      // multiplies the attention feed's exhaustion join. The finalize-time retry callers already
+      // recorded exhaustion once; this callback only needs the answer, which is "no retry".
+      // Mirrors the writer's own test for the default (transient_failure) budget exactly:
+      // exhausted iff executionFailureRetryCount(run) + 1 > max.
+      if (executionFailureRetryCount(run) >= BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS) return null;
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
     },
