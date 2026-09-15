@@ -33,7 +33,12 @@ const {
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
-  const createAppMock = vi.fn(async () => ((_: unknown, __: unknown) => {}) as never);
+  const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
+    locals: {
+      toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+      toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
+    },
+  }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({
     select: vi.fn(() => ({
@@ -59,6 +64,8 @@ const {
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
+    recoverPendingSessionGoalActions: vi.fn(async () => ({ scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 })),
+    recoverActiveSessionGoals: vi.fn(async () => ({ scanned: 0, enqueued: 0 })),
     reconcileStrandedAssignedIssues: vi.fn(async () => ({
       assignmentDispatched: 0,
       dispatchRequeued: 0,
@@ -95,7 +102,6 @@ const {
     reconcileUnfinalizableWorkspaceBarriers: vi.fn(async () => ({ reported: 0 })),
     ingestStaleInReviewChildIssues: vi.fn(async () => ({ archived: 0 })),
     sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
-    reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     scanTerminableSilentActiveRuns: vi.fn(async () => ({
       scanned: 0,
       terminated: 0,
@@ -434,6 +440,12 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
+vi.mock("../services/connection-intent-delivery.js", () => ({
+  connectionIntentDeliveryService: vi.fn(() => ({
+    sweepPending: vi.fn(async () => ({ scanned: 0, failed: 0 })),
+  })),
+}));
+
 vi.mock("../services/question-response-delivery.js", () => ({
   questionResponseDeliveryService: vi.fn(() => ({
     sweepPending: vi.fn(async () => ({
@@ -624,6 +636,40 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("never invokes the retired review detector at startup or on periodic recovery", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
+    }));
+    const retiredDetector = vi.fn(async () => ({ created: 1, updated: 1, failed: 0 }));
+    const runtime = Object.assign(heartbeatServiceMock, { reconcileProductivityReviews: retiredDetector });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, delayMs?: number) => {
+      // Capture only the heartbeat scheduler interval so unrelated startup
+      // timers registered later cannot shadow it.
+      if (delayMs === HEARTBEAT_SCHEDULER_INTERVAL_MS) intervalCallback = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      await startServer();
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.ingestStaleInReviewChildIssues).toHaveBeenCalledTimes(1);
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      // The fork's periodic recovery chain runs many sweeps in sequence; wait for
+      // its tail (the step the retired detector used to follow) before asserting.
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
+        expect(heartbeatServiceMock.ingestStaleInReviewChildIssues).toHaveBeenCalledTimes(2);
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(retiredDetector).not.toHaveBeenCalled();
+    } finally {
+      delete (runtime as Partial<typeof runtime>).reconcileProductivityReviews;
+      setIntervalSpy.mockRestore();
+    }
   });
 
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {

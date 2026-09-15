@@ -125,6 +125,29 @@ describe("docker-entrypoint.sh", () => {
     expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
   });
 
+  it.each([false, true])(
+    "skips remapping a cloud identity while preserving volume repair (mismatch: %s)",
+    async (homeRootMismatch) => {
+      // Upstream #13210 bakes the managed runtime identity into cloud images,
+      // so node already IS the requested UID/GID and neither usermod nor
+      // groupmod must run. Re-expressed in the fork's probe model: the repair
+      // decision is a single stat of the home ROOT against `id -u node`, and
+      // the repair itself is the non-recursive `chown node` (see the
+      // "never recursively chowns" invariant below), not upstream's
+      // `chown -R node:node`.
+      installStubs({ uid: 0, gid: 0, nodeUid: 1001, nodeGid: 1001, homeRootUid: homeRootMismatch ? 0 : 1001 });
+
+      const { stdout, calls } = await runEntrypoint({ USER_UID: "1001", USER_GID: "1001", PAPERCLIP_HOME: stubDir });
+
+      expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+      expect(calls).not.toContain("usermod");
+      expect(calls).not.toContain("groupmod");
+      expect(calls.includes(`chown node ${stubDir}`)).toBe(homeRootMismatch);
+      expect(calls).not.toContain("chown -R");
+      expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
+    },
+  );
+
   it("chowns a root-owned home root before gosu even with the default UID/GID (fresh volume mount)", async () => {
     // A freshly mounted volume arrives root-owned and shadows the image's
     // build-time chown; with no remap requested the old entrypoint dropped

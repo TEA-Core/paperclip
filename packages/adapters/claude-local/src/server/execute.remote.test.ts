@@ -86,6 +86,7 @@ describe("claude remote execution", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     resetClaudeCliCapabilitiesCacheForTests();
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
@@ -95,6 +96,8 @@ describe("claude remote execution", () => {
   });
 
   it("prepares the workspace, syncs Claude runtime assets, and restores workspace changes for remote SSH execution", async () => {
+    vi.stubEnv("CLAUDE_CODE_USE_BEDROCK", "1");
+    vi.stubEnv("ANTHROPIC_MODEL", "host-only-model");
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -121,6 +124,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
         instructionsFilePath: instructionsPath,
         env: {
@@ -189,6 +193,7 @@ describe("claude remote execution", () => {
     const call = runChildProcess.mock.calls[0] as unknown as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
+    expect(call?.[2]).toEqual(expect.arrayContaining(["--model", "claude-opus-5"]));
     expect(call?.[2]).toContain("--allowedTools");
     expect(call?.[2]).toContain(
       "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write",
@@ -254,6 +259,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
       },
       context: {
@@ -315,6 +321,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
       },
       context: {
@@ -382,6 +389,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
       },
       context: {
@@ -431,6 +439,7 @@ describe("claude remote execution", () => {
           taskKey: null,
         },
         config: {
+        engine: "cli",
           command: "claude",
           ...config,
         },

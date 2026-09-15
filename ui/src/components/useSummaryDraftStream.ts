@@ -1,3 +1,4 @@
+import { usePageVisibility } from "@/lib/page-visibility";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { LiveEvent, SummarySlotIssueRef } from "@paperclipai/shared";
@@ -79,6 +80,7 @@ export function useSummaryDraftStream(
   companyId: string | null | undefined,
   generatingIssue: SummarySlotIssueRef | null,
 ): SummaryDraftStream {
+  const { visible } = usePageVisibility();
   const issueId = generatingIssue?.id ?? null;
   const [runId, setRunId] = useState<string | null>(null);
   const [chunks, setChunks] = useState<RunLogChunk[]>([]);
@@ -216,7 +218,7 @@ export function useSummaryDraftStream(
 
   // Live token deltas over the shared company-events socket.
   useCompanyLiveEvent((event: LiveEvent) => {
-    if (!runId) return;
+    if (!visible || !runId) return;
     if (event.type !== "heartbeat.run.log") return;
     const payload = event.payload ?? {};
     if (payload.runId !== runId) return;
@@ -234,12 +236,12 @@ export function useSummaryDraftStream(
   // The interval is torn down (cleanup) the moment the run id clears, so a
   // finished run no longer drives persisted-log reads.
   useEffect(() => {
-    if (!runId) return;
-    logOffsetRef.current = 0;
-    pendingLogRowsRef.current = new Map();
-
+    if (!visible || !runId) return;
     let cancelled = false;
+    let reading = false;
     const read = async () => {
+      if (reading || cancelled) return;
+      reading = true;
       try {
         const result = await heartbeatsApi.log(runId, logOffsetRef.current, LOG_READ_LIMIT_BYTES);
         if (cancelled) return;
@@ -251,6 +253,8 @@ export function useSummaryDraftStream(
         }
       } catch {
         // Ignore transient/404 reads (log not yet flushed, run just started).
+      } finally {
+        reading = false;
       }
     };
 
@@ -260,7 +264,7 @@ export function useSummaryDraftStream(
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [runId, appendChunks]);
+  }, [visible, runId, appendChunks]);
 
   const parse = useMemo(() => parseSummaryDraftStream(extractAssistantOutputText(chunks)), [chunks]);
 

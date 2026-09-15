@@ -308,11 +308,16 @@ function createRunContextDb(
   };
   const buildQuery = (selection: Record<string, unknown>) => {
     const rows = rowsForSelection(selection);
+    const limitResult = {
+      then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(rows),
+    };
     const whereResult = {
-      orderBy: vi.fn(async () => []),
-      limit: vi.fn(() => ({
-        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(rows),
-      })),
+      // Upstream #13100's live-goal steer reads the newest task session with
+      // `.where(...).orderBy(...).limit(1)` (runner-goals.ts). `orderBy` has to
+      // return a chainable, not a promise, or POST /issues/:id/comments 500s
+      // here while the route itself is fine.
+      orderBy: vi.fn(() => ({ limit: vi.fn(() => limitResult), ...limitResult })),
+      limit: vi.fn(() => limitResult),
       then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(rows),
     };
     const query = {

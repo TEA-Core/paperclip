@@ -790,6 +790,14 @@ function walk(dir) {
 }
 
 walk(root);
+// package.json is the pnpm 9 patch manifest for this repository. Hash the
+// declared paths, including non-.patch filenames and patches outside patches/.
+const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+for (const patch of Object.values(manifest.pnpm?.patchedDependencies ?? {})) {
+  if (typeof patch !== "string") throw new Error("Invalid pnpm patch path");
+  const file = path.resolve(root, patch);
+  if (!files.includes(file)) files.push(file);
+}
 files.sort((left, right) => path.relative(root, left).localeCompare(path.relative(root, right)));
 
 const hash = crypto.createHash("sha256");
@@ -963,6 +971,8 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
       # regenerated for this branch, and the same --no-frozen-lockfile retry clears
       # both -- but only the first was matched, so an overrides-only branch
       # (SUP-12943) failed provisioning outright and no agent run could launch.
+      # Upstream #13093 reached the same two-code match from the other direction;
+      # the alternation below is the same set, spelled out.
       if grep -qE "ERR_PNPM_OUTDATED_LOCKFILE|ERR_PNPM_LOCKFILE_CONFIG_MISMATCH" "$stdout_path" "$stderr_path"; then
         rm -f "$stdout_path" "$stderr_path"
         return 90

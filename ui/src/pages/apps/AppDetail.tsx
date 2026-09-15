@@ -1,3 +1,5 @@
+import { EmailConnectionAccess } from "@/components/EmailConnectionAccess";
+import { EmailConnectionInboxes } from "./chat/EmailEndpointSetup";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, Pencil } from "lucide-react";
@@ -149,7 +151,7 @@ export function AppDetail() {
     grant.kind === "organization" && grant.isDefault
   )) ?? grantRows.find((grant) => grant.kind === "organization") ?? null;
   const managedIdentityGrant = connection?.credentialPolicy === "per_user"
-    ? retainedPersonalGrant
+    ? currentUserPersonalGrant ?? retainedPersonalGrant
     : connection?.credentialPolicy === "per_agent"
       ? retainedAgentGrant
     : connection?.credentialPolicy === "per_user_with_fallback"
@@ -476,7 +478,8 @@ export function AppDetail() {
   }
 
   const status = statusFor(connection);
-  const needsReconnect = status.tone === "attention" && connection.healthStatus !== "unknown";
+  const needsReconnect = connection.requiresReauthorization
+    ?? (status.tone === "attention" && connection.healthStatus !== "unknown");
   const quarantined = catalog.filter((e) => e.status === "quarantined");
   const active = catalog.filter((e) => e.status === "active");
   const readOnly = active.filter((e) => e.isReadOnly);
@@ -512,6 +515,14 @@ export function AppDetail() {
         }}
       />
 
+      {status.tone === "attention" && connection.requiresReauthorization === false && (
+        <div role="status">
+          <p>{connection.healthMessage || "GitHub access could not be checked. Try again."}</p>
+          <Button variant="outline" disabled={refreshGitHubAccess.isPending} onClick={() => refreshGitHubAccess.mutate()}>
+            Retry access
+          </Button>
+        </div>
+      )}
       {needsReconnect && (
         <ReconnectCard
           connection={connection}
@@ -557,6 +568,8 @@ export function AppDetail() {
           : permissionsLoading
           ? <ToolsLoading />
           : <div className="space-y-10">
+              {connection.config?.provider === "agentmail" && <EmailConnectionInboxes companyId={connection.companyId} connectionId={connection.id} canConfigure={grantsQuery.data?.capabilities?.canConfigure ?? false} />}
+              {connection.config?.provider === "agentmail" ? <EmailConnectionAccess companyId={connection.companyId} connectionId={connection.id} agents={agents} /> : <>
               <IdentitiesSection
                 appName={appName}
                 credentialPolicy={connection.credentialPolicy}
@@ -612,6 +625,7 @@ export function AppDetail() {
                 onSetActionPermission={(id, next) => apply(actionPermissionMutation(id, next, enabledIds, askFirstIds))}
                 onReviewQuarantined={reviewQuarantined}
               />
+              </>}
             </div>
       )}
     </div>
@@ -700,7 +714,7 @@ function AppDetailHeader({
           )}
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <StatusBadge status={status} />
-            {actionCount !== null && (
+            {connection.config?.provider !== "agentmail" && actionCount !== null && (
               <span className="text-xs text-muted-foreground">
                 {actionCount} {actionCount === 1 ? "action" : "actions"} available
               </span>

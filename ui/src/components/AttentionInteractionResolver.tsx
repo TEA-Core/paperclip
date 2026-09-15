@@ -90,10 +90,12 @@ export function AttentionInteractionResolver({
       interaction: SuggestTasksInteraction | RequestConfirmationInteraction | RequestCheckboxConfirmationInteraction | RequestBoardApprovalInteraction;
       selectedClientKeys?: string[];
       selectedOptionIds?: string[];
+      rememberAction?: boolean;
     }) =>
       issuesApi.acceptInteraction(issueId, input.interaction.id, {
         selectedClientKeys: input.selectedClientKeys,
         selectedOptionIds: input.selectedOptionIds,
+        rememberAction: input.rememberAction,
       }),
     onSuccess: invalidate,
   });
@@ -146,8 +148,8 @@ export function AttentionInteractionResolver({
       agentMap={agentMap}
       currentUserId={currentUserId}
       userLabelMap={userLabelMap}
-      onAcceptInteraction={(target, selectedClientKeys, selectedOptionIds) =>
-        acceptMutation.mutateAsync({ interaction: target, selectedClientKeys, selectedOptionIds }).then(() => undefined)
+      onAcceptInteraction={(target, selectedClientKeys, selectedOptionIds, rememberAction) =>
+        acceptMutation.mutateAsync({ interaction: target, selectedClientKeys, selectedOptionIds, rememberAction }).then(() => undefined)
       }
       onRejectInteraction={(target, reason) =>
         rejectMutation.mutateAsync({ interactionId: target.id, reason }).then(() => undefined)
