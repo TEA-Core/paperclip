@@ -225,6 +225,15 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         title: "Child work",
         parentId: parent.id,
         assigneeAgentId: childOwner.id,
+        // Fork divergence (SUP-11047 assigned-backlog-blocking guard, slice 2c): upstream
+        // 8cfd30fb0 creates this child as an assigned `backlog` issue under a parent (the
+        // task() helper defaults status to `backlog`), which the fork rejects with 422 (fork
+        // 2a88a588e) because assignment wakeup skips `backlog`, so a child that gates its
+        // parent would never be woken. `parkDeliberately` is that guard's own escape hatch and
+        // is stripped before insert (server/src/services/issues.ts), so the child is still
+        // created as `backlog`, the loop below still flips it to `todo`, and every run, Stop,
+        // pause/cancel and resume assertion is unchanged.
+        parkDeliberately: true,
       });
       const completed = await task(request, company.id, {
         title: "Finished child",
