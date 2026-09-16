@@ -3808,11 +3808,15 @@ async function recordWorkspaceCommandOperation(
             stderrBytes: result.stderrBytes,
           }
         : null;
+      const failureDetails = [trimToLastBytes(stderr.trim(), DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES), result.stdout.trim()]
+        .filter(Boolean)
+        .join("\n");
+      const failureMessage = `${input.label} failed with exit code ${code ?? -1}${failureDetails ? `: ${failureDetails}` : ""}`;
       return {
         status: code === 0 ? "succeeded" : "failed",
         exitCode: code,
         stdout: result.stdout,
-        stderr,
+        stderr: code === 0 ? stderr : `${stderr}${stderr.endsWith("\n") ? "" : "\n"}${failureMessage}\n`,
         system: code === 0 ? input.successMessage ?? null : null,
         metadata: seedEvidence
           ? { ...seedEvidence.metadata, ...(truncationMetadata ?? {}) }
