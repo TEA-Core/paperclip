@@ -2754,7 +2754,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
     const cause =
-      'Execution workspace provision command "corepack enable && pnpm install --frozen-lockfile --prefer-offline" failed:  ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation.';
+      'Execution workspace provision command "corepack enable && pnpm install --frozen-lockfile --prefer-offline" failed with exit code 1:  ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation.';
 
     await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
@@ -2790,6 +2790,43 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   // Control: with no structured payload the placeholder must survive — it is what keeps
   // agent transcript content out of the issue thread.
+  it("preserves the provision exit code in workspace recovery evidence", async () => {
+    const { sourceIssue, coderId, prefix, companyId } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const cause = "Execution workspace provision command failed with exit code 1: (node) [DEP0169] DeprecationWarning";
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: cause,
+        errorCode: "workspace_validation_failed",
+        contextSnapshot: {},
+        livenessState: "failed",
+        resultJson: {
+          workspaceValidation: {
+            reason: "inherited_workspace_reuse_failed",
+            cause,
+          },
+        },
+      },
+      comment: "Workspace failed validation.",
+      recoveryCause: "workspace_validation_failed",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    const evidence = action?.evidence as Record<string, unknown> | null;
+    expect(evidence?.failureSummary).toContain("exit code 1");
+    expect((evidence?.workspaceValidation as Record<string, unknown>)?.cause).toContain("exit code 1");
+  });
+
   it("keeps the withheld placeholder when the run recorded no workspace validation payload", async () => {
     const { sourceIssue, coderId, prefix, companyId } = await seedCompany();
     await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
