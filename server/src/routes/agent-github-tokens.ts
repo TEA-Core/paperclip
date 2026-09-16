@@ -6,7 +6,11 @@ import { z } from "zod";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
 import { HttpError, forbidden, notFound } from "../errors.js";
-import { logActivity, secretService } from "../services/index.js";
+// Fold 2c / barrel-cycle: see the note in ./dispatch-quiesce.ts. `openapi.ts`
+// imports this file for `agentInstallationTokenRequestSchema`, so a barrel
+// import here closes the same heartbeat.ts -> services/index.ts cycle.
+import { logActivity } from "../services/activity-log.js";
+import { secretService } from "../services/secrets.js";
 import {
   BROKER_GITHUB_APP_ENV,
   normalizeRepoUrl,
