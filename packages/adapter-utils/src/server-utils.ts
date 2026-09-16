@@ -3855,6 +3855,20 @@ export const SECRET_ENV_KEYS = new Set([
   "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
 ]);
 
+// The five GitHub credential keys Paperclip manages for agent runs. This set
+// is the single source of truth: server/src/services/heartbeat.ts imports it
+// for its managed-GitHub-credential binding gate, and
+// `sanitizeInheritedPaperclipEnv` below strips it from every
+// runChildProcess-lane spawn env so the server's inherited GitHub
+// credentials never leak into child processes.
+export const MANAGED_GITHUB_TOKEN_KEYS = new Set([
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
+  "PAPERCLIP_GIT_TOKEN",
+]);
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
@@ -3867,12 +3881,26 @@ export function sanitizeInheritedPaperclipEnv(
       delete env[key];
       continue;
     }
+    // Managed GitHub credentials are stripped even though the ACP lane does
+    // not inherit them: runChildProcess lanes spread this env before their
+    // adapterConfig-bound env, so an inherited GH_TOKEN/GITHUB_TOKEN/etc.
+    // would reach the child when a bound one is absent. PAPERCLIP_GIT_TOKEN is
+    // also caught by the PAPERCLIP_ prefix guard; it is listed in the set so
+    // the two copies of the key list stay aligned by construction.
+    if (MANAGED_GITHUB_TOKEN_KEYS.has(key)) {
+      delete env[key];
+      continue;
+    }
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;
     if (key === "PAPERCLIP_LISTEN_PORT") continue;
     delete env[key];
   }
+  // GH_CONFIG_DIR is stripped with the tokens: the gh-wrapper gate assigns a
+  // run-owned config dir when unset (and a binding may set it), so inheriting
+  // the server's gh config location would let every agent share it.
+  delete env.GH_CONFIG_DIR;
   delete env.DATABASE_URL;
   delete env.DATABASE_MIGRATION_URL;
   return env;
