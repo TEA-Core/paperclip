@@ -324,6 +324,15 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # setuid bit is set (for root too), which would break `exec gosu node` in the
 # entrypoint and stop the container from starting. Do NOT use
 # `setcap cap_setuid+ep` on node either — that lets an agent setuid(0).
+#
+# Fork divergence (agent-uid split vs. baked cloud identity): the defaults below
+# sit directly above the self-hosted server identity (USER_UID/USER_GID 1000).
+# A build that moves `node` onto one of them -- upstream's cloud variant bakes
+# USER_UID/USER_GID=1001 -- must pass non-colliding AGENT_UID/AGENT_GID/
+# AGENTS_GID (docker-cloud.yml does). The guard at the top of the RUN below
+# fails such a build with the cause named instead of a bare groupadd/useradd
+# "already exists". Never auto-pick free ids here: the agent principal owns
+# files on persistent volumes, so its ids must be a deterministic input.
 ARG AGENT_UID=1001
 ARG AGENT_GID=1001
 ARG AGENTS_GID=1002
@@ -333,7 +342,14 @@ ARG AGENTS_GID=1002
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 COPY docker/agent-spawn-shim/spawn-agent.c /tmp/spawn-agent.c
-RUN groupadd -g ${AGENTS_GID} agents \
+RUN if getent passwd "${AGENT_UID}" >/dev/null \
+     || getent group "${AGENT_GID}" >/dev/null \
+     || getent group "${AGENTS_GID}" >/dev/null \
+     || [ "${AGENT_GID}" = "${AGENTS_GID}" ]; then \
+       echo "ERROR: agent-uid split ids collide: AGENT_UID=${AGENT_UID} AGENT_GID=${AGENT_GID} AGENTS_GID=${AGENTS_GID}, but node is $(id -u node):$(id -g node) (USER_UID=${USER_UID} USER_GID=${USER_GID}) and each id must be unused and AGENT_GID != AGENTS_GID. Pass non-colliding --build-arg AGENT_UID/AGENT_GID/AGENTS_GID (the cloud build uses 1002/1002/1003 for USER_UID/USER_GID=1001)." >&2; \
+       exit 1; \
+     fi \
+  && groupadd -g ${AGENTS_GID} agents \
   && groupadd -g ${AGENT_GID} node-agent \
   && useradd -u ${AGENT_UID} -g ${AGENT_GID} -G agents -M -d /paperclip -s /usr/sbin/nologin node-agent \
   # Both principals share `agents` so they can write the same worktrees; the

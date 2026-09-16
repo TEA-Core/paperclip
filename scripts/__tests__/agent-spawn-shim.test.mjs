@@ -167,3 +167,70 @@ test("gosu is never made setuid, and node never gets CAP_SETUID", () => {
     "node must never carry CAP_SETUID",
   );
 });
+
+// Upstream's cloud variant bakes the managed node identity (USER_UID/USER_GID
+// 1001) into the image, which is exactly where the agent principal lives by
+// default. PR CI never builds the cloud target -- it only publishes on push --
+// so a colliding build-arg set would first fail on the fold branch, where it
+// blocks every rollout. Resolve each published build's ids statically instead.
+const principalIdArgs = ["USER_UID", "USER_GID", "AGENT_UID", "AGENT_GID", "AGENTS_GID"];
+
+function dockerfileIdDefaults() {
+  const defaults = {};
+  for (const name of principalIdArgs) {
+    const values = [...dockerfileInstructions.matchAll(new RegExp(`^ARG ${name}=(\\d+)$`, "gm"))].map(m => m[1]);
+    assert.ok(values.length > 0, `Dockerfile must declare a numeric default for ${name}`);
+    assert.equal(new Set(values).size, 1, `every stage must agree on the ${name} default`);
+    defaults[name] = values[0];
+  }
+  return defaults;
+}
+
+function imageBuildSteps(workflowPath) {
+  const workflow = readFileSync(path.join(repoRoot, workflowPath), "utf8");
+  return workflow
+    .split("\n      - name: ")
+    .filter(step => /uses: docker\/build-push-action@/.test(step))
+    .map(step => {
+      const name = step.split("\n")[0].trim();
+      const args = {};
+      const block = step.split(/\n\s+build-args: \|\n/)[1];
+      if (block) {
+        for (const line of block.split("\n")) {
+          const arg = /^\s+([A-Z][A-Z0-9_]*)=(.*)$/.exec(line);
+          if (!arg) break;
+          args[arg[1]] = arg[2].trim();
+        }
+      }
+      return { name: `${workflowPath}: ${name}`, args };
+    });
+}
+
+test("every published image build gives the agent principal ids that do not collide with node", () => {
+  const defaults = dockerfileIdDefaults();
+  const steps = [".github/workflows/docker.yml", ".github/workflows/docker-cloud.yml"].flatMap(imageBuildSteps);
+  assert.ok(
+    steps.some(step => step.name.includes("docker-cloud.yml")),
+    "the cloud build step must still be found, or this test checks nothing",
+  );
+  for (const step of steps) {
+    const ids = Object.fromEntries(principalIdArgs.map(name => [name, step.args[name] ?? defaults[name]]));
+    const shown = JSON.stringify(ids);
+    assert.notEqual(ids.AGENT_UID, ids.USER_UID, `${step.name}: AGENT_UID must differ from node's USER_UID ${shown}`);
+    assert.notEqual(ids.AGENT_GID, ids.USER_GID, `${step.name}: AGENT_GID must differ from node's USER_GID ${shown}`);
+    assert.notEqual(ids.AGENTS_GID, ids.USER_GID, `${step.name}: AGENTS_GID must differ from node's USER_GID ${shown}`);
+    assert.notEqual(ids.AGENT_GID, ids.AGENTS_GID, `${step.name}: AGENT_GID and AGENTS_GID must differ ${shown}`);
+  }
+});
+
+test("the Dockerfile refuses colliding agent ids with the cause named, before creating any principal", () => {
+  const guard = dockerfileInstructions.indexOf('getent passwd "${AGENT_UID}"');
+  const firstGroupadd = dockerfileInstructions.indexOf("groupadd -g ${AGENTS_GID} agents");
+  assert.ok(guard > 0, "the collision guard must live in an instruction, not only in a comment");
+  assert.ok(guard < firstGroupadd, "the guard must run before the first groupadd");
+  const guardBlock = dockerfileInstructions.slice(guard, firstGroupadd);
+  for (const probe of ['getent group "${AGENT_GID}"', 'getent group "${AGENTS_GID}"', '[ "${AGENT_GID}" = "${AGENTS_GID}" ]']) {
+    assert.ok(guardBlock.includes(probe), `the guard must check ${probe}`);
+  }
+  assert.match(guardBlock, /exit 1/, "a collision must fail the build");
+});
