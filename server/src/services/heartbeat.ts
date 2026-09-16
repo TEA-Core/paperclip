@@ -15866,9 +15866,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       ),
     );
+    // Fold 2c / occupancy-retry-count: executionFailureRetryCount now reads an
+    // occupancy successor's carried pre-wait failure count, but the occupancy
+    // guard's own attempt must keep counting deferrals, so a deferral that
+    // follows a deferral still advances scheduledRetryAttempt. Every other
+    // predecessor enters the wait exactly as before.
+    const occupancyDeferralFollowsDeferral =
+      retryReason === EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON &&
+      run.scheduledRetryReason === EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON;
     const nextAttempt =
       (retryReason === WORKSPACE_BUSY_RETRY_REASON ||
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
+      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+      occupancyDeferralFollowsDeferral
         ? (run.scheduledRetryAttempt ?? 0)
         : executionFailureRetryCount(run)) + 1;
     const computedBaseSchedule =
@@ -16056,7 +16065,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         retryOfRunId: run.id,
         wakeReason,
         retryReason,
-        ...(retryReason === WORKSPACE_BUSY_RETRY_REASON
+        // Fold 2c / occupancy-retry-count: an occupancy deferral is a workspace
+        // wait too, so its successor carries (and overwrites any caller copy of)
+        // the pre-wait failure count that executionFailureRetryCount reads back.
+        ...(retryReason === WORKSPACE_BUSY_RETRY_REASON ||
+        retryReason === EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON
           ? {
               failureRetriesBeforeWorkspaceWait:
                 executionFailureRetryCount(run),
