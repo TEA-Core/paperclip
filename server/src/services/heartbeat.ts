@@ -31753,7 +31753,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(options.eventPayload ? { payload: options.eventPayload } : {}),
         });
         await releaseIssueExecutionAndPromote(cancelled, {
-          suppressImmediateRecovery: options.suppressImmediateRecovery,
+          // Fold 2c / native retry cancel: upstream #13075 (35fdc0c66) made a failed native run
+          // with a durable retry cancellable, and the cancellation terminalizes its coordinator
+          // (native_retry_cancelled). Upstream's release then records the incident without a new
+          // run (recordNativeTerminalRecoveryIfNeeded). With D9 deferred, the fork's in-file
+          // release is live and has no native exit, so it queued a generic
+          // issue_continuation_needed run as retryOfRunId of the cancelled run, or threw 422 when
+          // no responsible user resolved and left the task's execution lock on the cancelled run.
+          // The fork's own finalize rule (suppressImmediateRecovery: nativeTerminalFailureCode
+          // !== null) forbids that replacement chain, so apply it here too. The D9 port makes
+          // this redundant; delete it in that change.
+          suppressImmediateRecovery:
+            options.suppressImmediateRecovery || pendingNativeRetry,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
