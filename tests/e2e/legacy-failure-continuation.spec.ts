@@ -27,7 +27,14 @@ for (const action of ["task_retry", "inbox_retry", "message"] as const) {
         name: "Recovery fixture", role: "engineer", adapterType: "claude_local",
         adapterConfig: { engine: "acp", cwd: root, stateDir: path.join(root, "state"),
           agentCommand: `${JSON.stringify(process.execPath)} ${JSON.stringify(path.resolve("scripts/mcp-fixtures/servers/acp-stop-agent.mjs"))}`,
-          env: { PAPERCLIP_STOP_FIXTURE_ROOT: root, PAPERCLIP_STOP_FIXTURE_FINISH_TASK: "1" } },
+          // Fork divergence (SUP-13716 local ACP credential gate, slice 2c): upstream 9031516a7
+          // runs this claude_local fixture with no Claude login, but the fork's
+          // prepareClaudeLocalManagedHome (packages/adapters/claude-local/src/server/acp.ts, fork
+          // 3f7308253) refuses a local ACP run whose agent-side home holds no OAuth credentials
+          // unless fileless auth is configured, so the recovered run never reaches the fixture. A
+          // placeholder subscription token is that gate's own bypass; the fixture never reads it
+          // and billing stays `subscription`, so every recovery assertion below is unchanged.
+          env: { PAPERCLIP_STOP_FIXTURE_ROOT: root, PAPERCLIP_STOP_FIXTURE_FINISH_TASK: "1", CLAUDE_CODE_OAUTH_TOKEN: "paperclip-e2e-fixture-placeholder" } },
         runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
       } }));
       const issue = await json(await request.post(`/api/companies/${company.id}/issues`, { data: {

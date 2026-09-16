@@ -21,7 +21,14 @@ for (const { unfinishedWrite, pause } of [{ unfinishedWrite: false, pause: false
         name: "ACP Stop fixture", role: "engineer", adapterType: "claude_local",
         adapterConfig: { engine: "acp", cwd: root, stateDir: path.join(root, "state"),
           agentCommand: `${JSON.stringify(process.execPath)} ${JSON.stringify(path.resolve("scripts/mcp-fixtures/servers/acp-stop-agent.mjs"))}`,
-          env: { PAPERCLIP_STOP_FIXTURE_ROOT: root, PAPERCLIP_STOP_FIXTURE_FINISH_TASK: "1", ...(unfinishedWrite ? { PAPERCLIP_STOP_FIXTURE_TOOL: "write" } : {}) },
+          // Fork divergence (SUP-13716 local ACP credential gate, slice 2c): upstream 018ca5daa
+          // runs this claude_local fixture with no Claude login, but the fork's
+          // prepareClaudeLocalManagedHome (packages/adapters/claude-local/src/server/acp.ts, fork
+          // 3f7308253) refuses a local ACP run whose agent-side home holds no OAuth credentials
+          // unless fileless auth is configured, so no prompt is ever sent. A placeholder
+          // subscription token is that gate's own bypass; the fixture never reads it and billing
+          // stays `subscription`, so every Stop/continuation assertion below is unchanged.
+          env: { PAPERCLIP_STOP_FIXTURE_ROOT: root, PAPERCLIP_STOP_FIXTURE_FINISH_TASK: "1", CLAUDE_CODE_OAUTH_TOKEN: "paperclip-e2e-fixture-placeholder", ...(unfinishedWrite ? { PAPERCLIP_STOP_FIXTURE_TOOL: "write" } : {}) },
         }, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
       } }));
       const issue = await json(await request.post(`/api/companies/${company.id}/issues`, { data: {
