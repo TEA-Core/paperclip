@@ -74,6 +74,7 @@ import {
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
+  MANAGED_GITHUB_TOKEN_KEYS,
   resolveCommandForLogs,
   runChildProcess,
   sanitizeInheritedPaperclipEnv,
@@ -1591,17 +1592,21 @@ async function githubOperationLauncherBasePath(
  * env it copies is the SERVER's. Server GitHub tokens are not copied into a run's config env
  * (agents use the App-broker credential helper and gh wrapper, fork I4/I5), and GH_CONFIG_DIR is
  * not pinned to the server's $HOME/.config/gh. Agent env bindings (input.env) still apply.
- * Remote (SSH/sandbox) discovery reads the TARGET's env and is not filtered. This only governs
- * config env: lanes that spawn via runChildProcess still inherit the server environment
- * (sanitizeInheritedPaperclipEnv does not strip these keys); the ACP lane does not.
- * Keep the five token keys aligned with heartbeat.ts MANAGED_GITHUB_TOKEN_KEYS.
+ * Remote (SSH/sandbox) discovery reads the TARGET's env and is not filtered.
+ *
+ * SUP-16539: sanitizeInheritedPaperclipEnv now strips this same set, so runChildProcess lanes
+ * no longer inherit these keys and the probe below receives them stripped too. GH_CONFIG_DIR
+ * impact on the probe: the probe script only *reports* GH_CONFIG_DIR (git does not read it, and
+ * the probe runs no gh binary); the reported value is deleted from the discovery result by the
+ * loop below, so stripping it from the probe's env changes no observable output. A lane that
+ * needs a gh config location gets it from a binding or the run-owned gh-wrapper gate, never
+ * from inheritance. The ACP lane does not inherit them.
+ *
+ * Derived from the shared MANAGED_GITHUB_TOKEN_KEYS constant (server-utils.ts, also imported
+ * by heartbeat.ts), so the three copies cannot drift.
  */
 export const LOCAL_HOST_DISCOVERY_EXCLUDED_ENV_KEYS: readonly string[] = [
-  "GH_TOKEN",
-  "GITHUB_TOKEN",
-  "GH_ENTERPRISE_TOKEN",
-  "GITHUB_ENTERPRISE_TOKEN",
-  "PAPERCLIP_GIT_TOKEN",
+  ...MANAGED_GITHUB_TOKEN_KEYS,
   "GH_CONFIG_DIR",
 ];
 

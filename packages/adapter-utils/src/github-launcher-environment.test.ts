@@ -268,6 +268,7 @@ describe("managed GitHub launcher environment", () => {
     vi.stubEnv("BETTER_AUTH_SECRET", "probe-auth-secret-value");
     vi.stubEnv("DATABASE_URL", "postgres://probe-database-url");
     vi.stubEnv("GH_TOKEN", "legacy-token");
+    vi.stubEnv("GH_CONFIG_DIR", "/server-gh-config");
 
     const env = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: {}, hostCredentials: true, networkAccess: true });
 
@@ -275,9 +276,14 @@ describe("managed GitHub launcher environment", () => {
     expect(childEnv).not.toContain("probe-master-key-value");
     expect(childEnv).not.toContain("probe-auth-secret-value");
     expect(childEnv).not.toContain("postgres://probe-database-url");
+    // SUP-16539: the probe child now receives the sanitized server env, so the
+    // managed GitHub credential keys and the server's gh config location do
+    // not reach it (git in the probe reads none of them; the probe's reported
+    // GH_CONFIG_DIR was deleted from the discovery result even before).
+    expect(childEnv).not.toContain("legacy-token");
+    expect(childEnv).not.toContain("/server-gh-config");
     // Host discovery keys still reach the probe.
     expect(childEnv).toContain(`HOME=${root}`);
-    expect(childEnv).toContain("GH_TOKEN=legacy-token");
     expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("host");
     expect(env.PAPERCLIP_GITHUB_HOST_HOME).toBe(root);
   });

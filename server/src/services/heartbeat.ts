@@ -600,6 +600,7 @@ import {
 import {
   isPaperclipGhWrapperEnabled,
   isPaperclipGitHubCredentialHelperEnabled,
+  MANAGED_GITHUB_TOKEN_KEYS,
   readPaperclipSkillSyncPreference,
   selectPaperclipTaskMarkdown,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
@@ -1658,13 +1659,8 @@ const FORBIDDEN_ENV_BINDING_KEYS = new Set([
   "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
   "PAPERCLIP_GITHUB_LAUNCHER_DIR",
 ]);
-const MANAGED_GITHUB_TOKEN_KEYS = new Set([
-  "GH_TOKEN",
-  "GITHUB_TOKEN",
-  "GH_ENTERPRISE_TOKEN",
-  "GITHUB_ENTERPRISE_TOKEN",
-  "PAPERCLIP_GIT_TOKEN",
-]);
+// MANAGED_GITHUB_TOKEN_KEYS is shared from @paperclipai/adapter-utils/server-utils
+// (the sanitizeInheritedPaperclipEnv choke point strips the same set).
 
 function stripForbiddenEnvBindings(
   envValue: unknown,
