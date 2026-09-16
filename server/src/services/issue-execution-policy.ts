@@ -525,8 +525,12 @@ export function assertPatchableExecutionPolicyWrite(input: {
    *  before the schema's `.default([])` erases the distinction. Omitting the
    *  key preserves the stored stages rather than clearing them (SUP-15377). */
   stagesKeyAbsent: boolean;
+  /** SUP-16525: the issue's stored execution state. When present with a
+   *  non-null currentStageId, INV-LADDER-1 rejects stage inserts behind
+   *  the live pointer. */
+  executionState?: IssueExecutionState | null;
 }): void {
-  const { raw, currentPolicy, stagesExplicitlyEmpty, stagesKeyAbsent } = input;
+  const { raw, currentPolicy, stagesExplicitlyEmpty, stagesKeyAbsent, executionState } = input;
 
   // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
   // over a stored policy that is already stage-less is a faithful round-trip,
@@ -558,6 +562,22 @@ export function assertPatchableExecutionPolicyWrite(input: {
       );
     }
   }
+
+  // SUP-16525 INV-LADDER-1: reject stage inserts behind the live stage pointer.
+  // Vacuous when the client omitted the stages key (preserve-on-omit: the
+  // stored stages are carried forward unchanged, so no insertion is possible).
+  if (
+    executionState?.currentStageId &&
+    !stagesKeyAbsent &&
+    raw !== null &&
+    typeof raw === "object" &&
+    !Array.isArray(raw)
+  ) {
+    const normalized = normalizeIssueExecutionPolicy(raw);
+    if (normalized && normalized.stages.length > 0) {
+      assertNoStageInsertedBehindPointer({ policy: normalized, executionState });
+    }
+  }
 }
 
 /**
@@ -585,6 +605,9 @@ export function resolvePatchExecutionPolicy(input: {
   raw: unknown;
   currentPolicy: IssueExecutionPolicy | null;
   stagesKeyAbsent: boolean;
+  /** SUP-16525: the issue's stored execution state (for pointer-consistency
+   *  validation alongside the invariant check in the assert). */
+  executionState?: IssueExecutionState | null;
 }): IssueExecutionPolicy | null {
   const { raw, currentPolicy, stagesKeyAbsent } = input;
   if (raw === null) return null;
@@ -597,6 +620,87 @@ export function resolvePatchExecutionPolicy(input: {
       ? { ...(raw as Record<string, unknown>), stages: storedStages }
       : raw;
   return normalizeIssueExecutionPolicy(effectiveRaw);
+}
+
+/**
+ * INV-LADDER-1 (SUP-16525): rejects stage inserts behind the live stage pointer.
+ *
+ * For a stored execution state S with a non-null currentStageId, and an incoming
+ * policy P', the write is admissible iff:
+ *   C1: every stage id in S.completedStageIds ∪ S.skippedStageIds that survives
+ *       in P' has a position strictly before pos'(S.currentStageId); AND
+ *   C2: no stage id that is NOT in S.completedStageIds ∪ S.skippedStageIds
+ *       occupies a position before pos'(S.currentStageId).
+ *
+ * The invariant is vacuous when S.currentStageId is null (no ladder active).
+ *
+ * §5 pointer consistency: if S.currentStageId is not found in P', the write is
+ * rejected (dangling pointer — the client removed the stage the state points to).
+ */
+export function assertNoStageInsertedBehindPointer(input: {
+  policy: IssueExecutionPolicy;
+  executionState: IssueExecutionState | null;
+}): void {
+  const { policy, executionState } = input;
+  const currentStageId = executionState?.currentStageId;
+  if (!currentStageId) return;
+
+  const currentIdx = policy.stages.findIndex((s) => s.id === currentStageId);
+  if (currentIdx === -1) {
+    throw unprocessable(
+      "executionPolicy must retain the issue's current stage; the stage pointer references a stage that is not in the incoming policy",
+      { code: "execution_policy_current_stage_removed", currentStageId },
+    );
+  }
+
+  const resolvedIds = new Set([
+    ...(executionState!.completedStageIds ?? []),
+    ...(executionState!.skippedStageIds ?? []),
+  ]);
+
+  // C1: all surviving completed/skipped stages must be strictly before the pointer
+  for (const stage of policy.stages) {
+    if (resolvedIds.has(stage.id) && stage.id !== currentStageId) {
+      const idx = policy.stages.findIndex((s) => s.id === stage.id);
+      if (idx >= currentIdx) {
+        throw unprocessable(
+          "executionPolicy must not place a completed or skipped stage at or after the current stage pointer",
+          { code: "execution_policy_stage_inserted_behind_pointer", offendingStageId: stage.id, currentStageId },
+        );
+      }
+    }
+  }
+
+  // C2: no unresolved stage may occupy a position before the pointer
+  for (let i = 0; i < currentIdx; i++) {
+    const stage = policy.stages[i];
+    if (!resolvedIds.has(stage.id)) {
+      throw unprocessable(
+        "executionPolicy must not insert an unresolved stage before the current stage pointer",
+        { code: "execution_policy_stage_inserted_behind_pointer", offendingStageId: stage.id, currentStageId },
+      );
+    }
+  }
+}
+
+/**
+ * SUP-16525 §4: authorized re-arm of the execution state pointer after a policy
+ * change. Rewinds currentStageId/currentStageIndex to the first stage in P' that
+ * is not in S.completedStageIds. Does NOT add skipped-over stages to
+ * completedStageIds; does NOT write skippedStageIds.
+ *
+ * Returns null when all stages in P' are already completed (no re-arm target).
+ */
+export function rearmExecutionPolicyPointer(input: {
+  policy: IssueExecutionPolicy;
+  executionState: IssueExecutionState;
+}): { currentStageId: string; currentStageIndex: number } | null {
+  const { policy, executionState } = input;
+  const completed = new Set(executionState.completedStageIds ?? []);
+  const next = policy.stages.find((s) => !completed.has(s.id));
+  if (!next) return null;
+  const idx = policy.stages.findIndex((s) => s.id === next.id);
+  return { currentStageId: next.id, currentStageIndex: idx };
 }
 
 /**

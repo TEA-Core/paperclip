@@ -15703,16 +15703,19 @@ export function issueRoutes(
       const stagesKeyAbsent = Boolean(
         (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent,
       );
+      const parsedExecutionState = parseIssueExecutionState(existing.executionState);
       assertPatchableExecutionPolicyWrite({
         raw: req.body.executionPolicy,
         currentPolicy: previousExecutionPolicy,
         stagesExplicitlyEmpty,
         stagesKeyAbsent,
+        executionState: parsedExecutionState,
       });
       const normalizedExecutionPolicy = resolvePatchExecutionPolicy({
         raw: req.body.executionPolicy,
         currentPolicy: previousExecutionPolicy,
         stagesKeyAbsent,
+        executionState: parsedExecutionState,
       });
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
       // moves the assignee off the collision in the same body is accepted.
