@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyExecutionPolicyReArm,
+  applyIssueExecutionPolicyTransition,
   assertNoStageInsertedBehindPointer,
   assertPatchableExecutionPolicyWrite,
   normalizeIssueExecutionPolicy,
@@ -37,7 +39,7 @@ function threeStagePolicy() {
 /** Execution state: stage1 completed, pointer on stage2. */
 function activeState(): IssueExecutionState {
   return {
-    status: "in_progress",
+    status: "pending",
     currentStageId: stage2Id,
     currentStageIndex: 1,
     currentStageType: "review",
@@ -117,16 +119,57 @@ describe("INV-LADDER-1: assertNoStageInsertedBehindPointer (SUP-16525)", () => {
     ).not.toThrow();
   });
 
-  it("allows removing a completed stage from the prefix", () => {
+  it("rejects removing a completed stage from the prefix (shifts the stored pointer)", () => {
     const state = activeState();
-    // Remove stage1 (completed) from the policy.
+    // Remove stage1 (completed) from BEFORE the pointer. stage2 slides from
+    // index 1 to index 0, so the stored currentStageIndex would no longer name
+    // it — the duplicated pointer would be inconsistent. Neither C1 nor C2 sees
+    // this (nothing is inserted before the pointer), so §5 must catch it.
     const removed = makePolicyWithIds([
       { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
       { id: stage3Id, type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
     ]);
     expect(() =>
       assertNoStageInsertedBehindPointer({ policy: removed, executionState: state }),
+    ).toThrowError(HttpError);
+
+    try {
+      assertNoStageInsertedBehindPointer({ policy: removed, executionState: state });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as HttpError).status).toBe(422);
+      expect((err as HttpError).details).toMatchObject({
+        code: "execution_policy_stage_inserted_behind_pointer",
+        offendingStageId: stage3Id,
+        currentStageId: stage2Id,
+        currentStageIndex: 1,
+      });
+    }
+  });
+
+  it("allows removing a stage after the pointer (stored index still names the current stage)", () => {
+    const state = activeState();
+    // Remove stage3 (after the pointer): stage2 stays at index 1.
+    const removed = makePolicyWithIds([
+      { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+      { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
+    ]);
+    expect(() =>
+      assertNoStageInsertedBehindPointer({ policy: removed, executionState: state }),
     ).not.toThrow();
+  });
+
+  it("rejects a write that shifts the current stage when currentStageIndex is stale", () => {
+    // Stored state claims index 2 but the policy only has 2 stages — a stale /
+    // duplicated pointer the pre-§5 check accepted.
+    const state = {
+      ...activeState(),
+      currentStageId: stage2Id,
+      currentStageIndex: 2,
+    } as unknown as IssueExecutionState;
+    expect(() =>
+      assertNoStageInsertedBehindPointer({ policy: threeStagePolicy(), executionState: state }),
+    ).toThrowError(HttpError);
   });
 
   it("is vacuous when currentStageId is null", () => {
@@ -348,5 +391,189 @@ describe("resolvePatchExecutionPolicy with executionState (SUP-16525 API symmetr
     expect(withState!.stages.map((s) => s.participants.length)).toEqual(
       withoutState!.stages.map((s) => s.participants.length),
     );
+  });
+
+  it("rejects an insert behind the pointer at the resolver boundary (SUP-16525 finding 3)", () => {
+    const stored = threeStagePolicy();
+    const state = activeState();
+    // newStage inserted before the live pointer — the assert rejects this; the
+    // resolver must independently refuse to *produce* the same bad policy.
+    const raw = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+        { id: newStageId, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
+        { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
+        { id: stage3Id, type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+      ],
+    };
+
+    expect(() =>
+      resolvePatchExecutionPolicy({
+        raw,
+        currentPolicy: stored,
+        stagesKeyAbsent: false,
+        executionState: state,
+      }),
+    ).toThrowError(HttpError);
+  });
+
+  it("keeps the preserve-on-omit path a no-op even when armed", () => {
+    const stored = threeStagePolicy();
+    const state = activeState();
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+      executionState: state,
+    });
+    expect(resolved!.stages.map((s) => s.id)).toEqual([stage1Id, stage2Id, stage3Id]);
+  });
+});
+
+/** Minimal issue shape for the re-arm / transition paths. */
+function rearmIssue(executionState: IssueExecutionState) {
+  return {
+    id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    status: "in_review",
+    assigneeAgentId: coderAgentId,
+    assigneeUserId: null,
+    createdByUserId: ctoUserId,
+    executionState: executionState as unknown as Record<string, unknown>,
+  };
+}
+
+describe("applyExecutionPolicyReArm (SUP-16525 §4 persisted path)", () => {
+  it("persists a re-armed pending state with a self-consistent pointer", () => {
+    const state = activeState(); // stage1 completed, pointer on stage2
+    const policy = threeStagePolicy();
+    const result = applyExecutionPolicyReArm({
+      issue: rearmIssue(state),
+      policy,
+      executionState: state,
+    });
+
+    expect(result.patch.status).toBe("in_review");
+    const written = result.patch.executionState as IssueExecutionState;
+    expect(written).toBeTruthy();
+    // Both halves of the duplicated pointer agree with each other and with P'.
+    expect(written.currentStageId).toBe(stage2Id);
+    expect(written.currentStageIndex).toBe(1);
+    expect(policy.stages[written.currentStageIndex!]!.id).toBe(written.currentStageId);
+    // A re-arm is NOT a completion: the resolved sets are carried forward.
+    expect(written.completedStageIds).toEqual([stage1Id]);
+    expect(written.skippedStageIds).toEqual([]);
+    // The re-armed stage lands in NEITHER list — the parent stays unclosable
+    // until it earns a real decision row (ADR-073 D4).
+    expect(written.completedStageIds).not.toContain(stage2Id);
+    expect(written.skippedStageIds).not.toContain(stage2Id);
+    expect(written.changesRequestedCount).toBe(0);
+    expect(written.currentParticipant).toMatchObject({ type: "agent", agentId: leAgentId });
+    expect(result.patch.assigneeAgentId).toBe(leAgentId);
+  });
+
+  it("re-arms onto a newly inserted stage ahead of the stale pointer", () => {
+    const state = activeState();
+    const policy = makePolicyWithIds([
+      { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+      { id: newStageId, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
+      { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
+      { id: stage3Id, type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+    ]);
+    const result = applyExecutionPolicyReArm({
+      issue: rearmIssue(state),
+      policy,
+      executionState: state,
+    });
+    const written = result.patch.executionState as IssueExecutionState;
+    expect(written.currentStageId).toBe(newStageId);
+    expect(written.currentStageIndex).toBe(1);
+    expect(policy.stages[1]!.id).toBe(written.currentStageId);
+    expect(written.completedStageIds).toEqual([stage1Id]);
+  });
+
+  it("returns an empty patch when every stage is already completed", () => {
+    const state = {
+      ...activeState(),
+      completedStageIds: [stage1Id, stage2Id, stage3Id],
+      currentStageId: null,
+      currentStageIndex: null,
+    } as unknown as IssueExecutionState;
+    const result = applyExecutionPolicyReArm({
+      issue: rearmIssue(state),
+      policy: threeStagePolicy(),
+      executionState: state,
+    });
+    expect(result.patch).toEqual({});
+  });
+
+  it("is reachable through applyIssueExecutionPolicyTransition via rearmPointer", () => {
+    const state = activeState();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: rearmIssue(state),
+      policy: threeStagePolicy(),
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      rearmPointer: true,
+    });
+    expect(result.patch.status).toBe("in_review");
+    const written = result.patch.executionState as IssueExecutionState;
+    expect(written.currentStageId).toBe(stage2Id);
+    expect(written.currentStageIndex).toBe(1);
+  });
+});
+
+describe("INV-LADDER-1 full scenario: raw PATCH refused, §4 re-arm recovers (SUP-16525)", () => {
+  it("refuses the raw prefix-removal rewrite and re-seats the pointer via the re-arm", () => {
+    const stored = threeStagePolicy();
+    const state = activeState();
+    // Client removes the completed stage1 from the prefix. The raw rewrite is
+    // refused by BOTH the assert (route boundary) and the resolver (store boundary).
+    const rewrite = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
+        { id: stage3Id, type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+      ],
+    };
+
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: rewrite,
+        currentPolicy: stored,
+        stagesExplicitlyEmpty: false,
+        stagesKeyAbsent: false,
+        executionState: state,
+      }),
+    ).toThrowError(HttpError);
+    expect(() =>
+      resolvePatchExecutionPolicy({
+        raw: rewrite,
+        currentPolicy: stored,
+        stagesKeyAbsent: false,
+        executionState: state,
+      }),
+    ).toThrowError(HttpError);
+
+    // The sanctioned recovery: re-arm against the NEW policy. The pointer
+    // re-seats on stage2 at its new index 0, completedStageIds is pruned to the
+    // surviving policy (stage1 dropped), and no stage is wrongly completed.
+    const newPolicy = normalizeIssueExecutionPolicy({ stages: rewrite.stages })!;
+    const result = applyIssueExecutionPolicyTransition({
+      issue: rearmIssue(state),
+      policy: newPolicy,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      rearmPointer: true,
+    });
+    const written = result.patch.executionState as IssueExecutionState;
+    expect(written.currentStageId).toBe(stage2Id);
+    expect(written.currentStageIndex).toBe(0);
+    expect(newPolicy.stages[written.currentStageIndex!]!.id).toBe(stage2Id);
+    expect(written.completedStageIds).toEqual([]);
+    expect(written.skippedStageIds).toEqual([]);
+    expect(result.droppedStageIds).toEqual([stage1Id]);
   });
 });

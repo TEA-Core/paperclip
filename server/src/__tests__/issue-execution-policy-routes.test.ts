@@ -1307,6 +1307,89 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
+  it("rejects a PATCH inserting a stage behind the live pointer (SUP-16525 INV-LADDER-1)", async () => {
+    const stage1Id = "aaaaaaaa-0000-4000-8000-000000000001";
+    const stage2Id = "aaaaaaaa-0000-4000-8000-000000000002";
+    const stage3Id = "aaaaaaaa-0000-4000-8000-000000000003";
+    const newStageId = "bbbbbbbb-0000-4000-8000-000000000004";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: stage1Id,
+          type: "review",
+          participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+        },
+        {
+          id: stage2Id,
+          type: "review",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+        { id: stage3Id, type: "approval", participants: [{ type: "user", userId: "cto-user" }] },
+      ],
+    })!;
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: "44444444-4444-4444-8444-444444444444",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1011",
+      title: "Armed ladder",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: stage2Id,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+        returnAssignee: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        completedStageIds: [stage1Id],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              id: stage1Id,
+              type: "review",
+              participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+            },
+            {
+              id: newStageId,
+              type: "review",
+              participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+            },
+            {
+              id: stage2Id,
+              type: "review",
+              participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+            },
+            { id: stage3Id, type: "approval", participants: [{ type: "user", userId: "cto-user" }] },
+          ],
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "execution_policy_stage_inserted_behind_pointer",
+      offendingStageId: newStageId,
+      currentStageId: stage2Id,
+    });
+    // Fail-closed: the refusal happens before any write, so the stored policy,
+    // pointer and completed set are left byte-identical to their pre-PATCH values.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   function roundCapReviewIssue(overrides: Record<string, unknown> = {}, stateOverrides: Record<string, unknown> = {}) {
     const policy = normalizeIssueExecutionPolicy({
       stages: [

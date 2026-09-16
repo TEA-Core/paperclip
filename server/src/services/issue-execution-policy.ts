@@ -63,6 +63,15 @@ type TransitionInput = {
    * (SUP-15768).
    */
   forcedReturnAssignee?: IssueExecutionStagePrincipal | null;
+  /**
+   * SUP-16525 §4: opt-in authorized re-arm. When true and the issue carries a
+   * policy plus an execution state, the transition is short-circuited to
+   * `applyExecutionPolicyReArm` instead of the normal stage-advance logic. This
+   * is the single sanitized recovery for a policy change that cannot keep the
+   * live stage in place (the shape INV-LADDER-1 fails closed on); callers must
+   * set it expressly — it is never inferred from the policy diff.
+   */
+  rearmPointer?: boolean;
 };
 
 export type ReviewEscalationSignal = {
@@ -600,16 +609,24 @@ export function assertPatchableExecutionPolicyWrite(input: {
  * A malformed non-object body is returned as `null` rather than thrown: the
  * route has already validated the body against the schema before calling this,
  * so a non-object body is defense-in-depth, not a reachable state.
+ *
+ * SUP-16525: the resolver is the single boundary that produces the *stored*
+ * policy, so it re-runs INV-LADDER-1 over the resolved shape. The route asserts
+ * on the client body first; running the invariant again here makes the
+ * `executionState` parameter load-bearing rather than decorative — a direct
+ * caller that resolves a policy for an armed issue cannot persist a ladder that
+ * breaks the pointer, even if it skipped the assert.
  */
 export function resolvePatchExecutionPolicy(input: {
   raw: unknown;
   currentPolicy: IssueExecutionPolicy | null;
   stagesKeyAbsent: boolean;
-  /** SUP-16525: the issue's stored execution state (for pointer-consistency
-   *  validation alongside the invariant check in the assert). */
+  /** SUP-16525: the issue's stored execution state. When present with a
+   *  non-null currentStageId, INV-LADDER-1 rejects stage inserts behind the
+   *  live pointer (including a shifted/mismatched duplicated pointer). */
   executionState?: IssueExecutionState | null;
 }): IssueExecutionPolicy | null {
-  const { raw, currentPolicy, stagesKeyAbsent } = input;
+  const { raw, currentPolicy, stagesKeyAbsent, executionState } = input;
   if (raw === null) return null;
   if (typeof raw !== "object" || Array.isArray(raw)) return null;
 
@@ -619,7 +636,21 @@ export function resolvePatchExecutionPolicy(input: {
     stagesKeyAbsent && storedStages !== null
       ? { ...(raw as Record<string, unknown>), stages: storedStages }
       : raw;
-  return normalizeIssueExecutionPolicy(effectiveRaw);
+  const resolved = normalizeIssueExecutionPolicy(effectiveRaw);
+
+  // Preserve-on-omit carries the stored stages forward unchanged, so no insert
+  // is possible on that path; only an explicit `stages` body can move the
+  // pointer. Skip the invariant there to keep the omission path a pure no-op.
+  if (
+    executionState?.currentStageId &&
+    !stagesKeyAbsent &&
+    resolved !== null &&
+    resolved.stages.length > 0
+  ) {
+    assertNoStageInsertedBehindPointer({ policy: resolved, executionState });
+  }
+
+  return resolved;
 }
 
 /**
@@ -634,8 +665,16 @@ export function resolvePatchExecutionPolicy(input: {
  *
  * The invariant is vacuous when S.currentStageId is null (no ladder active).
  *
- * §5 pointer consistency: if S.currentStageId is not found in P', the write is
- * rejected (dangling pointer — the client removed the stage the state points to).
+ * §5 pointer consistency: the stored state carries a *duplicated* pointer —
+ * both `currentStageId` and `currentStageIndex`. A write is rejected unless the
+ * incoming policy keeps `currentStageId` at exactly `S.currentStageIndex`:
+ *   - if S.currentStageId is not found in P' the write is rejected (dangling
+ *     pointer — the client removed the stage the state points to); and
+ *   - if P'.stages[S.currentStageIndex]?.id !== S.currentStageId the write is
+ *     rejected (the client shifted the current stage's position, so the two
+ *     halves of the duplicated pointer would disagree).
+ * Both are fail-closed: the sanctioned recovery for a policy that no longer
+ * keeps the live stage in place is the §4 re-arm, not a raw PATCH.
  */
 export function assertNoStageInsertedBehindPointer(input: {
   policy: IssueExecutionPolicy;
@@ -652,6 +691,9 @@ export function assertNoStageInsertedBehindPointer(input: {
       { code: "execution_policy_current_stage_removed", currentStageId },
     );
   }
+
+  // Captured here, enforced after C1/C2 (see the §5 backstop below).
+  const storedIndex = executionState!.currentStageIndex;
 
   const resolvedIds = new Set([
     ...(executionState!.completedStageIds ?? []),
@@ -681,6 +723,24 @@ export function assertNoStageInsertedBehindPointer(input: {
       );
     }
   }
+
+  // §5 duplicated-pointer consistency (backstop, checked after C1/C2 so those
+  // keep their more specific messages): the persisted state stores currentStageId
+  // *and* currentStageIndex. A policy that keeps the id but moves it leaves the
+  // stored numeric index pointing at a different stage — e.g. removing a
+  // completed stage from the prefix shifts the live stage without inserting
+  // anything before it, which both positional loops above stay silent on.
+  if (typeof storedIndex === "number" && policy.stages[storedIndex]?.id !== currentStageId) {
+    throw unprocessable(
+      "executionPolicy would leave the stored currentStageIndex pointing at a different stage than currentStageId; the duplicated pointer would be inconsistent",
+      {
+        code: "execution_policy_stage_inserted_behind_pointer",
+        offendingStageId: policy.stages[storedIndex]?.id ?? null,
+        currentStageId,
+        currentStageIndex: storedIndex,
+      },
+    );
+  }
 }
 
 /**
@@ -701,6 +761,61 @@ export function rearmExecutionPolicyPointer(input: {
   if (!next) return null;
   const idx = policy.stages.findIndex((s) => s.id === next.id);
   return { currentStageId: next.id, currentStageIndex: idx };
+}
+
+/**
+ * SUP-16525 §4: the authorized *persisted* re-arm path. `rearmExecutionPolicyPointer`
+ * is the pure calculator; this is the single writer that turns its result into a
+ * concrete patch, so a policy change that no longer keeps the live stage in place
+ * has a real recovery path rather than a dangling helper.
+ *
+ * The re-armed stage is the first stage in P' not in `S.completedStageIds`,
+ * mirroring `nextPendingStage`. `completedStageIds`/`skippedStageIds` are carried
+ * forward unchanged — a re-arm is explicitly NOT a completion, so the re-armed
+ * stage lands in NEITHER list — and the pending-review counter resets to 0 for
+ * the fresh round. `patch.status` is `in_review` and the target stage's
+ * participant is assigned, exactly like a normal pending-stage patch.
+ *
+ * Returns `{ patch: {} }` when P' has no un-completed stage (nothing to re-arm:
+ * the ladder is fully resolved, so the completed state stands).
+ */
+export function applyExecutionPolicyReArm(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  executionState: IssueExecutionState;
+}): TransitionResult {
+  const { issue, policy, executionState } = input;
+  const rearm = rearmExecutionPolicyPointer({ policy, executionState });
+  if (!rearm) return { patch: {} };
+
+  const stage = policy.stages[rearm.currentStageIndex];
+  if (!stage || stage.id !== rearm.currentStageId) return { patch: {} };
+
+  const returnAssignee = resolveReturnAssignee({
+    policy,
+    existingState: executionState,
+    currentAssignee: assigneePrincipal(issue),
+  });
+  const participant =
+    selectStageParticipant(stage, { preferred: returnAssignee }) ?? selectStageParticipant(stage);
+  if (!participant) {
+    throw unprocessable(
+      "Cannot re-arm the execution pointer: the target stage has no eligible participant",
+      { code: "execution_policy_rearm_no_participant", stageId: stage.id },
+    );
+  }
+
+  const patch: Record<string, unknown> = {};
+  buildPendingStagePatch({
+    patch,
+    previous: executionState,
+    policy,
+    stage,
+    participant,
+    returnAssignee,
+    changesRequestedCount: 0,
+  });
+  return { patch };
 }
 
 /**
@@ -1753,6 +1868,23 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
       executionState: pruned.state as Record<string, unknown> | null,
     },
   };
+
+  // SUP-16525 §4: an explicit re-arm request bypasses the stage-advance logic
+  // entirely — its whole purpose is to re-seat a pointer the normal flow cannot
+  // keep consistent after a policy rewrite. It runs against the *pruned* state so
+  // its re-armed `completedStageIds`/`skippedStageIds` stay scoped to the policy
+  // being written (SUP-14590). Falls through when there is no policy or no
+  // execution state to re-arm.
+  if (input.rearmPointer && input.policy && pruned.state) {
+    const rearmed = applyExecutionPolicyReArm({
+      issue: scopedInput.issue,
+      policy: input.policy,
+      executionState: pruned.state,
+    });
+    if (pruned.droppedStageIds.length > 0) rearmed.droppedStageIds = pruned.droppedStageIds;
+    return rearmed;
+  }
+
   const stageResult = applyIssueExecutionStageTransition(scopedInput);
   const monitorPatch = applyMonitorTransition(scopedInput, stageResult.patch);
   Object.assign(stageResult.patch, monitorPatch);
