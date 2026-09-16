@@ -643,6 +643,7 @@ export async function provisionIssueExecutionWorkspace(
     heartbeatRunId: run.id,
     responsibleUserId: run.responsibleUserId,
     agentId: agent.id,
+    environmentDriver: input.selectedEnvironmentForConfig?.driver ?? null,
   });
   const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
     await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({

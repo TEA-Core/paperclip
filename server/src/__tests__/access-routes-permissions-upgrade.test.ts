@@ -109,6 +109,12 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     await tempDb?.cleanup();
   });
 
+  // Fork divergence (first-test cold-import budget, slice 2c): upstream pins this test to 10s (897cc322c).
+  // The first test in a route suite pays the cold import of the route graph, and a fold
+  // imports the union of both sides' graphs. On CI this test took 8392ms at the fork tip
+  // and 9459ms on the fold PR (run 35035870711), under a 10s pin; issue-telemetry-routes and
+  // issue-thread-interaction-routes crossed it in the same run. The pin is dropped so the
+  // test uses server/vitest.config.ts's 15s testTimeout (upstream 69590890d).
   it("rejects owner self-lockout through the member route after the permissions upgrade", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
 
@@ -125,7 +131,7 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
       .where(eq(companyMemberships.id, owner.id))
       .then((rows) => rows[0]!);
     expect(unchanged.membershipRole).toBe("owner");
-  }, 10_000);
+  });
 
   it("keeps custom grants when the role-only member route changes a member role", async () => {
     const { company, owner } = await createCompanyWithOwner(db);

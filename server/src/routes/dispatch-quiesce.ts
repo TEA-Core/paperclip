@@ -3,7 +3,21 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { heartbeatService, instanceSettingsService, logActivity } from "../services/index.js";
+// Fold 2c / barrel-cycle: import these from their own modules, never from the
+// `../services/index.js` barrel. `openapi.ts` imports this file for
+// `dispatchQuiesceRequestSchema`, and upstream's
+// `services/native-runtime/runner-api-catalog.ts` imports `openapi.ts`, so a
+// barrel import here closes the cycle heartbeat.ts -> native-runtime ->
+// openapi.ts -> this route -> services/index.ts -> heartbeat.ts. The barrel is
+// then first evaluated inside heartbeat.ts's own load and binds its
+// `heartbeatService` to the real module, which defeats a partial
+// `vi.mock("../services/heartbeat.js", importOriginal)` for every route that
+// reads the barrel (upstream's board-native-attachments test dispatched a real
+// run instead of its mocked wake). Upstream e83018013's `openapi.ts` imports no
+// route handler module, so it has no such cycle.
+import { heartbeatService } from "../services/heartbeat.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { logActivity } from "../services/activity-log.js";
 import {
   dispatchQuiesce,
   resolveDispatchQuiesceTtlMs,

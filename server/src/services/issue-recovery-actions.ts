@@ -954,3 +954,5 @@ export function issueRecoveryActionService(db: Db) {
     upsertSourceScoped,
   };
 }
+
+export { toReadModel as issueRecoveryActionReadModel };

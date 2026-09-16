@@ -14,6 +14,7 @@ import {
   type CompletedRunStrandFacts,
   type CompletedRunStrandLatestRun,
 } from "./completed-run-strand-sweep.js";
+import { decideSuccessfulRunHandoff, isSuccessfulRunHandoffValidPathSkip } from "./successful-run-handoff.js";
 
 const NOW = new Date("2026-09-15T12:00:00.000Z");
 // Matches the sweep's DEFAULT_SWEEP_IDLE_THRESHOLD_MS.
@@ -550,5 +551,96 @@ describe("real SQL shape (Postgres-acceptable guards)", () => {
     // write is not escalated.
     expect(compiled.sql).toContain('"issues"."status" = $');
     expect(compiled.sql.toLowerCase()).toContain("for update");
+  });
+});
+
+// Fold 2c: upstream's chat channels (not on the fork base) keep a conversation
+// card `in_progress` between turns. The fold's own successful-run handoff treats
+// a correlated chat wake as a valid path ("chat conversation already owns the
+// next action"), so this sweep must not call that card stranded either.
+describe("chat conversation ownership (fold 2c)", () => {
+  const CHAT_COMMENT_ID = "11111111-1111-4111-8111-111111111111";
+  const chatContext = {
+    issueId: "issue-chat",
+    source: "chat:slack",
+    wakeCommentId: CHAT_COMMENT_ID,
+    wakeCommentIds: [CHAT_COMMENT_ID],
+  };
+
+  it("skips escalation when the chat conversation owns the next action", () => {
+    expect(decide({ chatConversationOwnsNextAction: true } as never)).toEqual({ action: "skip-chat-conversation" });
+    expect(decide({ chatConversationOwnsNextAction: false } as never)).toEqual({ action: "escalate" });
+  });
+
+  it("does not escalate an idle chat_channel card whose latest run was a correlated chat wake", async () => {
+    const state: FakeDbState = {
+      candidates: [makeCandidate({ id: "issue-chat", originKind: "chat_channel" } as never)],
+      liveRunQueue: [[], []],
+      latestRunRows: [makeLatestRun({ contextSnapshot: chatContext } as never)],
+      escalationRows: [],
+      updates: 0,
+    };
+    const escalateIssue = vi.fn(async () => true);
+    const report = await sweepCompletedRunStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      idleThresholdMs: IDLE_THRESHOLD_MS,
+      escalateIssue,
+    });
+    expect(report.escalated).toEqual([]);
+    expect(escalateIssue).not.toHaveBeenCalled();
+    expect((report.skipped as unknown as Record<string, string[]>).chatConversation).toEqual(["issue-chat"]);
+  });
+
+  it("agrees with the fold's successful-run handoff decision on the same run", async () => {
+    const cases = [
+      { name: "correlated chat wake on a chat card", originKind: "chat_channel", context: chatContext },
+      { name: "chat wake context on a non-chat card", originKind: null, context: chatContext },
+      { name: "chat card without a wake comment", originKind: "chat_channel", context: { issueId: "issue-chat", source: "chat:slack" } },
+    ];
+    for (const entry of cases) {
+      const handoff = decideSuccessfulRunHandoff({
+        run: { id: "run-1", companyId: "company-1", agentId: "agent-1", status: "succeeded", contextSnapshot: entry.context } as never,
+        issue: {
+          id: "issue-chat", companyId: "company-1", identifier: "PAP-9", title: "Chat", description: null,
+          status: "in_progress", assigneeAgentId: "agent-1", assigneeUserId: null, executionState: null, originKind: entry.originKind,
+        } as never,
+        agent: { id: "agent-1", companyId: "company-1", status: "idle" } as never,
+        livenessState: "advanced",
+        detectedProgressSummary: "replied",
+        hasProgressEvidence: true,
+        paperclipToolCallCount: null,
+        finalReport: "replied",
+        nextAction: null,
+        taskKey: "issue-chat",
+        hasActiveExecutionPath: false,
+        hasQueuedWake: false,
+        hasPendingInteractionOrApproval: false,
+        hasPersistedMonitor: false,
+        hasExplicitBlockerPath: false,
+        hasOpenRecoveryIssue: false,
+        hasPauseHold: false,
+        hasActiveRoutineContinuation: false,
+        budgetBlocked: false,
+        idempotentWakeExists: false,
+      });
+      const state: FakeDbState = {
+        candidates: [makeCandidate({ id: "issue-chat", originKind: entry.originKind } as never)],
+        liveRunQueue: [[], []],
+        latestRunRows: [makeLatestRun({ contextSnapshot: entry.context } as never)],
+        escalationRows: [],
+        updates: 0,
+      };
+      const report = await sweepCompletedRunStrandedIssues({
+        db: makeFakeDb(state),
+        now: NOW,
+        idleThresholdMs: IDLE_THRESHOLD_MS,
+        escalateIssue: vi.fn(async () => true),
+      });
+      const foldTreatsAsOwned = isSuccessfulRunHandoffValidPathSkip(handoff) &&
+        handoff.reason === "chat conversation already owns the next action";
+      expect({ case: entry.name, sweepEscalated: report.escalated.length > 0 })
+        .toEqual({ case: entry.name, sweepEscalated: !foldTreatsAsOwned });
+    }
   });
 });

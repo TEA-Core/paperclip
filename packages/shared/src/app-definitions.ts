@@ -4,6 +4,7 @@ import type { AppDefinition, ConnectionMethodDef, FieldDef } from "./types/app-d
 import type { ToolConnectionOwnership } from "./types/tool-access.js";
 
 export const CONNECTABLE_APP_SLUGS = new Set([
+  "agentmail",
   ...SELF_SERVE_MCP_CANDIDATES.map((entry) => entry.slug),
   "zapier",
   "slack",
@@ -23,6 +24,9 @@ export const CONNECTABLE_APP_SLUGS = new Set([
   "google-people",
   "google-workspace-search",
   "github",
+  "discord",
+  "microsoft-teams",
+  "telegram",
 ]);
 
 export const CONNECTABLE_APP_DEFINITIONS = APP_DEFINITIONS.filter((app) =>
@@ -54,7 +58,6 @@ export const APP_STORE_HIDDEN_SLUGS = new Set([
   "razorpay",
   "sanity",
   "similarweb",
-  "slack",
   "ticket-tailor",
   "ticktick",
   "xero",

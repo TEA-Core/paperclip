@@ -14,9 +14,17 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
-vi.mock("../services/index.js", () => ({
+// Mock the three service modules the route imports. It used to take all three
+// from the `../services/index.js` barrel, but that import closed a module cycle
+// back into heartbeat.ts through openapi.ts (see the Fold 2c note at the top of
+// ../routes/dispatch-quiesce.ts), so the route now imports each one directly.
+vi.mock("../services/heartbeat.js", () => ({
   heartbeatService: () => mockHeartbeatService,
+}));
+vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => mockInstanceSettingsService,
+}));
+vi.mock("../services/activity-log.js", () => ({
   logActivity: mockLogActivity,
 }));
 
