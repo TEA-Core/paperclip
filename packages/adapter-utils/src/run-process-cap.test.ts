@@ -75,6 +75,15 @@ describe("DEFAULT_RUN_PROCESS_CAP (census-derived, SUP-16010)", () => {
     expect(DEFAULT_RUN_PROCESS_CAP).toBe(20);
   });
 
+  it("locks the census sample count that anchors the derivation", () => {
+    // The documented live census (lastRunAt 2026-09-16T18:55:25.397Z, runs=119)
+    // observed 9 sampled runs. Asserting sampleCount locks every input used by
+    // the derivation so the default stays traceable to that authenticated
+    // result; a smaller sample would invalidate the p99/max it multiplies.
+    expect(CENSUS.sampleCount).toBe(9);
+    // The default 20 is 4x p99 with 4x headroom over it (20 / 5 = 4x).
+  });
+
   it("rejects the old incident-derived value as the source", () => {
     expect(DEFAULT_RUN_PROCESS_CAP).not.toBe(512);
   });
