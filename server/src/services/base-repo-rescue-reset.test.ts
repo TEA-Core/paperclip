@@ -398,7 +398,7 @@ function waitForCapture(identity: string, seq: number, timeoutMs = 12000): Promi
 // --- P1 ---
 
 describe("P1 — operator reset and auto self-heal contend on the lease", () => {
-  it("capture barrier: exactly one contender captures and performs a destructive move", async () => {
+  it("capture barrier: BOTH authoritative in-lease captures are recorded and exactly one destructive move lands", async () => {
     const f = await makeOriginAndClone("sup15722-p1-");
     const { priorTip, originMain } = await makeAheadByDuplicates(f);
 
@@ -407,58 +407,76 @@ describe("P1 — operator reset and auto self-heal contend on the lease", () => 
     // log. It only records argv; the deterministic freeze is the capture barrier.
     const shim = await installLogShim(f);
     try {
-      // Arm the capture barrier: gate the operator's in-lease capture (seq1) and
-      // the auto's in-lease capture (seq2). In GREEN the auto's seq2 is
-      // unreachable (refused at the allUpstream check before it can capture); in
-      // RED (lease passthrough) both contenders are held at their own capture.
-      armCapture(f.work, { operator: [1], auto: [2] });
+      // Arm the capture barrier on the TWO authoritative (in-lease) captures:
+      // the auto's `rev-parse HEAD` under the lease (seq2, line 5382) and the
+      // operator's `rev-parse HEAD` under the lease (seq1, line 4582). Every
+      // other capture is an un-gated pre-lease observation that only gates the
+      // attempt. Because the on-disk lease is EXCLUSIVE, only one caller can be
+      // inside the critical section at a time, so the two authoritative captures
+      // are ordered rather than concurrent: the winner captures the stale tip,
+      // the loser (serialized behind it) captures the post-move tip and is
+      // refused non-destructively.
+      armCapture(f.work, { auto: [2], operator: [1] });
 
-      const pOperator = cap.als.run("operator", () =>
-        resetProjectBaseRepoWithRescue({ repoRoot: f.work, baseRef: "origin/main" }),
-      );
+      // Deterministic winner = the auto. It is launched first, reaches the lease
+      // and is frozen at its in-lease capture while still holding the lease.
       const pAuto = cap.als.run("auto", () =>
         prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" }),
       );
-      void pOperator.catch(() => {});
       void pAuto.catch(() => {});
 
-      // Wait for the operator's gated in-lease capture (seq1, line 4582) and the
-      // auto's pre-lease observation (seq1, line 5262, passes through).
-      const [opSha, autoPreSha] = await Promise.all([
-        waitForCapture("operator", 1),
+      // auto:1 is the pre-lease observation (line 5262); auto:2 is the
+      // authoritative in-lease capture (line 5382). Both read the stale tip.
+      const [autoPreSha, autoLeaseSha] = await Promise.all([
         waitForCapture("auto", 1),
+        waitForCapture("auto", 2),
       ]);
-
-      // Both contenders observed the SAME stale prior tip.
-      expect(opSha).toBe(priorTip);
       expect(autoPreSha).toBe(priorTip);
+      expect(autoLeaseSha).toBe(priorTip);
 
-      // Frozen state: the operator holds the lease and is frozen BEFORE its pin;
-      // the auto is blocked at the on-disk lease lock. NO pin, CAS, or reset has
-      // occurred. This is the distinguishing assertion: the old pin-barrier test
-      // asserted pinLines(frozen) === 1 (one pin reached the gate), which does
-      // NOT prove the second contender was prevented from capturing. Here, ZERO
-      // pins exist because neither contender has passed the capture point yet.
+      // Frozen state: the auto holds the lease and is frozen AFTER its
+      // authoritative capture and BEFORE its pin. ZERO pins exist — neither
+      // contender has entered the destructive section. (Pre-fix, with the lease
+      // serialization disabled, both contenders capture here and both proceed to
+      // pin the same priorTip, so `pinLines(full)` becomes 2 — the distinguishing
+      // red. The exact pre-fix red command + raw output is in the SUP-16430
+      // delivery comment.)
       const frozen = await readLog(shim.logFile);
       expect(pinLines(frozen)).toHaveLength(0);
       expect(casLines(frozen)).toEqual([]);
       expect(resetLines(frozen)).toEqual([]);
       expect(await git(["rev-parse", "HEAD"], f.work)).toBe(priorTip);
 
-      // The auto never reached its own in-lease capture: the lease serialized it
-      // behind the operator, and by the time it re-acquires the lease HEAD is the
-      // upstream tip, so it is refused before capturing (and before pinning).
-      expect(cap.log.some((e) => e.identity === "auto" && e.seq === 2)).toBe(false);
+      // The operator now contends and is serialized behind the auto's lease: it
+      // blocks at lease acquisition (line 4561) before reaching its own capture.
+      const pOperator = cap.als.run("operator", () =>
+        resetProjectBaseRepoWithRescue({ repoRoot: f.work, baseRef: "origin/main" }),
+      );
+      void pOperator.catch(() => {});
 
-      // Release the operator's gated capture. The operator now pins, CASes,
-      // resets, and releases the lease. The auto (unblocked) acquires the lease,
-      // re-checks aheadCount (= 0, since HEAD is now originMain), and refuses.
+      // Let the auto perform the ONE destructive move and release the lease.
+      releaseCapture("auto", 2);
+
+      // The operator then acquires the lease and records its OWN authoritative
+      // in-lease capture (seq1, line 4582). It observes the upstream tip because
+      // the auto already moved HEAD, so it is refused as alreadyAtTarget — the
+      // complementary, non-destructive loser.
+      const operatorLeaseSha = await waitForCapture("operator", 1);
+      expect(operatorLeaseSha).toBe(originMain);
       releaseCapture("operator", 1);
-      const [operatorResult, autoResult] = await Promise.all([pOperator, pAuto]);
+
+      const [autoResult, operatorResult] = await Promise.all([pAuto, pOperator]);
+
+      // BOTH authoritative in-lease captures were recorded, by identity and SHA,
+      // by the same caller-identified barrier. This is the property the previous
+      // pin-barrier test could not prove: it only asserted the auto's in-lease
+      // capture was ABSENT, so it could not distinguish "the lease ordered two
+      // real captures" from "the second contender simply never arrived".
+      expect(cap.log.some((e) => e.identity === "auto" && e.seq === 2 && e.sha === priorTip)).toBe(true);
+      expect(cap.log.some((e) => e.identity === "operator" && e.seq === 1 && e.sha === originMain)).toBe(true);
 
       // EXACTLY ONE destructive move: one pin, one CAS, one reset, all recorded
-      // by the same shim. Pre-fix (lease passthrough) both contenders capture
-      // and pin the same priorTip: pinLines would be 2 — the distinguishing red.
+      // by the same shim.
       const full = await readLog(shim.logFile);
       expect(pinLines(full)).toHaveLength(1);
       expect(casLines(full)).toHaveLength(1);
@@ -471,23 +489,18 @@ describe("P1 — operator reset and auto self-heal contend on the lease", () => 
       expect(await git(["rev-parse", "HEAD"], f.work)).toBe(originMain);
       expect(await objectExists(f.work, priorTip)).toBe(true);
 
-      // Explicit winner/loser branches (no count-only inference): exactly one
-      // contender performed a destructive reset; the other was refused.
-      expect(operatorResult.ok).toBe(true);
-      if (!operatorResult.ok) throw new Error("operator reset did not succeed");
+      // Explicit winner/loser branches (no count-only inference): the auto
+      // performed the destructive reset; the operator was refused as
+      // alreadyAtTarget and moved nothing.
       const autoDidReset = autoResult.warnings.some(
         (w) => w.includes("Auto reset: Base repository") && w.includes(" was reset to "),
       );
-      const operatorDidReset = !operatorResult.alreadyAtTarget;
-      expect([operatorDidReset, autoDidReset].filter(Boolean)).toHaveLength(1);
-      if (operatorDidReset) {
-        expect(operatorResult.resetToSha).toBe(originMain);
-        expect(operatorResult.previousTip).toBe(priorTip);
-        expect(autoDidReset).toBe(false);
-      } else {
-        expect(operatorResult.alreadyAtTarget).toBe(true);
-        expect(autoDidReset).toBe(true);
-      }
+      expect(autoDidReset).toBe(true);
+      expect(operatorResult.ok).toBe(true);
+      if (!operatorResult.ok) throw new Error("operator reset did not succeed");
+      expect(operatorResult.alreadyAtTarget).toBe(true);
+      expect(operatorResult.previousTip).toBeNull();
+      expect([autoDidReset, !operatorResult.alreadyAtTarget].filter(Boolean)).toHaveLength(1);
     } finally {
       shim.restore();
     }
@@ -570,51 +583,79 @@ describe("P3 — path aliases converge on one lease identity", () => {
     }
   });
 
-  it("P3c: a linked-worktree contender performs a real destructive reset alongside the main-branch contender", async () => {
+  it("P3c: a linked-worktree contender lands the single destructive move and a path alias of the same repo is refused", async () => {
     const f = await makeOriginAndClone("sup15722-p3c-");
     const { priorTip, originMain } = await makeAheadByDuplicates(f);
-    // Create a linked worktree on a different branch, at the same priorTip.
+    // A linked worktree on its own branch, created at the same priorTip. Calling
+    // the operator reset through it exercises the real linked-worktree identity
+    // path (`git rev-parse --git-common-dir`), not just identity resolution.
     const wt = path.join(f.root, "linked-wt");
     await git(["worktree", "add", "-q", wt, "-b", "alias-branch"], f.work);
-    // The linked worktree is at the same commit as main (priorTip).
     expect(await git(["rev-parse", "HEAD"], wt)).toBe(priorTip);
 
-    const shim = await installBarrierShim(f);
+    // The second contender addresses the SAME repo (the linked worktree) through
+    // a symlink alias, so both contenders contend over the identical ref
+    // (alias-branch). Exactly one destructive move can land.
+    const wtLink = path.join(f.root, "linked-wt-link");
+    await fs.symlink(wt, wtLink, "dir");
+    expect(await git(["rev-parse", "HEAD"], wtLink)).toBe(priorTip);
+
+    const shim = await installLogShim(f);
     try {
-      // Contender A: operator reset through the linked worktree (alias-branch).
-      const pWorktree = resetProjectBaseRepoWithRescue({ repoRoot: wt, baseRef: "origin/main" });
-      // Contender B: operator reset through the main branch (absolute path).
-      const pMain = resetProjectBaseRepoWithRescue({ repoRoot: f.work, baseRef: "origin/main" });
+      // Deterministically make the linked-worktree contender the winner: gate
+      // its authoritative in-lease capture (operator seq1, line 4582). The alias
+      // contender is serialized behind the lease at acquisition (line 4561).
+      armCapture(wt, { operator: [1] });
+
+      const pWorktree = cap.als.run("operator", () =>
+        resetProjectBaseRepoWithRescue({ repoRoot: wt, baseRef: "origin/main" }),
+      );
       void pWorktree.catch(() => {});
-      void pMain.catch(() => {});
+      expect(await waitForCapture("operator", 1)).toBe(priorTip);
 
-      await waitForFile(shim.frozenMarker);
+      // Frozen: the linked-worktree contender holds the lease with ZERO moves
+      // landed; the alias contender is blocked at lease acquisition. Serialized,
+      // not interleaved.
       const frozen = await readLog(shim.logFile);
-      // Serialization: exactly one pin in-flight at the frozen moment.
-      expect(pinLines(frozen)).toHaveLength(1);
+      expect(pinLines(frozen)).toHaveLength(0);
       expect(casLines(frozen)).toEqual([]);
+      expect(resetLines(frozen)).toEqual([]);
+      expect(await git(["rev-parse", "HEAD"], wt)).toBe(priorTip);
 
-      await shim.release();
-      const [wtResult, mainResult] = await Promise.all([pWorktree, pMain]);
+      const pAlias = cap.als.run("operator", () =>
+        resetProjectBaseRepoWithRescue({ repoRoot: wtLink, baseRef: "origin/main" }),
+      );
+      void pAlias.catch(() => {});
 
-      // Both contenders performed a destructive reset on their respective branches.
+      releaseCapture("operator", 1);
+      const [wtResult, aliasResult] = await Promise.all([pWorktree, pAlias]);
+
+      // EXACTLY ONE destructive move across both contenders: one pin, one CAS,
+      // one reset on the one ref both of them target.
+      const full = await readLog(shim.logFile);
+      expect(pinLines(full)).toHaveLength(1);
+      expect(casLines(full)).toHaveLength(1);
+      expect(resetLines(full)).toHaveLength(1);
+      expect(capturedTips(pinLines(full))).toEqual([priorTip]);
+
+      // Complementary results: the linked-worktree contender performed the
+      // destructive reset; the alias contender was refused non-destructively.
       expect(wtResult.ok).toBe(true);
-      expect(mainResult.ok).toBe(true);
-      if (wtResult.ok && !wtResult.alreadyAtTarget) {
-        expect(wtResult.resetToSha).toBe(originMain);
-        expect(wtResult.previousTip).toBe(priorTip);
-      }
-      if (mainResult.ok && !mainResult.alreadyAtTarget) {
-        expect(mainResult.resetToSha).toBe(originMain);
-        expect(mainResult.previousTip).toBe(priorTip);
-      }
+      if (!wtResult.ok) throw new Error("linked-worktree reset did not succeed");
+      expect(wtResult.alreadyAtTarget).toBe(false);
+      expect(wtResult.resetToSha).toBe(originMain);
+      expect(wtResult.previousTip).toBe(priorTip);
+      expect(aliasResult.ok).toBe(true);
+      if (!aliasResult.ok) throw new Error("alias reset did not succeed");
+      expect(aliasResult.alreadyAtTarget).toBe(true);
+      expect(aliasResult.previousTip).toBeNull();
 
-      // Both branches now point to originMain.
-      expect(await git(["rev-parse", "HEAD"], f.work)).toBe(originMain);
+      // Both views of the linked worktree now sit on the upstream tip; the main
+      // worktree was never touched, and the prior tip stays reachable.
       expect(await git(["rev-parse", "HEAD"], wt)).toBe(originMain);
-
-      // The prior tip is still a live, reachable object.
-      expect(await objectExists(f.work, priorTip)).toBe(true);
+      expect(await git(["rev-parse", "HEAD"], wtLink)).toBe(originMain);
+      expect(await git(["rev-parse", "HEAD"], f.work)).toBe(priorTip);
+      expect(await objectExists(wt, priorTip)).toBe(true);
     } finally {
       shim.restore();
     }
