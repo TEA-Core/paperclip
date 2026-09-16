@@ -227,8 +227,18 @@ describe("chat publication commit signals", () => {
     const appendRunEventStart = heartbeatSource.indexOf(
       "async function appendRunEvent(",
     );
+    // Fork divergence (heartbeat_run_events error column, slice 2c): upstream
+    // 51ad751e0 (#12616) routes appendRunEvent's write through the shared
+    // `appendHeartbeatRunEvent` helper, and 889947c23 (#13038) pins that literal
+    // here. The fork's appendRunEvent keeps the allocate+insert shape instead —
+    // `allocateHeartbeatRunEventSeq` + `buildRunEventInsertValues` + a direct
+    // insert — because `AppendHeartbeatRunEventInput` has no `error` field and
+    // the helper would drop the driver error the fork stores in that column
+    // (#565, migration 0245; kept over upstream's helper by the slice 2b fold
+    // e5d442a8b). Only the literal changes: this still asserts the durable
+    // heartbeat_run_events write lands before the live emit.
     const persistedEvent = heartbeatSource.indexOf(
-      "await appendHeartbeatRunEvent",
+      "await db.insert(heartbeatRunEvents).values(insertValues)",
       appendRunEventStart,
     );
     const emittedEvent = heartbeatSource.indexOf(
