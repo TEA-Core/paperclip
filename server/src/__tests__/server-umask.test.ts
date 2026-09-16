@@ -20,9 +20,12 @@ describe("server umask bootstrap", () => {
     // await (instrumentation, secrets, config, database, HTTP).
     const wrapperIdx = startServerMatch!.index!;
     const wrapperStart = source.slice(wrapperIdx, wrapperIdx + 500);
-    const delegationMatch = wrapperStart.match(/return await startServerWithDatabaseTeardown\(startupDatabase\);/);
+    // Only the teardown holder may precede the delegation; any other statement
+    // in the wrapper would run ahead of the umask.
+    const delegationMatch = wrapperStart.match(
+      /^export async function startServer\(\): Promise<StartedServer> \{\s*const startupDatabase: StartupDatabaseTeardown = \{ close: null \};\s*try \{\s*return await startServerWithDatabaseTeardown\(startupDatabase\);/,
+    );
     expect(delegationMatch).not.toBeNull();
-    expect(delegationMatch!.index).toBeLessThan(200);
 
     const bootBodyMatch = source.match(
       /async function startServerWithDatabaseTeardown\(\s*startupDatabase: StartupDatabaseTeardown,\s*\): Promise<StartedServer> \{/,
@@ -34,7 +37,10 @@ describe("server umask bootstrap", () => {
 
     const umaskMatch = bodyStart.match(/process\.umask\(0o002\)/);
     expect(umaskMatch).not.toBeNull();
-    expect(umaskMatch!.index).toBeLessThan(200);
+    // Keep the pre-fold budget: 200 chars counted from the startServer()
+    // signature, so measured from the opening brace it is 200 minus the
+    // signature. A synchronous statement added ahead of the umask must fail.
+    expect(umaskMatch!.index).toBeLessThan(200 - startServerMatch![0].length);
 
     const firstAwaitIdx = bodyStart.search(/\bawait\b/);
     expect(firstAwaitIdx).toBeGreaterThan(-1);
