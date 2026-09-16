@@ -1390,6 +1390,212 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  // SUP-16525 §4: the route-level probe for the ONE sanctioned recovery from
+  // INV-LADDER-1. The same body that is refused above must persist a
+  // self-consistent pointer when — and only when — it carries the explicit,
+  // authorization-checked `rearmExecutionPolicy` opt-in.
+  function armedLadderInsertIssue() {
+    const stage1Id = "aaaaaaaa-0000-4000-8000-000000000001";
+    const stage2Id = "aaaaaaaa-0000-4000-8000-000000000002";
+    const stage3Id = "aaaaaaaa-0000-4000-8000-000000000003";
+    const newStageId = "bbbbbbbb-0000-4000-8000-000000000004";
+    const agentCoder = "33333333-3333-4333-8333-333333333333";
+    const agentLE = "44444444-4444-4444-8444-444444444444";
+    // The already-completed first gate is decided by a third agent, so no stage
+    // in this ladder is gated solely by the coder return assignee (SUP-10602 /
+    // assertIssueExecutionPolicyGatesAreEnforceable).
+    const agentOther = "66666666-6666-4666-8666-666666666666";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: agentOther }] },
+        { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: agentLE }] },
+        { id: stage3Id, type: "approval", participants: [{ type: "user", userId: "cto-user" }] },
+      ],
+    })!;
+    // newStage is spliced in BEFORE the live pointer (stage2) — the shape
+    // INV-LADDER-1 refuses without the opt-in.
+    const rearmBody = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: agentOther }] },
+        { id: newStageId, type: "review", participants: [{ type: "agent", agentId: agentLE }] },
+        { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: agentLE }] },
+        { id: stage3Id, type: "approval", participants: [{ type: "user", userId: "cto-user" }] },
+      ],
+    };
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      // The assignee is the coder, NOT the LE whose gate is being re-seated: a
+      // stage gated solely by its own return assignee is refused by the
+      // satisfiability guard (SUP-13526), and that guard must keep firing.
+      assigneeAgentId: agentCoder,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1012",
+      title: "Re-arm a rewritten ladder",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: stage2Id,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: agentLE },
+        returnAssignee: { type: "agent", agentId: agentCoder },
+        completedStageIds: [stage1Id],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    return { issue, rearmBody, stageIds: [stage1Id, newStageId, stage2Id, stage3Id], stage1Id, stage2Id, newStageId, agentLE };
+  }
+
+  it("persists both pointer halves when an authorized re-arm rewrites the ladder (SUP-16525 §4)", async () => {
+    const { issue, rearmBody, stageIds, stage1Id, newStageId } = armedLadderInsertIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    // Control: the identical body WITHOUT the opt-in is still refused, and no
+    // write reaches the store (fail closed).
+    const refused = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: rearmBody });
+    expect(refused.status).toBe(422);
+    expect(refused.body.details).toMatchObject({
+      code: "execution_policy_stage_inserted_behind_pointer",
+      offendingStageId: newStageId,
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    // Board re-arm: accepted.
+    const boardRes = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: rearmBody, rearmExecutionPolicy: true });
+    expect(boardRes.status).toBe(200);
+
+    // The sanctioned caller inside the ladder (the assignee/LE) can re-arm its
+    // own card too — the opt-in is not a board-only escape hatch.
+    const agentRes = await request(await createApp({
+      type: "agent",
+      agentId: issue.assigneeAgentId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: rearmBody, rearmExecutionPolicy: true });
+    expect(agentRes.status).toBe(200);
+
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    // The rewritten ladder is persisted in the requested order...
+    const writtenPolicy = patch.executionPolicy as { stages: Array<{ id: string }> };
+    expect(writtenPolicy.stages.map((stage) => stage.id)).toEqual(stageIds);
+    // ...and BOTH halves of the duplicated pointer are re-seated onto the first
+    // stage that is not already completed, i.e. the newly inserted gate.
+    const writtenState = patch.executionState as Record<string, unknown>;
+    expect(patch.status).toBe("in_review");
+    expect(writtenState.currentStageId).toBe(newStageId);
+    expect(writtenState.currentStageIndex).toBe(1);
+    expect(writtenPolicy.stages[writtenState.currentStageIndex as number]!.id).toBe(
+      writtenState.currentStageId,
+    );
+    expect(writtenState.completedStageIds).toEqual([stage1Id]);
+    expect(writtenState.skippedStageIds).toEqual([]);
+    // A re-arm records no verdict: the re-armed gate is in NEITHER resolved set,
+    // so it still blocks a close until it earns a real decision row.
+    expect(writtenState.completedStageIds).not.toContain(newStageId);
+    expect(writtenState.skippedStageIds).not.toContain(newStageId);
+  });
+
+  it("refuses a re-arm that carries no executionPolicy in the same body", async () => {
+    const { issue } = armedLadderInsertIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ rearmExecutionPolicy: true });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("execution_policy_rearm_requires_policy_write");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses a re-arm that smuggles another workflow mutation into the same body", async () => {
+    const { issue, rearmBody } = armedLadderInsertIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    // ...a stage verdict in the same body...
+    const verdict = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: rearmBody, rearmExecutionPolicy: true, status: "done" });
+
+    expect(verdict.status).toBe(422);
+    expect(verdict.body.code).toBe("execution_policy_rearm_conflicts_with_status");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    // ...and a monitor change, which the re-arm's short-circuit would drop.
+    const monitor = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        executionPolicy: {
+          ...rearmBody,
+          monitor: {
+            nextCheckAt: "2026-12-01T12:00:00.000Z",
+            scheduledBy: "assignee",
+            notes: "Wait for external QA report.",
+          },
+        },
+        rearmExecutionPolicy: true,
+      });
+
+    expect(monitor.status).toBe(422);
+    expect(monitor.body.code).toBe("execution_policy_rearm_conflicts_with_monitor_change");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses the re-arm to an assignee agent without runtime:manage", async () => {
+    const { issue, rearmBody } = armedLadderInsertIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    // The assignee holds issue:mutate (it clears the write boundary above) but
+    // not runtime:manage — the re-arm gate must still refuse it.
+    const defaultDecide = mockAccessService.decide.getMockImplementation()!;
+    mockAccessService.decide.mockImplementation(async (input: { actor?: { type?: string; source?: string }; action?: string }) => {
+      if (input.action === "runtime:manage") {
+        return {
+          allowed: false,
+          action: "runtime:manage",
+          reason: "deny_missing_grant",
+          explanation: "Missing permission: runtime:manage",
+        };
+      }
+      return defaultDecide(input);
+    });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: issue.assigneeAgentId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: rearmBody, rearmExecutionPolicy: true });
+
+    expect(res.status).toBe(403);
+    expect(res.body.details?.explanation ?? res.body.error).toContain("runtime:manage");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   function roundCapReviewIssue(overrides: Record<string, unknown> = {}, stateOverrides: Record<string, unknown> = {}) {
     const policy = normalizeIssueExecutionPolicy({
       stages: [

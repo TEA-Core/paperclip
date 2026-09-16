@@ -538,8 +538,15 @@ export function assertPatchableExecutionPolicyWrite(input: {
    *  non-null currentStageId, INV-LADDER-1 rejects stage inserts behind
    *  the live pointer. */
   executionState?: IssueExecutionState | null;
+  /** SUP-16525 §4: the caller has expressly, and through an authorized path,
+   *  asked for the live pointer to be re-armed as part of this write. INV-LADDER-1
+   *  protects the pointer from an *implicit* prefix mutation; a re-arm rewrites
+   *  both halves of the pointer from the incoming policy, so the preservation
+   *  invariant does not apply. Set this ONLY from an explicit,
+   *  authorization-checked request — never inferred from the policy diff. */
+  rearmPointer?: boolean;
 }): void {
-  const { raw, currentPolicy, stagesExplicitlyEmpty, stagesKeyAbsent, executionState } = input;
+  const { raw, currentPolicy, stagesExplicitlyEmpty, stagesKeyAbsent, executionState, rearmPointer } = input;
 
   // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
   // over a stored policy that is already stage-less is a faithful round-trip,
@@ -575,7 +582,10 @@ export function assertPatchableExecutionPolicyWrite(input: {
   // SUP-16525 INV-LADDER-1: reject stage inserts behind the live stage pointer.
   // Vacuous when the client omitted the stages key (preserve-on-omit: the
   // stored stages are carried forward unchanged, so no insertion is possible).
+  // Also vacuous on an authorized §4 re-arm, which rewrites the pointer from
+  // the incoming policy instead of preserving it.
   if (
+    !rearmPointer &&
     executionState?.currentStageId &&
     !stagesKeyAbsent &&
     raw !== null &&
@@ -625,8 +635,12 @@ export function resolvePatchExecutionPolicy(input: {
    *  non-null currentStageId, INV-LADDER-1 rejects stage inserts behind the
    *  live pointer (including a shifted/mismatched duplicated pointer). */
   executionState?: IssueExecutionState | null;
+  /** SUP-16525 §4: mirror of `assertPatchableExecutionPolicyWrite`'s flag — an
+   *  explicit, authorization-checked re-arm resolves the policy for a pointer
+   *  rewrite, so the preservation invariant must not refuse it. */
+  rearmPointer?: boolean;
 }): IssueExecutionPolicy | null {
-  const { raw, currentPolicy, stagesKeyAbsent, executionState } = input;
+  const { raw, currentPolicy, stagesKeyAbsent, executionState, rearmPointer } = input;
   if (raw === null) return null;
   if (typeof raw !== "object" || Array.isArray(raw)) return null;
 
@@ -641,7 +655,9 @@ export function resolvePatchExecutionPolicy(input: {
   // Preserve-on-omit carries the stored stages forward unchanged, so no insert
   // is possible on that path; only an explicit `stages` body can move the
   // pointer. Skip the invariant there to keep the omission path a pure no-op.
+  // An authorized §4 re-arm is likewise exempt: it produces the pointer anew.
   if (
+    !rearmPointer &&
     executionState?.currentStageId &&
     !stagesKeyAbsent &&
     resolved !== null &&

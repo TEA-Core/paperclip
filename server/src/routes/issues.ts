@@ -431,6 +431,12 @@ const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObject
   force: z.boolean().optional(),
   doneTransitionOverride: doneTransitionOverrideSchema.optional().nullable(),
   deliveryIdentity: deliveryIdentitySchema.optional(),
+  // SUP-16525 §4: explicit, authorization-checked request to rewind the live
+  // execution-stage pointer as part of an `executionPolicy` write. A policy
+  // change that would move a stage behind the live pointer fails closed (422,
+  // INV-LADDER-1); opting in here — and only here — sanctions the rewrite and
+  // re-seats both halves of the pointer from the written policy.
+  rearmExecutionPolicy: z.boolean().optional(),
 }));
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -2566,6 +2572,34 @@ async function assertCanManageIssueMonitor(
   throw forbidden(
     "Only the assignee agent or a board user can manage issue monitors",
   );
+}
+
+/**
+ * SUP-16525 §4: gate the one sanctioned path that may rewind a live execution
+ * pointer. INV-LADDER-1 fails closed on every implicit prefix mutation; this is
+ * the explicit, audited counter-path, so it must be authorization-checked by
+ * the same boundary as monitor management (runtime:manage + assignee/board)
+ * rather than merely being reachable by anyone who can PATCH the issue.
+ */
+async function assertCanReArmExecutionPolicy(
+  accessSvc: ReturnType<typeof accessService>,
+  req: Request,
+  companyId: string,
+  assigneeAgentId: string | null,
+  rearmRequested: boolean,
+) {
+  if (!rearmRequested) return;
+  if (req.actor.type === "board") return;
+  const runtimeDecision = await accessSvc.decide({
+    actor: req.actor,
+    action: "runtime:manage",
+    resource: { type: "company", companyId },
+  });
+  if (!runtimeDecision.allowed) {
+    throw forbidden(runtimeDecision.explanation, authorizationDeniedDetails(runtimeDecision));
+  }
+  if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === assigneeAgentId) return;
+  throw forbidden("Only the assignee agent or a board user can re-arm an issue's execution-policy stage pointer");
 }
 
 function summarizeIssueMonitor(
@@ -15441,6 +15475,9 @@ export function issueRoutes(
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
       deliveryIdentity: requestedDeliveryIdentity,
+      // SUP-16525 §4: request-level flag, not an issue column — keep it out of
+      // `updateFields` so it never reaches svc.update as a spurious write.
+      rearmExecutionPolicy: rearmExecutionPolicyRaw,
       ...updateFields
     } = req.body;
     if (
@@ -15688,6 +15725,40 @@ export function issueRoutes(
         actor,
       });
     }
+    // SUP-16525 §4: the explicit, authorization-checked re-arm path. A re-arm
+    // rewrites the live pointer from the incoming policy, so it must arrive
+    // WITH that policy and must not smuggle a second workflow transition
+    // through the same body — the transition short-circuits to the re-arm, so a
+    // co-sent verdict would be silently dropped. Fail closed before any write.
+    const rearmExecutionPolicyRequested = rearmExecutionPolicyRaw === true;
+    if (rearmExecutionPolicyRequested) {
+      if (req.body.executionPolicy === undefined) {
+        res.status(422).json({
+          error: "rearmExecutionPolicy requires an executionPolicy in the same PATCH body",
+          code: "execution_policy_rearm_requires_policy_write",
+          details: {
+            issueId: existing.id,
+            remedy:
+              "Send the replacement executionPolicy (including the stages to re-seat) together with rearmExecutionPolicy: true.",
+          },
+        });
+        return;
+      }
+      const clientRequestedStatus = (req.body as { status?: unknown }).status;
+      if (clientRequestedStatus !== undefined && clientRequestedStatus !== "in_review") {
+        res.status(422).json({
+          error: "rearmExecutionPolicy cannot be combined with a status change",
+          code: "execution_policy_rearm_conflicts_with_status",
+          details: {
+            issueId: existing.id,
+            requestedStatus: clientRequestedStatus,
+            remedy: "Re-arm the pointer first, then record the stage verdict in a separate PATCH.",
+          },
+        });
+        return;
+      }
+      await assertCanReArmExecutionPolicy(access, req, existing.companyId, existing.assigneeAgentId, true);
+    }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     if (req.body.executionPolicy !== undefined) {
       // SUP-13634: a PATCH must not strip the close ladder. An explicitly
@@ -15710,12 +15781,14 @@ export function issueRoutes(
         stagesExplicitlyEmpty,
         stagesKeyAbsent,
         executionState: parsedExecutionState,
+        rearmPointer: rearmExecutionPolicyRequested,
       });
       const normalizedExecutionPolicy = resolvePatchExecutionPolicy({
         raw: req.body.executionPolicy,
         currentPolicy: previousExecutionPolicy,
         stagesKeyAbsent,
         executionState: parsedExecutionState,
+        rearmPointer: rearmExecutionPolicyRequested,
       });
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
       // moves the assignee off the collision in the same body is accepted.
@@ -15821,6 +15894,21 @@ export function issueRoutes(
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
     const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
+    // SUP-16525 §4: the re-arm short-circuits the monitor transition along with
+    // the stage-advance logic, so a monitor change co-sent with the re-arm
+    // would be accepted and then silently dropped. Refuse the combination
+    // rather than lose the write.
+    if (rearmExecutionPolicyRequested && req.body.executionPolicy !== undefined && monitorChanged) {
+      res.status(422).json({
+        error: "rearmExecutionPolicy cannot be combined with a monitor change",
+        code: "execution_policy_rearm_conflicts_with_monitor_change",
+        details: {
+          issueId: existing.id,
+          remedy: "Re-arm the pointer first, then schedule or clear the monitor in a separate PATCH.",
+        },
+      });
+      return;
+    }
     await assertCanManageIssueMonitor(
       access,
       req,
@@ -15931,6 +16019,9 @@ export function issueRoutes(
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
       forcedReturnAssignee: summaryForcedReturnAssignee,
+      // SUP-16525 §4: only set by the explicit, authorization-checked request
+      // validated above — never inferred from the policy diff.
+      rearmPointer: rearmExecutionPolicyRequested,
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {
