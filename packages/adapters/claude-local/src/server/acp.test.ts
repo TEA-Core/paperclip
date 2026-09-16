@@ -278,8 +278,17 @@ describe("claude_local ACP lane", () => {
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
     });
+    const base = buildContext(root);
     const result = await execute(buildContext(root, {
       onMeta: async (payload) => { meta.push(payload); },
+      // Fork divergence (fork managed-home credential gate, slice 2c): upstream
+      // 5128b4f32 (#13055) added this case. The fork's prepareClaudeLocalManagedHome
+      // refuses a local ACP run whose managed home holds no Claude OAuth credentials,
+      // and the test home never has any. A configured subscription token is fileless
+      // auth the gate already honours, so the run reaches ACP startup, which is what
+      // this case asserts. The model assertion is untouched: resolveClaudeModel reads
+      // only model, ANTHROPIC_MODEL and the Bedrock/Vertex flags.
+      config: { ...base.config, env: { CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription-token" } },
     }));
     expect(result.exitCode).toBe(0);
     expect(meta[0]?.env?.ANTHROPIC_MODEL).toBe("claude-opus-5");
