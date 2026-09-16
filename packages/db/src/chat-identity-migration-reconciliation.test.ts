@@ -32,6 +32,7 @@ import {
 // The next upstream chain occupies0246–0254. Chat files now use0255–0268;
 // historical data-repair audit labels remain byte-identical.
 // Fork divergence (fold restamp of upstream migration numbers, slice 2c):
+// this file is upstream's (6abeb6733, #13100) and pins upstream's numbering.
 // fold-restamp-migrations.ts moves newly folded upstream migrations above the
 // fork's deployed apply watermark, so upstream's numbers are not the fork's.
 // Upstream 0240–0245 identity / 0246–0254 / 0255–0268 chat are fork
@@ -206,9 +207,10 @@ describe("chat and execution identity migration reconciliation", () => {
     // interleave it.
     expect(chatStart - identityEnd - 1).toBe(9);
     // Fork divergence (sparse snapshot retention, slice 2c): upstream keeps one
-    // meta/NNNN_snapshot.json per migration and walks a checkpoint per chat
-    // migration. The fork retains them sparsely and a fold emits only the
-    // journal's newest idx (fold-restamp-migrations.ts step 2), so those
+    // meta/NNNN_snapshot.json per migration and its test (6abeb6733, #13100)
+    // walks a checkpoint per chat migration. The fork retains them sparsely
+    // and a fold emits only the journal's newest idx
+    // (fold-restamp-migrations.ts step 2), so those
     // fourteen per-migration checkpoints do not exist here. Assert the same
     // invariants on the checkpoint the fold did regenerate: chained onto the
     // previous retained snapshot, still carrying the whole execution-identity
