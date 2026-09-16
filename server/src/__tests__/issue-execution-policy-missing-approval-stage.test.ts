@@ -1,7 +1,6 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { issueLabels, labels } from "@paperclipai/db";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
@@ -273,6 +272,45 @@ function dbChainNode(rows: unknown[]): Record<string, unknown> {
   };
 }
 
+// SUP-16586: `countLadderedChildren` resolves the carve-out label names through
+// `inArray(labels.name, [...])`. A plain mock that returns every seeded label
+// row regardless of that predicate would make the new carve-out look honored
+// BEFORE the change and let the route-level regression pass while pinning
+// nothing. Emulate the name filter instead: keep only the seeded label rows
+// whose `name` is among the string params the guard actually requested
+// (drizzle stores `inArray` values as `Param` chunks under `queryChunks`).
+function requestedLabelNames(condition: unknown): Set<string> {
+  const values = new Set<string>();
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const anyNode = node as { queryChunks?: unknown[]; value?: unknown };
+    if (Array.isArray(anyNode.queryChunks)) {
+      for (const chunk of anyNode.queryChunks) visit(chunk);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (anyNode.constructor?.name === "Param" && typeof anyNode.value === "string") {
+      values.add(anyNode.value);
+    }
+  };
+  visit(condition);
+  return values;
+}
+
+function filterLabelRowsByName(rows: unknown[], condition: unknown): unknown[] {
+  const requested = requestedLabelNames(condition);
+  return rows.filter(
+    (row) =>
+      row &&
+      typeof row === "object" &&
+      typeof (row as Record<string, unknown>).name === "string" &&
+      requested.has((row as Record<string, unknown>).name as string),
+  );
+}
+
 const PARENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CHILD_PARTICIPANT_ID = "44444444-4444-4444-8444-444444444444";
 const AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -320,7 +358,17 @@ function ladderedChildRow(
 // laddered count by the real helper (the label-name read returns the redo
 // label and the issue_labels read maps it onto that child).
 function armRedoCarveOutFor(childId: string) {
-  carveOutLabelRowsState.rows = [{ id: "label-work-type-redo" }];
+  carveOutLabelRowsState.rows = [{ id: "label-work-type-redo", name: "work-type:redo" }];
+  carveOutIssueLabelRowsState.rows = [{ issueId: childId }];
+}
+
+// SUP-16586: arm the `work-type:architecture-review` carve-out so the named child
+// is excluded from the laddered count by the real helper, identically to the
+// redo/delivery carve-outs.
+function armArchitectureReviewCarveOutFor(childId: string) {
+  carveOutLabelRowsState.rows = [
+    { id: "label-work-type-architecture-review", name: "work-type:architecture-review" },
+  ];
   carveOutIssueLabelRowsState.rows = [{ issueId: childId }];
 }
 
@@ -440,15 +488,24 @@ describe("issue execution policy missing approval stage", () => {
       return {
         from: (table: unknown) => {
           let rows: unknown[] = HANDOFF_AGENT_ROWS;
+          let filterLabelNames = false;
           if (childSignature) {
             rows = childRowsState.rows;
-          } else if (table === labels && keys.length === 1 && keys[0] === "id") {
+          } else if (keys.length === 1 && keys[0] === "id") {
+            // The carve-out labels read is the only single-key `id` projection on
+            // this route path (the child decomposition is a 6-key projection and
+            // the issue read is a 3-key projection), so it is matched by
+            // signature alone. Table-identity matching is unreliable here: the
+            // guard's `@paperclipai/db` instance is a different module instance
+            // than this test's, so `table === labels` is always false.
             rows = carveOutLabelRowsState.rows;
-          } else if (table === issueLabels && keys.length === 1 && keys[0] === "issueId") {
+            filterLabelNames = true;
+          } else if (keys.length === 1 && keys[0] === "issueId") {
             rows = carveOutIssueLabelRowsState.rows;
           }
           return {
-            where: () => dbChainNode(rows),
+            where: (condition: unknown) =>
+              dbChainNode(filterLabelNames ? filterLabelRowsByName(rows, condition) : rows),
             innerJoin: () => dbChainNode([]),
           };
         },
@@ -758,6 +815,40 @@ describe("issue execution policy missing approval stage", () => {
       .send({ status: "done" });
 
     expect(res.status).toBe(200);
+    expect(gapActivityInputs()).toEqual([]);
+  });
+
+  // Distinguishing regression (SUP-16586): the SUP-16569 shape — a card whose
+  // children are ONE work-type:architecture-review child (a chain terminator
+  // filed to adjudicate THIS parent's close gate) plus ONE ordinary laddered
+  // child. The arch child is excluded by the shared countLadderedChildren
+  // predicate, so the laddered count is 1 (< 2): the card does not owe a close
+  // ladder and the `done` transition is NOT refused. This exercises the SUP-15878
+  // route call site directly (not the shared helper in isolation), proving the
+  // route gap inherits the carve-out. It fails against the pre-change code,
+  // where the `work-type:architecture-review` name is not in the carve-out set
+  // so both children count (2) and the route refuses with
+  // `done_transition_missing_approval_stage`.
+  it("does not refuse done on a card whose children are one architecture-review child + one ordinary child (SUP-16586 route regression)", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-arch-id", "PAP-2"),
+      ladderedChildRow("child-genuine-id", "PAP-3"),
+    ];
+    armArchitectureReviewCarveOutFor("child-arch-id");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.code).not.toBe("done_transition_missing_approval_stage");
     expect(gapActivityInputs()).toEqual([]);
   });
 

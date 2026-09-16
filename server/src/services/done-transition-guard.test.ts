@@ -87,6 +87,43 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+// SUP-16586: `countLadderedChildren` resolves the carve-out label names through
+// `inArray(labels.name, [...])`. A plain mock that returns every seeded label
+// row regardless of that predicate would make the new carve-out look honored
+// BEFORE the change and let a regression pass while pinning nothing. Emulate the
+// name filter instead: keep only the seeded label rows whose `name` is among the
+// string params the guard actually requested, so the mock discriminates on the
+// guard's own query (drizzle stores `inArray` values as `Param` chunks under
+// `queryChunks`).
+function requestedLabelNames(condition: unknown): Set<string> {
+  const values = new Set<string>();
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const anyNode = node as { queryChunks?: unknown[]; value?: unknown };
+    if (Array.isArray(anyNode.queryChunks)) {
+      for (const chunk of anyNode.queryChunks) visit(chunk);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (anyNode.constructor?.name === "Param" && typeof anyNode.value === "string") {
+      values.add(anyNode.value);
+    }
+  };
+  visit(condition);
+  return values;
+}
+
+function filterLabelRowsByName(
+  rows: Record<string, unknown>[],
+  condition: unknown,
+): Record<string, unknown>[] {
+  const requested = requestedLabelNames(condition);
+  return rows.filter((row) => typeof row.name === "string" && requested.has(row.name));
+}
+
 /**
  * Build the shared `db` mock. Selects are dispatched by table identity when the
  * matching `rows.<table>` is seeded; otherwise every
@@ -139,7 +176,9 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
   // table identity; unseeded tests return [] so the redo exclusion is a no-op.
   const labelsChain = {
     from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue(rows.labels ?? []),
+    where: vi.fn((condition: unknown) =>
+      Promise.resolve(filterLabelRowsByName(rows.labels ?? [], condition)),
+    ),
     then: vi.fn().mockResolvedValue(rows.labels ?? []),
   };
   const issueLabelsChain = {
@@ -2396,6 +2435,245 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(logActivity).not.toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+  });
+
+  describe("work-type:architecture-review children are not decomposition children (SUP-16586)", () => {
+    const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
+    const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
+    const coderLeId = "bbbbbbb2-0000-4000-8000-000000000002";
+    const execCtoId = "ccccccc3-0000-4000-8000-000000000003";
+    const parentStageId = "30000000-0000-4000-8000-000000000004";
+    const archLabelId = "60000000-0000-4000-8000-00000000000a";
+    const redoLabelId = "60000000-0000-4000-8000-000000000009";
+    const deliveryLabelId = "60000000-0000-4000-8000-000000000008";
+
+    const agents = [
+      { id: supportCrId, name: "support-CR", role: "support" },
+      { id: supportQaeId, name: "support-QAE", role: "support" },
+      { id: coderLeId, name: "coder-LE", role: "engineer" },
+      { id: execCtoId, name: "exec-CTO", role: "executive" },
+    ];
+
+    // The shape-incomplete parent (a single satisfied support-CR review stage)
+    // that only arms mechanism D when the laddered child count reaches >= 2.
+    const parentLadder = {
+      stages: [
+        { id: parentStageId, type: "review", participants: [{ type: "agent", agentId: supportCrId }] },
+      ],
+    };
+
+    const satisfiedState = (stageIds: string[]) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: stageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    // An architecture-review child: origin_kind manual, a ran review ladder, and
+    // (via the issue_labels join) the architecture-review label. It is a chain
+    // terminator, not sub-work.
+    const archChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    // A genuine manual decomposition child (no carve-out label).
+    const manualChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    const archLabelRow = {
+      id: archLabelId,
+      companyId: "company-1",
+      name: "work-type:architecture-review",
+      color: "#000000",
+    };
+
+    it("excludes a work-type:architecture-review child so a 1-genuine + 1-arch pair arms neither mechanism A nor D (AC1 regression)", async () => {
+      // One genuine manual decomposition child + one architecture-review child: the
+      // arch child is excluded, so the count is 1 (< 2). Neither mechanism arms.
+      // This fails against the pre-change guard: the `work-type:architecture-review`
+      // name is not in the carve-out set, so the arch child counts -> count 2 ->
+      // mechanism A / D refuse the close.
+      const children = [
+        manualChild("child-1", "SUP-16561", "40000000-0000-4000-8000-000000000001"),
+        archChild("arch-1", "SUP-16569", "50000000-0000-4000-8000-000000000002"),
+      ];
+      const issueLabels = [{ issueId: "arch-1", labelId: archLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [archLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [archLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("still counts an unlabelled sibling: 1-genuine + 1-unlabelled-manual arms mechanism A and D (AC1 negative control)", async () => {
+      // Same child pair minus the arch label: both are now genuine decomposition
+      // children, the count reaches >= 2, and both mechanisms arm. Proves the
+      // exclusion — not the setup — clears the main case.
+      const children = [
+        manualChild("child-1", "SUP-16571", "40000000-0000-4000-8000-000000000001"),
+        manualChild("child-2", "SUP-16572", "50000000-0000-4000-8000-000000000002"),
+      ];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [archLabelRow], issueLabels: [] });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [archLabelRow], issueLabels: [], agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+    });
+
+    it("resolves work-type:redo, work-type:delivery, and work-type:architecture-review in one exclusion set (AC2)", async () => {
+      // One child of each carve-out class: all three carry a carve-out label, so
+      // all are excluded and the count is 0. Discriminates: if the guard resolved
+      // only two of the three names, the third's child would count and mechanism
+      // D would arm over the shape-incomplete ladder (refusal), failing this.
+      setupDbMock({
+        issues: [
+          {
+            id: "redo-1",
+            identifier: "SUP-16581",
+            originKind: "manual",
+            executionPolicy: { mode: "normal", stages: [{ id: "60000001-0000-4000-8000-000000000001", type: "review" }] },
+            executionState: satisfiedState(["60000001-0000-4000-8000-000000000001"]),
+          },
+          {
+            id: "delivery-1",
+            identifier: "SUP-16582",
+            originKind: "manual",
+            executionPolicy: { mode: "normal", stages: [{ id: "60000001-0000-4000-8000-000000000002", type: "review" }] },
+            executionState: satisfiedState(["60000001-0000-4000-8000-000000000002"]),
+          },
+          archChild("arch-1", "SUP-16583", "60000001-0000-4000-8000-000000000003"),
+        ],
+        labels: [
+          archLabelRow,
+          { id: redoLabelId, companyId: "company-1", name: "work-type:redo", color: "#000000" },
+          { id: deliveryLabelId, companyId: "company-1", name: "work-type:delivery", color: "#000000" },
+        ],
+        issueLabels: [
+          { issueId: "redo-1", labelId: redoLabelId, companyId: "company-1" },
+          { issueId: "delivery-1", labelId: deliveryLabelId, companyId: "company-1" },
+          { issueId: "arch-1", labelId: archLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("records excludedChildIdentifiers for an architecture-review child in the mechanism A and D audit payloads (AC3)", async () => {
+      // Two genuine children + one architecture-review child: the arch child is
+      // carved out (the count stays 2, so both mechanisms still refuse), and its
+      // identifier must be visible in the audit trail so a mislabel is detectable.
+      const children = [
+        manualChild("genuine-1", "SUP-16591", "40000000-0000-4000-8000-000000000001"),
+        manualChild("genuine-2", "SUP-16592", "50000000-0000-4000-8000-000000000002"),
+        archChild("arch-1", "SUP-16593", "60000001-0000-4000-8000-000000000003"),
+      ];
+      const issueLabels = [{ issueId: "arch-1", labelId: archLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [archLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-16591", "SUP-16592"],
+            excludedChildIdentifiers: ["SUP-16593"],
+          }),
+        }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [archLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-16591", "SUP-16592"],
+            excludedChildIdentifiers: ["SUP-16593"],
+          }),
+        }),
       );
     });
   });
