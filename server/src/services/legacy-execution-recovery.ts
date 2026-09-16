@@ -34,6 +34,15 @@ export function legacyExecutionNeedsReconciliation(
   // resource wait, not a failed provider attempt or permission to replay work.
   if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
       evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
+  // Fold 2c / occupancy-wait: the fork's shared execution-workspace occupancy
+  // guard (heartbeat.ts onExecutionWorkspaceOccupied) is the same kind of
+  // resource wait. It cancels the contender before the adapter is invoked and
+  // schedules its own bounded deferral, and it is the only writer of this code.
+  // It records no executionRecovery evidence, so upstream #13075 (35fdc0c66)
+  // read every deferral as an uncertain legacy execution: a board hold, a
+  // blocked issue and no retry. The code alone exempts it, which also keeps a
+  // deferral chain written before this fold alive across the deploy.
+  if (run.status === "cancelled" && run.errorCode === "execution_workspace_occupied") return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
