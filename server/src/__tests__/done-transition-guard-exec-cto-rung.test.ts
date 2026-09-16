@@ -385,6 +385,135 @@ describe("SUP-15650 ADR-072 close-ladder shape: re-seat the principal's rung", (
   });
 });
 
+describe("SUP-16532 ADR-072 close-ladder shape: ordered forward scan (ADR-102 M3)", () => {
+  beforeEach(() => {
+    ghFetchMock.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+    mockFetchOpenPullRequests.mockReset();
+    mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: [] });
+    mockResolveGitHubToken.mockReset();
+    mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    vi.mocked(logActivity).mockClear();
+    mockExecFile.mockReset();
+    mockGitProbe("0", "0");
+    setupDbMock({});
+  });
+
+  it("refuses a complete ladder where approval:exec-CTO lands before review:coder-LE as an ordering violation (AC1)", async () => {
+    // All three ADR-072 rungs are present, but the terminal approval sits
+    // between the two reviews — the final approver signs off before the coder-LE
+    // Definition-of-Done gate runs. The ordered scan refuses this as an
+    // ordering violation, distinct from a missing rung.
+    const executionPolicy = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.skipped).toBe(false);
+    expect(result.reason).toContain("Mechanism D");
+    expect(result.reason).toContain("ADR-072 close-ladder shape");
+    // The ordering violation is named distinctly from a missing rung.
+    expect(result.reason).toContain("out of order");
+    expect(result.reason).toContain("approval:exec-CTO");
+    expect(result.reason).not.toContain("missing the ADR-072 close-ladder stage");
+    // Fail closed before any external probe.
+    expect(ghFetchMock).not.toHaveBeenCalled();
+    expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          reason: "adr072_close_ladder_shape_incomplete",
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+          ladderedChildCount: 2,
+        }),
+      }),
+    );
+  });
+
+  it("refuses a complete ladder where approval:exec-CTO leads, naming the ordering violation (AC1b)", async () => {
+    // The approver signs FIRST, before either review. Both reviews still land in
+    // their relative order, but the approval's position is an ordering
+    // violation, so the close is refused — not because a rung is missing.
+    const executionPolicy = {
+      stages: [
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("out of order");
+    expect(result.reason).toContain("approval:exec-CTO");
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+        }),
+      }),
+    );
+  });
+
+  it("still closes a ladder in the ratified ADR-072 order (AC2)", async () => {
+    // review:support-QAE -> review:coder-LE -> approval:exec-CTO, in order:
+    // every rung lands before any later-required stage, so the close is allowed.
+    const executionPolicy = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(true);
+    expect(logActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+    );
+  });
+});
+
 describe("SUP-15650 regression: Guard B and mechanism D agree on one gated principal", () => {
   beforeEach(() => {
     vi.mocked(logActivity).mockClear();
