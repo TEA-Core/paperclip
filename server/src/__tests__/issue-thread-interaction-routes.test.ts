@@ -587,6 +587,16 @@ describe.sequential("issue thread interaction routes", () => {
     mockCrossIssueInfluence.inserted.length = 0;
   });
 
+  // Fork divergence (first-test cold-import budget, slice 2c): upstream pins this
+  // test to 10s (b847e8b6f). That pin predates upstream's own policy in
+  // server/vitest.config.ts (testTimeout 15s, 69590890d), which exists for exactly
+  // this case: the first test in a route suite pays the cold import of
+  // routes/issues.ts. A fold imports the union of both sides' graphs.
+  // The fork tip already spent 9745ms in this test on CI (job 104554026394).
+  // Slice 2c adds upstream's wake-queue, run-dispatch and chat trees (973 -> 1081
+  // evaluated modules), and CI job 104604939099 timed it out at 10012ms while the
+  // other 88 tests took about 400ms each. The request itself takes under 60ms.
+  // The pin is dropped so the test uses the config's 15s budget.
   it("creates board-authored interactions", async () => {
     const app = await createApp();
 
@@ -612,7 +622,7 @@ describe.sequential("issue thread interaction routes", () => {
         }),
       }),
     );
-  }, 10_000);
+  });
 
   it("does not run historical-comment catch-up or queue recovery from the interaction read path", async () => {
     mockIssueService.getById.mockResolvedValue(createIssue({

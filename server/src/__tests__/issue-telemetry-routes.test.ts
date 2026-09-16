@@ -218,6 +218,17 @@ describe("issue telemetry routes", () => {
     }));
   });
 
+  // Fork divergence (first-test cold-import budget, slice 2c): upstream pins this
+  // test to 10s (fe21ab324). That pin predates upstream's own policy in
+  // server/vitest.config.ts (testTimeout 15s, 69590890d), which exists for exactly
+  // this case: the first test in a route suite pays the cold import of
+  // routes/issues.ts, and a timeout here leaks the fire-and-forget telemetry into
+  // the next test. A fold imports the union of both sides' graphs.
+  // The fork tip already spent 9796ms in this test on CI (job 104554026394).
+  // Slice 2c adds upstream's wake-queue, run-dispatch and chat trees (977 -> 1084
+  // evaluated modules), and CI job 104604938932 timed it out at 10009ms. The
+  // request itself takes under 60ms. The pin is dropped so the test uses the
+  // config's 15s budget.
   it("emits task-completed telemetry with the agent role, adapter type, and model", async () => {
     mockAgentService.getById.mockResolvedValue({
       id: "agent-1",
@@ -247,7 +258,7 @@ describe("issue telemetry routes", () => {
         taskId: "11111111-1111-4111-8111-111111111111",
       });
     });
-  }, 10_000);
+  });
 
   it("does not emit agent task-completed telemetry for board-driven completions", async () => {
     const app = await createApp({
