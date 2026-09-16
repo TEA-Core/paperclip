@@ -53,8 +53,15 @@ for (const classic of [false, true]) {
       await page.getByRole("button", { name: "More task actions", exact: true }).click();
       await page.getByRole("button", { name: "Pause work", exact: true }).click();
       await expect(takeover).toBeVisible();
+      // Fork divergence (SUP-11047 assigned-backlog-blocking guard, slice 2c): upstream
+      // 52811c6ce creates this child as an assigned `backlog` issue under a parent, which the
+      // fork rejects with 422 (fork 2a88a588e) because assignment wakeup skips `backlog`, so a
+      // child that gates its parent would never be woken. `parkDeliberately` is that guard's own
+      // escape hatch and is stripped before insert (server/src/services/issues.ts), so the child
+      // is still created with `status: "backlog"` and every assertion below is unchanged.
       const child = await json(await request.post(`/api/companies/${company.id}/issues`, { data: {
         title: "Child held by parent", parentId: task.id, status: "backlog", assigneeAgentId: agent.id,
+        parkDeliberately: true,
       } }));
       await page.goto(`/${company.issuePrefix}/issues/${child.identifier}`);
       await expect(takeover).toContainText("Subtree is paused.");
