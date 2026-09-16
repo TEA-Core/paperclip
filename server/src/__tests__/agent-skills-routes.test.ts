@@ -386,6 +386,12 @@ describe.sequential("agent skill routes", () => {
     ));
   });
 
+  // Fork divergence (first-test cold-import budget, slice 2c): upstream pins this test to 10s (fe21ab324).
+  // The first test in a route suite pays the cold import of the route graph, and a fold
+  // imports the union of both sides' graphs. On CI this test took 8384ms at the fork tip
+  // and 9215ms on the fold PR (run 35035870711), under a 10s pin; issue-telemetry-routes and
+  // issue-thread-interaction-routes crossed it in the same run. The pin is dropped so the
+  // test uses server/vitest.config.ts's 15s testTimeout (upstream 69590890d).
   it("skips runtime materialization when listing Claude skills", async () => {
     mockAgentService.getById.mockResolvedValue(makeAgent("claude_local"));
 
@@ -408,7 +414,7 @@ describe.sequential("agent skill routes", () => {
         }),
       }),
     );
-  }, 10_000);
+  });
 
   it("lists skills without resolving required user-secret env bindings", async () => {
     const adapterConfig = {

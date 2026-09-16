@@ -396,6 +396,12 @@ describe("agent live run routes", () => {
     });
   });
 
+  // Fork divergence (first-test cold-import budget, slice 2c): upstream pins this test to 10s (a95739442).
+  // The first test in a route suite pays the cold import of the route graph, and a fold
+  // imports the union of both sides' graphs. On CI this test took 7866ms at the fork tip
+  // and 8439ms on the fold PR (run 35035870711), under a 10s pin; issue-telemetry-routes and
+  // issue-thread-interaction-routes crossed it in the same run. The pin is dropped so the
+  // test uses server/vitest.config.ts's 15s testTimeout (upstream 69590890d).
   it("returns a compact active run payload for issue polling", async () => {
     const res = await requestApp(await createApp(), (baseUrl) =>
       request(baseUrl).get("/api/issues/pc1a2-1295/active-run"),
@@ -427,7 +433,7 @@ describe("agent live run routes", () => {
     expect(res.body).not.toHaveProperty("resultJson");
     expect(res.body).not.toHaveProperty("contextSnapshot");
     expect(res.body).not.toHaveProperty("logRef");
-  }, 10_000);
+  });
 
   it("ignores a stale execution run from another issue and falls back to the assignee's matching run", async () => {
     mockHeartbeatService.getRunIssueSummary.mockResolvedValue({
