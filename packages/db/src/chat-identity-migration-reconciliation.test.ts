@@ -1,5 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { drizzle } from "drizzle-orm/postgres-js";
@@ -24,6 +31,13 @@ import {
 // and must never run again just because its filename moved.
 // The next upstream chain occupies0246–0254. Chat files now use0255–0268;
 // historical data-repair audit labels remain byte-identical.
+// Fork divergence (fold restamp of upstream migration numbers, slice 2c):
+// fold-restamp-migrations.ts moves newly folded upstream migrations above the
+// fork's deployed apply watermark, so upstream's numbers are not the fork's.
+// Upstream 0240–0245 identity / 0246–0254 / 0255–0268 chat are fork
+// 0255–0260 / 0261–0269 / 0270–0283, and journal `idx` no longer equals the
+// migration number (fork tag = idx + 2). Every window below is therefore
+// anchored on a tag rather than a literal number, so the next restamp moves it.
 const chatMigrations = [
   [
     "0270_previous_captain_america",
@@ -106,9 +120,38 @@ const identityMigrations = [
   "0260_misty_nightshade.sql",
 ];
 
+// The columns 0255_pink_fantastic_four creates. Neither the chat chain nor the
+// fold's regenerated checkpoint may drop one.
+const identityContextColumns = [
+  "accepted_at",
+  "cause",
+  "company_id",
+  "correlation_id",
+  "created_at",
+  "github",
+  "id",
+  "message_id",
+  "parent_context_id",
+  "responsible_user_id",
+  "revision",
+  "run_id",
+  "status",
+];
+
 const provenanceMigration = "0280_chat_interaction_wakeup_provenance.sql";
 const legacyProvenance = "0245_chat_interaction_wakeup_idempotency";
 const canonicalProvenance = "0251_chat_interaction_wakeup_idempotency";
+
+const tagOf = (file: string) => file.replace(/\.sql$/, "");
+
+function journalIdx(
+  entries: ReadonlyArray<{ idx: number; tag: string }>,
+  tag: string,
+) {
+  const entry = entries.find((candidate) => candidate.tag === tag);
+  expect(entry, tag).toBeDefined();
+  return entry!.idx;
+}
 
 async function executeMigration(sql: postgres.Sql, file: string) {
   const content = await readFile(
@@ -141,122 +184,117 @@ describe("chat and execution identity migration reconciliation", () => {
         "utf8",
       ),
     );
+    const entries = journal.entries as Array<{ idx: number; tag: string }>;
+    const identityStart = journalIdx(entries, tagOf(identityMigrations[0]!));
+    const identityEnd = journalIdx(entries, tagOf(identityMigrations.at(-1)!));
+    const chatStart = journalIdx(entries, chatMigrations[0][0]);
+    const chatEnd = journalIdx(entries, chatMigrations.at(-1)![0]);
     expect(
-      journal.entries
+      entries
         .filter(
-          (entry: { idx: number }) => entry.idx >= 240 && entry.idx <= 245,
+          (entry) => entry.idx >= identityStart && entry.idx <= identityEnd,
         )
-        .map((entry: { tag: string }) => `${entry.tag}.sql`),
+        .map((entry) => `${entry.tag}.sql`),
     ).toEqual(identityMigrations);
     expect(
-      journal.entries
-        .filter(
-          (entry: { idx: number }) => entry.idx >= 255 && entry.idx <= 268,
-        )
-        .map((entry: { tag: string }) => entry.tag),
+      entries
+        .filter((entry) => entry.idx >= chatStart && entry.idx <= chatEnd)
+        .map((entry) => entry.tag),
     ).toEqual(chatMigrations.map(([tag]) => tag));
-    let previous = JSON.parse(
-      await readFile(
-        new URL("./migrations/meta/0254_snapshot.json", import.meta.url),
-        "utf8",
-      ),
+    // The nine-migration upstream chain still sits between the two, in that
+    // order: the restamp shifted upstream's block, it did not reorder or
+    // interleave it.
+    expect(chatStart - identityEnd - 1).toBe(9);
+    // Fork divergence (sparse snapshot retention, slice 2c): upstream keeps one
+    // meta/NNNN_snapshot.json per migration and walks a checkpoint per chat
+    // migration. The fork retains them sparsely and a fold emits only the
+    // journal's newest idx (fold-restamp-migrations.ts step 2), so those
+    // fourteen per-migration checkpoints do not exist here. Assert the same
+    // invariants on the checkpoint the fold did regenerate: chained onto the
+    // previous retained snapshot, still carrying the whole execution-identity
+    // chain, and carrying the end state of every chat feature the per-step walk
+    // pinned.
+    const metaDirectory = new URL("./migrations/meta/", import.meta.url);
+    const snapshots = (await readdir(metaDirectory))
+      .filter((name) => name.endsWith("_snapshot.json"))
+      .sort();
+    const newest = `${String(entries.at(-1)!.idx).padStart(4, "0")}_snapshot.json`;
+    expect(snapshots.at(-1)).toBe(newest);
+    const current = JSON.parse(
+      await readFile(new URL(newest, metaDirectory), "utf8"),
     );
-    for (let step = 0; step < chatMigrations.length; step++) {
-      const index = String(255 + step).padStart(4, "0");
-      const current = JSON.parse(
-        await readFile(
-          new URL(`./migrations/meta/${index}_snapshot.json`, import.meta.url),
-          "utf8",
-        ),
-      );
-      expect(current.prevId, index).toBe(previous.id);
-      expect(current.tables["public.run_identity_contexts"], index).toEqual(
-        previous.tables["public.run_identity_contexts"],
-      );
+    const previous = JSON.parse(
+      await readFile(new URL(snapshots.at(-2)!, metaDirectory), "utf8"),
+    );
+    expect(current.prevId, newest).toBe(previous.id);
+    for (const column of identityContextColumns)
       expect(
-        current.tables["public.heartbeat_runs"].columns
-          .active_identity_context_id,
-        index,
+        current.tables["public.run_identity_contexts"].columns[column],
+        column,
       ).toBeDefined();
-      expect(
-        current.tables["public.issues"].columns.origin_identity_context_id,
-        index,
-      ).toBeDefined();
-      expect(
-        current.tables["public.issues"].columns
-          .continuation_identity_context_id,
-        index,
-      ).toBeDefined();
-      expect(
-        current.tables["public.issue_thread_interactions"].columns
-          .source_identity_context_id,
-        index,
-      ).toBeDefined();
-      expect(
-        Boolean(
-          current.tables["public.chat_conversations"].columns
-            .session_generation,
-        ),
-        index,
-      ).toBe(step >= 1);
-      expect(
-        Boolean(
-          current.tables["public.chat_endpoints"].indexes
-            .chat_endpoints_live_bot_external_uq,
-        ),
-        index,
-      ).toBe(step >= 2);
-      expect(
-        current.tables[
-          "public.chat_publications"
-        ].checkConstraints.chat_publications_state_check.value.includes(
-          "delivery_unknown",
-        ),
-        index,
-      ).toBe(step >= 3);
-      expect(
-        current.tables["public.chat_endpoints"].columns.allow_group_chats
-          .default,
-        index,
-      ).toBe(step < 4);
-      expect(
-        current.tables[
-          "public.agent_wakeup_requests"
-        ].indexes.agent_wakeup_requests_question_response_delivery_idempotency_uq.where.includes(
-          "interaction:%",
-        ),
-        index,
-      ).toBe(step >= 5);
-      expect(
-        current.tables[
-          "public.chat_endpoints"
-        ].checkConstraints.chat_endpoints_provider_check.value.includes(
-          "discord",
-        ),
-        index,
-      ).toBe(step >= 6);
-      expect(
-        Boolean(
-          current.tables["public.chat_endpoints"].indexes
-            .chat_endpoints_live_discord_bot_external_uq,
-        ),
-        index,
-      ).toBe(step >= 7);
-      expect(
-        Boolean(
-          current.tables["public.chat_endpoints"].indexes
-            .chat_endpoints_live_global_app_bot_external_uq,
-        ),
-        index,
-      ).toBe(step >= 8);
-      expect(
-        Boolean(
-          current.tables["public.issue_attachments"].columns.originating_run_id,
-        ),
-        index,
-      ).toBe(step >= 9);
-      previous = current;
-    }
+    expect(
+      current.tables["public.heartbeat_runs"].columns.active_identity_context_id,
+    ).toBeDefined();
+    expect(
+      current.tables["public.issues"].columns.origin_identity_context_id,
+    ).toBeDefined();
+    expect(
+      current.tables["public.issues"].columns.continuation_identity_context_id,
+    ).toBeDefined();
+    expect(
+      current.tables["public.issue_thread_interactions"].columns
+        .source_identity_context_id,
+    ).toBeDefined();
+    expect(
+      Boolean(
+        current.tables["public.chat_conversations"].columns.session_generation,
+      ),
+    ).toBe(true);
+    expect(
+      Boolean(
+        current.tables["public.chat_endpoints"].indexes
+          .chat_endpoints_live_bot_external_uq,
+      ),
+    ).toBe(true);
+    expect(
+      current.tables[
+        "public.chat_publications"
+      ].checkConstraints.chat_publications_state_check.value.includes(
+        "delivery_unknown",
+      ),
+    ).toBe(true);
+    expect(
+      current.tables["public.chat_endpoints"].columns.allow_group_chats.default,
+    ).toBe(false);
+    expect(
+      current.tables[
+        "public.agent_wakeup_requests"
+      ].indexes.agent_wakeup_requests_question_response_delivery_idempotency_uq.where.includes(
+        "interaction:%",
+      ),
+    ).toBe(true);
+    expect(
+      current.tables[
+        "public.chat_endpoints"
+      ].checkConstraints.chat_endpoints_provider_check.value.includes("discord"),
+    ).toBe(true);
+    expect(
+      Boolean(
+        current.tables["public.chat_endpoints"].indexes
+          .chat_endpoints_live_discord_bot_external_uq,
+      ),
+    ).toBe(true);
+    expect(
+      Boolean(
+        current.tables["public.chat_endpoints"].indexes
+          .chat_endpoints_live_global_app_bot_external_uq,
+      ),
+    ).toBe(true);
+    expect(
+      Boolean(
+        current.tables["public.issue_attachments"].columns.originating_run_id,
+      ),
+    ).toBe(true);
   });
 });
 
@@ -606,22 +644,30 @@ const support = await getEmbeddedPostgresTestSupport();
             version: string;
             breakpoints: boolean;
           }>;
+          const identityEnd = journalIdx(
+            entries,
+            tagOf(identityMigrations.at(-1)!),
+          );
+          const chatStart = journalIdx(entries, chatMigrations[0][0]);
+          const chatEnd = journalIdx(entries, chatMigrations.at(-1)![0]);
           const priorEntries = entries
             .filter(
-              (entry) => entry.idx < 246 || (entry.idx >= 255 && entry.idx <= 268),
+              (entry) =>
+                entry.idx <= identityEnd ||
+                (entry.idx >= chatStart && entry.idx <= chatEnd),
             )
             .map((entry, index) => ({
               ...entry,
               idx: index,
               // Exact immutable007 chat-history timestamps. Filenames are not
               // persisted by Drizzle; the SQL hash and applied time are.
-              when: entry.idx < 255 ? entry.when : [
+              when: entry.idx < chatStart ? entry.when : [
                 1788832469741, 1788832471197, 1788832472637,
                 1788832474071, 1788832475492, 1788832476957,
                 1788832478340, 1788832479792, 1788832481237,
                 1788832482645, 1788880065244, 1788930085103,
                 1788934048647, 1788942847296,
-              ][entry.idx - 255]!,
+              ][entry.idx - chatStart]!,
             }));
           expect(priorEntries.every((entry) => Number.isFinite(entry.when))).toBe(true);
           await mkdir(join(directory, "meta"));
@@ -662,10 +708,14 @@ const support = await getEmbeddedPostgresTestSupport();
             await legacy`SELECT id,hash,created_at::text FROM drizzle.__drizzle_migrations ORDER BY id`;
           const pending = entries
             .filter(
-              (entry) => (entry.idx >= 246 && entry.idx <= 254) || entry.idx > 268,
+              (entry) =>
+                (entry.idx > identityEnd && entry.idx < chatStart) ||
+                entry.idx > chatEnd,
             )
             .map((entry) => `${entry.tag}.sql`);
-          expect(pending).toHaveLength(9 + entries.filter((entry) => entry.idx > 268).length);
+          expect(pending).toHaveLength(
+            9 + entries.filter((entry) => entry.idx > chatEnd).length,
+          );
           expect(await inspectMigrations(legacyUrl.href)).toMatchObject({
             status: "needsMigrations",
             pendingMigrations: pending,
