@@ -53,6 +53,33 @@ describe("resolveRunProcessCap", () => {
   });
 });
 
+describe("DEFAULT_RUN_PROCESS_CAP (census-derived, SUP-16010)", () => {
+  // Live run-process census (SUP-16010), GET /api/health ->
+  // sweepLiveness.sweeps.runProcessCensus.lastResult (authenticated result at
+  // lastRunAt 2026-09-16T18:55:25.397Z, runs=119):
+  const CENSUS = {
+    sampleCount: 9,
+    p50: 4,
+    p95: 5,
+    p99: 5,
+    max: 5,
+    unreadable: 0,
+  };
+  const HEADROOM_MULTIPLE = 4;
+
+  it("equals the documented census derivation (p99 x headroom)", () => {
+    // Distinguishing assertion: the default is a census-derived safe headroom
+    // over p99, not the old incident-derived constant.
+    expect(DEFAULT_RUN_PROCESS_CAP).toBe(CENSUS.p99 * HEADROOM_MULTIPLE);
+    expect(DEFAULT_RUN_PROCESS_CAP).toBe(CENSUS.max * HEADROOM_MULTIPLE);
+    expect(DEFAULT_RUN_PROCESS_CAP).toBe(20);
+  });
+
+  it("rejects the old incident-derived value as the source", () => {
+    expect(DEFAULT_RUN_PROCESS_CAP).not.toBe(512);
+  });
+});
+
 describe("shouldRefuseRunProcessSpawn (boundary)", () => {
   it("allows a run at cap - 1", () => {
     expect(shouldRefuseRunProcessSpawn({ cap: 5, current: 4 })).toBe(false);

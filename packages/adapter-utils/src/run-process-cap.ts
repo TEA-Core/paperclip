@@ -24,21 +24,27 @@ export const RUN_PROCESS_CAP_EXCEEDED_ERROR_CODE = "run_process_cap_exceeded";
 export const RUN_PROCESS_CAP_ENV_KEY = "PAPERCLIP_RUN_PROCESS_CAP";
 
 /**
- * Derived default cap.
+ * Derived default cap — a census-derived safe headroom, not an incident guess.
  *
- * PROVISIONAL pending live-census confirmation. The consume-contract for the
- * census is `GET /api/health` ->
- * `sweepLiveness.sweeps.runProcessCensus.lastResult` (`sampleCount`, `max`,
- * `p50`, `p95`, `p99`, `maxRunId`). At the time this shipped the census was
- * merged but had not yet been sampled by a live control plane, so the cap is
- * derived from the one real distribution anchor available — the 2026-08-25
- * incident where a single leaked run reached 1,291 processes (SUP-13949) — with
- * deliberate headroom: 512 is ~40% of that runaway and comfortably above any
- * expected legitimate per-run child count (a healthy agent CLI and its tool
- * subprocesses sit in the single digits to low tens). It is env-overridable so
- * it can be raised, without a redeploy, once the live census p99 is published.
+ * The number comes from the live run-process census (SUP-16010), read from
+ * `GET /api/health` -> `sweepLiveness.sweeps.runProcessCensus.lastResult`. The
+ * authenticated live result at derivation (lastRunAt 2026-09-16T18:55:25.397Z,
+ * runs=119):
+ *
+ *   {"lastResult":{"max":5,"maxRunId":"1a28308f-e5ba-4d81-aac8-4fd4d17b3ec4",
+ *    "p50":4,"p95":5,"p99":5,"sampleCount":9,"unreadable":0},
+ *   "lastRunAt":"2026-09-16T18:55:25.397Z","runs":119}
+ *
+ *   percentile = p99 = 5 · sampleCount = 9 · observed max = 5
+ *
+ * Default = 4x p99 = 20 (which is also 4x the observed max of 5). The 4x
+ * headroom keeps the cap comfortably above the observed tail of legitimate
+ * per-run child counts while still bounding a runaway many orders of magnitude
+ * below the 2026-08-25 incident (1,291 processes, SUP-13949). It is
+ * env-overridable via PAPERCLIP_RUN_PROCESS_CAP so it can be raised, without a
+ * redeploy, if the distribution shifts.
  */
-export const DEFAULT_RUN_PROCESS_CAP = 512;
+export const DEFAULT_RUN_PROCESS_CAP = 20;
 
 export type RunProcessCapExceededResultJson = {
   errorCode: typeof RUN_PROCESS_CAP_EXCEEDED_ERROR_CODE;
