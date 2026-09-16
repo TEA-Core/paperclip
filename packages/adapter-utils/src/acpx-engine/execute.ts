@@ -2184,6 +2184,14 @@ async function buildRuntime(input: {
       ...(Array.isArray(scratch.tempKeysApplied) ? scratch.tempKeysApplied.filter((key): key is string =>
         typeof key === "string" && ["TMPDIR", "TEMP", "TMP"].includes(key)) : [])])
     : new Set<string>();
+  // Fold 2c / scratch-toolchain-homes-fingerprint: fork SUP-15937
+  // (server/src/services/run-scratch.ts) also points CARGO_HOME and RUSTUP_HOME
+  // inside the run scratch (`<scratch>/cargo`, `<scratch>/rustup`) on every local
+  // run. Those paths rotate with the scratch exactly like the keys above, so
+  // hashing them changed the fingerprint on every wake and no ACP session was ever
+  // resumed. An operator-set value wins over that default and cannot live inside
+  // a per-run scratch dir, so it still feeds the hash.
+  const scratchToolchainHomePrefix = scratchKeys.size > 0 ? `${scratch.dir as string}${path.sep}` : null;
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value !== "string") continue;
     // Runtime PAPERCLIP_* always wins over config: skip a PAPERCLIP_* key that
@@ -2194,6 +2202,12 @@ async function buildRuntime(input: {
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;
+    // Fold 2c / scratch-toolchain-homes-fingerprint: forwarded above, never hashed.
+    if (
+      scratchToolchainHomePrefix !== null &&
+      (key === "CARGO_HOME" || key === "RUSTUP_HOME") &&
+      value.startsWith(scratchToolchainHomePrefix)
+    ) continue;
     // The server rotates run-owned scratch paths on every wake. Still forward
     // them, but only hash actual adapter settings. User-supplied temp overrides
     // are absent from tempKeysApplied and keep their compatibility protection.

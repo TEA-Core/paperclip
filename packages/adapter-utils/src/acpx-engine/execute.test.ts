@@ -1646,6 +1646,29 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(changed.result.sessionParams?.configFingerprint).not.toBe(first.result.sessionParams?.configFingerprint);
   });
 
+  it("keeps the fork's scratch-scoped toolchain homes out of session identity while an operator-set home still busts it (fold 2c)", async () => {
+    // Fork SUP-15937 (server/src/services/run-scratch.ts) adds CARGO_HOME and
+    // RUSTUP_HOME under the rotating run scratch. Hashing them reset every ACP
+    // session on every wake, so upstream #13119's same-session continuation never
+    // happened (tests/e2e/acp-stop-continuation.spec.ts).
+    const root = await makeTempRoot();
+    const config = { agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") };
+    async function withScratch(dir: string, operatorCargoHome?: string) {
+      return runExecutor({ ...config, env: {
+        PAPERCLIP_RUN_SCRATCH_DIR: dir, PAPERCLIP_TASK_SCRATCH_DIR: dir,
+        PAPERCLIP_SCRATCH_DIR: dir, PAPERCLIP_TMPDIR: dir, TEMP: dir, TMP: dir, TMPDIR: dir,
+        CARGO_HOME: operatorCargoHome ?? path.join(dir, "cargo"), RUSTUP_HOME: path.join(dir, "rustup"),
+      } }, { context: { taskId: "issue-1", paperclipScratch: { type: "heartbeat_run", dir, tempKeysApplied: ["TMPDIR", "TEMP", "TMP"] } } });
+    }
+    const first = await withScratch(path.join(root, "run-1"));
+    const second = await withScratch(path.join(root, "run-2"));
+    const operatorFirst = await withScratch(path.join(root, "run-3"), "/opt/shared/cargo-1");
+    const operatorChanged = await withScratch(path.join(root, "run-4"), "/opt/shared/cargo-2");
+    expect(first.result.sessionParams?.configFingerprint).toBeDefined();
+    expect(second.result.sessionParams?.configFingerprint).toBe(first.result.sessionParams?.configFingerprint);
+    expect(operatorChanged.result.sessionParams?.configFingerprint).not.toBe(operatorFirst.result.sessionParams?.configFingerprint);
+  });
+
   it("busts the session fingerprint when a stable configured PAPERCLIP_* value rotates", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
