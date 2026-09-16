@@ -65,7 +65,12 @@ for (const action of ["task_retry", "inbox_retry", "message"] as const) {
         await page.getByRole("button", { name: "Retry", exact: true }).click();
         if (action === "inbox_retry") await page.goto(taskUrl);
       }
-      await expect(page.getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
+      // Fork divergence (SUP-12693 done-tier close comment, slice 2c): upstream 9031516a7 posts
+      // this reply only when the run finalizes, but the fork fixture closes with a reply-bearing
+      // Tier 1 comment mid-turn, so until the run settles the reply also renders as the live
+      // transcript interstitial and an unscoped getByText hits a strict-mode violation. Both
+      // reply checks assert on the posted agent reply bubble, which is the response under test.
+      await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
       await expect(page.getByText("Work cannot start.", { exact: false })).toHaveCount(0);
       const completed = await json(await request.get(`/api/issues/${issue.id}`));
       expect(completed).toMatchObject({ status: "done", executionBlocker: null });
@@ -73,7 +78,7 @@ for (const action of ["task_retry", "inbox_retry", "message"] as const) {
       expect(runs.filter(run => run.id !== sourceRunId)).toHaveLength(1);
       expect(runs.find(run => run.id === sourceRunId)).toMatchObject({ status: "failed", resultJson: null });
       await page.reload();
-      await expect(page.getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible();
+      await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible();
     } finally {
       await request.patch(`/api/companies/${company.id}`, { data: { status: "archived" } });
       await closeRegisteredClients(url);

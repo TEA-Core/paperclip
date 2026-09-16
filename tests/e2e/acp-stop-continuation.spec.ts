@@ -73,7 +73,12 @@ for (const { unfinishedWrite, pause } of [{ unfinishedWrite: false, pause: false
         await dialog.getByRole("checkbox").check();
         await dialog.getByRole("button", { name: "Resume work", exact: true }).click();
       }
-      await expect(page.getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 30_000 });
+      // Fork divergence (SUP-12693 done-tier close comment, slice 2c): upstream 018ca5daa posts
+      // this reply only when the run finalizes, but the fork fixture closes with a reply-bearing
+      // Tier 1 comment mid-turn, so until the run settles the reply also renders as the live
+      // transcript interstitial and an unscoped getByText hits a strict-mode violation. Assert
+      // on the posted agent reply bubble, which is the answer this journey checks for.
+      await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 30_000 });
       await expect.poll(async () => (await json(await request.get(`/api/issues/${issue.id}/live-runs`))).length).toBe(0);
       const prompts = (await readFile(path.join(root, "prompts"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
       expect(prompts).toHaveLength(2);
