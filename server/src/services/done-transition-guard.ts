@@ -69,8 +69,16 @@ const ADR072_CLOSE_LADDER: {
 // deliverable. It is resolved by the same single company-scoped name read as
 // `work-type:redo` and feeds the same exclusion set, so both mechanism A and D
 // inherit the carve-out.
+// SUP-16586: the third non-decomposition label name,
+// `work-type:architecture-review`, marks a card filed to adjudicate a parent's
+// close gate (SUP-16569 over SUP-15805; SUP-16584). An architecture-review card
+// is a chain terminator per escalation.md — it is never sub-work and can never
+// be a decomposition child at any depth, so its parent must not be armed by it.
+// It is resolved by the SAME single company-scoped name read as the other two
+// and feeds the same exclusion set, so both mechanism A and D inherit it.
 const REDO_LABEL_NAME = "work-type:redo";
 const DELIVERY_LABEL_NAME = "work-type:delivery";
+const ARCHITECTURE_REVIEW_LABEL_NAME = "work-type:architecture-review";
 
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
@@ -1025,6 +1033,13 @@ function evaluateReviewLadderSatisfaction(
    * SUP-15410/SUP-15405 shape over the coding leaf SUP-15140) that lands and
    * re-delivers the parent's already-gated deliverable. Both names are resolved
    * by the SAME single company-scoped labels read and feed one exclusion set.
+   *
+   * SUP-16586: the carve-out extends to a third company-scoped label name,
+   * `work-type:architecture-review`, which marks a card filed to adjudicate a
+   * parent's close gate (SUP-16569 over SUP-15805; SUP-16584). An architecture
+   * review terminates a chain rather than being sub-work, so a card filed to fix
+   * a parent's ladder must never arm that ladder. All THREE names are resolved
+   * by the SAME single company-scoped labels read and feed one exclusion set.
    * A laddered child excluded this way is also recorded in
    * `excludedChildIdentifiers`, so a carve-out is visible in the mechanism A /
    * D audit trail and a mislabelled genuine child is detectable. This exclusion
@@ -1074,14 +1089,16 @@ export async function countLadderedChildren(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
 
-  // SUP-15464 / SUP-15533: a `work-type:redo` or `work-type:delivery` child
-  // re-delivers the same deliverable this parent already gated, so it is not a
-  // decomposition child. Resolve BOTH carve-out label names in a single
-  // company-scoped labels read — the label id is company-scoped and this guard
-  // is not, and one read covers both names (a second query would only add a
-  // round trip for a name the first already resolves). A company with neither
-  // label present cannot have such a child, so the issue_labels read is
-  // skipped entirely.
+  // SUP-15464 / SUP-15533 / SUP-16586: a `work-type:redo`, `work-type:delivery`,
+  // or `work-type:architecture-review` child is not a decomposition child. The
+  // first two re-deliver the same deliverable this parent already gated; the
+  // third is a card filed to adjudicate this parent's close gate (a chain
+  // terminator that must never arm the gate it exists to correct). Resolve ALL
+  // THREE carve-out label names in a single company-scoped labels read — the
+  // label id is company-scoped and this guard is not, and one read covers all
+  // three names (a second query would only add a round trip for a name the
+  // first already resolves). A company with none of the labels present cannot
+  // have such a child, so the issue_labels read is skipped entirely.
   let carveOutChildIds: Set<string> | null = null;
   const carveOutLabelRows = await db
     .select({ id: labels.id })
@@ -1089,7 +1106,7 @@ export async function countLadderedChildren(
     .where(
       and(
         eq(labels.companyId, companyId),
-        inArray(labels.name, [REDO_LABEL_NAME, DELIVERY_LABEL_NAME]),
+        inArray(labels.name, [REDO_LABEL_NAME, DELIVERY_LABEL_NAME, ARCHITECTURE_REVIEW_LABEL_NAME]),
       ),
     );
   if (carveOutLabelRows.length > 0) {
@@ -1130,11 +1147,13 @@ export async function countLadderedChildren(
     const completed = state?.completedStageIds?.length ?? 0;
     const skipped = state?.skippedStageIds?.length ?? 0;
     if (completed === 0 && skipped === 0) continue;
-    // SUP-15464 / SUP-15533: a `work-type:redo` or `work-type:delivery` child
-    // re-delivers the same work this parent already gated, not a separate
-    // child's. Record it so the carve-out is visible in the mechanism A / D
-    // audit trail (a mislabelled genuine child is detectable there), and do not
-    // count it toward the decomposition.
+    // SUP-15464 / SUP-15533 / SUP-16586: a `work-type:redo`, `work-type:delivery`,
+    // or `work-type:architecture-review` child is not "which child gated this
+    // work?" — the first two re-deliver the same deliverable this parent already
+    // gated, and the third is a chain terminator filed to adjudicate this
+    // parent's gate. Record it so the carve-out is visible in the mechanism A /
+    // D audit trail (a mislabelled genuine child is detectable there), and do
+    // not count it toward the decomposition.
     if (carveOutChildIds?.has(row.id)) {
       excludedChildIdentifiers.push(row.identifier ?? "<unnamed>");
       continue;
