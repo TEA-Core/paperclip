@@ -835,6 +835,203 @@ describe("issue execution policy transitions", () => {
     });
   });
 
+  describe("participant blocked park (ADR-072 / SUP-16587)", () => {
+    const policy = twoStagePolicy();
+    const reviewStageId = policy.stages[0].id;
+
+    // An agent review-stage participant that cannot record an honest decision
+    // (its `done` approve was refused by an independent downstream guard) parks
+    // the card `blocked` WITHOUT fabricating a changes_requested decision.
+    const parkedReviewState = (): Record<string, unknown> => ({
+      status: "pending",
+      currentStageId: reviewStageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      changesRequestedCount: 0,
+    });
+
+    it("parks blocked without recording any execution decision and leaves the stage armed", () => {
+      const before = parkedReviewState();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: before,
+        },
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Approve refused by done-transition guard; waiting on SUP-15878 route gap",
+      });
+
+      // No decision is written to the review ledger.
+      expect(result.decision).toBeUndefined();
+      // The armed stage is left byte-identical: the patch carries no
+      // executionState so the stored state (every field) is untouched.
+      expect(result.patch.executionState).toBeUndefined();
+      expect(JSON.stringify(before)).toBe(
+        JSON.stringify({
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        }),
+      );
+    });
+
+    it("requires a comment to park blocked", () => {
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: parkedReviewState(),
+          },
+          policy,
+          requestedStatus: "blocked",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+        }),
+      ).toThrow(/requires a comment/);
+    });
+
+    it("keeps the changes_requested coercion for every other non-in_review status", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: parkedReviewState(),
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs another pass",
+      });
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: reviewStageId,
+        lastDecisionOutcome: "changes_requested",
+      });
+      expect(result.decision).toMatchObject({
+        stageId: reviewStageId,
+        outcome: "changes_requested",
+      });
+    });
+
+    it("leaves the allowBoardOverride escape untouched for a board actor", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: parkedReviewState(),
+        },
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+        commentBody: "board override",
+      });
+
+      // The board path still dissolves the execution state (its documented
+      // escape hatch), so a board actor does NOT get the participant park.
+      expect(result.patch.executionState).toBeNull();
+      expect(result.decision).toBeUndefined();
+    });
+
+    it("re-arms via in_review and the subsequent approval lands on the same stage id", () => {
+      // 1. Park: the card goes blocked with the review stage still armed.
+      const park = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: parkedReviewState(),
+        },
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "waiting on dependency",
+      });
+      expect(park.patch.executionState).toBeUndefined();
+
+      // The stored state after parking is exactly the pending review state.
+      const parkedState = parkedReviewState() as Record<string, unknown>;
+
+      // 2. Re-arm: PATCH in_review re-pends the same pending stage.
+      const rearm = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "blocked",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: parkedState,
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+      });
+      const rearmState = rearm.patch.executionState as Record<string, unknown>;
+      expect(rearm.patch.status).toBe("in_review");
+      expect(rearmState.status).toBe("pending");
+      // A rebuilt stage would mint a new id; the round history is dropped.
+      expect(rearmState.currentStageId).toBe(reviewStageId);
+      expect(rearmState.currentParticipant).toEqual({ type: "agent", agentId: qaAgentId });
+      expect(rearmState.completedStageIds).toEqual([]);
+      expect(rearmState.lastDecisionOutcome).toBe(null);
+      expect(rearmState.changesRequestedCount).toBe(0);
+
+      // 3. Approve: the decision lands on the same review stage id.
+      const approve = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: rearm.patch.executionState,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "LGTM",
+      });
+      expect(approve.decision).toMatchObject({
+        stageId: reviewStageId,
+        outcome: "approved",
+      });
+    });
+  });
+
   describe("review-only policy (no approval stage)", () => {
     const policy = reviewOnlyPolicy();
     const reviewStageId = policy.stages[0].id;

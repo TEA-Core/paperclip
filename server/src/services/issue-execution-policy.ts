@@ -1201,6 +1201,22 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         return { patch };
       }
 
+      // ADR-072: when an agent review/approval-stage participant cannot record
+      // an honest decision — e.g. an independent downstream guard refuses the
+      // `done` close it tried and there is no real changes-requested to file —
+      // it must be able to PARK the card `blocked` without fabricating a
+      // decision. Parking writes no execution decision and leaves the armed
+      // stage exactly as it was (same stage id, same round history, same
+      // participant), so the same participant can resume once the blocker
+      // clears. This escape is deliberately scoped to `blocked`: every other
+      // non-in_review status keeps the changes_requested coercion below.
+      if (requestedStatus === "blocked") {
+        if (!input.commentBody?.trim()) {
+          throw unprocessable(`Parking a review or approval stage blocked requires a comment naming the blocker and the unblock action. ${STAGE_DECISION_COMMENT_HINT}`);
+        }
+        return { patch };
+      }
+
       if (requestedStatus && requestedStatus !== "in_review") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
