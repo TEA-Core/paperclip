@@ -20,6 +20,7 @@ import {
   workspaceRuntimeControlOwnerIdForTests,
 } from "../services/workspace-operations.js";
 import { getWorkspaceOperationLogStore } from "../services/workspace-operation-log-store.js";
+import { runWorkspaceJobForControl } from "../services/workspace-runtime.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -480,6 +481,50 @@ describeEmbeddedPostgres("managed runtime-control operation recovery", () => {
       reconciled: 0,
       operationIds: [],
     });
+  });
+
+  it("persists provision exit code and warning output in the operation log", async () => {
+    const { companyId, executionWorkspaceId } = await seedWorkspace();
+    const service = workspaceOperationService(db);
+    const recorder = service.createRecorder({ companyId, executionWorkspaceId });
+    const warning = "(node) [DEP0169] DeprecationWarning: url.parse()";
+    const workspaceCommand = `printf '%s\\n' '${warning}' >&2; exit 1`;
+
+    await expect(
+      runWorkspaceJobForControl({
+        actor: { id: "agent-1", name: "Codex Coder", companyId },
+        issue: { id: "issue-1", identifier: "PAP-1", title: "Failing provision" },
+        workspace: {
+          baseCwd: "/tmp",
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: null,
+          strategy: "project_primary",
+          cwd: "/tmp",
+          branchName: null,
+          worktreePath: null,
+          warnings: [],
+          created: false,
+          branchCreatedByRuntime: false,
+        },
+        command: { name: "failing provision", command: workspaceCommand },
+        recorder,
+      }),
+    ).rejects.toThrow(/failed with exit code 1/);
+
+    const persisted = await db
+      .select()
+      .from(workspaceOperations)
+      .where(eq(workspaceOperations.executionWorkspaceId, executionWorkspaceId))
+      .then((rows) => rows[0]);
+    expect(persisted).toMatchObject({ status: "failed", exitCode: 1 });
+    expect(persisted?.stderrExcerpt).toContain(warning);
+    expect(persisted?.stderrExcerpt).toContain("exit code 1");
+    const log = await service.readLog(persisted!.id);
+    expect(log.content).toContain(warning);
+    expect(log.content).toContain("exit code 1");
   });
 
   it("lets a managed retry succeed immediately after a failed start", async () => {

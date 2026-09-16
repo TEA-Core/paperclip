@@ -3687,11 +3687,11 @@ async function runWorkspaceCommand(input: {
   if (proc.stderr && input.onLog) await input.onLog("stderr", `[runtime-provision] ${proc.stderr}`);
   if (proc.code === 0) return;
 
-  const details = [proc.stderr.trim(), proc.stdout.trim()].filter(Boolean).join("\n");
+  const details = [trimToLastBytes(proc.stderr.trim(), DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES), proc.stdout.trim()]
+    .filter(Boolean)
+    .join("\n");
   throw new Error(
-    details.length > 0
-      ? `${input.label} failed: ${details}`
-      : `${input.label} failed with exit code ${proc.code ?? -1}`,
+    `${input.label} failed with exit code ${proc.code ?? -1}${details ? `: ${details}` : ""}`,
   );
 }
 
@@ -3747,11 +3747,11 @@ async function recordGitOperation(
   });
 
   if (code !== 0) {
-    const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+    const details = [trimToLastBytes(stderr.trim(), DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES), stdout.trim()]
+      .filter(Boolean)
+      .join("\n");
     throw new Error(
-      details.length > 0
-        ? `${input.failureLabel ?? `git ${input.args.join(" ")}`} failed: ${details}`
-        : `${input.failureLabel ?? `git ${input.args.join(" ")}`} failed with exit code ${code ?? -1}`,
+      `${input.failureLabel ?? `git ${input.args.join(" ")}`} failed with exit code ${code ?? -1}${details ? `: ${details}` : ""}`,
     );
   }
   return stdout.trim();
@@ -3808,11 +3808,15 @@ async function recordWorkspaceCommandOperation(
             stderrBytes: result.stderrBytes,
           }
         : null;
+      const failureDetails = [trimToLastBytes(stderr.trim(), DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES), result.stdout.trim()]
+        .filter(Boolean)
+        .join("\n");
+      const failureMessage = `${input.label} failed with exit code ${code ?? -1}${failureDetails ? `: ${failureDetails}` : ""}`;
       return {
         status: code === 0 ? "succeeded" : "failed",
         exitCode: code,
         stdout: result.stdout,
-        stderr,
+        stderr: code === 0 ? stderr : `${stderr}${stderr.endsWith("\n") ? "" : "\n"}${failureMessage}\n`,
         system: code === 0 ? input.successMessage ?? null : null,
         metadata: seedEvidence
           ? { ...seedEvidence.metadata, ...(truncationMetadata ?? {}) }
@@ -3823,11 +3827,11 @@ async function recordWorkspaceCommandOperation(
 
   if (code === 0) return operation;
 
-  const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+  const details = [trimToLastBytes(stderr.trim(), DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES), stdout.trim()]
+    .filter(Boolean)
+    .join("\n");
   throw new Error(
-    details.length > 0
-      ? `${input.label} failed: ${details}`
-      : `${input.label} failed with exit code ${code ?? -1}`,
+    `${input.label} failed with exit code ${code ?? -1}${details ? `: ${details}` : ""}`,
   );
 }
 
