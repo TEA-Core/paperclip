@@ -262,7 +262,15 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     // Fault the release transaction on the issue-lock write, so executeRun's
     // suppression branch catches the failure, logs it, and returns instead
     // of throwing. There is no in-process fallback or retry for this path.
-    const failingDb = withFailingTransactionalUpdate(db, { 1: issues });
+    // Fork divergence (claim-path staleness gate kept in-file, slice 2c):
+    // upstream f65991a5f (#12920) moved claimQueuedRun's stale-run check onto
+    // runDispatch.cancelStaleQueuedRun, whose issue-then-run lock transaction
+    // is db.transaction() call 0, so upstream faults call 1. The fold kept the
+    // fork's in-file evaluateQueuedRunStaleness at the claim gate (SUP-10605
+    // handoff, SUP-15237 review-participant exemption; revisit with the D9
+    // run-dispatch port), which opens no transaction, so the release
+    // transaction is call 0 here. Restore { 1: issues } when that port lands.
+    const failingDb = withFailingTransactionalUpdate(db, { 0: issues });
     const heartbeat = heartbeatService(failingDb);
 
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
