@@ -15607,6 +15607,88 @@ export function issueRoutes(
         policyIsObject && !("stages" in (policy as Record<string, unknown>));
       next();
     },
+    // SUP-16607: the issues PATCH is a governed close path, but an unhandled
+    // non-HttpError terminating it is invisible after the fact: the app-level
+    // error handler renders a bare `{"error":"Internal server error"}` and the
+    // close transaction has already rolled back, so the activity feed and
+    // `issue_execution_decisions` retain ZERO rows about the attempt (observed
+    // live: SUP-16602's 01:05 done-close 500 left no trace of what threw). Record
+    // the error class and the issue durably, and put a `code`/`details` on the
+    // response so the caller can at least attribute the fault. Scoped to this
+    // route only — the generic 500 shape for other routes is out of scope.
+    (req, res, next) => {
+      const originalJson = res.json.bind(res);
+      // Capture what the failure record needs WHILE the layer is still live:
+      // Express 5 (`router@2`) restores `req.params` when the layer unwinds, so by
+      // the time the error handler responds `req.params.id` is gone (and an id
+      // resolved later would name the wrong route).
+      const routeId = req.params.id as string | undefined;
+      const actorCompanyId = req.actor.companyId ?? (req.actor.companyIds ?? [])[0] ?? null;
+      const originalUrl = req.originalUrl;
+      let recorded = false;
+      const recordUnhandled = async (errorClass: string, message: string) => {
+        if (recorded) return;
+        recorded = true;
+        try {
+          const issue = routeId
+            ? await svc.getById(routeId).catch(() => null)
+            : null;
+          const companyId = issue?.companyId ?? actorCompanyId;
+          if (!companyId) {
+            logger.error(
+              { routeId, errorClass },
+              "cannot record unhandled issues PATCH error without a company id",
+            );
+            return;
+          }
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: "issue-patch-error-recorder",
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: "issue.patch_unhandled_error",
+            entityType: "issue",
+            entityId: issue?.id ?? routeId ?? "unknown",
+            issueId: issue?.id ?? null,
+            details: {
+              identifier: issue?.identifier ?? routeId ?? null,
+              errorClass,
+              message: message.slice(0, 2000),
+              method: "PATCH",
+              path: originalUrl,
+            },
+          });
+        } catch (err) {
+          logger.error({ err }, "failed to record unhandled issues PATCH error");
+        }
+      };
+      res.json = ((body: unknown) => {
+        const errorContext = (res as unknown as {
+          __errorContext?: { error?: { name?: string; message?: string } };
+        }).__errorContext;
+        if (res.statusCode === 500 && errorContext?.error) {
+          const errorClass = errorContext.error.name ?? "Error";
+          const message = errorContext.error.message ?? "";
+          void recordUnhandled(errorClass, message);
+          return originalJson({
+            error: "Issue update failed unexpectedly",
+            code: "issue_patch_unhandled_error",
+            details: {
+              issueId: routeId ?? null,
+              errorClass,
+              message,
+              remedy:
+                "The failure is recorded on the issue activity feed " +
+                "(issue.patch_unhandled_error); include it when reporting.",
+            },
+          } as never);
+        }
+        return originalJson(body as never);
+      }) as typeof res.json;
+      next();
+    },
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
     const id = req.params.id as string;
