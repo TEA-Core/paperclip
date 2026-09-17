@@ -56,6 +56,11 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
   stringifyPaperclipWakePayload,
+  stringifyPaperclipWakePayloadForEnv,
+  SpawnEnvelopeTooLargeError,
+  assertSpawnEnvelopeWithinLimits,
+  isSpawnEnvelopeTooLargeError,
+  PAPERCLIP_WAKE_ENV_MAX_BYTES,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
@@ -67,6 +72,252 @@ vi.mock("node:child_process", async (importOriginal) => {
     ...actual,
     spawn: vi.fn().mockImplementation(actual.spawn),
   };
+});
+
+describe("e2big-wake-env helpers (FORK-DIVERGENCE e2big-wake-env)", () => {
+  const baseIssue = {
+    id: "issue-e2big",
+    identifier: "E2B-1",
+    title: "E2BIG repro",
+    status: "in_progress",
+  };
+
+  const makeContinuation = (messageCount: number, body: string) => ({
+    version: 1,
+    companyId: "company-1",
+    issueId: "issue-e2big",
+    trigger: { reason: "issue_commented", interactionId: null, sourceRunId: null },
+    originCommentIds: ["c-1"],
+    objective: "keep the launch envelope small",
+    messages: Array.from({ length: messageCount }, (_, index) => ({
+      id: `msg-${index}`,
+      authorType: "agent",
+      authorId: null,
+      body,
+      createdAt: "2026-09-16T00:00:00.000Z",
+      updatedAt: "2026-09-16T00:00:00.000Z",
+      deleted: false,
+      sourceTrust: null,
+    })),
+    interactionOutcomes: [],
+    completedWork: null,
+    unresolvedInteractionIds: [],
+    coverage: {
+      kind: "full_task_history",
+      throughCommentId: "c-1",
+      summaryThroughCommentId: null,
+    },
+  });
+
+  it("delivers the full executionContinuation in the prompt while the env carries a delivered-elsewhere marker", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: baseIssue,
+      executionContinuation: makeContinuation(1, "E2BIG sentinel final history message 9001"),
+    };
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("E2BIG sentinel final history message 9001");
+
+    const envString = stringifyPaperclipWakePayloadForEnv(payload);
+    expect(typeof envString).toBe("string");
+    const envJson = JSON.parse(envString!);
+    expect(envJson.executionContinuation).toMatchObject({
+      omitted: true,
+      reason: "delivered_in_prompt",
+      messageCount: 1,
+      throughCommentId: "c-1",
+      coverageKind: "full_task_history",
+    });
+    // the heavy history stays in the prompt, not in the env value
+    expect(envJson.executionContinuation).not.toHaveProperty("messages");
+    expect(envJson.executionContinuation).not.toContain("E2BIG sentinel final history message 9001");
+  });
+
+  it("caps the env value at PAPERCLIP_WAKE_ENV_MAX_BYTES and keeps the delivered-elsewhere marker when the continuation is large", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: baseIssue,
+      executionContinuation: makeContinuation(80, "x".repeat(2000)),
+    };
+    const rawBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+    expect(rawBytes).toBeGreaterThan(PAPERCLIP_WAKE_ENV_MAX_BYTES);
+
+    const envString = stringifyPaperclipWakePayloadForEnv(payload);
+    expect(typeof envString).toBe("string");
+    const envBytes = Buffer.byteLength(envString!, "utf8");
+    expect(envBytes).toBeLessThanOrEqual(PAPERCLIP_WAKE_ENV_MAX_BYTES);
+    expect(envBytes).toBeLessThan(rawBytes);
+
+    const envJson = JSON.parse(envString!);
+    expect(envJson.executionContinuation).toMatchObject({
+      omitted: true,
+      reason: "delivered_in_prompt",
+    });
+    expect(envJson.executionContinuation).not.toHaveProperty("messages");
+  });
+
+  it("isSpawnEnvelopeTooLargeError recognises the class and a plain object carrying the code", () => {
+    expect(isSpawnEnvelopeTooLargeError(new SpawnEnvelopeTooLargeError("x"))).toBe(true);
+    expect(isSpawnEnvelopeTooLargeError({ code: "spawn_envelope_too_large" })).toBe(true);
+    expect(isSpawnEnvelopeTooLargeError(new Error("unrelated"))).toBe(false);
+    expect(isSpawnEnvelopeTooLargeError(null)).toBe(false);
+    expect(isSpawnEnvelopeTooLargeError("string")).toBe(false);
+  });
+
+  describe("assertSpawnEnvelopeWithinLimits", () => {
+    it("accepts a single argv string at the 131071-byte limit and rejects one byte over", () => {
+      expect(() =>
+        assertSpawnEnvelopeWithinLimits({
+          command: "opencode",
+          args: ["x".repeat(131071)],
+          env: {},
+        }),
+      ).not.toThrow();
+      expect(() =>
+        assertSpawnEnvelopeWithinLimits({
+          command: "opencode",
+          args: ["x".repeat(131072)],
+          env: {},
+        }),
+      ).toThrow(SpawnEnvelopeTooLargeError);
+    });
+
+    it("accepts an env entry at the NUL-included 131072 limit and rejects one over", () => {
+      // entry = "K=" + value; 131069 x's -> entry 131071 (+1 NUL) == 131072 passes
+      expect(() =>
+        assertSpawnEnvelopeWithinLimits({
+          command: "c",
+          args: [],
+          env: { K: "x".repeat(131069) },
+        }),
+      ).not.toThrow();
+      expect(() =>
+        assertSpawnEnvelopeWithinLimits({
+          command: "c",
+          args: [],
+          env: { K: "x".repeat(131070) },
+        }),
+      ).toThrow(SpawnEnvelopeTooLargeError);
+    });
+
+    it("rejects a total argv+envp envelope over the ~1 MiB budget", () => {
+      expect(() =>
+        assertSpawnEnvelopeWithinLimits({
+          command: "c",
+          args: ["y".repeat(1_050_000)],
+          env: {},
+        }),
+      ).toThrow(SpawnEnvelopeTooLargeError);
+    });
+
+    it("names the offending key and its size, but never the value", () => {
+      let message = "";
+      try {
+        assertSpawnEnvelopeWithinLimits({
+          command: "c",
+          args: [],
+          env: { SENSITIVE: "SECRET_SENTINEL_0001" + "x".repeat(131070) },
+        });
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain("SENSITIVE");
+      expect(message).toMatch(/\d+ bytes/);
+      expect(message).not.toContain("SECRET_SENTINEL_0001");
+    });
+
+    it("counts the key and = toward the per-argument limit (8-byte key + value == 131072 bytes throws)", () => {
+      // key (8) + "=" (1) + value (131063) = 131072 bytes; +1 NUL = 131073 > 131072
+      const key = "ABCDEFGH";
+      expect(key.length).toBe(8);
+      expect(() =>
+        assertSpawnEnvelopeWithinLimits({
+          command: "c",
+          args: [],
+          env: { [key]: "x".repeat(131063) },
+        }),
+      ).toThrow(SpawnEnvelopeTooLargeError);
+      // one byte less in the value keeps KEY=value at 131071 bytes (+1 NUL == 131072), which passes
+      expect(() =>
+        assertSpawnEnvelopeWithinLimits({
+          command: "c",
+          args: [],
+          env: { [key]: "x".repeat(131062) },
+        }),
+      ).not.toThrow();
+    });
+
+    it("does not read as a spawn-like failure message", () => {
+      const inputs: Array<Parameters<typeof assertSpawnEnvelopeWithinLimits>[0]> = [
+        { command: "opencode", args: ["x".repeat(131072)], env: {} },
+        { command: "c", args: [], env: { K: "x".repeat(131070) } },
+      ];
+      for (const input of inputs) {
+        let message = "";
+        try {
+          assertSpawnEnvelopeWithinLimits(input);
+        } catch (err) {
+          message = (err as Error).message;
+        }
+        expect(message).not.toMatch(/\bspawn\b/i);
+        expect(message).not.toContain("failed to start command");
+        expect(message).not.toContain("ENOENT");
+      }
+    });
+  });
+});
+
+describe("runChildProcess launch-size guard (FORK-DIVERGENCE e2big-wake-env)", () => {
+  // `spawn` is the vi.mock("node:child_process") spy wrapping the real spawn, so
+  // its mock state reflects exactly which launches actually reached the kernel.
+  const spawnSpy = vi.mocked(spawn);
+
+  it("rejects with spawn_envelope_too_large when an INHERITED process.env value is over the single-arg limit, without ever calling spawn", async () => {
+    const hugeKey = "E2BIG_INHERITED_HUGE";
+    const prevHuge = process.env[hugeKey];
+    // A small opts.env that would be fine on its own; the oversize value comes
+    // from the inherited process env that runChildProcess merges before spawn.
+    process.env[hugeKey] = "x".repeat(140_000);
+    spawnSpy.mockClear();
+    try {
+      await expect(
+        runChildProcess(randomUUID(), process.execPath, ["-e", "process.exit(0)"], {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+        }),
+      ).rejects.toMatchObject({ code: "spawn_envelope_too_large" });
+    } finally {
+      if (prevHuge === undefined) delete process.env[hugeKey];
+      else process.env[hugeKey] = prevHuge;
+    }
+    // The guard refuses the launch before child_process.spawn, so no launch ran.
+    expect(spawnSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects with spawn_envelope_too_large for an oversize opts.env value and names the key, not the value", async () => {
+    spawnSpy.mockClear();
+    const sentinel = "SECRET_SENTINEL_OPTSENV";
+    let caught: unknown;
+    try {
+      await runChildProcess(randomUUID(), process.execPath, ["-e", "process.exit(0)"], {
+        cwd: process.cwd(),
+        env: { OVERSIZED: sentinel + "x".repeat(140_000) },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toMatchObject({ code: "spawn_envelope_too_large" });
+    expect((caught as Error).message).toContain("OVERSIZED");
+    expect((caught as Error).message).not.toContain(sentinel);
+    // The guard refuses the launch before child_process.spawn, so no launch ran.
+    expect(spawnSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe("runtime connection tool delivery", () => {

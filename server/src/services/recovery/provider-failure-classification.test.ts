@@ -127,3 +127,13 @@ describe("classifyAdapterFailureForRecovery", () => {
     })).toBeNull();
   });
 });
+
+describe("classifyContinuationFailure (FORK-DIVERGENCE e2big-wake-env)", () => {
+  it("treats a refused launch envelope as non-retryable instead of a transient infra retry", () => {
+    expect(classifyContinuationFailure({ errorCode: "spawn_envelope_too_large" } as never)).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+      errorCode: "spawn_envelope_too_large",
+    });
+  });
+});

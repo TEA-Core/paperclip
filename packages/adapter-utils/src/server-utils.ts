@@ -2080,6 +2080,189 @@ export function stringifyPaperclipWakePayload(
   return JSON.stringify(normalized);
 }
 
+// FORK-DIVERGENCE(e2big-wake-env)
+// Reconciliation against upstream #13144: when #13144 merges, take its writer
+// deletion, drop this env helper, keep the launch-size guard (see
+// assertSpawnEnvelopeWithinLimits), and re-check the skills-releases/* copies.
+//
+// `PAPERCLIP_WAKE_PAYLOAD_JSON` rides the child process environment. A single
+// env value larger than Linux MAX_ARG_STRLEN (131072 B, NUL included) makes the
+// kernel reject the whole exec with E2BIG, so the run never starts and every new
+// wake on the same card fails identically. This helper is the env-boundary copy
+// of the wake payload: it drops the byte-dominant `executionContinuation` (the
+// full task history is already delivered in the prompt) and caps the result at
+// PAPERCLIP_WAKE_ENV_MAX_BYTES so the value can never approach the kernel limit.
+export const PAPERCLIP_WAKE_ENV_MAX_BYTES = 32 * 1024;
+
+// A single exec argument (argv string or KEY=value env entry) may not exceed
+// this many bytes once the trailing NUL is counted (Linux MAX_ARG_STRLEN).
+const SPAWN_SINGLE_ARG_MAX_BYTES = 131071;
+// Conservative whole-argv+envp budget (Linux ARG_MAX is larger, but this leaves
+// headroom for the stack, the interpreter, and quoting used by sandbox lanes).
+const SPAWN_TOTAL_MAX_BYTES = 1048576;
+
+// Compact stand-in for the byte-dominant executionContinuation. Keeps just the
+// cursor fields a reader needs to know what was delivered elsewhere.
+type PaperclipWakeEnvContinuationStub = {
+  omitted: true;
+  reason: "delivered_in_prompt";
+  messageCount: number;
+  throughCommentId: string | null;
+  coverageKind: string | null;
+};
+
+function paperclipWakeContinuationStub(
+  normalized: PaperclipWakePayload,
+): PaperclipWakeEnvContinuationStub | null {
+  const continuation = normalized.executionContinuation;
+  if (!continuation) return null;
+  return {
+    omitted: true,
+    reason: "delivered_in_prompt",
+    messageCount: Array.isArray(continuation.messages)
+      ? continuation.messages.length
+      : 0,
+    throughCommentId: continuation.coverage?.throughCommentId ?? null,
+    coverageKind: continuation.coverage?.kind ?? null,
+  };
+}
+
+/**
+ * FORK-DIVERGENCE(e2big-wake-env): byte-bounded, continuation-free copy of the
+ * wake payload for `PAPERCLIP_WAKE_PAYLOAD_JSON`. Always <= PAPERCLIP_WAKE_ENV_MAX_BYTES
+ * and always valid JSON (never cut mid-string). Returns null when even the
+ * minimal payload cannot fit, so callers omit the variable entirely.
+ */
+export function stringifyPaperclipWakePayloadForEnv(
+  value: unknown,
+): string | null {
+  const normalized = normalizePaperclipWakePayload(value);
+  if (!normalized) return null;
+  const stub = paperclipWakeContinuationStub(normalized);
+  const stubbed: Record<string, unknown> = {
+    ...normalized,
+    executionContinuation: stub,
+  };
+  const full = JSON.stringify(stubbed);
+  if (Buffer.byteLength(full, "utf8") <= PAPERCLIP_WAKE_ENV_MAX_BYTES) {
+    return full;
+  }
+  // Over the cap: drop the comment bodies and every other heavy field, keeping
+  // only the identifiers a reader needs to re-fetch.
+  const minimal: Record<string, unknown> = {
+    reason: normalized.reason,
+    issue: normalized.issue
+      ? {
+          id: normalized.issue.id,
+          identifier: normalized.issue.identifier,
+          title: normalized.issue.title,
+          status: normalized.issue.status,
+        }
+      : null,
+    commentIds: normalized.commentIds,
+    latestCommentId: normalized.latestCommentId,
+    executionContinuation: stub,
+    truncated: true,
+    fallbackFetchNeeded: true,
+  };
+  const minimalString = JSON.stringify(minimal);
+  const minimalBytes = Buffer.byteLength(minimalString, "utf8");
+  if (minimalBytes <= PAPERCLIP_WAKE_ENV_MAX_BYTES) {
+    // Report how many bytes of the original payload were omitted from the env.
+    return JSON.stringify({
+      ...minimal,
+      omittedBytes: Buffer.byteLength(full, "utf8") - minimalBytes,
+    });
+  }
+  // Even the minimal payload is over the cap. Omit the variable entirely.
+  console.warn(
+    `[paperclip] PAPERCLIP_WAKE_PAYLOAD_JSON minimal payload is ${minimalBytes} bytes, ` +
+      `over the ${PAPERCLIP_WAKE_ENV_MAX_BYTES}-byte env cap; omitting the variable. ` +
+      `Full history remains in the prompt; fetch the thread for the comment bodies.`,
+  );
+  return null;
+}
+
+export class SpawnEnvelopeTooLargeError extends Error {
+  readonly code = "spawn_envelope_too_large";
+  constructor(message: string) {
+    super(message);
+    this.name = "SpawnEnvelopeTooLargeError";
+  }
+}
+
+export function isSpawnEnvelopeTooLargeError(error: unknown): boolean {
+  return (
+    error instanceof SpawnEnvelopeTooLargeError ||
+    (error != null &&
+      typeof error === "object" &&
+      (error as { code?: unknown }).code === "spawn_envelope_too_large")
+  );
+}
+
+/**
+ * FORK-DIVERGENCE(e2big-wake-env): fail fast, before `child_process.spawn`, when
+ * the FINAL launch envelope (command, args, env) would be rejected by the
+ * kernel. Runs on the exact values that are executed — after the inherited
+ * process env, the run-deadline merge, the opts.env merge, the nesting-variable
+ * strip, and any sandbox/remote wrapping that rewrites command and args.
+ *
+ * Two limits:
+ *   (a) any single argv string, or any `KEY=value` env entry, with UTF-8
+ *       byteLength + 1 (the NUL terminator) > 131072 (MAX_ARG_STRLEN);
+ *   (b) the argv+envp total (bytes + one NUL + an 8-byte pointer per string)
+ *       > 1048576 (a conservative ARG_MAX).
+ *
+ * The thrown message names the offending key or argv index and its size but
+ * never the value. It deliberately does NOT match `isSpawnLikeFailureMessage`
+ * (no bare "spawn" word, no "failed to start command"), so a recorded run is
+ * classified by this specific code instead of as a retryable spawn blip.
+ */
+export function assertSpawnEnvelopeWithinLimits(input: {
+  command: string;
+  args: string[];
+  env: Record<string, string | undefined>;
+}): void {
+  const { command, args, env } = input;
+  const totalStrings: string[] = [command, ...args];
+  let total = 0;
+  for (const arg of totalStrings) {
+    total += Buffer.byteLength(arg, "utf8") + 1 + 8;
+  }
+  for (const [key, value] of Object.entries(env)) {
+    if (value == null) continue;
+    const entry = `${key}=${value}`;
+    total += Buffer.byteLength(entry, "utf8") + 1 + 8;
+  }
+  // (b) total budget first: it is the coarsest and usually the least surprising.
+  if (total > SPAWN_TOTAL_MAX_BYTES) {
+    throw new SpawnEnvelopeTooLargeError(
+      `launch argument and environment total ${total} bytes exceeds the ` +
+        `${SPAWN_TOTAL_MAX_BYTES}-byte limit; refusing to launch`,
+    );
+  }
+  // (a) argv: the command and each argument are one NUL-terminated string each.
+  for (let index = 0; index < totalStrings.length; index++) {
+    const bytes = Buffer.byteLength(totalStrings[index], "utf8");
+    if (bytes + 1 > SPAWN_SINGLE_ARG_MAX_BYTES + 1) {
+      throw new SpawnEnvelopeTooLargeError(
+        index === 0
+          ? `launch command is ${bytes} bytes; the kernel limit per argument is ${SPAWN_SINGLE_ARG_MAX_BYTES} bytes (NUL-included ${SPAWN_SINGLE_ARG_MAX_BYTES + 1})`
+          : `launch argument at index ${index} is ${bytes} bytes; the kernel limit per argument is ${SPAWN_SINGLE_ARG_MAX_BYTES} bytes (NUL-included ${SPAWN_SINGLE_ARG_MAX_BYTES + 1})`,
+      );
+    }
+  }
+  for (const [key, value] of Object.entries(env)) {
+    if (value == null) continue;
+    const bytes = Buffer.byteLength(`${key}=${value}`, "utf8");
+    if (bytes + 1 > SPAWN_SINGLE_ARG_MAX_BYTES + 1) {
+      throw new SpawnEnvelopeTooLargeError(
+        `environment entry "${key}" is ${bytes} bytes; the kernel limit per argument is ${SPAWN_SINGLE_ARG_MAX_BYTES} bytes (NUL-included ${SPAWN_SINGLE_ARG_MAX_BYTES + 1})`,
+      );
+    }
+  }
+}
+
 export function isPaperclipRecoveryWakePayload(value: unknown): boolean {
   const normalized = normalizePaperclipWakePayload(value);
   return Boolean(
@@ -5168,6 +5351,18 @@ export async function runChildProcess(
           childEnv.PWD = spawnCwd;
           delete childEnv.OLDPWD;
         }
+        // FORK-DIVERGENCE(e2big-wake-env): validate the FINAL launch envelope —
+        // the exact command/args/env about to be exec'd — before spawn. Runs
+        // after the inherited-process / run-deadline / opts.env merge and the
+        // nesting-variable strip, and after resolveSpawnTarget has produced the
+        // final command and args (including the inlined env for the SSH lane),
+        // so a check at function entry would undercount. A throw here rejects
+        // the run promise without ever calling child_process.spawn.
+        assertSpawnEnvelopeWithinLimits({
+          command: target.command,
+          args: target.args,
+          env: childEnv,
+        });
         const child = spawn(target.command, target.args, {
           cwd: spawnCwd,
           env: childEnv,

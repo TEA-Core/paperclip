@@ -1043,6 +1043,65 @@ describe("execute — SUP-14939 router admission refusal classification", () => 
     expect(result.errorCode).toBe("opencode_exit_1");
     expect(result.errorMeta?.routerAbort).toBeUndefined();
   }, 15000);
+
+  it("keeps PAPERCLIP_WAKE_PAYLOAD_JSON under the env cap even when executionContinuation is huge", async () => {
+    let capturedEnv: Record<string, string> | undefined;
+    runAdapterExecutionTargetProcessMock.mockImplementation(
+      async (_runId, _target, _command, _args, options) => {
+        capturedEnv = (options as { env?: Record<string, string> }).env;
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+      },
+    );
+    const wake = {
+      reason: "issue_commented",
+      issue: {
+        id: "issue-e2big",
+        identifier: "E2B-1",
+        title: "E2BIG repro",
+        status: "in_progress",
+      },
+      executionContinuation: {
+        version: 1,
+        companyId: "company-1",
+        issueId: "issue-e2big",
+        trigger: { reason: "issue_commented", interactionId: null, sourceRunId: null },
+        originCommentIds: ["c-1"],
+        objective: "keep the launch small",
+        messages: Array.from({ length: 60 }, (_, index) => ({
+          id: `msg-${index}`,
+          authorType: "agent",
+          authorId: null,
+          body: `e2big sentinel body ${index} ${"x".repeat(800)}`,
+          createdAt: "2026-09-16T00:00:00.000Z",
+          updatedAt: "2026-09-16T00:00:00.000Z",
+          deleted: false,
+          sourceTrust: null,
+        })),
+        interactionOutcomes: [],
+        completedWork: null,
+        unresolvedInteractionIds: [],
+        coverage: {
+          kind: "full_task_history",
+          throughCommentId: "c-1",
+          summaryThroughCommentId: null,
+        },
+      },
+    };
+
+    await execute(makeCtx({ context: { paperclipWake: wake } }));
+
+    expect(capturedEnv).toBeTruthy();
+    const envValue = capturedEnv!.PAPERCLIP_WAKE_PAYLOAD_JSON;
+    expect(typeof envValue).toBe("string");
+    expect(Buffer.byteLength(envValue, "utf8")).toBeLessThanOrEqual(32 * 1024);
+    const parsed = JSON.parse(envValue);
+    expect(parsed.executionContinuation).toMatchObject({
+      omitted: true,
+      reason: "delivered_in_prompt",
+    });
+    // the heavy history stays out of the env value
+    expect(envValue).not.toContain("e2big sentinel body 59");
+  }, 15000);
 });
 
 // SUP-10914: every opencode_local run wrote to ONE shared SQLite database

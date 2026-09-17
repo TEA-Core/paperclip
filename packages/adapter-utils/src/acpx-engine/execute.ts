@@ -74,7 +74,10 @@ import {
   rewriteWorkspaceCwdEnvVarsForExecution,
   sanitizeInheritedPaperclipEnv,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
+  stringifyPaperclipWakePayloadForEnv,
+  assertSpawnEnvelopeWithinLimits,
+  SpawnEnvelopeTooLargeError,
+  isSpawnEnvelopeTooLargeError,
   SIGNAL_UNDELIVERABLE_REASON,
   SECRET_ENV_KEYS,
   type OrphanedProcessEvidence,
@@ -2142,7 +2145,7 @@ async function buildRuntime(input: {
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -3682,6 +3685,17 @@ function classifyError(
       errorMeta: { category: "runtime", ...baseMeta },
     };
   }
+  // FORK-DIVERGENCE(e2big-wake-env): the launch-size guard refuses an envelope
+  // that would hit the kernel limit before spawn, and a real E2BIG from the
+  // kernel surfaces here too. Both are preflight and non-retryable; classify
+  // by type/code ahead of the ensure_session fallback so a refused launch is
+  // never re-read as a session-identity failure.
+  if (isSpawnEnvelopeTooLargeError(err) || /\bE2BIG\b/.test(message)) {
+    return {
+      errorCode: "spawn_envelope_too_large",
+      errorMeta: { category: "preflight", ...baseMeta },
+    };
+  }
   const lower = message.toLowerCase();
   const authLike = lower.includes("auth") || lower.includes("login") || lower.includes("credential");
   if (authLike) {
@@ -4525,6 +4539,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           }),
         );
         buildRuntimeSettled = true;
+        // FORK-DIVERGENCE(e2big-wake-env): fail fast before `createRuntime` /
+        // `ensureSession`. The provider child is spawned inside `acpx/runtime`,
+        // not this repo, so the check runs on the prepared launch values — the
+        // agent command plus the launch env merged with the inherited process
+        // env the runtime would pass on. An oversized value (for example an
+        // uncapped wake payload) throws SpawnEnvelopeTooLargeError, which the
+        // acpx classifier records as a non-retryable spawn_envelope_too_large
+        // instead of a bare E2BIG that would collapse into
+        // acpx_session_init_failed.
+        assertSpawnEnvelopeWithinLimits({
+          command: prepared.agentCommand ?? prepared.acpxAgent,
+          args: [],
+          env: { ...process.env, ...prepared.env },
+        });
         // Capture the run's staging lease release now that the runtime built. The
         // run root `finally` releases it as the final settlement act.
         releaseStagingLease = prepared.sessionStagingLeaseRelease;

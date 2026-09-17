@@ -657,6 +657,10 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
+  // FORK-DIVERGENCE(e2big-wake-env): a launch refused because its argv+env
+  // envelope exceeds the kernel limit. Re-running recomputes the same oversize
+  // payload and fails identically, so recovery must not retry it.
+  "spawn_envelope_too_large",
   // SUP-11280: the opencode growth guard kills a run for the command it chose,
   // not for anything about the runtime. Continuing the same work re-runs the same
   // command and trips at the same place -- on 2026-08-06 two identical 250 MB
