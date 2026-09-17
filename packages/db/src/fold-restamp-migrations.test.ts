@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,8 +7,10 @@ import { ensureMonotonicWhen } from "./check-migration-numbering.js";
 import {
   type Journal,
   type MigrationReference,
+  classifyJournalIdxWindow,
   planFoldRestamp,
   repointMigrationReferences,
+  scanJournalIdxWindows,
   snapshotFileName,
 } from "./fold-restamp-migrations.js";
 
@@ -255,5 +258,69 @@ describe("re-pointing source references", () => {
       await repointMigrationReferences([reference("c.test.ts", "0232_gone", "0247_gone")], root),
     ).toEqual([]);
     expect(await readFile(join(root, "c.test.ts"), "utf8")).toBe('readMigration("0300_unrelated.sql");');
+  });
+});
+
+async function tempGitRepo(files: Record<string, string>): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "fold-idx-window-"));
+  const run = (args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
+  run(["init", "-q", "-b", "main"]);
+  run(["config", "user.email", "idx@fixture.local"]);
+  run(["config", "user.name", "idx fixture"]);
+  for (const [file, body] of Object.entries(files)) await writeFile(join(root, file), body, "utf8");
+  run(["add", "-A"]);
+  run(["commit", "-qm", "fixture"]);
+  return root;
+}
+
+// A fold resequences the journal's `idx` to 0..n-1, so a test that pins a slice
+// of the journal to a hardcoded number (`entry.idx < 227`) silently moves to a
+// different set of migrations. The scanner reports those windows so the operator
+// re-anchors them on a tag instead of discovering the break when the test fails.
+// The tag-anchored form (`entry.idx >= startIdx`) already survives a fold and must
+// not be reported, and a bare `idx` loop counter is not a journal entry.
+describe("journal idx windows", () => {
+  it("flags a property .idx pinned to a hardcoded number", () => {
+    expect(
+      classifyJournalIdxWindow(
+        "const prior = journal.entries.filter((entry: { idx: number }) => entry.idx < 227);",
+      ),
+    ).toBe(true);
+  });
+
+  it("flags the other comparison operators and a number on the left", () => {
+    expect(classifyJournalIdxWindow("if (entry.idx > 246) skip();")).toBe(true);
+    expect(classifyJournalIdxWindow("when: entry.idx <= 300")).toBe(true);
+    expect(classifyJournalIdxWindow("if (entry.idx === 12) return;")).toBe(true);
+    expect(classifyJournalIdxWindow("if (246 > entry.idx) return;")).toBe(true);
+  });
+
+  it("does not flag a tag-anchored window, where .idx is compared to a variable", () => {
+    expect(
+      classifyJournalIdxWindow("(entry) => entry.idx >= identityStart && entry.idx <= identityEnd,"),
+    ).toBe(false);
+    expect(classifyJournalIdxWindow("when: entry.idx < chatStart ? entry.when : []")).toBe(false);
+  });
+
+  it("does not flag a bare local idx, which is a loop counter not a journal entry", () => {
+    expect(classifyJournalIdxWindow("if (idx < 0) break;")).toBe(false);
+    expect(classifyJournalIdxWindow("if (idx <= 0 || idx === key.length - 1) {")).toBe(false);
+  });
+
+  it("does not flag idx 0 or a boundary sentinel, which are invariant across folds", () => {
+    expect(classifyJournalIdxWindow("if (entry.idx < 0) continue;")).toBe(false);
+    expect(classifyJournalIdxWindow("if (entry.idx === 0) return first;")).toBe(false);
+  });
+
+  it("reports a hardcoded window in a repo and ignores the tag-anchored and local lines", async () => {
+    const root = await tempGitRepo({
+      "client.test.ts": "journal.entries.filter((entry: { idx: number }) => entry.idx < 227);",
+      "other.test.ts": "entries.filter((entry) => entry.idx >= startIdx);",
+      "loop.ts": "for (const e of arr) if (idx < 0) break;",
+    });
+
+    const found = scanJournalIdxWindows(root);
+    expect(found.map((window) => window.file)).toEqual(["client.test.ts"]);
+    expect(found[0].text).toContain("entry.idx < 227");
   });
 });
