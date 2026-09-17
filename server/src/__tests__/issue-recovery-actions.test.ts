@@ -28,7 +28,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
-import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
+import { buildPaperclipWakePayload, heartbeatService, isNeverLaunchedDispatchRun, isSpentReviewParticipantRecoveryAttempt, shouldBlockReviewParticipantRecovery } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -5077,6 +5077,126 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(row.resolvedAt).toBeNull();
 
       vi.restoreAllMocks();
+    });
+  });
+
+  // SUP-16646: a participant-recovery retry reaped `dispatch_unlaunched` never acquired a
+  // lease, so nothing was attempted and the participant's retry is still available. It must
+  // not pin the block, or every restore to `in_review` is re-blocked before the reviewer can
+  // be dispatched. The regression is SUP-16638's third restore (17:13:41Z -> re-blocked 18s
+  // later with 0 dispatches) after the reviewer runtime was demonstrably healthy.
+  describe("SUP-16646 never-launched review-participant retry does not pin the block", () => {
+    const recoveryRetryRun = (errorCode: string | null) => ({
+      contextSnapshot: {
+        retryReason: "execution_review_participant_recovery",
+      },
+      errorCode,
+    });
+    // The production block decision at heartbeat.ts, with a present + invokable participant.
+    const decidedBlock = (overrides: {
+      reviewRecoveryAlreadyAttempted: boolean;
+      reviewParticipantDeferred?: boolean;
+      reviewDeferralRetriesExhausted?: boolean;
+      recoveryAgentPresent?: boolean;
+      recoveryAgentInvokable?: boolean;
+    }) =>
+      shouldBlockReviewParticipantRecovery({
+        recoveryAgentPresent: overrides.recoveryAgentPresent ?? true,
+        recoveryAgentInvokable: overrides.recoveryAgentInvokable ?? true,
+        reviewRecoveryAlreadyAttempted: overrides.reviewRecoveryAlreadyAttempted,
+        reviewParticipantDeferred: overrides.reviewParticipantDeferred ?? false,
+        reviewDeferralRetriesExhausted:
+          overrides.reviewDeferralRetriesExhausted ?? false,
+      });
+
+    it("classifies only dispatch_unlaunched as never launched", () => {
+      expect(isNeverLaunchedDispatchRun({ errorCode: "dispatch_unlaunched" })).toBe(true);
+      for (const errorCode of [
+        "setup_failed",
+        "opencode_exit_1",
+        "adapter_failed",
+        null,
+        undefined,
+      ]) {
+        expect(isNeverLaunchedDispatchRun({ errorCode })).toBe(false);
+      }
+      expect(isNeverLaunchedDispatchRun(null)).toBe(false);
+      expect(isNeverLaunchedDispatchRun(undefined)).toBe(false);
+    });
+
+    // Acceptance #1: the latest terminal run is a recovery retry reaped dispatch_unlaunched.
+    it("does not treat a dispatch_unlaunched recovery retry as a spent attempt", () => {
+      const run = recoveryRetryRun("dispatch_unlaunched");
+      expect(isSpentReviewParticipantRecoveryAttempt(run)).toBe(false);
+      // ...so the restore is not re-blocked, and the reviewer can be dispatched.
+      expect(
+        decidedBlock({
+          reviewRecoveryAlreadyAttempted: isSpentReviewParticipantRecoveryAttempt(run),
+        }),
+      ).toBe(false);
+    });
+
+    // Acceptance #2: the retry launched and crashed - it really did consume the attempt.
+    it.each(["setup_failed", "opencode_exit_1", "adapter_failed"] as const)(
+      "still blocks when the retry launched and failed (%s)",
+      (errorCode) => {
+        const run = recoveryRetryRun(errorCode);
+        expect(isSpentReviewParticipantRecoveryAttempt(run)).toBe(true);
+        expect(
+          decidedBlock({
+            reviewRecoveryAlreadyAttempted: isSpentReviewParticipantRecoveryAttempt(run),
+          }),
+        ).toBe(true);
+      },
+    );
+
+    // Acceptance #3: a non-invokable or missing participant always blocks, regardless of
+    // whether the retry was ever launched.
+    it.each([
+      { recoveryAgentPresent: false, recoveryAgentInvokable: true },
+      { recoveryAgentPresent: true, recoveryAgentInvokable: false },
+      { recoveryAgentPresent: false, recoveryAgentInvokable: false },
+    ] as const)(
+      "still blocks a non-invokable or missing participant (%o)",
+      (agent) => {
+        expect(
+          decidedBlock({ reviewRecoveryAlreadyAttempted: false, ...agent }),
+        ).toBe(true);
+        expect(
+          decidedBlock({ reviewRecoveryAlreadyAttempted: true, ...agent }),
+        ).toBe(true);
+      },
+    );
+
+    // Acceptance #4: the proof-of-life deferral path and its retry limit are unchanged.
+    it("keeps the reviewParticipantDeferred proof-of-life path and its retry limit", () => {
+      // A succeeded recovery retry (no dispatch_unlaunched) is still a spent attempt, so a
+      // deferred proof-of-life reviewer still re-arms rather than blocks...
+      expect(
+        isSpentReviewParticipantRecoveryAttempt(recoveryRetryRun(null)),
+      ).toBe(true);
+      expect(
+        decidedBlock({
+          reviewRecoveryAlreadyAttempted: true,
+          reviewParticipantDeferred: true,
+          reviewDeferralRetriesExhausted: false,
+        }),
+      ).toBe(false);
+      // ...until the deferral retry limit is exhausted, which still blocks.
+      expect(
+        decidedBlock({
+          reviewRecoveryAlreadyAttempted: true,
+          reviewParticipantDeferred: true,
+          reviewDeferralRetriesExhausted: true,
+        }),
+      ).toBe(true);
+      // A non-deferred spent attempt still blocks (no proof of life).
+      expect(
+        decidedBlock({
+          reviewRecoveryAlreadyAttempted: true,
+          reviewParticipantDeferred: false,
+        }),
+      ).toBe(true);
     });
   });
 });

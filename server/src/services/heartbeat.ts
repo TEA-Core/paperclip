@@ -5569,6 +5569,60 @@ function isExecutionReviewParticipantRecoveryRun(
   );
 }
 
+/**
+ * SUP-16646: a `dispatch_unlaunched` run was admitted to `running` but never registered a
+ * child process or an environment lease, so the dispatch never started - nothing was
+ * attempted. Callers that treat a terminal retry as a "spent attempt" must exclude this
+ * shape, otherwise a pure launch failure permanently spends the retry it never used.
+ * Contrast a launched-and-crashed retry (`setup_failed`, `opencode_exit_1`, ...), which
+ * really did consume an attempt and must keep counting.
+ */
+export function isNeverLaunchedDispatchRun(
+  run: { errorCode?: string | null } | null | undefined,
+): boolean {
+  return run?.errorCode === DISPATCH_UNLAUNCHED_ERROR_CODE;
+}
+
+/**
+ * SUP-16646: the review-participant block decision, isolated so the invariant is unit
+ * testable at the same boundary production uses. A non-invokable or missing participant
+ * always blocks. An attempted recovery always blocks, except the proof-of-life deferral
+ * (a succeeded retry that left a comment) re-arms the stage until its retry limit is spent.
+ */
+export function shouldBlockReviewParticipantRecovery(input: {
+  recoveryAgentPresent: boolean;
+  recoveryAgentInvokable: boolean;
+  reviewRecoveryAlreadyAttempted: boolean;
+  reviewParticipantDeferred: boolean;
+  reviewDeferralRetriesExhausted: boolean;
+}): boolean {
+  if (!input.recoveryAgentInvokable || !input.recoveryAgentPresent) return true;
+  return (
+    input.reviewRecoveryAlreadyAttempted &&
+    !(input.reviewParticipantDeferred && !input.reviewDeferralRetriesExhausted)
+  );
+}
+
+/**
+ * SUP-16646: a review-participant recovery retry counts as a spent attempt unless it was
+ * reaped `dispatch_unlaunched`. That shape was admitted to `running` but never registered a
+ * child process or an environment lease, so the dispatch never started and nothing was
+ * attempted. Counting it as spent would burn the participant's one retry on a pure launch
+ * failure and permanently pin the review block, so no restore can dispatch the reviewer.
+ * A retry that launched and crashed still counts, and must still block.
+ */
+export function isSpentReviewParticipantRecoveryAttempt(
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "contextSnapshot" | "errorCode"
+  > | null,
+) {
+  return (
+    isExecutionReviewParticipantRecoveryRun(run) &&
+    !isNeverLaunchedDispatchRun(run)
+  );
+}
+
 function isExecutionReviewParticipantRecoveryEligibleRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot"> | null,
 ) {
@@ -28472,7 +28526,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // opening a recovery action naming the reviewer as its own recovery owner.
         // A reviewer that never ran, was not invokable, crashed, or produced nothing still
         // escalates: no clean terminal status or no comment means no proof of life.
-        const reviewRecoveryAlreadyAttempted = isExecutionReviewParticipantRecoveryRun(run);
+        // SUP-16646: exclude a retry reaped `dispatch_unlaunched` - it never acquired a
+        // lease, so it must not spend the participant's one retry. See
+        // `isSpentReviewParticipantRecoveryAttempt`.
+        const reviewRecoveryAlreadyAttempted =
+          isSpentReviewParticipantRecoveryAttempt(run);
         const reviewParticipantDeferred =
           reviewRecoveryAlreadyAttempted &&
           Boolean(recoveryAgent) &&
@@ -28485,11 +28543,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           (await countTerminalReviewParticipantRecoveryRuns()) >=
             EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT;
 
-        const shouldBlockReviewRecovery =
-          !recoveryAgentInvokable ||
-          !recoveryAgent ||
-          (reviewRecoveryAlreadyAttempted &&
-            !(reviewParticipantDeferred && !reviewDeferralRetriesExhausted));
+        const shouldBlockReviewRecovery = shouldBlockReviewParticipantRecovery({
+          recoveryAgentPresent: Boolean(recoveryAgent),
+          recoveryAgentInvokable: Boolean(recoveryAgentInvokable),
+          reviewRecoveryAlreadyAttempted,
+          reviewParticipantDeferred,
+          reviewDeferralRetriesExhausted,
+        });
         if (shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
