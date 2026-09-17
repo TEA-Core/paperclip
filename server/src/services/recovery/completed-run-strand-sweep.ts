@@ -8,6 +8,11 @@ import {
   buildStrandedRecoveryEscalationNotice,
   type StrandedRecoveryNoticeSeed,
 } from "./stranded-notice.js";
+import {
+  collectStrandSkipFacts,
+  evaluateStrandSkipFacts,
+  type StrandSkipFacts,
+} from "./strand-skip.js";
 
 // Post-success strand sweep. When a run for an agent-assigned `in_progress`
 // card finishes on the success path WITHOUT writing a terminal disposition
@@ -60,6 +65,7 @@ export interface CompletedRunStrandCandidate {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
   originKind?: string | null;
+  executionState?: unknown | null;
 }
 
 export interface CompletedRunStrandLatestRun {
@@ -78,6 +84,9 @@ export interface CompletedRunStrandFacts {
   latestRun: CompletedRunStrandLatestRun | null;
   alreadyEscalated: boolean;
   chatConversationOwnsNextAction?: boolean;
+  // Gathered lazily (only when the cheap decision would escalate) so the common
+  // case stays at the cheap query count. Absent/null means "not gathered".
+  skipFacts?: StrandSkipFacts | null;
 }
 
 export type CompletedRunStrandDecision =
@@ -87,6 +96,7 @@ export type CompletedRunStrandDecision =
   | { action: "skip-chat-conversation" }
   | { action: "skip-already-escalated" }
   | { action: "skip-within-threshold" }
+  | { action: "skip-valid-path"; reason: string }
   | { action: "escalate" };
 
 // The card is a completed-run strand candidate only if it mirrors the
@@ -133,6 +143,7 @@ export function decideCompletedRunStrandEscalation(input: {
   alreadyEscalated: boolean;
   latestRun: CompletedRunStrandLatestRun | null;
   chatConversationOwnsNextAction?: boolean;
+  skipFacts?: StrandSkipFacts | null;
   now: Date;
   idleThresholdMs: number;
 }): CompletedRunStrandDecision {
@@ -150,6 +161,16 @@ export function decideCompletedRunStrandEscalation(input: {
   if (input.alreadyEscalated) return { action: "skip-already-escalated" };
   const idleMs = input.now.getTime() - completedRunIdleAnchor(input.latestRun).getTime();
   if (idleMs < input.idleThresholdMs) return { action: "skip-within-threshold" };
+  // Valid-path holds: a pending interaction/approval, blocker, pause hold,
+  // plugin-managed lifecycle, routine, queued wake, live executionState,
+  // external-pull assignee, open recovery issue, or open recovery action already
+  // owns this card's next action. Shared verbatim with the host-restart sweep and
+  // mirroring `decideSuccessfulRunHandoff`, so the sweep stops escalating cards
+  // that are legitimately waiting (SUP-16504).
+  if (input.skipFacts) {
+    const skip = evaluateStrandSkipFacts(input.skipFacts);
+    if (skip.skip) return { action: "skip-valid-path", reason: skip.reason };
+  }
   return { action: "escalate" };
 }
 
@@ -157,16 +178,9 @@ export interface CompletedRunStrandEscalationComment {
   body: string;
   presentation: ReturnType<typeof buildStrandedRecoveryEscalationNotice>["presentation"];
   metadata: ReturnType<typeof buildStrandedRecoveryEscalationNotice>["metadata"];
-  recoveryActionId: string;
-}
-
-// Stable, deterministic marker id for the notice's "Recovery action" row. It is
-// not a real recovery-action row — it is a stable dedupe key for this sweep.
-export function buildCompletedRunStrandRecoveryActionId(
-  identifier: string | null,
-  sourceRunId: string,
-): string {
-  return `completed-run-strand-sweep:${identifier ?? "issue"}:${sourceRunId}`;
+  // No real recovery action exists for this notice (SUP-16559), so the notice
+  // omits the "Recovery action" row rather than showing a synthetic id.
+  recoveryActionId: null;
 }
 
 export function buildCompletedRunStrandNoticeSeed(): StrandedRecoveryNoticeSeed {
@@ -185,11 +199,10 @@ export function buildCompletedRunStrandEscalationComment(input: {
   sourceRun: { id: string; agentId?: string | null; status: string; errorCode?: string | null };
 }): CompletedRunStrandEscalationComment {
   const seed = buildCompletedRunStrandNoticeSeed();
-  const recoveryActionId = buildCompletedRunStrandRecoveryActionId(input.identifier, input.sourceRun.id);
   const notice = buildStrandedRecoveryEscalationNotice({
     seed,
     recoveryCause: "completed_run_strand",
-    recoveryActionId,
+    recoveryActionId: null,
     recoveryOwner: null,
     sourceRun: {
       id: input.sourceRun.id,
@@ -198,7 +211,7 @@ export function buildCompletedRunStrandEscalationComment(input: {
       errorCode: input.sourceRun.errorCode,
     },
   });
-  return { body: notice.body, presentation: notice.presentation, metadata: notice.metadata, recoveryActionId };
+  return { body: notice.body, presentation: notice.presentation, metadata: notice.metadata, recoveryActionId: null };
 }
 
 export interface CompletedRunStrandSkip {
@@ -208,6 +221,7 @@ export interface CompletedRunStrandSkip {
   chatConversation: string[];
   alreadyEscalated: string[];
   withinThreshold: string[];
+  validPath: string[];
   capExceeded: string[];
 }
 
@@ -240,6 +254,7 @@ export function planCompletedRunStrandEscalations(input: {
     chatConversation: [],
     alreadyEscalated: [],
     withinThreshold: [],
+    validPath: [],
     capExceeded: [],
   };
 
@@ -255,6 +270,7 @@ export function planCompletedRunStrandEscalations(input: {
       alreadyEscalated: facts.alreadyEscalated,
       latestRun: facts.latestRun,
       chatConversationOwnsNextAction: facts.chatConversationOwnsNextAction,
+      skipFacts: facts.skipFacts,
       now: input.now,
       idleThresholdMs: input.idleThresholdMs,
     });
@@ -277,6 +293,9 @@ export function planCompletedRunStrandEscalations(input: {
         continue;
       case "skip-within-threshold":
         skipped.withinThreshold.push(candidate.id);
+        continue;
+      case "skip-valid-path":
+        skipped.validPath.push(candidate.id);
         continue;
     }
 
@@ -315,6 +334,12 @@ export interface CompletedRunStrandSweepInput {
     candidate: CompletedRunStrandCandidate,
     escalation: { sourceRun: CompletedRunStrandLatestRun },
   ) => Promise<boolean>;
+  // Injectable fact-gathering seam for the shared valid-path holds. Defaults to
+  // `collectStrandSkipFacts`; tests pass a fake to stay hermetic.
+  gatherStrandSkipFacts?: (
+    db: Db,
+    candidate: CompletedRunStrandCandidate,
+  ) => Promise<StrandSkipFacts>;
 }
 
 export interface CompletedRunStrandSweepReport {
@@ -331,8 +356,24 @@ function emptySkipped(): CompletedRunStrandSkip {
     chatConversation: [],
     alreadyEscalated: [],
     withinThreshold: [],
+    validPath: [],
     capExceeded: [],
   };
+}
+
+// Default gatherer for the shared valid-path holds. Only called for candidates
+// the cheap decision would otherwise escalate.
+async function defaultGatherStrandSkipFacts(
+  db: Db,
+  candidate: CompletedRunStrandCandidate,
+): Promise<StrandSkipFacts> {
+  return collectStrandSkipFacts(db, {
+    companyId: candidate.companyId,
+    issueId: candidate.id,
+    assigneeAgentId: candidate.assigneeAgentId,
+    executionState: candidate.executionState ?? null,
+    originKind: candidate.originKind ?? null,
+  });
 }
 
 function candidateWhere(companyId: string | null) {
@@ -475,6 +516,7 @@ export async function sweepCompletedRunStrandedIssues(
       assigneeAgentId: issues.assigneeAgentId,
       assigneeUserId: issues.assigneeUserId,
       originKind: issues.originKind,
+      executionState: issues.executionState,
     })
     .from(issues)
     .where(candidateWhere(input.companyId ?? null))
@@ -544,7 +586,34 @@ export async function sweepCompletedRunStrandedIssues(
         )
       : false;
 
-    facts.set(candidate.id, { hasLiveRun: liveRun, latestRun, alreadyEscalated, chatConversationOwnsNextAction });
+    const cheapFacts: CompletedRunStrandFacts = {
+      hasLiveRun: liveRun,
+      latestRun,
+      alreadyEscalated,
+      chatConversationOwnsNextAction,
+    };
+
+    // Lazily gather the shared valid-path holds only for candidates the cheap
+    // decision would otherwise escalate, so a card skipped for a cheap reason
+    // never pays for the hold queries.
+    const wouldEscalate =
+      decideCompletedRunStrandEscalation({
+        status: candidate.status,
+        assigneeAgentId: candidate.assigneeAgentId,
+        assigneeUserId: candidate.assigneeUserId,
+        hasLiveRun: cheapFacts.hasLiveRun,
+        alreadyEscalated: cheapFacts.alreadyEscalated,
+        latestRun: cheapFacts.latestRun,
+        chatConversationOwnsNextAction: cheapFacts.chatConversationOwnsNextAction,
+        now,
+        idleThresholdMs,
+      }).action === "escalate";
+
+    const skipFacts = wouldEscalate
+      ? await (input.gatherStrandSkipFacts ?? defaultGatherStrandSkipFacts)(db, candidate)
+      : null;
+
+    facts.set(candidate.id, { ...cheapFacts, skipFacts });
   }
 
   const plan = planCompletedRunStrandEscalations({ candidates, facts, now, idleThresholdMs, cap });
