@@ -479,6 +479,60 @@ jobs:
       - name: Verify release source branch gate
         run: pnpm run test:release-source
 
+  typecheck_server_tests:
+    # Standalone gate for the server test files in server/src/__tests__.
+    # Intentionally NOT part of the `pnpm typecheck` chain: that chain runs
+    # the runner cargo build before it reaches the server workspace, and
+    # server/tsconfig.json excludes src/__tests__, so nothing in the chain
+    # typechecks the test files. The two build steps below are TypeScript
+    # only (no cargo): @paperclipai/plugin-sdk and @paperclipai/paperclip-runner
+    # resolve their export types from dist/, which the cargo-dependent chain
+    # would normally produce. The gate is baseline-aware: the suite carries
+    # pre-existing upstream type errors recorded in
+    # server/src/__tests__/typecheck-baseline.txt, and only diagnostics that
+    # are not in that baseline fail the lane (see SUP-16604).
+    name: typecheck:server-tests
+    needs: [policy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
+        uses: actions/download-artifact@v8
+        with:
+          name: pr-lockfile
+          path: .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build @paperclipai/plugin-sdk (TypeScript only)
+        run: pnpm --filter @paperclipai/plugin-sdk build
+
+      - name: Build @paperclipai/paperclip-runner (TypeScript only)
+        run: pnpm --filter @paperclipai/paperclip-runner build:typescript
+
+      - name: Unit-test the baseline diff logic
+        run: pnpm run test:check-server-test-typecheck
+
+      - name: Typecheck server test files (baseline-aware)
+        run: pnpm run check:server-test-typecheck
+
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
@@ -576,7 +630,7 @@ jobs:
     # `verify` (the ruleset's required context) instead of letting it merge.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, build, verify_serialized_server, canary_dry_run]
+    needs: [typecheck_release_registry, typecheck_server_tests, general_tests, build, verify_serialized_server, canary_dry_run]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -584,12 +638,14 @@ jobs:
       - name: Fail if any split verify lane failed
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
+          TYPECHECK_SERVER_TESTS_RESULT: ${{ needs.typecheck_server_tests.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
           CANARY_DRY_RUN_RESULT: ${{ needs.canary_dry_run.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
+          test "$TYPECHECK_SERVER_TESTS_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
           test "$VERIFY_SERIALIZED_SERVER_RESULT" = "success"

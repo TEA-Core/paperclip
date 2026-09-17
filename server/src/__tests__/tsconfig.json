@@ -2,7 +2,8 @@
   "extends": "../../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "../../dist-tests",
-    "rootDir": "."
+    "rootDir": "../../..",
+    "allowImportingTsExtensions": true
   },
   "include": ["."]
 }
