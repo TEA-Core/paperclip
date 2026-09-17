@@ -330,10 +330,8 @@ import {
 import {
   DISPATCH_UNLAUNCHED_ERROR_CODE,
   buildHeartbeatRunStopMetadata,
-  isNeverLaunchedDispatchRun,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
-  shouldBlockReviewParticipantRecovery,
 } from "./heartbeat-stop-metadata.js";
 import {
   CHAT_CONTROL_RECOVERY_ADMISSION_KEY,
@@ -5568,6 +5566,40 @@ function isExecutionReviewParticipantRecoveryRun(
   return (
     readNonEmptyString(context.retryReason) ===
     EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON
+  );
+}
+
+/**
+ * SUP-16646: a `dispatch_unlaunched` run was admitted to `running` but never registered a
+ * child process or an environment lease, so the dispatch never started - nothing was
+ * attempted. Callers that treat a terminal retry as a "spent attempt" must exclude this
+ * shape, otherwise a pure launch failure permanently spends the retry it never used.
+ * Contrast a launched-and-crashed retry (`setup_failed`, `opencode_exit_1`, ...), which
+ * really did consume an attempt and must keep counting.
+ */
+export function isNeverLaunchedDispatchRun(
+  run: { errorCode?: string | null } | null | undefined,
+): boolean {
+  return run?.errorCode === DISPATCH_UNLAUNCHED_ERROR_CODE;
+}
+
+/**
+ * SUP-16646: the review-participant block decision, isolated so the invariant is unit
+ * testable at the same boundary production uses. A non-invokable or missing participant
+ * always blocks. An attempted recovery always blocks, except the proof-of-life deferral
+ * (a succeeded retry that left a comment) re-arms the stage until its retry limit is spent.
+ */
+export function shouldBlockReviewParticipantRecovery(input: {
+  recoveryAgentPresent: boolean;
+  recoveryAgentInvokable: boolean;
+  reviewRecoveryAlreadyAttempted: boolean;
+  reviewParticipantDeferred: boolean;
+  reviewDeferralRetriesExhausted: boolean;
+}): boolean {
+  if (!input.recoveryAgentInvokable || !input.recoveryAgentPresent) return true;
+  return (
+    input.reviewRecoveryAlreadyAttempted &&
+    !(input.reviewParticipantDeferred && !input.reviewDeferralRetriesExhausted)
   );
 }
 

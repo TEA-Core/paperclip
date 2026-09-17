@@ -28,11 +28,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
-import { buildPaperclipWakePayload, heartbeatService, isSpentReviewParticipantRecoveryAttempt } from "../services/heartbeat.js";
-import {
-  isNeverLaunchedDispatchRun,
-  shouldBlockReviewParticipantRecovery,
-} from "../services/heartbeat-stop-metadata.js";
+import { buildPaperclipWakePayload, heartbeatService, isNeverLaunchedDispatchRun, isSpentReviewParticipantRecoveryAttempt, shouldBlockReviewParticipantRecovery } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
