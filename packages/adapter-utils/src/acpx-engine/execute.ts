@@ -4541,17 +4541,22 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         buildRuntimeSettled = true;
         // FORK-DIVERGENCE(e2big-wake-env): fail fast before `createRuntime` /
         // `ensureSession`. The provider child is spawned inside `acpx/runtime`,
-        // not this repo, so the check runs on the prepared launch values — the
-        // agent command plus the launch env merged with the inherited process
-        // env the runtime would pass on. An oversized value (for example an
-        // uncapped wake payload) throws SpawnEnvelopeTooLargeError, which the
-        // acpx classifier records as a non-retryable spawn_envelope_too_large
-        // instead of a bare E2BIG that would collapse into
-        // acpx_session_init_failed.
+        // not this repo, so the check runs on the exact launch envelope the
+        // runtime will pass: the agent command plus `prepared.env` with the
+        // `envUnset` keys stripped. The runtime is configured with
+        // `inheritProcessEnv: false` (see runtimeOptions below), so the ambient
+        // `process.env` is NOT part of the child and must not be measured —
+        // doing so rejects launches on server-only variables that never reach
+        // the child. An oversized value (for example an uncapped wake payload)
+        // throws SpawnEnvelopeTooLargeError, which the acpx classifier records
+        // as a non-retryable spawn_envelope_too_large instead of a bare E2BIG
+        // that would collapse into acpx_session_init_failed.
+        const acpxChildEnv = { ...prepared.env };
+        for (const key of prepared.envUnset) delete acpxChildEnv[key];
         assertSpawnEnvelopeWithinLimits({
           command: prepared.agentCommand ?? prepared.acpxAgent,
           args: [],
-          env: { ...process.env, ...prepared.env },
+          env: acpxChildEnv,
         });
         // Capture the run's staging lease release now that the runtime built. The
         // run root `finally` releases it as the final settlement act.

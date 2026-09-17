@@ -2168,11 +2168,19 @@ export function stringifyPaperclipWakePayloadForEnv(
   const minimalString = JSON.stringify(minimal);
   const minimalBytes = Buffer.byteLength(minimalString, "utf8");
   if (minimalBytes <= PAPERCLIP_WAKE_ENV_MAX_BYTES) {
-    // Report how many bytes of the original payload were omitted from the env.
-    return JSON.stringify({
+    // Report how many bytes of the original payload were omitted from the env,
+    // but only when the final string (with `omittedBytes` appended) still fits
+    // the cap. Appending the field grows the string, so re-measure the candidate
+    // including it and drop the field at the boundary rather than returning a
+    // value larger than PAPERCLIP_WAKE_ENV_MAX_BYTES.
+    const withOmittedBytes = JSON.stringify({
       ...minimal,
       omittedBytes: Buffer.byteLength(full, "utf8") - minimalBytes,
     });
+    if (Buffer.byteLength(withOmittedBytes, "utf8") <= PAPERCLIP_WAKE_ENV_MAX_BYTES) {
+      return withOmittedBytes;
+    }
+    return minimalString;
   }
   // Even the minimal payload is over the cap. Omit the variable entirely.
   console.warn(
@@ -5334,7 +5342,7 @@ export async function runChildProcess(
       remoteEnv: opts.remoteExecution ? opts.env : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
-      .then((target) => {
+      .then(async (target) => {
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -5357,12 +5365,28 @@ export async function runChildProcess(
         // nesting-variable strip, and after resolveSpawnTarget has produced the
         // final command and args (including the inlined env for the SSH lane),
         // so a check at function entry would undercount. A throw here rejects
-        // the run promise without ever calling child_process.spawn.
-        assertSpawnEnvelopeWithinLimits({
-          command: target.command,
-          args: target.args,
-          env: childEnv,
-        });
+        // the run promise without ever calling child_process.spawn. Because
+        // spawn never runs, the close-path cleanup (runTargetCleanup) will not
+        // fire either, so release the target's own resources here — the SSH
+        // lane's temporary auth files — instead of leaking them on the reject
+        // path.
+        try {
+          assertSpawnEnvelopeWithinLimits({
+            command: target.command,
+            args: target.args,
+            env: childEnv,
+          });
+        } catch (error) {
+          // Await the release so the temp files are gone before the rejection
+          // reaches the caller; a thrown cleanup error is logged, not raised,
+          // so the original refusal stays the reported cause.
+          try {
+            await target.cleanup?.();
+          } catch (cleanupErr) {
+            onLogError(cleanupErr, runId, "failed to release spawn target after launch-size guard");
+          }
+          throw error;
+        }
         const child = spawn(target.command, target.args, {
           cwd: spawnCwd,
           env: childEnv,

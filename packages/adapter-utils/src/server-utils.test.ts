@@ -156,6 +156,31 @@ describe("e2big-wake-env helpers (FORK-DIVERGENCE e2big-wake-env)", () => {
     expect(envJson.executionContinuation).not.toHaveProperty("messages");
   });
 
+  it("never exceeds the env cap when appending omittedBytes would push the minimal payload over", () => {
+    // The minimal payload's own size is padded to sit inside the few bytes the
+    // appended `omittedBytes` field adds (its digit count varies), i.e. exactly
+    // the boundary where the old code returned `minimal + omittedBytes` over the
+    // cap. `comments` bodies are dropped from the minimal payload, so `full`
+    // stays over the cap and the minimal branch is always taken.
+    const paddedTitle = "t".repeat(32_000);
+    let lastResult: string | null = null;
+    for (let pad = 0; pad <= 300; pad++) {
+      const payload = {
+        reason: "issue_commented",
+        issue: { id: "issue-e2big", identifier: "E2B-1", title: paddedTitle, status: "in_progress" },
+        comments: [{ id: "c-1", body: "y".repeat(40_000) }],
+        commentIds: Array.from({ length: pad }, () => "a"),
+      };
+      const envString = stringifyPaperclipWakePayloadForEnv(payload);
+      if (envString === null) break; // padded past the cap; the window is covered
+      expect(Buffer.byteLength(envString, "utf8")).toBeLessThanOrEqual(PAPERCLIP_WAKE_ENV_MAX_BYTES);
+      lastResult = envString;
+    }
+    // The scan must actually reach populated minimal payloads, not bail on the
+    // first iteration, or it would not exercise the boundary at all.
+    expect(lastResult).not.toBeNull();
+  });
+
   it("isSpawnEnvelopeTooLargeError recognises the class and a plain object carrying the code", () => {
     expect(isSpawnEnvelopeTooLargeError(new SpawnEnvelopeTooLargeError("x"))).toBe(true);
     expect(isSpawnEnvelopeTooLargeError({ code: "spawn_envelope_too_large" })).toBe(true);
@@ -317,6 +342,44 @@ describe("runChildProcess launch-size guard (FORK-DIVERGENCE e2big-wake-env)", (
     expect((caught as Error).message).not.toContain(sentinel);
     // The guard refuses the launch before child_process.spawn, so no launch ran.
     expect(spawnSpy).not.toHaveBeenCalled();
+  });
+
+  it("releases the SSH target's temp auth files when the guard refuses the launch", async () => {
+    const tmpDir = os.tmpdir();
+    const listSshKeyDirs = async () =>
+      (await fs.readdir(tmpDir)).filter((name) => name.startsWith("paperclip-ssh-key-"));
+    const before = await listSshKeyDirs();
+    spawnSpy.mockClear();
+    let caught: unknown;
+    try {
+      await runChildProcess(randomUUID(), "true", [], {
+        cwd: process.cwd(),
+        // The SSH lane inlines this env into the single `sh -c <script>` argument,
+        // so the value overflows the launch envelope the guard validates.
+        env: { ZZZ_E2BIG_SSH: "x".repeat(140_000) },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: {
+          host: "e2big.invalid",
+          port: 22,
+          username: "agent",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey:
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nplaceholder\n-----END OPENSSH PRIVATE KEY-----\n",
+          knownHosts: null,
+          strictHostKeyChecking: false,
+        },
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toMatchObject({ code: "spawn_envelope_too_large" });
+    // The guard refuses before spawn, so the close-path cleanup (which normally
+    // releases the SSH auth temp) never runs; the guard must release it itself.
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(await listSshKeyDirs()).toEqual(before);
   });
 });
 
