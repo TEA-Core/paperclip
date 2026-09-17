@@ -22,7 +22,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { renderPaperclipWakePrompt, isSpawnEnvelopeTooLargeError } from "@paperclipai/adapter-utils/server-utils";
 import { initializeRunIdentity } from "./run-identity.js";
 import {
   assertDurableChatWakeupReceipt,
@@ -876,6 +876,10 @@ const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
 // cost two identical 250 MB trips on SUP-11109 within four minutes. Recovery
 // blocks instead, with the remediation in the comment.
 const OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE = "opencode_db_growth_limit";
+// FORK-DIVERGENCE(e2big-wake-env): launch refused because the spawn envelope
+// (argv + env) would exceed the kernel limit. Recorded on the run so recovery
+// treats it as non-retryable preflight rather than a transient spawn blip.
+const SPAWN_ENVELOPE_TOO_LARGE_FAILURE_CODE = "spawn_envelope_too_large";
 const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
@@ -884,6 +888,7 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
   "low_trust_runtime_services_denied",
   "chat_failed_run_retry_not_authorized",
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
+  SPAWN_ENVELOPE_TOO_LARGE_FAILURE_CODE,
 ]);
 // Error codes that mark a pre-dispatch setup failure. The adapter process never
 // started, so no agent could post an issue comment. The setup catch writes one
@@ -909,6 +914,12 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
 // upstream's `classifyContinuationFailure(run).kind === "non_retryable"`: that set
 // contains `setup_failed` and would make SUP-15589 dead code on the release path (see
 // the D9 note at the wake-queue glue).
+// FORK-DIVERGENCE(e2big-wake-env): `spawn_envelope_too_large` is also in this set
+// and is non-retryable. Its only producer is this fold's extended
+// `nonRetryablePreflightFailureCode` (the launch-size guard throwing out of the
+// adapter before spawn), and re-dispatch re-computes the same oversize argv+env
+// envelope and fails identically, so it blocks on the first failure just like the
+// low-trust codes above.
 const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
   "setup_failed",
   CONFIGURATION_INCOMPLETE_FAILURE_CODE,
@@ -965,6 +976,9 @@ const EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT = 3;
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
+  // FORK-DIVERGENCE(e2big-wake-env): the launch-size guard throws out of the
+  // adapter before spawn; record its stable code so recovery does not retry it.
+  if (isSpawnEnvelopeTooLargeError(error)) return SPAWN_ENVELOPE_TOO_LARGE_FAILURE_CODE;
   if (error instanceof ChatControlRecoveryUnresolvedError)
     return CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE;
   if (

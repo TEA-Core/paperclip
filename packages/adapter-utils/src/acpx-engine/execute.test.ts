@@ -41,7 +41,7 @@ import {
   type AcpxEngineExecutorOptions,
 } from "./execute.js";
 import { ACPX_HANDSHAKE_TIMEOUT_MS } from "./constants.js";
-import { runChildProcess } from "../server-utils.js";
+import { runChildProcess, SpawnEnvelopeTooLargeError } from "../server-utils.js";
 import { setExpensiveWorkspaceGitExecutor } from "../git-workspace-sync.js";
 import { resolveReferencedSourceIgnore } from "../sandbox-managed-runtime.js";
 import {
@@ -584,6 +584,199 @@ describe("shared ACPX engine runtime behavior", () => {
 
     expect((meta[0]?.env as Record<string, string>).CODEX_CONFIG).toBeUndefined();
     expect(configOptions).toEqual([]);
+  });
+
+  it("keeps PAPERCLIP_WAKE_PAYLOAD_JSON under the spawn env limit when executionContinuation is huge", async () => {
+    // 60 x ~800 B of continuation history would serialize to ~120 KB — far over the
+    // 32 KiB env cap and close to the 131,072 B kernel single-string limit.
+    const wake = {
+      reason: "issue_commented",
+      issue: { id: "issue-e2big", identifier: "E2B-1", title: "E2BIG repro", status: "in_progress" },
+      executionContinuation: {
+        version: 1,
+        companyId: "company-1",
+        issueId: "issue-e2big",
+        trigger: { reason: "issue_commented", interactionId: null, sourceRunId: null },
+        originCommentIds: ["c-1"],
+        objective: "keep the launch small",
+        messages: Array.from({ length: 60 }, (_, index) => ({
+          id: `msg-${index}`,
+          authorType: "agent",
+          authorId: null,
+          body: `e2big sentinel body ${index} ${"x".repeat(800)}`,
+          createdAt: "2026-09-16T00:00:00.000Z",
+          updatedAt: "2026-09-16T00:00:00.000Z",
+          deleted: false,
+          sourceTrust: null,
+        })),
+        interactionOutcomes: [],
+        completedWork: null,
+        unresolvedInteractionIds: [],
+        coverage: { kind: "full_task_history", throughCommentId: "c-1", summaryThroughCommentId: null },
+      },
+    };
+
+    const { meta } = await runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js" },
+      { context: { paperclipWake: wake } },
+    );
+
+    const env = meta[0]?.env as Record<string, string> | undefined;
+    const value = env?.PAPERCLIP_WAKE_PAYLOAD_JSON;
+    expect(typeof value).toBe("string");
+    // KEY=value (plus the NUL terminator) must fit one kernel argument string.
+    expect(Buffer.byteLength(`PAPERCLIP_WAKE_PAYLOAD_JSON=${value}`, "utf8") + 1).toBeLessThanOrEqual(131072);
+    const parsed = JSON.parse(value!);
+    expect(parsed.executionContinuation).toMatchObject({ omitted: true, reason: "delivered_in_prompt" });
+    // the heavy history stays out of the env value, not just the prompt
+    expect(value).not.toContain("e2big sentinel body 59");
+  });
+
+  // The guard runs inside the host `spawnAgent` callback, which the patched acpx
+  // fork calls with the FINAL resolved command/args/options just before it would
+  // have called `spawn()`. These tests read that callback off the captured
+  // runtime options and drive it directly, exercising the exact envelope the
+  // provider child would be launched with.
+  type SpawnAgentProbe = (input: {
+    command: string;
+    args: readonly string[];
+    options: { env?: Record<string, string | undefined> };
+  }) => { kill?: () => void };
+  const readSpawnAgent = (runtimeOptions: Record<string, unknown>[]): SpawnAgentProbe => {
+    const spawnAgent = runtimeOptions[0]?.spawnAgent;
+    expect(typeof spawnAgent).toBe("function");
+    return spawnAgent as SpawnAgentProbe;
+  };
+
+  it("runs the launch guard on acpx's final resolved argv inside the host spawnAgent callback", async () => {
+    // The configured `agentCommand` is not the launched envelope: acpx tokenizes
+    // it, rewrites built-in agents onto their package-exec bridge, applies the
+    // gemini/qoder argv changes and substitutes the `agentSpawnTarget` uid-drop
+    // shim before spawning. Measuring the raw command string with `args: []`
+    // cannot see an argv the runtime introduces, so the guard runs on the final
+    // command/args instead. A single oversized final argv string is refused
+    // before any child exists.
+    const { runtimeOptions } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(await makeTempRoot(), "state"),
+    });
+    const spawnAgent = readSpawnAgent(runtimeOptions);
+    expect(() =>
+      spawnAgent({
+        command: process.execPath,
+        args: ["--eval", "", "x".repeat(140_000)],
+        options: { env: {} },
+      }),
+    ).toThrow(SpawnEnvelopeTooLargeError);
+  });
+
+  it("measures only the final child env handed to spawnAgent, never ambient process.env", async () => {
+    // The runtime builds `options.env` from the sanitized launch env
+    // (`inheritProcessEnv: false`), so the Paperclip host's own variables are
+    // never part of the measured envelope. A large host-only variable must not
+    // be misread as an overflow and refuse the launch.
+    const previous = process.env.ZZZ_E2BIG_AMBIENT_ONLY;
+    process.env.ZZZ_E2BIG_AMBIENT_ONLY = "x".repeat(140_000);
+    try {
+      const { runtimeOptions } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(await makeTempRoot(), "state"),
+      });
+      const spawnAgent = readSpawnAgent(runtimeOptions);
+      const child = spawnAgent({
+        command: process.execPath,
+        args: ["--eval", ""],
+        options: { env: { PATH: process.env.PATH ?? "" } },
+      });
+      child.kill?.();
+    } finally {
+      if (previous === undefined) delete process.env.ZZZ_E2BIG_AMBIENT_ONLY;
+      else process.env.ZZZ_E2BIG_AMBIENT_ONLY = previous;
+    }
+  });
+
+  it("still refuses the launch when an oversized value reaches the final child env", async () => {
+    // Positive control for the guard above: the final child env acpx hands to
+    // `spawnAgent` is measured as-is, so an oversized value that DOES reach the
+    // provider child (here an uncapped wake payload) is still refused before any
+    // child is created.
+    const { runtimeOptions } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(await makeTempRoot(), "state"),
+    });
+    const spawnAgent = readSpawnAgent(runtimeOptions);
+    expect(() =>
+      spawnAgent({
+        command: process.execPath,
+        args: ["--eval", ""],
+        options: { env: { ZZZ_E2BIG_CHILD: "x".repeat(140_000) } },
+      }),
+    ).toThrow(SpawnEnvelopeTooLargeError);
+  });
+
+  it("classifies an ensure_session E2BIG error as spawn_envelope_too_large, not acpx_session_init_failed", async () => {
+    const stateDir = path.join(await makeTempRoot(), "state");
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => {
+          // A real kernel E2BIG surfaces from inside the acpx runtime spawn, here
+          // as a plain error whose message carries the kernel errno.
+          throw new Error("spawn E2BIG");
+        },
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-e2big",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("spawn_envelope_too_large");
+  });
+
+  it("classifies a SpawnEnvelopeTooLargeError as spawn_envelope_too_large, not acpx_session_init_failed", async () => {
+    const stateDir = path.join(await makeTempRoot(), "state");
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => {
+          throw new SpawnEnvelopeTooLargeError(
+            'environment entry "PAPERCLIP_WAKE_PAYLOAD_JSON" is 131072 bytes; the kernel limit per argument is 131071 bytes (NUL-included 131072)',
+          );
+        },
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-envelope",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("spawn_envelope_too_large");
   });
 
   it("includes Paperclip env and API access notes in the ACPX prompt without leaking the token", async () => {

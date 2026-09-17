@@ -36,7 +36,7 @@ import {
   renderPaperclipWakePrompt,
   isPaperclipRecoveryWakePayload,
   resolveLegacyPaperclipDesiredSkillNames,
-  stringifyPaperclipWakePayload,
+  stringifyPaperclipWakePayloadForEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   sanitizeInheritedPaperclipEnv,
@@ -282,7 +282,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const linkedIssueIds = Array.isArray(context.issueIds)
       ? context.issueIds.filter((value: unknown): value is string => typeof value === "string" && value.trim().length > 0)
       : [];
-    const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+    const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
     const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
     if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
     if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;

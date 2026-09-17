@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -74,7 +74,10 @@ import {
   rewriteWorkspaceCwdEnvVarsForExecution,
   sanitizeInheritedPaperclipEnv,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
+  stringifyPaperclipWakePayloadForEnv,
+  assertSpawnEnvelopeWithinLimits,
+  SpawnEnvelopeTooLargeError,
+  isSpawnEnvelopeTooLargeError,
   SIGNAL_UNDELIVERABLE_REASON,
   SECRET_ENV_KEYS,
   type OrphanedProcessEvidence,
@@ -2142,7 +2145,7 @@ async function buildRuntime(input: {
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -3682,6 +3685,17 @@ function classifyError(
       errorMeta: { category: "runtime", ...baseMeta },
     };
   }
+  // FORK-DIVERGENCE(e2big-wake-env): the launch-size guard refuses an envelope
+  // that would hit the kernel limit before spawn, and a real E2BIG from the
+  // kernel surfaces here too. Both are preflight and non-retryable; classify
+  // by type/code ahead of the ensure_session fallback so a refused launch is
+  // never re-read as a session-identity failure.
+  if (isSpawnEnvelopeTooLargeError(err) || /\bE2BIG\b/.test(message)) {
+    return {
+      errorCode: "spawn_envelope_too_large",
+      errorMeta: { category: "preflight", ...baseMeta },
+    };
+  }
   const lower = message.toLowerCase();
   const authLike = lower.includes("auth") || lower.includes("login") || lower.includes("credential");
   if (authLike) {
@@ -4525,6 +4539,17 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           }),
         );
         buildRuntimeSettled = true;
+        // FORK-DIVERGENCE(e2big-wake-env): the launch-size guard deliberately
+        // does NOT run here. `prepared.agentCommand` is the raw configured
+        // command string, not the envelope acpx executes: the runtime tokenizes
+        // it, rewrites built-in agents onto their package-exec bridge, applies
+        // the gemini/qoder argv changes and substitutes the `agentSpawnTarget`
+        // uid-drop shim. Measuring the configured string with `args: []` both
+        // overcounts a single token and undercounts the resolved launch, so it
+        // is the wrong envelope to refuse on. The guard runs instead inside the
+        // host `spawnAgent` callback (see `runtimeOptions` below), on acpx's
+        // FINAL resolved command/args and child environment, immediately before
+        // `spawn()`. That is the only envelope that can trip the kernel's E2BIG.
         // Capture the run's staging lease release now that the runtime built. The
         // run root `finally` releases it as the final settlement act.
         releaseStagingLease = prepared.sessionStagingLeaseRelease;
@@ -4629,6 +4654,30 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // must not merge the Paperclip server's ambient environment back in
           // when it spawns the provider child.
           inheritProcessEnv: false,
+          // FORK-DIVERGENCE(e2big-wake-env): host-owned spawn so the launch-size
+          // guard sees acpx's FINAL resolved envelope. The patched acpx fork
+          // calls this instead of `spawn()` (see `spawnAgentProcess`), handing
+          // over the command, args and spawn options it was about to execute —
+          // after `splitCommandLine`, the built-in package-exec bridge rewrite,
+          // the gemini/qoder argv changes, the `agentSpawnTarget` substitution,
+          // and with the complete, sanitized child env in `options.env`. The
+          // guard measures exactly those values, so it can no longer undercount
+          // a wrapped/rewritten launch, and an oversized value (for example an
+          // uncapped wake payload) throws SpawnEnvelopeTooLargeError before any
+          // child exists. The classifier records that as the non-retryable
+          // `spawn_envelope_too_large` instead of a bare E2BIG that would
+          // collapse into `acpx_session_init_failed`. Any small discrepancy is
+          // still bounded well under the kernel limits, but measuring the final
+          // argv removes it entirely. The spawn itself is byte-identical to the
+          // fork's fallback: same command, args and options.
+          spawnAgent: ({ command, args, options }) => {
+            assertSpawnEnvelopeWithinLimits({
+              command,
+              args: [...args],
+              env: options.env ?? {},
+            });
+            return spawn(command, args, options);
+          },
           onAgentStderr: prepared.childStderrLogPath
             ? (chunk) => routeChildStderr(childStderrState, chunk)
             : undefined,

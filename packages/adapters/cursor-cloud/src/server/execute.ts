@@ -22,7 +22,7 @@ import {
   renderPaperclipWakePrompt,
   isPaperclipRecoveryWakePayload,
   renderTemplate,
-  stringifyPaperclipWakePayload,
+  stringifyPaperclipWakePayloadForEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 
 type CursorCloudSession = {
@@ -122,7 +122,7 @@ function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, st
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
 
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
