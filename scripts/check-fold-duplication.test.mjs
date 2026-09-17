@@ -510,3 +510,90 @@ test("findMergeDuplication follows a rename for declaration counts", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("findMergeDuplication applies the three-way additive rule to a column-0 declaration", () => {
+  // The motivating false positive: `const fs` at 5 where the fork held 4, the
+  // upstream side held 2, and the base held 1 (4 + 2 - 1 = 5). The merge held
+  // exactly the additive count, so nothing was added -- the old "more than
+  // either parent" test flagged it, the three-way rule does not.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    const copy = (tag) => `const fs = load("${tag}");`;
+    writeFileSync(path.join(dir, "suite.test.ts"), `${copy("base")}\nexport const BASE = 0;\n`);
+    git("add", "-A");
+    git("commit", "-qm", "base: fs declared once");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(
+      path.join(dir, "suite.test.ts"),
+      `${copy("b1")}\n${copy("b2")}\n${copy("b3")}\n${copy("b4")}\nexport const FORK = 1;\n`,
+    );
+    git("commit", "-qam", "fork: four fs declarations");
+
+    git("checkout", "-q", "base");
+    writeFileSync(
+      path.join(dir, "suite.test.ts"),
+      `${copy("u1")}\n${copy("u2")}\nexport const UP = 1;\n`,
+    );
+    git("commit", "-qam", "upstream: two fs declarations");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    writeFileSync(
+      path.join(dir, "suite.test.ts"),
+      `${copy("b1")}\n${copy("b2")}\n${copy("b3")}\n${copy("b4")}\n${copy("u1")}\nexport const UP = 1;\nexport const FORK = 1;\n`,
+    );
+    git("add", "-A");
+    git("commit", "-qm", "merge: five fs declarations, exactly the additive count");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.equal(result.skipped, false);
+    assert.deepEqual(result.redeclarations, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findMergeDuplication still flags a column-0 declaration past the three-way additive count", () => {
+  // Same shapes, but the merge keeps one copy over the additive count: 4 + 2 - 1
+  // = 5, and it holds 6. That extra copy is the merge's own redeclaration.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    const copy = (tag) => `const fs = load("${tag}");`;
+    writeFileSync(path.join(dir, "suite.test.ts"), `${copy("base")}\nexport const BASE = 0;\n`);
+    git("add", "-A");
+    git("commit", "-qm", "base: fs declared once");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(
+      path.join(dir, "suite.test.ts"),
+      `${copy("b1")}\n${copy("b2")}\n${copy("b3")}\n${copy("b4")}\nexport const FORK = 1;\n`,
+    );
+    git("commit", "-qam", "fork: four fs declarations");
+
+    git("checkout", "-q", "base");
+    writeFileSync(
+      path.join(dir, "suite.test.ts"),
+      `${copy("u1")}\n${copy("u2")}\nexport const UP = 1;\n`,
+    );
+    git("commit", "-qam", "upstream: two fs declarations");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    writeFileSync(
+      path.join(dir, "suite.test.ts"),
+      `${copy("b1")}\n${copy("b2")}\n${copy("b3")}\n${copy("b4")}\n${copy("u1")}\n${copy("u2")}\nexport const UP = 1;\nexport const FORK = 1;\n`,
+    );
+    git("add", "-A");
+    git("commit", "-qm", "merge: six fs declarations, one over the additive count");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    assert.equal(result.skipped, false);
+    assert.equal(result.redeclarations.length, 1);
+    assert.equal(result.redeclarations[0].path, "suite.test.ts");
+    assert.equal(result.redeclarations[0].name, "fs");
+    assert.equal(result.redeclarations[0].count, 6);
+    assert.equal(result.redeclarations[0].baseCount, 1);
+    assert.deepEqual([...result.redeclarations[0].parentCounts].sort((a, b) => a - b), [2, 4]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -262,32 +262,55 @@ export function findMergeDuplication(commit, options = {}) {
     && !GENERATED_PATHS.has(f.split("/").pop()));
 
   const renameSources = parents.map((p) => renamesInto(p, commit));
+  // Rule 2's three-way additive rule compares the merge against the point the
+  // two parents shared. Resolve that base (and the renames into it) once per
+  // merge, not per resolved file.
+  const mergeBase = git(["merge-base", parents[0], parents[1]], { allowFailure: true })?.trim() || null;
+  const baseRenameSources = mergeBase ? renamesInto(mergeBase, commit) : new Map();
   const findings = [];
   const redeclarations = [];
   for (const path of resolved) {
     const mergedText = blobAt(commit, path);
     if (mergedText === null) continue;
 
-    // Rule 2: a column-0 declaration the merge now holds more copies of than
-    // either parent. Catches the copies the adjacency rule cannot -- the two
+    // Rule 2: a column-0 declaration the merge now holds more copies of than the
+    // three-way additive count predicts (merged > ours + theirs - base). Catches
+    // the copies the adjacency rule cannot -- the two
     // `pendingCleanupAttemptsSql` bodies sit 14k lines apart in heartbeat.ts.
     // A fold re-stamps (renames) migrations, so the same file sits under another
-    // path in a parent. Follow the rename for both rules, or the parent reads as
-    // empty and the file's own declarations and repetition read as merge-introduced.
+    // path in a parent or in the base. Follow the rename for both rules, or the
+    // parent reads as empty and the file's own declarations and repetition read
+    // as merge-introduced.
     const parentTexts = parents.map((p, i) => {
       const direct = blobAt(p, path);
       if (direct !== null) return direct;
       const source = renameSources[i].get(path);
       return source ? blobAt(p, source) : null;
     });
+    let baseText = null;
+    if (mergeBase) {
+      const direct = blobAt(mergeBase, path);
+      if (direct !== null) baseText = direct;
+      else {
+        const source = baseRenameSources.get(path);
+        baseText = source ? blobAt(mergeBase, source) : null;
+      }
+    }
 
     const mergedDecls = countDeclarations(mergedText);
     const parentDecls = parentTexts.map((text) => countDeclarations(text));
+    const baseDecls = countDeclarations(baseText);
     for (const [name, count] of mergedDecls) {
       if (count < 2) continue;
       const parentCounts = parentDecls.map((d) => d.get(name) ?? 0);
-      if (!parentCounts.every((c) => count > c)) continue;
-      redeclarations.push({ path, name, count, parentCounts });
+      const baseCount = baseDecls.get(name) ?? 0;
+      // A clean 3-way merge holds ours + theirs - base copies of a declaration:
+      // whatever each side added on top of the shared base. Only strictly more
+      // than that is a copy the merge itself introduced. The old "more than
+      // either parent" test over-flagged here -- e.g. `const fs` at 5 where the
+      // sides held 4 and 2 off a base of 1 (4 + 2 - 1 = 5, nothing new).
+      if (count <= parentCounts[0] + parentCounts[1] - baseCount) continue;
+      redeclarations.push({ path, name, count, parentCounts, baseCount });
     }
 
     const merged = normalize(mergedText);
@@ -402,7 +425,7 @@ function main() {
   if (result.redeclarations.length > 0) {
     console.error(`check-fold-duplication: ${result.redeclarations.length} declaration(s) this merge holds extra copies of:\n`);
     for (const r of result.redeclarations) {
-      console.error(`  ${r.path}: ${r.name} declared ${r.count}x (parents ${r.parentCounts.join(" / ")}) (merge ${r.commit})`);
+      console.error(`  ${r.path}: ${r.name} declared ${r.count}x (parents ${r.parentCounts.join(" / ")}, base ${r.baseCount}) (merge ${r.commit})`);
     }
     console.error("");
   }
