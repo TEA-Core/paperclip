@@ -632,86 +632,89 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(value).not.toContain("e2big sentinel body 59");
   });
 
-  it("ignores the ambient process.env when the acpx runtime launches with inheritProcessEnv:false", async () => {
-    // The ACPX runtime is configured with `inheritProcessEnv: false` and is handed
-    // the complete, sanitized launch env, so the Paperclip host's own environment
-    // is never part of the provider child. The preflight guard must measure the
-    // exact envelope acpx launches (`prepared.env` minus `envUnset`): a large
-    // host-only variable is not in the child and must not be misread as an
-    // envelope overflow and refused as spawn_envelope_too_large.
+  // The guard runs inside the host `spawnAgent` callback, which the patched acpx
+  // fork calls with the FINAL resolved command/args/options just before it would
+  // have called `spawn()`. These tests read that callback off the captured
+  // runtime options and drive it directly, exercising the exact envelope the
+  // provider child would be launched with.
+  type SpawnAgentProbe = (input: {
+    command: string;
+    args: readonly string[];
+    options: { env?: Record<string, string | undefined> };
+  }) => { kill?: () => void };
+  const readSpawnAgent = (runtimeOptions: Record<string, unknown>[]): SpawnAgentProbe => {
+    const spawnAgent = runtimeOptions[0]?.spawnAgent;
+    expect(typeof spawnAgent).toBe("function");
+    return spawnAgent as SpawnAgentProbe;
+  };
+
+  it("runs the launch guard on acpx's final resolved argv inside the host spawnAgent callback", async () => {
+    // The configured `agentCommand` is not the launched envelope: acpx tokenizes
+    // it, rewrites built-in agents onto their package-exec bridge, applies the
+    // gemini/qoder argv changes and substitutes the `agentSpawnTarget` uid-drop
+    // shim before spawning. Measuring the raw command string with `args: []`
+    // cannot see an argv the runtime introduces, so the guard runs on the final
+    // command/args instead. A single oversized final argv string is refused
+    // before any child exists.
+    const { runtimeOptions } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(await makeTempRoot(), "state"),
+    });
+    const spawnAgent = readSpawnAgent(runtimeOptions);
+    expect(() =>
+      spawnAgent({
+        command: process.execPath,
+        args: ["--eval", "", "x".repeat(140_000)],
+        options: { env: {} },
+      }),
+    ).toThrow(SpawnEnvelopeTooLargeError);
+  });
+
+  it("measures only the final child env handed to spawnAgent, never ambient process.env", async () => {
+    // The runtime builds `options.env` from the sanitized launch env
+    // (`inheritProcessEnv: false`), so the Paperclip host's own variables are
+    // never part of the measured envelope. A large host-only variable must not
+    // be misread as an overflow and refuse the launch.
     const previous = process.env.ZZZ_E2BIG_AMBIENT_ONLY;
     process.env.ZZZ_E2BIG_AMBIENT_ONLY = "x".repeat(140_000);
     try {
-      const stateDir = path.join(await makeTempRoot(), "state");
-      const execute = createAcpxEngineExecutor({
-        createRuntime: () => ({
-          ensureSession: async () => {
-            throw new Error("session temporarily unavailable");
-          },
-          startTurn: () => ({
-            events: (async function* () {})(),
-            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
-            cancel: async () => {},
-          }),
-          close: async () => {},
-        }) as never,
+      const { runtimeOptions } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(await makeTempRoot(), "state"),
       });
-
-      const result = await execute({
-        runId: "run-ambient-env",
-        agent: { id: "agent-1", companyId: "company-1" },
-        runtime: {},
-        config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
-        context: {},
-        onLog: async () => {},
-        onMeta: async () => {},
-      } as never);
-
-      // The guard let the launch through, so the failure is the (unrelated)
-      // ensure_session error — never a launch-size refusal driven by ambient env.
-      expect(result.errorCode).not.toBe("spawn_envelope_too_large");
-      expect(result.errorCode).toBe("acpx_session_init_failed");
+      const spawnAgent = readSpawnAgent(runtimeOptions);
+      const child = spawnAgent({
+        command: process.execPath,
+        args: ["--eval", ""],
+        options: { env: { PATH: process.env.PATH ?? "" } },
+      });
+      child.kill?.();
     } finally {
       if (previous === undefined) delete process.env.ZZZ_E2BIG_AMBIENT_ONLY;
       else process.env.ZZZ_E2BIG_AMBIENT_ONLY = previous;
     }
   });
 
-  it("still refuses the launch when an oversized value is in the prepared child env", async () => {
-    // Positive control for the guard above: the projected/explicit child env is
-    // measured as-is, so an oversized value that DOES reach the provider child is
-    // still refused before createRuntime/ensureSession run.
-    const stateDir = path.join(await makeTempRoot(), "state");
-    const execute = createAcpxEngineExecutor({
-      createRuntime: () => ({
-        ensureSession: async () => {
-          throw new Error("ensureSession must not run after a launch-size refusal");
-        },
-        startTurn: () => ({
-          events: (async function* () {})(),
-          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
-          cancel: async () => {},
-        }),
-        close: async () => {},
-      }) as never,
+  it("still refuses the launch when an oversized value reaches the final child env", async () => {
+    // Positive control for the guard above: the final child env acpx hands to
+    // `spawnAgent` is measured as-is, so an oversized value that DOES reach the
+    // provider child (here an uncapped wake payload) is still refused before any
+    // child is created.
+    const { runtimeOptions } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(await makeTempRoot(), "state"),
     });
-
-    const result = await execute({
-      runId: "run-oversized-child-env",
-      agent: { id: "agent-1", companyId: "company-1" },
-      runtime: {},
-      config: {
-        agent: "custom",
-        agentCommand: "node ./fake-acp.js",
-        stateDir,
-        env: { ZZZ_E2BIG_CHILD: "x".repeat(140_000) },
-      },
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-    } as never);
-
-    expect(result.errorCode).toBe("spawn_envelope_too_large");
+    const spawnAgent = readSpawnAgent(runtimeOptions);
+    expect(() =>
+      spawnAgent({
+        command: process.execPath,
+        args: ["--eval", ""],
+        options: { env: { ZZZ_E2BIG_CHILD: "x".repeat(140_000) } },
+      }),
+    ).toThrow(SpawnEnvelopeTooLargeError);
   });
 
   it("classifies an ensure_session E2BIG error as spawn_envelope_too_large, not acpx_session_init_failed", async () => {
