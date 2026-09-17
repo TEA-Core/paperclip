@@ -109,6 +109,12 @@ describeEmbeddedPostgres("heartbeat agent errorReason clears on running transiti
 
   afterEach(async () => {
     releaseHeldAdapterRun();
+    // A gated run released here (or one the test body timed out on) keeps writing
+    // heartbeat_run_events from executeRun's finally block after the run row reads
+    // terminal. Await the tracked executions so no run write is still in flight
+    // before teardown deletes rows, otherwise delete(heartbeatRuns) can hit the
+    // heartbeat_run_events_run_id_heartbeat_runs_id_fk constraint.
+    await heartbeat.drainActiveRunExecutions();
     await db.delete(activityLog);
     await db.delete(environmentLeases);
     await db.delete(issueRelations);
