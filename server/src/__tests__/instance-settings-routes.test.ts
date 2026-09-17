@@ -270,7 +270,7 @@ describe("instance settings routes", () => {
       enableIsolatedWorkspaces: true,
     });
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
-  }, 10_000);
+  }); // Fork divergence (first-test cold-import budget): see server/vitest.config.ts testTimeout 15000
 
   it("does not expose the retired liveness auto-recovery endpoints", async () => {
     const app = await createApp({
