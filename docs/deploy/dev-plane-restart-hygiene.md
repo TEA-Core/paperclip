@@ -76,7 +76,7 @@ If the cluster minutes line up with the `Server listening` timestamps, the failu
 
 ## Checking recovery after a burst
 
-Each `process_lost` run should have triggered one retry wake (`reason = 'process_lost_retry'`). To find lost runs that never recovered, look for `process_lost` failures with no subsequent successful run for the same issue, and re-wake or reassign those issues manually.
+Each `process_lost` run should have triggered one retry wake. To find lost runs that never recovered, look for `process_lost` failures in `heartbeat_runs` where `retryOfRunId IS NOT NULL` (indicating a retry was attempted) and no subsequent successful run for the same issue, and re-wake or reassign those issues manually.
 
 ## Related failure modes (not restart-caused)
 
