@@ -5199,4 +5199,365 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       ).toBe(true);
     });
   });
+
+  describe("SUP-16658 typed review participant revalidation staleness", () => {
+    const reviewStageId = randomUUID();
+    const typedParticipantCloseNote =
+      "Recovery action became stale because the source issue now has a typed review participant.";
+
+    function reviewExecutionState(input: {
+      agentId?: string | null;
+      userId?: string | null;
+      stageId?: string;
+      returnAgentId?: string | null;
+    }) {
+      const currentParticipant =
+        input.userId && !input.agentId
+          ? { type: "user" as const, userId: input.userId, agentId: null }
+          : { type: "agent" as const, agentId: input.agentId ?? null, userId: null };
+      return {
+        status: "pending" as const,
+        currentStageId: input.stageId ?? reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review" as const,
+        currentParticipant,
+        returnAssignee: {
+          type: "agent" as const,
+          agentId: input.returnAgentId ?? null,
+          userId: null,
+        },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+    }
+
+    // An in_review source parked at a pending review stage held by a typed agent
+    // participant — exactly the shape the SUP-16655 mint condition keys on.
+    async function seedTypedReviewParticipant() {
+      const seeded = await seedCompany();
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          assigneeAgentId: seeded.coderId,
+          executionState: reviewExecutionState({
+            agentId: seeded.managerId,
+            returnAgentId: seeded.coderId,
+          }),
+        })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      const [issue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, seeded.sourceIssueId));
+      return { ...seeded, issue: issue! };
+    }
+
+    function mintReviewParticipantAction(input: {
+      companyId: string;
+      sourceIssueId: string;
+      ownerAgentId: string;
+      evidence: Record<string, unknown>;
+    }) {
+      return issueRecoveryActionService(db).upsertSourceScoped({
+        companyId: input.companyId,
+        sourceIssueId: input.sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: input.ownerAgentId,
+        cause: "execution_review_participant_recovery",
+        fingerprint: `source_scoped_recovery:${input.companyId}:${input.sourceIssueId}:execution_review_participant_recovery`,
+        evidence: input.evidence,
+        nextAction: "Repair the failed review participant path.",
+      });
+    }
+
+    function reviewStateAtMintEvidence(participantAgentId: string, stageId = reviewStageId) {
+      return {
+        stageId,
+        participantType: "agent",
+        participantAgentId,
+        participantUserId: null,
+      };
+    }
+
+    // The read projection is the path where the durable-source-change gate is
+    // bypassed, so a bare GET is the faithful reproduction of the live stale
+    // close (a human or scheduler merely reads the issue).
+    async function readActiveRecovery(sourceIssueId: string) {
+      const app = createApp();
+      const res = await request(app)
+        .get(`/api/issues/${sourceIssueId}/recovery-actions`)
+        .expect(200);
+      return res.body.active as { id: string } | null;
+    }
+
+    async function readActionRow(actionId: string) {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId));
+      return row!;
+    }
+
+    it("keeps a typed-participant action open on a bare read with no motion", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const svc = issueRecoveryActionService(db);
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: {
+          latestRunId: "run-mint",
+          reviewStateAtMint: reviewStateAtMintEvidence(seeded.managerId),
+        },
+      });
+      expect(action).toMatchObject({ status: "active" });
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toMatchObject({
+        id: action.id,
+      });
+      const row = await readActionRow(action.id);
+      expect(row).toMatchObject({ status: "active", resolvedAt: null });
+      expect(
+        await svc.getActiveForIssue(seeded.companyId, seeded.sourceIssueId),
+      ).toMatchObject({ id: action.id });
+    });
+
+    it("closes the action when a decision was recorded after mint (signal D)", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { reviewStateAtMint: reviewStateAtMintEvidence(seeded.managerId) },
+      });
+      const mintedAt = (await readActionRow(action.id)).createdAt;
+      const { issueExecutionDecisions } = await import("@paperclipai/db");
+      await db.insert(issueExecutionDecisions).values({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        stageId: reviewStageId,
+        stageType: "review",
+        actorAgentId: seeded.managerId,
+        outcome: "changes_requested",
+        body: "Changes requested after the action was minted.",
+        createdAt: new Date(mintedAt.getTime() + 60_000),
+      });
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toBeNull();
+      const row = await readActionRow(action.id);
+      expect(row).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+      expect(row.resolutionNote).toBe(typedParticipantCloseNote);
+    });
+
+    it("closes the action when the review participant changed since mint (signal P)", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { reviewStateAtMint: reviewStateAtMintEvidence(seeded.managerId) },
+      });
+      // A different agent now holds the stage.
+      await db
+        .update(issues)
+        .set({
+          executionState: reviewExecutionState({
+            agentId: seeded.coderId,
+            returnAgentId: seeded.coderId,
+          }),
+        })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toBeNull();
+      expect((await readActionRow(action.id)).status).toBe("cancelled");
+    });
+
+    it("closes the action when the review stage changed since mint (signal P)", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { reviewStateAtMint: reviewStateAtMintEvidence(seeded.managerId) },
+      });
+      await db
+        .update(issues)
+        .set({
+          executionState: reviewExecutionState({
+            agentId: seeded.managerId,
+            returnAgentId: seeded.coderId,
+            stageId: randomUUID(),
+          }),
+        })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toBeNull();
+      expect((await readActionRow(action.id)).status).toBe("cancelled");
+    });
+
+    it("does not treat a completed reviewer run or a new comment as motion", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { reviewStateAtMint: reviewStateAtMintEvidence(seeded.managerId) },
+      });
+      await seedHeartbeatRun({
+        companyId: seeded.companyId,
+        agentId: seeded.managerId,
+        runId: randomUUID(),
+        issueId: seeded.sourceIssueId,
+        status: "succeeded",
+      });
+      await db.insert(issueComments).values({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        authorType: "agent",
+        authorAgentId: seeded.managerId,
+        body: "Still parked at the same review stage.",
+      });
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toMatchObject({
+        id: action.id,
+      });
+      expect((await readActionRow(action.id)).status).toBe("active");
+    });
+
+    it("falls through to the pending-interaction escape with no motion", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { reviewStateAtMint: reviewStateAtMintEvidence(seeded.managerId) },
+      });
+      const { issueThreadInteractions } = await import("@paperclipai/db");
+      await db.insert(issueThreadInteractions).values({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { version: 1, prompt: "Confirm the recovery premise." },
+      });
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toBeNull();
+      const row = await readActionRow(action.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.resolutionNote).toBe(
+        "Recovery action became stale because the source issue now has a pending issue interaction.",
+      );
+    });
+
+    it("falls through to the scheduled-monitor escape with no motion", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { reviewStateAtMint: reviewStateAtMintEvidence(seeded.managerId) },
+      });
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toBeNull();
+      const row = await readActionRow(action.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.resolutionNote).toBe(
+        "Recovery action became stale because the source issue now has a scheduled monitor.",
+      );
+    });
+
+    it("keeps the legacy close for an action minted without reviewStateAtMint", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { latestRunId: "run-legacy" },
+      });
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toBeNull();
+      const row = await readActionRow(action.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.resolutionNote).toBe(typedParticipantCloseNote);
+    });
+
+    it("treats a recorded null reviewStateAtMint as motion when a participant appears", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const action = await mintReviewParticipantAction({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        ownerAgentId: seeded.coderId,
+        evidence: { latestRunId: "run-null", reviewStateAtMint: null },
+      });
+
+      expect(await readActiveRecovery(seeded.sourceIssueId)).toBeNull();
+      const row = await readActionRow(action.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.resolutionNote).toBe(typedParticipantCloseNote);
+    });
+
+    it("records reviewStateAtMint when escalating a typed review participant", async () => {
+      const seeded = await seedTypedReviewParticipant();
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const runId = randomUUID();
+      await seedHeartbeatRun({
+        companyId: seeded.companyId,
+        agentId: seeded.managerId,
+        runId,
+        issueId: seeded.sourceIssueId,
+        status: "failed",
+      });
+      const [latestRun] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: seeded.issue,
+        previousStatus: "in_review",
+        latestRun: latestRun!,
+        recoveryCause: "execution_review_participant_recovery",
+      });
+
+      const active = await issueRecoveryActionService(db).getActiveForIssue(
+        seeded.companyId,
+        seeded.sourceIssueId,
+      );
+      expect(active?.evidence.reviewStateAtMint).toEqual(
+        reviewStateAtMintEvidence(seeded.managerId),
+      );
+    });
+
+    it("records a null reviewStateAtMint when the source is not at a pending stage", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const [issue] = await db
+        .update(issues)
+        .set({ status: "in_review", executionState: null })
+        .where(eq(issues.id, sourceIssueId))
+        .returning();
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+      const [latestRun] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: issue!,
+        previousStatus: "in_review",
+        latestRun: latestRun!,
+        recoveryCause: "execution_review_participant_recovery",
+      });
+
+      const active = await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId);
+      expect(active?.evidence).toHaveProperty("reviewStateAtMint", null);
+    });
+  });
 });
