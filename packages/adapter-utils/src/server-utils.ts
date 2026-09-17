@@ -2083,7 +2083,10 @@ export function stringifyPaperclipWakePayload(
 // FORK-DIVERGENCE(e2big-wake-env)
 // Reconciliation against upstream #13144: when #13144 merges, take its writer
 // deletion, drop this env helper, keep the launch-size guard (see
-// assertSpawnEnvelopeWithinLimits), and re-check the skills-releases/* copies.
+// assertSpawnEnvelopeWithinLimits), and re-check the note in skills/paperclip/SKILL.md.
+// Never edit skills-releases/*: those releases are frozen snapshots already
+// seeded into production databases, and changing one byte fails every agent
+// run's setup (see server/src/__tests__/bundled-skill-releases-frozen.test.ts).
 //
 // `PAPERCLIP_WAKE_PAYLOAD_JSON` rides the child process environment. A single
 // env value larger than Linux MAX_ARG_STRLEN (131072 B, NUL included) makes the
