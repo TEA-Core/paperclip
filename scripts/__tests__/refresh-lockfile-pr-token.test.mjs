@@ -49,3 +49,56 @@ test("the PR step fails loudly with the branch and the exact gh pr create comman
   assert.match(body, /pushed branch '\$\{BRANCH\}'/, "must name the pushed branch");
   assert.match(body, /PR_CMD="gh pr create --head/, "must record the exact gh pr create command");
 });
+
+// SUP-16627: the branch update was pushed with the credential that
+// actions/checkout persists (GITHUB_TOKEN, i.e. github-actions[bot]). Runs raised
+// by that attribution on pull_request workflows are held at action_required, so
+// the PR's required checks never execute and its armed auto-merge can't progress.
+// The push must instead be bound to the tea-core app installation token
+// (steps.bot-token's token, exposed as GH_TOKEN in this step), and it must not run
+// at all when that token is unavailable. These assertions distinguish the
+// credential used for `git push` from the one used by `gh pr create`.
+test("the branch push is bound to the app installation token, not the checkout-persisted credential", () => {
+  const body = stepBody("Create or update pull request").join("\n");
+  // The push must target a URL that embeds the generated app token as the
+  // credential, so git attributes the push to the app instead of falling back to
+  // the checkout-persisted default (GITHUB_TOKEN / github.token).
+  assert.match(
+    body,
+    /PUSH_URL="https:\/\/x-access-token:\$\{GH_TOKEN\}@\[?/,
+    "the push URL must embed the app installation token as its credential",
+  );
+  assert.match(
+    body,
+    /git push --force "?\$\{PUSH_URL\}"?/,
+    "the branch push must push to the explicitly token-bound URL",
+  );
+  // The push must never rely on the checkout-persisted origin remote (which is
+  // credentialed with GITHUB_TOKEN / github-actions[bot]).
+  assert.doesNotMatch(
+    body,
+    /git push[^\n]*\sorigin\b/,
+    "the branch push must not use the checkout-persisted origin credential",
+  );
+});
+
+test("the branch push is gated on an available app token and fails loudly otherwise", () => {
+  const body = stepBody("Create or update pull request");
+  const guardIdx = body.findIndex(line => /if \[ -z "\$GH_TOKEN" \]; then/.test(line));
+  const pushIdx = body.findIndex(line => /git push --force/.test(line));
+  assert.notEqual(guardIdx, -1, "must guard the push on the availability of the app token");
+  assert.notEqual(pushIdx, -1, "must push the branch when the token is available");
+  assert.ok(guardIdx < pushIdx, "the push must only run after the app-token availability guard passes");
+  // No authenticated push may run when the token is unavailable; it would recreate
+  // the held-runs failure. The step must say so explicitly.
+  assert.match(
+    body.join("\n"),
+    /::error title=Lockfile push not performed::/,
+    "must emit an explicit failure when the app token is unavailable",
+  );
+  assert.match(
+    body.join("\n"),
+    /was NOT pushed/,
+    "must state that no push was performed when the app token is unavailable",
+  );
+});
