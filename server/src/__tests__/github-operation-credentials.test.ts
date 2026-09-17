@@ -234,7 +234,7 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     // TEA-Core fork I3 (fold 2c D1): only the git credential provider sets requireEnabledConnection.
     it("fork I3: requireEnabledConnection drops a disabled or non-active GitHub connection only when the git provider asks", async () => {
-      for (const disable of [{ enabled: false }, { status: "disabled", enabled: true }]) {
+      for (const disable of [{ enabled: false }, { status: "disabled", enabled: true }] as const) {
         const input = await seed();
         const { connectionId } = await grant(input, "robot", true);
         await db
