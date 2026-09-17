@@ -3580,6 +3580,83 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(second.strandedNew).toBe(0);
         expect(mockLogger.error).toHaveBeenCalledTimes(1);
       });
+
+      it("SUP-16610 change 4: dedupes the per-PR alarm across ticks when the certifying cards fall in different capped windows", async () => {
+        // The cross-tick hole a single-batch fixture cannot exercise: candidates
+        // are swept through a capped keyset window (`maxCandidates` +
+        // `nextScanKey`), so two certifying `done` cards for the SAME PR
+        // routinely land in DIFFERENT ticks. A marker readable only from the
+        // scanned card's own row would let the second card re-emit a level-50
+        // line for the same (PR, live head) — the per-(PR, live head) contract
+        // the card requires, and Acceptance #3 ("no repeat across 1h with no
+        // head change").
+        await insertIssue({ status: "cancelled", identifier: "SUP-42" });
+
+        const certifierA = await insertIssue({
+          status: "done",
+          identifier: "SUP-43",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifierA);
+        const prObject = await insertMention(certifierA);
+        await seedDeliveryIdentity(certifierA, "SUP-43-branch", "https://github.com/TEA-Core/paperclip");
+
+        const certifierB = await insertIssue({
+          status: "done",
+          identifier: "SUP-44",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifierB);
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: certifierB,
+          sourceKind: "comment",
+          objectId: prObject!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+        await seedDeliveryIdentity(certifierB, "SUP-44-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        ]);
+
+        // Tick 1 scans ONLY SUP-43 (the lexicographic head of the candidate set)
+        // and raises the one new alarm, persisting the PR-scoped marker on it.
+        const tick1 = await runApprovalStatusReconcilerTick(db, { maxCandidates: 1 });
+        expect(tick1.nextScanKey).toBe("SUP-43");
+        expect(tick1.stranded).toBe(1);
+        expect(tick1.strandedNew).toBe(1);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        // Tick 2 scans ONLY SUP-44 — the second certifier, in a DIFFERENT window.
+        // It holds no marker of its own; the PR-scoped read of the cards citing
+        // the PR must find tick 1's marker and stay deduped.
+        const tick2 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 1,
+          resumeAfter: tick1.nextScanKey,
+        });
+        expect(tick2.stranded).toBe(1);
+        expect(tick2.strandedNew).toBe(0);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        // Tick 3 wraps to the head of the set and re-scans SUP-43: still deduped.
+        const tick3 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 1,
+          resumeAfter: tick2.nextScanKey,
+        });
+        expect(tick3.stranded).toBe(1);
+        expect(tick3.strandedNew).toBe(0);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        // One new alarm and one level-50 line across the whole sweep.
+        expect(tick1.strandedNew + tick2.strandedNew + tick3.strandedNew).toBe(1);
+      });
     });
 
     it("refuses the backfill when the head is provable only through committed (client-timed) events and the earliest server timestamp is after the approval, writing no anchor (SUP-14747 D-E, backfill-committed-event-timing)", async () => {

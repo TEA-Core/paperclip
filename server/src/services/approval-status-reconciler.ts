@@ -2804,10 +2804,11 @@ export interface StrandedAlarmObservation {
 /**
  * SUP-16610: persist the SUP-16579 dedupe marker for a stranded alarm. The key is
  * always (PR, live head) — for the per-PR `delivery-card-cancelled` class that is
- * deliberate: the marker is keyed on the PR rather than on the hosting card, so a
- * second certifying child that mentions the same PR reads the same key and never
- * re-alarms. A direct `executionState.approvalStatus` merge, never a comment, so
- * no card (done or cancelled) is re-opened or re-stamped.
+ * deliberate: the marker names the PR rather than the hosting card, and every
+ * later certifying child reads it through `prAlarmMarkerPersisted` (the
+ * `externalObjectMentions` set of cards citing the PR) instead of looking only
+ * at its own row. A direct `executionState.approvalStatus` merge, never a
+ * comment, so no card (done or cancelled) is re-opened or re-stamped.
  */
 async function persistStrandedAlarmMarker(
   db: Db,
@@ -2822,6 +2823,72 @@ async function persistStrandedAlarmMarker(
     { strandedAlarm: { pr: prKey, headSha, class: alarmClass, at: new Date().toISOString() } },
     { source: "approval-status-reconciler.stranded_alarm" },
   );
+}
+
+/**
+ * SUP-16610: does a persisted `strandedAlarm` marker satisfy the dedupe key
+ * (PR, live head, class)?
+ *
+ * A marker with NO `class` predates SUP-16610: the only class that existed when
+ * it was written was `delivery-card-unpublished`, so a classless marker matches
+ * that class and only that class. Treating it as a wildcard would let a legacy
+ * never-published marker silently suppress a distinct class transition on the
+ * same (PR, live head) — the exact blur the card's "the reason must be distinct"
+ * contract exists to prevent.
+ */
+function strandedMarkerMatches(
+  marker: { headSha?: unknown; pr?: unknown; class?: unknown } | null | undefined,
+  prKey: string,
+  liveHeadSha: string,
+  alarmClass: StrandedAlarmClass,
+): boolean {
+  if (!marker || marker.pr !== prKey || marker.headSha !== liveHeadSha) return false;
+  if (marker.class === undefined) return alarmClass === "delivery-card-unpublished";
+  return marker.class === alarmClass;
+}
+
+/**
+ * SUP-16610 change 4 (cross-tick): has ANY card citing this PR already recorded
+ * a stranded-alarm marker for (PR, live head, class)?
+ *
+ * The per-PR class is deduped "on the PR rather than on each mentioning card",
+ * but the marker itself is persisted into whichever certifying card was scanned
+ * first. Candidates are swept through a capped keyset window
+ * (`DEFAULT_MAX_CANDIDATES`, `nextScanKey`), so two certifying `done` cards for
+ * the same PR routinely land in DIFFERENT ticks — a per-row-only read would let
+ * the later card re-emit a second level-50 alarm for the same (PR, live head).
+ * Reading the marker set of every card that mentions the PR (via
+ * `externalObjectMentions`) closes that hole without a new table: the first
+ * scanned card's marker is visible to every later certifying card.
+ */
+async function prAlarmMarkerPersisted(
+  db: Db,
+  companyId: string,
+  prKey: string,
+  liveHeadSha: string,
+  alarmClass: StrandedAlarmClass,
+): Promise<boolean> {
+  // `externalObjects.externalId` is `<owner>/<repo>#pull/<number>`; the marker's
+  // `pr` key is `<owner>/<repo>#<number>`.
+  const externalId = prKey.replace(/#(\d+)$/, "#pull/$1");
+  const rows = await db
+    .select({ executionState: issues.executionState })
+    .from(externalObjectMentions)
+    .innerJoin(externalObjects, eq(externalObjects.id, externalObjectMentions.objectId))
+    .innerJoin(issues, eq(issues.id, externalObjectMentions.sourceIssueId))
+    .where(
+      and(
+        eq(externalObjectMentions.companyId, companyId),
+        eq(externalObjectMentions.objectType, "pull_request"),
+        eq(externalObjects.providerKey, "github"),
+        eq(externalObjects.externalId, externalId),
+      ),
+    );
+  return rows.some((row) => {
+    const marker = ((row.executionState ?? null) as { approvalStatus?: { strandedAlarm?: unknown } } | null)
+      ?.approvalStatus?.strandedAlarm as { headSha?: unknown; pr?: unknown; class?: unknown } | null | undefined;
+    return strandedMarkerMatches(marker, prKey, liveHeadSha, alarmClass);
+  });
 }
 
 /**
@@ -2908,7 +2975,10 @@ function strandedAlarmLogMessage(alarmClass: StrandedAlarmClass): string {
  *   - change 4 (`delivery-card-cancelled`): the PR is live-open and a `done` card
  *     certified the live head, but the PR's branch-owning delivery card is
  *     cancelled (or missing) — the #3536 / SUP-15728 shape. Alarm ONCE per
- *     (PR, live head), naming both cards, never once per certifying child.
+ *     (PR, live head), naming both cards, never once per certifying child. The
+ *     dedupe key is PR-scoped across ticks (`prAlarmMarkerPersisted` reads the
+ *     marker set of every card citing the PR), so the capped keyset window
+ *     cannot let a later-scanned certifying card re-emit.
  *
  * This is OBSERVABILITY ONLY: it returns the alarm verdict for the caller to log
  * at error level (new alarms only) and count. It does not re-stamp, comment, or
@@ -3014,15 +3084,8 @@ export async function findStrandedCardAlarm(
   const readMarker = () =>
     ((row.executionState ?? null) as { approvalStatus?: { strandedAlarm?: unknown } } | null)?.approvalStatus
       ?.strandedAlarm as { headSha?: unknown; pr?: unknown; class?: unknown } | null | undefined;
-  const markerMatches = (cls: StrandedAlarmClass) => {
-    const marker = readMarker();
-    return (
-      !!marker &&
-      marker.pr === prKey &&
-      marker.headSha === liveHeadSha &&
-      (marker.class === undefined || marker.class === cls)
-    );
-  };
+  const markerMatches = (cls: StrandedAlarmClass) =>
+    strandedMarkerMatches(readMarker(), prKey, liveHeadSha, cls);
 
   // SUP-16579 change 1/5 + SUP-16610 change 3: the PR IS this card's delivery PR.
   if (narrow.outcome === "narrowed" && narrow.delivered.some((candidate) => candidate.number === pr.number)) {
@@ -3072,9 +3135,9 @@ export async function findStrandedCardAlarm(
     const alarmClass: StrandedAlarmClass = "delivery-card-cancelled";
     const observationKey = `${prKey}@${liveHeadSha}`;
     if (perPrObserved.has(observationKey)) {
-      // Another certifying child already reported this PR this tick. Persist the
-      // per-PR marker here too (keyed on the PR, not this card) so a future tick
-      // in which this child is the first scanned one still dedupes.
+      // Another certifying child already reported this PR earlier in THIS tick.
+      // Persist the per-PR marker here too (keyed on the PR, not this card) so a
+      // future tick in which this child is the first scanned one still dedupes.
       if (!markerMatches(alarmClass)) {
         await persistStrandedAlarmMarker(db, row, prKey, liveHeadSha, alarmClass);
       }
@@ -3089,7 +3152,12 @@ export async function findStrandedCardAlarm(
       owner.found && owner.status === "cancelled",
       liveHeadSha,
     );
-    const deduped = markerMatches(alarmClass);
+    // Cross-tick dedupe: the marker is PR-scoped, not row-scoped, so a second
+    // certifying child scanned in a LATER tick (the capped keyset window) must
+    // read the marker the first certifying card persisted rather than re-emit.
+    const deduped =
+      markerMatches(alarmClass) ||
+      (await prAlarmMarkerPersisted(db, row.companyId, prKey, liveHeadSha, alarmClass));
     if (!deduped) await persistStrandedAlarmMarker(db, row, prKey, liveHeadSha, alarmClass);
     return { pr: pr.displayName, reason, deduped, class: alarmClass };
   }
