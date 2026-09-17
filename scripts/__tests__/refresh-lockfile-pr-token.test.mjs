@@ -7,12 +7,12 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const workflow = readFileSync(path.join(repoRoot, ".github/workflows/refresh-lockfile.yml"), "utf8");
 
-// `Refresh Lockfile` opens its PR with the default `GITHUB_TOKEN`, which this org
-// blocks from creating pull requests ("GitHub Actions is not permitted to create
-// or approve pull requests"). The fix swaps to a commitperclip app installation
-// token (generated from TEA_CORE_APP_PRIVATE_KEY) and, when PR creation is impossible,
-// emits an ::error:: naming the pushed branch and the exact `gh pr create` command
-// so the orphan branch is never left with no pointer. These tests pin that.
+// `Refresh Lockfile` authenticates both its branch push and its PR creation with the
+// generated commitperclip app installation token (from TEA_CORE_APP_PRIVATE_KEY),
+// not the default `GITHUB_TOKEN` — which this org blocks from creating pull requests
+// ("GitHub Actions is not permitted to create or approve pull requests"). When PR
+// creation is still impossible, it emits an ::error:: naming the pushed branch and the
+// exact `gh pr create` command so the orphan branch is never left with no pointer.
 
 const lines = workflow.split("\n");
 
