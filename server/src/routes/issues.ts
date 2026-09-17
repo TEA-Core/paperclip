@@ -5726,7 +5726,7 @@ export function issueRoutes(
       effectiveProjectWorkspaceId.trim().length > 0
     ) {
       throw badRequest(
-        `executionWorkspacePreference "agent_default" cannot be combined with a non-null projectWorkspaceId: agent_default resolves to the agent home directory, not a project workspace. Clear one of executionWorkspacePreference or projectWorkspaceId before retrying.`,
+        `executionWorkspacePreference "agent_default" cannot be combined with a non-null projectWorkspaceId: agent_default resolves to the agent home directory, not a project workspace. Clear one of executionWorkspacePreference or projectWorkspaceId before retrying. When a run is active on the card, clear projectWorkspaceId: clearing executionWorkspacePreference requests a re-provision, which is refused while the run is live.`,
       );
     }
   }

@@ -10751,6 +10751,20 @@ export function issueService(db: Db) {
               .then((rows) => rows[0]?.id ?? null);
           }
         }
+        // SUP-16608: `agent_default` resolves to the agent home directory, never a
+        // project workspace — yet both the explicit caller field and the
+        // project-default auto-fill above can leave the two set on the row. The
+        // issues PATCH guard refuses that pair for the card's whole lifetime, so a
+        // card minted with it can never be repaired. Normalize at the write
+        // boundary: `agent_default` wins and the project workspace is dropped.
+        // Normalizing rather than rejecting is deliberate — the auto-fill runs for
+        // any project-linked card, so rejecting would make an ordinary
+        // `agent_default` + `projectId` create (which never named a workspace)
+        // impossible.
+        if (executionWorkspacePreference === "agent_default") {
+          projectWorkspaceId = null;
+          delete issueData.projectWorkspaceId;
+        }
         if (projectWorkspaceId) {
           await assertValidProjectWorkspace(
             companyId,
