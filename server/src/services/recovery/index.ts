@@ -82,6 +82,18 @@ export type {
   StrandedRecoveryNoticeSeed,
 } from "./stranded-notice.js";
 export {
+  collectStrandSkipFacts,
+  evaluateStrandSkipFacts,
+  hasActiveReviewStageExecutionState,
+  STRAND_SKIP_REASONS,
+  STRAND_EXTERNAL_PULL_SKIP_REASON,
+} from "./strand-skip.js";
+export type {
+  StrandSkipFacts,
+  StrandSkipDecision,
+  CollectStrandSkipFactsInput,
+} from "./strand-skip.js";
+export {
   buildHostRestartStrandEscalationComment,
   buildRearmMonitorPatch,
   decideHostRestartStrandRepair,

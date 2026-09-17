@@ -151,13 +151,15 @@ export function buildExecutionReviewParticipantUnavailableNoticeSeed(): Stranded
 }
 
 // Escalation dedupe matches the `Recovery action` key_value row via
-// noticeMetadataReferencesRecoveryAction, so this builder must always emit
-// that row with the raw action id.
+// noticeMetadataReferencesRecoveryAction, so a caller that has a real recovery
+// action must pass its raw id. A caller with no real row (the strand sweeps,
+// SUP-16559) passes null/omits it and the row is dropped entirely rather than
+// showing a synthetic id; those callers dedupe on `sourceRunId` instead.
 export function buildStrandedRecoveryEscalationNotice(input: {
   seed?: StrandedRecoveryNoticeSeed | null;
   fallbackBody?: string | null;
   recoveryCause?: string | null;
-  recoveryActionId: string;
+  recoveryActionId?: string | null;
   recoveryOwner: { id: string; name: string | null } | null | undefined;
   sourceRun: {
     id: string;
@@ -176,7 +178,7 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     DEFAULT_STRANDED_RECOVERY_NOTICE_TITLE;
 
   const recoveryRows: NoticeMetadataRow[] = [
-    keyValueRow("Recovery action", input.recoveryActionId),
+    ...(input.recoveryActionId ? [keyValueRow("Recovery action", input.recoveryActionId)] : []),
     input.recoveryOwner
       ? agentLinkRow("Recovery owner", input.recoveryOwner)
       : keyValueRow(

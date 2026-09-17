@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
 import {
   buildEscalationGateSelect,
   buildHostRestartStrandEscalationComment,
@@ -15,6 +15,7 @@ import {
   type HostRestartStrandLatestRun,
   type HostRestartStrandSourceRun,
 } from "./host-restart-strand-sweep.js";
+import type { StrandSkipFacts } from "./strand-skip.js";
 
 const NOW = new Date("2026-09-10T12:00:00.000Z");
 const BOOT_NEW = "boot-new";
@@ -350,7 +351,10 @@ describe("buildHostRestartStrandEscalationComment", () => {
     expect(comment.body).toContain("host-restart strand sweep: exhausted");
     expect(comment.body).toContain(BOOT_NEW);
     expect(comment.metadata.sourceRunId).toBe("run-1");
-    expect(comment.recoveryActionId).toContain("run-1");
+    // SUP-16559: no real recovery-action row exists for this notice, so the
+    // synthetic id is gone and the "Recovery action" row is omitted entirely.
+    expect(comment.recoveryActionId).toBeNull();
+    expect(JSON.stringify(comment.metadata)).not.toContain("Recovery action");
   });
 });
 
@@ -362,6 +366,8 @@ interface FakeDbState {
   liveRunQueue: Array<Array<{ id: string }>>;
   latestRunRows?: Array<HostRestartStrandLatestRun>;
   escalationRows?: Array<{ id: string }>;
+  // Open `issue_recovery_actions` rows for the shared skip collector's probe.
+  recoveryActionRows?: Array<{ id: string }>;
   updateRows?: Array<{ id: string }>;
   // Candidate ids that have a live run at WRITE time; drives the re-arm's
   // atomic NOT-EXISTS guard so the UPDATE affects zero rows for them.
@@ -393,11 +399,16 @@ function makeFakeDb(state: FakeDbState): Db {
       then(resolve: (value: unknown) => unknown) {
         let rows: unknown[] = [];
         if (table === issues) {
-          rows = state.candidates.filter((candidate) => candidate.monitorNextCheckAt === null);
+          // Ordered scan = the candidate query; the unordered probe is the shared
+          // skip collector's recovery-issue lookup, which reads as "no open
+          // recovery issue" (the hermetic default the sweep tests rely on).
+          rows = hasOrderBy ? state.candidates.filter((candidate) => candidate.monitorNextCheckAt === null) : [];
         } else if (table === heartbeatRuns) {
           rows = hasOrderBy ? (state.latestRunRows ?? []) : (state.liveRunQueue.length > 0 ? (state.liveRunQueue.shift() ?? []) : []);
         } else if (table === issueComments) {
           rows = state.escalationRows ?? [];
+        } else if (table === issueRecoveryActions) {
+          rows = state.recoveryActionRows ?? [];
         }
         return Promise.resolve(rows.slice(0, limitN)).then(resolve);
       },
@@ -784,5 +795,145 @@ describe("real SQL shape (Postgres-acceptable guards)", () => {
     expect(compiled.sql).toContain('"issues"."id"');
     expect(compiled.sql.toLowerCase()).toContain("not exists");
     expect(compiled.sql.toLowerCase()).toContain("for update");
+  });
+});
+
+// The shared valid-path holds (strand-skip.ts). SUP-16504 was the regression:
+// a startup sweep posted a "likely stranded" notice on a card that already
+// carried an escalated `missing_disposition` recovery action.
+const NO_SKIP_FACTS: StrandSkipFacts = {
+  hasExecutionState: false,
+  pluginManagedLifecycle: false,
+  hasOpenRecoveryAction: false,
+  hasActiveRoutineContinuation: false,
+  isExternalPullAssignee: false,
+  hasPendingWake: false,
+  hasPendingInteractionOrApproval: false,
+  hasExplicitBlockerPath: false,
+  hasOpenRecoveryIssue: false,
+  hasPauseHold: false,
+};
+
+function makeExhaustedCandidate(id = "issue-escalate"): HostRestartStrandCandidate {
+  return makeCandidate({
+    id,
+    executionState: executionStateWithMonitor({ attemptCount: 7, maxAttempts: 7 }),
+    monitorAttemptCount: 7,
+  });
+}
+
+describe("valid-path holds (SUP-16504)", () => {
+  it("does not escalate a card that already has an open recovery action", async () => {
+    const state: FakeDbState = {
+      candidates: [makeExhaustedCandidate()],
+      liveRunQueue: [[]],
+      latestRunRows: [makeLatestRun()],
+      recoveryActionRows: [{ id: "ra-1" }],
+      escalationRows: [],
+    };
+    const escalateIssue = makeEscalateMock();
+
+    const report = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+      escalateIssue,
+    });
+
+    expect(report.escalated).toEqual([]);
+    expect(report.skipped.validPath).toEqual(["issue-escalate"]);
+    expect(escalateIssue).not.toHaveBeenCalled();
+  });
+
+  it("still escalates the same card when no recovery action exists", async () => {
+    const state: FakeDbState = {
+      candidates: [makeExhaustedCandidate()],
+      liveRunQueue: [[], []], // collection + pre-write
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+    };
+    const escalateIssue = makeEscalateMock();
+
+    const report = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+      escalateIssue,
+    });
+
+    expect(report.escalated).toEqual(["issue-escalate"]);
+    expect(report.skipped.validPath).toEqual([]);
+  });
+
+  it("honours an injected valid-path hold", async () => {
+    const state: FakeDbState = {
+      candidates: [makeExhaustedCandidate()],
+      liveRunQueue: [[]],
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+    };
+    const escalateIssue = makeEscalateMock();
+    const gatherStrandSkipFacts = vi.fn(async () => ({ ...NO_SKIP_FACTS, hasPendingWake: true }));
+
+    const report = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+      escalateIssue,
+      gatherStrandSkipFacts,
+    });
+
+    expect(report.escalated).toEqual([]);
+    expect(report.skipped.validPath).toEqual(["issue-escalate"]);
+    expect(escalateIssue).not.toHaveBeenCalled();
+    expect(gatherStrandSkipFacts).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not gather holds for a card a cheap reason already skipped", async () => {
+    const state: FakeDbState = {
+      candidates: [makeCandidate({ id: "issue-live" })],
+      liveRunQueue: [[{ id: "live-run" }]],
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+    };
+    const gatherStrandSkipFacts = vi.fn(async () => ({ ...NO_SKIP_FACTS }));
+
+    await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+      escalateIssue: makeEscalateMock(),
+      gatherStrandSkipFacts,
+    });
+
+    expect(gatherStrandSkipFacts).not.toHaveBeenCalled();
+  });
+
+  it("never lets a valid-path hold block a re-arm", async () => {
+    const state: FakeDbState = {
+      candidates: [makeCandidate({ id: "issue-rearm" })],
+      liveRunQueue: [[]],
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+      updateRows: [{ id: "issue-rearm" }],
+    };
+    const gatherStrandSkipFacts = vi.fn(async () => ({
+      ...NO_SKIP_FACTS,
+      hasExecutionState: true,
+      hasPendingWake: true,
+      hasPauseHold: true,
+    }));
+
+    const report = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+      escalateIssue: makeEscalateMock(),
+      gatherStrandSkipFacts,
+    });
+
+    expect(report.reArmed).toEqual(["issue-rearm"]);
+    expect(report.skipped.validPath).toEqual([]);
+    expect(gatherStrandSkipFacts).not.toHaveBeenCalled();
   });
 });

@@ -15,6 +15,12 @@ import {
   buildImmediateExecutionPathRecoveryNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
 } from "./stranded-notice.js";
+import {
+  collectStrandSkipFacts,
+  evaluateStrandSkipFacts,
+  hasActiveReviewStageExecutionState,
+  type StrandSkipFacts,
+} from "./strand-skip.js";
 
 // Post-host-restart strand sweep (B2). After a host restart, B1's
 // `reapOrphanedRuns` reaps any in-flight run and stamps `resultJson.hostRestart`
@@ -57,6 +63,7 @@ export interface HostRestartStrandCandidate {
   status: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  originKind?: string | null;
   executionPolicy: unknown;
   executionState: unknown;
   monitorAttemptCount: number | null;
@@ -97,12 +104,17 @@ export interface HostRestartStrandFacts {
   hasLiveRun: boolean;
   latestRun: HostRestartStrandLatestRun | null;
   alreadyEscalated: boolean;
+  // Gathered lazily (only for cards the decision would otherwise escalate) so a
+  // re-arm candidate never pays for the hold queries. Absent/null means "not
+  // gathered".
+  skipFacts?: StrandSkipFacts | null;
 }
 
 export type HostRestartStrandDecision =
   | { action: "skip-live" }
   | { action: "skip-no-marker" }
   | { action: "skip-already-escalated" }
+  | { action: "skip-valid-path"; reason: string }
   | { action: "rearm" }
   | { action: "escalate"; reason: "exhausted" | "never-armed" | "not-monitorable" };
 
@@ -164,6 +176,7 @@ export function decideHostRestartStrandRepair(input: {
   hasLiveRun: boolean;
   alreadyEscalated: boolean;
   latestRun: HostRestartStrandLatestRun | null;
+  skipFacts?: StrandSkipFacts | null;
   now: Date;
   detectedBootId?: string | null;
 }): HostRestartStrandDecision {
@@ -204,6 +217,15 @@ export function decideHostRestartStrandRepair(input: {
   }
 
   const reason = !monitorable ? "not-monitorable" : !armed ? "never-armed" : "exhausted";
+  // Valid-path holds gate only the escalation (notice) arm, never the re-arm:
+  // a re-arm restores the sweep's own monitor and posts nothing, and re-arm
+  // candidates structurally carry a fired monitor in executionState, so the
+  // executionState hold would otherwise disable the re-arm entirely. Shared
+  // verbatim with the completed-run sweep and mirroring the handoff.
+  if (input.skipFacts) {
+    const skip = evaluateStrandSkipFacts(input.skipFacts);
+    if (skip.skip) return { action: "skip-valid-path", reason: skip.reason };
+  }
   return { action: "escalate", reason };
 }
 
@@ -296,13 +318,9 @@ export interface HostRestartStrandEscalationComment {
   body: string;
   presentation: ReturnType<typeof buildStrandedRecoveryEscalationNotice>["presentation"];
   metadata: ReturnType<typeof buildStrandedRecoveryEscalationNotice>["metadata"];
-  recoveryActionId: string;
-}
-
-// Stable, deterministic marker id for the notice's "Recovery action" row. It is
-// not a real recovery-action row — it is a stable dedupe key for this sweep.
-export function buildHostRestartStrandRecoveryActionId(identifier: string | null, sourceRunId: string): string {
-  return `host-restart-strand-sweep:${identifier ?? "issue"}:${sourceRunId}`;
+  // No real recovery action exists for this notice (SUP-16559), so the notice
+  // omits the "Recovery action" row rather than showing a synthetic id.
+  recoveryActionId: null;
 }
 
 export function buildHostRestartStrandEscalationComment(input: {
@@ -312,12 +330,11 @@ export function buildHostRestartStrandEscalationComment(input: {
   bootId: string | null;
 }): HostRestartStrandEscalationComment {
   const seed = buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" });
-  const recoveryActionId = buildHostRestartStrandRecoveryActionId(input.identifier, input.sourceRun.id);
   const body = `${seed.body} (host-restart strand sweep: ${input.reason}; boot ${input.bootId ?? "unknown"})`;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: { body, title: seed.title, tone: seed.tone },
     recoveryCause: "host_restart_strand",
-    recoveryActionId,
+    recoveryActionId: null,
     recoveryOwner: null,
     sourceRun: {
       id: input.sourceRun.id,
@@ -326,13 +343,14 @@ export function buildHostRestartStrandEscalationComment(input: {
       errorCode: input.sourceRun.errorCode,
     },
   });
-  return { body: notice.body, presentation: notice.presentation, metadata: notice.metadata, recoveryActionId };
+  return { body: notice.body, presentation: notice.presentation, metadata: notice.metadata, recoveryActionId: null };
 }
 
 export interface HostRestartStrandSkip {
   liveRun: string[];
   noHostRestartMarker: string[];
   alreadyEscalated: string[];
+  validPath: string[];
   capExceeded: string[];
 }
 
@@ -363,6 +381,7 @@ export function planHostRestartStrandRepairs(input: {
     liveRun: [],
     noHostRestartMarker: [],
     alreadyEscalated: [],
+    validPath: [],
     capExceeded: [],
   };
 
@@ -379,6 +398,7 @@ export function planHostRestartStrandRepairs(input: {
       hasLiveRun: facts.hasLiveRun,
       alreadyEscalated: facts.alreadyEscalated,
       latestRun: facts.latestRun,
+      skipFacts: facts.skipFacts,
       now: input.now,
       detectedBootId: input.detectedBootId ?? null,
     });
@@ -393,6 +413,10 @@ export function planHostRestartStrandRepairs(input: {
     }
     if (decision.action === "skip-already-escalated") {
       skipped.alreadyEscalated.push(candidate.id);
+      continue;
+    }
+    if (decision.action === "skip-valid-path") {
+      skipped.validPath.push(candidate.id);
       continue;
     }
 
@@ -447,6 +471,12 @@ export interface HostRestartStrandSweepInput {
     escalation: { reason: "exhausted" | "never-armed" | "not-monitorable"; sourceRun: HostRestartStrandSourceRun },
     bootId: string | null,
   ) => Promise<boolean>;
+  // Injectable fact-gathering seam for the shared valid-path holds. Defaults to
+  // `collectStrandSkipFacts`; tests pass a fake to stay hermetic.
+  gatherStrandSkipFacts?: (
+    db: Db,
+    candidate: HostRestartStrandCandidate,
+  ) => Promise<StrandSkipFacts>;
 }
 
 export interface HostRestartStrandSweepReport {
@@ -458,7 +488,29 @@ export interface HostRestartStrandSweepReport {
 }
 
 function emptySkipped(): HostRestartStrandSkip {
-  return { liveRun: [], noHostRestartMarker: [], alreadyEscalated: [], capExceeded: [] };
+  return { liveRun: [], noHostRestartMarker: [], alreadyEscalated: [], validPath: [], capExceeded: [] };
+}
+
+// Default gatherer for the shared valid-path holds. Only called for candidates
+// whose (cheap) decision is to escalate.
+async function defaultGatherStrandSkipFacts(
+  db: Db,
+  candidate: HostRestartStrandCandidate,
+): Promise<StrandSkipFacts> {
+  return collectStrandSkipFacts(db, {
+    companyId: candidate.companyId,
+    issueId: candidate.id,
+    assigneeAgentId: candidate.assigneeAgentId,
+    // This sweep consumes the monitor dimension of `executionState` itself
+    // (re-arm vs escalate), and an escalate candidate structurally carries a
+    // fired monitor there. Feeding raw truthiness would suppress every
+    // exhausted-monitor escalation, so only a live review/approval stage counts
+    // as the executionState hold here. `null` means "no live stage".
+    executionState: hasActiveReviewStageExecutionState(candidate.executionState)
+      ? candidate.executionState
+      : null,
+    originKind: candidate.originKind ?? null,
+  });
 }
 
 function candidateWhere(companyId: string | null) {
@@ -625,6 +677,7 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
       status: issues.status,
       assigneeAgentId: issues.assigneeAgentId,
       assigneeUserId: issues.assigneeUserId,
+      originKind: issues.originKind,
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
       monitorAttemptCount: issues.monitorAttemptCount,
@@ -694,7 +747,29 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
           .then((rows) => rows.length > 0)
       : false;
 
-    facts.set(candidate.id, { hasLiveRun: liveRun, latestRun, alreadyEscalated });
+    const cheapFacts: HostRestartStrandFacts = { hasLiveRun: liveRun, latestRun, alreadyEscalated };
+
+    // Gather the shared valid-path holds only for cards the cheap decision would
+    // otherwise escalate; the re-arm arm never consults them.
+    const cheapDecision = decideHostRestartStrandRepair({
+      status: candidate.status,
+      assigneeAgentId: candidate.assigneeAgentId,
+      assigneeUserId: candidate.assigneeUserId,
+      executionState: candidate.executionState,
+      monitorAttemptCount: candidate.monitorAttemptCount,
+      hasLiveRun: cheapFacts.hasLiveRun,
+      alreadyEscalated: cheapFacts.alreadyEscalated,
+      latestRun: cheapFacts.latestRun,
+      now,
+      detectedBootId: bootId,
+    });
+
+    const skipFacts =
+      cheapDecision.action === "escalate"
+        ? await (input.gatherStrandSkipFacts ?? defaultGatherStrandSkipFacts)(db, candidate)
+        : null;
+
+    facts.set(candidate.id, { ...cheapFacts, skipFacts });
   }
 
   const plan = planHostRestartStrandRepairs({ candidates, facts, now, cap, detectedBootId: bootId });
