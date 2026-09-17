@@ -330,8 +330,10 @@ import {
 import {
   DISPATCH_UNLAUNCHED_ERROR_CODE,
   buildHeartbeatRunStopMetadata,
+  isNeverLaunchedDispatchRun,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
+  shouldBlockReviewParticipantRecovery,
 } from "./heartbeat-stop-metadata.js";
 import {
   CHAT_CONTROL_RECOVERY_ADMISSION_KEY,
@@ -5566,6 +5568,26 @@ function isExecutionReviewParticipantRecoveryRun(
   return (
     readNonEmptyString(context.retryReason) ===
     EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON
+  );
+}
+
+/**
+ * SUP-16646: a review-participant recovery retry counts as a spent attempt unless it was
+ * reaped `dispatch_unlaunched`. That shape was admitted to `running` but never registered a
+ * child process or an environment lease, so the dispatch never started and nothing was
+ * attempted. Counting it as spent would burn the participant's one retry on a pure launch
+ * failure and permanently pin the review block, so no restore can dispatch the reviewer.
+ * A retry that launched and crashed still counts, and must still block.
+ */
+export function isSpentReviewParticipantRecoveryAttempt(
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "contextSnapshot" | "errorCode"
+  > | null,
+) {
+  return (
+    isExecutionReviewParticipantRecoveryRun(run) &&
+    !isNeverLaunchedDispatchRun(run)
   );
 }
 
@@ -28472,7 +28494,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // opening a recovery action naming the reviewer as its own recovery owner.
         // A reviewer that never ran, was not invokable, crashed, or produced nothing still
         // escalates: no clean terminal status or no comment means no proof of life.
-        const reviewRecoveryAlreadyAttempted = isExecutionReviewParticipantRecoveryRun(run);
+        // SUP-16646: exclude a retry reaped `dispatch_unlaunched` - it never acquired a
+        // lease, so it must not spend the participant's one retry. See
+        // `isSpentReviewParticipantRecoveryAttempt`.
+        const reviewRecoveryAlreadyAttempted =
+          isSpentReviewParticipantRecoveryAttempt(run);
         const reviewParticipantDeferred =
           reviewRecoveryAlreadyAttempted &&
           Boolean(recoveryAgent) &&
@@ -28485,11 +28511,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           (await countTerminalReviewParticipantRecoveryRuns()) >=
             EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT;
 
-        const shouldBlockReviewRecovery =
-          !recoveryAgentInvokable ||
-          !recoveryAgent ||
-          (reviewRecoveryAlreadyAttempted &&
-            !(reviewParticipantDeferred && !reviewDeferralRetriesExhausted));
+        const shouldBlockReviewRecovery = shouldBlockReviewParticipantRecovery({
+          recoveryAgentPresent: Boolean(recoveryAgent),
+          recoveryAgentInvokable: Boolean(recoveryAgentInvokable),
+          reviewRecoveryAlreadyAttempted,
+          reviewParticipantDeferred,
+          reviewDeferralRetriesExhausted,
+        });
         if (shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
