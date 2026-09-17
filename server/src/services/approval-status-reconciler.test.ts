@@ -3279,6 +3279,53 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect((marker3.strandedAlarm as Record<string, unknown>).headSha).toBe(SHA_B);
       });
 
+      it("SUP-16579: fails closed when the live PR payload has no head SHA — no alarm, no 'unknown' marker", async () => {
+        // The dedupe contract is keyed on (card, PR, live head SHA). A payload
+        // without a usable head.sha cannot name the stranded head, so the alarm
+        // must return null rather than collapsing distinct heads into an
+        // "unknown" marker and claiming a live-open PR it cannot identify.
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          {
+            url: PR_URL,
+            body: {
+              state: "open",
+              merged: false,
+              // No `sha` on head (only the ref) — the live head is unnamed.
+              head: { ref: "SUP-42-branch" },
+              base: { ref: "main", sha: BASE_SHA },
+            },
+          },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+        // Fail closed: no strandedAlarm marker is written, so a later tick with a
+        // readable head is not spuriously deduped against an "unknown" marker.
+        const [row] = await db
+          .select({ executionState: issues.executionState })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.strandedAlarm).toBeUndefined();
+      });
+
       it("AC4 (negative control): a live (in_review) card in the same shape does NOT alarm", async () => {
         const issueId = await insertIssue({
           status: "in_review",

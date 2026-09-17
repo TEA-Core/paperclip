@@ -2723,10 +2723,10 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
  * anything from GitHub. Always begins with `stranded:` (the alarm prefix the
  * error-level log and the tick summary key on).
  */
-function strandedReason(pr: { displayName: string }, liveHeadSha: string | null): string {
+function strandedReason(pr: { displayName: string }, liveHeadSha: string): string {
   return (
     `stranded: card closed done with a terminally-approved ladder, ${pr.displayName} is ` +
-    `live-open at head ${liveHeadSha ?? "(unreadable)"} and is this card's delivery PR, but ` +
+    `live-open at head ${liveHeadSha} and is this card's delivery PR, but ` +
     `paperclip/approved was never minted on its head — the PR cannot enter the merge queue ` +
     `behind a required fail-closed check and no agent can re-stamp it ` +
     `(board-gated merge-arming/republish)`
@@ -2831,7 +2831,13 @@ export async function findStrandedCardAlarm(
   const head = prBody.head as Record<string, unknown> | undefined;
   const liveHeadRef = typeof head?.ref === "string" && head.ref.length > 0 ? head.ref : null;
   if (liveHeadRef === null) return null;
+  // The dedupe contract is keyed on the live head SHA ("once per (card, PR, live
+  // head SHA)"). A payload without a usable head SHA cannot name the stranded
+  // head — collapsing distinct heads into a shared "unknown" marker would both
+  // drop a later re-arm on a new head and let the alarm claim a live-open PR it
+  // cannot actually identify. Fail closed.
   const liveHeadSha = typeof head?.sha === "string" && head.sha.length > 0 ? head.sha : null;
+  if (liveHeadSha === null) return null;
 
   // SUP-16579 change 1: the PR must be the card's DELIVERY PR — the same ADR-091
   // D1 delivery predicate publishApprovalStatus enforces, reused (not re-copied)
@@ -2859,8 +2865,10 @@ export async function findStrandedCardAlarm(
   // SUP-16579 change 5: dedupe. At most one error-level alarm per
   // (card, PR, live head SHA). The marker persists in
   // executionState.approvalStatus.strandedAlarm. A moved live head re-arms.
+  // liveHeadSha is non-null here (guarded above), so the marker always names a
+  // usable head.
   const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
-  const dedupeHead = liveHeadSha ?? "unknown";
+  const dedupeHead = liveHeadSha;
   const previous = (approvalStatus?.approvalStatus as Record<string, unknown> | null | undefined)
     ?.strandedAlarm as { headSha?: unknown; pr?: unknown } | null | undefined;
   if (previous && previous.pr === prKey && previous.headSha === dedupeHead) {
