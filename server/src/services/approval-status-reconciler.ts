@@ -16,6 +16,7 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { issueService } from "./issues.js";
 import {
   ladderIsTerminallyApproved,
+  narrowToDelivered,
   postPullRequestComment,
   publishApprovalStatus,
   resolveCardPullRequest,
@@ -182,6 +183,14 @@ export interface ApprovalStatusReconcilerTickSummary {
   stranded: number;
   /** Bounded "IDENTIFIER: detail" stranded-card alarm outcomes. */
   strandedDetails: string[];
+  /**
+   * SUP-16579: the subset of `stranded` that raised a NEW error-level alarm this
+   * tick. A stranded card that already alarmed at the same (card, PR, live head
+   * SHA) is counted under `stranded` (observed) but NOT under `strandedNew` —
+   * the dedupe marker keeps the repeated shape visible without re-flooding the
+   * error log every ~15 min. A moved live head re-arms (counts again).
+   */
+  strandedNew: number;
 }
 
 export interface CandidateRow {
@@ -2709,26 +2718,67 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
 }
 
 /**
- * SUP-16081 fix #3. Detect a STRANDED card: a terminal `done` close whose ladder
- * is fully reviewed + approved, which carries exactly one linked open PR, yet has
- * no `publishedHeadSha` after the reconciler has had its chance. That is the
- * SUP-16041 shape — the first `paperclip/approved` publish dropped (or its
- * outcome was never recorded), the card closed clean, and the PR silently cannot
- * enter the merge queue behind a required, fail-closed check. Nothing about it
- * raises an alarm, and no fleet agent holds a grant that can re-stamp it
- * (merge-arming/republish is board-only).
+ * The human-readable reason text for a stranded-card alarm. Names the card's PR
+ * and the live head SHA it observed, so an operator can act without re-deriving
+ * anything from GitHub. Always begins with `stranded:` (the alarm prefix the
+ * error-level log and the tick summary key on).
+ */
+function strandedReason(pr: { displayName: string }, liveHeadSha: string | null): string {
+  return (
+    `stranded: card closed done with a terminally-approved ladder, ${pr.displayName} is ` +
+    `live-open at head ${liveHeadSha ?? "(unreadable)"} and is this card's delivery PR, but ` +
+    `paperclip/approved was never minted on its head — the PR cannot enter the merge queue ` +
+    `behind a required fail-closed check and no agent can re-stamp it ` +
+    `(board-gated merge-arming/republish)`
+  );
+}
+
+/**
+ * SUP-16081 fix #3 / SUP-16579. Detect a STRANDED card: a terminal `done` close
+ * whose ladder is fully reviewed + approved, which carries exactly one linked
+ * open PR, yet has no `publishedHeadSha` after the reconciler has had its
+ * chance. That is the SUP-16041 shape — the first `paperclip/approved` publish
+ * dropped (or its outcome never recorded), the card closed clean, and the PR
+ * silently cannot enter the merge queue behind a required, fail-closed check.
+ * Nothing about it raises an alarm, and no fleet agent holds a grant that can
+ * re-stamp it (merge-arming/republish is board-only).
  *
- * This is OBSERVABILITY ONLY: it returns a reason string for the caller to log
- * at error level. It does not re-stamp, comment, or otherwise remediate —
- * re-stamping stays the board-gated `merge-arming/republish` judgment call.
+ * SUP-16579 narrows the alarm to the card that actually owns the drop, so the
+ * level-50 no longer re-fires every ~15 min for 40 non-delivery child cards:
+ *   - change 1 (delivery card only): the one linked PR must be the card's
+ *     DELIVERY PR, passing the SAME ADR-091 D1 delivery predicate that
+ *     publishApprovalStatus enforces (reused via narrowToDelivered — never a
+ *     second copy). A child/sibling card whose PR is not its delivery branch,
+ *     or is in a different repo, or whose delivery identity is unresolvable,
+ *     is not the card that owns the drop, so it is not alarmed.
+ *   - change 2 (live state): the PR must be live-open RIGHT NOW. The head ref +
+ *     head SHA + open state are read live from /pulls/{number} (never the
+ *     cached data.head.ref). A PR that has closed/merged since the last
+ *     refresh — or a live read that fails — is not "stranded-open"; a card the
+ *     reconciler already reached a terminal verdict on this tick
+ *     (pr-merged / pr-closed) is not alarmed either.
+ *   - change 5 (dedupe): at most one error-level alarm per
+ *     (card, PR, live head SHA). The marker is persisted in
+ *     executionState.approvalStatus.strandedAlarm (merged via mergeApprovalStatus
+ *     — a direct DB write, not a card comment, so a done card is never
+ *     re-opened). A moved live head re-arms.
  *
- * Returns `null` when the card is not stranded (any guard missing), so the
- * caller only raises an alarm for the precise, non-recoverable shape.
+ * This is OBSERVABILITY ONLY: it returns the alarm verdict for the caller to log
+ * at error level (new alarms only) and count. It does not re-stamp, comment, or
+ * otherwise remediate — re-stamping stays the board-gated merge-arming/republish
+ * judgment call.
+ *
+ * Returns `null` when the card is not stranded (any guard missing) or the live
+ * read could not positively prove the PR open. Otherwise returns the PR, the
+ * reason, and whether this tick raises a NEW alarm (`deduped: true` = a prior
+ * tick already alarmed at this exact card/PR/live-head, so the caller counts it
+ * under `stranded` but not `strandedNew`).
  */
 export async function findStrandedCardAlarm(
   db: Db,
   row: CandidateRow,
-): Promise<{ pr: string; reason: string } | null> {
+  result: CandidateResult,
+): Promise<{ pr: string; reason: string; deduped: boolean } | null> {
   // Guard 1: only a terminal close is "stranded" — a live ladder is still in
   // play and will get its own publish on the next approval transition. Read the
   // status directly: reconciler candidates intentionally leave `row.status`
@@ -2761,16 +2811,69 @@ export async function findStrandedCardAlarm(
   const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id);
   const openPrs = linked.filter((pr) => pr.cachedState === "open");
   if (openPrs.length !== 1) return null;
-
   const pr = openPrs[0]!;
-  return {
-    pr: pr.displayName,
-    reason:
-      `stranded: card closed done with a terminally-approved ladder, ${pr.displayName} is ` +
-      `open, but paperclip/approved was never minted on its head — the PR cannot enter ` +
-      `the merge queue behind a required fail-closed check and no agent can re-stamp it ` +
-      `(board-gated merge-arming/republish)`,
+
+  // SUP-16579 change 2: a card the reconciler already reached a terminal verdict
+  // on this tick (the PR merged or closed) is not stranded — that drop, if any,
+  // was already surfaced through the verdict, not through this alarm.
+  if (result.kind === "skipped" && (result.reason === "pr-merged" || result.reason === "pr-closed")) {
+    return null;
+  }
+
+  // SUP-16579 change 2: the linked PR must be live-open RIGHT NOW. Read the live
+  // head ref + head SHA + open state from /pulls/{number} — never the cached
+  // data.head.ref. A failed live read means we cannot positively prove the PR is
+  // open, so the card is not "stranded-open" and we do not alarm.
+  const prRead = await ghReadJson(db, row.companyId, pr.owner, pr.repo, `/pulls/${pr.number}`);
+  if (!prRead.ok || !prRead.body) return null;
+  const prBody = prRead.body as Record<string, unknown>;
+  if (prBody.state !== "open" || prBody.merged === true) return null;
+  const head = prBody.head as Record<string, unknown> | undefined;
+  const liveHeadRef = typeof head?.ref === "string" && head.ref.length > 0 ? head.ref : null;
+  if (liveHeadRef === null) return null;
+  const liveHeadSha = typeof head?.sha === "string" && head.sha.length > 0 ? head.sha : null;
+
+  // SUP-16579 change 1: the PR must be the card's DELIVERY PR — the same ADR-091
+  // D1 delivery predicate publishApprovalStatus enforces, reused (not re-copied)
+  // via narrowToDelivered. The gate runs on the LIVE head ref just read, so a
+  // child/sibling card whose PR is not its own delivery branch (or is in a
+  // different repo, or whose delivery identity is unresolvable / an unrelated
+  // owner's branch) is not the card that owns the drop and is not alarmed.
+  const liveCandidate: LinkedPullRequest = {
+    id: pr.id,
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    nodeId: pr.nodeId,
+    headRefName: liveHeadRef,
+    displayName: pr.displayName,
+    title: pr.title,
+    cachedState: "open",
+    lastErrorCode: null,
+    reviewDecision: pr.reviewDecision,
   };
+  const narrow = await narrowToDelivered(db, row.companyId, row.id, [liveCandidate]);
+  if (narrow.outcome !== "narrowed") return null;
+  if (!narrow.delivered.some((candidate) => candidate.number === pr.number)) return null;
+
+  // SUP-16579 change 5: dedupe. At most one error-level alarm per
+  // (card, PR, live head SHA). The marker persists in
+  // executionState.approvalStatus.strandedAlarm. A moved live head re-arms.
+  const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
+  const dedupeHead = liveHeadSha ?? "unknown";
+  const previous = (approvalStatus?.approvalStatus as Record<string, unknown> | null | undefined)
+    ?.strandedAlarm as { headSha?: unknown; pr?: unknown } | null | undefined;
+  if (previous && previous.pr === prKey && previous.headSha === dedupeHead) {
+    return { pr: pr.displayName, reason: strandedReason(pr, liveHeadSha), deduped: true };
+  }
+  await mergeApprovalStatus(
+    db,
+    row,
+    { strandedAlarm: { pr: prKey, headSha: dedupeHead, at: new Date().toISOString() } },
+    { source: "approval-status-reconciler.stranded_alarm" },
+  );
+
+  return { pr: pr.displayName, reason: strandedReason(pr, liveHeadSha), deduped: false };
 }
 
 export async function runApprovalStatusReconcilerTick(
@@ -2806,6 +2909,7 @@ export async function runApprovalStatusReconcilerTick(
     backfilledDetails: [],
     stranded: 0,
     strandedDetails: [],
+    strandedNew: 0,
   };
 
   for (const row of batch) {
@@ -2845,21 +2949,37 @@ export async function runApprovalStatusReconcilerTick(
         // error-level alarm so it is visible without reading the PR checks tab.
         // Observability only — this never re-stamps.
         try {
-          const stranded = await findStrandedCardAlarm(db, row);
+          const stranded = await findStrandedCardAlarm(db, row, result);
           if (stranded) {
             summary.stranded += 1;
-            if (summary.strandedDetails.length < MAX_DETAIL_ENTRIES) {
-              summary.strandedDetails.push(`${label}: ${stranded.reason} [PR ${stranded.pr}]`);
+            if (!stranded.deduped) {
+              summary.strandedNew += 1;
             }
-            logger.error(
-              {
-                issueId: row.id,
-                identifier: label,
-                pr: stranded.pr,
-                reason: stranded.reason,
-              },
-              "stranded approval card: done + terminally approved + one linked open PR, no publishedHeadSha",
-            );
+            if (summary.strandedDetails.length < MAX_DETAIL_ENTRIES) {
+              summary.strandedDetails.push(
+                `${label}: ${stranded.reason} [PR ${stranded.pr}][${stranded.deduped ? "deduped" : "new"}]`,
+              );
+            }
+            if (!stranded.deduped) {
+              logger.error(
+                {
+                  issueId: row.id,
+                  identifier: label,
+                  pr: stranded.pr,
+                  reason: stranded.reason,
+                },
+                "stranded approval card: done + terminally approved + delivery PR live-open, no publishedHeadSha",
+              );
+            } else {
+              logger.info(
+                {
+                  issueId: row.id,
+                  identifier: label,
+                  pr: stranded.pr,
+                },
+                "stranded approval card observed (deduped: already alarmed at this card/PR/live-head)",
+              );
+            }
           }
         } catch (strandedErr) {
           logger.warn(
@@ -2893,6 +3013,7 @@ export async function runApprovalStatusReconcilerTick(
       backfilledDetails: summary.backfilledDetails,
       stranded: summary.stranded,
       strandedDetails: summary.strandedDetails,
+      strandedNew: summary.strandedNew,
     },
     "approval status reconciler tick",
   );
