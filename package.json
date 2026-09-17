@@ -50,6 +50,8 @@
     "check:module-boundaries": "node scripts/check-module-boundaries.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:check-fold-duplication": "node --test scripts/check-fold-duplication.test.mjs",
+    "check:server-test-typecheck": "node scripts/check-server-test-typecheck.mjs",
+    "test:check-server-test-typecheck": "node --test scripts/check-server-test-typecheck.test.mjs",
     "test:install-sh-docker": "./scripts/test-install-sh-docker.sh",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
