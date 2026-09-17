@@ -355,6 +355,7 @@ function zeroSummary(): ApprovalStatusReconcilerTickSummary {
     backfilled: 0,
     backfilledDetails: [],
     stranded: 0,
+    strandedNew: 0,
     strandedDetails: [],
   };
 }
@@ -2944,7 +2945,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         });
         await insertDecision(issueId);
         await insertMention(issueId);
-        await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+        // SUP-16579: the delivery branch must match the LIVE PR head ref
+        // (OPEN_PR_BODY.head.ref = "SUP-42-branch"), which is what the ADR-091 D1
+        // delivery gate now runs on, so this card is the PR's delivery card.
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
 
         installRoutes([
           { url: PR_URL, body: OPEN_PR_BODY },
@@ -2960,11 +2964,15 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(summary.republished).toBe(0);
         expect(summary.skipped["backfill:no-head-mutating-event"]).toBe(1);
         expect(summary.backfilled).toBe(0);
-        // The stranded-card alarm fired for exactly this card.
+        // The stranded-card alarm fired for exactly this card — and this tick it
+        // is a NEW alarm (no prior marker at this card/PR/live-head).
         expect(summary.stranded).toBe(1);
+        expect(summary.strandedNew).toBe(1);
         expect(summary.strandedDetails).toHaveLength(1);
         expect(summary.strandedDetails[0]).toContain("SUP-42");
         expect(summary.strandedDetails[0]).toContain("TEA-Core/paperclip#42");
+        // The alarm names the live head it observed, not the cached one.
+        expect(summary.strandedDetails[0]).toContain(NEW_HEAD);
         // Observability only — the alarm never re-stamps a status.
         expect(postStatusCalls()).toHaveLength(0);
         // The alarm is an error-level log naming the identifier, the PR, and the reason.
@@ -2973,6 +2981,349 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(errorMeta.identifier).toBe("SUP-42");
         expect(errorMeta.pr).toBe("TEA-Core/paperclip#42");
         expect(errorMeta.reason).toMatch(/^stranded:/);
+        // The dedupe marker is persisted so the next tick does not re-alarm.
+        const [alarmedRow] = await db
+          .select({ executionState: issues.executionState })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        const alarmedStatus = (alarmedRow!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        const strandedMarker = alarmedStatus.strandedAlarm as Record<string, unknown>;
+        expect(strandedMarker.pr).toBe("TEA-Core/paperclip#42");
+        expect(strandedMarker.headSha).toBe(NEW_HEAD);
+        expect(typeof strandedMarker.at).toBe("string");
+      });
+
+      it("SUP-16579: does not alarm a child card whose linked PR is not its delivery branch", async () => {
+        // The 40-cards-every-15-min flood: child cards with their own linked open
+        // PR that is NOT the card's delivery branch. Only the delivery card owns
+        // the drop; the child cards must stay silent.
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42-child",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "child-branch-not-the-pr", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("SUP-16579: does not alarm when the delivery branch belongs to an unrelated (non-carrier) issue", async () => {
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        // The card rides an execution-workspace row whose sourceIssueId is some
+        // OTHER issue that is not a strict ancestor (not an ADR-083 carrier): the
+        // delivery identity is unresolvable, so the PR is not provably delivered.
+        const ownerId = await insertIssue({ identifier: "SUP-999", status: "done" });
+        const [projectRow] = await db
+          .insert(projects)
+          .values({ id: randomUUID(), companyId, name: "TEA-Core/paperclip", status: "in_progress" })
+          .returning();
+        const [ewRow] = await db
+          .insert(executionWorkspaces)
+          .values({
+            id: randomUUID(),
+            companyId,
+            projectId: projectRow!.id,
+            mode: "isolated",
+            strategyType: "git_worktree",
+            name: "card-workspace",
+            status: "active",
+            branchName: "SUP-42-branch",
+            repoUrl: "https://github.com/TEA-Core/paperclip",
+            sourceIssueId: ownerId,
+          })
+          .returning();
+        await db
+          .update(issues)
+          .set({ projectId: projectRow!.id, executionWorkspaceId: ewRow!.id })
+          .where(eq(issues.id, issueId));
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("SUP-16579: does not alarm a shared-workspace plan carrier's child (the #3565/#3568 shape)", async () => {
+        // False-positive class (a): a done approved CHILD card of a shared_workspace
+        // plan carrier mentions an open PR whose head branch is the PLAN's branch
+        // (`SUP-<plan>`), not the child's own prefix (`SUP-<child>-...`). The ADR-091
+        // D1 predicate admits the ride as a legitimate carrier (branchIsOwn=false),
+        // but only the plan's delivery card owns the drop, so the child stays silent.
+        const planId = await insertIssue({ identifier: "SUP-15101", status: "blocked" });
+        const childId = await insertIssue({
+          status: "done",
+          identifier: "SUP-16221",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await db.update(issues).set({ parentId: planId }).where(eq(issues.id, childId));
+        await insertDecision(childId);
+        await insertMention(childId);
+        const [projectRow] = await db
+          .insert(projects)
+          .values({ id: randomUUID(), companyId, name: "TEA-Core/paperclip", status: "in_progress" })
+          .returning();
+        const [ewRow] = await db
+          .insert(executionWorkspaces)
+          .values({
+            id: randomUUID(),
+            companyId,
+            projectId: projectRow!.id,
+            mode: "shared_workspace",
+            strategyType: "git_worktree",
+            name: "plan-workspace",
+            status: "active",
+            branchName: "SUP-15101-plan",
+            repoUrl: "https://github.com/TEA-Core/paperclip",
+            sourceIssueId: planId,
+          })
+          .returning();
+        await db
+          .update(issues)
+          .set({ projectId: projectRow!.id, executionWorkspaceId: ewRow!.id })
+          .where(eq(issues.id, childId));
+
+        installRoutes([
+          { url: PR_URL, body: { ...OPEN_PR_BODY, head: { ref: "SUP-15101-plan", sha: NEW_HEAD } } },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("SUP-16579: does not alarm a cross-repo PR (the PR's repo is not this card's delivery repo)", async () => {
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        // The card's delivery repo is a DIFFERENT repo than the linked PR's
+        // (TEA-Core/paperclip), so the PR is not this card's delivery PR.
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/OtherOrg/other-repo");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("SUP-16579: does not alarm when the live PR read fails (404) — fail closed", async () => {
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([{ url: PR_URL, ok: false, status: 404, body: { message: "Not Found" } }]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // The reconciler's own live read also 404s, so the candidate is `failed`;
+        // the alarm's independent live read cannot positively prove the PR open,
+        // so it stays silent rather than manufacturing a false "stranded-open".
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("SUP-16579: does not alarm when the linked PR is live-closed", async () => {
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          {
+            url: PR_URL,
+            body: { state: "closed", merged: false, head: { ref: "SUP-42-branch", sha: NEW_HEAD }, base: { ref: "main", sha: BASE_SHA } },
+          },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // The reconciler reaches the terminal `pr-closed` verdict; the alarm's
+        // result gate (and its own live read) both stay silent.
+        expect(summary.skipped["pr-closed"]).toBe(1);
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("SUP-16579: dedupes a stranded-card alarm per (card, PR, live head SHA) and re-arms on a new head", async () => {
+        const SHA_A = NEW_HEAD;
+        const SHA_B = "new0000000000000000000000000000000000000009";
+        const prBodyAt = (sha: string) => ({
+          state: "open",
+          merged: false,
+          head: { ref: "SUP-42-branch", sha },
+          base: { ref: "main", sha: BASE_SHA },
+        });
+        const combinedStatusAt = (sha: string) =>
+          `https://api.github.com/repos/TEA-Core/paperclip/commits/${sha}/status`;
+
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+        const installForHead = (sha: string) =>
+          installRoutes([
+            { url: PR_URL, body: prBodyAt(sha) },
+            { url: combinedStatusAt(sha), body: { state: "pending", statuses: [] } },
+            { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+          ]);
+
+        // Tick 1: first observation -> a NEW error-level alarm + a persisted marker.
+        installForHead(SHA_A);
+        const s1 = await runApprovalStatusReconcilerTick(db);
+        expect(s1.stranded).toBe(1);
+        expect(s1.strandedNew).toBe(1);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        const [afterTick1] = await db
+          .select({ executionState: issues.executionState })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        const marker1 = (afterTick1!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        expect((marker1.strandedAlarm as Record<string, unknown>).pr).toBe("TEA-Core/paperclip#42");
+        expect((marker1.strandedAlarm as Record<string, unknown>).headSha).toBe(SHA_A);
+
+        // Tick 2: same live head -> observed but deduped: no new alarm, no re-log.
+        installForHead(SHA_A);
+        const s2 = await runApprovalStatusReconcilerTick(db);
+        expect(s2.stranded).toBe(1);
+        expect(s2.strandedNew).toBe(0);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        // Tick 3: the live head moved -> the alarm re-arms.
+        installForHead(SHA_B);
+        const s3 = await runApprovalStatusReconcilerTick(db);
+        expect(s3.stranded).toBe(1);
+        expect(s3.strandedNew).toBe(1);
+        expect(mockLogger.error).toHaveBeenCalledTimes(2);
+
+        const [afterTick3] = await db
+          .select({ executionState: issues.executionState })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        const marker3 = (afterTick3!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        expect((marker3.strandedAlarm as Record<string, unknown>).headSha).toBe(SHA_B);
+      });
+
+      it("SUP-16579: fails closed when the live PR payload has no head SHA — no alarm, no 'unknown' marker", async () => {
+        // The dedupe contract is keyed on (card, PR, live head SHA). A payload
+        // without a usable head.sha cannot name the stranded head, so the alarm
+        // must return null rather than collapsing distinct heads into an
+        // "unknown" marker and claiming a live-open PR it cannot identify.
+        const issueId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          {
+            url: PR_URL,
+            body: {
+              state: "open",
+              merged: false,
+              // No `sha` on head (only the ref) — the live head is unnamed.
+              head: { ref: "SUP-42-branch" },
+              base: { ref: "main", sha: BASE_SHA },
+            },
+          },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+        // Fail closed: no strandedAlarm marker is written, so a later tick with a
+        // readable head is not spuriously deduped against an "unknown" marker.
+        const [row] = await db
+          .select({ executionState: issues.executionState })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.strandedAlarm).toBeUndefined();
       });
 
       it("AC4 (negative control): a live (in_review) card in the same shape does NOT alarm", async () => {

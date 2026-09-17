@@ -1558,8 +1558,11 @@ function notDeliveredOutcome(
  * stamp — a second copy of this rule is how the D2a round-1 regression happened.
  * The generic result lets each caller map a refusal to its own outcome type
  * (ArmingOutcome vs DecisionHeadResolution) without duplicating the rule.
+ * SUP-16579: the stranded-card alarm (approval-status-reconciler) routes through
+ * this too, so "is this PR the card's delivery PR" has exactly one source of
+ * truth across the arming write, the decision pin, and the alarm.
  */
-type DeliveryNarrow<T> =
+export type DeliveryNarrow<T> =
   | { outcome: "narrowed"; delivered: T[]; deliveryBranch: string }
   | { outcome: "identity-unresolved"; branch: string | null; recordedUnusable?: string; missingIdentifier?: boolean }
   | {
@@ -1571,7 +1574,7 @@ type DeliveryNarrow<T> =
       requiredIdentifier?: string | null;
     };
 
-async function narrowToDelivered<
+export async function narrowToDelivered<
   T extends { owner: string; repo: string; headRefName: string | null; displayName: string },
 >(db: Db, companyId: string, issueId: string, candidates: T[]): Promise<DeliveryNarrow<T>> {
   const { branch, repo, recordedUnusable, branchIsOwn, identifier } = await resolveDeliveryIdentity(db, companyId, issueId);
