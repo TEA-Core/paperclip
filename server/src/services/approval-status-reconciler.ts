@@ -175,10 +175,19 @@ export interface ApprovalStatusReconcilerTickSummary {
   /** Bounded "IDENTIFIER: detail" backfill outcomes. */
   backfilledDetails: string[];
   /**
-   * SUP-16081 fix #3: stranded cards observed this tick — a terminal `done` card
-   * with a terminally-approved ladder, exactly one linked open PR, and no
-   * `publishedHeadSha` after the reconciler had its chance. Each is surfaced at
-   * error level (an alarm, not a log line buried in details) and counted here.
+   * SUP-16081 fix #3 / SUP-16579 / SUP-16610: stranded cards observed this tick.
+   * Three shapes, all surfaced at error level (an alarm, not a log line buried in
+   * details):
+   *   - `delivery-card-unpublished` (SUP-16081/16579): a terminal `done` card with
+   *     a terminally-approved ladder, exactly one linked open PR, no approval
+   *     anchor at all;
+   *   - `head-moved` (SUP-16610 change 3): the delivery card published an anchor,
+   *     but the live head moved off it with a changed diff-vs-base
+   *     (guard-a:changed-blob);
+   *   - `delivery-card-cancelled` (SUP-16610 change 4): the PR is live-open and a
+   *     `done` card certified its head, but the PR's owning delivery card is
+   *     cancelled/missing. This class is counted once per (PR, live head), not per
+   *     certifying child that mentions the PR.
    */
   stranded: number;
   /** Bounded "IDENTIFIER: detail" stranded-card alarm outcomes. */
@@ -2734,6 +2743,133 @@ function strandedReason(pr: { displayName: string }, liveHeadSha: string): strin
 }
 
 /**
+ * SUP-16610 change 3: the delivery card DID publish, but the live head has moved
+ * off the published anchor with a substance change (guard-a:changed-blob), so the
+ * stamp no longer covers the live head and no agent may re-stamp it (Guard A
+ * refuses by design). Distinct `stranded:head-moved` prefix so operators can tell
+ * it apart from the never-published `stranded:` drop, and it names the published
+ * head AND the moved live head.
+ */
+function strandedHeadMovedReason(
+  pr: { displayName: string },
+  publishedHeadSha: string,
+  liveHeadSha: string,
+): string {
+  return (
+    `stranded:head-moved: card closed done with a terminally-approved ladder and armed ` +
+    `${pr.displayName} at head ${publishedHeadSha}, but its live head is now ${liveHeadSha} ` +
+    `with a changed diff-vs-base (guard-a:changed-blob) — the stamp does not cover the live ` +
+    `head, Guard A refuses to re-publish, and the PR cannot enter the merge queue behind a ` +
+    `required fail-closed check`
+  );
+}
+
+/**
+ * SUP-16610 change 4: the PR is live-open and a `done` card certified its head,
+ * but the PR's real (branch-owning) delivery card was cancelled (or is missing),
+ * so no live card can carry the PR. The alarm names BOTH cards so the operator
+ * can see the orphaned delivery, and it is deduped once per (PR, live head) — not
+ * once per certifying child that mentions the PR.
+ */
+function strandedDeliveryCardCancelledReason(
+  pr: { displayName: string },
+  certifyingIdentifier: string,
+  ownerIdentifier: string | null,
+  ownerCancelled: boolean,
+  liveHeadSha: string,
+): string {
+  const owner = ownerIdentifier ?? "(unresolved)";
+  const ownerState = ownerCancelled ? "cancelled" : "missing";
+  return (
+    `stranded:delivery-card-cancelled: ${pr.displayName} is live-open at head ${liveHeadSha}, ` +
+    `and ${certifyingIdentifier} (done, terminally approved) certified that head, but the PR's ` +
+    `owning delivery card ${owner} is ${ownerState} — the PR has no live delivery card that can ` +
+    `carry it into the merge queue`
+  );
+}
+
+/** SUP-16610: which stranded shape a {@link findStrandedCardAlarm} verdict names. */
+export type StrandedAlarmClass =
+  | "delivery-card-unpublished"
+  | "head-moved"
+  | "delivery-card-cancelled";
+
+export interface StrandedAlarmObservation {
+  pr: string;
+  reason: string;
+  deduped: boolean;
+  class: StrandedAlarmClass;
+}
+
+/**
+ * SUP-16610: persist the SUP-16579 dedupe marker for a stranded alarm. The key is
+ * always (PR, live head) — for the per-PR `delivery-card-cancelled` class that is
+ * deliberate: the marker is keyed on the PR rather than on the hosting card, so a
+ * second certifying child that mentions the same PR reads the same key and never
+ * re-alarms. A direct `executionState.approvalStatus` merge, never a comment, so
+ * no card (done or cancelled) is re-opened or re-stamped.
+ */
+async function persistStrandedAlarmMarker(
+  db: Db,
+  row: CandidateRow,
+  prKey: string,
+  headSha: string,
+  alarmClass: StrandedAlarmClass,
+): Promise<void> {
+  await mergeApprovalStatus(
+    db,
+    row,
+    { strandedAlarm: { pr: prKey, headSha, class: alarmClass, at: new Date().toISOString() } },
+    { source: "approval-status-reconciler.stranded_alarm" },
+  );
+}
+
+/**
+ * SUP-16610 change 4: resolve the card that OWNS a PR's head — the card named by
+ * the head ref's identifier prefix (the same SUP-13361 title-OR-branch ownership
+ * convention merge-arming applies), falling back to the PR title when the branch
+ * names nothing. Returns `found: false` (with the best identifier we could read)
+ * when no such card exists. Deliberately does NOT look at the certifying card: the
+ * point of this class is that the certifying card is not the owner.
+ */
+async function resolvePrOwningCard(
+  db: Db,
+  companyId: string,
+  headRef: string,
+  title: string | null,
+): Promise<{ identifier: string | null; status: string | null; found: boolean }> {
+  const branchMatch = /^([A-Za-z][A-Za-z0-9]*-\d+)/.exec(headRef);
+  const titleIds = (title ?? "").match(/[A-Za-z][A-Za-z0-9]*-\d+/g) ?? [];
+  const candidates: string[] = [];
+  if (branchMatch) candidates.push(branchMatch[1]!);
+  for (const id of titleIds) {
+    if (!candidates.includes(id)) candidates.push(id);
+  }
+  if (candidates.length === 0) return { identifier: null, status: null, found: false };
+  for (const identifier of candidates) {
+    const [owner] = await db
+      .select({ identifier: issues.identifier, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.identifier, identifier)))
+      .limit(1);
+    if (owner) return { identifier: owner.identifier ?? identifier, status: owner.status, found: true };
+  }
+  return { identifier: candidates[0]!, status: null, found: false };
+}
+
+/** SUP-16610: the error-level log line for a new stranded alarm, by class. */
+function strandedAlarmLogMessage(alarmClass: StrandedAlarmClass): string {
+  switch (alarmClass) {
+    case "head-moved":
+      return "stranded approval card: delivery PR live-open but its live head moved off the published anchor with a changed diff-vs-base (guard-a:changed-blob); the stamp no longer covers the live head";
+    case "delivery-card-cancelled":
+      return "stranded approval PR: a done card certified the live head but the PR's owning delivery card is cancelled/missing; the PR has no live delivery card";
+    default:
+      return "stranded approval card: done + terminally approved + delivery PR live-open, no publishedHeadSha";
+  }
+}
+
+/**
  * SUP-16081 fix #3 / SUP-16579. Detect a STRANDED card: a terminal `done` close
  * whose ladder is fully reviewed + approved, which carries exactly one linked
  * open PR, yet has no `publishedHeadSha` after the reconciler has had its
@@ -2763,6 +2899,17 @@ function strandedReason(pr: { displayName: string }, liveHeadSha: string): strin
  *     — a direct DB write, not a card comment, so a done card is never
  *     re-opened). A moved live head re-arms.
  *
+ * SUP-16610 adds two further stranded shapes on the SAME observability contract:
+ *   - change 3 (`head-moved`): the delivery card published an anchor, but the
+ *     live head has moved off it with a changed diff-vs-base
+ *     (`guard-a:changed-blob`, the #3581 shape). The stamp no longer covers the
+ *     live head and Guard A will never re-publish it under the same approval.
+ *     Deduped per (card, PR, live head) like change 5.
+ *   - change 4 (`delivery-card-cancelled`): the PR is live-open and a `done` card
+ *     certified the live head, but the PR's branch-owning delivery card is
+ *     cancelled (or missing) — the #3536 / SUP-15728 shape. Alarm ONCE per
+ *     (PR, live head), naming both cards, never once per certifying child.
+ *
  * This is OBSERVABILITY ONLY: it returns the alarm verdict for the caller to log
  * at error level (new alarms only) and count. It does not re-stamp, comment, or
  * otherwise remediate — re-stamping stays the board-gated merge-arming/republish
@@ -2770,15 +2917,16 @@ function strandedReason(pr: { displayName: string }, liveHeadSha: string): strin
  *
  * Returns `null` when the card is not stranded (any guard missing) or the live
  * read could not positively prove the PR open. Otherwise returns the PR, the
- * reason, and whether this tick raises a NEW alarm (`deduped: true` = a prior
- * tick already alarmed at this exact card/PR/live-head, so the caller counts it
- * under `stranded` but not `strandedNew`).
+ * class, the reason, and whether this tick raises a NEW alarm (`deduped: true` =
+ * a prior tick already alarmed at this exact PR/live-head, so the caller counts
+ * it under `stranded` but not `strandedNew`).
  */
 export async function findStrandedCardAlarm(
   db: Db,
   row: CandidateRow,
   result: CandidateResult,
-): Promise<{ pr: string; reason: string; deduped: boolean } | null> {
+  perPrObserved: Set<string> = new Set(),
+): Promise<StrandedAlarmObservation | null> {
   // Guard 1: only a terminal close is "stranded" — a live ladder is still in
   // play and will get its own publish on the next approval transition. Read the
   // status directly: reconciler candidates intentionally leave `row.status`
@@ -2797,13 +2945,16 @@ export async function findStrandedCardAlarm(
     | null;
   if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) return null;
 
-  // Guard 3: no paperclip/approved was ever minted on a head. publishedHeadSha is
-  // the authoritative "the stamp was written" anchor (the D-B approvedHeadSha is
-  // only a certification, not a write) — its absence is the drop.
-  const approvalStatus = (row.executionState ?? null) as Record<string, unknown> | null;
-  const publishedHeadSha = (approvalStatus?.approvalStatus as Record<string, unknown> | null | undefined)
-    ?.publishedHeadSha;
-  if (typeof publishedHeadSha === "string" && publishedHeadSha.length > 0) return null;
+  // Guard 3 (SUP-16610): resolve the card's approval ANCHOR — publishedHeadSha, or
+  // the D-B approvedHeadSha certification when no stamp was written. A published
+  // anchor no longer short-circuits the alarm: change 3 alarms when the live head
+  // has MOVED off that anchor with a substance change (guard-a:changed-blob). The
+  // anchor's relationship to the live head (read below) selects the class:
+  //   - anchor === live head            → nothing stranded (the stamp covers it)
+  //   - anchor !== live head            → change 3 (head-moved), only on changed-blob
+  //   - no anchor at all                → the classic change 1/5 never-published drop
+  const approvedHead = readApprovedHead(row.executionState);
+  const anchorHeadSha = approvedHead ? approvedHead.anchorHeadSha : null;
 
   // Guard 4: exactly one linked open PR — a genuinely single-PR card. A card
   // with several open PRs is the ambiguous shape (recoverable once a duplicate
@@ -2859,29 +3010,91 @@ export async function findStrandedCardAlarm(
     reviewDecision: pr.reviewDecision,
   };
   const narrow = await narrowToDelivered(db, row.companyId, row.id, [liveCandidate]);
-  if (narrow.outcome !== "narrowed") return null;
-  if (!narrow.delivered.some((candidate) => candidate.number === pr.number)) return null;
-
-  // SUP-16579 change 5: dedupe. At most one error-level alarm per
-  // (card, PR, live head SHA). The marker persists in
-  // executionState.approvalStatus.strandedAlarm. A moved live head re-arms.
-  // liveHeadSha is non-null here (guarded above), so the marker always names a
-  // usable head.
   const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
-  const dedupeHead = liveHeadSha;
-  const previous = (approvalStatus?.approvalStatus as Record<string, unknown> | null | undefined)
-    ?.strandedAlarm as { headSha?: unknown; pr?: unknown } | null | undefined;
-  if (previous && previous.pr === prKey && previous.headSha === dedupeHead) {
-    return { pr: pr.displayName, reason: strandedReason(pr, liveHeadSha), deduped: true };
-  }
-  await mergeApprovalStatus(
-    db,
-    row,
-    { strandedAlarm: { pr: prKey, headSha: dedupeHead, at: new Date().toISOString() } },
-    { source: "approval-status-reconciler.stranded_alarm" },
-  );
+  const readMarker = () =>
+    ((row.executionState ?? null) as { approvalStatus?: { strandedAlarm?: unknown } } | null)?.approvalStatus
+      ?.strandedAlarm as { headSha?: unknown; pr?: unknown; class?: unknown } | null | undefined;
+  const markerMatches = (cls: StrandedAlarmClass) => {
+    const marker = readMarker();
+    return (
+      !!marker &&
+      marker.pr === prKey &&
+      marker.headSha === liveHeadSha &&
+      (marker.class === undefined || marker.class === cls)
+    );
+  };
 
-  return { pr: pr.displayName, reason: strandedReason(pr, liveHeadSha), deduped: false };
+  // SUP-16579 change 1/5 + SUP-16610 change 3: the PR IS this card's delivery PR.
+  if (narrow.outcome === "narrowed" && narrow.delivered.some((candidate) => candidate.number === pr.number)) {
+    // SUP-16610 change 3: the live head moved off the published anchor. Only the
+    // exact `guard-a:changed-blob` verdict proves the new head's content was never
+    // reviewed — any other unrecoverable Guard A reason stays silent.
+    if (anchorHeadSha !== null && anchorHeadSha !== liveHeadSha) {
+      if (!(result.kind === "skipped" && result.reason === "guard-a:changed-blob")) return null;
+      const alarmClass: StrandedAlarmClass = "head-moved";
+      const reason = strandedHeadMovedReason(pr, anchorHeadSha, liveHeadSha);
+      const deduped = markerMatches(alarmClass);
+      if (!deduped) await persistStrandedAlarmMarker(db, row, prKey, liveHeadSha, alarmClass);
+      return { pr: pr.displayName, reason, deduped, class: alarmClass };
+    }
+
+    // A live-matching anchor means the stamp covers the live head — nothing is
+    // stranded. Only an absent anchor is the classic never-published drop.
+    if (anchorHeadSha !== null) return null;
+    const alarmClass: StrandedAlarmClass = "delivery-card-unpublished";
+    const reason = strandedReason(pr, liveHeadSha);
+    const deduped = markerMatches(alarmClass);
+    if (!deduped) await persistStrandedAlarmMarker(db, row, prKey, liveHeadSha, alarmClass);
+    return { pr: pr.displayName, reason, deduped, class: alarmClass };
+  }
+
+  // SUP-16610 change 4: the PR is NOT this card's delivery PR, but this `done`
+  // card certified the live head, the PR is in this card's delivery repo, and the
+  // PR's real owning card is cancelled (or missing) — the PR has no live delivery
+  // card. One alarm per (PR, live head), not per certifying child.
+  if (narrow.outcome === "not-delivered") {
+    // This card "certified that same live head": its anchor is the live head AND
+    // came from the SUP-14715 D-B approvedHeadSha certification (firstPublish) —
+    // a card that already PUBLISHED the live head stamped the required check, so
+    // the PR is not stranded on a missing delivery card and must stay silent.
+    if (!approvedHead || !approvedHead.firstPublish || anchorHeadSha !== liveHeadSha) return null;
+    // The repo half of the ADR-091 D1 gate, taken from the predicate's own result
+    // so a cross-repo mention (change 1's D5 closure) stays silent.
+    if (
+      pr.owner.toLowerCase() !== narrow.deliveryRepo.owner.toLowerCase() ||
+      pr.repo.toLowerCase() !== narrow.deliveryRepo.repo.toLowerCase()
+    ) {
+      return null;
+    }
+    const owner = await resolvePrOwningCard(db, row.companyId, liveHeadRef, pr.title);
+    if (owner.found && owner.status !== "cancelled") return null;
+
+    const alarmClass: StrandedAlarmClass = "delivery-card-cancelled";
+    const observationKey = `${prKey}@${liveHeadSha}`;
+    if (perPrObserved.has(observationKey)) {
+      // Another certifying child already reported this PR this tick. Persist the
+      // per-PR marker here too (keyed on the PR, not this card) so a future tick
+      // in which this child is the first scanned one still dedupes.
+      if (!markerMatches(alarmClass)) {
+        await persistStrandedAlarmMarker(db, row, prKey, liveHeadSha, alarmClass);
+      }
+      return null;
+    }
+    perPrObserved.add(observationKey);
+
+    const reason = strandedDeliveryCardCancelledReason(
+      pr,
+      row.identifier ?? row.id,
+      owner.identifier,
+      owner.found && owner.status === "cancelled",
+      liveHeadSha,
+    );
+    const deduped = markerMatches(alarmClass);
+    if (!deduped) await persistStrandedAlarmMarker(db, row, prKey, liveHeadSha, alarmClass);
+    return { pr: pr.displayName, reason, deduped, class: alarmClass };
+  }
+
+  return null;
 }
 
 export async function runApprovalStatusReconcilerTick(
@@ -2920,6 +3133,11 @@ export async function runApprovalStatusReconcilerTick(
     strandedNew: 0,
   };
 
+  // SUP-16610 change 4: the `delivery-card-cancelled` class is per-PR, not per
+  // mentioning card — at most one observation per (PR, live head) per tick, even
+  // when several certifying children cite the same PR.
+  const perPrStrandedObserved = new Set<string>();
+
   for (const row of batch) {
     summary.scanned += 1;
     const label = row.identifier ?? row.id;
@@ -2957,7 +3175,7 @@ export async function runApprovalStatusReconcilerTick(
         // error-level alarm so it is visible without reading the PR checks tab.
         // Observability only — this never re-stamps.
         try {
-          const stranded = await findStrandedCardAlarm(db, row, result);
+          const stranded = await findStrandedCardAlarm(db, row, result, perPrStrandedObserved);
           if (stranded) {
             summary.stranded += 1;
             if (!stranded.deduped) {
@@ -2975,8 +3193,9 @@ export async function runApprovalStatusReconcilerTick(
                   identifier: label,
                   pr: stranded.pr,
                   reason: stranded.reason,
+                  alarmClass: stranded.class,
                 },
-                "stranded approval card: done + terminally approved + delivery PR live-open, no publishedHeadSha",
+                strandedAlarmLogMessage(stranded.class),
               );
             } else {
               logger.info(
@@ -2984,8 +3203,9 @@ export async function runApprovalStatusReconcilerTick(
                   issueId: row.id,
                   identifier: label,
                   pr: stranded.pr,
+                  alarmClass: stranded.class,
                 },
-                "stranded approval card observed (deduped: already alarmed at this card/PR/live-head)",
+                "stranded approval card observed (deduped: already alarmed at this PR/live-head)",
               );
             }
           }
