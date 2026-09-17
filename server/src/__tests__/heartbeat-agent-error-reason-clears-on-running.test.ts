@@ -99,10 +99,11 @@ describeEmbeddedPostgres("heartbeat agent errorReason clears on running transiti
     });
   }, 20_000);
 
+  // afterEach drains every in-flight run execution before this runs, so one
+  // delete pass is deterministic. The prior teardown paired this with a 25ms
+  // sleep and a second delete to outwait late event writes; the drain makes
+  // that timing crutch unnecessary.
   async function cleanupHeartbeatRunDependents() {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await new Promise((resolve) => setTimeout(resolve, 25));
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
   }
