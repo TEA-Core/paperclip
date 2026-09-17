@@ -14,6 +14,7 @@ import {
   toolConnectionInstalls,
   toolConnections,
 } from "@paperclipai/db";
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
@@ -34,7 +35,7 @@ import { secretService } from "../services/secrets.ts";
 // GitHub connection that upstream #13005 would otherwise switch the run to managed mode for.
 
 const adapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_ctx: AdapterExecutionContext) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -173,7 +174,6 @@ describeEmbeddedPostgres("heartbeat GitHub host gate (D1)", () => {
       });
       await db.insert(environments).values({
         id: environmentId,
-        companyId,
         name,
         driver: opts.environment.driver,
         status: "active",

@@ -19,6 +19,7 @@ import {
   toolConnectionInstalls,
   toolConnections,
 } from "@paperclipai/db";
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { buildSkillMentionHref } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -34,7 +35,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 const execFileAsync = promisify(execFile);
 
 const adapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_ctx: AdapterExecutionContext) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
