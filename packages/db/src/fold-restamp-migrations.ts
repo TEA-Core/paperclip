@@ -57,6 +57,18 @@
  *    rewrites them anyway when the operator has looked at the list and wants
  *    the mechanical edit.
  *
+ * 4. It reports every source file that pins a slice of the journal to a
+ *    hardcoded `idx` number — a "journal-idx window", e.g.
+ *    `journal.entries.filter((entry) => entry.idx < 227)`. `idx` is a position
+ *    in the journal array, not the migration number, and step 1 resequences
+ *    `idx` to 0..n-1, so a number-pinned window silently moves to a different
+ *    set of migrations after the fold. In slice 2c that is what broke
+ *    client.test.ts until it was re-anchored on migration tags by hand. These
+ *    are reported, not re-pointed: the repair is to resolve the boundary from a
+ *    migration tag rather than a number, which a mechanical rewrite cannot do.
+ *    A tag-anchored window (comparing `.idx` to a variable, e.g.
+ *    `entry.idx >= startIdx`) already survives a fold and is not reported.
+ *
  * Renaming a migration file is safe. drizzle hashes the SQL *content*
  * (migrator.js: `sha256(query)`), not the filename or tag, so an
  * already-applied migration stays recognised under a new number. The tag is
@@ -77,6 +89,8 @@
  *                     Without it, prints the plan and changes nothing.
  *   --repoint         with --apply, also rewrite source references to renamed
  *                     migration filenames. Review the reported list first.
+ *                     Journal-idx windows (step 4) are never re-pointed: they
+ *                     are re-anchored on a tag by hand.
  *   --skip-snapshot   do not generate the snapshot. Escape hatch for when
  *                     drizzle-kit cannot load the merged schema; the snapshot
  *                     then has to be produced by hand before CI goes green.
@@ -285,14 +299,66 @@ export async function buildFoldSnapshot(
 export type MigrationReference = { file: string; line: number; text: string; from: string; to: string };
 
 /**
- * Find every tracked source file that names a renamed migration by filename.
+ * A test that pins a slice of the journal to a hardcoded `idx`, e.g.
+ * `entry.idx < 227`.
  *
- * Searches for the bare tag rather than `<tag>.sql`, so a reference that
- * rebuilds the filename from parts is still caught. The migrations directory
- * itself is excluded — the `.sql` file and the journal are what the rename is
- * already handling.
+ * `idx` is a position in the journal array, not the migration number, so a fold
+ * that resequences `idx` to 0..n-1 silently moves a number-pinned window to a
+ * different set of migrations. These are reported, not re-pointed: the repair
+ * is to re-anchor the boundary on a migration tag (resolve `idx` from the tag,
+ * the `journalIdx(entries, tag)` shape), which a mechanical string rewrite
+ * cannot do.
  */
-export function scanMigrationReferences(renames: FoldRestampRename[], repoRoot: string): MigrationReference[] {
+export type JournalIdxWindow = { file: string; line: number; text: string };
+
+export type MigrationScan = {
+  /** References to renamed migrations by filename; re-pointable by --repoint. */
+  references: MigrationReference[];
+  /** Journal-idx windows pinned to a hardcoded number; report-only. */
+  idxWindows: JournalIdxWindow[];
+};
+
+/**
+ * A journal-idx window pinned to a hardcoded number: a `.idx` property access
+ * compared against a positive integer literal, e.g. `entry.idx < 227` or
+ * `if (246 > entry.idx)`.
+ *
+ * Only a *property* `.idx` against a *positive* integer literal counts. A bare
+ * `idx` local (`if (idx < 0) break`) is a loop counter, not a journal entry;
+ * `entry.idx >= startIdx` is already tag-anchored; and `idx === 0` is invariant
+ * across folds, because idx 0 is always the fork's first entry.
+ */
+const JOURNAL_IDX_WINDOW_RE =
+  /(\.\s*idx\b\s*(?:<=|>=|===|!==|==|!=|<|>)\s*[1-9][0-9]*)|([1-9][0-9]*\s*(?:<=|>=|===|!==|==|!=|<|>)\s*[\w$.]*\.\s*idx\b)/;
+
+/**
+ * Whether a single source line pins a journal slice to a hardcoded `idx`
+ * number. Pure and line-local, so the git-grep driver and the tests share one
+ * definition of "a number-pinned window".
+ */
+export function classifyJournalIdxWindow(line: string): boolean {
+  return JOURNAL_IDX_WINDOW_RE.test(line);
+}
+
+/**
+ * Find every tracked source file that names a renamed migration by filename,
+ * and every source file that pins a journal slice to a hardcoded `idx`.
+ *
+ * The filename search matches the bare tag rather than `<tag>.sql`, so a
+ * reference that rebuilds the filename from parts is still caught. The
+ * migrations directory itself is excluded — the `.sql` file and the journal are
+ * what the rename is already handling. The idx-window scan is independent of
+ * `renames`: a fold breaks those windows even when it renames no migration,
+ * because it resequences `idx` regardless.
+ */
+export function scanMigrationReferences(renames: FoldRestampRename[], repoRoot: string): MigrationScan {
+  return {
+    references: scanFilenameReferences(renames, repoRoot),
+    idxWindows: scanJournalIdxWindows(repoRoot),
+  };
+}
+
+function scanFilenameReferences(renames: FoldRestampRename[], repoRoot: string): MigrationReference[] {
   const found: MigrationReference[] = [];
 
   for (const rename_ of renames) {
@@ -315,6 +381,48 @@ export function scanMigrationReferences(renames: FoldRestampRename[], repoRoot: 
     }
   }
 
+  return found;
+}
+
+/**
+ * Scan every tracked source file for journal-idx windows pinned to a hardcoded
+ * number. Runs a coarse `git grep` for `.idx` in a comparison, then keeps only
+ * the lines `classifyJournalIdxWindow` accepts (a positive integer literal on
+ * the other side), so the tag-anchored windows that already survive a fold are
+ * not reported.
+ *
+ * This tool's own source and test are excluded: their doc comments and fixtures
+ * embed the example pattern to prove detection, and reporting them on every run
+ * would be self-referential noise rather than a live window.
+ */
+export function scanJournalIdxWindows(repoRoot: string): JournalIdxWindow[] {
+  let output: string;
+  try {
+    output = git(
+      [
+        "grep",
+        "-n",
+        "-E",
+        "--",
+        "\\.idx[[:space:]]*(<=|>=|===|==|!=|<|>)|[0-9]+[[:space:]]*(<=|>=|===|==|!=|<|>)[[:space:]]*[^[:space:]]*\\.idx",
+        ".",
+        ":(exclude)packages/db/src/migrations",
+        ":(exclude)packages/db/src/fold-restamp-migrations.ts",
+        ":(exclude)packages/db/src/fold-restamp-migrations.test.ts",
+      ],
+      repoRoot,
+    );
+  } catch {
+    // git grep exits 1 with no output when nothing matches.
+    return [];
+  }
+  const found: JournalIdxWindow[] = [];
+  for (const line of output.split("\n").filter(Boolean)) {
+    const match = line.match(/^([^:]+):(\d+):(.*)$/s);
+    if (!match) continue;
+    if (!classifyJournalIdxWindow(match[3])) continue;
+    found.push({ file: match[1], line: Number(match[2]), text: match[3].trim() });
+  }
   return found;
 }
 
@@ -386,7 +494,7 @@ async function main() {
 
   console.log(`\nsnapshot:       ${plan.snapshot.previousFile} -> ${plan.snapshot.nextFile}`);
 
-  const references = scanMigrationReferences(renames, repoRoot);
+  const { references, idxWindows } = scanMigrationReferences(renames, repoRoot);
   if (references.length > 0) {
     console.log(`\nsource references to renamed migrations (${references.length}):`);
     for (const reference of references) {
@@ -400,6 +508,20 @@ async function main() {
     );
   } else {
     console.log("\nNo source file references a renamed migration by filename.");
+  }
+
+  if (idxWindows.length > 0) {
+    console.log(`\njournal idx windows pinned to a hardcoded number (${idxWindows.length}):`);
+    for (const window_ of idxWindows) {
+      console.log(`  ${window_.file}:${window_.line}`);
+      console.log(`      ${window_.text}`);
+    }
+    console.log(
+      "  A fold resequences the journal's idx, so these windows silently shift to a\n" +
+        "  different set of migrations. Re-anchor each boundary on a migration tag\n" +
+        "  (resolve idx from the tag) instead of a number. They are not re-pointed\n" +
+        "  by --repoint.",
+    );
   }
 
   if (!apply) {
