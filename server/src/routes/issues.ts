@@ -15671,8 +15671,7 @@ export function issueRoutes(
         if (res.statusCode === 500 && errorContext?.error) {
           const errorClass = errorContext.error.name ?? "Error";
           const message = errorContext.error.message ?? "";
-          void recordUnhandled(errorClass, message);
-          return originalJson({
+          const typedBody = {
             error: "Issue update failed unexpectedly",
             code: "issue_patch_unhandled_error",
             details: {
@@ -15683,7 +15682,20 @@ export function issueRoutes(
                 "The failure is recorded on the issue activity feed " +
                 "(issue.patch_unhandled_error); include it when reporting.",
             },
-          } as never);
+          } as never;
+          // Settle the durable record BEFORE the response is flushed. A
+          // fire-and-forget write here commits asynchronously and races request
+          // teardown: the row can land after a caller's own cleanup transaction
+          // (measured as `delete from companies` failing on an
+          // `activity_log_company_id_companies_id_fk` in inbox-archive-routes),
+          // and the caller can observe the 500 before the record exists at all.
+          // The error handler ignores this Promise; the body still flushes via
+          // originalJson once the write settles.
+          recordUnhandled(errorClass, message).then(
+            () => originalJson(typedBody),
+            () => originalJson(typedBody),
+          );
+          return res;
         }
         return originalJson(body as never);
       }) as typeof res.json;
