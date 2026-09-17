@@ -3341,6 +3341,28 @@ export function recoveryService(
     ].join(":");
   }
 
+  // SUP-16658: the review state a source-scoped stranded action was minted
+  // against. `classifySourceRecoveryRevalidation` compares it to the issue's
+  // current review state to tell a typed participant that is genuinely new
+  // (motion, signal P) from one that was already true when the action was
+  // minted (the always-true close this key exists to stop). `null` means the
+  // issue was not at a pending stage at mint, so any later typed participant is
+  // real motion. `evidence` is jsonb, so this needs no migration.
+  function readReviewStateAtMint(
+    executionState: ReturnType<typeof parseIssueExecutionState>,
+  ) {
+    if (executionState?.status !== "pending") return null;
+    const participant = executionState.currentParticipant;
+    return {
+      stageId: executionState.currentStageId ?? null,
+      participantType: participant?.type ?? null,
+      participantAgentId:
+        participant?.type === "agent" ? participant.agentId ?? null : null,
+      participantUserId:
+        participant?.type === "user" ? participant.userId ?? null : null,
+    };
+  }
+
   function buildStrandedRecoveryActionEvidence(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
@@ -3364,6 +3386,9 @@ export function recoveryService(
       latestRunErrorCode: input.latestRun?.errorCode ?? null,
       retryReason: readNonEmptyString(context.retryReason) ?? null,
       recoveryCause: input.recoveryCause,
+      reviewStateAtMint: readReviewStateAtMint(
+        parseIssueExecutionState(input.issue.executionState),
+      ),
       sourceRunId: input.successfulRunHandoffEvidence?.sourceRunId ?? null,
       correctiveRunId: input.successfulRunHandoffEvidence?.correctiveRunId ?? null,
       missingDisposition: input.successfulRunHandoffEvidence?.missingDisposition ?? null,

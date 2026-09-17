@@ -21,6 +21,7 @@ import {
   asc,
   desc,
   eq,
+  gt,
   inArray,
   isNull,
   notInArray,
@@ -826,6 +827,45 @@ function readObject(value: unknown): Record<string, unknown> {
 
 function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * The review state a source-scoped stranded recovery action was minted against
+ * (`evidence.reviewStateAtMint`, SUP-16658). `classifySourceRecoveryRevalidation`
+ * uses it to tell a typed review participant that is genuinely new from one that
+ * was already true at mint — for cause `execution_review_participant_recovery`
+ * the latter is entailed by the mint condition itself, so closing on it carries
+ * no information (SUP-15607).
+ */
+type ReviewStateAtMint = {
+  stageId: string | null;
+  participantType: string | null;
+  participantAgentId: string | null;
+  participantUserId: string | null;
+};
+
+/**
+ * Reads `evidence.reviewStateAtMint`. The three outcomes are deliberate:
+ * `undefined` — the key is absent (an action minted before SUP-16658) or its
+ * shape is unrecognised, so the caller keeps the legacy close-on-typed-participant
+ * behaviour; `null` — the issue was not at a pending stage when the action was
+ * minted, so a typed participant is genuinely new; an object — the exact review
+ * state recorded at mint, to diff against.
+ */
+function readReviewStateAtMint(
+  evidence: Record<string, unknown> | null | undefined,
+): ReviewStateAtMint | null | undefined {
+  if (!evidence || !hasOwn(evidence, "reviewStateAtMint")) return undefined;
+  const raw = evidence.reviewStateAtMint;
+  if (raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  return {
+    stageId: readNonEmptyString(record.stageId),
+    participantType: readNonEmptyString(record.participantType),
+    participantAgentId: readNonEmptyString(record.participantAgentId),
+    participantUserId: readNonEmptyString(record.participantUserId),
+  };
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -5333,6 +5373,32 @@ export function issueRoutes(
     }
   }
 
+  // SUP-16658 signal D: a decision row recorded after the action was minted is
+  // real forward motion on the review stage. Nothing in the mint or the deferral
+  // re-arm path records one, so it cannot be manufactured by the loop this fix
+  // exists to close.
+  async function hasExecutionDecisionSinceMint(
+    issueId: string,
+    mintedAt: Date | string | null | undefined,
+  ): Promise<boolean> {
+    if (!mintedAt) return false;
+    const mintedAtDate =
+      mintedAt instanceof Date ? mintedAt : new Date(mintedAt);
+    if (Number.isNaN(mintedAtDate.getTime())) return false;
+    const row = await db
+      .select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions)
+      .where(
+        and(
+          eq(issueExecutionDecisions.issueId, issueId),
+          gt(issueExecutionDecisions.createdAt, mintedAtDate),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row !== null;
+  }
+
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
     trigger: RecoveryRevalidationTrigger;
@@ -5418,12 +5484,49 @@ export function issueRoutes(
         executionState?.status === "pending"
           ? executionState.currentParticipant
           : null;
-      if (
+      const hasTypedParticipant =
         (participant?.type === "agent" &&
           readNonEmptyString(participant.agentId)) ||
-        (participant?.type === "user" && readNonEmptyString(participant.userId))
-      ) {
-        return "Recovery action became stale because the source issue now has a typed review participant.";
+        (participant?.type === "user" && readNonEmptyString(participant.userId));
+      if (hasTypedParticipant) {
+        // SUP-16658: a typed participant alone is not evidence that this action's
+        // premise dissolved — for cause `execution_review_participant_recovery`
+        // it is entailed by the mint condition, so closing on it returns the card
+        // to the identical stuck state (SUP-15607). Close only on motion recorded
+        // since the action was minted: a decision row (D) or a stage / participant
+        // change (P). An action minted before this key existed has no
+        // `reviewStateAtMint` and keeps the legacy close.
+        const reviewStateAtMint = readReviewStateAtMint(
+          input.activeRecoveryAction?.evidence,
+        );
+        if (reviewStateAtMint === undefined) {
+          return "Recovery action became stale because the source issue now has a typed review participant.";
+        }
+        const currentParticipantAgentId =
+          participant?.type === "agent"
+            ? readNonEmptyString(participant.agentId)
+            : null;
+        const currentParticipantUserId =
+          participant?.type === "user"
+            ? readNonEmptyString(participant.userId)
+            : null;
+        const reviewStateMoved =
+          reviewStateAtMint === null ||
+          (executionState?.currentStageId ?? null) !== reviewStateAtMint.stageId ||
+          (participant?.type ?? null) !== reviewStateAtMint.participantType ||
+          currentParticipantAgentId !== reviewStateAtMint.participantAgentId ||
+          currentParticipantUserId !== reviewStateAtMint.participantUserId;
+        const decisionSinceMint = reviewStateMoved
+          ? false
+          : await hasExecutionDecisionSinceMint(
+              issue.id,
+              input.activeRecoveryAction?.createdAt ?? null,
+            );
+        if (reviewStateMoved || decisionSinceMint) {
+          return "Recovery action became stale because the source issue now has a typed review participant.";
+        }
+        // No motion: fall through to the pending-interaction, pending-approval
+        // and scheduled-monitor escapes below instead of returning early.
       }
 
       const interactions = await issueThreadInteractionsSvc.listForIssue(
