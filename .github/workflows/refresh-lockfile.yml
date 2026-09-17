@@ -89,24 +89,32 @@ jobs:
           git config user.name "lockfile-bot"
           git config user.email "lockfile-bot@users.noreply.github.com"
 
-          git checkout -B "$BRANCH"
-          git add pnpm-lock.yaml
-          git commit -m "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}"
-          git push --force origin "$BRANCH"
-
           # The exact command a human runs to open the PR by hand. Emitted in the
           # ::error:: remediation below so the pushed branch is never left unpointed.
           PR_CMD="gh pr create --head \"${BRANCH}\" --base \"${BASE_REF}\" --title \"chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}\" --body \$'Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\n\nPaperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)'"
 
-          # The default GITHUB_TOKEN cannot create PRs in this org ("GitHub Actions
-          # is not permitted to create or approve pull requests"), so the bot token
-          # (commitperclip app installation) is required. Fail loudly rather than
-          # leaving an orphan branch with no pointer.
+          # The branch update MUST be pushed with the tea-core app installation token
+          # (GH_TOKEN here is steps.bot-token's token), not the credential that
+          # actions/checkout persists (GITHUB_TOKEN / github-actions[bot]). Runs
+          # attributed to that token are held at action_required, so the PR's
+          # required checks never execute and its armed auto-merge cannot progress
+          # (SUP-16627). If the app token is unavailable we must NOT push: a push we
+          # cannot bind to the app would recreate the held-runs failure. Fail loudly
+          # instead and leave the branch unpushed.
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error title=Lockfile PR not created::No bot token (TEA_CORE_APP_PRIVATE_KEY) is available to open the PR. The refreshed lockfile was pushed to branch '${BRANCH}' but no PR was created. Open it manually with: ${PR_CMD}"
+            echo "::error title=Lockfile push not performed::No bot token (TEA_CORE_APP_PRIVATE_KEY) is available, so the branch update was NOT pushed: a push we could not bind to the app installation token would create runs held at action_required. Generate the token, push, and open the PR manually: ${PR_CMD}"
             echo "pr_url=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          # Bind the app installation token explicitly into the push URL so git does
+          # not fall back to the checkout-persisted default credential. The push is
+          # the only mutation here; PR creation below also uses GH_TOKEN.
+          PUSH_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}"
+          git checkout -B "$BRANCH"
+          git add pnpm-lock.yaml
+          git commit -m "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}"
+          git push --force "${PUSH_URL}" "$BRANCH"
 
           # Only reuse an open PR from this repository owner, not a fork with the same branch name.
           pr_url="$(
