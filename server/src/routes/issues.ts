@@ -3394,6 +3394,29 @@ function buildExecutionStageWakeup(input: {
   return null;
 }
 
+/**
+ * SUP-16684: an automatic no-replay disposition (`evidence.automaticRecovery.replay
+ * = "blocked"`) is a durable hold that `getExecutionBlocker` keeps reading even
+ * after the action is resolved, so a restored-stage wake would be dropped as
+ * "Automatic recovery stopped". A board restore that arms a fresh execution stage
+ * is new evidence, so clear the hold when we land one.
+ */
+function clearRecoveryReplayHold(
+  evidence: Record<string, unknown>,
+): Record<string, unknown> {
+  const automaticRecovery = evidence.automaticRecovery;
+  if (
+    !automaticRecovery ||
+    typeof automaticRecovery !== "object" ||
+    Array.isArray(automaticRecovery)
+  ) {
+    return evidence;
+  }
+  const automatic = automaticRecovery as Record<string, unknown>;
+  if (automatic.replay !== "blocked") return evidence;
+  return { ...evidence, automaticRecovery: { ...automatic, replay: "restored" } };
+}
+
 class AutoApprovalIssueMissingError extends Error {
   constructor() {
     super("Issue not found during auto-approval transaction");
@@ -11817,6 +11840,16 @@ export function issueRoutes(
               ? "owner_completed"
               : outcome;
 
+        // SUP-16684: a restore that lands a non-terminal issue on an armed
+        // execution stage must wake that stage's current participant. Compute the
+        // condition off the state the transition installed, so the cleared
+        // no-replay hold below and the post-commit wake agree on it.
+        const restoredLandsArmedStage =
+          outcome === "restored" &&
+          issue.status !== "done" &&
+          issue.status !== "cancelled" &&
+          parseIssueExecutionState(issue.executionState)?.currentStageId != null;
+
         const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
           {
             companyId: existing.companyId,
@@ -11825,6 +11858,11 @@ export function issueRoutes(
             status: actionStatus,
             outcome: recordedOutcome,
             resolutionNote: resolutionNote ?? null,
+            // Drop the automatic no-replay hold only when the restore lands an
+            // armed stage; otherwise leave the resolved action's evidence intact.
+            evidence: restoredLandsArmedStage
+              ? clearRecoveryReplayHold(activeRecoveryAction.evidence)
+              : undefined,
             // Explicit operator resolution of the escalation: allowed to clear a
             // terminal swept-exhausted action so a genuinely new action can be
             // minted on the next upsert. (SUP-13698)
@@ -11839,6 +11877,7 @@ export function issueRoutes(
           recoveryAction,
           chatRetry,
           reviewEscalation: recoveryEscalationPayload,
+          restoredLandsArmedStage,
         };
       });
       if (result.replayed) {
@@ -11970,6 +12009,37 @@ export function issueRoutes(
               agentId: result.issue.assigneeAgentId,
             },
             "failed to wake agent after recovery action restored issue",
+          );
+        }
+      } else if (result.restoredLandsArmedStage) {
+        // SUP-16684: the restore armed a fresh execution stage, but the resolve
+        // lanes above only wake a `todo` handback. Mint the same execution-stage
+        // wake the PATCH and board-decision paths would, so the restored stage is
+        // actually reachable instead of armed and stranded. Best effort: a wake
+        // failure must not fail an already-committed resolution.
+        try {
+          const nextExecutionState = parseIssueExecutionState(
+            result.issue.executionState,
+          );
+          const executionStageWakeup = buildExecutionStageWakeup({
+            issueId: result.issue.id,
+            previousState: null,
+            nextState: nextExecutionState,
+            interruptedRunId: null,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            requestedByRunId: actor.runId ?? null,
+          });
+          if (executionStageWakeup) {
+            await enqueueExecutionStageWakeup(executionStageWakeup.agentId, {
+              ...executionStageWakeup.wakeup,
+              idempotencyKey: `recovery-restored-stage-wake:${result.recoveryAction.id}`,
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: result.issue.id },
+            "failed to wake agent for restored execution stage",
           );
         }
       }
