@@ -284,12 +284,23 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         await request.get(`/api/issues/${parent.id}/comments`),
       );
       expect(JSON.stringify(comments)).toContain("Please check mobile too.");
-      const queue = await json(
-        await request.get(`/api/issues/${parent.id}/queued-comments`),
-      );
-      expect(JSON.stringify(queue.entries)).toContain(
-        "Please check mobile too.",
-      );
+      // The comment only appears in the queue once the server admits it into a
+      // queued-comment wake, which can lag the comment post. Wait for that
+      // observable instead of asserting on a single snapshot.
+      await expect
+        .poll(
+          async () => {
+            const queue = await json(
+              await request.get(`/api/issues/${parent.id}/queued-comments`),
+            );
+            return queue.entries.some(
+              (entry: { comment: { body: string } }) =>
+                entry.comment.body.includes("Please check mobile too."),
+            );
+          },
+          { timeout: 30_000 },
+        )
+        .toBe(true);
 
       let dispatchedAt = 0;
       page.on("request", (req) => {
