@@ -27,11 +27,6 @@ vi.mock("../middleware/logger.js", () => ({
   logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-vi.mock("../services/index.js", () => ({
-  secretService: () => ({ getByName: vi.fn(), resolveSecretValue: vi.fn() }),
-  logActivity: vi.fn(),
-}));
-
 const { privateKey: FIXTURE_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }) as string;
 const FIXTURE_TOKEN = "ghs_test_installation_token_for_agent_route_tests_only";
