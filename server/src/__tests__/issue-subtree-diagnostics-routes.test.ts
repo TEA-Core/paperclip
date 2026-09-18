@@ -229,7 +229,8 @@ describeEmbeddedPostgres("issue subtree diagnostics route", () => {
       title: "Unfinished child blocker",
       status: "in_progress",
     });
-    const rawMarker = `RAW-SUBTREE-${randomUUID()}`;
+    const payloadMarker = `PAYLOAD-SUBTREE-${randomUUID()}`;
+    const errorMarker = `ERRSUBTREE-${randomUUID()}`;
     await blockIssue(db, company.id, child.id, root.id);
     await db.insert(agentWakeupRequests).values({
       companyId: company.id,
@@ -237,8 +238,8 @@ describeEmbeddedPostgres("issue subtree diagnostics route", () => {
       source: "automation",
       reason: "issue_commented",
       status: "completed",
-      payload: { issueId: child.id, privateValue: rawMarker },
-      error: `secret ${rawMarker}`,
+      payload: { issueId: child.id, privateValue: payloadMarker },
+      error: `transient ${errorMarker}`,
       requestedAt: new Date(Date.now() - 5_000),
       finishedAt: new Date(Date.now() - 1_000),
     });
@@ -273,19 +274,28 @@ describeEmbeddedPostgres("issue subtree diagnostics route", () => {
       parentId: root.id,
       depth: 1,
       wakeRequestCount: 1,
-      wakeEvents: [expect.objectContaining({ kind: "wake_request", reason: "issue_commented", status: "completed" })],
+      wakeEvents: [
+        expect.objectContaining({
+          kind: "wake_request",
+          reason: "issue_commented",
+          // Known reason is not re-surfaced raw; the error is surfaced because
+          // this is a company-scoped (board) read.
+          rawReason: null,
+          status: "completed",
+        }),
+      ],
     });
+    expect(childNode.wakeEvents[0].error).toContain(errorMarker);
     expect(res.body.edges).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "parent", fromIssueId: root.id, toIssueId: child.id }),
       expect.objectContaining({ kind: "blocks", fromIssueId: child.id, toIssueId: root.id }),
       expect.objectContaining({ kind: "wake_request", issueId: child.id, reason: "issue_commented" }),
     ]));
     const serialized = JSON.stringify(res.body);
-    expect(serialized).not.toContain(rawMarker);
+    expect(serialized).not.toContain(payloadMarker);
     expect(serialized).not.toContain("\"payload\"");
     expect(serialized).not.toContain("\"details\"");
     expect(serialized).not.toContain("\"triggerDetail\"");
-    expect(serialized).not.toContain("\"error\"");
   });
 
   it("returns null diagnosis for a quiet unblocked singleton subtree", async () => {

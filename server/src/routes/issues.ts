@@ -1857,6 +1857,36 @@ function wakeFailureClass(
   return null;
 }
 
+// SUP-16680: the wake error is surfaced only to company-scoped callers,
+// head-bounded so one large recorded error cannot bloat the diagnostics body.
+export const ISSUE_WAKE_DIAGNOSTIC_ERROR_MAX_LENGTH = 512;
+
+// SUP-16680: the raw wake reason (only when it is outside the known-reason
+// allowlist, i.e. it projected to "other") is surfaced to company-scoped
+// callers so the actual skip/failure class is nameable from the response.
+function projectWakeDiagnosticRawReason(
+  rawReason: string | null,
+  includeInternalIds: boolean,
+): string | null {
+  if (!includeInternalIds) return null;
+  if (!rawReason) return null;
+  return ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(rawReason) ? null : rawReason;
+}
+
+// SUP-16680: the recorded wake error is surfaced to company-scoped callers,
+// redacted and head-bounded, so a stranded wake is diagnosable without DB.
+function projectWakeDiagnosticErrorDetail(
+  rawError: string | null,
+  includeInternalIds: boolean,
+): string | null {
+  if (!includeInternalIds) return null;
+  if (!rawError) return null;
+  return redactSensitiveText(rawError).slice(
+    0,
+    ISSUE_WAKE_DIAGNOSTIC_ERROR_MAX_LENGTH,
+  );
+}
+
 function projectIssueWakeRequest(
   row: {
     agentId: string;
@@ -1878,6 +1908,7 @@ function projectIssueWakeRequest(
     agentId: options.includeInternalIds ? row.agentId : null,
     source: projectWakeDiagnosticSource(row.source) ?? "other",
     reason: projectWakeDiagnosticReason(row.reason),
+    rawReason: projectWakeDiagnosticRawReason(row.reason, options.includeInternalIds),
     status,
     coalescedCount: row.coalescedCount,
     runId: options.includeInternalIds ? row.runId : null,
@@ -1885,6 +1916,7 @@ function projectIssueWakeRequest(
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
+    error: projectWakeDiagnosticErrorDetail(row.error, options.includeInternalIds),
   };
 }
 

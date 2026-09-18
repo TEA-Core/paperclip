@@ -270,6 +270,14 @@ export interface IssueWakeDiagnosticWakeRequest {
   agentId: string | null;
   source: string;
   reason: string | null;
+  /**
+   * The recorded wake reason when it falls outside the known-reason allowlist,
+   * so a company-scoped caller can name the actual skip/failure class (e.g. the
+   * deferrable, transient `heartbeat.scheduling_suppressed`) instead of the
+   * generic "other". Null when the reason is a known value or when the caller
+   * lacks company scope (includeInternalIds).
+   */
+  rawReason: string | null;
   status: string;
   coalescedCount: number;
   runId: string | null;
@@ -277,6 +285,14 @@ export interface IssueWakeDiagnosticWakeRequest {
   claimedAt: string | null;
   finishedAt: string | null;
   failureClass: IssueWakeDiagnosticWakeFailureClass | null;
+  /**
+   * The wake's recorded error, redacted and head-bounded to
+   * ISSUE_WAKE_DIAGNOSTIC_ERROR_MAX_LENGTH, so a company-scoped caller can
+   * distinguish a replayable transient suppression from a permanent failure
+   * from the response alone. Null when there is no recorded error or when the
+   * caller lacks company scope (includeInternalIds).
+   */
+  error: string | null;
 }
 
 export interface IssueWakeDiagnosticActivityRecord {

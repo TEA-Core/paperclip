@@ -21,7 +21,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
-import { issueRoutes } from "../routes/issues.js";
+import { issueRoutes, ISSUE_WAKE_DIAGNOSTIC_ERROR_MAX_LENGTH } from "../routes/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -257,16 +257,19 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       runId: wakeRunId,
       source: "automation",
       reason: "issue_blockers_resolved",
+      // A known reason is not re-surfaced raw, and a completed wake with no
+      // recorded error carries no failure detail.
+      rawReason: null,
       status: "completed",
       coalescedCount: 2,
       failureClass: null,
+      error: null,
     });
     const serialized = JSON.stringify(res.body);
     expect(serialized).not.toContain("SHOULD_NOT_LEAK");
     expect(serialized).not.toContain("\"payload\"");
     expect(serialized).not.toContain("\"details\"");
     expect(serialized).not.toContain("\"triggerDetail\"");
-    expect(serialized).not.toContain("\"error\"");
   });
 
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {
@@ -452,7 +455,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(res.body.error).toBe("Issue not found");
   });
 
-  it("projects activity records and wake failures without raw blobs", async () => {
+  it("surfaces a bounded wake error and raw reason to company-scoped callers without leaking payload blobs", async () => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);
     const project = await seedProject(db, company.id, "Core");
@@ -463,7 +466,11 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       status: "todo",
       assigneeAgentId: agent.id,
     });
-    const rawMarker = `RAW-DETAIL-${randomUUID()}`;
+    const payloadMarker = `PAYLOAD-BLOB-${randomUUID()}`;
+    const headSentinel = `WDHEAD-${randomUUID().slice(0, 8)}`;
+    const tailSentinel = `WDTAIL-${randomUUID().slice(0, 8)}`;
+    // Long enough to exceed the documented cap so the head-bound is exercised.
+    const errorBody = `${headSentinel} ${"x".repeat(600)} ${tailSentinel}`;
     const [activityRun] = await db.insert(heartbeatRuns).values({
       companyId: company.id,
       agentId: agent.id,
@@ -477,8 +484,8 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       source: "automation",
       reason: "unknown-private-reason",
       status: "failed",
-      payload: { issueId: issue.id, privateValue: rawMarker },
-      error: `secret stack ${rawMarker}`,
+      payload: { issueId: issue.id, privateValue: payloadMarker },
+      error: errorBody,
       requestedAt: new Date(Date.now() - 60_000),
     });
     await db.insert(activityLog).values({
@@ -495,8 +502,8 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
         holdId: "hold-safe",
         source: "automation",
         requestedReason: "issue_commented",
-        triggerDetail: rawMarker,
-        secret: rawMarker,
+        triggerDetail: payloadMarker,
+        secret: payloadMarker,
       },
       createdAt: new Date(Date.now() - 1_000),
     });
@@ -517,18 +524,125 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       holdId: "hold-safe",
       summary: "Wake was deferred because an active issue-tree hold was present.",
     });
+    // SUP-16680: a company-scoped caller now sees the raw reason plus a
+    // redacted, bounded error so the failure is diagnosable from the response.
     expect(res.body.events[1]).toMatchObject({
       kind: "wake_request",
       reason: "other",
+      rawReason: "unknown-private-reason",
       status: "failed",
       failureClass: "failed",
     });
+    expect(typeof res.body.events[1].error).toBe("string");
+    // The error is head-bounded to the documented cap, keeping the head and
+    // dropping the tail; the raw reason is surfaced verbatim.
+    expect(res.body.events[1].error).toHaveLength(ISSUE_WAKE_DIAGNOSTIC_ERROR_MAX_LENGTH);
+    expect(res.body.events[1].error).toContain(headSentinel);
+    expect(res.body.events[1].error).not.toContain(tailSentinel);
+    // The payload blob and activity details remain unprojected.
     const serialized = JSON.stringify(res.body);
-    expect(serialized).not.toContain(rawMarker);
+    expect(serialized).not.toContain(payloadMarker);
     expect(serialized).not.toContain("\"payload\"");
     expect(serialized).not.toContain("\"details\"");
     expect(serialized).not.toContain("\"triggerDetail\"");
-    expect(serialized).not.toContain("\"error\"");
+  });
+
+  it("withholds raw reason and wake error from non-company-scoped agents", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const allowedProject = await seedProject(db, company.id, "Allowed");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: allowedProject.id,
+      title: "Scoped root",
+      status: "todo",
+    });
+    const visibleBlocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: allowedProject.id,
+      title: "Visible blocker",
+      status: "in_progress",
+    });
+    const marker = `GATED-${randomUUID()}`;
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "assignment",
+      reason: "heartbeat.scheduling_suppressed",
+      status: "skipped",
+      coalescedCount: 0,
+      payload: { issueId: root.id },
+      error: `transient suppression ${marker}`,
+      requestedAt: new Date(Date.now() - 5_000),
+      finishedAt: new Date(Date.now() - 3_000),
+    });
+    const run = await attachLowTrustRun(db, { company, agent, allowedProject, root, visibleBlocker });
+
+    const res = await request(createApp(db, agentActor(company, agent, run.id)))
+      .get(`/api/issues/${root.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    // A non-company-scoped agent sees only the generic projection: the raw
+    // reason and error are withheld, not merely blanked.
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      agentId: null,
+      runId: null,
+      reason: "other",
+      rawReason: null,
+      status: "skipped",
+      failureClass: "failed",
+      error: null,
+    });
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain(marker);
+    expect(serialized).not.toContain("heartbeat.scheduling_suppressed");
+  });
+
+  it("names the transient skip class for a skipped wake that carries an error (SUP-16430 shape)", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Stranded wake",
+      status: "todo",
+      assigneeAgentId: agent.id,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "assignment",
+      reason: "heartbeat.scheduling_suppressed",
+      status: "skipped",
+      coalescedCount: 0,
+      payload: { issueId: issue.id },
+      runId: null,
+      error: "instance draining; will re-drive on next heartbeat",
+      requestedAt: new Date(Date.now() - 5_000),
+      finishedAt: new Date(Date.now() - 3_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    // Reproduce the SUP-16430 shape: a *skipped* wake whose recorded error
+    // still classifies as failureClass "failed". rawReason now names the
+    // deferrable transient class, and error carries the detail, so a
+    // company-scoped caller can diagnose it without DB access.
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      source: "assignment",
+      reason: "other",
+      rawReason: "heartbeat.scheduling_suppressed",
+      status: "skipped",
+      failureClass: "failed",
+    });
+    expect(res.body.events[0].error).toContain("instance draining");
   });
 
   it("caps wake output and reports truncation", async () => {
