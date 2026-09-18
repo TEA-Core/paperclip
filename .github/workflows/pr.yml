@@ -537,7 +537,14 @@ jobs:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Raised from 20 on 2026-09-18 (SUP-16686). The worst server shard measured
+    # 17m33s on the fully green run 35289958945 (merge_group for #722) after the
+    # duration manifest was refreshed, and shard 3/5 was cancelled at 20m15s on
+    # run 35281312708 when its suite mix ran slower. 30 leaves the worst observed
+    # shard at 58% of the cap and sets the 80%-of-cap warning line at 24m, above
+    # every observed shard. The refreshed general-server-shard-durations.json
+    # brings the predicted worst general-server shard to ~15.0m.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
