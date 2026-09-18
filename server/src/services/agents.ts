@@ -40,7 +40,7 @@ import {
   collectUserSecretRefs,
   syncAgentAdapterEnvBindings,
 } from "./agent-secret-bindings.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
@@ -519,7 +519,7 @@ export function agentService(db: Db) {
     const actorType = actor.createdByUserId ? "user" as const : actor.createdByAgentId ? "agent" as const : "system" as const;
     const actorId = actor.createdByUserId ?? actor.createdByAgentId ?? "system";
     for (const ref of createdRefs) {
-      await logActivity(dbClient, {
+      await logActivityInTransaction(dbClient, {
         companyId: agent.companyId,
         actorType,
         actorId,

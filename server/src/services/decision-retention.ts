@@ -19,7 +19,7 @@ import type {
   AttentionSourceKind,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import type { AuthorizationActor } from "./authorization.js";
 import {
   canReadDecisionSource,
@@ -325,7 +325,7 @@ export function decisionRetentionService(
         if (archived.length !== 1) {
           throw conflict("archive_proposal_stale", { code: "archive_proposal_stale" });
         }
-        await logActivity(txDb, {
+        await logActivityInTransaction(txDb, {
           companyId: input.companyId,
           actorType: "system",
           actorId: "decision-archive-proposal",
@@ -380,7 +380,7 @@ export function decisionRetentionService(
             originIssueId: origin.originIssueId,
           }).onConflictDoNothing();
         }
-        await logActivity(txDb, {
+        await logActivityInTransaction(txDb, {
           companyId: input.companyId,
           actorType: "system",
           actorId: "decision-retention-sweeper",

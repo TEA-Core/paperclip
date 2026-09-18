@@ -56,6 +56,7 @@ import type {
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
+  PluginIssueListRow,
   PluginIssueSubtree,
   PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
@@ -1843,7 +1844,7 @@ export interface WorkerToHostMethods {
       limit?: number;
       offset?: number;
     },
-    result: Issue[],
+    result: PluginIssueListRow[],
   ];
   "issues.get": [
     params: { issueId: string; companyId: string },

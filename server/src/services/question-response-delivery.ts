@@ -19,7 +19,7 @@ import type { PaperclipQuestionResponse } from "../vendor/paperclip-runner/index
 import { isUniqueViolation } from "../db-errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { logger } from "../middleware/logger.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 import type { heartbeatService } from "./heartbeat.js";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 
@@ -541,7 +541,7 @@ export function questionResponseDeliveryService(
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
-      await logActivity(tx as unknown as Db, {
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: input.interaction.companyId,
         actorType: "system",
         actorId: "question-response-delivery",

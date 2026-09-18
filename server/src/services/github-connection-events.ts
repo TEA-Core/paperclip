@@ -8,7 +8,7 @@ import {
 } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import {
-  logActivity,
+  logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
@@ -405,7 +405,7 @@ export function githubConnectionEventService(
           eq(connectionEventDeliveries.provider, event.provider),
           eq(connectionEventDeliveries.providerDeliveryId, event.id),
         ));
-        await logActivity(database, {
+        await logActivityInTransaction(database, {
           companyId,
           actorType: "system",
           actorId: "system:github-webhook",

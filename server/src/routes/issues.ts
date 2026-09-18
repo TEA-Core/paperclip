@@ -546,6 +546,22 @@ type NormalizedExecutionPolicy = NonNullable<
   ReturnType<typeof normalizeIssueExecutionPolicy>
 >;
 type IssueRouteSnapshot = typeof issueRows.$inferSelect;
+/**
+ * SUP-16741: list reads (`issueListSelect`) omit the execution-ladder columns
+ * for perf, so a row handed to recovery revalidation may legitimately be
+ * missing them. They are absent (not `null`) there — callers must treat the
+ * absence as "not projected", not as "no ladder".
+ */
+type IssueRouteSnapshotExecutionOptional = Omit<
+  IssueRouteSnapshot,
+  "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+> &
+  Partial<
+    Pick<
+      IssueRouteSnapshot,
+      "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+    >
+  >;
 type RecoveryRevalidationTrigger =
   "issue_update" | "comment" | "document" | "work_product" | "read_projection";
 type CompanySearchService = {
@@ -5502,7 +5518,7 @@ export function issueRoutes(
   }
 
   async function classifySourceRecoveryRevalidation(input: {
-    issue: IssueRouteSnapshot;
+    issue: IssueRouteSnapshotExecutionOptional;
     trigger: RecoveryRevalidationTrigger;
     activeRecoveryAction?: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>> | null;
     statusChanged?: boolean;
@@ -5664,7 +5680,7 @@ export function issueRoutes(
   }
 
   async function revalidateActiveSourceRecovery(input: {
-    issue: IssueRouteSnapshot;
+    issue: IssueRouteSnapshotExecutionOptional;
     trigger: RecoveryRevalidationTrigger;
     actor?: ReturnType<typeof getActorInfo> | null;
     activeRecoveryAction?: Awaited<
@@ -9869,7 +9885,9 @@ export function issueRoutes(
       allowTtlCache: compactView,
       diagnostics: opts.issueListDiagnostics,
       compute: async () => {
-        const rawResult = await svc.list(companyId, listFilters);
+        const rawResult: Array<
+          (Awaited<ReturnType<typeof svc.list>>)[number]
+        > = await svc.list(companyId, listFilters);
         const result = (await actorCanReadCompanyScope(req, companyId))
           ? rawResult
           : await filterIssuesForActor(req, rawResult);
@@ -10096,7 +10114,9 @@ export function issueRoutes(
       let offset = 0;
       let visibleCount = 0;
       while (true) {
-        const rows = await svc.list(companyId, {
+        const rows: Array<
+          (Awaited<ReturnType<typeof svc.list>>)[number]
+        > = await svc.list(companyId, {
           ...blockedCountFilters,
           limit: ISSUE_LIST_MAX_LIMIT,
           offset,
@@ -12267,6 +12287,13 @@ export function issueRoutes(
       res.json({ summaries: Object.fromEntries(summaries) });
     },
   );
+
+  router.get("/companies/:companyId/external-objects/stuck", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const objects = await externalObjectsSvc.getStuckObjects(companyId);
+    res.json(objects);
+  });
 
   router.post(
     "/issues/:id/external-objects/refresh",
@@ -16826,7 +16853,7 @@ export function issueRoutes(
       const previous = Object.fromEntries(
         Object.entries(changes).map(([key, change]) => [key, change.from]),
       );
-      await logActivity(tx as unknown as Db, {
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: updated.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,

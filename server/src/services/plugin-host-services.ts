@@ -20,6 +20,7 @@ import type {
   Agent,
   Project,
   Issue,
+  PluginIssueListRow,
   Goal,
   PluginWorkspace,
   IssueComment,
@@ -1905,7 +1906,7 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         assertReadableOriginFilter(params.originKind);
-        return applyWindow((await issues.list(companyId, params as any)) as Issue[], params);
+        return applyWindow((await issues.list(companyId, params as any)) as PluginIssueListRow[], params);
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);

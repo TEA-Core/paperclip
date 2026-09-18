@@ -94,7 +94,7 @@ import {
   TARGET_BOUND_INTERACTION_KINDS,
   USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
 } from "./issue-interaction-kinds.js";
-import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -1170,7 +1170,7 @@ async function resolveLinkedSecretProposal(
     outcome.actor.agentId ??
     outcome.actor.systemId ??
     "system";
-  await logActivity(db, {
+  await logActivityInTransaction(db, {
     companyId: interaction.companyId,
     actorType,
     actorId,
@@ -2303,7 +2303,7 @@ export function issueThreadInteractionService(
       );
 
       if (args.actor.systemId) {
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: args.issue.companyId,
           actorType: "system",
           actorId: args.actor.systemId,
@@ -3073,7 +3073,7 @@ export function issueThreadInteractionService(
                 eq(companySecretProposals.status, "pending"),
               ),
             );
-          await logActivity(tx as unknown as Db, {
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: issue.companyId,
             actorType: current.resolvedByUserId ? "user" : "system",
             actorId: current.resolvedByUserId ?? "system",

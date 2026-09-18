@@ -13,7 +13,7 @@ import {
   type SkillPolicySourceType,
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
-import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { logActivityInTransaction, type LogActivityInput } from "./activity-log.js";
 
 export type SkillPolicyPrincipal = {
   type: "agent" | "board";
@@ -246,7 +246,7 @@ export function companySkillPolicyService(db: Db) {
           });
         }
       }
-      await logActivity(transactionDb, {
+      await logActivityInTransaction(transactionDb, {
         ...input.activity,
         companyId: input.companyId,
         action: "company.skill_policy_replaced",
@@ -275,7 +275,7 @@ export function companySkillPolicyService(db: Db) {
         .returning({ revision: companySkillPolicies.revision })
         .then((rows) => rows[0] ?? null);
       if (existing) {
-        await logActivity(transactionDb, {
+        await logActivityInTransaction(transactionDb, {
           ...input.activity,
           companyId: input.companyId,
           action: "company.skill_policy_reset",
