@@ -29,10 +29,11 @@ const FIXTURE_INSTALLATION_ID = "12345678";
 const { privateKey: FIXTURE_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
 });
-const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }, "utf8");
+const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }) as string;
 
+const mockSelect = vi.fn();
 const mockDb = {
-  select: vi.fn(),
+  select: mockSelect,
 } as unknown as Parameters<typeof resolveGitHubTokenForRepo>[0];
 
 const mockSecretService = {
@@ -162,7 +163,7 @@ describe("resolveGitHubToken", () => {
   beforeEach(() => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
-    mockDb.select.mockReset();
+    mockSelect.mockReset();
     appTokenCache.clear();
   });
 
@@ -216,7 +217,9 @@ describe("resolveGitHubToken", () => {
 
     const result = await resolveGitHubToken(mockDb, "company-1");
     expect(result.token).toBeNull();
-    expect(result.reason).toContain("No GitHub token resolvable");
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.reason).toContain("No GitHub token resolvable");
+    }
   });
 
   it("skips empty/whitespace-only secret values and continues", async () => {
@@ -241,7 +244,7 @@ describe("resolveGitHubToken — App installation token", () => {
   beforeEach(() => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
-    mockDb.select.mockReset();
+    mockSelect.mockReset();
     appTokenCache.clear();
   });
 
@@ -608,7 +611,7 @@ describe("resolveAppInstallationToken — App identity selection", () => {
   beforeEach(() => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
-    mockDb.select.mockReset();
+    mockSelect.mockReset();
     appTokenCache.clear();
   });
 
@@ -662,9 +665,9 @@ describe("resolveAppInstallationToken — App identity selection", () => {
         { appId: "9999001", privateKeySecretName: "SECOND_APP_KEY" },
       );
 
-      expect(isGitHubTokenResolution(fleetApp)).toBe(true);
-      expect(isGitHubTokenResolution(secondApp)).toBe(true);
-      if (isGitHubTokenResolution(fleetApp) && isGitHubTokenResolution(secondApp)) {
+      expect(isGitHubTokenResolution(fleetApp!)).toBe(true);
+      expect(isGitHubTokenResolution(secondApp!)).toBe(true);
+      if (isGitHubTokenResolution(fleetApp!) && isGitHubTokenResolution(secondApp!)) {
         // Two Apps on the same company/owner/repo each mint their own token —
         // the second App did not reuse the first App's cache entry.
         expect(fleetApp.token).toBe("ghs_app_token_mint_1");
@@ -683,7 +686,7 @@ describe("resolveAppInstallationToken — App identity selection", () => {
         undefined,
         { appId: GITHUB_APP_ID, privateKeySecretName: "FLEET_APP_KEY" },
       );
-      if (isGitHubTokenResolution(fleetApp) && isGitHubTokenResolution(fleetAppAgain)) {
+      if (isGitHubTokenResolution(fleetApp!) && isGitHubTokenResolution(fleetAppAgain!)) {
         expect(fleetAppAgain.token).toBe(fleetApp.token);
       }
       expect(mintCount).toBe(2);
@@ -735,7 +738,7 @@ describe("resolveAppInstallationToken — App identity selection", () => {
         undefined,
         DEFAULT_GITHUB_APP,
       );
-      expect(isGitHubTokenResolution(broad)).toBe(true);
+      expect(isGitHubTokenResolution(broad!)).toBe(true);
       expect(mintCount).toBe(1);
 
       // Narrow: a narrowed permission set must mint its OWN token — it must NOT
@@ -750,8 +753,8 @@ describe("resolveAppInstallationToken — App identity selection", () => {
         DEFAULT_GITHUB_APP,
         { contents: "read" },
       );
-      expect(isGitHubTokenResolution(narrow)).toBe(true);
-      if (isGitHubTokenResolution(broad) && isGitHubTokenResolution(narrow)) {
+      expect(isGitHubTokenResolution(narrow!)).toBe(true);
+      if (isGitHubTokenResolution(broad!) && isGitHubTokenResolution(narrow!)) {
         expect(broad.token).toBe("ghs_perm_token_mint_1");
         expect(narrow.token).toBe("ghs_perm_token_mint_2");
         expect(narrow.token).not.toBe(broad.token);
@@ -768,7 +771,7 @@ describe("resolveAppInstallationToken — App identity selection", () => {
         DEFAULT_GITHUB_APP,
         { contents: "read" },
       );
-      if (isGitHubTokenResolution(narrow) && isGitHubTokenResolution(narrowAgain)) {
+      if (isGitHubTokenResolution(narrow!) && isGitHubTokenResolution(narrowAgain!)) {
         expect(narrowAgain.token).toBe(narrow.token);
       }
       expect(mintCount).toBe(2);
@@ -918,7 +921,7 @@ describe("resolveGitHubTokenForRepo", () => {
   beforeEach(() => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
-    mockDb.select.mockReset();
+    mockSelect.mockReset();
     appTokenCache.clear();
   });
 
@@ -933,7 +936,7 @@ describe("resolveGitHubTokenForRepo", () => {
         { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
 
@@ -956,7 +959,7 @@ describe("resolveGitHubTokenForRepo", () => {
         { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue
       .mockResolvedValueOnce("   ")
@@ -982,14 +985,16 @@ describe("resolveGitHubTokenForRepo", () => {
         { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv: { GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-1", version: "latest" } } },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockResolvedValue("   ");
     mockSecretService.getByName.mockResolvedValue(null);
 
     const result = await resolveGitHubTokenForRepo(mockDb, "company-1", "owner", "repo");
     expect(result.token).toBeNull();
-    expect(result.reason).toContain("No GitHub token bound to project");
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.reason).toContain("No GitHub token bound to project");
+    }
   });
 
   it("returns unresolved when repo is not found at company or project scope", async () => {
@@ -998,13 +1003,15 @@ describe("resolveGitHubTokenForRepo", () => {
       innerJoin: vi.fn().mockReturnThis(),
       where: vi.fn().mockResolvedValue([]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.getByName.mockResolvedValue(null);
 
     const result = await resolveGitHubTokenForRepo(mockDb, "company-1", "owner", "repo");
     expect(result.token).toBeNull();
-    expect(result.reason).toContain("repo not found");
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.reason).toContain("repo not found");
+    }
   });
 
   it("reports 'repo not found' (not a project-bound-token message) when only a substring-containing workspace matches", async () => {
@@ -1015,14 +1022,16 @@ describe("resolveGitHubTokenForRepo", () => {
         { repoUrl: "https://github.com/TEA-Core/paperclip-smart-router" },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.getByName.mockResolvedValue(null);
 
     const result = await resolveGitHubTokenForRepo(mockDb, "company-1", "TEA-Core", "paperclip");
     expect(result.token).toBeNull();
-    expect(result.reason).toContain("repo not found");
-    expect(result.reason).not.toContain("No GitHub token bound to project");
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.reason).toContain("repo not found");
+      expect(result.reason).not.toContain("No GitHub token bound to project");
+    }
   });
 
   it("resolves app_installation token with repo context for resolveGitHubTokenForRepo", async () => {
@@ -1039,7 +1048,7 @@ describe("resolveGitHubTokenForRepo", () => {
       innerJoin: vi.fn().mockReturnThis(),
       where: vi.fn().mockResolvedValue([]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     const restoreFetch = mockAppFetchResponses([
       {
@@ -1104,7 +1113,7 @@ describe("diagnostics route", () => {
     });
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
-    mockDb.select.mockReset();
+    mockSelect.mockReset();
     mockGhFetch.ghFetch.mockReset();
     appTokenCache.clear();
   });
@@ -1457,7 +1466,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
   beforeEach(() => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
-    mockDb.select.mockReset();
+    mockSelect.mockReset();
   });
 
   it("returns project_env candidate first, then company candidate", async () => {
@@ -1471,7 +1480,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
       if (secretId === "secret-1") return "company-token-value";
@@ -1503,7 +1512,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue
       .mockResolvedValueOnce("   ")
@@ -1530,7 +1539,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
     mockSecretService.getByName.mockImplementation((_companyId, name) => {
@@ -1552,7 +1561,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv: { GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-1", version: "latest" } } },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockResolvedValue("   ");
     mockSecretService.getByName.mockResolvedValue(null);
@@ -1567,7 +1576,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
       innerJoin: vi.fn().mockReturnThis(),
       where: vi.fn().mockResolvedValue([]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.getByName.mockResolvedValue(null);
 
@@ -1598,7 +1607,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
       if (secretId === "sr-secret") return "smart-router-token-should-never-appear";
@@ -1631,7 +1640,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
     mockSecretService.getByName.mockResolvedValue(null);
@@ -1657,7 +1666,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
     mockSecretService.getByName.mockResolvedValue(null);
@@ -1683,7 +1692,7 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
         },
       ]),
     };
-    mockDb.select.mockReturnValue(selectChain);
+    mockSelect.mockReturnValue(selectChain);
 
     mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
     mockSecretService.getByName.mockResolvedValue(null);
@@ -1703,7 +1712,7 @@ describe("GitHub token resolution — per-arm fail-soft on secret resolution err
   let loggerWarn: ReturnType<typeof vi.fn>;
 
   function mockProjectRows(rows: unknown[]) {
-    mockDb.select.mockReturnValue({
+    mockSelect.mockReturnValue({
       from: vi.fn().mockReturnThis(),
       innerJoin: vi.fn().mockReturnThis(),
       where: vi.fn().mockResolvedValue(rows),
@@ -1713,7 +1722,7 @@ describe("GitHub token resolution — per-arm fail-soft on secret resolution err
   beforeEach(async () => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
-    mockDb.select.mockReset();
+    mockSelect.mockReset();
     appTokenCache.clear();
     const loggerModule = await import("../middleware/logger.js");
     loggerWarn = vi.mocked(loggerModule.logger.warn);
@@ -1816,7 +1825,9 @@ describe("GitHub token resolution — per-arm fail-soft on secret resolution err
 
     const result = await resolveGitHubTokenForRepo(mockDb, "company-1", "owner", "repo");
     expect(result.token).toBeNull();
-    expect(result.reason).toContain("No GitHub token bound to project");
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.reason).toContain("No GitHub token bound to project");
+    }
   });
 
   it("resolveGitHubToken: skips a disabled company secret and falls through to the next name", async () => {
@@ -1848,7 +1859,9 @@ describe("GitHub token resolution — per-arm fail-soft on secret resolution err
     const result = await resolveGitHubToken(mockDb, "company-1");
 
     expect(result.token).toBeNull();
-    expect(result.reason).toContain("No GitHub token resolvable");
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.reason).toContain("No GitHub token resolvable");
+    }
   });
 });
 
