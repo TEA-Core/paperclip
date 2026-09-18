@@ -83,6 +83,12 @@ export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed
 export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
 export const DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION = "issue.done_close_landing_reenqueue_refused";
 export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
+// SUP-16689: a decision-carried `done` card whose (only) linked PR is a still-open
+// DRAFT. A draft can never auto-merge, so the re-enqueue / confirmed / failed legs
+// all miss it, and the resolvers are draft-blind by default — leaving the card
+// silently unaudited until the 7-day discovery window ages its skip row out. This
+// row makes the strand visible and owned (report only: no re-enqueue, no quota).
+export const DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION = "issue.done_close_landing_draft_stranded";
 // SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by the
 // prefix predicate cannot land through its own card. Instead of re-opening it
 // into a board park that its own parent blocks on, the landing obligation is
@@ -130,6 +136,7 @@ export interface DoneCloseLandingSweepResult {
   deferred: number;
   reenqueued: number;
   escalated: number;
+  draftStranded: number;
 }
 
 export type MeasuredPullRequestState = "merged" | "closed" | "open";
@@ -168,6 +175,7 @@ interface SweepCounts {
   deferred: number;
   reenqueued: number;
   escalated: number;
+  draftStranded: number;
 }
 
 /** A live-measured PR, captured in the first pass before any disposition. */
@@ -329,7 +337,7 @@ export function createDoneCloseLandingBackstopService(
     // The heartbeat tick fires every 30s; GitHub measurement is expensive, so
     // every non-due tick is a no-op.
     if (lastRunAt !== null && checkedAt.getTime() - lastRunAt < sweepIntervalMs) {
-      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 };
+      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 };
     }
     lastRunAt = checkedAt.getTime();
     const result: DoneCloseLandingSweepResult = {
@@ -340,6 +348,7 @@ export function createDoneCloseLandingBackstopService(
       deferred: 0,
       reenqueued: 0,
       escalated: 0,
+      draftStranded: 0,
     };
 
     const windowStart = new Date(checkedAt.getTime() - lookbackMs);
@@ -361,7 +370,7 @@ export function createDoneCloseLandingBackstopService(
     const svc = issueService(db);
 
     for (const row of candidates) {
-      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 };
+      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 };
       try {
         await sweepCandidate(row, counts, { resolver, svc, graceCutoff });
       } catch (err) {
@@ -375,6 +384,7 @@ export function createDoneCloseLandingBackstopService(
       result.deferred += counts.deferred;
       result.reenqueued += counts.reenqueued;
       result.escalated += counts.escalated;
+      result.draftStranded += counts.draftStranded;
     }
     return result;
   }
@@ -409,6 +419,7 @@ export function createDoneCloseLandingBackstopService(
       db,
       issue.companyId,
       issue.id,
+      { includeDrafts: true },
     );
     if (prs.length === 0) {
       // SUP-14917: zero cached mentions — the PR was delivered from a workspace and
@@ -420,7 +431,7 @@ export function createDoneCloseLandingBackstopService(
         issue.companyId,
         issue.id,
         issue.identifier ?? "",
-        { closingTransition: true },
+        { closingTransition: true, includeDrafts: true },
       );
       if (resolution.kind === "none") return;
       if (resolution.kind === "undetermined" || resolution.kind === "ambiguous") {
@@ -440,6 +451,7 @@ export function createDoneCloseLandingBackstopService(
         cachedState: null,
         lastErrorCode: null,
         reviewDecision: null,
+        draft: resolution.draft,
       });
     }
 
@@ -481,6 +493,7 @@ export function createDoneCloseLandingBackstopService(
               DONE_CLOSE_LANDING_ESCALATED_ACTION,
               DONE_CLOSE_LANDING_ATTRIBUTED_ACTION,
               DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION,
+              DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
             ],
           ),
           // This card's own rows (per-card ledger) OR any company row that
@@ -523,6 +536,18 @@ export function createDoneCloseLandingBackstopService(
         .filter(
           (r) =>
             r.action === DONE_CLOSE_LANDING_ATTRIBUTED_ACTION && r.entityId === issue.id,
+        )
+        .map((r) => readString(readRecord(r.details)?.pr))
+        .filter((value): value is string => value !== null),
+    );
+    // SUP-16689: per-card draft-stranded ledger. A draft PR is un-mergeable, so a
+    // `done` card whose only linked PR is an open draft is reported once per card;
+    // the per-card scope (entityId = issue.id) bounds the report like confirmed/failed.
+    const alreadyDraftStranded = new Set(
+      existing
+        .filter(
+          (r) =>
+            r.action === DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION && r.entityId === issue.id,
         )
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
@@ -713,6 +738,62 @@ export function createDoneCloseLandingBackstopService(
           });
         }
         counts.failed += 1;
+        continue;
+      }
+
+      // SUP-16689: a still-OPEN DRAFT can never land on its own — GitHub will not
+      // auto-merge a draft, so the re-enqueue / confirmed / failed legs all miss
+      // it. The resolvers are draft-blind by default; this sweep now passes
+      // `includeDrafts: true` specifically to SEE these, and reports the strand
+      // explicitly instead of letting the card age silently out of the 7-day
+      // discovery window. Report only: no re-enqueue, no escalation, and no
+      // MAX_REENQUEUE_ATTEMPTS quota consumed (a draft cannot be armed).
+      if (state === "open" && pr.draft === true) {
+        if (!verdictEligible) {
+          // A freshly-closed card gets the landing grace before naming a draft
+          // stranded (same conservatism as _failed); defer to a later sweep.
+          counts.deferred += 1;
+          continue;
+        }
+        if (alreadyDraftStranded.has(prKey)) {
+          // This card+PR was already reported as draft-stranded on a prior sweep.
+          continue;
+        }
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            pr: prKey,
+            prState: state,
+            draft: true,
+            skipReason: skipReason ?? null,
+            refusal: isArmingRefusal,
+          },
+        });
+        await deps.svc.addComment(
+          issue.id,
+          `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still an open DRAFT past the done-close grace window. A draft cannot be auto-merged, so this card cannot land until the PR is un-drafted (or merged another way). Promote the PR out of draft and re-verify the deliverable.`,
+          {},
+          { authorType: "system" },
+        );
+        if (opts.wakeup && issue.assigneeAgentId) {
+          await opts.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: { issueId: issue.id, mutation: "comment" },
+          });
+        }
+        counts.draftStranded += 1;
         continue;
       }
 

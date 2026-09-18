@@ -34,6 +34,7 @@ import {
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
+  resolveLinkedPullRequestsWithState,
   writeCommitStatusWithRetry,
   type NoPrBranchAnchor,
 } from "./merge-arming.js";
@@ -1324,6 +1325,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         displayName: `${OWNER}/${REPO}#42`,
         headRefName: "SUP-42-branch",
         source: "mention",
+        draft: false,
       });
     });
 
@@ -1361,6 +1363,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         displayName: `${OWNER}/${REPO}#455`,
         headRefName: "SUP-42-branch",
         source: "workspace",
+        draft: false,
       });
     });
 
@@ -1441,6 +1444,66 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(resolution.source).toBe("workspace");
         expect(resolution.number).toBe(455);
       }
+    });
+  });
+
+  describe("SUP-16689: linked-PR draft filter (arming stays draft-blind; backstop opts in)", () => {
+    it("AC3: the default resolver stays draft-blind — a linked draft is excluded (regression guard)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, draft: true, headRefName: "SUP-42-branch" });
+      await insertMention(issueId, { number: 43, draft: false, headRefName: "SUP-43-branch" });
+      installRoutes([]);
+
+      const result = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+
+      // Default (no includeDrafts): the draft #42 is dropped; only the non-draft
+      // #43 remains. This is the exact set every arming-path caller has always seen.
+      expect(result.map((pr) => pr.number)).toEqual([43]);
+      expect(result[0]!.draft).toBe(false);
+    });
+
+    it("includeDrafts: true surfaces the linked draft with draft:true (new opt-in)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, draft: true, headRefName: "SUP-42-branch" });
+      await insertMention(issueId, { number: 43, draft: false, headRefName: "SUP-43-branch" });
+      installRoutes([]);
+
+      const result = await resolveLinkedPullRequestsWithState(db, companyId, issueId, {
+        includeDrafts: true,
+      });
+
+      expect(result.map((pr) => pr.number).sort((a, b) => a - b)).toEqual([42, 43]);
+      const byNumber = new Map(result.map((pr) => [pr.number, pr]));
+      expect(byNumber.get(42)?.draft).toBe(true);
+      expect(byNumber.get(43)?.draft).toBe(false);
+    });
+
+    it("resolveCardPullRequest: a single draft mention is excluded by default but surfaced with includeDrafts", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, draft: true, headRefName: "SUP-42-branch" });
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [] }]);
+
+      const defaultResolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+      // Default is draft-blind: the only open mention is a draft -> excluded ->
+      // zero open mentions -> live discovery (empty) -> none.
+      expect(defaultResolution).toEqual({ kind: "none" });
+
+      const draftResolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+        includeDrafts: true,
+      });
+      expect(draftResolution).toEqual({
+        kind: "single",
+        owner: OWNER,
+        repo: REPO,
+        number: 42,
+        displayName: `${OWNER}/${REPO}#42`,
+        headRefName: "SUP-42-branch",
+        source: "mention",
+        draft: true,
+      });
     });
   });
 
