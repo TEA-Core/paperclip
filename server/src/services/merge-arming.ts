@@ -2012,7 +2012,19 @@ export async function resolveApprovalDecisionHead(
   issueIdentifier: string,
   closingTransition: boolean,
 ): Promise<DecisionHeadResolution> {
-  const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
+  // SUP-16667: resolve the card's linked PRs with drafts INCLUDED so a head that
+  // is only unresolvable because it is a draft is refused with its own named
+  // reason (`head_draft`) instead of the misleading `no-pr` — which reads as a
+  // missing link and sends the reader to the wrong place (the `draft` state key
+  // lives in external_objects.data, not in any arming message). Drafts are then
+  // EXCLUDED from the authorizing set below: arming a draft is wrong (GitHub
+  // refuses auto-merge on a draft), so every arming decision is unchanged and
+  // only the refusal vocabulary is sharpened.
+  const linkedPRsWithDrafts = await resolveLinkedPullRequests(db, companyId, issueId, {
+    includeDrafts: true,
+  });
+  const draftLinkedPRs = linkedPRsWithDrafts.filter((pr) => pr.draft === true);
+  const linkedPRs = linkedPRsWithDrafts.filter((pr) => pr.draft !== true);
 
   // ADR-091 D1 (SUP-14676): this resolver pins the FIRST publish, and that path
   // always runs publishApprovalStatus with enforceDeliveryIdentity: true — so it
@@ -2065,11 +2077,16 @@ export async function resolveApprovalDecisionHead(
     issueIdentifier,
     closingTransition,
     withState,
+    // SUP-16667: include drafts so a workspace-discovered draft-only head is
+    // reported as `head_draft`; drafts are excluded from the authorizing set
+    // immediately below, so arming semantics are unchanged.
+    true,
   );
   if (discovery.terminalFailure) {
     return decisionHeadFailureFromWorkspaceDiscovery(discovery.terminalFailure);
   }
-  const matched = discovery.matched;
+  const draftMatched = discovery.matched.filter((pr) => pr.draft === true);
+  const matched = discovery.matched.filter((pr) => pr.draft !== true);
 
   // ADR-091 D1 (SUP-14676): the live-discovery candidates above are matched by
   // identifier substring — pure citation. They take the SAME delivery-identity
@@ -2101,6 +2118,26 @@ export async function resolveApprovalDecisionHead(
       ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
       : { kind: "unresolvable", reason: head.reason };
   }
+  // SUP-16667: the only unresolved candidate is an open DRAFT. That is not
+  // "no PR" — the link exists and the PR is live; it simply cannot be armed
+  // until it is promoted out of draft (GitHub refuses auto-merge on a draft).
+  // Name it so the refusal is diagnosable from the message alone. No
+  // pendingCandidates here on purpose: attaching the no-pr delivery-branch
+  // anchor would let the approval-status reconciler stamp the draft head by
+  // content identity — re-introducing the arming-of-a-draft this refusal exists
+  // to prevent. Once the PR is promoted, the ordinary republish path re-resolves
+  // the head and arms normally (the #717 recovery).
+  const draftNames = [
+    ...new Set([...draftLinkedPRs, ...draftMatched].map((pr) => pr.displayName)),
+  ];
+  if (draftNames.length > 0) {
+    const verb = draftNames.length === 1 ? "is an open draft PR" : "are open draft PRs";
+    return {
+      kind: "unresolvable",
+      reason: `head_draft: ${draftNames.join(", ")} ${verb}; a draft head cannot be armed (GitHub refuses auto-merge on a draft) — promote it out of draft, then republish`,
+    };
+  }
+
   // SUP-15016: no-pr is unresolvable at decision time, but on a CLOSING transition
   // the certification the producer had in hand must not be discarded. The card's OWN
   // delivery branch is resolvable even with no PR (resolveDeliveryIdentity), so
