@@ -1343,7 +1343,25 @@ function redactedActor(actor: {
   };
 }
 
-function redactedTask(task: typeof issues.$inferSelect) {
+function redactedTask(
+  task: Pick<
+    typeof issues.$inferSelect,
+    | "id"
+    | "companyId"
+    | "identifier"
+    | "title"
+    | "description"
+    | "status"
+    | "statusVersion"
+    | "priority"
+    | "workMode"
+    | "assigneeAgentId"
+    | "executionRunId"
+    | "parentId"
+    | "projectId"
+    | "goalId"
+  >,
+) {
   return {
     id: task.id,
     companyId: task.companyId,

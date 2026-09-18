@@ -3978,7 +3978,24 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       selectedProjects.set(match.id, match);
     }
 
-    const selectedIssues = new Map<string, Awaited<ReturnType<typeof issuesSvc.getById>>>();
+    // SUP-16741: `issuesSvc.list` omits the execution-ladder columns from its
+    // projection for perf, so a selected issue reached via a project/all-issues
+    // selector may legitimately lack them (absent, not `null`). Keep the map
+    // value honest about that; the export treats absence as "not projected".
+    type PortabilityIssueRecord = NonNullable<
+      Awaited<ReturnType<typeof issuesSvc.getById>>
+    >;
+    type PortabilityIssueRow = Omit<
+      PortabilityIssueRecord,
+      "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+    > &
+      Partial<
+        Pick<
+          PortabilityIssueRecord,
+          "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+        >
+      >;
+    const selectedIssues = new Map<string, PortabilityIssueRow>();
     const selectedRoutines = new Map<string, typeof allRoutines[number]>();
     const routineById = new Map(allRoutines.map((routine) => [routine.id, routine]));
     const builtInRoutineById = new Map(builtInRoutineRows.map((routine) => [routine.id, routine]));
