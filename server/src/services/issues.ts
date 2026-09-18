@@ -11823,7 +11823,7 @@ export function issueService(db: Db) {
                 ),
               );
             for (const workspace of terminalWorkspaces) {
-              await logActivity(tx as unknown as Db, {
+              await logActivityInTransaction(tx as unknown as Db, {
                 companyId: updated.companyId,
                 actorType: actorAgentId
                   ? "agent"
@@ -11888,7 +11888,7 @@ export function issueService(db: Db) {
                   }
                 }
               }
-              await logActivity(tx as unknown as Db, {
+              await logActivityInTransaction(tx as unknown as Db, {
                 companyId: updated.companyId,
                 actorType: actorAgentId
                   ? "agent"
@@ -13698,8 +13698,16 @@ export function issueService(db: Db) {
           comment,
           { agentId: actor.agentId, userId: actor.userId },
         );
+        // `addComment` runs either on the pool (`dbOrTx === db`) or inside a
+        // caller-supplied transaction (`dbOrTx !== db`; the recursive run-id
+        // branch and the explicit-`tx` callers). The expiry write above shares
+        // this handle, so its audit must share the same fate: inside a
+        // transaction a swallowed audit failure would let the expiry commit
+        // unaudited. On the pool the documented best-effort behaviour stands.
+        const auditExpiredInteraction =
+          dbOrTx === db ? logActivity : logActivityInTransaction;
         for (const interaction of expiredInteractions) {
-          await logActivity(dbOrTx, {
+          await auditExpiredInteraction(dbOrTx, {
             companyId: issue.companyId,
             actorType: "user",
             actorId: actor.userId,

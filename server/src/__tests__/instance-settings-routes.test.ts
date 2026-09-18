@@ -33,6 +33,7 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => mockInstanceSettingsService,
     logActivity: mockLogActivity,
+    logActivityInTransaction: mockLogActivity,
     publishActivity: mockPublishActivity,
   }));
   vi.doMock("../services/environments.js", () => ({

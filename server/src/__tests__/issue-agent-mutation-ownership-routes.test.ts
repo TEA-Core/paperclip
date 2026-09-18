@@ -208,6 +208,7 @@ function registerRouteMocks() {
 
   vi.doMock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
+    logActivityInTransaction: mockLogActivity,
   }));
 
   vi.doMock("../services/cross-issue-influence-limit.js", () => ({
@@ -290,6 +291,7 @@ function registerRouteMocks() {
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     taskWatchdogService: () => mockTaskWatchdogService,
     logActivity: mockLogActivity,
+    logActivityInTransaction: mockLogActivity,
     projectService: () => mockProjectService,
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),

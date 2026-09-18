@@ -10,7 +10,7 @@ import { goalService } from "./goals.js";
 import { projectService } from "./projects.js";
 import { issueService } from "./issues.js";
 import { readBuiltInAgentMarker } from "./built-in-agent-metadata.js";
-import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 
 /**
  * The project the seeded first task lands in, matching the name the tenant's
@@ -407,7 +407,7 @@ export function onboardingSeedService(db: Db) {
       const applied = await applyWithin(dbx, companyId, seed);
 
       if (applied.changed && audit) {
-        await logActivity(
+        await logActivityInTransaction(
           dbx,
           {
             companyId,

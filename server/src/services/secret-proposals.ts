@@ -15,7 +15,7 @@ import type { SecretProvider } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { agentService } from "./agents.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import { normalizeSecretKey, secretService } from "./secrets.js";
 
 const CONFIG_PATH_RE = /^(?:env\.[A-Za-z_][A-Za-z0-9_]*|access\.[A-Za-z_][A-Za-z0-9_]*)$/;
@@ -129,7 +129,7 @@ export function createSecretProposalsService(db: Db) {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${input.companyId}), hashtext(${input.agentId}))`);
       const denial = await creationQuotaDenial(txDb, input);
       if (denial) {
-        await logActivity(txDb, {
+        await logActivityInTransaction(txDb, {
           companyId: input.companyId,
           actorType: "agent",
           actorId: input.agentId,
@@ -228,7 +228,7 @@ export function createSecretProposalsService(db: Db) {
       .where(eq(companySecretProposals.id, proposal.id))
       .returning();
     await txDb.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, proposal.originIssueId));
-    await logActivity(txDb, {
+    await logActivityInTransaction(txDb, {
       companyId: proposal.companyId,
       actorType: "agent",
       actorId: proposal.proposedByAgentId,
@@ -597,7 +597,7 @@ export function createSecretProposalsService(db: Db) {
       },
       { userId: input.resolvedByUserId, agentId: proposal.proposedByAgentId },
     );
-    await logActivity(txDb, {
+    await logActivityInTransaction(txDb, {
       companyId: proposal.companyId,
       actorType: "user",
       actorId: input.resolvedByUserId,
@@ -631,7 +631,7 @@ export function createSecretProposalsService(db: Db) {
       eq(companySecretProposals.status, "pending"),
     )).returning().then((rows) => rows[0] ?? null);
     if (!updated) throw conflict("Proposal is no longer pending");
-    await logActivity(txDb, {
+    await logActivityInTransaction(txDb, {
       companyId: proposal.companyId,
       actorType: "user",
       actorId: input.resolvedByUserId,
@@ -702,7 +702,7 @@ export function createSecretProposalsService(db: Db) {
       recordRevision: { createdByUserId: resolvedByUserId, source: "patch" },
     });
     if (!updated) throw notFound("Target agent not found");
-    await logActivity(txDb, {
+    await logActivityInTransaction(txDb, {
       companyId: proposal.companyId,
       actorType: "user",
       actorId: resolvedByUserId,
@@ -808,7 +808,7 @@ export function createSecretProposalsService(db: Db) {
         : [];
       const actorType = input.resolvedByUserId ? "user" as const : status === "withdrawn" ? "agent" as const : "system" as const;
       const actorId = input.resolvedByUserId ?? input.proposerAgentId ?? "system";
-      await logActivity(txDb, {
+      await logActivityInTransaction(txDb, {
         companyId,
         actorType,
         actorId,
@@ -820,7 +820,7 @@ export function createSecretProposalsService(db: Db) {
         details: { ciphertextScrubbed: true, issueId: proposal.originIssueId, reason: input.reason ?? null },
       });
       for (const dependent of dependents) {
-        await logActivity(txDb, {
+        await logActivityInTransaction(txDb, {
           companyId,
           actorType,
           actorId,

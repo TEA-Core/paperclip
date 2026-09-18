@@ -151,6 +151,7 @@ vi.mock("../services/access.js", () => ({
 
 vi.mock("../services/activity-log.js", () => ({
   logActivity: mockLogActivity,
+  logActivityInTransaction: mockLogActivity,
 }));
 
 vi.mock("../services/agents.js", () => ({
@@ -220,6 +221,7 @@ vi.mock("../services/index.js", () => ({
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   issueTreeControlService: () => mockIssueTreeControlService,
   logActivity: mockLogActivity,
+  logActivityInTransaction: mockLogActivity,
   projectService: () => ({}),
   routineService: () => mockRoutineService,
   workProductService: () => ({}),

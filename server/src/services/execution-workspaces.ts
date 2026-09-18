@@ -48,7 +48,7 @@ import {
   WORKSPACE_PATH_HELD_REMEDIATION,
 } from "./execution-workspace-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -3564,7 +3564,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             },
             "execution workspace reopen rebuild failed",
           );
-          await logActivity(tx as unknown as Db, {
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: row.companyId,
             actorType: actor.actorType === "user" ? "user" : "agent",
             actorId: actor.agentId ?? "system",
@@ -3618,7 +3618,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           },
           "execution workspace reopened",
         );
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: row.companyId,
           actorType: actor.actorType === "user" ? "user" : "agent",
           actorId: actor.agentId ?? "system",

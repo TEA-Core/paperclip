@@ -57,7 +57,7 @@ import {
   type EnvironmentCustomImageRelinkClassification,
   type EnvironmentCustomImageDriftedPath,
 } from "./environment-custom-image-runtime.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const ACTIVE_SETUP_STATUSES = ["starting", "waiting_for_user", "capturing"] as const;
@@ -1237,7 +1237,7 @@ export function environmentCustomImageService(
         if (!updated) {
           throw conflict("Active environment customImage template changed before relink; retry.");
         }
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: input.companyId,
           actorType: input.actor.actorType,
           actorId: input.actor.actorId,
