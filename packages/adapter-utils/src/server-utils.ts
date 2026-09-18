@@ -12,6 +12,11 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import {
+  evaluateRunProcessSpawn,
+  getRunProcessGroupCounter,
+  resolveRunProcessCap,
+} from "./run-process-cap.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
@@ -5362,6 +5367,35 @@ export async function runChildProcess(
           childEnv.PWD = spawnCwd;
           delete childEnv.OLDPWD;
         }
+
+        // SUP-16011: per-run process cap — refuse the spawn at the limit.
+        // Measure the run's *existing* process group through the census-grade
+        // counter before creating its top-level child, and refuse once the group
+        // has reached the cap. This is the single seam where run children are
+        // created, so no adapter can bypass it. Fails open when the cap is
+        // disabled or the group is unreadable (non-Linux / counter unwired), so
+        // an unmeasurable host never blocks a legitimate run. The decision is
+        // shared with the native runner (evaluateRunProcessSpawn). It runs
+        // before the E2BIG envelope guard because it needs only the run's
+        // tracked group, not the resolved target.
+        const runProcessCapRefusal = evaluateRunProcessSpawn({
+          runId,
+          cap: resolveRunProcessCap(process.env),
+          counter: getRunProcessGroupCounter(),
+          processGroupId: runningProcesses.get(runId)?.processGroupId ?? null,
+          onMeasureError: (err) =>
+            onLogError(
+              err,
+              runId,
+              "failed to measure run process group for the process cap",
+            ),
+        });
+        if (runProcessCapRefusal) {
+          onLogError(null, runId, runProcessCapRefusal.message);
+          reject(runProcessCapRefusal);
+          return;
+        }
+
         // FORK-DIVERGENCE(e2big-wake-env): validate the FINAL launch envelope —
         // the exact command/args/env about to be exec'd — before spawn. Runs
         // after the inherited-process / run-deadline / opts.env merge and the

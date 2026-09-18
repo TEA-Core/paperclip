@@ -23,6 +23,8 @@ import {
   nativeRunResults,
   type Db,
 } from "@paperclipai/db";
+import { runningProcesses } from "@paperclipai/adapter-utils/server-utils";
+import { registerRunProcessGroupCounter } from "@paperclipai/adapter-utils/run-process-cap";
 import {
   acpxRuntimeSessionDirectoryName,
   createPrpSemanticToolInputEnvelope,
@@ -100,6 +102,16 @@ type RunnerTransportOptions = {
       itemId: string;
     };
   }) => Promise<Record<string, unknown>>;
+  runProcessAdmission?: () => {
+    code: string;
+    resultJson: {
+      errorCode: string;
+      cap: number;
+      current: number;
+      processGroupId: number;
+      runId: string;
+    };
+  } | null;
 };
 
 const durableControlPlaneState = (identity: Record<string, unknown>) => ({
@@ -6712,6 +6724,49 @@ describe("runnerd provider runtime wiring", () => {
         }),
       }),
     );
+  });
+
+  it("injects a per-run process-cap admission bound to the execution's run", async () => {
+    state.createBackend.mockClear();
+    state.createTransport.mockClear();
+    const runId = execution.binding.runId;
+    const previousCap = process.env.PAPERCLIP_RUN_PROCESS_CAP;
+    process.env.PAPERCLIP_RUN_PROCESS_CAP = "5";
+    registerRunProcessGroupCounter(() => 5);
+    runningProcesses.set(runId, {
+      child: { pid: 4242 } as never,
+      graceSec: 1,
+      processGroupId: 88888,
+    });
+    try {
+      await createRunnerdBackend({
+        db: leaseDb(execution),
+        execution,
+        runnerInstanceId: "runner-cap-admission",
+      });
+      const factory =
+        state.createBackend.mock.calls[0]![1].codexTransportFactory!;
+      factory();
+      const options = state.createTransport.mock.calls[0]![0];
+      expect(options.runProcessAdmission).toBeTypeOf("function");
+      const refusal = options.runProcessAdmission!();
+      expect(refusal?.code).toBe("run_process_cap_exceeded");
+      expect(refusal?.resultJson).toEqual({
+        errorCode: "run_process_cap_exceeded",
+        cap: 5,
+        current: 5,
+        processGroupId: 88888,
+        runId,
+      });
+    } finally {
+      registerRunProcessGroupCounter(null);
+      runningProcesses.delete(runId);
+      if (previousCap === undefined) {
+        delete process.env.PAPERCLIP_RUN_PROCESS_CAP;
+      } else {
+        process.env.PAPERCLIP_RUN_PROCESS_CAP = previousCap;
+      }
+    }
   });
 
   it("rejects overlapping runs for the same runnerd provider session scope", async () => {
