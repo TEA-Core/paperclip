@@ -504,11 +504,6 @@ function rearmIssue(executionState: IssueExecutionState) {
   };
 }
 
-/**
- * The self-gated re-arm probe (SUP-16725): stage1 completed, a stale pointer on
- * the terminal approval, and the return assignee is `coderAgentId`. `rearm`
- * rewinds onto stage2, whose participant list is what the test varies.
- */
 function selfGatedProbeState(): IssueExecutionState {
   return {
     ...activeState(),
@@ -520,7 +515,6 @@ function selfGatedProbeState(): IssueExecutionState {
   } as unknown as IssueExecutionState;
 }
 
-/** Three-stage policy whose re-arm target (stage2) carries `targetParticipants`. */
 function selfGatedPolicy(
   targetParticipants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }>,
 ) {
@@ -596,9 +590,6 @@ describe("applyExecutionPolicyReArm (SUP-16525 §4 persisted path)", () => {
   });
 
   it("excludes the return assignee from the re-armed stage regardless of participant order", () => {
-    // Both orderings: with `preferred` the return assignee was selected even
-    // when listed second (the reported control), so `[RA, OTHER]` and
-    // `[OTHER, RA]` must both land on OTHER — this is exclusion, not first-eligible.
     const orderings = [
       [{ type: "agent" as const, agentId: coderAgentId }, { type: "agent" as const, agentId: leAgentId }],
       [{ type: "agent" as const, agentId: leAgentId }, { type: "agent" as const, agentId: coderAgentId }],
@@ -636,8 +627,6 @@ describe("applyExecutionPolicyReArm (SUP-16525 §4 persisted path)", () => {
   });
 
   it("leaves a single-participant target stage unchanged when the return assignee is not a participant", () => {
-    // SUP-16131-shaped regression: return assignee (coder) is not on stage2, so
-    // the re-arm keeps stage2's own participant and mints no decision row.
     const state = activeState();
     const result = applyExecutionPolicyReArm({
       issue: rearmIssue(state),

@@ -837,12 +837,6 @@ export function applyExecutionPolicyReArm(input: {
     existingState: executionState,
     currentAssignee: assigneePrincipal(issue),
   });
-  // Match every other arming site in this module: the return assignee is
-  // excluded from its own gate. `preferred` here positively steered selection
-  // onto the return assignee (the delivery author on a delivered card), and the
-  // unguarded fallback re-admitted it whenever the exclusion emptied the set —
-  // the SUP-10602 self-approval regression. No participant after exclusion is a
-  // hard 422 below, not a self-gated arm.
   const participant = selectStageParticipant(stage, { exclude: returnAssignee });
   if (!participant) {
     throw unprocessable(
