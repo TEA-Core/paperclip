@@ -537,6 +537,11 @@ jobs:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
     runs-on: ubuntu-latest
+    # Job cap fed to the general-server shard balance warning in
+    # scripts/run-vitest-stable.mjs (SUP-16681 ask 4). Keep in sync with
+    # timeout-minutes below; it drives the 80%-of-cap early warning.
+    env:
+      GENERAL_SERVER_SHARD_CAP_MINUTES: 30
     # Raised from 20 on 2026-09-18 (SUP-16686). The worst server shard measured
     # 17m33s on the fully green run 35289958945 (merge_group for #722) after the
     # duration manifest was refreshed, and shard 3/5 was cancelled at 20m15s on
@@ -551,11 +556,24 @@ jobs:
         include:
           # The server suite is pinned to maxWorkers=1 (server/vitest.config.ts),
           # so it can only be parallelized across runners. Shard it to keep this
-          # lane off the PR critical path. Five shards because the suite has
-          # grown to ~946s of serial vitest wall time (run 30930345729,
-          # 2026-08-04): at four shards the worst shard ran 311s and was the
-          # slowest check in the whole PR run; five brings each shard to ~196s
-          # of suite time (~240s job), level with the other ~250-300s lanes.
+          # lane off the PR critical path.
+          #
+          # Re-evaluated 2026-09-18 (SUP-16681) against the refreshed duration
+          # manifest (SUP-16686): the suite is now 749 suites / ~74.5m of serial
+          # wall time (was ~946s on 2026-08-04, ~4.5x growth). The chat cohort
+          # (chat-channels.integration.test.ts) is reserved at 15m on its own
+          # shard by design to bound its 377s-645s run-to-run variance, so the
+          # LPT partition keeps it alone at 5+ shards. Five shards therefore
+          # balances the 59.5m of non-chat suites to ~14.9m each across the four
+          # remaining shards, putting the predicted worst shard at ~15m = 50% of
+          # the 30m cap. Four shards is worse: it packs the chat shard up to
+          # ~18.6m and drops the chat-alone invariant; six+ only shrinks the
+          # non-chat shards while the chat shard stays the ~15m worst, for one
+          # extra runner per PR. Five is the right width; the 2026-09-18
+          # cancellation was the stale manifest, not the shard count. The
+          # general-server shard balance now warns at 80% of the cap (see
+          # GENERAL_SERVER_SHARD_CAP_MINUTES above and scripts/run-vitest-stable.mjs)
+          # so the next drift is caught here, not at the cap.
           - group: general-server
             group_label: server (1/5)
             shard_index: 0

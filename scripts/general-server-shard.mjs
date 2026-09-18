@@ -73,3 +73,34 @@ export function partitionGeneralServerSuites(files, shardCount, durations = {}) 
 export function selectGeneralServerShard(files, shardIndex, shardCount, durations = {}) {
   return partitionGeneralServerSuites(files, shardCount, durations)[shardIndex].files;
 }
+
+// Per-shard predicted wall-clock loads (ms) from the same deterministic LPT
+// partition the CI lane uses, plus a soft "over the warning line" flag. The
+// warning line is `warnRatio` of the job cap (default 80% of `capMinutes`):
+// when a shard's PREDICTED load clears it, the duration manifest (or the shard
+// count) has drifted and the lane is about to start cancelling PRs at the cap
+// for reasons unrelated to the diff — surfaced here so the next drift is caught
+// before it does, instead of surfacing as an unexplained `verify` failure.
+export function generalServerShardBalance(files, shardCount, durations = {}, capMinutes = 30, warnRatio = 0.8) {
+  const shards = partitionGeneralServerSuites(files, shardCount, durations);
+  const fallbackMs = defaultSuiteWeight(durations);
+  const missingCount = files.filter((file) => durations[file] === undefined).length;
+  const totalMs = shards.reduce((sum, shard) => sum + shard.totalWeight, 0);
+  const warnLineMs = capMinutes * 60000 * warnRatio;
+  const perShard = shards.map((shard, index) => ({
+    shardIndex: index,
+    suiteCount: shard.files.length,
+    predictedMs: shard.totalWeight,
+    overWarningLine: shard.totalWeight > warnLineMs,
+  }));
+  const maxPredictedMs = perShard.reduce((max, shard) => Math.max(max, shard.predictedMs), 0);
+  return {
+    perShard,
+    totalMs,
+    fallbackMs,
+    missingCount,
+    warnLineMs,
+    maxPredictedMs,
+    anyOverWarningLine: perShard.some((shard) => shard.overWarningLine),
+  };
+}

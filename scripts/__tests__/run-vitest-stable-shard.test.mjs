@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   defaultSuiteWeight,
+  generalServerShardBalance,
   loadShardDurations,
   partitionGeneralServerSuites,
 } from "../general-server-shard.mjs";
@@ -264,6 +265,73 @@ test("the real shard partition is duration-balanced", () => {
   assert.ok(
     maxTotal - minTotal <= heaviest,
     `shard weight spread ${maxTotal - minTotal}ms exceeds heaviest suite ${heaviest}ms: ${totals.join(", ")}`,
+  );
+});
+
+test("the shard balance flags a shard whose predicted load clears 80% of the cap", () => {
+  // One 30m suite, four ~1s suites, five shards: the heavy suite is reserved on
+  // its own shard at 30m, which is 100% of the cap and well past the 80% line.
+  const files = ["a", "b", "c", "d", "e"];
+  const durations = { a: 30 * 60000, b: 1000, c: 1000, d: 1000, e: 1000 };
+  const balance = generalServerShardBalance(files, 5, durations, 30, 0.8);
+
+  assert.equal(balance.warnLineMs, 24 * 60000, "80% of a 30m cap is 24m");
+  assert.equal(balance.maxPredictedMs, 30 * 60000);
+  assert.equal(balance.anyOverWarningLine, true);
+  assert.equal(balance.totalMs, 30 * 60000 + 4 * 1000);
+  assert.equal(balance.missingCount, 0);
+
+  const over = balance.perShard.filter((shard) => shard.overWarningLine);
+  assert.equal(over.length, 1, "exactly the heavy suite's shard clears the line");
+  assert.equal(over[0].suiteCount, 1, "the heavy suite is reserved on its own shard");
+});
+
+test("the shard balance stays quiet when no shard clears the warning line", () => {
+  const files = Array.from({ length: 8 }, (_, index) => `s-${index}`);
+  const durations = Object.fromEntries(files.map((file) => [file, 60000]));
+  // 8 shards x 60s = 1m each, far below 80% of a 30m cap.
+  const balance = generalServerShardBalance(files, 8, durations, 30, 0.8);
+  assert.equal(balance.anyOverWarningLine, false);
+  assert.equal(balance.perShard.length, 8);
+  assert.equal(balance.totalMs, 8 * 60000);
+  assert.equal(balance.maxPredictedMs, 60000);
+});
+
+test("the shard balance applies the median fallback and counts missing suites", () => {
+  const balance = generalServerShardBalance(["a", "b", "c", "new-suite"], 2, { a: 1000, b: 3000, c: 5000 });
+  assert.equal(balance.fallbackMs, 3000, "median of 1000/3000/5000");
+  assert.equal(balance.missingCount, 1);
+  assert.equal(balance.totalMs, 1000 + 3000 + 5000 + 3000);
+});
+
+test("the general-server dry-run exposes the predicted shard balance", () => {
+  const shard = dryRunJson([
+    "--mode", "general", "--group", "general-server",
+    "--shard-index", "0", "--shard-count", String(SHARD_COUNT),
+  ]);
+  const balance = shard.generalServerShardBalance;
+  assert.ok(balance, "dry-run must expose the general-server balance");
+  assert.equal(balance.perShard.length, SHARD_COUNT);
+  assert.equal(balance.maxPredictedMs, Math.max(...balance.perShard.map((entry) => entry.predictedMs)));
+  assert.equal(
+    balance.perShard.reduce((sum, entry) => sum + entry.predictedMs, 0),
+    balance.totalMs,
+    "per-shard predicted loads must sum to the suite total",
+  );
+});
+
+test("the checked-in manifest keeps every predicted general-server shard under the 80% warning line", () => {
+  // Guards the invariant behind the CI warning: a checked-in manifest that
+  // already predicts a shard past 80% of the cap is stale/mis-weighed and must
+  // be refreshed before it lets a real shard cancel at the cap (SUP-16681).
+  const balance = dryRunJson([
+    "--mode", "general", "--group", "general-server",
+    "--shard-index", "0", "--shard-count", String(SHARD_COUNT),
+  ]).generalServerShardBalance;
+  assert.equal(
+    balance.anyOverWarningLine,
+    false,
+    `a predicted general-server shard is past 80% of the cap: ${balance.perShard.map((entry) => `${entry.shardIndex + 1}=${(entry.predictedMs / 60000).toFixed(1)}m`).join(", ")}`,
   );
 });
 
