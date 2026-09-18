@@ -303,7 +303,26 @@ const openSnapshot = {
     statusKey: "open",
     statusCategory: "open",
     statusTone: "info",
+    data: { state: "open", merged: false, draft: false },
+  },
+} as unknown as ExternalObjectResolveResult;
+const unknownDraftOpenSnapshot = {
+  ok: true,
+  snapshot: {
+    statusKey: "open",
+    statusCategory: "open",
+    statusTone: "info",
     data: { state: "open", merged: false },
+  },
+} as unknown as ExternalObjectResolveResult;
+// SUP-16689: an OPEN PR whose LIVE snapshot reports `draft: true`.
+const draftOpenSnapshot = {
+  ok: true,
+  snapshot: {
+    statusKey: "draft",
+    statusCategory: "waiting",
+    statusTone: "warning",
+    data: { state: "open", merged: false, draft: true },
   },
 } as unknown as ExternalObjectResolveResult;
 // What the real resolver reports when resolveGitHubToken has no credential.
@@ -2299,6 +2318,65 @@ describe("SUP-16689: draft-stranded done cards", () => {
   // `draft_stranded` audit row + system comment + assignee wake — with NO
   // re-enqueue, NO escalation, and NO MAX_REENQUEUE_ATTEMPTS quota consumed.
 
+  it("uses the live ready state when the cached linked PR is still marked draft", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolver(async () => ({
+      ok: true,
+      snapshot: {
+        statusKey: "open",
+        statusCategory: "open",
+        statusTone: "info",
+        data: { state: "open", merged: false, draft: false },
+      },
+    } as unknown as ExternalObjectResolveResult));
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 1,
+      draftStranded: 0,
+    });
+
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_escalated",
+    }));
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+    }));
+  });
+
+  it("defers an open PR when the live draft state is unknown", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: false })]);
+    mockResolver(async () => unknownDraftOpenSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 0,
+    });
+
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
   it("reports an open DRAFT linked PR as draft-stranded with a system comment and assignee wake (AC1)", async () => {
     const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
     const { service } = makeService(
@@ -2306,7 +2384,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       { wakeup },
     );
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
-    mockResolver(async () => openSnapshot);
+    mockResolver(async () => draftOpenSnapshot);
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -2369,7 +2447,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       source: "workspace",
       draft: true,
     });
-    mockResolver(async () => openSnapshot);
+    mockResolver(async () => draftOpenSnapshot);
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -2413,7 +2491,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
     mockResolver(async (input: unknown) =>
       (input as { object: { externalId: string } }).object.externalId.endsWith("pull/368")
         ? mergedSnapshot
-        : openSnapshot,
+        : draftOpenSnapshot,
     );
 
     await expect(service.sweep()).resolves.toEqual({
@@ -2460,7 +2538,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       { wakeup },
     );
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
-    mockResolver(async () => openSnapshot);
+    mockResolver(async () => draftOpenSnapshot);
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -2497,7 +2575,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
     };
     const { service } = makeService(state);
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
-    mockResolver(async () => openSnapshot);
+    mockResolver(async () => draftOpenSnapshot);
 
     const result = await service.sweep();
 

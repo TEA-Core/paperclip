@@ -183,6 +183,10 @@ interface MeasuredLanding {
   pr: LinkedPullRequest;
   prKey: string;
   state: MeasuredPullRequestState;
+  // Live provider `data.draft`; `"unknown"` when the snapshot carries no readable
+  // draft flag. Only the OPEN branch consumes it (merged/closed need no draft),
+  // where `"unknown"` fails closed and defers.
+  draft: boolean | "unknown";
   closedAt: string | null;
 }
 
@@ -611,6 +615,7 @@ export function createDoneCloseLandingBackstopService(
         continue;
       }
       let state: MeasuredPullRequestState | "unknown" = "unknown";
+      let draft: boolean | "unknown" = "unknown";
       let data: Record<string, unknown> | null = null;
       try {
         const resolved = await deps.resolver.resolve({
@@ -622,11 +627,13 @@ export function createDoneCloseLandingBackstopService(
         });
         state = classifyPullRequestLanding(resolved);
         data = resolved.ok ? readRecord(resolved.snapshot.data) : null;
+        const liveDraft = data?.draft;
+        draft = typeof liveDraft === "boolean" ? liveDraft : "unknown";
       } catch {
         state = "unknown";
       }
       if (state === "unknown") {
-        // Never `…_confirmed` on an unmeasured PR; retry on a later sweep.
+        // Never disposition an unmeasured PR; retry on a later sweep.
         counts.deferred += 1;
         continue;
       }
@@ -638,7 +645,7 @@ export function createDoneCloseLandingBackstopService(
             ? readString(data?.closed_at)
             : null;
 
-      measured.push({ pr, prKey, state, closedAt });
+      measured.push({ pr, prKey, state, draft, closedAt });
     }
 
     // Did ANY linked PR on this card merge? If so, a closed-unmerged sibling is a
@@ -650,7 +657,7 @@ export function createDoneCloseLandingBackstopService(
       .map((m) => m.prKey);
     const hasMergedSibling = mergedSiblingKeys.length > 0;
 
-    for (const { pr, prKey, state, closedAt } of measured) {
+    for (const { pr, prKey, state, draft, closedAt } of measured) {
       const isSupersededCarrier = state === "closed" && hasMergedSibling;
 
       if (state === "merged") {
@@ -748,7 +755,17 @@ export function createDoneCloseLandingBackstopService(
       // explicitly instead of letting the card age silently out of the 7-day
       // discovery window. Report only: no re-enqueue, no escalation, and no
       // MAX_REENQUEUE_ATTEMPTS quota consumed (a draft cannot be armed).
-      if (state === "open" && pr.draft === true) {
+      //
+      // The draft flag is read from the LIVE snapshot (`data.draft`), never the
+      // cached mention: a PR promoted out of draft must not be reported stranded,
+      // and a PR converted into draft must not enter the re-enqueue/escalate lane.
+      // When the live flag is unreadable, fail closed and defer — guessing either
+      // way would mis-disposition an open PR.
+      if (draft === "unknown") {
+        counts.deferred += 1;
+        continue;
+      }
+      if (state === "open" && draft === true) {
         if (!verdictEligible) {
           // A freshly-closed card gets the landing grace before naming a draft
           // stranded (same conservatism as _failed); defer to a later sweep.
