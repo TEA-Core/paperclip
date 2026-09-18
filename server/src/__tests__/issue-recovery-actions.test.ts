@@ -30,6 +30,7 @@ import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService, isNeverLaunchedDispatchRun, isSpentReviewParticipantRecoveryAttempt, shouldBlockReviewParticipantRecovery } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
@@ -3547,6 +3548,269 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       currentParticipant: { type: "agent", agentId: qaId },
     });
     expect(resolved.body.recoveryAction).toMatchObject({ status: "resolved" });
+  });
+
+  // SUP-16684: a `restored` resolution that lands a non-terminal card on an
+  // already-armed execution stage used to mint no wake at all, and the durable
+  // no-replay hold left behind by execution-recovery-resolution.ts:472 kept
+  // re-killing any later dispatch with "Automatic recovery stopped". Reproduce
+  // the SUP-16430 shape and pin the participant wake plus the cleared hold.
+  async function seedEscalatedArmedReview(input: {
+    companyId: string;
+    sourceIssueId: string;
+    coderId: string;
+    managerId: string;
+    status?: string;
+  }) {
+    const qaId = randomUUID();
+    await db.insert(agents).values({
+      id: qaId,
+      companyId: input.companyId,
+      name: "QA",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const reviewStageId = randomUUID();
+    await db.update(issues).set({
+      status: input.status ?? "blocked",
+      assigneeAgentId: input.coderId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: reviewStageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: qaId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaId },
+        returnAssignee: { type: "agent", agentId: input.coderId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, input.sourceIssueId));
+
+    const runId = randomUUID();
+    await seedHeartbeatRun({
+      companyId: input.companyId,
+      agentId: input.coderId,
+      runId,
+      issueId: input.sourceIssueId,
+      status: "failed",
+    });
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      recoveryIssueId: null,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      previousOwnerAgentId: input.managerId,
+      returnOwnerAgentId: input.coderId,
+      cause: "uncertain_provider_action",
+      fingerprint: "recovery:sup-16684",
+      evidence: {
+        runId,
+        automaticRecovery: {
+          policy: "preserve_without_replay_v1",
+          runId,
+          replay: "blocked",
+          actionOutcome: "unknown",
+        },
+      },
+      nextAction:
+        "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+      wakePolicy: null,
+      monitorPolicy: null,
+      attemptCount: 5,
+      maxAttempts: 5,
+      timeoutAt: null,
+      lastAttemptAt: new Date("2026-09-17T17:50:15.000Z"),
+      outcome: null,
+      resolutionNote: null,
+      resolvedAt: null,
+    });
+    return { qaId, reviewStageId, runId, actionId };
+  }
+
+  it("wakes the restored review participant and clears the no-replay hold (SUP-16684)", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const { qaId, reviewStageId, actionId } = await seedEscalatedArmedReview({
+      companyId,
+      sourceIssueId,
+      coderId,
+      managerId,
+    });
+    // The fixture really armed the durable hold the stop leaves behind.
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({
+      recoveryActionId: actionId,
+      cause: "uncertain_provider_action",
+    });
+
+    const executionStageWakeupEnqueue = vi.fn(async () => ({ id: randomUUID() } as never));
+    const app = createApp(
+      { type: "board", source: "local_implicit", userId: "board-user" },
+      { executionStageWakeupEnqueue },
+    );
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "Restoring to in_review to re-pend that stage.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "in_review",
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentParticipant: { type: "agent", agentId: qaId },
+      },
+    });
+    // Exactly one wake, for the armed stage's current participant.
+    expect(executionStageWakeupEnqueue).toHaveBeenCalledTimes(1);
+    expect(executionStageWakeupEnqueue).toHaveBeenCalledWith(
+      qaId,
+      expect.objectContaining({
+        reason: "execution_review_requested",
+        requestedByActorType: "user",
+        idempotencyKey: `recovery-restored-stage-wake:${actionId}`,
+        payload: expect.objectContaining({ issueId: sourceIssueId }),
+      }),
+    );
+    // The hold is cleared, so a later dispatch admits the wake instead of
+    // deferring it as "Automatic recovery stopped".
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toBeNull();
+    const [persisted] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(persisted?.status).toBe("resolved");
+    expect(persisted?.evidence).toMatchObject({
+      automaticRecovery: { replay: "restored" },
+    });
+  });
+
+  it("mints no stage wake when a restored resolution lands the issue terminal (SUP-16684)", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const { actionId } = await seedEscalatedArmedReview({
+      companyId,
+      sourceIssueId,
+      coderId,
+      managerId,
+    });
+    const executionStageWakeupEnqueue = vi.fn(async () => ({ id: randomUUID() } as never));
+    const app = createApp(
+      { type: "board", source: "local_implicit", userId: "board-user" },
+      { executionStageWakeupEnqueue },
+    );
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        resolutionNote: "Operator confirmed the source issue is complete.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({ id: sourceIssueId, status: "done" });
+    expect(executionStageWakeupEnqueue).not.toHaveBeenCalled();
+  });
+
+  it("mints no stage wake when a restored resolution lands no armed stage (SUP-16684)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    // Already todo with the same assignee: the generic todo handback wake is a
+    // no-op, and there is no execution stage to arm.
+    await db
+      .update(issues)
+      .set({ status: "todo", executionState: null })
+      .where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:sup-16684-no-stage",
+      evidence: { sourceRunId: randomUUID() },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const executionStageWakeupEnqueue = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recoveryActionEnqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const app = createApp(
+      { type: "board", source: "local_implicit", userId: "board-user" },
+      { executionStageWakeupEnqueue, recoveryActionEnqueueWakeup },
+    );
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Restore the card to todo.",
+      })
+      .expect(200);
+
+    expect(executionStageWakeupEnqueue).not.toHaveBeenCalled();
+    expect(recoveryActionEnqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not mint a second stage wake when the same restore is resolved twice (SUP-16684)", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const { actionId } = await seedEscalatedArmedReview({
+      companyId,
+      sourceIssueId,
+      coderId,
+      managerId,
+    });
+    const executionStageWakeupEnqueue = vi.fn(async () => ({ id: randomUUID() } as never));
+    const app = createApp(
+      { type: "board", source: "local_implicit", userId: "board-user" },
+      { executionStageWakeupEnqueue },
+    );
+    const body = {
+      actionId,
+      outcome: "restored" as const,
+      sourceIssueStatus: "in_review" as const,
+      resolutionNote: "Restoring to in_review to re-pend that stage.",
+    };
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send(body)
+      .expect(200);
+    // A replay of the same resolution returns the settled action and mints nothing.
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send(body)
+      .expect(200);
+
+    expect(executionStageWakeupEnqueue).toHaveBeenCalledTimes(1);
   });
 
   it("still refuses an in_review resolve with no review policy and no review path (T27 / SUP-14905)", async () => {
