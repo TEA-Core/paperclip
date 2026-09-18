@@ -193,6 +193,66 @@ describe("INV-LADDER-1: assertNoStageInsertedBehindPointer (SUP-16525)", () => {
     ).not.toThrow();
   });
 
+  it("rejects a live pointer that is itself a completed stage (fail-closed §5)", () => {
+    // The stored state points at stage1 while ALSO listing it completed. A
+    // resolved stage cannot still be the stage the issue is waiting on; the old
+    // C1 loop excluded currentStageId and silently accepted this.
+    const state = {
+      ...activeState(),
+      currentStageId: stage1Id,
+      currentStageIndex: 0,
+      completedStageIds: [stage1Id],
+    } as unknown as IssueExecutionState;
+    expect(() =>
+      assertNoStageInsertedBehindPointer({ policy: threeStagePolicy(), executionState: state }),
+    ).toThrowError(HttpError);
+    try {
+      assertNoStageInsertedBehindPointer({ policy: threeStagePolicy(), executionState: state });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as HttpError).status).toBe(422);
+      expect((err as HttpError).details).toMatchObject({
+        code: "execution_policy_stage_inserted_behind_pointer",
+        offendingStageId: stage1Id,
+        currentStageId: stage1Id,
+      });
+    }
+  });
+
+  it("rejects a live pointer whose stored currentStageIndex is null (fail-closed §5)", () => {
+    // currentStageId is non-null but the duplicated numeric half is missing, so
+    // the pointer cannot be verified. Accepting it would let a later write trust
+    // a numeric index that does not exist.
+    const state = {
+      ...activeState(),
+      currentStageIndex: null,
+    } as unknown as IssueExecutionState;
+    expect(() =>
+      assertNoStageInsertedBehindPointer({ policy: threeStagePolicy(), executionState: state }),
+    ).toThrowError(HttpError);
+    try {
+      assertNoStageInsertedBehindPointer({ policy: threeStagePolicy(), executionState: state });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as HttpError).status).toBe(422);
+      expect((err as HttpError).details).toMatchObject({
+        code: "execution_policy_stage_inserted_behind_pointer",
+        currentStageId: stage2Id,
+        currentStageIndex: null,
+      });
+    }
+  });
+
+  it("rejects a live pointer whose stored currentStageIndex is absent (fail-closed §5)", () => {
+    const state = {
+      ...activeState(),
+      currentStageIndex: undefined,
+    } as unknown as IssueExecutionState;
+    expect(() =>
+      assertNoStageInsertedBehindPointer({ policy: threeStagePolicy(), executionState: state }),
+    ).toThrowError(HttpError);
+  });
+
   it("rejects removal of the current stage (dangling pointer, §5)", () => {
     const state = activeState();
     // Remove stage2 (the current stage) from the policy.

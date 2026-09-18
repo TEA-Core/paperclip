@@ -947,6 +947,60 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       return { companyId, agentId, issueId, identifier };
     }
 
+    const rearmPolicyBody = (reviewerAgentId: string) => ({
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+        { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+        { id: stage3Id, type: "approval", participants: [{ type: "user", userId: "cloud-user-1" }] },
+      ],
+    });
+
+    /**
+     * The pre-repair shape a policy rewrite can leave behind: the pointer already
+     * sits on the terminal approval while the coder-LE rung (stage2) never landed.
+     * That is exactly what INV-LADDER-1 refuses and what the §4 re-arm repairs.
+     *
+     * A second agent is seeded as the reviewer because the route's satisfiability
+     * check rejects a review stage gated solely by the issue's own return
+     * assignee (the assignee is excluded from its own participant selection).
+     */
+    async function seedBypassedLadderIssue(prefix: string) {
+      const { companyId, agentId, issueId, identifier } = await seedIssue(prefix);
+      const reviewerAgentId = randomUUID();
+      const now = new Date();
+      await db.insert(agents).values({
+        id: reviewerAgentId,
+        companyId,
+        name: "CodeReviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const executionPolicy = rearmPolicyBody(reviewerAgentId);
+      const executionState = {
+        status: "pending",
+        currentStageId: stage3Id,
+        currentStageIndex: 2,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: "cloud-user-1" },
+        returnAssignee: null,
+        completedStageIds: [stage1Id],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+      await db
+        .update(issues)
+        .set({ executionPolicy, executionState })
+        .where(eq(issues.id, issueId));
+      return { companyId, agentId, reviewerAgentId, issueId, identifier };
+    }
+
     async function recordApprovedDecision(
       companyId: string,
       issueId: string,
@@ -1041,6 +1095,67 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(cleared.body.code).toBe("done_transition_missing_delivery");
       expect(cleared.body.error).not.toContain("Review ladder unsatisfied");
       expect(cleared.body.details.remedy).toContain("deliver.sh");
+    });
+
+    it("performs the authorized re-arm PATCH, then advances the close only once the re-armed rung earns a durable decision row (AC4/AC5 route-level)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedBypassedLadderIssue("RARM2");
+      currentActor = {
+        type: "board",
+        userId: "cloud-user-1",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        runId: randomUUID(),
+      };
+
+      // Leg 1 — the authorized §4 re-arm PATCH runs through the real route and
+      // rewrites BOTH halves of the pointer onto the skipped coder-LE rung
+      // (stage2), landing it in NEITHER resolved set. This is the projection the
+      // close-path test above seeds by hand; here it is produced by the route.
+      const rearmResponse = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          executionPolicy: rearmPolicyBody(reviewerAgentId),
+          rearmExecutionPolicy: true,
+          comment: "Re-arm the pointer onto the skipped coder-LE rung.",
+        });
+      expect(rearmResponse.status, JSON.stringify(rearmResponse.body)).toBe(200);
+
+      const afterRearm = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      const rearmedState = afterRearm[0]!.executionState as any;
+      expect(rearmedState.currentStageId).toBe(stage2Id);
+      expect(rearmedState.currentStageIndex).toBe(1);
+      expect(rearmedState.completedStageIds).toEqual([stage1Id]);
+      expect(rearmedState.skippedStageIds).toEqual([]);
+
+      // Leg 2 — `done` is refused by the ladder gate naming the re-armed rung,
+      // and the refusal happens before any write or network probe.
+      const refused = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Attempt the close before the re-armed rung is decided." });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      expect(refused.body.error).toContain("Review ladder unsatisfied");
+      expect(refused.body.error).toContain(stage2Id);
+      expect(refused.body.error).toContain("stage 2 of 3");
+
+      // Leg 3 — the durable decision row is the ONLY change. The refusal now
+      // advances to the terminal rung (stage3), proving the re-armed gate opened
+      // only once the row existed.
+      await recordApprovedDecision(companyId, issueId, reviewerAgentId, stage2Id, "review");
+      const advanced = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Attempt the close after the re-armed rung is decided." });
+      expect(advanced.status, JSON.stringify(advanced.body)).toBe(409);
+      expect(advanced.body.error).toContain("Review ladder unsatisfied");
+      expect(advanced.body.error).not.toContain(stage2Id);
+      expect(advanced.body.error).toContain(stage3Id);
+      expect(advanced.body.error).toContain("stage 3 of 3");
     });
   });
 

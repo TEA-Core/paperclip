@@ -346,6 +346,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   applyBoardStageDecision,
+  assertNoStageInsertedBehindPointer,
   assertPatchableExecutionPolicyWrite,
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
@@ -15760,6 +15761,13 @@ export function issueRoutes(
       await assertCanReArmExecutionPolicy(access, req, existing.companyId, existing.assigneeAgentId, true);
     }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    // SUP-16525: set when this PATCH writes an executionPolicy that must satisfy
+    // INV-LADDER-1 against the *live* pointer. The assert in the block below
+    // reads `existing.executionState`; the pointer can move between that
+    // request-time read and the locked write, so a non-null value here forces
+    // the update onto the transactional path and is re-asserted against the
+    // locked row inside that transaction (see the re-check before `updateIssue`).
+    let invariantPolicyToRecheck: ReturnType<typeof resolvePatchExecutionPolicy> = null;
     if (req.body.executionPolicy !== undefined) {
       // SUP-13634: a PATCH must not strip the close ladder. An explicitly
       // empty stages array, or an explicit null over a non-null stored
@@ -15790,6 +15798,19 @@ export function issueRoutes(
         executionState: parsedExecutionState,
         rearmPointer: rearmExecutionPolicyRequested,
       });
+      // Mirror of the assert's gating above: only the paths that actually
+      // enforce INV-LADDER-1 pre-transaction are re-checked under the lock.
+      // A §4 re-arm rewrites the pointer and a preserved-stages omission
+      // cannot insert anything, so neither needs the locked re-check.
+      if (
+        !rearmExecutionPolicyRequested &&
+        !stagesKeyAbsent &&
+        parsedExecutionState?.currentStageId &&
+        normalizedExecutionPolicy !== null &&
+        normalizedExecutionPolicy.stages.length > 0
+      ) {
+        invariantPolicyToRecheck = normalizedExecutionPolicy;
+      }
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
       // moves the assignee off the collision in the same body is accepted.
       assertIssueExecutionPolicySatisfiable({
@@ -16668,6 +16689,9 @@ export function issueRoutes(
       || persistReviewActivityTransactionally
       || reviewPolicySensitiveMutationRequested
       || workspaceReprovisionCloseId !== null
+      // SUP-16525: a policy write that must satisfy INV-LADDER-1 is re-asserted
+      // against the locked row, so it has to run on the transactional path.
+      || invariantPolicyToRecheck !== null
       || (
         missingApprovalStageGap !== null
         && requestedTransitionStatus === "done"
@@ -16748,6 +16772,21 @@ export function issueRoutes(
                 },
               );
             }
+          }
+
+          // SUP-16525 INV-LADDER-1 under the update lock. The request-time
+          // assert validated against the snapshot `existing` was read from; the
+          // pointer can move before this write acquires the row lock, so the
+          // invariant is re-run against the locked row. A stale validation must
+          // not admit a stage inserted behind a pointer that has since
+          // advanced. Throwing 422 aborts the transaction with no partial write.
+          if (invariantPolicyToRecheck !== null) {
+            const lockedForInvariant = await svc.getByIdForUpdate(id, tx);
+            if (!lockedForInvariant) return null;
+            assertNoStageInsertedBehindPointer({
+              policy: invariantPolicyToRecheck,
+              executionState: parseIssueExecutionState(lockedForInvariant.executionState),
+            });
           }
 
           const updated = await updateIssue(tx);

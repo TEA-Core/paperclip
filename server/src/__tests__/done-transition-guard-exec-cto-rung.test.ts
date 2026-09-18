@@ -516,6 +516,48 @@ describe("SUP-16532 ADR-072 close-ladder shape: ordered forward scan (ADR-102 M3
       expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
     );
   });
+
+  it("keeps the ordering violation when a later duplicate eventually matches in order (AC1c)", async () => {
+    // support-QAE -> exec-CTO -> coder-LE -> exec-CTO. The first exec-CTO lands
+    // before coder-LE (out of order), but the trailing duplicate exec-CTO then
+    // matches the cursor in order. The earlier sighting is a permanent
+    // violation and must not be erased by the later match, or the terminal
+    // approver would be allowed to sign off before the DoD gate ran.
+    const stage4 = "40000000-0000-4000-8000-000000000004";
+    const executionPolicy = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+        { id: stage4, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3, stage4]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("out of order");
+    expect(result.reason).toContain("approval:exec-CTO");
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          reason: "adr072_close_ladder_shape_incomplete",
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+        }),
+      }),
+    );
+  });
 });
 
 describe("SUP-15650 regression: Guard B and mechanism D agree on one gated principal", () => {

@@ -685,12 +685,14 @@ export function resolvePatchExecutionPolicy(input: {
  * both `currentStageId` and `currentStageIndex`. A write is rejected unless the
  * incoming policy keeps `currentStageId` at exactly `S.currentStageIndex`:
  *   - if S.currentStageId is not found in P' the write is rejected (dangling
- *     pointer — the client removed the stage the state points to); and
- *   - if P'.stages[S.currentStageIndex]?.id !== S.currentStageId the write is
- *     rejected (the client shifted the current stage's position, so the two
- *     halves of the duplicated pointer would disagree).
- * Both are fail-closed: the sanctioned recovery for a policy that no longer
- * keeps the live stage in place is the §4 re-arm, not a raw PATCH.
+ *     pointer — the client removed the stage the state points to);
+ *   - if S.currentStageId is itself in completedStageIds/skippedStageIds the
+ *     write is rejected (a resolved stage cannot still be the live pointer); and
+ *   - unless S.currentStageIndex is a number and P'.stages[S.currentStageIndex]
+ *     .id === S.currentStageId the write is rejected (a missing/non-numeric or
+ *     shifted stored index leaves the two halves of the pointer disagreeing).
+ * All are fail-closed: the sanctioned recovery for a policy or state that no
+ * longer keeps the live stage in place is the §4 re-arm, not a raw PATCH.
  */
 export function assertNoStageInsertedBehindPointer(input: {
   policy: IssueExecutionPolicy;
@@ -716,9 +718,26 @@ export function assertNoStageInsertedBehindPointer(input: {
     ...(executionState!.skippedStageIds ?? []),
   ]);
 
+  // §5 fail-closed: the live pointer must not itself be a resolved
+  // (completed/skipped) stage. Such a state is internally inconsistent — a
+  // resolved stage cannot still be the stage the issue is waiting on — and a
+  // write that keeps it must be refused rather than propagated. The previous
+  // C1 loop explicitly excluded `currentStageId` from the "must be strictly
+  // before the pointer" rule, which silently accepted it.
+  if (resolvedIds.has(currentStageId)) {
+    throw unprocessable(
+      "executionPolicy keeps a current stage pointer that is already completed or skipped; the live pointer must be an unresolved stage",
+      {
+        code: "execution_policy_stage_inserted_behind_pointer",
+        offendingStageId: currentStageId,
+        currentStageId,
+      },
+    );
+  }
+
   // C1: all surviving completed/skipped stages must be strictly before the pointer
   for (const stage of policy.stages) {
-    if (resolvedIds.has(stage.id) && stage.id !== currentStageId) {
+    if (resolvedIds.has(stage.id)) {
       const idx = policy.stages.findIndex((s) => s.id === stage.id);
       if (idx >= currentIdx) {
         throw unprocessable(
@@ -746,14 +765,20 @@ export function assertNoStageInsertedBehindPointer(input: {
   // stored numeric index pointing at a different stage — e.g. removing a
   // completed stage from the prefix shifts the live stage without inserting
   // anything before it, which both positional loops above stay silent on.
-  if (typeof storedIndex === "number" && policy.stages[storedIndex]?.id !== currentStageId) {
+  //
+  // Fail closed on a MISSING/non-numeric index too: a non-null live pointer
+  // whose stored `currentStageIndex` is null (or otherwise not a number) cannot
+  // be verified, so the duplicated pointer is already inconsistent. Accepting it
+  // would let a later write trust a numeric index that does not exist.
+  if (typeof storedIndex !== "number" || policy.stages[storedIndex]?.id !== currentStageId) {
     throw unprocessable(
-      "executionPolicy would leave the stored currentStageIndex pointing at a different stage than currentStageId; the duplicated pointer would be inconsistent",
+      "executionPolicy would leave the stored currentStageIndex inconsistent with currentStageId; the duplicated pointer must be repaired through the authorized re-arm path",
       {
         code: "execution_policy_stage_inserted_behind_pointer",
-        offendingStageId: policy.stages[storedIndex]?.id ?? null,
+        offendingStageId:
+          typeof storedIndex === "number" ? policy.stages[storedIndex]?.id ?? null : null,
         currentStageId,
-        currentStageIndex: storedIndex,
+        currentStageIndex: typeof storedIndex === "number" ? storedIndex : null,
       },
     );
   }
