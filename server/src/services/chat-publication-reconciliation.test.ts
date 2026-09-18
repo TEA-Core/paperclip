@@ -22,6 +22,45 @@ function deferred() {
   return { promise, resolve };
 }
 
+// Index of the `}` that closes the `{` at openIndex, or -1. appendRunEvent's body
+// is a plain brace block, so brace depth locates its end without a parser.
+function matchingBrace(source: string, openIndex: number): number {
+  let depth = 0;
+  for (let index = openIndex; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+// Locates appendRunEvent's durable write and live emit in the heartbeat source.
+// Callers assert the emit index is below appendRunEventEnd: an unbounded
+// `indexOf("publishLiveEvent({", persistedEvent)` matches a later function's
+// emit, so the ordering assertion could pass with appendRunEvent emitting
+// nothing (SUP-16564).
+function locateAppendRunEventOrder(source: string) {
+  const appendRunEventStart = source.indexOf("async function appendRunEvent(");
+  const bodyOpen =
+    appendRunEventStart === -1 ? -1 : source.indexOf("{", appendRunEventStart);
+  const appendRunEventEnd =
+    bodyOpen === -1 ? -1 : matchingBrace(source, bodyOpen);
+  const persistedEvent = source.indexOf(
+    "await db.insert(heartbeatRunEvents).values(insertValues)",
+    appendRunEventStart,
+  );
+  const emittedEvent = source.indexOf("publishLiveEvent({", persistedEvent);
+  return {
+    appendRunEventStart,
+    appendRunEventEnd,
+    persistedEvent,
+    emittedEvent,
+  };
+}
+
 describe("createCoalescedAsyncTrigger", () => {
   it("coalesces notifications received before the scheduled pass starts", async () => {
     const run = vi.fn(async () => undefined);
@@ -224,9 +263,6 @@ describe("chat publication commit signals", () => {
       new URL("./heartbeat.ts", import.meta.url),
       "utf8",
     );
-    const appendRunEventStart = heartbeatSource.indexOf(
-      "async function appendRunEvent(",
-    );
     // Fork divergence (heartbeat_run_events error column, slice 2c): upstream
     // 51ad751e0 (#12616) routes appendRunEvent's write through the shared
     // `appendHeartbeatRunEvent` helper, and 889947c23 (#13038) pins that literal
@@ -237,17 +273,20 @@ describe("chat publication commit signals", () => {
     // (#565, migration 0245; kept over upstream's helper by the slice 2b fold
     // e5d442a8b). Only the literal changes: this still asserts the durable
     // heartbeat_run_events write lands before the live emit.
-    const persistedEvent = heartbeatSource.indexOf(
-      "await db.insert(heartbeatRunEvents).values(insertValues)",
+    const {
       appendRunEventStart,
-    );
-    const emittedEvent = heartbeatSource.indexOf(
-      "publishLiveEvent({",
+      appendRunEventEnd,
       persistedEvent,
-    );
+      emittedEvent,
+    } = locateAppendRunEventOrder(heartbeatSource);
     expect(appendRunEventStart).toBeGreaterThanOrEqual(0);
+    expect(appendRunEventEnd).toBeGreaterThan(appendRunEventStart);
     expect(persistedEvent).toBeGreaterThan(appendRunEventStart);
     expect(emittedEvent).toBeGreaterThan(persistedEvent);
+    // Fork divergence (ordering bound, SUP-16564): the emit must sit inside
+    // appendRunEvent's body, not merely somewhere later in the file. Without
+    // this bound the check passes when the emit is moved into another function.
+    expect(emittedEvent).toBeLessThan(appendRunEventEnd);
 
     const presentationMarker = heartbeatSource.indexOf(
       'eventType: "run.presentation.resolved"',
@@ -259,6 +298,35 @@ describe("chat publication commit signals", () => {
     expect(presentationMarker).toBeGreaterThanOrEqual(0);
     expect(committedComment).toBeGreaterThanOrEqual(0);
     expect(presentationMarker).toBeGreaterThan(committedComment);
+  });
+
+  it("rejects an emit that is ordered after the insert but outside appendRunEvent", () => {
+    // Same durable write, same emit, same relative order — but the emit sits in
+    // a later function. The bare ordering comparison still holds, so only the
+    // appendRunEvent bound rejects the layout: that is what makes it strict
+    // (SUP-16564).
+    const movedEmit = [
+      "async function appendRunEvent(run, event) {",
+      "  await db.insert(heartbeatRunEvents).values(insertValues);",
+      "}",
+      "function emitElsewhere(run, event) {",
+      "  publishLiveEvent({",
+      '    type: "heartbeat.run.event",',
+      "  });",
+      "}",
+    ].join("\n");
+
+    const {
+      appendRunEventStart,
+      appendRunEventEnd,
+      persistedEvent,
+      emittedEvent,
+    } = locateAppendRunEventOrder(movedEmit);
+
+    expect(appendRunEventStart).toBeGreaterThanOrEqual(0);
+    expect(persistedEvent).toBeGreaterThan(appendRunEventStart);
+    expect(emittedEvent).toBeGreaterThan(persistedEvent);
+    expect(emittedEvent).toBeGreaterThan(appendRunEventEnd);
   });
 
   it("accepts only the closed durable progress and final-presentation event types", () => {
