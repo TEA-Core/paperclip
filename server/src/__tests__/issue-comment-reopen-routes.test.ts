@@ -707,6 +707,68 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  // SUP-16694: the combined status+seat PATCH is the sanctioned one-write
+  // backlog-promotion shape. It must classify its wake `issue_assigned`, exactly
+  // like a seat-only write — the route never emits `reason: "other"`. (The
+  // `other` projection in diagnostics is a SKIP reason overwriting the stored
+  // reason, not an emission shape.)
+  it("emits issue_assigned for a seat-only PATCH (control shape)", async () => {
+    const issue = makeIssue("todo");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "33333333-3333-4333-8333-333333333333",
+        expect.objectContaining({
+          source: "assignment",
+          reason: "issue_assigned",
+        }),
+      ),
+    );
+  });
+
+  it("emits issue_assigned for a combined status+seat PATCH (promotion shape)", async () => {
+    const issue = makeIssue("backlog");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({
+        status: "todo",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "33333333-3333-4333-8333-333333333333",
+        expect.objectContaining({
+          source: "assignment",
+          reason: "issue_assigned",
+        }),
+      ),
+    );
+    const emittedReasons = mockHeartbeatService.wakeup.mock.calls.map(
+      (call) => (call[1] as { reason?: string }).reason,
+    );
+    expect(emittedReasons).toContain("issue_assigned");
+    expect(emittedReasons).not.toContain("issue_status_changed");
+    expect(emittedReasons).not.toContain("other");
+  });
+
   it("rejects ambiguous assignee shortnames", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
 
