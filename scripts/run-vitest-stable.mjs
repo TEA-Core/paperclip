@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
+import { generalServerShardBalance, loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
 
@@ -16,6 +16,10 @@ const generalServerShardDurations = loadShardDurations(
 const serializedShardDurations = loadShardDurations(
   path.join(scriptsDir, "serialized-shard-durations.json"),
 );
+// Mirrors .github/workflows/pr.yml `general_tests.timeout-minutes` (30). CI sets
+// GENERAL_SERVER_SHARD_CAP_MINUTES so the 80%-of-cap warning line stays in sync
+// with the job cap; the default is the cap raised on 2026-09-18 (SUP-16686).
+const generalServerShardCapMinutes = Number(process.env.GENERAL_SERVER_SHARD_CAP_MINUTES) || 30;
 const serverRoot = path.join(repoRoot, "server");
 const serverSrcDir = path.join(repoRoot, "server", "src");
 const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
@@ -378,6 +382,36 @@ function runProjectGroup(projects, groupName, shardIndex = null, shardCount = nu
   }
 }
 
+function logGeneralServerShardBalance(files, shardCount, groupLabel) {
+  const balance = generalServerShardBalance(
+    files,
+    shardCount,
+    generalServerShardDurations,
+    generalServerShardCapMinutes,
+  );
+  const warnLineMinutes = balance.warnLineMs / 60000;
+  console.log(
+    `\n[test:run] ${groupLabel} predicted balance (${shardCount} shards, cap ${generalServerShardCapMinutes}m, warn ${warnLineMinutes.toFixed(0)}m): ` +
+      balance.perShard.map((shard) => `${(shard.predictedMs / 60000).toFixed(2)}m`).join(" "),
+  );
+  if (!balance.anyOverWarningLine) {
+    return;
+  }
+  const offenders = balance.perShard
+    .filter((shard) => shard.overWarningLine)
+    .map((shard) => `shard ${shard.shardIndex + 1} (${(shard.predictedMs / 60000).toFixed(1)}m)`)
+    .join(", ");
+  const message = `general-server ${offenders} predict past 80% of the ${generalServerShardCapMinutes}m job cap (${warnLineMinutes.toFixed(0)}m) — refresh scripts/general-server-shard-durations.json or re-evaluate the shard count before the lane cancels PRs at the cap`;
+  console.error(`\n[test:run] WARNING: ${message}`);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\n**⚠️ ${message}**\n`);
+    } catch {
+      // The step summary is best-effort; the console warning above is authoritative.
+    }
+  }
+}
+
 function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = null) {
   if (groupName === generalChatGroupName) {
     runVitest(["--project", "@paperclipai/server", ...serializedServerVitestArgs, chatSuite],
@@ -398,6 +432,12 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
       console.log(
         `\n[test:run] general-server shard ${shardIndex + 1}/${shardCount} running ${shardFiles.length} of ${files.length} suites`,
       );
+      // Surface the whole lane's predicted balance before the shard's own suites
+      // start, so the next manifest/shard drift is visible in the PR page instead
+      // of surfacing later as an unexplained `verify` failure (SUP-16681 ask 4).
+      if (groupName === generalServerGroupName) {
+        logGeneralServerShardBalance(files, shardCount, `${groupName} ${shardIndex + 1}/${shardCount}`);
+      }
       if (shardFiles.length === 0) {
         return;
       }
@@ -514,8 +554,21 @@ if (options.dryRun) {
             ? selectGeneralServerShard(
                 options.group === generalServerWithoutChatGroupName ? generalServerTestFiles.filter((file) => file !== chatSuite) : generalServerTestFiles,
                 options.shardIndex,
+                 options.shardCount,
+                 generalServerShardDurations,
+               )
+             : null,
+        generalServerShardBalance:
+          options.mode === generalModeName &&
+          [generalServerGroupName, generalServerWithoutChatGroupName].includes(options.group) &&
+          options.shardCount !== null
+            ? generalServerShardBalance(
+                options.group === generalServerWithoutChatGroupName
+                  ? generalServerTestFiles.filter((file) => file !== chatSuite)
+                  : generalServerTestFiles,
                 options.shardCount,
                 generalServerShardDurations,
+                generalServerShardCapMinutes,
               )
             : null,
         workspaceProjects:
