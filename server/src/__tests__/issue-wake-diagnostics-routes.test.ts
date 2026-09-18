@@ -583,21 +583,26 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.events).toHaveLength(1);
-    // A non-company-scoped agent sees only the generic projection: the raw
-    // reason and error are withheld, not merely blanked.
+    // A non-company-scoped agent sees only the generic projection: the new
+    // failure-detail fields are withheld entirely (no key at all), not merely
+    // blanked to null. Existing fields and their semantics are unchanged.
     expect(res.body.events[0]).toMatchObject({
       kind: "wake_request",
       agentId: null,
       runId: null,
       reason: "other",
-      rawReason: null,
       status: "skipped",
       failureClass: "failed",
-      error: null,
     });
+    // SUP-16685: the gated fields are omitted, not serialized as null, so a
+    // caller without company scope sees no new field at all.
+    expect(res.body.events[0]).not.toHaveProperty("rawReason");
+    expect(res.body.events[0]).not.toHaveProperty("error");
     const serialized = JSON.stringify(res.body);
     expect(serialized).not.toContain(marker);
     expect(serialized).not.toContain("heartbeat.scheduling_suppressed");
+    expect(serialized).not.toContain("\"rawReason\"");
+    expect(serialized).not.toContain("\"error\"");
   });
 
   it("names the transient skip class for a skipped wake that carries an error (SUP-16430 shape)", async () => {

@@ -1903,12 +1903,11 @@ function projectIssueWakeRequest(
   options: { includeInternalIds: boolean },
 ): IssueWakeDiagnosticWakeRequest {
   const status = projectWakeDiagnosticStatus(row.status);
-  return {
+  const projected: IssueWakeDiagnosticWakeRequest = {
     kind: "wake_request",
     agentId: options.includeInternalIds ? row.agentId : null,
     source: projectWakeDiagnosticSource(row.source) ?? "other",
     reason: projectWakeDiagnosticReason(row.reason),
-    rawReason: projectWakeDiagnosticRawReason(row.reason, options.includeInternalIds),
     status,
     coalescedCount: row.coalescedCount,
     runId: options.includeInternalIds ? row.runId : null,
@@ -1916,8 +1915,21 @@ function projectIssueWakeRequest(
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
-    error: projectWakeDiagnosticErrorDetail(row.error, options.includeInternalIds),
   };
+  // SUP-16680 / SUP-16685: the failure-detail fields are present only for
+  // company-scoped callers; a caller without company scope sees no new key at
+  // all (not merely null values), matching the includeInternalIds boundary.
+  if (options.includeInternalIds) {
+    projected.rawReason = projectWakeDiagnosticRawReason(
+      row.reason,
+      options.includeInternalIds,
+    );
+    projected.error = projectWakeDiagnosticErrorDetail(
+      row.error,
+      options.includeInternalIds,
+    );
+  }
+  return projected;
 }
 
 function wakeDiagnosticActivityAction(action: string) {
