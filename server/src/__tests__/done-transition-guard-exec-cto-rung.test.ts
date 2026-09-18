@@ -598,25 +598,43 @@ describe("SUP-16525 §4/§5 close path after re-arm: only a durable decision row
   // The ratified ADR-072 order. The coder-LE review is the rung the bypassed
   // policy change skipped, so it is the stage the authorized re-arm rewinds onto.
   const rearmPolicy = {
+    mode: "normal" as const,
+    commentRequired: true,
     stages: [
-      { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
-      { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
-      { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+      {
+        id: stage1,
+        type: "review" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ id: "p1", type: "agent" as const, agentId: supportQaeId, userId: null }],
+      },
+      {
+        id: stage2,
+        type: "review" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ id: "p2", type: "agent" as const, agentId: coderLeId, userId: null }],
+      },
+      {
+        id: stage3,
+        type: "approval" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ id: "p3", type: "agent" as const, agentId: execCtoId, userId: null }],
+      },
     ],
   };
 
   // The pre-repair projection: the pointer sits on the terminal approval while
   // the coder-LE rung never landed — exactly the shape INV-LADDER-1 now refuses.
   const bypassedState = {
-    status: "pending",
+    status: "pending" as const,
     currentStageId: stage3,
     currentStageIndex: 2,
-    currentStageType: "approval",
-    currentParticipant: { type: "agent", agentId: execCtoId },
+    currentStageType: "approval" as const,
+    currentParticipant: { type: "agent" as const, agentId: execCtoId, userId: null },
     returnAssignee: null,
+    reviewRequest: null,
     deliveryAuthor: null,
     completedStageIds: [stage1],
-    skippedStageIds: [],
+    skippedStageIds: [] as string[],
     lastDecisionId: null,
     lastDecisionOutcome: null,
   };

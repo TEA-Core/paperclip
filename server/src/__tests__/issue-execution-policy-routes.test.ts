@@ -1668,7 +1668,7 @@ describe("issue execution policy routes", () => {
     // Exactly one interaction is minted, as a user-actor request_confirmation.
     expect(mockIssueThreadInteractionService.create).toHaveBeenCalledTimes(1);
     const [createIssue, createOptions, createActor] =
-      mockIssueThreadInteractionService.create.mock.calls[0] as [
+      mockIssueThreadInteractionService.create.mock.calls[0] as unknown as [
         unknown,
         Record<string, unknown>,
         Record<string, unknown>,
@@ -2285,8 +2285,8 @@ describe("issue execution policy routes", () => {
       expect(res.body).toMatchObject({ error: "executionPolicy.stages must not be empty" });
       expect(mockIssueService.update).not.toHaveBeenCalled();
       for (const call of mockLogActivity.mock.calls) {
-        expect((call[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
-        expect((call[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
+        expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
+        expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
       }
       expect(storedPolicy).not.toBeNull();
     });
@@ -2362,8 +2362,8 @@ describe("issue execution policy routes", () => {
       expect(res.body.error).toContain("executionPolicy must not be set to null");
       expect(mockIssueService.update).not.toHaveBeenCalled();
       for (const call of mockLogActivity.mock.calls) {
-        expect((call[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
-        expect((call[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
+        expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
+        expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
       }
     });
 
@@ -2901,7 +2901,7 @@ describe("issue execution policy routes", () => {
           limit: () => chain,
           then: resolveDefault,
         };
-        return chain;
+        return chain as never;
       });
 
       const app = await createApp({
@@ -2976,7 +2976,7 @@ describe("issue execution policy routes", () => {
         type: "agent",
         agentId: summarizerAgentId,
         userId: null,
-      });
+      } as never);
       mockIssueService.getById.mockResolvedValue(issue);
       mockIssueService.update.mockResolvedValue({
         ...issue,
@@ -3010,7 +3010,7 @@ describe("issue execution policy routes", () => {
           limit: () => chain,
           then: resolveDefault,
         };
-        return chain;
+        return chain as never;
       });
 
       const app = await createApp({
@@ -3073,7 +3073,7 @@ describe("issue execution policy routes", () => {
           limit: () => chain,
           then: resolveDefault,
         };
-        return chain;
+        return chain as never;
       });
 
       const app = await createApp({

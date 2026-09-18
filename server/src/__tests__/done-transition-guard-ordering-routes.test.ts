@@ -732,8 +732,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
 
     const notes = allRows.filter((r) => r.action === "issue.done_transition_guard_note");
     expect(notes).toHaveLength(1);
-    expect(notes[0]!.details.skipReason).toBe("unhydrated_linked_prs:1");
-    expect(notes[0]!.details.decisionCarried).toBe(false);
+    expect(notes[0]!.details?.skipReason).toBe("unhydrated_linked_prs:1");
+    expect(notes[0]!.details?.decisionCarried).toBe(false);
     expect(allRows.every((r) => r.action !== "issue.done_transition_guard_skipped")).toBe(true);
 
     // SUP-13197 acceptance #4: a not-skipped path with a non-auth skipReason must NOT
@@ -823,9 +823,9 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     }, { timeout: 5000 });
 
     expect(skippedRows).toHaveLength(1);
-    expect(skippedRows[0]!.details.skipReason).toBe("token_missing");
-    expect(skippedRows[0]!.details.reason).toContain("GitHub token not configured");
-    expect(skippedRows[0]!.details.decisionCarried).toBe(false);
+    expect(skippedRows[0]!.details?.skipReason).toBe("token_missing");
+    expect(skippedRows[0]!.details?.reason).toContain("GitHub token not configured");
+    expect(skippedRows[0]!.details?.decisionCarried).toBe(false);
 
     const allRows = await guardAuditRows(issueId);
     expect(allRows.every((r) => r.action !== "issue.done_transition_guard_note")).toBe(true);
@@ -888,8 +888,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     // Upstream's activity redaction (folded in slice 2b) text-redacts every string value, and
     // `secretName=` matches its secret-field pattern, so the stored note masks the secret's NAME.
     // The guard's own skipReason still carries it (done-transition-guard.test.ts).
-    expect(notes[0]!.details.skipReason).toBe("auth_failed:compare:401:scope=repo:secretName=***REDACTED***");
-    expect(notes[0]!.details.decisionCarried).toBe(false);
+    expect(notes[0]!.details?.skipReason).toBe("auth_failed:compare:401:scope=repo:secretName=***REDACTED***");
+    expect(notes[0]!.details?.decisionCarried).toBe(false);
     expect(allRows.every((r) => r.action !== "issue.done_transition_guard_skipped")).toBe(true);
 
     // Contract: postAuthFailureComment is reachable only when guardResult.skipped
@@ -1189,7 +1189,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
         .then((rows) => rows.filter((r) => r.action === "issue.done_tier_declaration_skipped"));
       expect(audit).toHaveLength(1);
-      expect(audit[0]!.details.skipReason).toBe("board_actor_bypass");
+      expect(audit[0]!.details?.skipReason).toBe("board_actor_bypass");
     });
 
     it("AC4: board close with a comment lacking evidence still bypasses the gate", async () => {
@@ -1215,7 +1215,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
         .then((rows) => rows.filter((r) => r.action === "issue.done_tier_declaration_skipped"));
       expect(audit).toHaveLength(1);
-      expect(audit[0]!.details.skipReason).toBe("board_actor_bypass");
+      expect(audit[0]!.details?.skipReason).toBe("board_actor_bypass");
     });
 
     it("AC5: statuses other than done are not subject to the tier gate", async () => {
