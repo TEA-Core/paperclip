@@ -10,6 +10,10 @@ import {
 import { evaluateDoneTransitionGuard } from "../services/done-transition-guard.js";
 import { evaluateStageIntegrity } from "../services/approval-status-reconciler.js";
 import { logActivity } from "../services/activity-log.js";
+import {
+  applyExecutionPolicyReArm,
+  rearmExecutionPolicyPointer,
+} from "../services/issue-execution-policy.js";
 
 const mockDb = {
   select: vi.fn(),
@@ -385,6 +389,177 @@ describe("SUP-15650 ADR-072 close-ladder shape: re-seat the principal's rung", (
   });
 });
 
+describe("SUP-16532 ADR-072 close-ladder shape: ordered forward scan (ADR-102 M3)", () => {
+  beforeEach(() => {
+    ghFetchMock.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+    mockFetchOpenPullRequests.mockReset();
+    mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: [] });
+    mockResolveGitHubToken.mockReset();
+    mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    vi.mocked(logActivity).mockClear();
+    mockExecFile.mockReset();
+    mockGitProbe("0", "0");
+    setupDbMock({});
+  });
+
+  it("refuses a complete ladder where approval:exec-CTO lands before review:coder-LE as an ordering violation (AC1)", async () => {
+    // All three ADR-072 rungs are present, but the terminal approval sits
+    // between the two reviews — the final approver signs off before the coder-LE
+    // Definition-of-Done gate runs. The ordered scan refuses this as an
+    // ordering violation, distinct from a missing rung.
+    const executionPolicy = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.skipped).toBe(false);
+    expect(result.reason).toContain("Mechanism D");
+    expect(result.reason).toContain("ADR-072 close-ladder shape");
+    // The ordering violation is named distinctly from a missing rung.
+    expect(result.reason).toContain("out of order");
+    expect(result.reason).toContain("approval:exec-CTO");
+    expect(result.reason).not.toContain("missing the ADR-072 close-ladder stage");
+    // Fail closed before any external probe.
+    expect(ghFetchMock).not.toHaveBeenCalled();
+    expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          reason: "adr072_close_ladder_shape_incomplete",
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+          ladderedChildCount: 2,
+        }),
+      }),
+    );
+  });
+
+  it("refuses a complete ladder where approval:exec-CTO leads, naming the ordering violation (AC1b)", async () => {
+    // The approver signs FIRST, before either review. Both reviews still land in
+    // their relative order, but the approval's position is an ordering
+    // violation, so the close is refused — not because a rung is missing.
+    const executionPolicy = {
+      stages: [
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("out of order");
+    expect(result.reason).toContain("approval:exec-CTO");
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+        }),
+      }),
+    );
+  });
+
+  it("still closes a ladder in the ratified ADR-072 order (AC2)", async () => {
+    // review:support-QAE -> review:coder-LE -> approval:exec-CTO, in order:
+    // every rung lands before any later-required stage, so the close is allowed.
+    const executionPolicy = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(true);
+    expect(logActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+    );
+  });
+
+  it("keeps the ordering violation when a later duplicate eventually matches in order (AC1c)", async () => {
+    // support-QAE -> exec-CTO -> coder-LE -> exec-CTO. The first exec-CTO lands
+    // before coder-LE (out of order), but the trailing duplicate exec-CTO then
+    // matches the cursor in order. The earlier sighting is a permanent
+    // violation and must not be erased by the later match, or the terminal
+    // approver would be allowed to sign off before the DoD gate ran.
+    const stage4 = "40000000-0000-4000-8000-000000000004";
+    const executionPolicy = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+        { id: stage4, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy,
+        executionState: satisfiedState([stage1, stage2, stage3, stage4]),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("out of order");
+    expect(result.reason).toContain("approval:exec-CTO");
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          reason: "adr072_close_ladder_shape_incomplete",
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+        }),
+      }),
+    );
+  });
+});
+
 describe("SUP-15650 regression: Guard B and mechanism D agree on one gated principal", () => {
   beforeEach(() => {
     vi.mocked(logActivity).mockClear();
@@ -458,5 +633,198 @@ describe("SUP-15650 regression: Guard B and mechanism D agree on one gated princ
     const verdict = await evaluateStageIntegrity(mockDb, row);
     expect(verdict).not.toBeNull();
     expect(verdict?.reason).toBe("guard-b:decision-by-return-assignee");
+  });
+});
+
+describe("SUP-16525 §4/§5 close path after re-arm: only a durable decision row discharges the re-armed rung", () => {
+  // The ratified ADR-072 order. The coder-LE review is the rung the bypassed
+  // policy change skipped, so it is the stage the authorized re-arm rewinds onto.
+  const rearmPolicy = {
+    mode: "normal" as const,
+    commentRequired: true,
+    stages: [
+      {
+        id: stage1,
+        type: "review" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ id: "p1", type: "agent" as const, agentId: supportQaeId, userId: null }],
+      },
+      {
+        id: stage2,
+        type: "review" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ id: "p2", type: "agent" as const, agentId: coderLeId, userId: null }],
+      },
+      {
+        id: stage3,
+        type: "approval" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ id: "p3", type: "agent" as const, agentId: execCtoId, userId: null }],
+      },
+    ],
+  };
+
+  // The pre-repair projection: the pointer sits on the terminal approval while
+  // the coder-LE rung never landed — exactly the shape INV-LADDER-1 now refuses.
+  const bypassedState = {
+    status: "pending" as const,
+    currentStageId: stage3,
+    currentStageIndex: 2,
+    currentStageType: "approval" as const,
+    currentParticipant: { type: "agent" as const, agentId: execCtoId, userId: null },
+    returnAssignee: null,
+    reviewRequest: null,
+    deliveryAuthor: null,
+    completedStageIds: [stage1],
+    skippedStageIds: [] as string[],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+  };
+
+  // The persisted re-arm patch, computed through the authorized writer.
+  const rearmIssue = { ...issue, status: "in_review", assigneeAgentId: coderLeId, createdByAgentId: null };
+  const rearmPatch = () =>
+    applyExecutionPolicyReArm({ issue: rearmIssue, policy: rearmPolicy, executionState: bypassedState }).patch;
+  const rearmedState = () => rearmPatch().executionState;
+
+  const rearmedGuardInput = () => ({
+    ...issue,
+    parentId: null,
+    executionPolicy: rearmPolicy,
+    executionState: rearmedState(),
+  });
+
+  beforeEach(() => {
+    ghFetchMock.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+    mockFetchOpenPullRequests.mockReset();
+    mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: [] });
+    mockResolveGitHubToken.mockReset();
+    mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    vi.mocked(logActivity).mockClear();
+    mockExecFile.mockReset();
+    mockGitProbe("0", "0");
+    setupDbMock({});
+  });
+
+  it("re-arm rewinds the pointer onto the skipped rung and lands it in NEITHER list (AC3)", () => {
+    // The pure calculator names the re-armed stage...
+    expect(
+      rearmExecutionPolicyPointer({ policy: rearmPolicy, executionState: bypassedState }),
+    ).toEqual({ currentStageId: stage2, currentStageIndex: 1 });
+
+    // ...and the persisted writer turns it into a concrete patch: the re-armed
+    // rung is pending, carries the completed set forward unchanged, and is an
+    // explicit NON-completion (it is in neither completedStageIds nor skippedStageIds).
+    const patch = rearmPatch();
+    expect(patch.status).toBe("in_review");
+    const state = patch.executionState as {
+      currentStageId: string;
+      completedStageIds: string[];
+      skippedStageIds: string[];
+    };
+    expect(state.currentStageId).toBe(stage2);
+    expect(state.completedStageIds).toEqual([stage1]);
+    expect(state.skippedStageIds).toEqual([]);
+    expect(state.completedStageIds).not.toContain(stage2);
+    expect(state.skippedStageIds).not.toContain(stage2);
+  });
+
+  it("refuses done after the re-arm while the re-armed rung has no durable decision row (AC4)", async () => {
+    // The post-re-arm close attempt: the projection still shows only stage 1
+    // completed and no decision rows exist, so the re-armed rung is unsatisfied
+    // and the guard fails closed in the pre-network zone.
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await evaluateDoneTransitionGuard(mockDb, rearmedGuardInput(), null);
+    expect(result.allowed).toBe(false);
+    expect(result.ladderUnsatisfied).toBe(true);
+    expect(result.reason).toContain("Review ladder unsatisfied");
+    expect(result.reason).toContain("stage 2 of 3");
+    expect(result.reason).toContain(stage2);
+    expect(result.reason).toContain("neither completedStageIds nor skippedStageIds");
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_refused",
+        details: expect.objectContaining({ reason: `review_ladder_unsatisfied:${stage2}` }),
+      }),
+    );
+    // Fail closed before any external probe.
+    expect(ghFetchMock).not.toHaveBeenCalled();
+    expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+  });
+
+  it("the re-armed rung opens only on a durable APPROVED row, then advances to the next rung (AC4)", async () => {
+    // Fail closed: a non-approved latest decision supersedes nothing, so a
+    // changes_requested row leaves the rung exactly as open as no row at all.
+    const decision = (outcome: string) => ({
+      id: `dec-${outcome}`,
+      stageId: stage2,
+      outcome,
+      actorAgentId: coderLeId,
+      actorUserId: null,
+      createdAt: new Date("2026-09-10T12:00:00Z"),
+    });
+    setupDbMock({ issues: twoLadderedChildren, agents, issueExecutionDecisions: [decision("changes_requested")] });
+    const refused = await evaluateDoneTransitionGuard(mockDb, rearmedGuardInput(), null);
+    expect(refused.allowed).toBe(false);
+    expect(refused.ladderUnsatisfied).toBe(true);
+    expect(refused.reason).toContain(stage2);
+    expect(refused.reason).toContain("stage 2 of 3");
+
+    // The ONLY change now is the outcome of that one row: approved discharges
+    // the re-armed rung, so the refusal moves on to the next unsatisfied rung —
+    // proof that the row, not the projection, is what opens the ladder.
+    setupDbMock({ issues: twoLadderedChildren, agents, issueExecutionDecisions: [decision("approved")] });
+    const advanced = await evaluateDoneTransitionGuard(mockDb, rearmedGuardInput(), null);
+    expect(advanced.allowed).toBe(false);
+    expect(advanced.ladderUnsatisfied).toBe(true);
+    expect(advanced.reason).not.toContain(stage2);
+    expect(advanced.reason).toContain("stage 3 of 3");
+    expect(advanced.reason).toContain(stage3);
+  });
+
+  it("closes only once every rung has a durable approved row, with the projection untouched (AC5)", async () => {
+    // `executionState` is byte-for-byte the same as the refused attempt: the
+    // close is allowed solely because the re-armed rung AND the terminal rung
+    // now carry durable approved decision rows (SUP-14912 recovery). The
+    // ratified ADR-072 order then satisfies mechanism D as well.
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents,
+      issueExecutionDecisions: [
+        {
+          id: "dec-1",
+          stageId: stage2,
+          outcome: "approved",
+          actorAgentId: coderLeId,
+          actorUserId: null,
+          createdAt: new Date("2026-09-10T12:00:00Z"),
+        },
+        {
+          id: "dec-2",
+          stageId: stage3,
+          outcome: "approved",
+          actorAgentId: execCtoId,
+          actorUserId: null,
+          createdAt: new Date("2026-09-10T13:00:00Z"),
+        },
+      ],
+    });
+    const result = await evaluateDoneTransitionGuard(mockDb, rearmedGuardInput(), null);
+    expect(result.allowed).toBe(true);
+    expect(result.ladderUnsatisfied).toBeUndefined();
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_recovered_from_decisions",
+        details: expect.objectContaining({ reason: "review_ladder_recovered_from_decisions" }),
+      }),
+    );
+    expect(logActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+    );
   });
 });

@@ -1167,7 +1167,17 @@ export async function countLadderedChildren(
 /**
  * SUP-14579 (mechanism D / ADR-072 close-ladder shape): given a parent's
  * execution policy, report which of the three ADR-072 close-ladder stages
- * (review:support-QAE, review:coder-LE, approval:exec-CTO) are absent.
+ * (review:support-QAE, review:coder-LE, approval:exec-CTO) are absent — and,
+ * SUP-16532 / ADR-102 M3, which are present but out of order.
+ *
+ * The check is an ORDERED forward scan that consumes ADR072_CLOSE_LADDER in its
+ * declared order: one pass over `policy.stages` keeps a requirement cursor and
+ * advances it on each in-order match. A requirement is satisfied only when a
+ * matching stage lands BEFORE any later-required stage. A requirement whose
+ * only matching stage lands after an earlier requirement's stage is reported as
+ * an ordering violation (its own label list), never silently accepted — the
+ * order-less membership check closed this open, letting the final approver
+ * sign off before the Definition-of-Done gate runs.
  *
  * A stage satisfies a requirement when its `type` matches the required stage
  * type AND at least one of its agent participants resolves to the required
@@ -1187,19 +1197,30 @@ export async function countLadderedChildren(
  * right type whose ONLY agent participant is the principal does NOT satisfy
  * the requirement (a self-held rung is not a rung), so a ladder with fewer
  * independent gates than ADR-072 requires still refuses. Every rung the
- * principal does not hold keeps its verbatim agent requirement.
+ * principal does not hold keeps its verbatim agent requirement. The re-seat
+ * changes WHO satisfies a rung; the order rule above is applied per
+ * requirement on top of that same predicate.
  *
- * Returns the labels of the missing requirements; an empty array means the
- * ladder carries the full close-ladder shape. A missing/stages-less policy
- * reports every requirement as missing.
+ * Returns `{ missingStageLabels, outOfOrderStageLabels }`. Requirements
+ * unmatched by the end of the scan are missing (unchanged shape); a
+ * missing/stages-less policy reports every requirement as missing. Both lists
+ * empty means the ladder carries the full close-ladder shape in the ratified
+ * order.
  */
+interface Adr072CloseLadderShape {
+  /** Requirements with no matching stage at all (the unchanged "missing" shape). */
+  missingStageLabels: string[];
+  /** Requirements matched only out of order — a distinct ordering violation (SUP-16532). */
+  outOfOrderStageLabels: string[];
+}
+
 async function findMissingAdr072CloseLadderStages(
   db: Db,
   companyId: string,
   executionPolicy: unknown,
   executionState: unknown,
   createdByAgentId: string | null | undefined,
-): Promise<string[]> {
+): Promise<Adr072CloseLadderShape> {
   const policy: Record<string, unknown> =
     executionPolicy != null && typeof executionPolicy === "object"
       ? (executionPolicy as Record<string, unknown>)
@@ -1211,7 +1232,10 @@ async function findMissingAdr072CloseLadderStages(
 
   const rawStages = policy.stages;
   if (!Array.isArray(rawStages)) {
-    return ADR072_CLOSE_LADDER.map((requirement) => requirement.label);
+    return {
+      missingStageLabels: ADR072_CLOSE_LADDER.map((requirement) => requirement.label),
+      outOfOrderStageLabels: [],
+    };
   }
 
   const stages = rawStages
@@ -1265,37 +1289,82 @@ async function findMissingAdr072CloseLadderStages(
     if (urlKey !== null && urlKey !== undefined) principalUrlKeys.add(urlKey);
   }
 
-  const missing: string[] = [];
-  for (const requirement of ADR072_CLOSE_LADDER) {
+  const requirementCount = ADR072_CLOSE_LADDER.length;
+
+  // Per-requirement satisfaction predicate. PRESERVES the SUP-15650 re-seat:
+  // a rung whose required agent urlKey is the gated principal's is satisfied
+  // only by a same-type stage carrying an INDEPENDENT (non-principal) agent
+  // participant — a self-held rung is not a rung.
+  const stageSatisfiesRequirement = (
+    stage: { type: string | null; participants: unknown[] },
+    requirementIndex: number,
+  ): boolean => {
+    const requirement = ADR072_CLOSE_LADDER[requirementIndex];
     const principalHoldsRung = principalUrlKeys.has(requirement.agentUrlKey);
-    const satisfied = stages.some(
-      (stage) =>
-        stage.type === requirement.stageType &&
-        stage.participants.some((participant) => {
-          if (
-            participant == null ||
-            typeof participant !== "object" ||
-            (participant as { type?: unknown }).type !== "agent" ||
-            typeof (participant as { agentId?: unknown }).agentId !== "string"
-          ) {
-            return false;
-          }
-          const agentId = (participant as { agentId: string }).agentId;
-          if (principalHoldsRung) {
-            // Re-seated rung: satisfied only by an INDEPENDENT (non-principal)
-            // agent participant. A rung held only by the principal is not a
-            // rung — the gate must move to another agent, never drop.
-            return !gated.agentIds.has(agentId);
-          }
-          // Ordinary rung: the participant must resolve to the required agent.
-          return (
-            agentIdToUrlKey.get(agentId) === requirement.agentUrlKey
-          );
-        }),
+    return (
+      stage.type === requirement.stageType &&
+      stage.participants.some((participant) => {
+        if (
+          participant == null ||
+          typeof participant !== "object" ||
+          (participant as { type?: unknown }).type !== "agent" ||
+          typeof (participant as { agentId?: unknown }).agentId !== "string"
+        ) {
+          return false;
+        }
+        const agentId = (participant as { agentId: string }).agentId;
+        if (principalHoldsRung) {
+          // Re-seated rung: satisfied only by an INDEPENDENT (non-principal)
+          // agent participant. A rung held only by the principal is not a
+          // rung — the gate must move to another agent, never drop.
+          return !gated.agentIds.has(agentId);
+        }
+        // Ordinary rung: the participant must resolve to the required agent.
+        return agentIdToUrlKey.get(agentId) === requirement.agentUrlKey;
+      })
     );
-    if (!satisfied) missing.push(requirement.label);
+  };
+
+  // Ordered forward scan (SUP-16532 / ADR-102 M3): a single pass keeps a
+  // requirement cursor and advances it on each in-order match. A requirement
+  // matched only OUT OF ORDER (its stage lands before an earlier-required
+  // stage) is recorded separately rather than accepted, so the final approver
+  // can no longer sign off before the Definition-of-Done gate runs.
+  let cursor = 0;
+  const matchedOutOfOrder = new Set<number>();
+  for (const stage of stages) {
+    const matches: number[] = [];
+    for (let i = 0; i < requirementCount; i += 1) {
+      if (stageSatisfiesRequirement(stage, i)) matches.push(i);
+    }
+    if (matches.includes(cursor)) {
+      // In-order: consume this requirement, and any consecutive requirement the
+      // same stage also satisfies (a review stage may carry several review rungs).
+      while (cursor < requirementCount && matches.includes(cursor)) cursor += 1;
+    } else {
+      // No in-order progress here: any LATER requirement this stage satisfies
+      // appears before the rung still owed — an ordering violation.
+      for (const j of matches) if (j > cursor) matchedOutOfOrder.add(j);
+    }
   }
-  return missing;
+
+  const missingStageLabels: string[] = [];
+  const outOfOrderStageLabels: string[] = [];
+  for (let i = 0; i < requirementCount; i += 1) {
+    // An out-of-order sighting is a permanent violation, not a transient one:
+    // once a requirement's only stage lands before an earlier-required stage,
+    // a later duplicate of that same requirement matching in order must NOT
+    // erase the finding. Reporting it regardless of the final cursor is what
+    // keeps `support-QAE -> exec-CTO -> coder-LE -> exec-CTO` an ordering
+    // violation instead of silently accepting the trailing exec-CTO.
+    if (matchedOutOfOrder.has(i)) {
+      outOfOrderStageLabels.push(ADR072_CLOSE_LADDER[i].label);
+      continue;
+    }
+    if (i < cursor) continue; // satisfied in order
+    missingStageLabels.push(ADR072_CLOSE_LADDER[i].label);
+  }
+  return { missingStageLabels, outOfOrderStageLabels };
 }
 
 /**
@@ -1404,23 +1473,26 @@ export async function evaluateDoneTransitionGuard(
     ladderedChildIdentifiers: string[];
     excludedChildIdentifiers: string[];
     missingStageLabels: string[];
+    outOfOrderStageLabels: string[];
   } | null = null;
   if (reviewLadder !== null && reviewLadder.satisfied) {
     const laddered = await countLadderedChildren(db, issue.companyId, issue.id);
     if (laddered.count >= 2) {
-      const missingStageLabels = await findMissingAdr072CloseLadderStages(
-        db,
-        issue.companyId,
-        issue.executionPolicy,
-        issue.executionState,
-        issue.createdByAgentId,
-      );
-      if (missingStageLabels.length > 0) {
+      const { missingStageLabels, outOfOrderStageLabels } =
+        await findMissingAdr072CloseLadderStages(
+          db,
+          issue.companyId,
+          issue.executionPolicy,
+          issue.executionState,
+          issue.createdByAgentId,
+        );
+      if (missingStageLabels.length > 0 || outOfOrderStageLabels.length > 0) {
         ladderShape = {
           ladderedChildCount: laddered.count,
           ladderedChildIdentifiers: laddered.identifiers,
           excludedChildIdentifiers: laddered.excludedChildIdentifiers,
           missingStageLabels,
+          outOfOrderStageLabels,
         };
       }
     }
@@ -1504,19 +1576,39 @@ export async function evaluateDoneTransitionGuard(
     void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
       reason: "adr072_close_ladder_shape_incomplete",
       missingStageLabels: ladderShape.missingStageLabels,
+      outOfOrderStageLabels: ladderShape.outOfOrderStageLabels,
       ladderedChildCount: ladderShape.ladderedChildCount,
       ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
       excludedChildIdentifiers: ladderShape.excludedChildIdentifiers,
       source: "done_transition_guard",
     });
+    // SUP-16532: name the ordering violation distinctly from a missing rung.
+    const defects: string[] = [];
+    if (ladderShape.missingStageLabels.length > 0) {
+      defects.push(
+        `missing the ADR-072 close-ladder stage(s): ${ladderShape.missingStageLabels.join(", ")}`,
+      );
+    }
+    if (ladderShape.outOfOrderStageLabels.length > 0) {
+      defects.push(
+        `the ADR-072 close-ladder stage(s) ${ladderShape.outOfOrderStageLabels.join(
+          ", ",
+        )} appear out of order (each lands before an earlier-required close-ladder stage)`,
+      );
+    }
+    const remedy =
+      ladderShape.outOfOrderStageLabels.length > 0
+        ? "Add any missing review/approval stages and place every close-ladder stage in the ADR-072 order (review:support-QAE, review:coder-LE, approval:exec-CTO)."
+        : "Add the missing review/approval stages to this issue's execution policy.";
     return {
       allowed: false,
       reason:
         `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
         `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
-        `(${ladderShape.ladderedChildIdentifiers.join(", ")}), but its review ladder is missing ` +
-        `the ADR-072 close-ladder stage(s): ${ladderShape.missingStageLabels.join(", ")}. ` +
-        "Add the missing review/approval stages to this issue's execution policy.",
+        `(${ladderShape.ladderedChildIdentifiers.join(", ")}), and its review ladder is ${defects.join(
+          "; ",
+        )}. ` +
+        remedy,
       aheadBy: null,
       branch: null,
       defaultRef: null,
