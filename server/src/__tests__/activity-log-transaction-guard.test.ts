@@ -19,14 +19,19 @@ import { describe, expect, it } from "vitest";
  * whose first argument is a transaction handle. It can only go green once every
  * in-transaction site has been converted — and it keeps them converted.
  *
- * `dbOrTx` is included: it is a propagated handle that is a transaction whenever
- * it is not the service's own pool (`dbOrTx !== db`), so a direct
- * `logActivity(dbOrTx, ...)` is a violation. The sanctioned form dispatches on
- * `dbOrTx === db` (see `issues.addComment`'s expiry audit), which the scanner
- * does not flag because `logActivity` is not directly called there.
+ * Scope limit: this scan only matches direct calls whose first argument is one
+ * of the three conventional transaction-handle names below. It cannot see the
+ * residual class where a transaction is propagated through a parameter typed
+ * `Db` (or a local alias/cast such as `tx as unknown as Db`) — e.g.
+ * `addComment`'s `dbOrTx`, `syncAgentSecretBindings`' `dbClient`,
+ * `decision-queues`' `recordActivity`, and `resolveLinkedSecretProposal`. Those
+ * are handled by call-graph reachability, not by this guard; the remaining
+ * instances are tracked in SUP-16541. Do not widen this name set to paper over
+ * that gap: a guard that appears to cover the residual class is worse than one
+ * that states it does not.
  */
 const SERVER_SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
-const TRANSACTION_HANDLE_NAMES = new Set(["tx", "txDb", "transactionDb", "dbOrTx"]);
+const TRANSACTION_HANDLE_NAMES = new Set(["tx", "txDb", "transactionDb"]);
 // `logActivityInTransaction(` does not match: the `(` must follow `logActivity`.
 const CALL_RE = /\blogActivity\s*\(/g;
 const FIRST_ARG_RE = /^\s*([A-Za-z_$][\w$]*)/;

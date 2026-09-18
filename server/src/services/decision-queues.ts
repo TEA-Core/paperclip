@@ -26,7 +26,7 @@ import type {
   DecisionTriage,
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 import {
   authorizationService,
   type AuthorizationActor,
@@ -337,7 +337,7 @@ async function recordActivity(
   actor: DecisionMutationActor,
   input: { companyId: string; action: string; entityType: string; entityId: string; details?: Record<string, unknown> },
 ) {
-  await logActivity(db, {
+  await logActivityInTransaction(db, {
     companyId: input.companyId,
     actorType: actor.actorType,
     actorId: actor.actorId,
