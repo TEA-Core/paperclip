@@ -837,8 +837,7 @@ export function applyExecutionPolicyReArm(input: {
     existingState: executionState,
     currentAssignee: assigneePrincipal(issue),
   });
-  const participant =
-    selectStageParticipant(stage, { preferred: returnAssignee }) ?? selectStageParticipant(stage);
+  const participant = selectStageParticipant(stage, { exclude: returnAssignee });
   if (!participant) {
     throw unprocessable(
       "Cannot re-arm the execution pointer: the target stage has no eligible participant",

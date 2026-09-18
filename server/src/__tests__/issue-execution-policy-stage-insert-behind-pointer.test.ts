@@ -504,6 +504,27 @@ function rearmIssue(executionState: IssueExecutionState) {
   };
 }
 
+function selfGatedProbeState(): IssueExecutionState {
+  return {
+    ...activeState(),
+    currentStageId: stage3Id,
+    currentStageIndex: 2,
+    currentStageType: "approval",
+    currentParticipant: { type: "user", userId: ctoUserId, agentId: null },
+    completedStageIds: [stage1Id],
+  } as unknown as IssueExecutionState;
+}
+
+function selfGatedPolicy(
+  targetParticipants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }>,
+) {
+  return makePolicyWithIds([
+    { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: leAgentId }] },
+    { id: stage2Id, type: "review", participants: targetParticipants },
+    { id: stage3Id, type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+  ]);
+}
+
 describe("applyExecutionPolicyReArm (SUP-16525 §4 persisted path)", () => {
   it("persists a re-armed pending state with a self-consistent pointer", () => {
     const state = activeState(); // stage1 completed, pointer on stage2
@@ -566,6 +587,59 @@ describe("applyExecutionPolicyReArm (SUP-16525 §4 persisted path)", () => {
       executionState: state,
     });
     expect(result.patch).toEqual({});
+  });
+
+  it("excludes the return assignee from the re-armed stage regardless of participant order", () => {
+    const orderings = [
+      [{ type: "agent" as const, agentId: coderAgentId }, { type: "agent" as const, agentId: leAgentId }],
+      [{ type: "agent" as const, agentId: leAgentId }, { type: "agent" as const, agentId: coderAgentId }],
+    ];
+    for (const participants of orderings) {
+      const state = selfGatedProbeState();
+      const result = applyExecutionPolicyReArm({
+        issue: rearmIssue(state),
+        policy: selfGatedPolicy(participants),
+        executionState: state,
+      });
+      const written = result.patch.executionState as IssueExecutionState;
+      expect(written.currentStageId).toBe(stage2Id);
+      expect(written.currentParticipant).toMatchObject({ type: "agent", agentId: leAgentId });
+      expect(written.currentParticipant).not.toMatchObject({ agentId: coderAgentId });
+      expect(result.patch.assigneeAgentId).toBe(leAgentId);
+    }
+  });
+
+  it("fails loud with execution_policy_rearm_no_participant when the return assignee is the only participant", () => {
+    const state = selfGatedProbeState();
+    const policy = selfGatedPolicy([{ type: "agent", agentId: coderAgentId }]);
+    try {
+      applyExecutionPolicyReArm({ issue: rearmIssue(state), policy, executionState: state });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(HttpError);
+      const httpErr = err as HttpError;
+      expect(httpErr.status).toBe(422);
+      expect(httpErr.details).toMatchObject({
+        code: "execution_policy_rearm_no_participant",
+        stageId: stage2Id,
+      });
+    }
+  });
+
+  it("leaves a single-participant target stage unchanged when the return assignee is not a participant", () => {
+    const state = activeState();
+    const result = applyExecutionPolicyReArm({
+      issue: rearmIssue(state),
+      policy: threeStagePolicy(),
+      executionState: state,
+    });
+    const written = result.patch.executionState as IssueExecutionState;
+    expect(written.currentStageId).toBe(stage2Id);
+    expect(written.currentParticipant).toMatchObject({ type: "agent", agentId: leAgentId });
+    expect(result.patch.assigneeAgentId).toBe(leAgentId);
+    expect(written.completedStageIds).toEqual([stage1Id]);
+    expect(written.skippedStageIds).toEqual([]);
+    expect(result.decision).toBeUndefined();
   });
 
   it("is reachable through applyIssueExecutionPolicyTransition via rearmPointer", () => {
