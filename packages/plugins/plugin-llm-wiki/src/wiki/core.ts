@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, Project, ToolResult } from "@paperclipai/plugin-sdk";
+import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginIssueListRow, PluginLocalFolderEntry, Project, ToolResult } from "@paperclipai/plugin-sdk";
 import type { IssueDocument, PluginIssueOriginKind, PluginManagedRoutineResolution, PluginManagedSkillResolution } from "@paperclipai/plugin-sdk/types";
 import {
   DEFAULT_MAX_SOURCE_BYTES,
@@ -602,7 +602,7 @@ function redactDistillationSensitiveText(input: string): string {
 }
 
 function protectDistillationSourceBody(input: {
-  issue: Issue;
+  issue: PluginIssueListRow;
   sourceKind: "comment" | "document";
   sourceId: string;
   body: string;
@@ -2383,7 +2383,7 @@ export async function createOperationIssue(ctx: PluginContext, input: OperationI
   return { operationId, wikiId, spaceSlug: space.slug, issue };
 }
 
-function isLlmWikiOperationIssue(issue: Issue): boolean {
+function isLlmWikiOperationIssue(issue: PluginIssueListRow): boolean {
   return typeof issue.originKind === "string" && issue.originKind.startsWith(OPERATION_ORIGIN_KIND);
 }
 
@@ -2562,7 +2562,7 @@ function appendBoundedSection(input: {
   input.remaining.value -= clippedSection.length;
 }
 
-function issueSortKey(issue: Issue): string {
+function issueSortKey(issue: PluginIssueListRow): string {
   return `${issue.identifier ?? ""}:${issue.title}:${issue.id}`;
 }
 
@@ -2570,7 +2570,7 @@ function sourceRefUpdatedAt(ref: PaperclipSourceRef): string | null {
   return ref.updatedAt ?? ref.createdAt ?? null;
 }
 
-function issueInBackfillWindow(issue: Issue, input: Pick<PaperclipSourceBundleInput, "backfillStartAt" | "backfillEndAt">): boolean {
+function issueInBackfillWindow(issue: PluginIssueListRow, input: Pick<PaperclipSourceBundleInput, "backfillStartAt" | "backfillEndAt">): boolean {
   const issueUpdatedAt = isoString(issue.updatedAt);
   if (!issueUpdatedAt) return true;
   const startAt = isoString(input.backfillStartAt);
@@ -2580,8 +2580,8 @@ function issueInBackfillWindow(issue: Issue, input: Pick<PaperclipSourceBundleIn
   return true;
 }
 
-async function listPaperclipBundleIssues(ctx: PluginContext, input: PaperclipSourceBundleInput): Promise<Issue[]> {
-  const filterAndSort = (issues: Issue[]) =>
+async function listPaperclipBundleIssues(ctx: PluginContext, input: PaperclipSourceBundleInput): Promise<PluginIssueListRow[]> {
+  const filterAndSort = (issues: PluginIssueListRow[]) =>
     issues
       .filter((issue) => !isLlmWikiOperationIssue(issue))
       .filter((issue) => issueInBackfillWindow(issue, input))
@@ -2960,7 +2960,7 @@ function projectPageSlug(input: { project: Project | null; rootIssue: Issue | nu
   return slugify(input.project?.name ?? input.rootIssue?.title ?? "paperclip-project");
 }
 
-function issueDescription(issue: Issue): string {
+function issueDescription(issue: PluginIssueListRow): string {
   return issue.description?.trim() ?? "";
 }
 
@@ -2969,11 +2969,11 @@ function issueReference(identifier: string): string {
   return prefix ? `[${identifier}](/${prefix}/issues/${identifier})` : identifier;
 }
 
-function issueReferenceFor(issue: Issue): string {
+function issueReferenceFor(issue: PluginIssueListRow): string {
   return issue.identifier ? issueReference(issue.identifier) : "source issue";
 }
 
-function issueConcept(issue: Issue): string {
+function issueConcept(issue: PluginIssueListRow): string {
   const title = issue.title
     .replace(/^\s*(implement|add|update|fix|ship|write|create|publish|review|validate|investigate|design|refactor|support|make)\s+/i, "")
     .replace(/\s+/g, " ")
@@ -2982,12 +2982,12 @@ function issueConcept(issue: Issue): string {
   return words || issue.title;
 }
 
-function issueNarrative(issue: Issue, maxLength = 260): string {
+function issueNarrative(issue: PluginIssueListRow, maxLength = 260): string {
   const details = issueDescription(issue);
   return excerpt(details || issue.title, maxLength);
 }
 
-function conceptBullet(issue: Issue): string {
+function conceptBullet(issue: PluginIssueListRow): string {
   return `- **${issueConcept(issue)}.** ${issueNarrative(issue)} (${issueReferenceFor(issue)})`;
 }
 
@@ -3005,7 +3005,7 @@ function hasRiskSignal(value: string): boolean {
   return /\b(blocked|blocker|risk|warning|stale|conflict|failed|failure|regression)\b/i.test(value);
 }
 
-function hasDurableSignal(bundle: PaperclipSourceBundle, issues: Issue[]): boolean {
+function hasDurableSignal(bundle: PaperclipSourceBundle, issues: PluginIssueListRow[]): boolean {
   if (bundle.sourceRefs.some((ref) => ref.kind === "document" || ref.kind === "comment")) return true;
   if (issues.some((issue) => issue.status !== "todo" || issueDescription(issue).length > 0)) return true;
   return /\b(decision|approved|implemented|completed|blocked|risk|artifact|plan|handoff|merged|fixed)\b/i.test(bundle.markdown);
@@ -3014,7 +3014,7 @@ function hasDurableSignal(bundle: PaperclipSourceBundle, issues: Issue[]): boole
 function standupPageContents(input: {
   project: Project | null;
   rootIssue: Issue | null;
-  issues: Issue[];
+  issues: PluginIssueListRow[];
   bundle: PaperclipSourceBundle;
   pagePath: string;
   durablePagePath: string;
@@ -3086,7 +3086,7 @@ function standupPageContents(input: {
 function projectPageContents(input: {
   project: Project | null;
   rootIssue: Issue | null;
-  issues: Issue[];
+  issues: PluginIssueListRow[];
   bundle: PaperclipSourceBundle;
   pagePath: string;
 }): string {
@@ -3147,7 +3147,7 @@ function projectPageContents(input: {
   ].filter((line): line is string => line !== null).join("\n");
 }
 
-function decisionsPageContents(input: { project: Project | null; rootIssue: Issue | null; issues: Issue[]; bundle: PaperclipSourceBundle }): string {
+function decisionsPageContents(input: { project: Project | null; rootIssue: Issue | null; issues: PluginIssueListRow[]; bundle: PaperclipSourceBundle }): string {
   const title = input.project?.name ?? input.rootIssue?.title ?? "Paperclip Project";
   const decisionIssues = input.issues.filter((issue) => hasDecisionSignal(`${issue.title}\n${issueDescription(issue)}`));
   return [
@@ -3172,7 +3172,7 @@ function decisionsPageContents(input: { project: Project | null; rootIssue: Issu
   ].join("\n");
 }
 
-function historyPageContents(input: { project: Project | null; rootIssue: Issue | null; issues: Issue[]; bundle: PaperclipSourceBundle }): string {
+function historyPageContents(input: { project: Project | null; rootIssue: Issue | null; issues: PluginIssueListRow[]; bundle: PaperclipSourceBundle }): string {
   const title = input.project?.name ?? input.rootIssue?.title ?? "Paperclip Project";
   const timeline = [...input.issues]
     .sort((a, b) => (isoString(a.updatedAt) ?? "").localeCompare(isoString(b.updatedAt) ?? ""))
@@ -3548,7 +3548,7 @@ function eventPayload(event: PluginEvent): Record<string, unknown> {
     : {};
 }
 
-function sourceTitleForIssue(issue: Issue): string {
+function sourceTitleForIssue(issue: PluginIssueListRow): string {
   return issue.identifier ? `${issue.identifier} ${issue.title}` : issue.title;
 }
 

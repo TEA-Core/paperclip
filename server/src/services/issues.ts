@@ -1903,12 +1903,29 @@ type IssueScheduledRetryRow = {
   error?: string | null;
   errorCode?: string | null;
 };
-type IssueWithLabels = IssueRow & {
+/**
+ * SUP-16741: `issueListSelect` deliberately omits the three execution-ladder
+ * columns from list reads (a perf decision). They must be ABSENT from a list
+ * row, never present-and-`null`: a projected-out field that reads as `null` is
+ * indistinguishable from "this card has no ladder", and an armed gate has
+ * already been misread as an absent one in production. Keeping the omission in
+ * the type stops any consumer from reading these off a list row by accident.
+ */
+type IssueListRow = Omit<
+  IssueRow,
+  "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+>;
+type IssueLabelEnrichment = {
   labels: IssueLabelRow[];
   labelIds: string[];
   watchdog?: IssueWatchdogSummary | null;
 };
+type IssueWithLabels = IssueRow & IssueLabelEnrichment;
 type IssueWithLabelsAndRun = IssueWithLabels & {
+  activeRun: IssueActiveRunRow | null;
+};
+type IssueListRowWithLabels = IssueListRow & IssueLabelEnrichment;
+type IssueListRowWithLabelsAndRun = IssueListRowWithLabels & {
   activeRun: IssueActiveRunRow | null;
 };
 type IssueUserCommentStats = {
@@ -3628,7 +3645,15 @@ async function labelMapForIssues(
 async function withIssueLabels(
   dbOrTx: any,
   rows: IssueRow[],
-): Promise<IssueWithLabels[]> {
+): Promise<IssueWithLabels[]>;
+async function withIssueLabels(
+  dbOrTx: any,
+  rows: IssueListRow[],
+): Promise<IssueListRowWithLabels[]>;
+async function withIssueLabels(
+  dbOrTx: any,
+  rows: Array<{ id: string; companyId: string }>,
+): Promise<Array<{ id: string; companyId: string } & IssueLabelEnrichment>> {
   if (rows.length === 0) return [];
   const issueIds = rows.map((row) => row.id);
   const [labelsByIssueId, watchdogByIssueId] = await Promise.all([
@@ -3648,7 +3673,7 @@ async function withIssueLabels(
 
 async function watchdogMapForIssues(
   dbOrTx: any,
-  rows: IssueRow[],
+  rows: Array<{ id: string; companyId: string }>,
 ): Promise<Map<string, IssueWatchdogSummary>> {
   const map = new Map<string, IssueWatchdogSummary>();
   if (rows.length === 0) return map;
@@ -3782,7 +3807,7 @@ type IssueBlockerAttentionAgentRow = {
 
 async function activeRunMapForIssues(
   dbOrTx: any,
-  issueRows: IssueWithLabels[],
+  issueRows: Array<{ executionRunId: string | null; companyId: string }>,
 ): Promise<Map<string, IssueActiveRunRow>> {
   const map = new Map<string, IssueActiveRunRow>();
   const runIds = issueRows
@@ -5329,8 +5354,6 @@ const issueListSelect = {
   requestDepth: issues.requestDepth,
   billingCode: issues.billingCode,
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
-  executionPolicy: sql<null>`null`,
-  executionState: sql<null>`null`,
   monitorNextCheckAt: issues.monitorNextCheckAt,
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
@@ -5339,7 +5362,6 @@ const issueListSelect = {
   monitorScheduledBy: issues.monitorScheduledBy,
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
-  executionWorkspaceSettings: sql<null>`null`,
   sourceTrust: issues.sourceTrust,
   unblockDescriptor: issues.unblockDescriptor,
   blockedTransitionAt: issues.blockedTransitionAt,
@@ -5352,10 +5374,10 @@ const issueListSelect = {
   updatedAt: issues.updatedAt,
 };
 
-function withActiveRuns(
-  issueRows: IssueWithLabels[],
+function withActiveRuns<T extends { executionRunId: string | null }>(
+  issueRows: T[],
   runMap: Map<string, IssueActiveRunRow>,
-): IssueWithLabelsAndRun[] {
+): Array<T & { activeRun: IssueActiveRunRow | null }> {
   return issueRows.map((row) => ({
     ...row,
     activeRun: row.executionRunId
@@ -5579,7 +5601,7 @@ const BLOCKED_INBOX_SUCCESSFUL_RUN_HANDOFF_ACTIONS = [
   "issue.successful_run_handoff_escalated",
 ] as const;
 
-type BlockedInboxIssueRow = IssueRow & {
+type BlockedInboxIssueRow = IssueListRow & {
   labels?: IssueLabelRow[];
   labelIds?: string[];
 };
@@ -6729,7 +6751,7 @@ async function listBlockedInboxIssues(
   filters?: IssueFilters,
 ): Promise<
   Array<
-    IssueWithLabelsAndRun & {
+    IssueListRowWithLabelsAndRun & {
       blockedBy?: IssueRelationIssueSummary[];
       blockerAttention?: IssueBlockerAttention;
       reviewAttention?: IssueReviewAttention;
@@ -6748,7 +6770,7 @@ async function listBlockedInboxIssues(
     filters,
   );
 
-  const rows = (
+  const rows: IssueListRow[] = (
     await dbOrTx
       .select(issueListSelect)
       .from(issues)
@@ -6758,7 +6780,7 @@ async function listBlockedInboxIssues(
         desc(issues.updatedAt),
         desc(issues.id),
       )
-  ).map((row: any) => ({
+  ).map((row: IssueListRow) => ({
     ...row,
     description: decodeDatabaseTextPreview(
       row.description,

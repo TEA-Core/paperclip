@@ -2765,9 +2765,9 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(result).toBeTruthy();
     expect(result?.description).toHaveLength(1200);
     expect(result?.descriptionTruncated).toBe(true);
-    expect(result?.executionPolicy).toBeNull();
-    expect(result?.executionState).toBeNull();
-    expect(result?.executionWorkspaceSettings).toBeNull();
+    expect(result).not.toHaveProperty("executionPolicy");
+    expect(result).not.toHaveProperty("executionState");
+    expect(result).not.toHaveProperty("executionWorkspaceSettings");
   });
 
   it("normalizes executionPolicy returnAssigneeAgentId on create and update", async () => {

@@ -1237,6 +1237,19 @@ export interface PluginIssueRelationSummary {
   blocks: IssueRelationIssueSummary[];
 }
 
+/**
+ * An issue row as returned by `issues.list`.
+ *
+ * The list projection does not select the execution-ladder fields
+ * (`executionPolicy`, `executionState`, `executionWorkspaceSettings`), so those
+ * keys are absent from list rows rather than present-and-null (SUP-16741).
+ * Use `issues.get` when the full ladder is required.
+ */
+export type PluginIssueListRow = Omit<
+  Issue,
+  "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+>;
+
 export interface PluginIssueRelationsClient {
   /** Read blocker relationships for an issue. Requires `issue.relations.read`. */
   get(issueId: string, companyId: string): Promise<PluginIssueRelationSummary>;
@@ -1441,7 +1454,7 @@ export interface PluginIssuesClient {
     includePluginOperations?: boolean;
     limit?: number;
     offset?: number;
-  }): Promise<Issue[]>;
+  }): Promise<PluginIssueListRow[]>;
   get(issueId: string, companyId: string): Promise<Issue | null>;
   create(input: {
     companyId: string;
