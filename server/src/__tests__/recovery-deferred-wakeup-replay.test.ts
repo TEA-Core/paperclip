@@ -9,6 +9,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
+  issueRecoveryActions,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -39,6 +40,9 @@ describe("wake skip classification (SUP-15552 / D1 of SUP-15551)", () => {
     expect(isDeferrableWakeSkipReason("heartbeat.scheduling_suppressed")).toBe(true);
     expect(isDeferrableWakeSkipReason("heartbeat.worktree_execution_cutoff")).toBe(true);
     expect(isDeferrableWakeSkipReason("budget.blocked")).toBe(true);
+    // SUP-16697: a resolved execution-reconciliation hold is cleared only by
+    // later actual evidence, so the wake behind it is a deferral, not a drop.
+    expect(isDeferrableWakeSkipReason("execution_reconciliation_required")).toBe(true);
 
     for (const reason of [
       "agent.not_invokable",
@@ -54,7 +58,7 @@ describe("wake skip classification (SUP-15552 / D1 of SUP-15551)", () => {
     }
 
     // Every deferrable reason is classified (acceptance #4 exhaustiveness).
-    expect(Object.values(WAKE_SKIP_CLASSIFICATION).filter((c) => c === "deferrable")).toHaveLength(3);
+    expect(Object.values(WAKE_SKIP_CLASSIFICATION).filter((c) => c === "deferrable")).toHaveLength(4);
     // An unknown / unclassified reason is NOT treated as deferrable (fails safe to
     // terminal), so a missing classification cannot silently strand a wake as a
     // forever-deferrable row.
@@ -539,6 +543,74 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
       .then((rows) => rows[0]);
     expect(row.status).toBe("skipped");
     expect(row.finishedAt).not.toBeNull();
+  });
+
+  it("SUP-16697: a plain-assignment wake held by a resolved replay-blocked execution hold is written as a durable deferral and re-driven", async () => {
+    const { companyId, agentId, issueId } = await seedCard("todo");
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      returnOwnerAgentId: agentId,
+      cause: "legacy_execution_requires_reconciliation",
+      status: "resolved",
+      evidence: { automaticRecovery: { replay: "blocked" } },
+      fingerprint: randomUUID(),
+      nextAction: "Check the stopped execution before resuming.",
+    });
+
+    // 1) enqueue → defer: the REAL write path takes the plain-assignment else
+    //    branch of deferBlockedExecution and records the execution wait. Before
+    //    SUP-16697 it hard-coded finishedAt, so the replay sweep could not see
+    //    it and the card went dark with no retry.
+    const heartbeat = heartbeatService(db);
+    const skippedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      requestedByActorType: "system",
+      requestedByActorId: "execution_hold_deferral",
+    });
+    expect(skippedRun).toBeNull();
+    const pending = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        finishedAt: agentWakeupRequests.finishedAt,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(pending.status).toBe("skipped");
+    expect(pending.reason).toBe("execution_reconciliation_required");
+    // The pending marker, not the status, is what makes it selectable.
+    expect(pending.finishedAt).toBeNull();
+    expect(pending.payload).toMatchObject({ issueId });
+
+    // 2) re-drive: the deferrable reason is now in the replay predicate, so the
+    //    sweep selects the row and re-enqueues the original payload.
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.reDriven).toBe(1);
+    expect(result.issueIds).toContain(issueId);
+    const [, opts] = enqueueWakeup.mock.calls[0] as [string, { payload?: Record<string, unknown> }];
+    expect(opts.payload).toMatchObject({ issueId });
+
+    const retired = await db
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(retired.status).toBe("skipped");
+    expect(retired.finishedAt).not.toBeNull();
   });
 
   // Regression (review round 1, `deferred-wake-replay-drops-generic-wake`): the

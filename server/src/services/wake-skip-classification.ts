@@ -28,7 +28,8 @@ export type WakeSkipReason =
   | "company.inactive"
   | "issue_tree_hold_active"
   | "heartbeat.timer.all_work_leased"
-  | "heartbeat.timer.no_actionable_work";
+  | "heartbeat.timer.no_actionable_work"
+  | "execution_reconciliation_required";
 
 export type WakeSkipClass = "deferrable" | "terminal";
 
@@ -38,6 +39,12 @@ export const WAKE_SKIP_CLASSIFICATION: Record<WakeSkipReason, WakeSkipClass> = {
   "heartbeat.scheduling_suppressed": "deferrable",
   "heartbeat.worktree_execution_cutoff": "deferrable",
   "budget.blocked": "deferrable",
+  // Describes the INSTANCE: a resolved execution-reconciliation hold retains a
+  // dispatch block until ACTUAL evidence clears it (it is explicitly not a
+  // statement that the external action succeeded or never happened). Re-driving
+  // once that evidence arrives is exactly what a deferral means, so it must be
+  // selected by the replay sweep rather than written terminal — SUP-16697.
+  "execution_reconciliation_required": "deferrable",
   // Describes the WORK or the AGENT — re-driving cannot help while the state
   // persists, so it stays terminal exactly as before.
   "agent.not_invokable": "terminal",
