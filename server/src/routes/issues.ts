@@ -16826,7 +16826,7 @@ export function issueRoutes(
       const previous = Object.fromEntries(
         Object.entries(changes).map(([key, change]) => [key, change.from]),
       );
-      await logActivity(tx as unknown as Db, {
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: updated.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,

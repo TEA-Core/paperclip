@@ -6,7 +6,7 @@ import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclip
 import type { AttentionArchiveManifestEntry, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
-import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { logActivity, logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
 import { logger } from "../middleware/logger.js";
 import {
@@ -245,7 +245,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       throw conflict("Decision idempotency key already used with a different payload");
     }
     if (ids.length) await dbOrTx.insert(decisionTargetIssues).values(ids.map((issueId) => ({ decisionId: id, issueId, companyId: input.companyId })));
-    await logActivity(dbOrTx, { companyId: input.companyId, actorType: "agent", actorId: input.agentId, agentId: input.agentId,
+    await logActivityInTransaction(dbOrTx, { companyId: input.companyId, actorType: "agent", actorId: input.agentId, agentId: input.agentId,
       runId: input.runId, action: "decision.created", entityType: "decision", entityId: id,
       details: { originIssueId: provenance.issueId, originAgentId: input.agentId, originResponsibleUserId: provenance.run.responsibleUserId } });
     return created;
@@ -384,7 +384,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
 
   async function effectAudit(tx: Db, decision: typeof decisions.$inferSelect, executionId: string, effect: DecisionEffect,
     status: "executed" | "failed" | "skipped", decidedByUserId: string, originResponsibleUserId: string | null, details: Record<string, unknown>) {
-    return logActivity(tx, { companyId: decision.companyId, actorType: "system", actorId: "decision-executor", agentId: decision.originAgentId,
+    return logActivityInTransaction(tx, { companyId: decision.companyId, actorType: "system", actorId: "decision-executor", agentId: decision.originAgentId,
       runId: decision.originRunId, responsibleUserIdOverride: decidedByUserId, action: `decision.effect_${status}`, entityType: "decision", entityId: decision.id,
       details: { effectType: effect.type, targetIssueId: effect.targetIssueId, originIssueId: decision.originIssueId, originAgentId: decision.originAgentId,
         chosenOptionId: decision.chosenOptionId, executionId, decidedByUserId, originResponsibleUserId, ...details } });

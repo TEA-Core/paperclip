@@ -11,7 +11,7 @@ import {
   projects,
 } from "@paperclipai/db";
 import { onboardingSeedRoutes } from "../routes/onboarding-seed.js";
-import { logActivity } from "../services/activity-log.js";
+import { logActivityInTransaction } from "../services/activity-log.js";
 import {
   describeEmbeddedPostgres,
   resetCompanyIssueFixtures,
@@ -26,7 +26,7 @@ import {
 // into failure with `mockRejectedValueOnce`.
 vi.mock("../services/activity-log.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/activity-log.js")>();
-  return { ...actual, logActivity: vi.fn(actual.logActivity) };
+  return { ...actual, logActivityInTransaction: vi.fn(actual.logActivityInTransaction) };
 });
 
 const SEED = {
@@ -256,7 +256,7 @@ describeEmbeddedPostgres("POST /api/companies/:companyId/onboarding-seed", () =>
     // Injected at the module boundary, not on `ctx.db`: the audit write goes
     // through the transaction handle, so a spy on the outer connection would
     // never be reached and the test would pass for the wrong reason.
-    vi.mocked(logActivity).mockRejectedValueOnce(new Error("activity log unavailable"));
+    vi.mocked(logActivityInTransaction).mockRejectedValueOnce(new Error("activity log unavailable"));
 
     const failed = await post(app, companyId, SEED);
     expect(failed.status).toBeGreaterThanOrEqual(500);

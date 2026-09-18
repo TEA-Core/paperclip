@@ -15,6 +15,7 @@ import {
   heartbeatService,
   instanceSettingsService,
   logActivity,
+  logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
 } from "../services/index.js";
@@ -321,7 +322,7 @@ export function instanceSettingsRoutes(db: Db) {
         await db.transaction((tx) =>
           Promise.all(
             companyIds.map((companyId) =>
-              logActivity(tx as unknown as Db, {
+              logActivityInTransaction(tx as unknown as Db, {
                 companyId,
                 actorType: actor.actorType,
                 actorId: actor.actorId,
@@ -374,7 +375,7 @@ export function instanceSettingsRoutes(db: Db) {
       await db.transaction((tx) =>
         Promise.all(
           companyIds.map((companyId) =>
-            logActivity(tx as unknown as Db, {
+            logActivityInTransaction(tx as unknown as Db, {
               companyId,
               actorType: actor.actorType,
               actorId: actor.actorId,

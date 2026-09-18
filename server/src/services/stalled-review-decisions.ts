@@ -3,7 +3,7 @@ import { issues, type Db } from "@paperclipai/db";
 import type { StalledReviewDecisionAction } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import {
-  logActivity,
+  logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
@@ -124,7 +124,7 @@ export function stalledReviewDecisionService(db: Db) {
         if (!updated) throw notFound("Issue not found");
 
         if (comment) {
-          await logActivity(txDb, {
+          await logActivityInTransaction(txDb, {
             companyId: updated.companyId,
             actorType: "user",
             actorId: input.actor.userId,
@@ -140,7 +140,7 @@ export function stalledReviewDecisionService(db: Db) {
             },
           });
         }
-        await logActivity(txDb, {
+        await logActivityInTransaction(txDb, {
           companyId: updated.companyId,
           actorType: "user",
           actorId: input.actor.userId,

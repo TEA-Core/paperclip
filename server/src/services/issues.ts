@@ -11801,7 +11801,7 @@ export function issueService(db: Db) {
                 ),
               );
             for (const workspace of terminalWorkspaces) {
-              await logActivity(tx as unknown as Db, {
+              await logActivityInTransaction(tx as unknown as Db, {
                 companyId: updated.companyId,
                 actorType: actorAgentId
                   ? "agent"
@@ -11866,7 +11866,7 @@ export function issueService(db: Db) {
                   }
                 }
               }
-              await logActivity(tx as unknown as Db, {
+              await logActivityInTransaction(tx as unknown as Db, {
                 companyId: updated.companyId,
                 actorType: actorAgentId
                   ? "agent"
