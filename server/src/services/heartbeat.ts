@@ -334,6 +334,10 @@ import {
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
 import {
+  NON_RETRYABLE_PREFLIGHT_FAILURE_CODES,
+  SPAWN_ENVELOPE_TOO_LARGE_FAILURE_CODE,
+} from "./non-retryable-preflight-failure-codes.js";
+import {
   CHAT_CONTROL_RECOVERY_ADMISSION_KEY,
   CHAT_CONTROL_RECOVERY_STOP_CODE,
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
@@ -877,32 +881,23 @@ const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
 // cost two identical 250 MB trips on SUP-11109 within four minutes. Recovery
 // blocks instead, with the remediation in the comment.
 const OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE = "opencode_db_growth_limit";
-// FORK-DIVERGENCE(e2big-wake-env): launch refused because the spawn envelope
-// (argv + env) would exceed the kernel limit. Recorded on the run so recovery
-// treats it as non-retryable preflight rather than a transient spawn blip.
-const SPAWN_ENVELOPE_TOO_LARGE_FAILURE_CODE = "spawn_envelope_too_large";
-const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
-  "low_trust_isolation_unavailable",
-  "low_trust_requires_isolated_workspace",
-  "low_trust_boundary_mismatch",
-  "low_trust_requires_sandbox_environment",
-  "low_trust_runtime_services_denied",
-  "chat_failed_run_retry_not_authorized",
-  CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
-  SPAWN_ENVELOPE_TOO_LARGE_FAILURE_CODE,
-]);
+// FORK-DIVERGENCE(e2big-wake-env): the launch-size guard throws out of the
+// adapter before spawn; record its stable code so recovery does not retry it.
+// SPAWN_ENVELOPE_TOO_LARGE_FAILURE_CODE and NON_RETRYABLE_PREFLIGHT_FAILURE_CODES
+// live in ./non-retryable-preflight-failure-codes.ts so recovery/service.ts can
+// read them without closing an import cycle through this module.
 // Error codes that mark a pre-dispatch setup failure. The adapter process never
 // started, so no agent could post an issue comment. The setup catch writes one
 // of these codes when a failure happens before `adapter.execute`.
 //
 // Fold note (2c / D12, operator decision 2026-09-15): #13038 widened this set with
-// NON_RETRYABLE_PREFLIGHT_FAILURE_CODES. None of the seven could reach
+// NON_RETRYABLE_PREFLIGHT_FAILURE_CODES. None of these codes could reach
 // `heartbeat_runs.error_code` before this fold (the only producer is #13038's own
 // `nonRetryablePreflightFailureCode`), so the codes and the widening arrive together.
 // Upstream blocks those codes on the FIRST failure (wake-queue
 // isImmediateRecoverySourceBlocked -> sourceRequiresExplicitRecovery). The fork does
 // the same in releaseIssueExecutionAndPromote: isNonRetryablePreflightFailedRun is a
-// disjunct of shouldBlockImmediately, so none of the seven ever gets an
+// disjunct of shouldBlockImmediately, so none of these codes ever gets an
 // immediate-recovery run. They stay in THIS set for two other readers:
 //   - the missing-comment gate (a pre-adapter failure cannot post a comment), and
 //   - the SUP-15589 streak (countConsecutivePreAdapterSetupFailures), which bounds the
@@ -28939,7 +28934,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : promotionResult.recoveryCause === OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
                 ? OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
               : undefined,
-        suppressOwnerWakeForRefusedAgent: firstStrikeRefusal,
       });
       return;
     }
