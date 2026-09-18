@@ -12288,6 +12288,13 @@ export function issueRoutes(
     },
   );
 
+  router.get("/companies/:companyId/external-objects/stuck", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const objects = await externalObjectsSvc.getStuckObjects(companyId);
+    res.json(objects);
+  });
+
   router.post(
     "/issues/:id/external-objects/refresh",
     validate(refreshExternalObjectsSchema),
