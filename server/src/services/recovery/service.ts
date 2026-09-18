@@ -29,6 +29,7 @@ import {
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   INTENTIONALLY_OWNERLESS_LABEL,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
+  EXECUTION_RECONCILIATION_CAUSES,
   requiresExecutionReconciliation,
   type IssueCommentMetadata,
   type IssueCommentPresentation,
@@ -5338,6 +5339,7 @@ export function recoveryService(
       reviewStageUnarmed: 0,
       reviewStageArmedStranded: 0,
       noLivePathOwnerUnavailable: 0,
+      executionHoldSurfaced: 0,
       issueIds: [] as string[],
     };
 
@@ -5835,6 +5837,101 @@ export function recoveryService(
 
       if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
         result.skipped += 1;
+        continue;
+      }
+
+      // SUP-16697: a `resolved` execution-reconciliation action carrying
+      // `automaticRecovery.replay: "blocked"` is a deliberate no-replay hold —
+      // it is cleared only by later actual evidence, so nothing auto-ages it out
+      // (execution-blocker.ts). A plain assignment wake held by it is now a
+      // durable deferral that `reconcileDeferredWakeupReplay` re-drives, but the
+      // re-drive cannot dispatch while the hold stands, so the card still needs
+      // a board surface. The board-owned stand-down below exists to protect a
+      // board action that OWNS the continuation; a stale board action for a
+      // condition that has since cleared (an exhausted `blocked_without_blockers`
+      // whose blockers have resolved) does not own this hold and must not hide
+      // it. This runs BEFORE the stand-down and names the hold itself.
+      const executionHold = await db
+        .select({
+          id: issueRecoveryActions.id,
+          cause: issueRecoveryActions.cause,
+          nextAction: issueRecoveryActions.nextAction,
+        })
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.companyId, issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+          eq(issueRecoveryActions.status, "resolved"),
+          inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        ))
+        .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (executionHold) {
+        const holdFingerprint =
+          `execution_hold_unresolved:${issue.companyId}:${issue.id}:${executionHold.id}`;
+        const alreadySurfaced = await db
+          .select({ id: issueRecoveryActions.id })
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.companyId, issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issue.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            eq(issueRecoveryActions.fingerprint, holdFingerprint),
+          ))
+          .limit(1);
+        if (alreadySurfaced.length > 0) {
+          result.skipped += 1;
+          continue;
+        }
+        await recoveryActionsSvc.upsertSourceScoped({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: "stranded_assigned_issue",
+          ownerType: "board",
+          ownerAgentId: null,
+          previousOwnerAgentId: issue.assigneeAgentId ?? null,
+          // The stale board action the stand-down would have honored is a
+          // different identity (a cleared condition). Supersede it so the live
+          // hold actually gets its own action rather than being swallowed by an
+          // exhausted one.
+          supersedeOnIdentityChange: true,
+          cause: "execution_hold_unresolved",
+          fingerprint: holdFingerprint,
+          evidence: {
+            source: "recovery.reconcile_execution_hold_unresolved",
+            identifier: issue.identifier,
+            status: issue.status,
+            executionHoldRecoveryActionId: executionHold.id,
+            executionHoldCause: executionHold.cause,
+            executionHoldNextAction: executionHold.nextAction,
+          },
+          nextAction:
+            `The card is held by a resolved execution-reconciliation hold (${executionHold.cause}) ` +
+            `that only actual evidence can clear, so no automatic wake can dispatch. Verify the ` +
+            `stopped execution, then resolve or re-arm the hold: ${executionHold.nextAction}`,
+          wakePolicy: null,
+          monitorPolicy: null,
+          maxAttempts: null,
+          lastAttemptAt: now,
+        });
+        result.executionHoldSurfaced += 1;
+        result.issueIds.push(issue.id);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "recovery.reconcile_execution_hold_unresolved",
+          action: "issue.execution_hold_unresolved_surfaced",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: "recovery.reconcile_execution_hold_unresolved",
+            identifier: issue.identifier,
+            executionHoldRecoveryActionId: executionHold.id,
+            fingerprint: holdFingerprint,
+          },
+        });
         continue;
       }
 

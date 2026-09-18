@@ -745,6 +745,83 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 
+  it("SUP-16697: surfaces a todo card held by a resolved replay-blocked execution hold, even past a stale board action", async () => {
+    const { companyId, agentId, blockedIssueId } = await seedResolvedDependencyBackstopFixture({
+      workspaceState: "none",
+    });
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockedIssueId));
+
+    // A stale, exhausted board-owned action for a condition that has since
+    // cleared (its blockers are resolved). Before SUP-16697 its presence stood
+    // down generic recovery and the live execution hold stayed invisible.
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "blocked_without_blockers",
+      ownerType: "board",
+      cause: "blocked_without_blockers",
+      status: "escalated",
+      outcome: "exhausted",
+      evidence: {},
+      fingerprint: randomUUID(),
+      nextAction: "Resolve the blocker.",
+    });
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      returnOwnerAgentId: agentId,
+      cause: "legacy_execution_requires_reconciliation",
+      status: "resolved",
+      evidence: { automaticRecovery: { replay: "blocked" } },
+      fingerprint: randomUUID(),
+      nextAction: "Check the stopped execution before resuming.",
+    }).returning();
+
+    const recovery = recoveryServiceWithMocks();
+    const first = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(first.executionHoldSurfaced).toBe(1);
+    expect(first.issueIds).toContain(blockedIssueId);
+
+    const surfaced = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.sourceIssueId, blockedIssueId),
+        eq(issueRecoveryActions.status, "active"),
+      ));
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      cause: "execution_hold_unresolved",
+    });
+    expect(surfaced[0]!.fingerprint).toContain(`:${hold!.id}`);
+
+    const events = await db
+      .select({ action: activityLog.action, entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.execution_hold_unresolved_surfaced"),
+      ));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ entityId: blockedIssueId });
+
+    // Idempotent: the surfaced action holds the detector off on the next pass.
+    const second = await recovery.reconcileStrandedAssignedIssues();
+    expect(second.executionHoldSurfaced).toBe(0);
+    expect(await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.sourceIssueId, blockedIssueId),
+        eq(issueRecoveryActions.status, "active"),
+      ))).toHaveLength(1);
+  });
+
   it("rechecks every gate after an execution hold clears", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId, action } = await seedExecutionWait();
     const wake = () => heartbeatService(db).wakeup(agentId, {
