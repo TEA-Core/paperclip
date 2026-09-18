@@ -1070,6 +1070,62 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    // SUP-16667: a draft is not "no PR" — the link exists and the PR is live; it
+    // simply cannot be armed until promoted (GitHub refuses auto-merge on a
+    // draft). Name it (`head_draft`) so the refusal is diagnosable from the
+    // message alone instead of reading as a missing link (`no-pr`) and sending
+    // the reader to the wrong place.
+    it("names a draft-only cached head as head_draft, not no-pr (SUP-16667)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { draft: true });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", false);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).not.toMatch(/^no-pr:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+        // No pendingCandidates: a no-pr branch anchor would let the approval-status
+        // reconciler stamp the draft head by content identity, arming exactly what
+        // this refusal exists to prevent.
+        expect(result.pendingCandidates).toBeUndefined();
+      }
+    });
+
+    it("names a workspace-discovered draft head as head_draft on a closing transition (SUP-16667)", async () => {
+      const issueId = await insertIssue();
+      // No cached mention: the live workspace re-resolve finds the open draft.
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ draft: true })] }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).not.toMatch(/^no-pr:/);
+        expect(result.pendingCandidates).toBeUndefined();
+      }
+    });
+
+    it("still arms the non-draft head when a card cites a draft and a non-draft PR (SUP-16667)", async () => {
+      const issueId = await insertIssue();
+      // #42 is the delivered (non-draft) PR; #43 is a cited draft. Including drafts
+      // must not make the authorizing set ambiguous nor arm the draft.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch", draft: false });
+      await insertMention(issueId, { number: 43, headRefName: "SUP-42-branch", draft: true });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+      }
+    });
+
     // SUP-15016: a no-pr decision certifies the card's OWN delivery-branch head so a
     // later reconciler tick has an anchor to verify against. The no-pr refusal reason
     // is unchanged (acceptance #5); only the certification evidence is now attached.
