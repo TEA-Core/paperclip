@@ -225,15 +225,16 @@ async function startServerWithDatabaseTeardown(
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 
   process.umask(0o002);
-  // SUP-16011: wire the census-grade process-group counter into the run-child
-  // seam before any run child can be created. This is the single, explicit
-  // registration point so the per-run process cap measures the run's existing
-  // group. Inert on non-Linux hosts, where the counter returns null and the
-  // cap fails open.
-  registerRunProcessGroupCounter(countLiveProcessGroupMembers);
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
+  // SUP-16011: wire the census-grade process-group counter into the run-child
+  // seam before any run child can be created (run children only exist once the
+  // heartbeat services run, well after instrumentation is ready). This is the
+  // single, explicit registration point so the per-run process cap measures the
+  // run's existing group. Inert on non-Linux hosts, where the counter returns
+  // null and the cap fails open.
+  registerRunProcessGroupCounter(countLiveProcessGroupMembers);
   ensureDecisionSigningSecret();
   assertDecisionSigningKeyPathAtBoot();
   // sentry.ts.
