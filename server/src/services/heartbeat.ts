@@ -974,6 +974,24 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participan
 // Bound the re-arming anyway: a reviewer that defers forever is its own kind of
 // stall, and the recovery owner should hear about it rather than the stage looping.
 const EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT = 3;
+// SUP-16813: the failure codes that mean a run was admitted to `running` but never reached
+// the adapter - no child process, no environment lease, no agent turn - so nothing was
+// attempted and the participant's one retry was never used. Deliberately NARROWER than
+// PRE_ADAPTER_SETUP_FAILURE_CODES: that set also contains `setup_failed`, and a retry that
+// launched and then crashed really did consume an attempt (SUP-16646) and must keep
+// counting as spent. The SUP-15589 three-strike streak already bounds `setup_failed` on the
+// release path. Expressed with the existing code constants, not hand-copied literals.
+const PRE_LAUNCH_ALLOCATION_FAILURE_CODES = new Set<string>([
+  DISPATCH_UNLAUNCHED_ERROR_CODE,
+  WORKSPACE_VALIDATION_FAILURE_CODE,
+  CONFIGURATION_INCOMPLETE_FAILURE_CODE,
+]);
+// SUP-16813: because a pre-launch allocation retry is not a spent attempt (see the set
+// above), a persistently-failing workspace (for example a broken `pnpm install`) would
+// otherwise re-dispatch the reviewer on every restore and livelock the card the other way.
+// Cap those re-dispatches and block once the cap is spent - the same count-terminal-runs
+// shape as EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT just above.
+const EXECUTION_REVIEW_PARTICIPANT_PRE_LAUNCH_RETRY_LIMIT = 3;
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
@@ -5571,17 +5589,28 @@ function isExecutionReviewParticipantRecoveryRun(
 }
 
 /**
- * SUP-16646: a `dispatch_unlaunched` run was admitted to `running` but never registered a
- * child process or an environment lease, so the dispatch never started - nothing was
- * attempted. Callers that treat a terminal retry as a "spent attempt" must exclude this
- * shape, otherwise a pure launch failure permanently spends the retry it never used.
- * Contrast a launched-and-crashed retry (`setup_failed`, `opencode_exit_1`, ...), which
- * really did consume an attempt and must keep counting.
+ * SUP-16646: a run reaped with a pre-launch allocation failure code (`dispatch_unlaunched`,
+ * `workspace_validation_failed`, `configuration_incomplete`) was admitted to `running` but
+ * never registered a child process or an environment lease, so the dispatch never started -
+ * nothing was attempted. Callers that treat a terminal retry as a "spent attempt" must
+ * exclude this shape, otherwise a pure launch/allocation failure permanently spends the
+ * retry it never used. Contrast a launched-and-crashed retry (`setup_failed`,
+ * `opencode_exit_1`, ...), which really did consume an attempt and must keep counting.
+ *
+ * SUP-16813 widened this from `dispatch_unlaunched` alone to the whole
+ * PRE_LAUNCH_ALLOCATION_FAILURE_CODES set: SUP-16775 measured a
+ * `workspace_validation_failed` recovery retry (the workspace provision command exited 1
+ * before any lease) pinning a review stage exactly the way SUP-16646's
+ * `dispatch_unlaunched` did. `setup_failed` is deliberately NOT in the set - see the set's
+ * declaration for why.
  */
 export function isNeverLaunchedDispatchRun(
   run: { errorCode?: string | null } | null | undefined,
 ): boolean {
-  return run?.errorCode === DISPATCH_UNLAUNCHED_ERROR_CODE;
+  return (
+    run?.errorCode != null &&
+    PRE_LAUNCH_ALLOCATION_FAILURE_CODES.has(run.errorCode)
+  );
 }
 
 /**
@@ -5589,6 +5618,11 @@ export function isNeverLaunchedDispatchRun(
  * testable at the same boundary production uses. A non-invokable or missing participant
  * always blocks. An attempted recovery always blocks, except the proof-of-life deferral
  * (a succeeded retry that left a comment) re-arms the stage until its retry limit is spent.
+ *
+ * SUP-16813 adds the pre-launch allocation retry cap: a pre-launch failure is not a spent
+ * attempt (see isNeverLaunchedDispatchRun), so it re-dispatches the reviewer. Once that
+ * re-dispatch count reaches EXECUTION_REVIEW_PARTICIPANT_PRE_LAUNCH_RETRY_LIMIT the block
+ * fires anyway, so a persistently-failing workspace cannot livelock the card the other way.
  */
 export function shouldBlockReviewParticipantRecovery(input: {
   recoveryAgentPresent: boolean;
@@ -5596,8 +5630,10 @@ export function shouldBlockReviewParticipantRecovery(input: {
   reviewRecoveryAlreadyAttempted: boolean;
   reviewParticipantDeferred: boolean;
   reviewDeferralRetriesExhausted: boolean;
+  reviewPreLaunchRetriesExhausted: boolean;
 }): boolean {
   if (!input.recoveryAgentInvokable || !input.recoveryAgentPresent) return true;
+  if (input.reviewPreLaunchRetriesExhausted) return true;
   return (
     input.reviewRecoveryAlreadyAttempted &&
     !(input.reviewParticipantDeferred && !input.reviewDeferralRetriesExhausted)
@@ -5606,11 +5642,15 @@ export function shouldBlockReviewParticipantRecovery(input: {
 
 /**
  * SUP-16646: a review-participant recovery retry counts as a spent attempt unless it was
- * reaped `dispatch_unlaunched`. That shape was admitted to `running` but never registered a
- * child process or an environment lease, so the dispatch never started and nothing was
- * attempted. Counting it as spent would burn the participant's one retry on a pure launch
- * failure and permanently pin the review block, so no restore can dispatch the reviewer.
- * A retry that launched and crashed still counts, and must still block.
+ * reaped a pre-launch allocation failure code (`dispatch_unlaunched`,
+ * `workspace_validation_failed`, `configuration_incomplete`; widened by SUP-16813 from
+ * `dispatch_unlaunched` alone). Those shapes were admitted to `running` but never
+ * registered a child process or an environment lease, so the dispatch never started and
+ * nothing was attempted. Counting one as spent would burn the participant's one retry on a
+ * pure launch/allocation failure and permanently pin the review block, so no restore can
+ * dispatch the reviewer. A retry that launched and crashed still counts, and must still
+ * block. The unbounded re-dispatch this widening allows is capped at the call site by
+ * EXECUTION_REVIEW_PARTICIPANT_PRE_LAUNCH_RETRY_LIMIT.
  */
 export function isSpentReviewParticipantRecoveryAttempt(
   run: Pick<
@@ -27459,7 +27499,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   function buildExecutionReviewParticipantRecoveryNoticeSeedForRun(input: {
     latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "status"> | null | undefined;
     deferralRetriesExhausted?: boolean;
+    preLaunchRetriesExhausted?: boolean;
   }): StrandedRecoveryNoticeSeed {
+    // SUP-16813: the pre-launch allocation retry cap fired. Say so explicitly - the
+    // reviewer is not the fault, the workspace/allocation kept failing before the adapter
+    // could start, so pointing the recovery owner at the workspace is the useful action.
+    if (input.preLaunchRetriesExhausted) {
+      return {
+        body:
+          "Paperclip re-dispatched the pending execution-review participant up to the pre-launch " +
+          `retry limit (${EXECUTION_REVIEW_PARTICIPANT_PRE_LAUNCH_RETRY_LIMIT} attempts), but each retry was ` +
+          "reaped before the adapter started (for example a workspace validation or configuration failure), " +
+          "so none of them reached the reviewer. Moving it to `blocked` with a source-scoped recovery action " +
+          "so the recovery owner can repair the workspace or configuration, restore the review stage, or " +
+          "record an intentional manual resolution.",
+        title: "Review recovery stalled",
+        tone: "danger",
+      };
+    }
     if (input.deferralRetriesExhausted) {
       return {
         body:
@@ -28488,6 +28545,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           )
           .then((rows) => rows[0]?.count ?? 0);
+      // SUP-16813: terminal recovery retries reaped a pre-launch allocation failure code.
+      // A pre-launch retry is not a spent attempt, so it re-dispatches the reviewer; this
+      // count bounds that re-dispatch (the current run is included, matching
+      // countTerminalReviewParticipantRecoveryRuns above).
+      const countPreLaunchAllocationReviewRecoveryRuns = () =>
+        tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, run.agentId),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+              inArray(heartbeatRuns.errorCode, [
+                ...PRE_LAUNCH_ALLOCATION_FAILURE_CODES,
+              ]),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON}`,
+            ),
+          )
+          .then((rows) => rows[0]?.count ?? 0);
       const executionState = parseIssueExecutionState(issue.executionState);
       const currentParticipant =
         executionState?.status === "pending"
@@ -28537,9 +28615,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // opening a recovery action naming the reviewer as its own recovery owner.
         // A reviewer that never ran, was not invokable, crashed, or produced nothing still
         // escalates: no clean terminal status or no comment means no proof of life.
-        // SUP-16646: exclude a retry reaped `dispatch_unlaunched` - it never acquired a
-        // lease, so it must not spend the participant's one retry. See
-        // `isSpentReviewParticipantRecoveryAttempt`.
+        // SUP-16646: exclude a retry reaped a pre-launch allocation failure code
+        // (`dispatch_unlaunched`, `workspace_validation_failed`, `configuration_incomplete`;
+        // widened by SUP-16813) - it never acquired a lease, so it must not spend the
+        // participant's one retry. See `isSpentReviewParticipantRecoveryAttempt`.
         const reviewRecoveryAlreadyAttempted =
           isSpentReviewParticipantRecoveryAttempt(run);
         const reviewParticipantDeferred =
@@ -28553,6 +28632,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reviewParticipantDeferred &&
           (await countTerminalReviewParticipantRecoveryRuns()) >=
             EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT;
+        // SUP-16813: a pre-launch allocation failure is not a spent attempt, so it
+        // re-dispatches the reviewer. Once the excluded-code re-dispatch count reaches the
+        // cap, block anyway so a persistently-failing workspace cannot livelock the card.
+        const reviewPreLaunchRetriesExhausted =
+          isNeverLaunchedDispatchRun(run) &&
+          (await countPreLaunchAllocationReviewRecoveryRuns()) >=
+            EXECUTION_REVIEW_PARTICIPANT_PRE_LAUNCH_RETRY_LIMIT;
 
         const shouldBlockReviewRecovery = shouldBlockReviewParticipantRecovery({
           recoveryAgentPresent: Boolean(recoveryAgent),
@@ -28560,6 +28646,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reviewRecoveryAlreadyAttempted,
           reviewParticipantDeferred,
           reviewDeferralRetriesExhausted,
+          reviewPreLaunchRetriesExhausted,
         });
         if (shouldBlockReviewRecovery) {
           return {
@@ -28569,6 +28656,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             notice: buildExecutionReviewParticipantRecoveryNoticeSeedForRun({
               latestRun: run,
               deferralRetriesExhausted: reviewDeferralRetriesExhausted,
+              preLaunchRetriesExhausted: reviewPreLaunchRetriesExhausted,
             }),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
           };
