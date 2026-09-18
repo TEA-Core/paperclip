@@ -779,7 +779,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       nextAction: "Check the stopped execution before resuming.",
     }).returning();
 
-    const recovery = recoveryService(db);
+    const recovery = recoveryServiceWithMocks();
     const first = await recovery.reconcileStrandedAssignedIssues();
 
     expect(first.executionHoldSurfaced).toBe(1);
