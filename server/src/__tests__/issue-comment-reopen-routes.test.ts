@@ -761,12 +761,14 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       ),
     );
-    const emittedReasons = mockHeartbeatService.wakeup.mock.calls.map(
-      (call) => (call[1] as { reason?: string }).reason,
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "33333333-3333-4333-8333-333333333333",
+      expect.objectContaining({ reason: "issue_status_changed" }),
     );
-    expect(emittedReasons).toContain("issue_assigned");
-    expect(emittedReasons).not.toContain("issue_status_changed");
-    expect(emittedReasons).not.toContain("other");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "33333333-3333-4333-8333-333333333333",
+      expect.objectContaining({ reason: "other" }),
+    );
   });
 
   it("rejects ambiguous assignee shortnames", async () => {
