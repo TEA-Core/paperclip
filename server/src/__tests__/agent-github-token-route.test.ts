@@ -33,7 +33,7 @@ vi.mock("../services/index.js", () => ({
 }));
 
 const { privateKey: FIXTURE_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }, "utf8");
+const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }) as string;
 const FIXTURE_TOKEN = "ghs_test_installation_token_for_agent_route_tests_only";
 const FIXTURE_INSTALLATION_ID = "12345678";
 
@@ -49,7 +49,7 @@ const DEFAULT_WORKSPACE_ROWS: WorkspaceRow[] = [
   { projectId: "project-x", repoUrl: "https://github.com/owner/repo" },
 ];
 
-type RouteDeps = Parameters<typeof agentGitHubTokenRoutes>[1];
+type RouteDeps = NonNullable<Parameters<typeof agentGitHubTokenRoutes>[1]>;
 
 function fakeDb(rows: FakeRows = {}) {
   const issueRows = rows.issues ?? DEFAULT_ISSUE_ROWS;
@@ -107,7 +107,7 @@ function fakeDeps(
     }),
     resolveSecretValue: vi.fn(async () => FIXTURE_PRIVATE_KEY),
   };
-  const resolveToken = vi.fn(async () =>
+  const resolveToken = vi.fn<NonNullable<RouteDeps["resolveToken"]>>(async () =>
     opts.tokenResult !== undefined
       ? opts.tokenResult
       : {
@@ -118,7 +118,7 @@ function fakeDeps(
           expiresAt: 1_900_000_000_000,
         },
   );
-  const log = vi.fn(async () => undefined);
+  const log = vi.fn<NonNullable<RouteDeps["log"]>>();
   return { deps: { secrets, resolveToken, log }, secrets, resolveToken, log };
 }
 
@@ -334,7 +334,7 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
       .send({ owner: "owner", repo: "repo" });
     expect(res.status).toBe(200);
     expect(log).toHaveBeenCalledTimes(1);
-    const audit = log.mock.calls[0]![1] as Record<string, unknown>;
+    const audit = log.mock.calls[0]![1] as unknown as Record<string, unknown>;
     expect(audit.action).toBe("github_installation_token_minted");
     expect(audit.actorType).toBe("agent");
     expect(audit.entityType).toBe("github_installation");
@@ -466,7 +466,7 @@ describe("resolveAppInstallationToken — permissions, expiry, cache (route cont
         DEFAULT_GITHUB_APP,
         { contents: "read", pull_requests: "write" },
       );
-      expect(isGitHubTokenResolution(result)).toBe(true);
+      expect(isGitHubTokenResolution(result!)).toBe(true);
       expect(mintBody).toBe(
         JSON.stringify({
           permissions: { contents: "read", pull_requests: "write" },
@@ -502,7 +502,7 @@ describe("resolveAppInstallationToken — permissions, expiry, cache (route cont
       // reach any other repo in the installation, even though the request layer
       // already authorized exactly this one.
       const result = await resolveAppInstallationToken(company, fakeSecrets, owner, repo, undefined, DEFAULT_GITHUB_APP);
-      expect(isGitHubTokenResolution(result)).toBe(true);
+      expect(isGitHubTokenResolution(result!)).toBe(true);
       expect(mintBody).toBe(JSON.stringify({ repositories: [repo] }));
       expect(JSON.stringify(mintBody)).not.toContain("permissions");
     } finally {
@@ -531,7 +531,7 @@ describe("resolveAppInstallationToken — permissions, expiry, cache (route cont
 
     try {
       const result = await resolveAppInstallationToken(company, fakeSecrets, undefined, undefined, undefined, DEFAULT_GITHUB_APP);
-      expect(isGitHubTokenResolution(result)).toBe(true);
+      expect(isGitHubTokenResolution(result!)).toBe(true);
       // No owner/repo → no narrowing: the body is omitted entirely (undefined),
       // so the company-wide diagnostics probe still sees the whole installation.
       expect(mintBody).toBeUndefined();
@@ -556,8 +556,8 @@ describe("resolveAppInstallationToken — permissions, expiry, cache (route cont
 
     try {
       const result = await resolveAppInstallationToken(company, fakeSecrets, owner, repo, undefined, DEFAULT_GITHUB_APP);
-      expect(isGitHubTokenResolution(result)).toBe(true);
-      if (isGitHubTokenResolution(result)) {
+      expect(isGitHubTokenResolution(result!)).toBe(true);
+      if (isGitHubTokenResolution(result!)) {
         expect(result.expiresAt).toBe(new Date(expiresAt).getTime());
       }
     } finally {
@@ -591,9 +591,9 @@ describe("resolveAppInstallationToken — permissions, expiry, cache (route cont
     try {
       const first = await resolveAppInstallationToken(company, fakeSecrets, owner, repo, undefined, DEFAULT_GITHUB_APP);
       const second = await resolveAppInstallationToken(company, fakeSecrets, owner, repo, undefined, DEFAULT_GITHUB_APP);
-      expect(isGitHubTokenResolution(first)).toBe(true);
-      expect(isGitHubTokenResolution(second)).toBe(true);
-      if (isGitHubTokenResolution(first) && isGitHubTokenResolution(second)) {
+      expect(isGitHubTokenResolution(first!)).toBe(true);
+      expect(isGitHubTokenResolution(second!)).toBe(true);
+      if (isGitHubTokenResolution(first!) && isGitHubTokenResolution(second!)) {
         expect(second.token).toBe(first.token);
         expect(second.expiresAt).toBe(first.expiresAt);
       }
