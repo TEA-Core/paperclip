@@ -23,6 +23,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { authorizationService } from "../services/authorization.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
@@ -134,16 +135,29 @@ describeEmbeddedPostgres(
     /**
      * The live shape: a card on a pending review stage whose current participant
      * is the acting agent, drifted to `in_progress`, with a checkout/execution run
-     * that belongs to a different agent's run. `withRecoveryAction` toggles the
-     * one state that changed between the 422 attempts and the 500 attempts.
+     * that belongs to a different run. `withRecoveryAction` toggles the one state
+     * that changed between the 422 attempts and the 500 attempts.
+     *
+     * SUP-16705 adds two knobs so the same shape can prove the self-management
+     * waiver is closed at the call site:
+     *  - `conflictingRunOwner` picks whose run holds the checkout. `"assignee"`
+     *    (the AC1' shape) is a *sibling run of the same agent*; `"other"` is the
+     *    legacy foreign-run fixture.
+     *  - `withManager` seeds a third agent the assignee reports to, so a
+     *    DIFFERENT managing agent can be the actor (the AC3' shape).
      */
     async function seedLiveShape(
       issuePrefix: string,
-      opts: { withRecoveryAction: boolean },
+      opts: {
+        withRecoveryAction: boolean;
+        conflictingRunOwner?: "assignee" | "other";
+        withManager?: boolean;
+      },
     ) {
       const companyId = randomUUID();
       const actorAgentId = randomUUID();
       const otherAgentId = randomUUID();
+      const managerAgentId = randomUUID();
       const issueId = randomUUID();
       const executionWorkspaceId = randomUUID();
       const projectId = randomUUID();
@@ -190,6 +204,7 @@ describeEmbeddedPostgres(
       for (const [agentId, name] of [
         [actorAgentId, "Reviewer"],
         [otherAgentId, "Other"],
+        [managerAgentId, "Manager"],
       ] as const) {
         await db.insert(agents).values({
           id: agentId,
@@ -202,6 +217,12 @@ describeEmbeddedPostgres(
           runtimeConfig: {},
           permissions: {},
         });
+      }
+      if (opts.withManager) {
+        await db
+          .update(agents)
+          .set({ reportsTo: managerAgentId })
+          .where(eq(agents.id, actorAgentId));
       }
       await db.insert(executionWorkspaces).values({
         id: executionWorkspaceId,
@@ -225,9 +246,22 @@ describeEmbeddedPostgres(
         updatedAt: now,
       });
 
+      const conflictingRunAgentId =
+        opts.conflictingRunOwner === "other" ? otherAgentId : actorAgentId;
       const actorRunId = await seedRun(companyId, actorAgentId, issueId);
-      const foreignCheckoutRunId = await seedRun(companyId, otherAgentId, issueId, "succeeded");
-      const foreignExecutionRunId = await seedRun(companyId, otherAgentId, issueId, "succeeded");
+      const managerRunId = await seedRun(companyId, managerAgentId, issueId);
+      const conflictingCheckoutRunId = await seedRun(
+        companyId,
+        conflictingRunAgentId,
+        issueId,
+        "succeeded",
+      );
+      const conflictingExecutionRunId = await seedRun(
+        companyId,
+        conflictingRunAgentId,
+        issueId,
+        "succeeded",
+      );
 
       await db.insert(issues).values({
         id: issueId,
@@ -241,8 +275,8 @@ describeEmbeddedPostgres(
         assigneeAgentId: actorAgentId,
         createdByUserId: "cloud-user-1",
         executionWorkspaceId,
-        checkoutRunId: foreignCheckoutRunId,
-        executionRunId: foreignExecutionRunId,
+        checkoutRunId: conflictingCheckoutRunId,
+        executionRunId: conflictingExecutionRunId,
         executionPolicy: {
           mode: "normal",
           commentRequired: true,
@@ -290,7 +324,16 @@ describeEmbeddedPostgres(
         });
       }
 
-      return { companyId, actorAgentId, issueId, identifier, actorRunId };
+      return {
+        companyId,
+        actorAgentId,
+        managerAgentId,
+        issueId,
+        identifier,
+        actorRunId,
+        managerRunId,
+        conflictingCheckoutRunId,
+      };
     }
 
     function agentActor(
@@ -338,9 +381,18 @@ describeEmbeddedPostgres(
       "Closed at Tier 2 (live): the stage participant re-ran the close against the " +
       "armed card and the delivery ref is unchanged.";
 
-    it("LIVE SHAPE: an active recovery action on an in_progress card never yields a bare 500", async () => {
-      const { companyId, issueId, identifier, actorAgentId, actorRunId } =
-        await seedLiveShape("D16607L", { withRecoveryAction: true });
+    it("AC1': an assignee cannot waive its own conflicting run lock via the management grant", async () => {
+      const {
+        companyId,
+        issueId,
+        identifier,
+        actorAgentId,
+        actorRunId,
+        conflictingCheckoutRunId,
+      } = await seedLiveShape("D16607A1", {
+        withRecoveryAction: true,
+        conflictingRunOwner: "assignee",
+      });
       currentActor = agentActor(companyId, actorAgentId, actorRunId);
       mockUnmergedBranch();
 
@@ -348,22 +400,60 @@ describeEmbeddedPostgres(
         .patch(`/api/issues/${identifier}`)
         .send({ status: "done", comment: liveCloseComment });
 
-      // AC2: the governed close resolves to a stage verdict. The live shape
-      // closes cleanly -- a bare 500 with no code and no details was the defect.
+      // The historical shape now resolves to a typed conflict instead of a bare
+      // 500: the actor IS the assignee, so its own checkout run is a foreign run
+      // it must not be able to waive. Before SUP-16705 this returned 200/done
+      // because `isManagerOf(X, X)` made the management grant self-vacuous.
       expect(
         res.body?.error ?? "",
         `unexpected bare 500 body: ${JSON.stringify(res.body)}`,
       ).not.toBe("Internal server error");
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(await statusOf(issueId)).toBe("done");
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details?.code).toBe("recovery_source_run_lock");
+      expect(res.body.details?.checkoutRunId).toBe(conflictingCheckoutRunId);
+      expect(await statusOf(issueId)).toBe("in_progress");
+    });
 
-      // The seeded row was a real active recovery action (not a mock), so the
-      // close really traversed the governed path with it present.
-      const actions = await db
-        .select({ id: issueRecoveryActions.id, status: issueRecoveryActions.status })
-        .from(issueRecoveryActions)
-        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-      expect(actions).toHaveLength(1);
+    it("AC2': the waiver is re-scoped at the call site, not by narrowing agentIsInSubtree", async () => {
+      const { companyId, actorAgentId } = await seedLiveShape("D16607A2", {
+        withRecoveryAction: true,
+      });
+
+      // The authorization primitive is deliberately untouched: an agent is still
+      // "in its own subtree" (`agentIsInSubtree` short-circuits on
+      // rootAgentId === targetAgentId), so `isManagerOf(X, X)` remains true. That
+      // is exactly why the run-lock waiver has to be scoped where it is consumed.
+      await expect(
+        authorizationService(db).isManagerOf(companyId, actorAgentId, actorAgentId),
+      ).resolves.toBe(true);
+    });
+
+    it("AC3': a different managing agent still waives the run lock and closes the card", async () => {
+      const { companyId, issueId, identifier, managerAgentId, managerRunId } =
+        await seedLiveShape("D16607A3", {
+          withRecoveryAction: true,
+          conflictingRunOwner: "assignee",
+          withManager: true,
+        });
+      // The assignee (the run holder) reports to this actor, so the grant is held
+      // over a DIFFERENT agent and must keep working.
+      currentActor = agentActor(companyId, managerAgentId, managerRunId);
+      mockUnmergedBranch();
+
+      // The manager reaches the card through the ancestor escape hatch, which
+      // forbids a comment -- so the close carries only `status`. If the manager
+      // grant did not waive the run lock, this would 409 recovery_source_run_lock
+      // before the update persisted.
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.details?.code).not.toBe("recovery_source_run_lock");
+      // The mutation persisted and the governed close advanced the drifted card
+      // to its pending review stage (it does not jump straight to `done`); the
+      // point is that the manager's grant waived the lock instead of 409ing.
+      expect(await statusOf(issueId)).toBe("in_review");
     });
 
     it("NO-RECOVERY CONTROL: the same shape without the recovery action behaves identically (AC5)", async () => {

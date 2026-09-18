@@ -8319,8 +8319,16 @@ export function issueRoutes(
     const governedParticipantAgentId = activeExecutionParticipantAgentId(issue);
     const isSourceOwner = issue.assigneeAgentId === actorAgentId;
     const isExecutionParticipant = governedParticipantAgentId === actorAgentId;
+    // SUP-16705: a management grant is only meaningful when it is held over a
+    // DIFFERENT agent. `agentIsInSubtree` treats `rootAgentId === targetAgentId`
+    // as in-subtree, so `isManagerOf(X, X)` is always true and consulting the
+    // override for a self-assignee would let an agent waive its own conflicting
+    // checkout/run lock -- exactly the self-management SUP-16705 closes. The
+    // source owner already clears the authority check below via `isSourceOwner`,
+    // so excluding the self case costs nothing legitimate.
     const hasPolicyGrant = Boolean(
       issue.assigneeAgentId &&
+      issue.assigneeAgentId !== actorAgentId &&
       (await hasActiveCheckoutManagementOverride(
         actorAgentId,
         issue.companyId,
