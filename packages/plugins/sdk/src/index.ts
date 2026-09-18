@@ -254,6 +254,7 @@ export type {
   PluginIssueMutationActor,
   PluginIssueRelationsClient,
   PluginIssueRelationSummary,
+  PluginIssueListRow,
   PluginIssueCheckoutOwnership,
   PluginIssueWakeupResult,
   PluginIssueWakeupBatchResult,
