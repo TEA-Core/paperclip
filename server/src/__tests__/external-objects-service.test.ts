@@ -1514,7 +1514,7 @@ describeEmbeddedPostgres("externalObjectService", () => {
     const resolver: ExternalObjectResolver = {
       providerKey: "url",
       objectType: "link",
-      resolve: vi.fn(async () => ({ ok: false, liveness: "unreachable", errorCode: "network", retryAfterSeconds: 60 })),
+      resolve: vi.fn(async () => ({ ok: false as const, liveness: "unreachable" as const, errorCode: "network", retryAfterSeconds: 60 })),
     };
     const svc = externalObjectService(db, { resolvers: [resolver], github: false });
     await svc.syncIssue(issueId);
