@@ -18,9 +18,15 @@ import { describe, expect, it } from "vitest";
  * the `activity-log` definitions excluded) and fails on any `logActivity(...)`
  * whose first argument is a transaction handle. It can only go green once every
  * in-transaction site has been converted — and it keeps them converted.
+ *
+ * `dbOrTx` is included: it is a propagated handle that is a transaction whenever
+ * it is not the service's own pool (`dbOrTx !== db`), so a direct
+ * `logActivity(dbOrTx, ...)` is a violation. The sanctioned form dispatches on
+ * `dbOrTx === db` (see `issues.addComment`'s expiry audit), which the scanner
+ * does not flag because `logActivity` is not directly called there.
  */
 const SERVER_SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
-const TRANSACTION_HANDLE_NAMES = new Set(["tx", "txDb", "transactionDb"]);
+const TRANSACTION_HANDLE_NAMES = new Set(["tx", "txDb", "transactionDb", "dbOrTx"]);
 // `logActivityInTransaction(` does not match: the `(` must follow `logActivity`.
 const CALL_RE = /\blogActivity\s*\(/g;
 const FIRST_ARG_RE = /^\s*([A-Za-z_$][\w$]*)/;
