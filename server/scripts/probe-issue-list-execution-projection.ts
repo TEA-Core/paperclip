@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import express from "express";
 import {
   activityLog,
@@ -128,12 +129,23 @@ try {
   const singleRes = await fetch(`${base}/api/issues/${armedIssueId}`);
   const singleBody = (await singleRes.json()) as Record<string, unknown>;
 
-  const listAssertsLadder = listRow !== undefined && FIELDS.some((field) => field in listRow);
-  const singleHasLadder =
-    singleBody.executionPolicy != null &&
-    singleBody.executionState != null &&
-    singleBody.executionWorkspaceSettings != null;
-  const ok = !listAssertsLadder && singleHasLadder;
+  const responsesOk = listRes.ok && blockedRes.ok && singleRes.ok;
+  const bothListRowsPresent = listRow !== undefined && blockedRow !== undefined;
+  const listRowsOmitLadder =
+    bothListRowsPresent &&
+    FIELDS.every((field) => !(field in (listRow ?? {}))) &&
+    FIELDS.every((field) => !(field in (blockedRow ?? {})));
+  const singleMatchesSeededLadder =
+    isDeepStrictEqual(singleBody.executionPolicy, ARMED_POLICY) &&
+    isDeepStrictEqual(singleBody.executionState, ARMED_STATE) &&
+    isDeepStrictEqual(singleBody.executionWorkspaceSettings, ARMED_WORKSPACE_SETTINGS);
+
+  const failures: string[] = [];
+  if (!responsesOk) failures.push("a request did not return 2xx");
+  if (!bothListRowsPresent) failures.push("a seeded issue is missing from its list read");
+  if (!listRowsOmitLadder) failures.push("a list row asserts an execution-ladder field");
+  if (!singleMatchesSeededLadder) failures.push("the single read does not deep-equal the seeded ladder");
+  const ok = failures.length === 0;
 
   console.log("SUP-16741 probe — list projection vs single read (branch, real HTTP + embedded Postgres)");
   console.log(`GET /api/companies/{companyId}/issues -> ${listRes.status}`);
@@ -146,8 +158,8 @@ try {
   console.log(`  executionWorkspaceSettings=${JSON.stringify(singleBody.executionWorkspaceSettings)}`);
   console.log(
     ok
-      ? "OK: list rows do not assert a ladder state; the single read still returns the armed ladder"
-      : "FAIL: list row still asserts a ladder state the single read contradicts",
+      ? "OK: list rows omit every ladder field; the single read deep-equals the seeded ladder"
+      : `FAIL: ${failures.join("; ")}`,
   );
 
   process.exitCode = ok ? 0 : 1;

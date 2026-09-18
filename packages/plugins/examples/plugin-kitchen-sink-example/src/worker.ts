@@ -13,6 +13,7 @@ import {
   type PluginEntityQuery,
   type PluginEvent,
   type PluginHealthDiagnostics,
+  type PluginIssueListRow,
   type PluginJobContext,
   type PluginLauncherRegistration,
   type PluginWebhookInput,
@@ -238,7 +239,7 @@ function getListLimit(params: Record<string, unknown>, fallback = 50): number {
   return Math.max(1, Math.min(200, Math.floor(value)));
 }
 
-async function listIssuesForCompany(ctx: PluginContext, companyId: string, limit = 50): Promise<Issue[]> {
+async function listIssuesForCompany(ctx: PluginContext, companyId: string, limit = 50): Promise<PluginIssueListRow[]> {
   return await ctx.issues.list({ companyId, limit, offset: 0 });
 }
 
