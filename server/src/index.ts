@@ -94,6 +94,8 @@ import { createBranchPrReconcilerSweepService } from "./services/branch-pr-recon
 import { prDeliveryService } from "./services/pr-delivery.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
 import { runProcessCensusSweep } from "./services/run-process-census.js";
+import { countLiveProcessGroupMembers } from "./services/local-service-supervisor.js";
+import { registerRunProcessGroupCounter } from "@paperclipai/adapter-utils/run-process-cap";
 import {
   armSweepLiveness,
   sweepLivenessTracker,
@@ -226,6 +228,13 @@ async function startServerWithDatabaseTeardown(
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
+  // SUP-16011: wire the census-grade process-group counter into the run-child
+  // seam before any run child can be created (run children only exist once the
+  // heartbeat services run, well after instrumentation is ready). This is the
+  // single, explicit registration point so the per-run process cap measures the
+  // run's existing group. Inert on non-Linux hosts, where the counter returns
+  // null and the cap fails open.
+  registerRunProcessGroupCounter(countLiveProcessGroupMembers);
   ensureDecisionSigningSecret();
   assertDecisionSigningKeyPathAtBoot();
   // sentry.ts.

@@ -607,6 +607,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isRunProcessCapExceededFailure } from "@paperclipai/adapter-utils/run-process-cap";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -27002,6 +27003,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         )
           ? outerErr
           : null;
+        // SUP-16011: a per-run process-cap refusal is a dispatch-time failure,
+        // not a setup crash. Recognise it explicitly so it keeps its own
+        // attributable code instead of collapsing to `setup_failed`.
+        const runProcessCapExceededFailure = isRunProcessCapExceededFailure(
+          outerErr,
+        )
+          ? outerErr
+          : null;
         // A sandbox provider plugin stuck in error/disabled/upgrade_pending
         // fails every lease the same way until an operator acts, so it is a
         // configuration gap, not a transient setup failure.
@@ -27016,6 +27025,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const nonRetryablePreflightCode =
           nonRetryablePreflightFailureCode(outerErr);
         const setupFailureErrorCode =
+          runProcessCapExceededFailure?.code ??
           workspaceValidationSetupFailure?.code ??
           configurationIncompleteSetupFailure?.code ??
           (unresolvedBaseRefSetupFailure ||
@@ -27049,6 +27059,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // action, so it is persisted even when the agent lookup failed and the
         // agent-scoped stop metadata cannot be merged in.
         const setupFailureDetails =
+          runProcessCapExceededFailure?.resultJson ??
           workspaceValidationSetupFailure?.resultJson ??
           configurationIncompleteSetupFailure?.resultJson ??
           (unresolvedBaseRefSetupFailure

@@ -25,6 +25,8 @@ import { validatePrpEvent } from "../protocol/replay-contract.js";
 import { digestPaperclipSemanticContent } from "../semantic-tools/receipts.js";
 import {
   DurablePrpControlPlane,
+  RUNNERD_RUN_PROCESS_CAP_ERROR_CODE,
+  RunnerdRunProcessCapExceededError,
   inspectWarmRunTransition,
   spawnRunner,
   type RunnerProcessLaunchSpec,
@@ -3293,4 +3295,172 @@ describe.sequential("DurablePrpControlPlane", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+// ─── SUP-16011 production-path cap boundary tests ──────────────────────────
+//
+// These tests prove the `runProcessCapGate` seam on `spawnRunner`:
+//   1. cap not reached → spawn proceeds
+//   2. cap reached → spawn refused before any process launch, with the
+//      correct error shape matching `@paperclipai/adapter-utils`
+//   3. restart re-enters spawnRunner and the gate re-applies
+//
+// Production runnerd paths that funnel through spawnRunner:
+//   - runnerd-codex-transport.ts:3236 (initial spawn)
+//   - runnerd-codex-transport.ts:3639 (reattach spawn)
+//   - durable-prp-control-plane.ts restart (withRestart → spawnRunner)
+
+it("admits spawn when the cap gate allows", () => {
+  const launches: RunnerProcessLaunchSpec[] = [];
+  const handle = spawnRunner({
+    connection: { mode: "connect", connectUrl: "ws://127.0.0.1:43127" },
+    stateDirectory: "/tmp/paperclip-runner-test",
+    identity,
+    ticket: "bootstrap-ticket",
+    maxOutboxBytes: 256 * 1024,
+    p0ReserveBytes: 64 * 1024,
+    runnerVersion: expectedRunnerVersion,
+    runnerDigest: expectedRunnerDigest,
+    processLauncher: (spec) => {
+      launches.push(spec);
+      return {
+        child: {
+          pid: 42,
+          exitCode: null,
+          signalCode: null,
+          kill: () => true,
+        },
+        completion: Promise.resolve({
+          code: 0,
+          signal: null,
+          stdout: "",
+          stderr: "",
+        }),
+      };
+    },
+    runProcessCapGate: () => null,
+  });
+
+  expect(launches).toHaveLength(1);
+  expect(handle.child.pid).toBe(42);
+});
+
+it("refuses spawn before process launch when the cap gate denies", () => {
+  const launches: RunnerProcessLaunchSpec[] = [];
+  let killed = false;
+
+  let thrown: unknown;
+  try {
+    spawnRunner({
+      connection: { mode: "connect", connectUrl: "ws://127.0.0.1:43127" },
+      stateDirectory: "/tmp/paperclip-runner-test",
+      identity,
+      ticket: "bootstrap-ticket",
+      maxOutboxBytes: 256 * 1024,
+      p0ReserveBytes: 64 * 1024,
+      runnerVersion: expectedRunnerVersion,
+      runnerDigest: expectedRunnerDigest,
+      processLauncher: (spec) => {
+        launches.push(spec);
+        return {
+          child: {
+            pid: 42,
+            exitCode: null,
+            signalCode: null,
+            kill: () => {
+              killed = true;
+              return true;
+            },
+          },
+          completion: Promise.resolve({
+            code: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+          }),
+        };
+      },
+      runProcessCapGate: ({ runId }) =>
+        new RunnerdRunProcessCapExceededError({
+          runId,
+          cap: 512,
+          current: 512,
+          processGroupId: 12345,
+        }),
+    });
+  } catch (e) {
+    thrown = e;
+  }
+
+  expect(thrown).toBeInstanceOf(RunnerdRunProcessCapExceededError);
+  const err = thrown as RunnerdRunProcessCapExceededError;
+  expect(err.code).toBe(RUNNERD_RUN_PROCESS_CAP_ERROR_CODE);
+  expect(err.name).toBe("RunnerdRunProcessCapExceededError");
+  expect(err.resultJson).toEqual({
+    errorCode: "run_process_cap_exceeded",
+    cap: 512,
+    current: 512,
+    processGroupId: 12345,
+    runId: identity.runId,
+  });
+  expect(
+    err.message,
+  ).toBe(
+    `[paperclip] run process cap exceeded: cap=512 current=512 group=12345 runId=${identity.runId}; spawn refused`,
+  );
+  expect(launches).toHaveLength(0);
+  expect(killed).toBe(false);
+});
+
+it("re-applies the cap gate on restart", () => {
+  let gateCalls = 0;
+  const launches: RunnerProcessLaunchSpec[] = [];
+
+  const handle = spawnRunner({
+    connection: { mode: "connect", connectUrl: "ws://127.0.0.1:43127" },
+    stateDirectory: "/tmp/paperclip-runner-test",
+    identity,
+    ticket: "bootstrap-ticket",
+    maxOutboxBytes: 256 * 1024,
+    p0ReserveBytes: 64 * 1024,
+    runnerVersion: expectedRunnerVersion,
+    runnerDigest: expectedRunnerDigest,
+    processLauncher: (spec) => {
+      launches.push(spec);
+      return {
+        child: {
+          pid: 42,
+          exitCode: null,
+          signalCode: null,
+          kill: () => true,
+        },
+        completion: Promise.resolve({
+          code: 0,
+          signal: null,
+          stdout: "",
+          stderr: "",
+        }),
+      };
+    },
+    runProcessCapGate: () => {
+      gateCalls++;
+      return gateCalls > 1
+        ? new RunnerdRunProcessCapExceededError({
+            runId: identity.runId,
+            cap: 1,
+            current: 1,
+            processGroupId: 999,
+          })
+        : null;
+    },
+  });
+
+  expect(launches).toHaveLength(1);
+  expect(gateCalls).toBe(1);
+
+  expect(() => handle.restart!("replacement-ticket")).toThrow(
+    RunnerdRunProcessCapExceededError,
+  );
+  expect(gateCalls).toBe(2);
+  expect(launches).toHaveLength(1);
 });
