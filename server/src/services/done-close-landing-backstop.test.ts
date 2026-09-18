@@ -303,7 +303,26 @@ const openSnapshot = {
     statusKey: "open",
     statusCategory: "open",
     statusTone: "info",
+    data: { state: "open", merged: false, draft: false },
+  },
+} as unknown as ExternalObjectResolveResult;
+const unknownDraftOpenSnapshot = {
+  ok: true,
+  snapshot: {
+    statusKey: "open",
+    statusCategory: "open",
+    statusTone: "info",
     data: { state: "open", merged: false },
+  },
+} as unknown as ExternalObjectResolveResult;
+// SUP-16689: an OPEN PR whose LIVE snapshot reports `draft: true`.
+const draftOpenSnapshot = {
+  ok: true,
+  snapshot: {
+    statusKey: "draft",
+    statusCategory: "waiting",
+    statusTone: "warning",
+    data: { state: "open", merged: false, draft: true },
   },
 } as unknown as ExternalObjectResolveResult;
 // What the real resolver reports when resolveGitHubToken has no credential.
@@ -568,7 +587,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 0,
       deferred: 0,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -606,7 +625,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 1,
       deferred: 0,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -652,7 +671,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 0,
       deferred: 0,
       reenqueued: 0,
-      escalated: 1,
+      escalated: 1, draftStranded: 0,
     });
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "issue.done_close_landing_escalated",
@@ -691,7 +710,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 0,
       deferred: 0,
       reenqueued: 0,
-      escalated: 1,
+      escalated: 1, draftStranded: 0,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -730,7 +749,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 0,
       deferred: 0,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -774,7 +793,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 1,
+        escalated: 1, draftStranded: 0,
       });
 
       expect(mockResolveCardPullRequest).toHaveBeenCalledTimes(1);
@@ -805,7 +824,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockAddComment).not.toHaveBeenCalled();
@@ -831,7 +850,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 1,
         reenqueued: 0,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockAddComment).not.toHaveBeenCalled();
@@ -864,7 +883,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
 
       // Two audit rows: the merged sibling confirmed, the closed carrier recorded
@@ -906,7 +925,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 2,
         deferred: 0,
         reenqueued: 0,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
 
       expect(mockAddComment).toHaveBeenCalledTimes(2);
@@ -926,7 +945,7 @@ describe("createDoneCloseLandingBackstopService", () => {
   it("never evaluates a done issue without the decision-carried skip row, and ignores other skip reasons", async () => {
     const { service } = makeService({ candidates: [], existingLandingRows: [] });
     const result = await service.sweep();
-    expect(result).toEqual({ due: true, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
+    expect(result).toEqual({ due: true, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 });
     expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
 
@@ -954,7 +973,7 @@ describe("createDoneCloseLandingBackstopService", () => {
     mockResolver(async () => mergedSnapshot);
 
     const first: DoneCloseLandingSweepResult = await service.sweep();
-    expect(first).toEqual({ due: true, candidates: 1, confirmed: 1, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
+    expect(first).toEqual({ due: true, candidates: 1, confirmed: 1, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 });
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
 
     // The first sweep's row now exists; a later sweep must not re-emit.
@@ -964,7 +983,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       details: { identifier: "SUP-13326", pr: "paperclipai/paperclip#3158" },
     });
     const second = await service.sweep();
-    expect(second).toEqual({ due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
+    expect(second).toEqual({ due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 });
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockAddComment).not.toHaveBeenCalled();
   });
@@ -983,7 +1002,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 0,
       deferred: 1,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
@@ -996,7 +1015,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 0,
       deferred: 1,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
@@ -1042,7 +1061,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 1,
       deferred: 0,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -1068,7 +1087,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       failed: 1,
       deferred: 0,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockAddComment).toHaveBeenCalledTimes(1);
     expect(wakeup).not.toHaveBeenCalled();
@@ -1089,7 +1108,7 @@ describe("createDoneCloseLandingBackstopService", () => {
     const selectCallsAfterFirst = db.select.mock.calls.length;
     clock += 30 * 1000;
     const second = await service.sweep();
-    expect(second).toEqual({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
+    expect(second).toEqual({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 });
     // Non-due tick performed no database work at all.
     expect(db.select.mock.calls.length).toBe(selectCallsAfterFirst);
     clock += 61 * 60 * 1000;
@@ -1126,7 +1145,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 1,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
 
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
@@ -1173,7 +1192,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 1,
+        escalated: 1, draftStranded: 0,
       });
 
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
@@ -1221,7 +1240,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 1,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
 
       expect(mockFetchGitHubNodeId).toHaveBeenCalledWith("ghp_fetched", "paperclipai", "paperclip", 514);
@@ -1301,7 +1320,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 1,
+        escalated: 1, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
       expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -1350,7 +1369,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: "issue.done_close_landing_confirmed",
@@ -1420,7 +1439,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       // PR once. That is the ENTIRE allowed budget for the PR (not 3x3).
       const first = await service.sweep();
       expect(first).toEqual({
-        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 3, escalated: 0,
+        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 3, escalated: 0, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(3);
 
@@ -1429,7 +1448,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       // escalated row and do NOT re-escalate (no 2nd/3rd board action on one PR).
       const second = await service.sweep();
       expect(second).toEqual({
-        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 1,
+        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 1, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(3); // no 4th attempt ever
       expect(mockUpdate).toHaveBeenCalledTimes(1); // one blocked card, not three
@@ -1460,7 +1479,7 @@ describe("createDoneCloseLandingBackstopService", () => {
 
       const result = await service.sweep();
       expect(result).toEqual({
-        due: true, candidates: 2, confirmed: 2, failed: 0, deferred: 0, reenqueued: 0, escalated: 0,
+        due: true, candidates: 2, confirmed: 2, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0,
       });
 
       // Both cards confirmed even though card B's fresh query sees card A's
@@ -1507,7 +1526,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 1,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -1548,7 +1567,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 1,
+        escalated: 1, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
       // AC2: durable refusal row with head + stamp + reason.
@@ -1604,7 +1623,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 1,
+        escalated: 1, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -1653,7 +1672,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 1,
         reenqueued: 0,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalled();
@@ -1689,7 +1708,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 1,
         reenqueued: 0,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalled();
@@ -1724,7 +1743,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 1,
-        escalated: 0,
+        escalated: 0, draftStranded: 0,
       });
       // Stamp match short-circuits the status read (AC5).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).not.toHaveBeenCalled();
@@ -1979,7 +1998,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 0,
       reenqueued: 1,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -2007,7 +2026,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 1,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockUpdate).not.toHaveBeenCalled();
@@ -2029,7 +2048,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 0,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
   });
 
@@ -2055,7 +2074,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 0,
       reenqueued: 0,
-      escalated: 1,
+      escalated: 1, draftStranded: 0,
     });
     // The predicate runs BEFORE the head-authorization gate: no queue add, no
     // head read (which would otherwise be a wasted API round-trip).
@@ -2113,7 +2132,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 1,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -2147,7 +2166,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 0,
       reenqueued: 1,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -2177,7 +2196,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 0,
       reenqueued: 1,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
   });
@@ -2203,7 +2222,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 1,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
     expect(mockFetchHeadViaTokenCandidates).not.toHaveBeenCalled();
@@ -2229,7 +2248,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 1,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
@@ -2255,7 +2274,7 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       failed: 0,
       deferred: 1,
       reenqueued: 0,
-      escalated: 0,
+      escalated: 0, draftStranded: 0,
     });
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
@@ -2288,6 +2307,292 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
       action: "issue.done_close_landing_reenqueue_refused",
     }));
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+  });
+});
+
+describe("SUP-16689: draft-stranded done cards", () => {
+  // A `done` card whose only linked PR is an OPEN DRAFT used to be invisible to
+  // every landing leg (re-enqueue / confirmed / failed are all draft-blind) and
+  // silently aged out of the 7-day discovery window. The sweep now resolves with
+  // `includeDrafts: true` and reports the strand explicitly: a durable
+  // `draft_stranded` audit row + system comment + assignee wake — with NO
+  // re-enqueue, NO escalation, and NO MAX_REENQUEUE_ATTEMPTS quota consumed.
+
+  it("uses the live ready state when the cached linked PR is still marked draft", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolver(async () => ({
+      ok: true,
+      snapshot: {
+        statusKey: "open",
+        statusCategory: "open",
+        statusTone: "info",
+        data: { state: "open", merged: false, draft: false },
+      },
+    } as unknown as ExternalObjectResolveResult));
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 1,
+      draftStranded: 0,
+    });
+
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_escalated",
+    }));
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+    }));
+  });
+
+  it("defers an open PR when the live draft state is unknown", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: false })]);
+    mockResolver(async () => unknownDraftOpenSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 0,
+    });
+
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("reports an open DRAFT linked PR as draft-stranded with a system comment and assignee wake (AC1)", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const { service } = makeService(
+      { candidates: [candidateRow()], existingLandingRows: [] },
+      { wakeup },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 1,
+    });
+
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      actorType: "system",
+      action: "issue.done_close_landing_draft_stranded",
+      entityType: "issue",
+      entityId: ISSUE,
+      details: expect.objectContaining({
+        identifier: "SUP-13326",
+        pr: "paperclipai/paperclip#3158",
+        prState: "open",
+        draft: true,
+        skipReason: "open_linked_prs_decision_carried:1",
+        refusal: false,
+      }),
+    }));
+    // A draft cannot be armed: no re-enqueue (mockEnableAutoMerge) and no board
+    // block (mockUpdate).
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    const [commentIssueId, commentBody] = mockAddComment.mock.calls[0]!;
+    expect(commentIssueId).toBe(ISSUE);
+    expect(commentBody).toContain("still an open DRAFT");
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledWith(AGENT, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: ISSUE, mutation: "comment" },
+    });
+  });
+
+  it("reports a draft PR discovered from the shared workspace (zero cached mentions) as draft-stranded (AC2)", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const { service } = makeService(
+      { candidates: [candidateRow()], existingLandingRows: [] },
+      { wakeup },
+    );
+    // Zero cached mentions; the shared resolution finds the delivered draft by
+    // workspace. The backstop opts into drafts on this path too.
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+    mockResolveCardPullRequest.mockResolvedValue({
+      kind: "single",
+      owner: "paperclipai",
+      repo: "paperclip",
+      number: 455,
+      displayName: "paperclipai/paperclip#455",
+      headRefName: "SUP-branch",
+      source: "workspace",
+      draft: true,
+    });
+    mockResolver(async () => draftOpenSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 1,
+    });
+
+    expect(mockResolveCardPullRequest).toHaveBeenCalledTimes(1);
+    expect(mockResolveCardPullRequest).toHaveBeenCalledWith(
+      expect.anything(),
+      COMPANY,
+      ISSUE,
+      "SUP-13326",
+      expect.objectContaining({ closingTransition: true, includeDrafts: true }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#455",
+        prState: "open",
+        draft: true,
+      }),
+    }));
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a draft PR as draft-stranded while a merged sibling is confirmed on the same card", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ draft: true }),
+      linkedPr({ id: "eo-368", number: 368, displayName: "paperclipai/paperclip#368" }),
+    ]);
+    mockResolver(async (input: unknown) =>
+      (input as { object: { externalId: string } }).object.externalId.endsWith("pull/368")
+        ? mergedSnapshot
+        : draftOpenSnapshot,
+    );
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 1,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 1,
+    });
+
+    // Two audit rows: the merged sibling confirmed, the draft reported as stranded.
+    expect(mockLogActivity).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_confirmed",
+      details: expect.objectContaining({ pr: "paperclipai/paperclip#368", prState: "merged" }),
+    }));
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+      details: expect.objectContaining({ pr: "paperclipai/paperclip#3158", prState: "open", draft: true }),
+    }));
+    // The draft never touches the re-enqueue lane.
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("a draft PR does not consume the MAX_REENQUEUE_ATTEMPTS cap or escalate — it reports draft-stranded", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    // Pre-seed the cap's worth of prior re-enqueue rows for this PR: a NON-draft
+    // open PR here would be cap-exhausted and escalate. But this PR is a DRAFT, so
+    // the draft branch intercepts BEFORE the re-enqueue / escalate logic runs.
+    const priorRows = Array.from({ length: MAX_REENQUEUE_ATTEMPTS }, () => ({
+      action: "issue.done_close_landing_reenqueued",
+      details: { pr: "paperclipai/paperclip#3158" },
+    }));
+    const { service } = makeService(
+      {
+        candidates: [candidateRow()],
+        existingLandingRows: priorRows,
+        companyMergeArmingEnabled: true,
+      },
+      { wakeup },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 1,
+    });
+
+    // No re-enqueue attempt and no board escalation: a draft is un-armable.
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+      details: expect.objectContaining({ pr: "paperclipai/paperclip#3158", draft: true }),
+    }));
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-report a draft-stranded card+PR on a later sweep (idempotent)", async () => {
+    const state: DbState = {
+      candidates: [candidateRow()],
+      existingLandingRows: [
+        {
+          action: "issue.done_close_landing_draft_stranded",
+          entityId: ISSUE,
+          details: { pr: "paperclipai/paperclip#3158" },
+        },
+      ],
+    };
+    const { service } = makeService(state);
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    const result = await service.sweep();
+
+    // This card+PR was already reported as draft-stranded -> no second row, no
+    // re-count, no re-comment.
+    expect(result).toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 0,
+    });
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
   });
 });
 

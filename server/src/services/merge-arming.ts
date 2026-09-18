@@ -191,6 +191,14 @@ export interface LinkedPullRequest {
    * unknown, not a refusal (SUP-14429).
    */
   reviewDecision: string | null;
+  /**
+   * True when the cached/live PR is a draft. Populated by the card resolvers
+   * (`resolveLinkedPullRequests` / `resolveLinkedPullRequestsWithState` /
+   * `resolveCardPullRequest`); absent on arming-path constructions that do not
+   * care about draft-ness. The done-close-landing backstop reads this to report
+   * a draft-stranded `done` card (SUP-16689); treat absent as non-draft.
+   */
+  draft?: boolean;
 }
 
 export interface IssueRepoContext {
@@ -318,6 +326,7 @@ export async function resolveLinkedPullRequests(
   db: Db,
   companyId: string,
   issueId: string,
+  options: { includeDrafts?: boolean } = {},
 ): Promise<LinkedPullRequest[]> {
   const rows = await db
     .select({
@@ -343,7 +352,7 @@ export async function resolveLinkedPullRequests(
   for (const row of rows) {
     const state = row.data?.state as string | undefined;
     const draft = row.data?.draft as boolean | undefined;
-    if (draft === true) continue;
+    if (!options.includeDrafts && draft === true) continue;
     if (state !== undefined && state !== "open") continue;
 
     const match = /^([^/]+)\/([^/]+)#(pull|issues)\/([1-9][0-9]*)$/.exec(row.externalId);
@@ -371,6 +380,7 @@ export async function resolveLinkedPullRequests(
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
         reviewDecision: null,
+        draft: draft === true,
       });
   }
 
@@ -381,6 +391,7 @@ export async function resolveLinkedPullRequestsWithState(
   db: Db,
   companyId: string,
   issueId: string,
+  options: { includeDrafts?: boolean } = {},
 ): Promise<LinkedPullRequest[]> {
   const rows = await db
     .select({
@@ -406,7 +417,7 @@ export async function resolveLinkedPullRequestsWithState(
   for (const row of rows) {
     const state = row.data?.state as string | undefined;
     const draft = row.data?.draft as boolean | undefined;
-    if (draft === true) continue;
+    if (!options.includeDrafts && draft === true) continue;
 
     const match = /^([^/]+)\/([^/]+)#(pull|issues)\/([1-9][0-9]*)$/.exec(row.externalId);
     if (!match) continue;
@@ -433,6 +444,7 @@ export async function resolveLinkedPullRequestsWithState(
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
         reviewDecision: null,
+        draft: draft === true,
       });
   }
 
@@ -467,6 +479,8 @@ export interface WorkspacePullRequestMatch {
   headRefName: string | null;
   /** The PR title as GitHub reported it in the open-PR list, or null. Carried so a certified subject can reproduce the SUP-13361 title-OR-branch ownership check (SUP-15394). */
   title: string | null;
+  /** True when the live open PR is a draft (SUP-16689: the backstop reports a draft-stranded `done` card instead of arming it). */
+  draft: boolean;
   candidate: GitHubTokenResolution;
 }
 
@@ -525,6 +539,7 @@ async function discoverCardPullRequestByWorkspace(
   issueIdentifier: string,
   closingTransition: boolean,
   withState: LinkedPullRequest[],
+  includeDrafts = false,
 ): Promise<WorkspaceDiscoveryResult> {
   const pairs: Array<{ owner: string; repo: string }> = [];
   const seenPairs = new Set<string>();
@@ -621,7 +636,7 @@ async function discoverCardPullRequestByWorkspace(
       }
 
       for (const item of listResult.items) {
-        if (item.draft === true) continue;
+        if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
         const title = (item.title ?? "").toLowerCase();
         const body = (item.body ?? "").toLowerCase();
@@ -633,6 +648,7 @@ async function discoverCardPullRequestByWorkspace(
           displayName: `${pair.owner}/${pair.repo}#${item.number}`,
           headRefName: item.headRef ?? null,
           title: item.title ?? null,
+          draft: item.draft === true,
           candidate,
         });
       }
@@ -739,6 +755,8 @@ export type CardPullRequestResolution =
       displayName: string;
       headRefName: string | null;
       source: "mention" | "workspace";
+      /** True when the resolved PR is a draft (SUP-16689). */
+      draft: boolean;
     }
   | { kind: "ambiguous"; reason: string; displayNames: string[] }
   | { kind: "none" }
@@ -749,9 +767,10 @@ export async function resolveCardPullRequest(
   companyId: string,
   issueId: string,
   issueIdentifier: string,
-  options: { closingTransition?: boolean } = {},
+  options: { closingTransition?: boolean; includeDrafts?: boolean } = {},
 ): Promise<CardPullRequestResolution> {
-  const openMentions = await resolveLinkedPullRequests(db, companyId, issueId);
+  const includeDrafts = options.includeDrafts ?? false;
+  const openMentions = await resolveLinkedPullRequests(db, companyId, issueId, { includeDrafts });
 
   if (openMentions.length > 0) {
     if (openMentions.length === 1) {
@@ -764,6 +783,7 @@ export async function resolveCardPullRequest(
         displayName: pr.displayName,
         headRefName: pr.headRefName,
         source: "mention",
+        draft: pr.draft === true,
       };
     }
     return {
@@ -773,7 +793,7 @@ export async function resolveCardPullRequest(
     };
   }
 
-  const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+  const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts });
   const discovery = await discoverCardPullRequestByWorkspace(
     db,
     companyId,
@@ -781,6 +801,7 @@ export async function resolveCardPullRequest(
     issueIdentifier,
     options.closingTransition ?? true,
     withState,
+    includeDrafts,
   );
   if (discovery.terminalFailure) {
     return {
@@ -824,6 +845,7 @@ export async function resolveCardPullRequest(
     displayName: single.displayName,
     headRefName: single.headRefName,
     source: "workspace",
+    draft: single.draft === true,
   };
 }
 
