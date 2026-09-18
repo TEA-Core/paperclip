@@ -14,6 +14,7 @@ import {
   externalObjects,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issues,
   projectWorkspaces,
   projects,
@@ -903,6 +904,144 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       const body = typeof call[1] === "string" ? call[1] : null;
       expect(body?.includes("Delivery verification was SKIPPED") ?? false).toBe(false);
     }
+  });
+
+  describe("SUP-16525 §4/§5 close path after re-arm (INV-LADDER-1 recovery)", () => {
+    // The ratified ADR-072 order. The coder-LE review is the rung the bypassed
+    // policy change skipped, so it is the stage the authorized §4 re-arm rewinds
+    // onto. The projection below is the shape `applyExecutionPolicyReArm`
+    // persists (asserted in issue-execution-policy-stage-insert-behind-pointer
+    // .test.ts): the pointer sits on the coder-LE rung and that rung is in
+    // NEITHER resolved set — a non-completion, not a verdict.
+    const stage1Id = "aaaaaaaa-0000-4000-8000-000000000001";
+    const stage2Id = "aaaaaaaa-0000-4000-8000-000000000002";
+    const stage3Id = "aaaaaaaa-0000-4000-8000-000000000003";
+
+    async function seedRearmedLadderIssue(prefix: string) {
+      const { companyId, agentId, issueId, identifier } = await seedIssue(prefix);
+      const executionPolicy = {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          { id: stage1Id, type: "review", participants: [{ type: "agent", agentId }] },
+          { id: stage2Id, type: "review", participants: [{ type: "agent", agentId }] },
+          { id: stage3Id, type: "approval", participants: [{ type: "user", userId: "cloud-user-1" }] },
+        ],
+      };
+      const executionState = {
+        status: "pending",
+        currentStageId: stage2Id,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId },
+        returnAssignee: null,
+        completedStageIds: [stage1Id],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+      await db
+        .update(issues)
+        .set({ executionPolicy, executionState })
+        .where(eq(issues.id, issueId));
+      return { companyId, agentId, issueId, identifier };
+    }
+
+    async function recordApprovedDecision(
+      companyId: string,
+      issueId: string,
+      agentId: string,
+      stageId: string,
+      stageType: string,
+    ) {
+      await db.insert(issueExecutionDecisions).values({
+        companyId,
+        issueId,
+        stageId,
+        stageType,
+        actorAgentId: agentId,
+        actorUserId: null,
+        outcome: "approved",
+        body: `stage ${stageId} approved`,
+      });
+    }
+
+    it("refuses done until the re-armed rung earns a durable decision row, then advances past the ladder gate (AC4/AC5)", async () => {
+      const { companyId, agentId, issueId, identifier } = await seedRearmedLadderIssue("RARM");
+      // A board plain close carries no stage decision, so it reaches the
+      // done-transition guard directly. (An agent PATCH would instead be read as
+      // a stage approval and demand a decision comment before the guard runs.)
+      currentActor = {
+        type: "board",
+        userId: "cloud-user-1",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        runId: randomUUID(),
+      };
+
+      // Leg 1 — the projection is unchanged and no decision row exists, so the
+      // re-armed rung (stage2) is unsatisfied: the close fails closed in the
+      // pre-network zone and the remedy is the ladder remedy, not the delivery one.
+      const refused = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Attempt the close before the re-armed rung is decided." });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      expect(refused.body.error).toContain("Review ladder unsatisfied");
+      expect(refused.body.error).toContain(stage2Id);
+      expect(refused.body.error).toContain("stage 2 of 3");
+      expect(refused.body.details.remedy).toContain(
+        "Record the unsatisfied review stage's approval",
+      );
+
+      // Fail-closed: the refusal happens before any write, so the card never left
+      // its pre-PATCH status.
+      const afterRefusal = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(afterRefusal[0]?.status).toBe("todo");
+
+      // Leg 2 — the ONLY change is a durable approved row for the re-armed rung.
+      // The refusal now moves on to the next unsatisfied rung (stage3): the row,
+      // not the projection, is what opens the re-armed gate.
+      await recordApprovedDecision(companyId, issueId, agentId, stage2Id, "review");
+      const advanced = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Attempt the close after the re-armed rung is decided." });
+      expect(advanced.status, JSON.stringify(advanced.body)).toBe(409);
+      expect(advanced.body.error).toContain("Review ladder unsatisfied");
+      expect(advanced.body.error).not.toContain(stage2Id);
+      expect(advanced.body.error).toContain(stage3Id);
+      expect(advanced.body.error).toContain("stage 3 of 3");
+
+      // Leg 3 — the terminal rung also earns a durable approved row, so the
+      // ladder gate clears and the close advances to the next (delivery) gate.
+      // GitHub is stubbed to a branch-ahead/no-merged-PR shape so the post-ladder
+      // refusal is deterministic and names the DELIVERY remedy, proving the
+      // ladder refusal is gone.
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{ merged: false, merged_at: null }]), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      await recordApprovedDecision(companyId, issueId, agentId, stage3Id, "approval");
+      const cleared = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Close once every rung carries a durable decision." });
+      expect(cleared.status, JSON.stringify(cleared.body)).toBe(409);
+      expect(cleared.body.code).toBe("done_transition_missing_delivery");
+      expect(cleared.body.error).not.toContain("Review ladder unsatisfied");
+      expect(cleared.body.details.remedy).toContain("deliver.sh");
+    });
   });
 
   describe("SUP-13939: tier-2 close-evidence gate on the control-plane done entry", () => {
