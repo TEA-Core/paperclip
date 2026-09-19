@@ -23,7 +23,6 @@ const mockIssueService = vi.hoisted(() => ({
   findMentionedProjectIds: vi.fn(),
   listBlockerAttention: vi.fn(),
   listReviewAttention: vi.fn(),
-  listProductivityReviews: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   getActiveInboxArchiveFields: vi.fn(),
 }));
@@ -345,7 +344,6 @@ describe("issue execution policy routes", () => {
     mockIssueService.findMentionedProjectIds.mockResolvedValue([]);
     mockIssueService.listBlockerAttention.mockResolvedValue(new Map());
     mockIssueService.listReviewAttention.mockResolvedValue(new Map());
-    mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.getActiveInboxArchiveFields.mockResolvedValue({});
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
