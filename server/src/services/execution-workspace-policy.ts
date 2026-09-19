@@ -354,6 +354,24 @@ export function suppliesIssueExecutionWorkspaceOverride(input: {
   return Boolean(preference && preference !== "inherit");
 }
 
+/**
+ * SUP-16886: the single source of truth for the forbidden issue-workspace pair —
+ * `executionWorkspacePreference: "agent_default"` combined with a non-null
+ * `projectWorkspaceId`. `agent_default` resolves to the agent home directory and
+ * can never coexist with a project workspace binding; the create boundary
+ * (SUP-16608) normalizes the pair away at write time with `agent_default` winning,
+ * and the issues PATCH boundary and the provisioning write-back (this invariant's
+ * other two writers) must apply the same rule instead of minting or refusing the
+ * pair.
+ */
+export function isAgentDefaultProjectWorkspacePair(input: {
+  executionWorkspacePreference?: string | null;
+  projectWorkspaceId?: string | null;
+}): boolean {
+  if (input.executionWorkspacePreference !== "agent_default") return false;
+  return typeof input.projectWorkspaceId === "string" && input.projectWorkspaceId.trim().length > 0;
+}
+
 export function isUnrunnableWorktreeCombo(input: {
   issue: UnrunnableWorktreeIssueRef;
   resolvedMode: ParsedExecutionWorkspaceMode;

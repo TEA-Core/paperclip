@@ -161,7 +161,7 @@ export interface ExecutionWorkspaceProvisioningInput {
       executionWorkspaceId?: string;
       executionWorkspacePreference?: string;
       executionWorkspaceSettings?: Record<string, unknown>;
-      projectWorkspaceId?: string;
+      projectWorkspaceId?: string | null;
     } | null;
   }) => Promise<{
     previousSessionParams: Record<string, unknown> | null;
@@ -915,12 +915,23 @@ export async function provisionIssueExecutionWorkspace(
     input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
     input.effectiveExecutionWorkspaceMode === "operator_branch" ||
     warmReusableExecutionWorkspace;
+  // SUP-16886: a card pinned to `agent_default` resolves to the agent home and must
+  // never carry a `projectWorkspaceId` (the create boundary, SUP-16608, normalizes
+  // the pair away with `agent_default` winning; the issues PATCH boundary heals it).
+  // Provisioning is the third writer and the one that re-minted the pair on every
+  // re-provision: it must neither mint a project workspace on such a card nor leave
+  // a stored bricked pair in place. `agent_default` wins, so the issue-row binding
+  // is null for these cards and a stored pair is cleared in this same system write.
+  const issuePrefersAgentDefault = issueRef?.executionWorkspacePreference === "agent_default";
+  const issueProjectWorkspaceIdForBinding = issuePrefersAgentDefault
+    ? null
+    : resolvedProjectWorkspaceId;
   const nextIssuePatch: Record<string, unknown> = {};
   const postAttachIssuePatch: {
     executionWorkspaceId?: string;
     executionWorkspacePreference?: string;
     executionWorkspaceSettings?: Record<string, unknown>;
-    projectWorkspaceId?: string;
+    projectWorkspaceId?: string | null;
   } | null = persistedExecutionWorkspace ? {} : null;
   // The issue's binding as this run last wrote it, so the post-realization re-bind below
   // writes only what changed.
@@ -934,9 +945,17 @@ export async function provisionIssueExecutionWorkspace(
       nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
       postAttachIssuePatch!.executionWorkspaceId = persistedExecutionWorkspace.id;
     }
-    if (resolvedProjectWorkspaceId && issueRef?.projectWorkspaceId !== resolvedProjectWorkspaceId) {
-      nextIssuePatch.projectWorkspaceId = resolvedProjectWorkspaceId;
-      postAttachIssuePatch!.projectWorkspaceId = resolvedProjectWorkspaceId;
+    if (issuePrefersAgentDefault && issueRef?.projectWorkspaceId) {
+      // Heal a stored bricked pair in the same system write that would otherwise
+      // re-mint it: agent_default wins, so the project workspace binding is dropped.
+      nextIssuePatch.projectWorkspaceId = null;
+      postAttachIssuePatch!.projectWorkspaceId = null;
+    } else if (
+      issueProjectWorkspaceIdForBinding &&
+      issueRef?.projectWorkspaceId !== issueProjectWorkspaceIdForBinding
+    ) {
+      nextIssuePatch.projectWorkspaceId = issueProjectWorkspaceIdForBinding;
+      postAttachIssuePatch!.projectWorkspaceId = issueProjectWorkspaceIdForBinding;
     }
     if (shouldSwitchIssueToExistingWorkspace) {
       nextIssuePatch.executionWorkspacePreference = "reuse_existing";
@@ -955,7 +974,7 @@ export async function provisionIssueExecutionWorkspace(
       // (SUP-13058).
       await issuesSvc.update(issueId, { ...nextIssuePatch, systemWorkspaceBinding: true });
       issueExecutionWorkspaceIdForRun = persistedExecutionWorkspace.id;
-      issueProjectWorkspaceIdForRun = resolvedProjectWorkspaceId ?? issueProjectWorkspaceIdForRun;
+      issueProjectWorkspaceIdForRun = issueProjectWorkspaceIdForBinding ?? issueProjectWorkspaceIdForRun;
       if (shouldSwitchIssueToExistingWorkspace) {
         issueExecutionWorkspacePreferenceForRun = "reuse_existing";
         issueExecutionWorkspaceModeForRun = nextIssueWorkspaceMode;
@@ -975,8 +994,8 @@ export async function provisionIssueExecutionWorkspace(
     if (issueExecutionWorkspaceIdForRun !== workspace.id) {
       realizedIssuePatch.executionWorkspaceId = workspace.id;
     }
-    if (resolvedProjectWorkspaceId && issueProjectWorkspaceIdForRun !== resolvedProjectWorkspaceId) {
-      realizedIssuePatch.projectWorkspaceId = resolvedProjectWorkspaceId;
+    if (issueProjectWorkspaceIdForBinding && issueProjectWorkspaceIdForRun !== issueProjectWorkspaceIdForBinding) {
+      realizedIssuePatch.projectWorkspaceId = issueProjectWorkspaceIdForBinding;
     }
     if (
       shouldSwitchIssueToExistingWorkspace &&
@@ -993,7 +1012,7 @@ export async function provisionIssueExecutionWorkspace(
     // Same system-binding marker as the bind above (SUP-13058).
     await issuesSvc.update(issueId, { ...realizedIssuePatch, systemWorkspaceBinding: true });
     issueExecutionWorkspaceIdForRun = workspace.id;
-    issueProjectWorkspaceIdForRun = resolvedProjectWorkspaceId ?? issueProjectWorkspaceIdForRun;
+    issueProjectWorkspaceIdForRun = issueProjectWorkspaceIdForBinding ?? issueProjectWorkspaceIdForRun;
     if (shouldSwitchIssueToExistingWorkspace) {
       issueExecutionWorkspacePreferenceForRun = "reuse_existing";
       issueExecutionWorkspaceModeForRun = realizedIssueWorkspaceMode;

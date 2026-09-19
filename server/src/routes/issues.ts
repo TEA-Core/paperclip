@@ -364,7 +364,10 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
-import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
+import {
+  isAgentDefaultProjectWorkspacePair,
+  parseIssueExecutionWorkspaceSettings,
+} from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
   buildPromotedSourceTrust,
@@ -5923,7 +5926,32 @@ export function issueRoutes(
     });
   }
 
-  function assertAgentDefaultProjectWorkspacePairValid(
+  /**
+   * SUP-16886: guard the reader of the `agent_default` + non-null
+   * `projectWorkspaceId` invariant, but do not let the guard brick the card.
+   *
+   * Before this, any PATCH whose effective state carried the pair 400'd — including
+   * a bare `{"status":"blocked"}` on a card that already stored the pair, which the
+   * provisioning write-back re-mints on every re-provision. The card's own assignee
+   * could not set a terminal status, park, or reassign.
+   *
+   * The guard now distinguishes the two directions:
+   *  - a REQUEST that itself asserts the pair (sets `executionWorkspacePreference`
+   *    to `agent_default` while a project workspace is in effect, or names a
+   *    non-null `projectWorkspaceId` while the preference is `agent_default`) is
+   *    refused, with the remedy in the message; and
+   *  - a request that merely ENCOUNTERS a stored pair (touches neither half) heals
+   *    it instead of refusing: `agent_default` wins and the project workspace is
+   *    dropped, the same write-boundary normalization SUP-16608 applies at create.
+   *
+   * `agent_default` wins because it is the card's own intent signal while
+   * `projectWorkspaceId` is the derived, system-minted field provisioning re-stamps
+   * every run; and clearing the preference is unreachable while a run is live (it
+   * requests a re-provision, refused with 409
+   * `issue_workspace_reprovision_run_active`), so dropping the project workspace is
+   * the reachable, intent-preserving repair.
+   */
+  function healAgentDefaultProjectWorkspacePair(
     existing: {
       projectWorkspaceId: string | null;
       executionWorkspacePreference: string | null;
@@ -5942,14 +5970,23 @@ export function issueRoutes(
         ? existing.projectWorkspaceId
         : body.projectWorkspaceId;
     if (
-      effectiveExecutionWorkspacePreference === "agent_default" &&
-      typeof effectiveProjectWorkspaceId === "string" &&
-      effectiveProjectWorkspaceId.trim().length > 0
+      !isAgentDefaultProjectWorkspacePair({
+        executionWorkspacePreference: effectiveExecutionWorkspacePreference,
+        projectWorkspaceId: effectiveProjectWorkspaceId,
+      })
     ) {
+      return;
+    }
+    const requestAssertsPair =
+      body.executionWorkspacePreference === "agent_default" ||
+      (typeof body.projectWorkspaceId === "string" &&
+        body.projectWorkspaceId.trim().length > 0);
+    if (requestAssertsPair) {
       throw badRequest(
         `executionWorkspacePreference "agent_default" cannot be combined with a non-null projectWorkspaceId: agent_default resolves to the agent home directory, not a project workspace. Clear one of executionWorkspacePreference or projectWorkspaceId before retrying. When a run is active on the card, clear projectWorkspaceId: clearing executionWorkspacePreference requests a re-provision, which is refused while the run is live.`,
       );
     }
+    body.projectWorkspaceId = null;
   }
 
   async function assertIssueEnvironmentSelection(
@@ -15713,7 +15750,7 @@ export function issueRoutes(
       await denyIssueWrite(req, res, existing, "issue_write_attribution_spoof_rejected");
       return;
     }
-    assertAgentDefaultProjectWorkspacePairValid(existing, req.body);
+    healAgentDefaultProjectWorkspacePair(existing, req.body);
     const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
     let mutationAccess:
       | boolean
