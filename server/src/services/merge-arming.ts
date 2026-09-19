@@ -985,6 +985,110 @@ export async function enableAutoMerge(
   return result;
 }
 
+/**
+ * SUP-16921: narrow matcher for the clean-status refusal. GitHub returns
+ * `errors[0].message = "Pull request Pull request is in clean status"` in a 200
+ * body when the PR is already immediately mergeable on a queue-less branch and
+ * `enablePullRequestAutoMerge` has nothing to defer. This matcher is
+ * deliberately specific: a `success === false` catch-all would swallow every
+ * unrecognised provider error and mask it behind the fallback merge.
+ */
+function isCleanStatusRefusal(error: string | null | undefined): boolean {
+  return error?.toLowerCase().includes("is in clean status") ?? false;
+}
+
+/**
+ * SUP-16921: resolve the repository's default merge method via the REST API so
+ * the fallback `mergePullRequest` mutation lands the same commit shape
+ * `enablePullRequestAutoMerge` (no explicit mergeMethod) would have used.
+ * Returns the uppercased enum value ("MERGE", "SQUASH", "REBASE") or null.
+ */
+async function fetchDefaultMergeMethod(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<string | null> {
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-merge-arming",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  try {
+    const response = await ghFetch(url, { headers });
+    if (!response.ok) return null;
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const method = body?.default_merge_method;
+    return typeof method === "string" ? method.toUpperCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface MergePullRequestOptions {
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * SUP-16921: head-pinned direct merge via the GraphQL `mergePullRequest`
+ * mutation. Retries transient 429/5xx using the same `isTransientArmingStatus`
+ * policy as `enableAutoMerge` (SUP-16088 contract). A 200-body provider error
+ * is terminal, not transient.
+ */
+export async function mergePullRequest(
+  token: string,
+  nodeId: string,
+  expectedHeadOid: string,
+  mergeMethod: string,
+  options: MergePullRequestOptions = {},
+): Promise<{ success: boolean; error: string | null; status: number }> {
+  const maxAttempts = options.maxAttempts ?? 3;
+  const baseDelay = options.retryDelayMs ?? 250;
+  const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+  const attempt = async (): Promise<{ success: boolean; error: string | null; status: number }> => {
+    const query = `mutation { mergePullRequest(input: { pullRequestId: "${nodeId}", expectedHeadOid: "${expectedHeadOid}", mergeMethod: ${mergeMethod} }) { clientMutationId pullRequest { merged } } }`;
+
+    try {
+      const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ query }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+        const errors = body?.errors as Array<{ message?: string }> | undefined;
+        const firstError = errors?.[0]?.message ?? "";
+        return { success: false, error: firstError || `HTTP ${response.status}`, status: response.status };
+      }
+
+      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+      const errors = body?.errors as Array<{ message?: string }> | undefined;
+      if (errors && errors.length > 0) {
+        return { success: false, error: errors[0]?.message ?? "", status: response.status };
+      }
+
+      return { success: true, error: null, status: response.status };
+    } catch {
+      return { success: false, error: "network_error", status: 0 };
+    }
+  };
+
+  let result = await attempt();
+  for (let attemptNo = 1; attemptNo < maxAttempts && isTransientArmingStatus(result.status); attemptNo++) {
+    await sleep(baseDelay * 2 ** (attemptNo - 1));
+    result = await attempt();
+  }
+  return result;
+}
+
 export interface MarkPullRequestReadyForReviewResult {
   success: boolean;
   alreadyReady: boolean;
@@ -3327,6 +3431,35 @@ export async function armMergeOnApproval(
     }
 
     const safeError = result.error ?? "unknown_error";
+
+    if (isCleanStatusRefusal(safeError)) {
+      const executionState = ownerRow.executionState as Record<string, unknown> | null;
+      const approvalStatus = executionState?.approvalStatus as Record<string, unknown> | null;
+      const publishedHeadSha =
+        typeof approvalStatus?.publishedHeadSha === "string" ? approvalStatus.publishedHeadSha : null;
+
+      if (!publishedHeadSha) {
+        return {
+          kind: "skipped",
+          message: `skipped:no-approved-head: ${pr.displayName} — publishedHeadSha is null, cannot pin the direct merge`,
+        };
+      }
+
+      const defaultMergeMethod = await fetchDefaultMergeMethod(token, pr.owner, pr.repo) ?? "MERGE";
+      const mergeResult = await mergePullRequest(token, nodeId, publishedHeadSha, defaultMergeMethod);
+
+      if (mergeResult.success) {
+        return {
+          kind: "armed",
+          message: `armed:direct-merge: ${pr.displayName} (head ${publishedHeadSha})`,
+        };
+      }
+
+      const mergeSafeError = mergeResult.error ?? "unknown_error";
+      const mergeTruncated = mergeSafeError.length > 200 ? mergeSafeError.slice(0, 200) + "..." : mergeSafeError;
+      return { kind: "failed", message: `failed:direct_merge:${mergeTruncated}` };
+    }
+
     const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
     return { kind: "failed", message: `failed:${truncated}` };
   }
