@@ -94,6 +94,7 @@ import {
 } from "../activity-log.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { DISPATCH_UNLAUNCHED_ERROR_CODE } from "../heartbeat-stop-metadata.js";
+import { isNonRetryablePreflightFailureCode } from "../non-retryable-preflight-failure-codes.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -3549,15 +3550,46 @@ export function recoveryService(
     return action;
   }
 
+  // Fold 2c / D12 (operator decision 2026-09-15) + SUP-16538 follow-up: upstream first-strike
+  // means "no automatic re-dispatch" for the non-retryable preflight refusals. Upstream #11961
+  // deleted the owner wake outright; the fork keeps it, but when the owner IS the refused run's
+  // agent the wake re-dispatches the same agent onto the same issue policy, which refuses it
+  // again (a structural refusal, not a transient one). A different owner can legitimately pass
+  // (e.g. low_trust_boundary_mismatch keys on allowedAgentIds), so only the same-agent wake is
+  // skipped. The recovery action and the blocked status still stand.
+  //
+  // SUP-16538: keyed on the run's errorCode, not only on the release path's explicit flag, so a
+  // sweep escalation (reconcileStrandedAssignedIssues) suppresses the same wake. Applied at the
+  // shared enqueue choke point so the stale-action sweep (reconcileStaleRecoveryActionWakes),
+  // which re-fires the action directly, is covered too.
+  function ownerWakeWouldRedispatchRefusedAgent(input: {
+    ownerAgentId: string | null;
+    latestRun: LatestIssueRun;
+  }): boolean {
+    return (
+      input.ownerAgentId != null &&
+      input.latestRun?.agentId != null &&
+      input.ownerAgentId === input.latestRun.agentId &&
+      isNonRetryablePreflightFailureCode(input.latestRun.errorCode)
+    );
+  }
+
   async function enqueueSourceScopedStrandedRecoveryWake(input: {
     action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
-  }) {
-    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
-    if (input.recoveryCause === "configuration_incomplete") return;
-    if (!input.action.ownerAgentId) return;
+  }): Promise<boolean> {
+    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return false;
+    if (input.recoveryCause === "configuration_incomplete") return false;
+    if (!input.action.ownerAgentId) return false;
+    if (
+      ownerWakeWouldRedispatchRefusedAgent({
+        ownerAgentId: input.action.ownerAgentId,
+        latestRun: input.latestRun,
+      })
+    )
+      return false;
     await deps.enqueueWakeup(input.action.ownerAgentId, {
       source: "assignment",
       triggerDetail: "system",
@@ -3584,6 +3616,7 @@ export function recoveryService(
         recoveryCause: input.recoveryCause,
       }, "status_only"),
     });
+    return true;
   }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
@@ -4833,9 +4866,6 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
     agentInvokability?: AgentInvokability | null;
-    // Fold 2c / D12: set only by releaseIssueExecutionAndPromote for a first-strike
-    // non-retryable preflight refusal. See the owner-wake call below.
-    suppressOwnerWakeForRefusedAgent?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -5078,25 +5108,16 @@ export function recoveryService(
       },
     });
 
-    // Fold 2c / D12 (operator decision 2026-09-15): upstream first-strike means "no automatic
-    // re-dispatch" for the seven non-retryable preflight refusals. Upstream #11961 deleted this
-    // owner wake outright; the fork keeps it, but when the owner IS the refused run's agent the
-    // wake re-dispatches the same agent onto the same issue policy, which refuses it again
-    // (a structural refusal, not a transient one). A different owner can legitimately pass
-    // (e.g. low_trust_boundary_mismatch keys on allowedAgentIds), so only the same-agent wake
-    // is skipped. The recovery action and the blocked status still stand.
-    const ownerWakeWouldRedispatchRefusedAgent =
-      input.suppressOwnerWakeForRefusedAgent === true &&
-      recoveryAction.ownerAgentId != null &&
-      recoveryAction.ownerAgentId === input.latestRun?.agentId;
-    if (!ownerWakeWouldRedispatchRefusedAgent) {
-      await enqueueSourceScopedStrandedRecoveryWake({
-        action: recoveryAction,
-        issue: input.issue,
-        latestRun: input.latestRun,
-        recoveryCause,
-      });
-    }
+    // Fold 2c / D12 + SUP-16538: the same-agent refusal suppression is applied inside
+    // enqueueSourceScopedStrandedRecoveryWake (keyed on latestRun.errorCode) so this escalation
+    // path and the stale-action sweep share one predicate. See
+    // ownerWakeWouldRedispatchRefusedAgent. The recovery action and the blocked status still stand.
+    await enqueueSourceScopedStrandedRecoveryWake({
+      action: recoveryAction,
+      issue: input.issue,
+      latestRun: input.latestRun,
+      recoveryCause,
+    });
 
     if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
       const [currentIssue] = await db
@@ -9451,12 +9472,13 @@ export function recoveryService(
       const latestRun = await getLatestIssueRun(candidate.companyId, candidate.sourceIssueId);
 
       try {
-        await enqueueSourceScopedStrandedRecoveryWake({
+        const enqueued = await enqueueSourceScopedStrandedRecoveryWake({
           action,
           issue: sourceIssue,
           latestRun,
           recoveryCause: candidate.cause as StrandedRecoveryCause,
         });
+        if (!enqueued) continue;
         if (rerouteOwnerAgentId) result.rerouted += 1;
         else result.reFired += 1;
         result.issueIds.push(candidate.sourceIssueId);
