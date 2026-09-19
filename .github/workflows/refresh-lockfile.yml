@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
@@ -89,24 +91,24 @@ jobs:
           git config user.name "lockfile-bot"
           git config user.email "lockfile-bot@users.noreply.github.com"
 
-          git checkout -B "$BRANCH"
-          git add pnpm-lock.yaml
-          git commit -m "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}"
-          git push --force origin "$BRANCH"
-
           # The exact command a human runs to open the PR by hand. Emitted in the
           # ::error:: remediation below so the pushed branch is never left unpointed.
           PR_CMD="gh pr create --head \"${BRANCH}\" --base \"${BASE_REF}\" --title \"chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}\" --body \$'Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\n\nPaperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)'"
 
-          # The default GITHUB_TOKEN cannot create PRs in this org ("GitHub Actions
-          # is not permitted to create or approve pull requests"), so the bot token
-          # (commitperclip app installation) is required. Fail loudly rather than
-          # leaving an orphan branch with no pointer.
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error title=Lockfile PR not created::No bot token (TEA_CORE_APP_PRIVATE_KEY) is available to open the PR. The refreshed lockfile was pushed to branch '${BRANCH}' but no PR was created. Open it manually with: ${PR_CMD}"
+            echo "::error title=Lockfile push not performed::No bot token (TEA_CORE_APP_PRIVATE_KEY) is available, so the branch update was NOT pushed: a push we could not bind to the app installation token would create runs held at action_required. Generate the token, push, and open the PR manually: ${PR_CMD}" >&2
             echo "pr_url=" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
+
+          PUSH_CREDENTIAL_HELPER="$(mktemp)"
+          trap 'rm -f "$PUSH_CREDENTIAL_HELPER"' EXIT
+          printf '#!/bin/sh\nprintf "username=x-access-token\\npassword=%s\\n" "$GH_TOKEN"\n' > "$PUSH_CREDENTIAL_HELPER"
+          chmod 700 "$PUSH_CREDENTIAL_HELPER"
+          git checkout -B "$BRANCH"
+          git add pnpm-lock.yaml
+          git commit -m "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}"
+          git -c credential.helper="!$PUSH_CREDENTIAL_HELPER" push --force origin "$BRANCH"
 
           # Only reuse an open PR from this repository owner, not a fork with the same branch name.
           pr_url="$(

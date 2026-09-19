@@ -7,12 +7,12 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const workflow = readFileSync(path.join(repoRoot, ".github/workflows/refresh-lockfile.yml"), "utf8");
 
-// `Refresh Lockfile` opens its PR with the default `GITHUB_TOKEN`, which this org
-// blocks from creating pull requests ("GitHub Actions is not permitted to create
-// or approve pull requests"). The fix swaps to a commitperclip app installation
-// token (generated from TEA_CORE_APP_PRIVATE_KEY) and, when PR creation is impossible,
-// emits an ::error:: naming the pushed branch and the exact `gh pr create` command
-// so the orphan branch is never left with no pointer. These tests pin that.
+// `Refresh Lockfile` authenticates both its branch push and its PR creation with the
+// generated commitperclip app installation token (from TEA_CORE_APP_PRIVATE_KEY),
+// not the default `GITHUB_TOKEN` — which this org blocks from creating pull requests
+// ("GitHub Actions is not permitted to create or approve pull requests"). When PR
+// creation is still impossible, it emits an ::error:: naming the pushed branch and the
+// exact `gh pr create` command so the orphan branch is never left with no pointer.
 
 const lines = workflow.split("\n");
 
@@ -48,4 +48,42 @@ test("the PR step fails loudly with the branch and the exact gh pr create comman
   assert.match(body, /Open it manually with: \$\{PR_CMD\}/, "must name the remediation command");
   assert.match(body, /pushed branch '\$\{BRANCH\}'/, "must name the pushed branch");
   assert.match(body, /PR_CMD="gh pr create --head/, "must record the exact gh pr create command");
+});
+
+// SUP-16627: the branch update was pushed with the credential that
+// actions/checkout persists (GITHUB_TOKEN, i.e. github-actions[bot]). Runs raised
+// by that attribution on pull_request workflows are held at action_required, so
+// the PR's required checks never execute and its armed auto-merge can't progress.
+// The push must instead be bound to the tea-core app installation token
+// (steps.bot-token's token, exposed as GH_TOKEN in this step), and it must not run
+// at all when that token is unavailable. These assertions distinguish the
+// credential used for `git push` from the one used by `gh pr create`.
+test("checkout does not persist the default GitHub token", () => {
+  const body = stepBody("Checkout repository").join("\n");
+  assert.match(body, /persist-credentials:\s*false/, "checkout must not persist GITHUB_TOKEN");
+});
+
+test("the branch push uses a temporary helper bound to the app token", () => {
+  const body = stepBody("Create or update pull request").join("\n");
+  assert.match(body, /PUSH_CREDENTIAL_HELPER="\$\(mktemp\)"/, "must create an ephemeral credential helper");
+  assert.match(body, /password=%s\\\\n.*\$GH_TOKEN/, "the helper must read the app token from GH_TOKEN");
+  assert.match(body, /git -c credential\.helper="!\$PUSH_CREDENTIAL_HELPER" push --force origin "\$BRANCH"/, "push must bind the helper explicitly");
+  assert.doesNotMatch(body, /PUSH_URL|https:\/\/x-access-token:\$\{GH_TOKEN\}/, "must not put the token in a URL or command argument");
+  assert.doesNotMatch(body, /git push[^\n]*\$\{GH_TOKEN\}/, "push must not use the token as a command argument");
+});
+
+test("the branch push is unreachable without an app token and fails nonzero", () => {
+  const body = stepBody("Create or update pull request");
+  const guardIdx = body.findIndex(line => /if \[ -z "\$GH_TOKEN" \]; then/.test(line));
+  const failIdx = body.findIndex((line, index) => index > guardIdx && /exit 1/.test(line));
+  const guardEndIdx = body.findIndex((line, index) => index > guardIdx && line.trim() === "fi");
+  const pushIdx = body.findIndex(line => /git .*push --force/.test(line));
+  assert.notEqual(guardIdx, -1, "must guard the push on the app token");
+  assert.notEqual(failIdx, -1, "missing app token must fail nonzero");
+  assert.notEqual(guardEndIdx, -1, "token guard must close before the push");
+  assert.notEqual(pushIdx, -1, "must push when the token is available");
+  assert.ok(guardIdx < failIdx && failIdx < guardEndIdx && guardEndIdx < pushIdx, "push must follow the failing guard");
+  assert.doesNotMatch(body.slice(guardIdx, guardEndIdx + 1).join("\n"), /git .*push/, "missing-token branch must not push");
+  assert.match(body.join("\n"), /::error title=Lockfile push not performed::/, "must explain why no push occurred");
+  assert.match(body.join("\n"), /was NOT pushed/, "must state that no push occurred");
 });
