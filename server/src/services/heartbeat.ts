@@ -1,4 +1,4 @@
-import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
+import { AGENT_CHAT_DIRECTIVE, conversationReplay, currentConversationCommentCondition, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
@@ -29,7 +29,7 @@ export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt, isSpawnEnvelopeTooLargeError } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
-import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
+import { isWorkspaceGitScanError, isWorkspaceGitScanFailureCode, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
@@ -28599,6 +28599,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(issueComments.companyId, issue.companyId),
                 eq(issueComments.issueId, issue.id),
                 inArray(issueComments.id, queuedCommentIds),
+                // Fold 2d / D9: upstream #13284 added this boundary filter to the
+                // module's `getQueuedCommentLiveness`
+                // (modules/wake-queue/adapters/postgres.ts). That adapter has no
+                // caller while the fork keeps this in-file promotion, so without
+                // the predicate a comment parked before the user's `/new` still
+                // reads as live here: the stopped session's deferred wake is
+                // promoted instead of cancelled, the freshly reset chat
+                // immediately re-runs the old topic, and because that old comment
+                // sorts before `/new` the turn settles `in_progress`/`active` and
+                // the conversation never returns to `waiting`. No-op off a
+                // conversation (the NOT EXISTS needs a non-null
+                // conversation_agent_id and boundary comment). Delete this only
+                // together with the D9 port, which replaces the whole loop.
+                currentConversationCommentCondition(),
               ),
             );
           const targetsFinishingRunAgent = deferred.agentId === run.agentId;
@@ -29012,12 +29026,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
+        // Upstream f1d57863d (#13404) adds one more revival and slice 2d adopts it
+        // verbatim: live, non-self agent feedback carrying an explicit resume intent,
+        // on a DONE card the waking agent still owns. It cannot revive a `cancelled`
+        // card, and the outer `!deferredCommentWakeIsSelfAuthored` keeps it clear of
+        // SUP-14913 (a self write-up never reopens). Ported here rather than onto
+        // modules/wake-queue because D9 keeps the module release dormant.
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
           !deferredCommentWakeIsSelfAuthored &&
           (issue.status === "done" || issue.status === "cancelled") &&
           (deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment");
+            deferredWakeReason === "issue_reopened_via_comment" ||
+            (issue.status === "done" &&
+              deferred.agentId === issue.assigneeAgentId &&
+              deferred.requestedByActorType === "agent" &&
+              deferredContextSeed.resumeIntent === true &&
+              queuedCommentIds.length > 0));
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {
@@ -29502,6 +29527,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
         isOpenCodeDatabaseGrowthLimitFailedRun(run) ||
+        // Fold 2d: setup already owns the bounded durable retry budget for every
+        // workspace_git_scan_* failure, so generic immediate recovery must not queue a
+        // run for one -- it would retry a permanent scan failure, or give an exhausted
+        // transient chain a fresh budget. Upstream refuses all five on the first failure
+        // via isImmediateRecoverySourceBlocked -> classifyContinuationFailure; the scan
+        // codes are absent from NON_RETRYABLE_PREFLIGHT_FAILURE_CODES on purpose (see the
+        // D12/SUP-15589 note above PRE_ADAPTER_SETUP_FAILURE_CODES), so they get their own
+        // disjunct rather than widening that set.
+        isWorkspaceGitScanFailureCode(run.errorCode) ||
         // Fold 2c / D12: first-strike (upstream sourceRequiresExplicitRecovery). Deliberately
         // placed after the suppress / existing-path / monitor / blocker / pause-hold /
         // stranded-origin exits above, which is upstream's evaluation order.
@@ -32741,6 +32775,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           message: options.eventMessage ?? "run cancelled",
           ...(options.eventPayload ? { payload: options.eventPayload } : {}),
         });
+        // Slice 2d / upstream #13316 (0e14c61da): a cancellation that wins during native
+        // STARTUP is the same rule as the native-retry cancel below. Upstream fences startup
+        // and its release records the incident without a new run; the fork's in-file release
+        // has no native exit, so it queued a generic issue_continuation_needed successor whose
+        // own dispatch is NOT gated by withChatControlRecoveryGate, and the provider the
+        // cancellation just fenced off started anyway. The predicate is upstream's own
+        // never-claimed coordinator proof from services/cancelled-native-startup.ts. The D9
+        // port (SUP-16581) makes this redundant; delete it in that change.
+        const nativeStartupNeverClaimed =
+          run.runtimeMode === "native" &&
+          !run.processPid &&
+          !run.processGroupId &&
+          !run.processStartedAt &&
+          !run.sessionIdAfter &&
+          (await db
+            .select()
+            .from(nativeRunFinalizations)
+            .where(
+              and(
+                eq(nativeRunFinalizations.runId, run.id),
+                eq(nativeRunFinalizations.companyId, run.companyId),
+              ),
+            )
+            .limit(1)
+            .then(([coordinator]) =>
+              Boolean(
+                coordinator &&
+                  ["observed", "terminal_failure"].includes(coordinator.phase) &&
+                  coordinator.attempt === 0 &&
+                  coordinator.controllerGeneration === 0 &&
+                  !coordinator.controllerBootId &&
+                  !coordinator.controllerPid &&
+                  !coordinator.leaseOwner &&
+                  !coordinator.leaseExpiresAt &&
+                  !coordinator.resultId,
+              ),
+            )
+            .catch(() => false));
         await releaseIssueExecutionAndPromote(cancelled, {
           // Fold 2c / native retry cancel: upstream #13075 (35fdc0c66) made a failed native run
           // with a durable retry cancellable, and the cancellation terminalizes its coordinator
@@ -32753,7 +32825,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // !== null) forbids that replacement chain, so apply it here too. The D9 port makes
           // this redundant; delete it in that change.
           suppressImmediateRecovery:
-            options.suppressImmediateRecovery || pendingNativeRetry,
+            options.suppressImmediateRecovery ||
+            pendingNativeRetry ||
+            nativeStartupNeverClaimed,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),

@@ -44,14 +44,35 @@ function matchingBrace(source: string, openIndex: number): number {
 // nothing (SUP-16564).
 function locateAppendRunEventOrder(source: string) {
   const appendRunEventStart = source.indexOf("async function appendRunEvent(");
-  const bodyOpen =
-    appendRunEventStart === -1 ? -1 : source.indexOf("{", appendRunEventStart);
+  // FORK DIVERGENCE (appendRunEvent signature carries an inline type literal, slice 2d):
+  // the fold retired the fork loop-stopper (a31d07b0d / 8f462304a) for upstream 667c79ded
+  // (#13451), which widened the `event` parameter with `& { retryExhaustion?: ... }`. The
+  // body brace is therefore the `{` after the parameter list's `) {`, not the first `{`
+  // after the function name -- matching that type literal's brace put appendRunEventEnd
+  // ahead of the emit and silently broke the SUP-16564 bound.
+  const signatureEnd =
+    appendRunEventStart === -1
+      ? -1
+      : source.indexOf(") {", appendRunEventStart);
+  const bodyOpen = signatureEnd === -1 ? -1 : signatureEnd + 2;
   const appendRunEventEnd =
     bodyOpen === -1 ? -1 : matchingBrace(source, bodyOpen);
-  const persistedEvent = source.indexOf(
-    "await db.insert(heartbeatRunEvents).values(insertValues)",
+  // FORK DIVERGENCE (heartbeat_run_events `error` column, slice 2d): upstream routes every
+  // event through `appendHeartbeatRunEvent`; the fork routes only the retry-exhaustion event
+  // there (upstream 667c79ded's idempotent receipt, adopted verbatim) and keeps a direct
+  // insert for every other event, because buildRunEventInsertValues also persists the `error`
+  // column (#565 / SUP-15431) that `AppendHeartbeatRunEventInput` does not carry. Both arms
+  // are durable writes, so anchor on the LATER of the two: the live emit must follow every
+  // durable write, not merely the first one.
+  const exhaustionWrite = source.indexOf(
+    "await appendHeartbeatRunEvent(db, {",
     appendRunEventStart,
   );
+  const directWrite = source.indexOf(
+    "await db.insert(heartbeatRunEvents).values({ ...sanitizedValues, seq })",
+    appendRunEventStart,
+  );
+  const persistedEvent = Math.max(exhaustionWrite, directWrite);
   const emittedEvent = source.indexOf("publishLiveEvent({", persistedEvent);
   return {
     appendRunEventStart,
@@ -266,9 +287,11 @@ describe("chat publication commit signals", () => {
     // Fork divergence (heartbeat_run_events error column, slice 2c): upstream
     // 51ad751e0 (#12616) routes appendRunEvent's write through the shared
     // `appendHeartbeatRunEvent` helper, and 889947c23 (#13038) pins that literal
-    // here. The fork's appendRunEvent keeps the allocate+insert shape instead —
-    // `allocateHeartbeatRunEventSeq` + `buildRunEventInsertValues` + a direct
-    // insert — because `AppendHeartbeatRunEventInput` has no `error` field and
+    // here. The fork's appendRunEvent keeps the allocate+insert shape for every
+    // event except retry-exhaustion (slice 2d adopted upstream 667c79ded's
+    // idempotent receipt for that one arm) — `allocateHeartbeatRunEventSeq` +
+    // `buildRunEventInsertValues` + a direct insert — because
+    // `AppendHeartbeatRunEventInput` has no `error` field and
     // the helper would drop the driver error the fork stores in that column
     // (#565, migration 0245; kept over upstream's helper by the slice 2b fold
     // e5d442a8b). Only the literal changes: this still asserts the durable
@@ -307,7 +330,7 @@ describe("chat publication commit signals", () => {
     // (SUP-16564).
     const movedEmit = [
       "async function appendRunEvent(run, event) {",
-      "  await db.insert(heartbeatRunEvents).values(insertValues);",
+      "  await db.insert(heartbeatRunEvents).values({ ...sanitizedValues, seq });",
       "}",
       "function emitElsewhere(run, event) {",
       "  publishLiveEvent({",

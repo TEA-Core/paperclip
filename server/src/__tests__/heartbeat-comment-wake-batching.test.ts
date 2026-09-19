@@ -1394,19 +1394,32 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       gateway.releaseFirstWait();
 
       if (targetAssignee && !shouldReopen) {
+        // FORK DIVERGENCE (SUP-14913 delivery guarantee vs upstream ab15aff39 / #13284, slice 2d):
+        // upstream cancels a stale assignee continuation on a terminal card with
+        // "Deferred execution wake no longer applies to a terminal task". This fork
+        // deliberately PROMOTES a deferred comment wake onto a closed card so the assignee
+        // still receives the message (heartbeat.ts, the SUP-14913 note on the
+        // `issueContext.status !== "done"` continuation guard; D9 keeps the in-file release
+        // live, wake-queue-release-dormant-guard.test.ts). What upstream is protecting still
+        // holds and is asserted below: the card does NOT reopen and the comment is retained.
+        // Restore upstream's cancel assertions in the change that adopts #13284's cancel arm.
+        await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
         await waitFor(async () => {
-          const cancelled = await db.select().from(agentWakeupRequests).where(and(
+          const runs = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.companyId, companyId));
+          return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        }, 90_000);
+        expect(
+          await db.select().from(agentWakeupRequests).where(and(
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.agentId, targetAgentId),
             eq(agentWakeupRequests.status, "cancelled"),
-          ));
-          return cancelled.some((wake) => wake.error === "Deferred execution wake no longer applies to a terminal task");
-        });
-        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
-        expect(runs).toEqual([expect.objectContaining({ id: firstRun!.id, status: "succeeded" })]);
-        expect(gateway.getAgentPayloads()).toHaveLength(1);
+          )),
+        ).toEqual([]);
         const [closedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
-        expect(closedIssue).toMatchObject({ status: terminalStatus, executionRunId: null });
+        expect(closedIssue).toMatchObject({ status: terminalStatus });
         expect(closedIssue.completedAt).not.toBeNull();
         const [retainedComment] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
         expect(retainedComment.body).toContain("please review after I finish");

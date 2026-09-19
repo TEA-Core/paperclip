@@ -16,6 +16,29 @@ export const WORKSPACE_GIT_SCAN_ERROR_CODES = {
 export type WorkspaceGitScanErrorCode =
   (typeof WORKSPACE_GIT_SCAN_ERROR_CODES)[keyof typeof WORKSPACE_GIT_SCAN_ERROR_CODES];
 
+const WORKSPACE_GIT_SCAN_ERROR_CODE_SET: ReadonlySet<string> = new Set<string>(
+  Object.values(WORKSPACE_GIT_SCAN_ERROR_CODES),
+);
+
+// Fold 2d (upstream #13442/#13636): heartbeat setup owns the shared durable retry
+// budget for every workspace_git_scan_* failure -- executeRun routes the transient
+// codes to scheduleBoundedRetryForRun (BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
+// budget 2) and lets the rest terminate. Generic immediate recovery must not touch
+// any of the five: it would retry a permanent scan failure, or hand an exhausted
+// transient chain a second budget. recovery/service.ts already records exactly that
+// for the continuation path ("Setup owns the shared durable retry budget for
+// temporary Git scans"); this predicate carries the same rule to the fork's in-file
+// releaseIssueExecutionAndPromote, which is where upstream lands via wake-queue's
+// isImmediateRecoverySourceBlocked -> classifyContinuationFailure. Deliberately NOT
+// merged into NON_RETRYABLE_PREFLIGHT_FAILURE_CODES: that set also feeds
+// PRE_ADAPTER_SETUP_FAILURE_CODES, and widening it would change SUP-15589's
+// three-strike streak, which the D12 note forbids.
+export function isWorkspaceGitScanFailureCode(
+  code: string | null | undefined,
+): boolean {
+  return code != null && WORKSPACE_GIT_SCAN_ERROR_CODE_SET.has(code);
+}
+
 export class WorkspaceGitScanError extends HttpError {
   readonly code: WorkspaceGitScanErrorCode;
 

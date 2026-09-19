@@ -99,6 +99,7 @@ import {
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { DISPATCH_UNLAUNCHED_ERROR_CODE } from "../heartbeat-stop-metadata.js";
 import { isNonRetryablePreflightFailureCode } from "../non-retryable-preflight-failure-codes.js";
+import { isWorkspaceGitScanFailureCode } from "../workspace-git-operation-scheduler.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -3587,7 +3588,13 @@ export function recoveryService(
       input.ownerAgentId != null &&
       input.latestRun?.agentId != null &&
       input.ownerAgentId === input.latestRun.agentId &&
-      isNonRetryablePreflightFailureCode(input.latestRun.errorCode)
+      // Fold 2d: a workspace_git_scan_* failure is a property of the host checkout, not
+      // of the agent's policy, and setup already spent its bounded durable retry budget
+      // on it. Waking the same agent re-runs the same scan. Upstream #11961 deleted this
+      // owner wake outright; the fork keeps it (Fold 2c / D12 + SUP-16538), so the scan
+      // codes join the same-agent suppression instead.
+      (isNonRetryablePreflightFailureCode(input.latestRun.errorCode) ||
+        isWorkspaceGitScanFailureCode(input.latestRun.errorCode))
     );
   }
 
