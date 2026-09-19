@@ -372,6 +372,15 @@ export function isAgentDefaultProjectWorkspacePair(input: {
   return typeof input.projectWorkspaceId === "string" && input.projectWorkspaceId.trim().length > 0;
 }
 
+/**
+ * SUP-16886 (AC5): a pure *predicate* over the stored pair — it reads
+ * `issue.projectWorkspaceId` to decide whether a worktree combo is unrunnable and
+ * never writes the pair back. Because it is a reader, it does NOT need the
+ * write-boundary self-heal that the two writers (the provisioning write-back in
+ * `execution-workspace-provisioning.ts` and the issues PATCH guard in
+ * `routes/issues.ts`) apply via `isAgentDefaultProjectWorkspacePair`; there is
+ * nothing here to mint, refuse, or heal.
+ */
 export function isUnrunnableWorktreeCombo(input: {
   issue: UnrunnableWorktreeIssueRef;
   resolvedMode: ParsedExecutionWorkspaceMode;
