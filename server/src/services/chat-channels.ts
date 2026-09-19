@@ -8646,7 +8646,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 .returning({ id: chatActions.id });
               if (!claimed.length)
                 throw forbidden("Photon prompt has already been resolved");
-              await logActivity(tx as unknown as Db, {
+              await logActivityInTransaction(tx as unknown as Db, {
                 companyId: endpoint.companyId,
                 actorType: "user",
                 actorId: principal.userId!,
@@ -8763,7 +8763,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               .returning({ id: chatActions.id });
             if (!claimed.length)
               throw forbidden("Photon prompt has already been resolved");
-            await logActivity(tx as unknown as Db, {
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: endpoint.companyId,
               actorType: "user",
               actorId: principal.userId!,

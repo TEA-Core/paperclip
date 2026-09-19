@@ -30,7 +30,7 @@ import {
   type AiConnectionLoginIntent,
 } from "@paperclipai/shared";
 import { forbidden, notFound, unprocessable } from "../errors.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 
 /** Same human audience displayed by the existing Connections identity controls. */
@@ -761,7 +761,7 @@ export function aiConnectionService(db: Db) {
               ? eq(adapterAuthSessions.publicSessionId, sessionId)
               : eq(adapterAuthSessions.id, sessionId),
           );
-      await logActivity(tx as unknown as Db, {
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId,
         actorType: "user",
         actorId: userId,

@@ -8,7 +8,7 @@ import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { notFound, unprocessable } from "../errors.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { readVerifiedLocalAiCredential } from "./local-ai-credentials.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 
 const LOCAL_LOGIN_METHOD = "local_subscription";
 const ATTEMPT_DURATION_MS = 30 * 60 * 1000;
@@ -88,7 +88,7 @@ export function localAiLoginService(db: Db) {
         await rm(loginHome(existing.id), { recursive: true, force: true });
         await tx.update(adapterAuthSessions).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
           .where(eq(adapterAuthSessions.id, existing.id));
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId, actorType: "user", actorId: userId, action: "ai_connection.local_login_cancelled",
           entityType: "adapter_auth_session", entityId: existing.id, details: { provider: intent.provider },
         });
@@ -107,7 +107,7 @@ export function localAiLoginService(db: Db) {
           startedByUserId: userId, aiConnection: intent,
           connectionMethod: LOCAL_LOGIN_METHOD, status: "waiting_for_user", expiresAt,
         });
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId, actorType: "user", actorId: userId, action: "ai_connection.local_login_started",
           entityType: "adapter_auth_session", entityId: id, details: { provider: intent.provider },
         });
@@ -193,7 +193,7 @@ export function localAiLoginService(db: Db) {
         await tx.update(adapterAuthSessions).set({
           status: "cancelled", finishedAt: new Date(), updatedAt: new Date(),
         }).where(eq(adapterAuthSessions.id, id));
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId, actorType: "user", actorId: userId, action: "ai_connection.local_login_cancelled",
           entityType: "adapter_auth_session", entityId: id,
           details: { provider: session.aiConnection?.provider },
