@@ -354,6 +354,33 @@ export function suppliesIssueExecutionWorkspaceOverride(input: {
   return Boolean(preference && preference !== "inherit");
 }
 
+/**
+ * SUP-16886: the single source of truth for the forbidden issue-workspace pair —
+ * `executionWorkspacePreference: "agent_default"` combined with a non-null
+ * `projectWorkspaceId`. `agent_default` resolves to the agent home directory and
+ * can never coexist with a project workspace binding; the create boundary
+ * (SUP-16608) normalizes the pair away at write time with `agent_default` winning,
+ * and the issues PATCH boundary and the provisioning write-back (this invariant's
+ * other two writers) must apply the same rule instead of minting or refusing the
+ * pair.
+ */
+export function isAgentDefaultProjectWorkspacePair(input: {
+  executionWorkspacePreference?: string | null;
+  projectWorkspaceId?: string | null;
+}): boolean {
+  if (input.executionWorkspacePreference !== "agent_default") return false;
+  return typeof input.projectWorkspaceId === "string" && input.projectWorkspaceId.trim().length > 0;
+}
+
+/**
+ * SUP-16886 (AC5): a pure *predicate* over the stored pair — it reads
+ * `issue.projectWorkspaceId` to decide whether a worktree combo is unrunnable and
+ * never writes the pair back. Because it is a reader, it does NOT need the
+ * write-boundary self-heal that the two writers (the provisioning write-back in
+ * `execution-workspace-provisioning.ts` and the issues PATCH guard in
+ * `routes/issues.ts`) apply via `isAgentDefaultProjectWorkspacePair`; there is
+ * nothing here to mint, refuse, or heal.
+ */
 export function isUnrunnableWorktreeCombo(input: {
   issue: UnrunnableWorktreeIssueRef;
   resolvedMode: ParsedExecutionWorkspaceMode;

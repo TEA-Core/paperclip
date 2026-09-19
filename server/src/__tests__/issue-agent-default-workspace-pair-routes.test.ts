@@ -167,7 +167,7 @@ describe.sequential("issue PATCH agent_default / projectWorkspaceId pair guard",
     mockLogActivity.mockReset();
   });
 
-  it("rejects a PATCH that would leave executionWorkspacePreference agent_default with a non-null projectWorkspaceId", async () => {
+  it("self-heals a stored pair on an innocent PATCH: agent_default wins and the project workspace is dropped", async () => {
     mockIssueService.getById.mockResolvedValue({
       id: "issue-1",
       companyId: "company-1",
@@ -180,17 +180,27 @@ describe.sequential("issue PATCH agent_default / projectWorkspaceId pair guard",
       createdByUserId: null,
       identifier: "PAPA-999",
     });
+    mockIssueService.update.mockResolvedValue({
+      id: "issue-1",
+      companyId: "company-1",
+      status: "todo",
+      projectWorkspaceId: null,
+      executionWorkspacePreference: "agent_default",
+      identifier: "PAPA-999",
+    });
     const app = createIssueApp();
 
+    // SUP-16886: a card that already stores the pair is patchable. A bare PATCH that
+    // touches neither half of the pair no longer 400s; it heals the pair instead.
     const res = await request(app)
       .patch("/api/issues/issue-1")
       .send({ title: "Touched" });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("executionWorkspacePreference");
-    expect(res.body.error).toContain("projectWorkspaceId");
-    expect(res.body.error).toContain("agent_default");
-    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(res.status).not.toBe(400);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    const updateArgs = mockIssueService.update.mock.calls[0];
+    // agent_default wins: the stored projectWorkspaceId is dropped in the same write.
+    expect(updateArgs[1].projectWorkspaceId).toBeNull();
   });
 
   it("rejects setting projectWorkspaceId on an issue that already prefers agent_default", async () => {
