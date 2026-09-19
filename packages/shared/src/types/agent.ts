@@ -1,3 +1,4 @@
+import type { AiConnectionLoginIntent } from "../ai-connections.js";
 import type {
   AgentAdapterType,
   PauseReason,
@@ -28,7 +29,9 @@ export interface AgentPermissions extends Record<string, unknown> {
   pluginTools?: string[];
 }
 
-export type AgentRuntimeConfig = Record<string, unknown>;
+export type AgentRuntimeConfig = Record<string, unknown> & {
+  aiConnection?: import("../ai-connections.js").AiConnectionBinding;
+};
 
 export type AgentInstructionsBundleMode = "managed" | "external";
 
@@ -203,6 +206,7 @@ export interface CodexAccountBindingClaim {
 // The owner read of a login session. It adds the one-time prompt to the public
 // response. Only the owner principal that started the session reads this shape.
 export interface AdapterAuthSessionOwnerResponse extends AdapterAuthSessionResponse {
+  aiConnection?: AiConnectionLoginIntent;
   prompt: AdapterAuthSessionPrompt | null;
   codexAccountBinding?: CodexAccountBindingClaim | null;
 }
@@ -210,6 +214,7 @@ export interface AdapterAuthSessionOwnerResponse extends AdapterAuthSessionRespo
 // The request that starts a login session for one adapter in one environment.
 // The owner principal comes from the authenticated caller, not from this body.
 export interface StartAdapterAuthSessionRequest {
+  aiConnection?: AiConnectionLoginIntent;
   environmentId: string;
   adapterType: AgentAdapterType;
   ttlSeconds?: number;
@@ -284,6 +289,7 @@ export interface ClaudeSetupTokenSessionResponse {
 // the session reads this shape.
 export interface ClaudeSetupTokenSessionOwnerResponse
   extends ClaudeSetupTokenSessionResponse {
+  aiConnection?: AiConnectionLoginIntent;
   panelMode: AdapterAuthPanelMode;
   prompt: ClaudeSetupTokenSessionPrompt | null;
 }

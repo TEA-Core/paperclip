@@ -16,6 +16,16 @@ describe("shouldAutoCheckoutIssueForWake", () => {
     })).toBe(true);
   });
 
+  it("leaves an idle review issue in review without an actionable wake", () => {
+    expect(shouldAutoCheckoutIssueForWake({
+      contextSnapshot: {},
+      issueStatus: "in_review",
+      issueAssigneeAgentId: "agent-1",
+      isDependencyReady: true,
+      agentId: "agent-1",
+    })).toBe(false);
+  });
+
   it("does not auto-checkout pending execution-review state even if the row status is todo", () => {
     const reviewerAgentId = "11111111-1111-4111-8111-111111111111";
     const coderAgentId = "22222222-2222-4222-8222-222222222222";

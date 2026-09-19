@@ -17,8 +17,13 @@ test("generated Capability inventory has full source coverage", async () => {
     readRows("eval-traceability.yaml"),
   ]);
 
-  assert.equal(capabilities.length, 152);
-  assert.equal(tools.length, 42);
+  // FORK DIVERGENCE (fork-only MCP work-session tools, slice 2d): capabilities follows upstream
+  // (154 -> 156 in this slice, the fork adds none), but the tool map is upstream's 42 plus the
+  // fork's three work-session tools (paperclipOpenWorkSession / paperclipHeartbeatWorkSession /
+  // paperclipCloseWorkSession), so 45. Both numbers are the generator's own output, not a guess:
+  // `node scripts/generate-capability-contract.mjs` reproduces 156 / 45 / 106 / 16 exactly.
+  assert.equal(capabilities.length, 156);
+  assert.equal(tools.length, 45);
   assert.equal(evals.length, 106);
   assert.equal(new Set(evals.map((row) => row.group)).size, 16);
   for (const row of [...capabilities, ...tools, ...evals]) {

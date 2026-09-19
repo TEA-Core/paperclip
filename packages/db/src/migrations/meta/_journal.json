@@ -2010,6 +2010,48 @@
       "when": 1788762043000,
       "tag": "0288_aromatic_moondragon",
       "breakpoints": true
+    },
+    {
+      "idx": 287,
+      "version": "7",
+      "when": 1788762044000,
+      "tag": "0289_agent_chat",
+      "breakpoints": true
+    },
+    {
+      "idx": 288,
+      "version": "7",
+      "when": 1788762045000,
+      "tag": "0290_easy_dragon_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 289,
+      "version": "7",
+      "when": 1788762046000,
+      "tag": "0291_hard_mandroid",
+      "breakpoints": true
+    },
+    {
+      "idx": 290,
+      "version": "7",
+      "when": 1788762047000,
+      "tag": "0292_uneven_lady_deathstrike",
+      "breakpoints": true
+    },
+    {
+      "idx": 291,
+      "version": "7",
+      "when": 1788762048000,
+      "tag": "0293_nappy_colonel_america",
+      "breakpoints": true
+    },
+    {
+      "idx": 292,
+      "version": "7",
+      "when": 1788762049000,
+      "tag": "0294_tired_deathstrike",
+      "breakpoints": true
     }
   ]
 }

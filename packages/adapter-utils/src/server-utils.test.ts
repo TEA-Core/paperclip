@@ -37,6 +37,7 @@ import {
   renderRunDeadlineNotice,
   buildRuntimeToolsEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   isPaperclipExternalChatContractTurn,
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
@@ -432,6 +433,9 @@ describe("runtime connection tool delivery", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
       CONNECTION_INTENT_AGENT_GUIDANCE,
     );
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(CONNECTION_INTENT_AGENT_GUIDANCE);
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).not.toContain("Execution contract:");
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).not.toContain("child issues");
   });
 });
 
@@ -1557,6 +1561,30 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("leaves conversation disposition and accepted-plan handoff to the injected chat policy", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: { id: "chat", workMode: "planning", status: "in_progress" },
+      interactionKind: "request_confirmation",
+      interactionStatus: "accepted",
+      comments: [],
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    };
+    const ordinary = renderPaperclipWakePrompt(payload, { resumedSession: true });
+    expect(ordinary).toContain("Execution contract:");
+    expect(ordinary).toContain("Create child issues from the approved plan");
+    for (const resumedSession of [false, true]) {
+      const chat = renderPaperclipWakePrompt(payload, {
+        resumedSession, conversationMode: true, includeExecutionContract: true,
+      });
+      expect(chat).not.toContain("Execution contract:");
+      expect(chat).not.toContain("clear final disposition");
+      expect(chat).not.toContain("Create child issues");
+      expect(chat).not.toContain("you may create child implementation issues");
+    }
+  });
+
   const ordinaryExternalChatWake = {
     reason: "External chat message received",
     externalChatProvider: " GitHub ",
@@ -4352,6 +4380,13 @@ describe("GitHub credential helper packaging (GH-APP-6 AC4)", () => {
 });
 
 describe("shapePaperclipWorkspaceEnvForExecution", () => {
+  it("maps editable project repositories inside the remote workspace", () => {
+    const result = shapePaperclipWorkspaceEnvForExecution({
+      workspaceCwd: "/host/task", executionCwd: "/sandbox/task", executionTargetIsRemote: true,
+      workspaceHints: [{ workspaceId: "backend", cwd: "/host/task/.paperclip-repositories/backend" }],
+    });
+    expect(result.workspaceHints).toEqual([{ workspaceId: "backend", cwd: "/sandbox/task/.paperclip-repositories/backend" }]);
+  });
   it("rewrites workspace env paths for remote execution", () => {
     const shaped = shapePaperclipWorkspaceEnvForExecution({
       workspaceCwd: "/tmp/workspace",

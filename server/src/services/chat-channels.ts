@@ -1,3 +1,16 @@
+import { takePhotonCompanion } from "./photon/attachments.js";
+import { writePhotonCheckpoint } from "./photon/receiver.js";
+import { PhotonState } from "./photon/state.js";
+import { nativeSha256 } from "./native-runtime/canonical.js";
+import { HEIF_CONTENT_TYPES, photonHeifPreview, validatePhotonImage } from "./photon/media.js";
+import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
+import { PhotonAnswerValidationError, nativePhotonInteraction, publishPhotonPrompt, photonResponseCommand, parsePhotonQuestionAnswer, type PhotonPromptReceipt, type PhotonInteractionBinding, type PhotonDraft } from "./photon/interactions.js";
+import { validateNativeQuestionResponseInput } from "./native-runtime/native-question-bridge.js";
+import type { AskUserQuestionsAnswer, AskUserQuestionsInteraction, IssueThreadInteraction } from "@paperclipai/shared";
+import { PhotonCloudClient, PhotonError, photonFailure, photonSharedIdentity, photonSharedScope } from "./photon/cloud.js";
+import { PhotonChatAdapter, photonThreadId, photonReplyReference } from "./photon/adapter.js";
+import { photonChannelConfigurationSchema, type PhotonChannelConfiguration } from "@paperclipai/shared";
+import type { LiveEvent as PhotonEvent } from "@photon-ai/advanced-imessage";
 import {
   createHash,
   createHmac,
@@ -389,6 +402,7 @@ function publicationSummary(
 }
 
 const PROVIDER_LABELS: Record<ChatProvider, string> = {
+  "imessage-photon": "iMessage Photon",
   agentmail: "AgentMail",
   slack: "Slack",
   github: "GitHub",
@@ -583,6 +597,7 @@ async function inspectSlackCallback(
 }
 
 const CAPABILITIES: Record<ChatProvider, ChatAdapterCapabilities> = {
+  "imessage-photon": { threads: false, directMessages: true, nativeStreaming: false, messageEdits: true, messageDeletes: false, reactions: false, files: true, cards: false, actions: true, modals: false, slashCommands: false, ephemeralMessages: false, proactiveDirectMessages: false },
   agentmail: { threads: true, directMessages: true, nativeStreaming: false, messageEdits: false, messageDeletes: false, reactions: false, files: true, cards: false, actions: false, modals: false, slashCommands: false, ephemeralMessages: false, proactiveDirectMessages: true },
   slack: {
     threads: true,
@@ -676,6 +691,7 @@ const REQUIRED_CREDENTIALS: Record<
   Exclude<ChatProvider, "github">,
   readonly string[]
 > = {
+  "imessage-photon": ["projectSecret"],
   agentmail: [],
   slack: ["botToken", "signingSecret"],
   discord: ["botToken", "applicationId", "guildId"],
@@ -734,6 +750,7 @@ const SUPPORTED_GITHUB_WEBHOOK_EVENTS = new Set<string>([
 ]);
 
 const SUPPLIED_CREDENTIAL_KEYS: Record<ChatProvider, readonly string[]> = {
+  "imessage-photon": ["projectSecret"],
   agentmail: [],
   slack: ["botToken", "signingSecret"],
   github: ["appId", "privateKey"],
@@ -773,6 +790,7 @@ const PUBLICATION_ENDPOINT_CONCURRENCY = 4;
 const CREDENTIAL_MUTATION_LEASE_WAIT_MS = 10_000;
 const CREDENTIAL_MUTATION_LEASE_POLL_MS = 25;
 const DISCORD_GATEWAY_LEASE_KEY = "discord_gateway_runtime";
+function leasedChatProvider(provider: string): boolean { return provider === "discord" || provider === "imessage-photon"; }
 const DISCORD_GATEWAY_LEASE_TTL_MS = 15_000;
 const DISCORD_GATEWAY_LEASE_WAIT_MS = 20_000;
 const DISCORD_GATEWAY_LEASE_POLL_MS = 100;
@@ -807,6 +825,7 @@ type DbOrTransaction = Db | DbTransaction;
 type SlackCallbackSurface = keyof ChatEndpointCallbackSurfaces;
 type SlackCallbackObservation = { url: string; observedAt: string };
 type InternalSetupState = ChatEndpointSetupState & {
+  photonIntakeAfter?: string;
   runtimeGeneration?: number;
   slackCallbackSurfaces?: Partial<
     Record<SlackCallbackSurface, SlackCallbackObservation>
@@ -1475,7 +1494,7 @@ type DiscordGatewayOwnership = {
   context: RuntimeContext;
   endpointId: string;
   expiresAt: Date;
-  leaseKey: typeof DISCORD_GATEWAY_LEASE_KEY;
+  leaseKey: typeof DISCORD_GATEWAY_LEASE_KEY | "photon_receiver_runtime";
   renewTimer: ReturnType<typeof setInterval> | null;
   renewal: Promise<void> | null;
   stopPromise: Promise<void> | null;
@@ -1493,6 +1512,7 @@ function providerResourceType(
 ): string {
   if (surfaceKind === "direct_message") return "direct_message";
   if (provider === "github") return "repository";
+  if (provider === "imessage-photon") return "group_chat";
   if (provider === "discord") return "channel";
   if (provider === "microsoft-teams")
     return surfaceKind === "linear_group" ? "group_chat" : "channel";
@@ -1611,6 +1631,7 @@ function chatSurfaceKind(
   thread: Thread,
 ): ChatSurfaceKind {
   if (thread.isDM) return "direct_message";
+  if (provider === "imessage-photon") return "linear_group";
   if (provider === "telegram") {
     return /^telegram:[^:]+:[^:]+$/.test(thread.id)
       ? "native_thread"
@@ -2600,6 +2621,7 @@ function providerSetupState(
   const webhookUrl = publicBaseUrl ? `${publicBaseUrl}${path}` : null;
   const step = endpoint.status === "active" ? "complete" : endpoint.setup.step;
   switch (endpoint.provider) {
+    case "imessage-photon": return { step, providerUrl: "https://photon.codes/", testStartedAt: endpoint.setup.testStartedAt } as const;
     case "agentmail": return endpoint.setup;
     case "slack": {
       const observations = (endpoint.setup as InternalSetupState)
@@ -3089,7 +3111,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         },
         ["verifying", "active", "attention"],
       );
-      if (!current || current.provider !== "discord") return false;
+      if (!current || !leasedChatProvider(current.provider)) return false;
       const expiresAt = new Date(
         now.getTime() +
           (options.discordGatewayLeaseTtlMs ?? DISCORD_GATEWAY_LEASE_TTL_MS),
@@ -3237,6 +3259,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     context: RuntimeContext,
     waitForOwnership: boolean,
   ): Promise<DiscordGatewayOwnership | null> {
+    const receiverLeaseKey = endpoint.provider === "imessage-photon" ? "photon_receiver_runtime" : DISCORD_GATEWAY_LEASE_KEY;
     const local = discordGatewayOwnerships.get(endpoint.id);
     if (
       local &&
@@ -3266,7 +3289,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         .values({
           companyId: endpoint.companyId,
           endpointId: endpoint.id,
-          leaseKey: DISCORD_GATEWAY_LEASE_KEY,
+          leaseKey: receiverLeaseKey,
           token,
           expiresAt,
         })
@@ -3281,7 +3304,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               and(
                 eq(chatEndpointLeases.companyId, endpoint.companyId),
                 eq(chatEndpointLeases.endpointId, endpoint.id),
-                eq(chatEndpointLeases.leaseKey, DISCORD_GATEWAY_LEASE_KEY),
+                eq(chatEndpointLeases.leaseKey, receiverLeaseKey),
                 lte(chatEndpointLeases.expiresAt, now),
               ),
             )
@@ -3292,7 +3315,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           context,
           endpointId: endpoint.id,
           expiresAt,
-          leaseKey: DISCORD_GATEWAY_LEASE_KEY,
+          leaseKey: receiverLeaseKey,
           renewal: null,
           renewTimer: null,
           stopPromise: null,
@@ -3329,6 +3352,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   }
 
   async function invalidateRuntime(endpointId: string): Promise<boolean> {
+    for (const [deliveryId, live] of liveInboundMessages) {
+      if (live.runtimeContext?.endpointRuntime === runtime.get(endpointId) && live.thread.id.startsWith("imessage-photon:")) liveInboundMessages.delete(deliveryId);
+    }
     runtimeLocalEpochs.set(endpointId, localRuntimeEpoch(endpointId) + 1);
     runtimeVersions.delete(endpointId);
     const discordOwnership = discordGatewayOwnerships.get(endpointId);
@@ -5238,6 +5264,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                     sent = await target.post(payload.fallbackText);
                   }
                 }
+              } else if (claim.endpoint.provider === "imessage-photon") {
+                const adapter = (await runtimeFor(claim.endpoint)).getProviderAdapter();
+                if (!(adapter instanceof PhotonChatAdapter)) throw new Error("Photon runtime unavailable");
+                const receipt = await adapter.publish(payload.threadId, `effect:${action.id}`, projectSafeChatPublicationText(payload.text), {
+                  assertCurrent: async () => { await credentialLease.assertOwned(); },
+                });
+                sent = { id: receipt.id, threadId: payload.threadId };
               } else {
                 sent = await target.post(payload.text);
               }
@@ -5466,7 +5499,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
     const runtimeContext = context as RuntimeContext;
     if (
-      endpoint.provider === "discord" &&
+      leasedChatProvider(endpoint.provider) &&
       runtimeContext.discordGatewayOwned === true &&
       runtimeContext.endpointRuntime !== undefined &&
       !discordGatewayRuntimeIsCurrent(endpointId, runtimeContext)
@@ -5483,7 +5516,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   ) {
     const record = await endpointRecord(endpointId);
     if (
-      record?.endpoint.provider === "discord" &&
+      record && leasedChatProvider(record.endpoint.provider) &&
       !(await ensureDiscordGatewayRuntimeIsCurrent(endpointId, context))
     ) {
       return null;
@@ -5494,7 +5527,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       credentialFingerprint(record.credentialSecretRefs) ===
         context.credentialFingerprint &&
       runtime.get(endpointId) === context.endpointRuntime &&
-      (record.endpoint.provider !== "discord" ||
+      (!leasedChatProvider(record.endpoint.provider) ||
         discordGatewayRuntimeIsCurrent(endpointId, context))
       ? record
       : null;
@@ -5773,6 +5806,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       botUsername: endpoint.botUsername,
       botLabel: endpoint.botDisplayName ?? row.assignedAgentName,
       botAvatarUrl: endpoint.botAvatarUrl,
+      ...(endpoint.provider === "imessage-photon" && endpoint.botExternalId ? { photonAllocation: endpoint.botExternalId.startsWith("photon-project:") ? "shared" as const : "dedicated" as const } : {}),
       allowDirectMessages: endpoint.allowDirectMessages,
       allowGroupChats: endpoint.allowGroupChats,
       allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
@@ -5950,6 +5984,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // enables that surface, even when this process is running against a
         // database created before the column default was hardened.
         allowGroupChats: input.provider !== "microsoft-teams",
+        allowUnlinkedPeople: input.provider !== "imessage-photon",
         capabilities: CAPABILITIES[input.provider],
         setup: {
           step: "provider_setup",
@@ -5996,6 +6031,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         };
         if (input.allowDirectMessages !== undefined)
           values.allowDirectMessages = input.allowDirectMessages;
+        if (input.allowGroupChats && existing.endpoint.provider === "imessage-photon" && (!existing.endpoint.botExternalId || existing.endpoint.botExternalId.startsWith("photon-project:")))
+          throw unprocessable("Photon shared channels support direct messages only; groups require a dedicated channel");
         if (input.allowGroupChats !== undefined)
           values.allowGroupChats = input.allowGroupChats;
         if (input.allowUnlinkedPeople !== undefined)
@@ -6056,6 +6093,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     provider: ChatProvider,
     credentials: Record<string, string>,
   ): Promise<VerifiedProviderIdentity> {
+    if (provider === "imessage-photon") {
+      const inspection = await inspectPhotonCredentials(credentials.projectId, credentials.projectSecret);
+      if (inspection.allocation !== (credentials.allocation ?? "dedicated")) throw unprocessable("Photon allocation changed; inspect the project again");
+      if (inspection.allocation === "shared") {
+        if (!inspection.eligible) throw unprocessable("Photon shared project is unavailable");
+        return { providerAccountId: inspection.projectId, providerAccountLabel: inspection.projectName, botExternalId: photonSharedIdentity(inspection.projectId), botUsername: null, botLabel: `${inspection.projectName} (DM only)` };
+      }
+      const line = inspection.lines.find((candidate) => candidate.lineId === credentials.lineId && candidate.eligible);
+      if (!line || !inspection.eligible) throw unprocessable("Select an eligible dedicated Photon line");
+      return { providerAccountId: inspection.projectId, providerAccountLabel: inspection.projectName, botExternalId: line.phoneNumber, botUsername: line.phoneNumber, botLabel: line.phoneNumber };
+    }
     if (provider === "slack") {
       const response = await fetchImpl("https://slack.com/api/auth.test", {
         method: "POST",
@@ -6280,7 +6328,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return (
       provider === "github" ||
       provider === "discord" ||
-      provider === "microsoft-teams"
+      provider === "microsoft-teams" || provider === "imessage-photon"
     );
   }
 
@@ -6337,7 +6385,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             : eq(chatEndpoints.companyId, endpoint.companyId),
           eq(chatEndpoints.provider, endpoint.provider),
           ne(chatEndpoints.id, endpoint.id),
-          inArray(chatEndpoints.status, [
+          endpoint.provider === "imessage-photon" ? ne(chatEndpoints.status, "archived") : inArray(chatEndpoints.status, [
             "verifying",
             "active",
             "paused",
@@ -6376,6 +6424,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   function isNativeBotIdentityUniqueViolation(error: unknown): boolean {
     return (
+      isUniqueViolation(error, "chat_endpoints_photon_number_uq") ||
       isUniqueViolation(error, "chat_endpoints_live_bot_external_uq") ||
       isUniqueViolation(error, "chat_endpoints_live_discord_bot_external_uq") ||
       isUniqueViolation(
@@ -6413,6 +6462,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const refs: ToolCredentialSecretRef[] = [];
     try {
       for (const [key, value] of Object.entries(credentials)) {
+        if (endpoint.provider === "imessage-photon" && key !== "projectSecret") continue;
         await credentialLease.assertOwned();
         const suffix = randomUUID();
         const secret = await secrets.create(
@@ -6608,7 +6658,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     endpoint: EndpointRow,
   ): Promise<Record<string, string>> {
     const connection = await db
-      .select({ refs: toolConnections.credentialSecretRefs })
+      .select({ refs: toolConnections.credentialSecretRefs, config: toolConnections.config })
       .from(toolConnections)
       .where(
         and(
@@ -6618,7 +6668,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
       .then((rows) => rows[0] ?? null);
     if (!connection) throw notFound("Chat connection not found");
-    return resolveCredentialRefs(endpoint, connection.refs);
+    const values = await resolveCredentialRefs(endpoint, connection.refs);
+    if (endpoint.provider === "imessage-photon") {
+      const configuration = photonChannelConfigurationSchema.parse(connection.config.photon);
+      return { ...values, ...configuration, lineId: configuration.allocation === "shared" ? photonSharedScope(configuration.projectId) : configuration.lineId };
+    }
+    return values;
   }
 
   async function acquireCredentialMutationLease(endpoint: EndpointRow) {
@@ -7453,6 +7508,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     userName: string,
     credentials: Record<string, string>,
   ): ResolvedChatSdkProviderConfig {
+    if (endpoint.provider === "imessage-photon") return {
+      provider: "imessage-photon", userName,
+      intakeAfter: Date.parse(String((endpoint.setup as InternalSetupState).photonIntakeAfter ?? endpoint.setup.testStartedAt ?? endpoint.createdAt.toISOString())),
+      credentials: { allocation: credentials.allocation === "shared" ? "shared" : "dedicated", projectId: credentials.projectId, lineId: credentials.lineId, projectSecret: credentials.projectSecret, phoneNumber: endpoint.botExternalId! },
+    };
     if (endpoint.provider === "slack")
       return {
         provider: "slack",
@@ -7699,7 +7759,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       if (
         current &&
         runtimeVersions.get(endpoint.id) === context.version &&
-        (record.endpoint.provider !== "discord" ||
+        (!leasedChatProvider(record.endpoint.provider) ||
           optionsForRuntime.requireDiscordOwnership !== true ||
           currentOwnsDiscordGateway)
       )
@@ -7753,7 +7813,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       };
       const promise = (async () => {
         const discordOwnership =
-          record.endpoint.provider === "discord"
+          leasedChatProvider(record.endpoint.provider)
             ? await acquireDiscordGatewayOwnership(
                 record.endpoint,
                 context,
@@ -7761,7 +7821,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               )
             : null;
         if (
-          record.endpoint.provider === "discord" &&
+          leasedChatProvider(record.endpoint.provider) &&
           !discordOwnership &&
           optionsForRuntime.requireDiscordOwnership === true
         ) {
@@ -7806,6 +7866,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             enableDiscordGateway: discordOwnership !== null,
             callbacks: {
               onMessage: (event) => handleSdkMessage(event, context),
+              onPhotonAssertOwned: async (activeThreadId) => {
+                if (!(await runtimeCallbackRecord(endpoint.id, context, ["verifying", "active", "attention"]))) throw new Error("Photon receiver ownership changed");
+                if (activeThreadId) {
+                  const working = await db.select({ id: heartbeatRuns.id }).from(chatConversations).innerJoin(heartbeatRuns, and(
+                    eq(heartbeatRuns.companyId, chatConversations.companyId), eq(heartbeatRuns.agentId, record.endpoint.assignedAgentId),
+                    eq(sql<string>`${heartbeatRuns.contextSnapshot}->>'issueId'`, sql<string>`${chatConversations.issueId}::text`), inArray(heartbeatRuns.status, ["queued", "running"]),
+                  )).where(and(eq(chatConversations.companyId, record.endpoint.companyId), eq(chatConversations.endpointId, endpoint.id), eq(chatConversations.externalThreadId, activeThreadId), inArray(chatConversations.state, ["active", "waiting"]))).limit(1);
+                  if (!working.length) throw new Error("Photon conversation has no active agent work");
+                }
+                await db.transaction(async (tx) => {
+                  const current = await runtimeCallbackEndpoint(tx, endpoint.id, context, ["attention"]);
+                  if (!current) return;
+                  const connection = await tx.select().from(toolConnections).where(eq(toolConnections.id, current.connectionId)).then((rows) => rows[0]);
+                  if (!connection?.enabled) throw new Error("Photon endpoint requires operator recovery");
+                  await tx.update(chatEndpoints).set({ status: current.setup.step === "complete" ? "active" : "verifying", healthMessage: "Photon receiver connected", lastError: null, updatedAt: new Date() }).where(eq(chatEndpoints.id, endpoint.id));
+                });
+              },
+              onPhotonCheckpoint: (sequence) => db.transaction(async (tx) => {
+                if (!(await runtimeCallbackEndpoint(tx, endpoint.id, context, ["verifying", "active"]))) throw new Error("Photon receiver is no longer current");
+                if ((await renewDiscordGatewayOwnershipForMessageAdmission(tx, endpoint.id, context)).kind !== "owned") throw new Error("Photon receiver lease was replaced");
+                await writePhotonCheckpoint(new PhotonState({ companyId: record.endpoint.companyId, endpointId: endpoint.id }, createChatSdkStatePersistence(tx as unknown as Db)), credentials.lineId, sequence);
+              }),
+              onPhotonEvent: (event) => handlePhotonEvent(endpoint.id, event, context),
+              onPhotonFailure: (error) => handlePhotonFailure(endpoint.id, error, context),
               onDiscordRootMentionAdmission:
                 record.endpoint.provider === "discord"
                   ? (event) =>
@@ -7863,7 +7947,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           const stillRegistered = runtime.get(endpoint.id) === instance;
           const stillCurrent =
             latest !== null &&
-            latest.endpoint.status === record.endpoint.status &&
+            (latest.endpoint.status === record.endpoint.status || record.endpoint.provider === "imessage-photon" && record.endpoint.status === "attention" && ["active", "verifying"].includes(latest.endpoint.status)) &&
             runtimeContextForRecord(latest).version === context.version;
           if (!stillRegistered || !stillCurrent) {
             if (stillRegistered) {
@@ -7928,7 +8012,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
       .where(
         and(
-          eq(chatEndpoints.provider, "discord"),
+          inArray(chatEndpoints.provider, ["discord", "imessage-photon"]),
           inArray(chatEndpoints.status, ["verifying", "active", "attention"]),
           eq(toolConnections.status, "active"),
           eq(toolConnections.enabled, true),
@@ -8060,6 +8144,881 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     };
   }
 
+  async function inspectPhotonCredentials(projectId: string, projectSecret: string) {
+    try {
+      return await new PhotonCloudClient(fetchImpl).inspect(projectId, projectSecret);
+    } catch (error) {
+      if (!(error instanceof PhotonError)) throw error;
+      // Only credentials/allocation failures mean the setup input needs repair.
+      // Preserve safe provider messages while distinguishing outages and bad
+      // upstream responses from validation errors. Never return response bodies.
+      const status = error.code === "credentials" || error.code === "line_unavailable"
+        ? 422
+        : error.code === "quota"
+          ? 429
+          : error.code === "network"
+            ? 503
+            : 502;
+      throw new HttpError(status, error.message, {
+        code: `photon_${error.code}`,
+      });
+    }
+  }
+
+  async function inspectPhoton(
+    endpointId: string,
+    input: { projectId: string; projectSecret: string },
+  ) {
+    const record = await endpointRecord(endpointId);
+    if (!record || record.endpoint.provider !== "imessage-photon")
+      throw notFound("iMessage Photon endpoint not found");
+    const inspection = structuredClone(await inspectPhotonCredentials(
+      input.projectId,
+      input.projectSecret,
+    ));
+    const reserved = await db
+      .select({ number: chatEndpoints.botExternalId })
+      .from(chatEndpoints)
+      .where(
+        and(
+          eq(chatEndpoints.provider, "imessage-photon"),
+          ne(chatEndpoints.id, endpointId),
+          ne(chatEndpoints.status, "archived"),
+        ),
+      );
+    for (const line of inspection.lines) {
+      if (reserved.some((row) => row.number === line.phoneNumber)) {
+        line.eligible = false;
+        line.unavailableReason =
+          "This number already belongs to another channel";
+      }
+    }
+    inspection.eligible = inspection.allocation === "shared" ? inspection.eligible && !reserved.some((row) => row.number === photonSharedIdentity(inspection.projectId)) : inspection.lines.some((line) => line.eligible);
+    return inspection;
+  }
+
+  async function handlePhotonFailure(
+    endpointId: string,
+    error: unknown,
+    context: RuntimeContext,
+  ) {
+    if (error instanceof PhotonError && error.code === "attachment_not_ready")
+      return;
+    error = photonFailure(error);
+    const fatal =
+      error instanceof PhotonError &&
+      [
+        "credentials",
+        "line_unavailable",
+        "history_gap",
+        "invalid_response",
+      ].includes(error.code);
+    const message =
+      error instanceof PhotonError
+        ? error.message
+        : "Photon connection interrupted; reconnecting";
+    await db.transaction(async (tx) => {
+      const endpoint = await runtimeCallbackEndpoint(tx, endpointId, context, [
+        "verifying",
+        "active",
+        "attention",
+      ]);
+      if (!endpoint) return;
+      await tx
+        .update(chatEndpoints)
+        .set({
+          status: "attention",
+          healthMessage: message,
+          lastError: message,
+          updatedAt: new Date(),
+        })
+        .where(eq(chatEndpoints.id, endpointId));
+      if (fatal)
+        await tx
+          .update(toolConnections)
+          .set({
+            enabled: false,
+            healthStatus: "error",
+            healthMessage: message,
+          })
+          .where(eq(toolConnections.id, endpoint.connectionId));
+    });
+    // Retirement is queued outside the receiver callback to avoid self-joining.
+    void invalidateRuntime(endpointId).catch(() => undefined);
+  }
+
+  async function processPhotonResponse(
+    endpoint: EndpointRow,
+    event: PhotonEvent,
+    threadId: string,
+    adapter: PhotonChatAdapter,
+    context: RuntimeContext,
+  ): Promise<boolean> {
+    const command =
+      event.type === "message.received"
+        ? photonResponseCommand(event.message.content.text ?? "")
+        : null;
+    const replyGuid =
+      event.type === "message.received" ? event.message.replyTargetGuid : null;
+    const prompt =
+      event.type === "poll.changed"
+        ? await adapter.state.read<PhotonPromptReceipt>(
+            `poll-message:${event.pollMessageGuid}`,
+          )
+        : replyGuid
+          ? ((await adapter.state.read<PhotonPromptReceipt>(
+              `prompt-message:${replyGuid}`,
+            )) ??
+            (await adapter.state.read<PhotonPromptReceipt>(
+              `poll-message:${replyGuid}`,
+            )))
+          : null;
+    const reference = command?.reference ?? prompt?.reference;
+    if (!reference) {
+      if (
+        !event.isFromMe &&
+        (replyGuid ||
+          (event.type === "poll.changed" &&
+            (event.delta.type === "voted" || event.delta.type === "unvoted")))
+      ) {
+        // A vote can beat the local poll-binding write. Keep it behind the
+        // checkpoint while a publication in this chat is in flight.
+        const pending = await db
+          .select({ id: chatPublications.id })
+          .from(chatPublications)
+          .innerJoin(
+            chatConversations,
+            eq(chatConversations.id, chatPublications.conversationId),
+          )
+          .where(
+            and(
+              eq(chatPublications.endpointId, endpoint.id),
+              eq(chatConversations.externalThreadId, threadId),
+              inArray(chatPublications.state, [
+                "pending",
+                "retry",
+                "streaming",
+                "delivery_unknown",
+              ]),
+              isNotNull(sql`${chatPublications.payload}->>'interactionId'`),
+            ),
+          )
+          .limit(1);
+        if (pending.length)
+          throw new PhotonError(
+            "attachment_not_ready",
+            "Waiting for Photon poll binding",
+          );
+      }
+      return (
+        event.type === "poll.changed" ||
+        (event.type === "message.received" &&
+          /^\/(answer|submit)\b/i.test(event.message.content.text ?? ""))
+      );
+    }
+    const action = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, endpoint.companyId),
+          eq(chatActions.endpointId, endpoint.id),
+          eq(chatActions.kind, "photon_interaction"),
+          eq(chatActions.providerActionId, `photon:${reference}`),
+        ),
+      )
+      .then((rows) => rows[0]);
+    if (!action || action.status !== "issued" || !action.conversationId)
+      return true;
+    const binding = action.payload as unknown as PhotonInteractionBinding;
+    if (
+      binding.version !== 1 ||
+      binding.reference !== reference ||
+      !Number.isFinite(Date.parse(binding.expiresAt)) ||
+      Date.parse(binding.expiresAt) <= Date.now()
+    )
+      return true;
+    const conversation = await db
+      .select()
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          eq(chatConversations.id, action.conversationId),
+        ),
+      )
+      .then((rows) => rows[0]);
+    if (
+      !conversation ||
+      !["active", "waiting"].includes(conversation.state) ||
+      conversation.sessionGeneration !== binding.sessionGeneration ||
+      conversation.externalThreadId !== threadId
+    )
+      return true;
+    const publication = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, endpoint.companyId),
+          eq(chatPublications.endpointId, endpoint.id),
+          eq(chatPublications.id, binding.publicationId),
+          eq(chatPublications.conversationId, conversation.id),
+        ),
+      )
+      .then((rows) => rows[0]);
+    if (
+      !publication ||
+      publication.payload.interactionId !== binding.interactionId ||
+      new Date(event.occurredAt).getTime() < action.createdAt.getTime()
+    )
+      return true;
+    if (
+      ["pending", "retry", "streaming", "delivery_unknown"].includes(
+        publication.state,
+      )
+    )
+      throw new PhotonError(
+        "attachment_not_ready",
+        "Waiting for Photon prompt publication",
+      );
+    if (publication.state !== "published") return true;
+    const interaction = (
+      await issueThreadInteractionService(db).listForIssue(conversation.issueId)
+    ).find((candidate) => candidate.id === binding.interactionId);
+    if (
+      !interaction ||
+      interaction.status !== "pending" ||
+      interaction.companyId !== endpoint.companyId ||
+      interaction.createdByAgentId !== endpoint.assignedAgentId ||
+      !nativePhotonInteraction(interaction)
+    )
+      return true;
+    const actor =
+      event.type === "message.received" ? event.message.sender : event.actor;
+    if (event.isFromMe || !actor?.address || actor.service !== "iMessage")
+      return true;
+    const chat = await adapter.chatInfo(threadId);
+    if (
+      chat.isArchived ||
+      !chat.participants.some(
+        (person) =>
+          person.address === actor.address && person.service === actor.service,
+      )
+    )
+      return true;
+    const principal = await ensurePrincipal(
+      endpoint,
+      {
+        userId: `${actor.service}:${actor.address}`,
+        userName: actor.address,
+        fullName: actor.address,
+        isMe: false,
+        isBot: false,
+      },
+      event,
+    );
+    if (
+      !principal.userId ||
+      principal.linkedDenied ||
+      principal.principal.kind !== "user" ||
+      principal.principal.isBot
+    )
+      return true;
+    const assertCurrent = async () =>
+      db.transaction((tx) =>
+        requireCurrentExternalActionAuthorization(tx, {
+          conversationId: conversation.id,
+          endpointId: endpoint.id,
+          expectedUserId: principal.userId!,
+          principalId: principal.principal.id,
+          runtimeContext: context,
+        }),
+      );
+    try {
+      await assertCurrent();
+    } catch (error) {
+      if (isExternalActionAuthorizationChange(error)) return true;
+      throw error;
+    }
+    const draftKey = `draft:${reference}:${principal.principal.id}:${principal.userId}`;
+    let draft = (await adapter.state.read<PhotonDraft>(draftKey)) ?? {
+      schema: 1,
+      interactionId: interaction.id,
+      principalId: principal.principal.id,
+      userId: principal.userId,
+      answers: [],
+      lastSequence: 0,
+    };
+    if (draft.lastSequence > event.sequence) return true;
+    const questionIndex = command?.questionIndex ?? prompt?.questionIndex ?? 0;
+    let answerValue =
+      command?.value ??
+      (event.type === "message.received"
+        ? (event.message.content.text ?? "")
+        : "");
+    let pollChoice: string | undefined;
+    if (event.type === "poll.changed") {
+      if (!prompt || event.pollMessageGuid !== prompt.pollMessageGuid)
+        return true;
+      if (event.delta.type !== "voted" && event.delta.type !== "unvoted")
+        return true;
+      pollChoice = prompt.options[event.delta.optionIdentifier];
+      if (!pollChoice) return true;
+      if (event.delta.type === "unvoted") {
+        const questionId =
+          interaction.kind === "ask_user_questions"
+            ? interaction.payload.questions[questionIndex]?.id
+            : null;
+        await adapter.state.update<PhotonDraft>(draftKey, () => ({
+          ...draft,
+          answers: draft.answers.filter(
+            (answer) =>
+              answer.questionId !== questionId ||
+              !answer.optionIds.includes(pollChoice!),
+          ),
+          decision: draft.decision === pollChoice ? undefined : draft.decision,
+          lastSequence: event.sequence,
+        }));
+        return true;
+      }
+    }
+    const enqueueResponse = async (key: string, text: string) => {
+      await assertCurrent();
+      await db.transaction(async (tx) => {
+        await tx
+          .insert(chatActions)
+          .values({
+            companyId: endpoint.companyId,
+            endpointId: endpoint.id,
+            conversationId: conversation.id,
+            kind: "photon_response_notice",
+            providerActionId: `photon-notice:${key}`,
+            payload: {
+              reference,
+              questionIndex,
+              publicationId: binding.publicationId,
+            },
+            status: "processed",
+          })
+          .onConflictDoNothing();
+        await tx
+          .insert(chatPublications)
+          .values({
+            companyId: endpoint.companyId,
+            endpointId: endpoint.id,
+            conversationId: conversation.id,
+            issueId: conversation.issueId,
+            idempotencyKey: key,
+            payload: {
+              ...publication.payload,
+              card: undefined,
+              text: projectSafeChatPublicationText(text),
+            },
+            state: "pending",
+          })
+          .onConflictDoNothing();
+      });
+      scheduleMessageProcessing(() =>
+        processPendingPublications().then(() => undefined),
+      );
+    };
+    const notice = (text: string) =>
+      enqueueResponse(`photon-response:${reference}:${event.sequence}`, text);
+    try {
+      if (interaction.kind === "ask_user_questions") {
+        if (command?.command !== "submit") {
+          let answer: AskUserQuestionsAnswer;
+          if (pollChoice) {
+            const question = interaction.payload.questions[questionIndex];
+            if (
+              !question ||
+              !question.options.some((option) => option.id === pollChoice)
+            )
+              return true;
+            answer = { questionId: question.id, optionIds: [pollChoice] };
+          } else
+            answer = parsePhotonQuestionAnswer(
+              interaction,
+              questionIndex,
+              answerValue,
+            );
+          draft = {
+            ...draft,
+            answers: [
+              ...draft.answers.filter(
+                (entry) => entry.questionId !== answer.questionId,
+              ),
+              answer,
+            ],
+            lastSequence: event.sequence,
+          };
+        }
+        const answers = interaction.payload.questions.flatMap((question) =>
+          draft.answers.filter((answer) => answer.questionId === question.id),
+        );
+        if (
+          interaction.payload.questions.length > 1 &&
+          command?.command !== "submit"
+        ) {
+          await adapter.state.update<PhotonDraft>(draftKey, () => draft);
+          const next = interaction.payload.questions.findIndex(
+            (question) =>
+              !answers.some((answer) => answer.questionId === question.id),
+          );
+          if (next >= 0)
+            await enqueueResponse(
+              `photon-question:${reference}:${next}`,
+              "Input needed",
+            );
+          else
+            await notice(
+              `Your answers are saved. Send /submit ${reference} to submit them.`,
+            );
+          return true;
+        }
+        validateNativeQuestionResponseInput(interaction, { answers });
+        // Canonical service rechecks required fields, options, audience, and
+        // pending -> answered atomically with the response-delivery receipt.
+        const issue = await db
+          .select()
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, endpoint.companyId),
+              eq(issues.id, conversation.issueId),
+            ),
+          )
+          .then((rows) => rows[0]);
+        if (!issue) return true;
+        const answered = await issueThreadInteractionService(
+          db,
+        ).answerQuestions(
+          issue,
+          interaction.id,
+          { answers },
+          { userId: principal.userId },
+          {
+            beforeResolveInTransaction: async (tx) => {
+              await requireCurrentExternalActionAuthorization(tx, {
+                conversationId: conversation.id,
+                endpointId: endpoint.id,
+                expectedUserId: principal.userId!,
+                principalId: principal.principal.id,
+                runtimeContext: context,
+              });
+              const current = await tx
+                .select()
+                .from(chatConversations)
+                .where(eq(chatConversations.id, conversation.id))
+                .then((rows) => rows[0]);
+              if (
+                current?.sessionGeneration !== binding.sessionGeneration ||
+                Date.parse(binding.expiresAt) <= Date.now()
+              )
+                throw forbidden(
+                  "Photon prompt expired or its task generation changed",
+                );
+            },
+            afterResolveInTransaction: async (tx, resolved) => {
+              const claimed = await tx
+                .update(chatActions)
+                .set({
+                  principalId: principal.principal.id,
+                  status: "processed",
+                  result: {
+                    code: "photon_question_answered",
+                    interactionId: resolved.id,
+                    interactionStatus: resolved.status,
+                    answersSha256: nativeSha256(
+                      (resolved as AskUserQuestionsInteraction).result?.answers,
+                    ),
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(chatActions.id, action.id),
+                    eq(chatActions.status, "issued"),
+                  ),
+                )
+                .returning({ id: chatActions.id });
+              if (!claimed.length)
+                throw forbidden("Photon prompt has already been resolved");
+              await logActivity(tx as unknown as Db, {
+                companyId: endpoint.companyId,
+                actorType: "user",
+                actorId: principal.userId!,
+                action: "issue.thread_interaction_answered",
+                entityType: "issue",
+                entityId: issue.id,
+                details: {
+                  source: "external_chat",
+                  provider: endpoint.provider,
+                  endpointId: endpoint.id,
+                  conversationId: conversation.id,
+                  interactionId: resolved.id,
+                },
+              });
+            },
+          },
+        );
+        scheduleMessageProcessing(async () => {
+          await questionResponses.deliver(answered.id);
+          await processPendingPublications();
+        });
+      } else {
+        if (command?.command === "submit") return true;
+        const matched = /^(accept|reject|1|2)(?:\s+([\s\S]+))?$/i.exec(
+          answerValue.trim(),
+        );
+        const decision =
+          pollChoice === "accept" || pollChoice === "reject"
+            ? pollChoice
+            : matched
+              ? /^(accept|1)$/i.test(matched[1])
+                ? "accept"
+                : "reject"
+              : draft.decision;
+        if (!decision)
+          throw new PhotonAnswerValidationError(
+            `Send /answer ${reference} Accept or /answer ${reference} Reject <reason>.`,
+          );
+        const reason =
+          matched?.[2]?.trim() ??
+          (draft.decision === "reject" && !pollChoice
+            ? answerValue.trim()
+            : "");
+        if (
+          decision === "reject" &&
+          interaction.payload.rejectRequiresReason &&
+          !reason
+        ) {
+          await adapter.state.update<PhotonDraft>(draftKey, () => ({
+            ...draft,
+            decision,
+            lastSequence: event.sequence,
+          }));
+          await notice(
+            `Give a rejection reason with /answer ${reference} Reject <reason>.`,
+          );
+          return true;
+        }
+        const issue = await db
+          .select()
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, endpoint.companyId),
+              eq(issues.id, conversation.issueId),
+            ),
+          )
+          .then((rows) => rows[0]);
+        if (!issue) return true;
+        const mutation = {
+          beforeResolveInTransaction: async (tx: DbTransaction) => {
+            await requireCurrentExternalActionAuthorization(tx, {
+              conversationId: conversation.id,
+              endpointId: endpoint.id,
+              expectedUserId: principal.userId!,
+              principalId: principal.principal.id,
+              runtimeContext: context,
+            });
+            const current = await tx
+              .select()
+              .from(chatConversations)
+              .where(eq(chatConversations.id, conversation.id))
+              .then((rows) => rows[0]);
+            if (
+              current?.sessionGeneration !== binding.sessionGeneration ||
+              Date.parse(binding.expiresAt) <= Date.now()
+            )
+              throw forbidden(
+                "Photon prompt expired or its task generation changed",
+              );
+          },
+          afterResolveInTransaction: async (
+            tx: DbTransaction,
+            resolved: IssueThreadInteraction,
+          ) => {
+            const claimed = await tx
+              .update(chatActions)
+              .set({
+                principalId: principal.principal.id,
+                status: "processed",
+                result: {
+                  code: "photon_confirmation_resolved",
+                  interactionId: resolved.id,
+                  interactionStatus: resolved.status,
+                },
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(chatActions.id, action.id),
+                  eq(chatActions.status, "issued"),
+                ),
+              )
+              .returning({ id: chatActions.id });
+            if (!claimed.length)
+              throw forbidden("Photon prompt has already been resolved");
+            await logActivity(tx as unknown as Db, {
+              companyId: endpoint.companyId,
+              actorType: "user",
+              actorId: principal.userId!,
+              action:
+                decision === "accept"
+                  ? "issue.thread_interaction_accepted"
+                  : "issue.thread_interaction_rejected",
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                source: "external_chat",
+                provider: endpoint.provider,
+                endpointId: endpoint.id,
+                conversationId: conversation.id,
+                interactionId: resolved.id,
+              },
+            });
+          },
+        };
+        if (decision === "accept")
+          await issueThreadInteractionService(db).acceptInteraction(
+            issue,
+            interaction.id,
+            {},
+            { userId: principal.userId },
+            mutation,
+          );
+        else
+          await issueThreadInteractionService(db).rejectInteraction(
+            issue,
+            interaction.id,
+            { reason },
+            { userId: principal.userId },
+            mutation,
+          );
+        scheduleMessageProcessing(async () => {
+          await processPendingPublications();
+        });
+      }
+    } catch (error) {
+      if (error instanceof PhotonError) throw error;
+      if (isExternalActionAuthorizationChange(error)) return true;
+      if (error instanceof HttpError && [403, 404, 409].includes(error.status))
+        return true;
+      // Only validator errors become correction copy. Infrastructure errors
+      // leave the checkpoint unchanged and retry through durable recovery.
+      if (
+        (error instanceof HttpError && error.status === 422) ||
+        error instanceof PhotonAnswerValidationError
+      ) {
+        const missingIndex = interaction.kind === "ask_user_questions" && command?.command === "submit"
+          ? interaction.payload.questions.findIndex((question) =>
+              question.required !== false && !draft.answers.some((answer) => answer.questionId === question.id))
+          : -1;
+        await notice(
+          `${redactError(error)} Send /answer ${reference}.${(missingIndex >= 0 ? missingIndex : questionIndex) + 1} <answer> to correct it.`,
+        );
+        return true;
+      }
+      throw error;
+    }
+    return true;
+  }
+
+  async function handlePhotonEvent(
+    endpointId: string,
+    event: PhotonEvent,
+    context: RuntimeContext,
+  ) {
+    const record = await runtimeCallbackRecord(endpointId, context, [
+      "verifying",
+      "active",
+      "attention",
+    ]);
+    if (!record)
+      throw new Error("Photon receiver no longer owns this endpoint");
+    const adapter = context.endpointRuntime!.getProviderAdapter();
+    if (!(adapter instanceof PhotonChatAdapter))
+      throw new Error("Photon adapter unavailable");
+    if (adapter.authentication.identity.allocation === "shared" && event.type === "group.changed") return;
+    if (
+      event.type === "group.changed" &&
+      (event.change.type === "participantRemoved" ||
+        event.change.type === "participantLeft") &&
+      event.change.participant.address === record.endpoint.botExternalId
+    ) {
+      const removedThreadId = photonThreadId({
+        lineId: adapter.authentication.identity.lineId,
+        chatGuid: event.chatGuid,
+        isGroup: true,
+      });
+      await db.transaction(async (tx) => {
+        if (
+          !(await runtimeCallbackEndpoint(tx, endpointId, context, [
+            "verifying",
+            "active",
+          ]))
+        )
+          throw new Error("Photon receiver is no longer current");
+        if (
+          (
+            await renewDiscordGatewayOwnershipForMessageAdmission(
+              tx,
+              endpointId,
+              context,
+            )
+          ).kind !== "owned"
+        )
+          throw new Error("Photon receiver lease was replaced");
+        // Removal can be the first retained event after activation. Preserve a
+        // tombstone even when the group has never been discovered locally.
+        await tx
+          .insert(chatEndpointResources)
+          .values({
+            companyId: record.endpoint.companyId,
+            endpointId,
+            providerResourceId: removedThreadId,
+            type: "group_chat",
+            label: "Unavailable iMessage group",
+            enabled: false,
+            availability: "unavailable",
+            metadata: { photonRemoved: true },
+          })
+          .onConflictDoUpdate({
+            target: [
+              chatEndpointResources.endpointId,
+              chatEndpointResources.type,
+              chatEndpointResources.providerResourceId,
+            ],
+            set: {
+              availability: "unavailable",
+              metadata: sql`jsonb_set(${chatEndpointResources.metadata}, '{photonRemoved}', 'true'::jsonb)`,
+              updatedAt: new Date(),
+            },
+          });
+      });
+      await adapter.endTyping(removedThreadId);
+      return;
+    }
+    const groupIdentity = photonThreadId({ lineId: adapter.authentication.identity.lineId, chatGuid: event.chatGuid, isGroup: true });
+    const removedGroup = await db.select({ metadata: chatEndpointResources.metadata }).from(chatEndpointResources).where(and(eq(chatEndpointResources.companyId, record.endpoint.companyId), eq(chatEndpointResources.endpointId, endpointId), eq(chatEndpointResources.providerResourceId, groupIdentity))).limit(1).then((rows) => rows[0]);
+    const readded = event.type === "group.changed" && event.change.type === "participantAdded" && event.change.participant.address === record.endpoint.botExternalId;
+    // Late events from a removed chat must still advance recovery without a
+    // now-forbidden chat lookup holding every other conversation behind them.
+    if (removedGroup?.metadata.photonRemoved === true && !readded) return;
+    const chat = await adapter.client.chats
+      .get(event.chatGuid)
+      .catch((error) => {
+        throw photonFailure(error);
+      });
+    if (chat.guid !== event.chatGuid || chat.service !== "iMessage" || (chat.isGroup && adapter.authentication.identity.allocation === "shared")) return;
+    const threadId = photonThreadId({
+      lineId: adapter.authentication.identity.lineId,
+      chatGuid: chat.guid,
+      isGroup: chat.isGroup,
+    });
+    const removed =
+      event.type === "group.changed" &&
+      (event.change.type === "participantRemoved" ||
+        event.change.type === "participantLeft") &&
+      event.change.participant.address === record.endpoint.botExternalId;
+    const available = await db.transaction(async (tx) => {
+      if (
+        !(await runtimeCallbackEndpoint(tx, endpointId, context, [
+          "verifying",
+          "active",
+        ]))
+      )
+        throw new Error("Photon receiver is no longer current");
+      const ownership = await renewDiscordGatewayOwnershipForMessageAdmission(
+        tx,
+        endpointId,
+        context,
+      );
+      if (ownership.kind !== "owned")
+        throw new Error("Photon receiver lease was replaced");
+      const existing = await tx
+        .select()
+        .from(chatEndpointResources)
+        .where(
+          and(
+            eq(chatEndpointResources.endpointId, endpointId),
+            eq(chatEndpointResources.providerResourceId, threadId),
+            eq(
+              chatEndpointResources.type,
+              chat.isGroup ? "group_chat" : "direct_message",
+            ),
+          ),
+        )
+        .then((rows) => rows[0]);
+      const added =
+        event.type === "group.changed" &&
+        event.change.type === "participantAdded" &&
+        event.change.participant.address === record.endpoint.botExternalId;
+      const stillRemoved =
+        removed || (existing?.metadata.photonRemoved === true && !added);
+      const availability =
+        stillRemoved || chat.isArchived ? "unavailable" : "available";
+      const metadata = {
+        photonRemoved: stillRemoved,
+        participants: chat.participants
+          .slice(0, 256)
+          .map((p) => ({ address: p.address, service: p.service })),
+      };
+      const label = (
+        chat.displayName || chat.participants.map((p) => p.address).join(", ")
+      ).slice(0, 512);
+      await tx
+        .insert(chatEndpointResources)
+        .values({
+          companyId: record.endpoint.companyId,
+          endpointId,
+          providerResourceId: threadId,
+          type: chat.isGroup ? "group_chat" : "direct_message",
+          label,
+          enabled: !chat.isGroup,
+          availability,
+          metadata,
+        })
+        .onConflictDoUpdate({
+          target: [
+            chatEndpointResources.endpointId,
+            chatEndpointResources.type,
+            chatEndpointResources.providerResourceId,
+          ],
+          set: { label, availability, metadata, updatedAt: new Date() },
+        });
+      return availability === "available";
+    });
+    if (!available) return;
+    if (
+      !event.isFromMe &&
+      (await processPhotonResponse(
+        record.endpoint,
+        event,
+        threadId,
+        adapter,
+        context,
+      ))
+    )
+      return;
+    if (event.type === "message.received" && !event.isFromMe) {
+      await handleSdkMessage(
+        {
+          provider: "imessage-photon",
+          endpointId,
+          thread: context.endpointRuntime!.thread(threadId),
+          message: adapter.normalize(event.message, chat),
+          trigger: chat.isGroup ? "unaddressed_message" : "direct_message",
+        },
+        context,
+      );
+    }
+  }
+
   async function configure(
     endpointId: string,
     input: ConfigureChatEndpointInput,
@@ -8068,6 +9027,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const record = await endpointRecord(endpointId);
     if (!record) throw notFound("Chat endpoint not found");
     if (record.endpoint.provider === "agentmail") throw badRequest("Use the email inbox API for AgentMail");
+    if (input.photon && record.endpoint.provider !== "imessage-photon") throw badRequest("Photon configuration is only valid for iMessage Photon");
     const suppliedCredentialKeys = Object.keys(input.credentials ?? {});
     if (suppliedCredentialKeys.length > 0) {
       const credentialAction =
@@ -8137,7 +9097,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             status: "paused",
             setup: {
               ...current.setup,
-              runtimeGeneration: runtimeGeneration(current.setup) + 1,
+              runtimeGeneration: runtimeGeneration(current.setup) + (endpoint.provider === "imessage-photon" ? 0 : 1),
             } as InternalSetupState,
             updatedAt: pausedAt,
           })
@@ -8157,6 +9117,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           })
           .where(
             and(
+              endpoint.provider === "imessage-photon" ? sql`false` : undefined,
               eq(chatDeliveries.endpointId, endpoint.id),
               inArray(chatDeliveries.state, ["received", "retry"]),
             ),
@@ -8258,6 +9219,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             })
             .where(
               and(
+                endpoint.provider === "imessage-photon" ? sql`false` : undefined,
                 eq(chatDeliveries.endpointId, endpoint.id),
                 inArray(chatDeliveries.state, ["received", "retry"]),
               ),
@@ -8273,7 +9235,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               lastError: null,
               setup: {
                 ...current.setup,
-                runtimeGeneration: runtimeGeneration(current.setup) + 1,
+                ...(endpoint.provider === "imessage-photon" ? { photonIntakeAfter: resumedAt.toISOString() } : {}),
+                runtimeGeneration: runtimeGeneration(current.setup) + (endpoint.provider === "imessage-photon" ? 0 : 1),
               } as InternalSetupState,
               updatedAt: resumedAt,
             })
@@ -8297,8 +9260,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (activatedEndpoint.provider === "discord")
           await reconcileDiscordCommands(endpoint.id, credentialLease, true);
         await runtimeFor(activatedEndpoint, {
-          requireDiscordOwnership: activatedEndpoint.provider === "discord",
-          waitForDiscordOwnership: activatedEndpoint.provider === "discord",
+          requireDiscordOwnership: leasedChatProvider(activatedEndpoint.provider),
+          waitForDiscordOwnership: leasedChatProvider(activatedEndpoint.provider),
         });
       } catch (error) {
         await invalidateRuntime(endpoint.id).catch(() => undefined);
@@ -8474,7 +9437,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     ) {
       throw unprocessable("Unsupported chat endpoint setup action");
     }
-    if (!webhookPublicBaseUrl && endpoint.provider !== "discord") {
+    if (!webhookPublicBaseUrl && endpoint.provider !== "discord" && endpoint.provider !== "imessage-photon") {
       throw unprocessable(
         `A public HTTPS Paperclip URL is required before connecting ${PROVIDER_LABELS[endpoint.provider]}`,
       );
@@ -8586,6 +9549,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               `${PROVIDER_LABELS[endpoint.provider]} credentials are required`,
             );
           });
+    if (endpoint.provider === "imessage-photon") {
+      const configuration = photonChannelConfigurationSchema.parse(input.photon ?? (credentials.allocation === "shared" ? { allocation: "shared", projectId: credentials.projectId } : { projectId: credentials.projectId, lineId: credentials.lineId }));
+      const lineId = configuration.allocation === "shared" ? photonSharedScope(configuration.projectId) : configuration.lineId;
+      if (endpoint.botExternalId && (configuration.projectId !== endpoint.providerAccountId || credentials.lineId && lineId !== credentials.lineId)) throw conflict("A different Photon identity requires a new channel");
+      credentials = { ...credentials, ...configuration, lineId };
+    }
     const identity = await verifyCredentials(endpoint.provider, credentials);
     // Once setup has claimed a provider bot identity, every credential repair
     // must prove that same identity before secrets can be replaced. A process
@@ -8662,6 +9631,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         throw error;
       }
     }
+    if (endpoint.provider === "imessage-photon") {
+      await invalidateRuntime(endpoint.id);
+      await credentialLease.assertOwned();
+      if (credentials.allocation === "shared") await db.update(chatEndpoints).set({ allowGroupChats: false }).where(eq(chatEndpoints.id, endpoint.id));
+      await db.update(toolConnections).set({ config: { provider: endpoint.provider, photon: credentials.allocation === "shared" ? { allocation: "shared", projectId: credentials.projectId } : { allocation: "dedicated", projectId: credentials.projectId, lineId: credentials.lineId } } }).where(and(eq(toolConnections.companyId, endpoint.companyId), eq(toolConnections.id, endpoint.connectionId)));
+    }
     if (
       (input.credentials && Object.keys(input.credentials).length > 0) ||
       credentialsChangedByDiscovery
@@ -8712,6 +9687,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             setup: {
               ...current.setup,
               step: waitingForSlackConfiguration ? "provider_setup" : "test",
+              ...(endpoint.provider === "imessage-photon" ? { photonIntakeAfter: (current.setup as InternalSetupState).photonIntakeAfter ?? updatedAt.toISOString() } : {}),
               testStartedAt: waitingForSlackConfiguration
                 ? null
                 : updatedAt.toISOString(),
@@ -8952,7 +9928,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           );
         }
         const requiredTrigger =
-          endpoint.provider === "telegram"
+          ["telegram", "imessage-photon"].includes(endpoint.provider)
             ? "direct_message"
             : "subscribed_message";
         const qualifyingDelivery = await db
@@ -8979,7 +9955,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           !qualifyingDelivery.processedAt
         ) {
           throw conflict(
-            endpoint.provider === "telegram"
+            ["telegram", "imessage-photon"].includes(endpoint.provider)
               ? "Send the test direct message before completing setup"
               : "Reply once without mentioning the agent before completing setup",
             { code: "chat_test_follow_up_missing" },
@@ -9323,9 +10299,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       tx,
       input.endpointId,
       input.runtimeContext,
-      ["active"],
+      ["active", "verifying"],
     );
-    if (!endpoint) {
+    // Photon setup already admits linked senders and publishes agent prompts.
+    // Let those prompts resolve so a clarifying question cannot deadlock the
+    // actual-reply qualification. Other providers retain their active-only gate.
+    if (!endpoint || (endpoint.status !== "active" &&
+      (endpoint.provider !== "imessage-photon" || endpoint.setup.step !== "test"))) {
       throw forbidden("This chat action is no longer authorized", {
         code: "chat_action_authorization_changed",
       });
@@ -9471,6 +10451,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       omissionReasons[reason] = (omissionReasons[reason] ?? 0) + count;
     };
     const boundedAttachments = input.attachments.slice(0, 20);
+    const photonDerivatives = new Map<Attachment, { source: Attachment; sourceHash: string; kind: "heif_jpeg_preview" | "live_photo_video" }>();
+    const originalPhotonAttachments = new Map<Attachment, string>();
     if (
       input.endpoint.provider === "microsoft-teams" &&
       input.unavailableReferenceCount
@@ -9481,7 +10463,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       omit("download_unavailable", input.unavailableReferenceCount);
     }
     if (
-      input.endpoint.provider === "github" &&
+      ["github", "imessage-photon"].includes(input.endpoint.provider) &&
       input.attachmentLimitOmissions
     ) {
       omit("attachment_limit", input.attachmentLimitOmissions);
@@ -9760,7 +10742,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const telegramMedia =
         input.endpoint.provider === "telegram" &&
         hasTelegramMediaProvenance(attachment);
-      const sourceBoundMedia = teamsInlineImage || telegramMedia;
+      const sourceBoundMedia =
+        teamsInlineImage ||
+        telegramMedia ||
+        input.endpoint.provider === "imessage-photon";
       const requireCurrentAttachmentAuthorization =
         input.endpoint.provider === "github" || sourceBoundMedia;
       try {
@@ -9854,8 +10839,40 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             continue;
           }
         }
+        const photonSourceHash = createHash("sha256")
+          .update(body)
+          .digest("hex");
+        if (input.endpoint.provider === "imessage-photon") {
+          await validatePhotonImage(body, contentType);
+          const companion = takePhotonCompanion(body);
+          if (companion?.unavailable) omit("companion_unavailable");
+          else if (companion) {
+            const video: Attachment = { type: "video", name: companion.fileName, mimeType: companion.mimeType, size: companion.data.length, fetchData: async () => companion.data };
+            photonDerivatives.set(video, { source: attachment, sourceHash: photonSourceHash, kind: "live_photo_video" });
+            boundedAttachments.push(video);
+          }
+          if (
+            HEIF_CONTENT_TYPES.has(contentType) &&
+            isAllowedContentType("image/jpeg")
+          ) {
+            try {
+              const preview = await photonHeifPreview(body);
+              const derivative: Attachment = {
+                type: "image",
+                name: `${originalFilename} (JPEG preview).jpg`,
+                mimeType: "image/jpeg",
+                size: preview.length,
+                fetchData: async () => preview,
+              };
+              photonDerivatives.set(derivative, { source: attachment, sourceHash: photonSourceHash, kind: "heif_jpeg_preview" });
+              boundedAttachments.push(derivative);
+            } catch {
+              omit("preview_unavailable");
+            }
+          }
+        }
         const fingerprint = JSON.stringify([
-          createHash("sha256").update(body).digest("hex"),
+          photonSourceHash,
           body.length,
           contentType,
           originalFilename,
@@ -9871,8 +10888,39 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             telegramMedia ? attachment : undefined,
           );
         }
+        const registerPhotonProvenance = async (attachmentId: string) => {
+          if (input.endpoint.provider !== "imessage-photon") return;
+          const relation = photonDerivatives.get(attachment);
+          if (!relation) {
+            originalPhotonAttachments.set(attachment, attachmentId);
+            return;
+          }
+          const originalAttachmentId =
+            originalPhotonAttachments.get(relation.source);
+          if (!originalAttachmentId)
+            throw new Error("Photon related attachment source is missing");
+          await db
+            .insert(chatActions)
+            .values({
+              companyId: input.endpoint.companyId,
+              endpointId: input.endpoint.id,
+              deliveryId: input.deliveryId,
+              kind: relation.kind === "heif_jpeg_preview" ? "attachment_derivative" : "attachment_companion",
+              providerActionId: `photon-${relation.kind}:${input.deliveryId}:${originalAttachmentId}`,
+              payload: {
+                originalAttachmentId,
+                derivativeAttachmentId: attachmentId,
+                originalSha256: relation.sourceHash,
+                derivativeSha256: photonSourceHash,
+                kind: relation.kind,
+              },
+              status: "processed",
+            })
+            .onConflictDoNothing();
+        };
         if (existingId) {
           storedIds.push(existingId);
+          await registerPhotonProvenance(existingId);
           continue;
         }
         const stored = await options.storage.putFile({
@@ -9918,8 +10966,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           throw error;
         }
         storedIds.push(row.id);
+        await registerPhotonProvenance(row.id);
       } catch (error) {
         if (isExternalActionAuthorizationChange(error)) throw error;
+        if (
+          error instanceof PhotonError &&
+          ["attachment_not_ready", "network", "quota", "credentials"].includes(
+            error.code,
+          )
+        )
+          throw error;
         // Use the closed current-input omission vocabulary consumed by native
         // prompts; provider-specific diagnostics remain redacted log codes.
         omit(
@@ -10837,9 +11893,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         )
         .limit(1);
       const checkpoint = run.runnerProfileJson?.sessionCheckpoint as
-        Record<string, unknown> | undefined;
+        | Record<string, unknown>
+        | undefined;
       const binding = checkpoint?.identity as
-        Record<string, unknown> | undefined;
+        | Record<string, unknown>
+        | undefined;
       if (
         !event &&
         !result &&
@@ -11081,7 +12139,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return;
     }
     const checkpoint = run.runnerProfileJson?.sessionCheckpoint as
-      Record<string, unknown> | undefined;
+      | Record<string, unknown>
+      | undefined;
     if (
       !run.nativeSessionId ||
       !run.runnerInstanceId ||
@@ -11107,7 +12166,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             ? checkpoint.providerSessionId
             : null,
         recoveryMode: coordinator.failureDetail!.recoveryMode as
-          "bootstrap_retry" | "exact_checkpoint_resume",
+          | "bootstrap_retry"
+          | "exact_checkpoint_resume",
         allowVerifiedBackup: leases.length > 0,
       })
     )
@@ -11248,11 +12308,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         )
         .for("share", { noWait: true });
       const result = accepted?.resultJson.result as
-        Record<string, unknown> | undefined;
+        | Record<string, unknown>
+        | undefined;
       const terminal = accepted?.resultJson.terminal as
-        Record<string, unknown> | undefined;
+        | Record<string, unknown>
+        | undefined;
       const continuation = result?.continuation as
-        Record<string, unknown> | undefined;
+        | Record<string, unknown>
+        | undefined;
       if (
         failedRun.runtimeMode !== "native" ||
         failedRun.nativeIssueId !== issue.id ||
@@ -11570,8 +12633,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ),
       );
     if (sources.length !== commentIds.length) throw failedChatRetryDenied();
-    const ordered = commentIds.map((id) =>
-      sources.find((action) => action.payload.commentId === id)!,
+    const ordered = commentIds.map(
+      (id) => sources.find((action) => action.payload.commentId === id)!,
     );
     const first = ordered[0]!;
     if (
@@ -11683,7 +12746,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           issueId: issue.id,
           commentId: comment.id,
           requestedByActorType: action.payload.requestedByActorType as
-            "user" | "system",
+            | "user"
+            | "system",
           requestedByActorId: String(action.payload.requestedByActorId),
           requestedAt: action.createdAt,
           authorize: async () => {},
@@ -11783,7 +12847,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       principalId: first.principalId,
       sessionGeneration: destination.conversation.sessionGeneration,
       requestedByActorType: first.payload.requestedByActorType as
-        "user" | "system",
+        | "user"
+        | "system",
       requestedByActorId: String(first.payload.requestedByActorId),
       retryAncestors: [],
     };
@@ -12008,7 +13073,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       await assertFailedNativeRetryState(tx, source, input.companyId);
       const context = input.contextSnapshot;
       const hint = context.chatFailedRunRetry as
-        Record<string, unknown> | undefined;
+        | Record<string, unknown>
+        | undefined;
       if (
         context.issueId !== source.issueId ||
         context.source !== `chat:${source.provider}` ||
@@ -12946,7 +14012,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             issueId: String(action.payload.issueId),
             commentId: String(action.payload.commentId),
             requestedByActorType: action.payload.requestedByActorType as
-              "user" | "system",
+              | "user"
+              | "system",
             requestedByActorId: String(action.payload.requestedByActorId),
             requestedAt: action.createdAt,
             authorize: async () => {},
@@ -13131,7 +14198,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         issueId: claimed.payload.issueId,
         commentId: claimed.payload.commentId,
         requestedByActorType: claimed.payload.requestedByActorType as
-          "user" | "system",
+          | "user"
+          | "system",
         requestedByActorId: String(claimed.payload.requestedByActorId),
         requestedAt: claimed.createdAt,
         authorize: async (tx) => {
@@ -13169,7 +14237,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         taskKey: context.issue.identifier,
         wakeCommentId: request.commentId,
         attachmentOmissionReasons: claimed.payload.attachmentOmissionReasons as
-          Record<string, number> | undefined,
+          | Record<string, number>
+          | undefined,
         durableChatRequest: request,
         rethrowOnError: true,
       });
@@ -13230,7 +14299,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
-
   async function processMessage(
     endpoint: EndpointRow,
     thread: Thread,
@@ -13281,6 +14349,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const providerEventId = `${durableExternalThreadIdentity(thread.id)}:${message.id}`;
     const surfaceKind = chatSurfaceKind(endpoint.provider, thread);
     const addressed =
+      endpoint.provider === "imessage-photon" ||
       trigger === "mention" ||
       trigger === "direct_message" ||
       message.isMention === true;
@@ -13349,10 +14418,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ? telegramMessageSentAt(message.raw)
           : endpoint.provider === "slack"
             ? slackMessageSentAt(message.raw, message.id)
-          : message.metadata.dateSent instanceof Date &&
-              Number.isFinite(message.metadata.dateSent.getTime())
-            ? message.metadata.dateSent
-            : null;
+            : message.metadata.dateSent instanceof Date &&
+                Number.isFinite(message.metadata.dateSent.getTime())
+              ? message.metadata.dateSent
+              : null;
     const providerSentAtSource = providerSentAt
       ? endpoint.provider === "microsoft-teams"
         ? "teams_activity_timestamp"
@@ -13360,7 +14429,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ? "telegram_message_date"
           : endpoint.provider === "slack"
             ? "slack_message_ts"
-          : null
+            : null
       : null;
     const providerUrl =
       chatProviderConversationUrl({
@@ -13397,13 +14466,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       kind: eventKind,
       trigger,
       ...(teamsPersonalRecipient ? { teamsPersonalRecipient } : {}),
-      ...(slackSlashControl ? { admission: { origin: "slack_slash_control" } } : suppressSetupDestinationActivation
-        ? // A slash-command root is provider-confirmed only after an enabled
-          // destination authorized its transport. Persist that closed origin so
-          // crash recovery can never reinterpret it as first-time setup traffic
-          // and undo a later operator reach revocation.
-          { admission: { origin: "provider_confirmed_action" } }
-        : {}),
+      ...(slackSlashControl
+        ? { admission: { origin: "slack_slash_control" } }
+        : suppressSetupDestinationActivation
+          ? // A slash-command root is provider-confirmed only after an enabled
+            // destination authorized its transport. Persist that closed origin so
+            // crash recovery can never reinterpret it as first-time setup traffic
+            // and undo a later operator reach revocation.
+            { admission: { origin: "provider_confirmed_action" } }
+          : {}),
       ...(runtimeContext
         ? {
             runtimeContext: {
@@ -13445,6 +14516,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       },
       message: {
         providerMessageId: message.id,
+        ...(endpoint.provider === "imessage-photon"
+          ? { photonReply: photonReplyReference(message.raw) }
+          : {}),
         providerMessageSequence:
           endpoint.provider === "telegram"
             ? telegramMessageSequence(message.raw)
@@ -13455,10 +14529,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         mentionedBot: message.isMention === true,
         providerSentAt: providerSentAt?.toISOString() ?? null,
         ...(providerSentAtSource ? { providerSentAtSource } : {}),
-        ...(endpoint.provider === "github" &&
-        githubAttachmentLimitOmissions(message)
+        ...((endpoint.provider === "github" ||
+          endpoint.provider === "imessage-photon") &&
+        (githubAttachmentLimitOmissions(message) ||
+          Math.max(0, message.attachments.length - 20))
           ? {
-              attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
+              attachmentLimitOmissions:
+                githubAttachmentLimitOmissions(message) ||
+                Math.max(0, message.attachments.length - 20),
             }
           : {}),
         attachments: message.attachments.slice(0, 20).map((attachment) => ({
@@ -13470,7 +14548,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             : nativeInboundAttachments.includes(attachment)
               ? endpointRuntime.attachmentRecoveryDescriptor(
                   attachment,
-                  endpoint.provider === "telegram"
+                  ["telegram", "imessage-photon"].includes(endpoint.provider)
                     ? attachmentSource
                     : undefined,
                 )
@@ -13564,7 +14642,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         !staleActivation;
       if (
         endpointAccepting &&
-        endpoint.provider === "discord" &&
+        leasedChatProvider(endpoint.provider) &&
         runtimeContext &&
         !admittedDeliveryId
       ) {
@@ -13682,12 +14760,24 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             resource,
           );
       }
+      if (
+        endpointAccepting &&
+        endpoint.provider === "imessage-photon" &&
+        !thread.isDM
+      ) {
+        const resource = await ensureResource(endpoint, thread, false, tx);
+        destinationAccepting =
+          resource.enabled &&
+          resource.availability === "available" &&
+          currentEndpoint.allowGroupChats;
+      }
       const accepting = endpointAccepting && destinationAccepting;
       const redactDestinationDelivery =
         (!accepting && thread.isDM) ||
         (!thread.isDM &&
           (endpoint.provider === "microsoft-teams" ||
-            endpoint.provider === "telegram") &&
+            endpoint.provider === "telegram" ||
+            endpoint.provider === "imessage-photon") &&
           (!accepting || provisionalTeamsSetupReply));
       const ignoredAt = accepting ? null : new Date();
       const inactiveReason = !endpointAccepting
@@ -14178,6 +15268,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         message.raw,
       );
       const mayEnableSetupDestination =
+        endpoint.provider !== "imessage-photon" &&
         !thread.isDM &&
         endpoint.status === "verifying" &&
         addressed &&
@@ -14288,9 +15379,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       if (
         isLinear &&
         existingConversation &&
-        (existingConversation.state === "completed" ||
-          existingIssue?.status === "done" ||
-          existingIssue?.status === "cancelled")
+        (endpoint.provider === "imessage-photon"
+          // A reply finishes an iMessage turn, not the conversation. Only a
+          // delivered /new or /close releases this chat's task binding. Use
+          // the durable control receipt so pre-fix completed rows also resume.
+          ? await hasCommittedTaskControlCompletion(existingConversation.id)
+          : existingConversation.state === "completed" ||
+            existingIssue?.status === "done" ||
+            existingIssue?.status === "cancelled")
       ) {
         if (existingConversation.state !== "completed") {
           await db
@@ -14419,18 +15515,73 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
 
       const filterPreControlSource = async (database: DbOrTransaction) => {
-        if (controlCommand === "status" || (controlCommand === "new" && endpoint.provider === "telegram" && surfaceKind === "native_thread") || guidanceCommand || (await readChatControlChronology(database, endpoint, thread, activeDelivery)) !== "before_or_unproven") return false;
+        if (
+          controlCommand === "status" ||
+          (controlCommand === "new" &&
+            endpoint.provider === "telegram" &&
+            surfaceKind === "native_thread") ||
+          guidanceCommand ||
+          (await readChatControlChronology(
+            database,
+            endpoint,
+            thread,
+            activeDelivery,
+          )) !== "before_or_unproven"
+        )
+          return false;
         const filteredAt = new Date();
-        await database.update(chatDeliveries).set({
-          state: "filtered",
-          nextAttemptAt: null,
-          processedAt: filteredAt,
-          updatedAt: filteredAt,
-          redactedError: "Message predates or cannot be ordered after a completed chat close/new. Send a new request to start work.",
-        }).where(and(eq(chatDeliveries.id, activeDelivery.id), eq(chatDeliveries.companyId, endpoint.companyId), eq(chatDeliveries.state, "processing")));
+        await database
+          .update(chatDeliveries)
+          .set({
+            state: "filtered",
+            nextAttemptAt: null,
+            processedAt: filteredAt,
+            updatedAt: filteredAt,
+            redactedError:
+              "Message predates or cannot be ordered after a completed chat close/new. Send a new request to start work.",
+          })
+          .where(
+            and(
+              eq(chatDeliveries.id, activeDelivery.id),
+              eq(chatDeliveries.companyId, endpoint.companyId),
+              eq(chatDeliveries.state, "processing"),
+            ),
+          );
         return true;
       };
       if (await filterPreControlSource(db)) return;
+      const photonQuote =
+        endpoint.provider === "imessage-photon"
+          ? photonReplyReference(message.raw)
+          : null;
+      if (controlCommand && photonQuote) {
+        const source = await db
+          .select({ conversationId: chatMessageLinks.conversationId })
+          .from(chatMessageLinks)
+          .where(
+            and(
+              eq(chatMessageLinks.companyId, endpoint.companyId),
+              eq(chatMessageLinks.endpointId, endpoint.id),
+              eq(chatMessageLinks.providerMessageId, photonQuote.guid),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0]);
+        if (!source || source.conversationId !== existingConversation?.id) {
+          await db
+            .update(chatDeliveries)
+            .set({
+              state: "filtered",
+              processedAt: new Date(),
+              nextAttemptAt: null,
+              redactedError:
+                "Quoted control does not belong to the current task generation",
+              updatedAt: new Date(),
+            })
+            .where(eq(chatDeliveries.id, activeDelivery.id));
+          return;
+        }
+      }
 
       const emptySlackMention =
         endpoint.provider === "slack" &&
@@ -14688,6 +15839,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return;
       }
 
+      const inboundActivityPublications: ActivityPublication[] = [];
       const persistTaskMutation = async (
         taskTx: DbOrTransaction,
         taskEndpoint: EndpointRow,
@@ -14851,10 +16003,33 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             authorType: taskUserId ? "user" : "system",
             metadata: {
               version: 1,
+              ...(endpoint.provider === "imessage-photon"
+                ? { sourceChannel: "imessage-photon" as const }
+                : {}),
               sections: [
                 {
                   title: `${PROVIDER_LABELS[endpoint.provider]} sender`,
                   rows: [
+                    ...(endpoint.provider === "imessage-photon" &&
+                    photonReplyReference(message.raw)
+                      ? [
+                          {
+                            type: "key_value" as const,
+                            label: "Reply to message",
+                            value: photonReplyReference(message.raw)!.guid,
+                          },
+                          ...(photonReplyReference(message.raw)!.part
+                            ? [
+                                {
+                                  type: "key_value" as const,
+                                  label: "Reply part",
+                                  value: photonReplyReference(message.raw)!
+                                    .part!,
+                                },
+                              ]
+                            : []),
+                        ]
+                      : []),
                     {
                       type: "key_value",
                       label: "Name",
@@ -14937,6 +16112,26 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           principalId: principalResolution.principal.id,
           actorUserId: taskUserId,
         });
+        if (taskEndpoint.provider === "imessage-photon") {
+          await logActivity(
+            taskTx as Db,
+            {
+              companyId: taskEndpoint.companyId,
+              actorType: taskUserId ? "user" : "system",
+              actorId: taskUserId ?? "chat:imessage-photon",
+              action: "issue.comment_added",
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                commentId: comment.id,
+                issueIdentifier: issue.identifier,
+                source: "chat:imessage-photon",
+                endpointId: taskEndpoint.id,
+              },
+            },
+            inboundActivityPublications,
+          );
+        }
         return { actorUserId: taskUserId, comment, conversation, issue };
       };
       const taskMutation = await db.transaction(async (tx) => {
@@ -15066,6 +16261,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         );
       });
       if (!taskMutation) return;
+      // The open task can fetch the comment immediately, before attachments
+      // finish preparing or the agent starts. Never publish an uncommitted row.
+      for (const publication of inboundActivityPublications) {
+        publishActivity(publication);
+      }
       const { actorUserId, comment, conversation, issue } = taskMutation;
       const attachmentResult = await ingestAttachments({
         endpoint,
@@ -15664,6 +16864,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           recovery?: unknown;
         }>;
         attachmentLimitOmissions?: unknown;
+        photonReply?: { guid?: unknown; part?: unknown };
       };
       conversation?: { providerUrl?: unknown };
     };
@@ -15702,6 +16903,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (rehydrated) return rehydrated;
         if (
           isTeams ||
+          endpointRuntime.provider === "imessage-photon" ||
           (endpointRuntime.provider === "telegram" &&
             typeof attachment.recovery === "object" &&
             attachment.recovery !== null &&
@@ -15750,7 +16952,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ? normalized.message.text
           : "",
       formatted: { type: "root", children: [] },
-      raw: {},
+      raw:
+        endpointRuntime.provider === "imessage-photon" &&
+        typeof normalized.message?.photonReply?.guid === "string"
+          ? {
+              replyTargetGuid: normalized.message.photonReply.guid,
+              threadOriginatorPart: normalized.message.photonReply.part,
+            }
+          : {},
       author: {
         userId: externalId,
         userName:
@@ -15770,7 +16979,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       links: [],
       isMention: normalized.message?.mentionedBot === true,
     } as unknown as Message;
-    if (endpointRuntime.provider === "github") {
+    if (
+      endpointRuntime.provider === "github" ||
+      endpointRuntime.provider === "imessage-photon"
+    ) {
       restoreGitHubAttachmentLimitOmissions(
         message,
         normalized.message?.attachmentLimitOmissions,
@@ -16126,7 +17338,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function handleSdkMessage(
     event: ChatSdkMessageCallbackEvent,
     runtimeContext?: RuntimeContext,
-    messageOptions: { receiptReactionSupported?: boolean; slackSlashControl?: boolean } = {},
+    messageOptions: {
+      receiptReactionSupported?: boolean;
+      slackSlashControl?: boolean;
+    } = {},
   ) {
     if (
       event.provider === "discord" &&
@@ -16150,7 +17365,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         event.thread,
         message,
         message === event.message ? event.trigger : "subscribed_message",
-        options.deferWebhookProcessing === true,
+        event.provider === "imessage-photon" ||
+          options.deferWebhookProcessing === true,
         null,
         runtimeContext,
         event.providerUpdateId,
@@ -20031,7 +21247,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
       .then((rows) => (rows.length === 1 ? rows[0]! : null));
     const linkedPayload = currentMessageBinding?.publication.payload as
-      SafeChatPublicationPayload | undefined;
+      | SafeChatPublicationPayload
+      | undefined;
     const linkStillAuthoritative =
       currentMessageBinding?.link.publicationId === originalPublication.id ||
       (currentMessageBinding?.publication.idempotencyKey ===
@@ -21749,13 +22966,24 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               invocation.sourceKind === "direct_message"
                 ? "No task is active. Send a message to start a new Paperclip task."
                 : "No active task is bound here. Open its Discord thread to manage it.";
-          } else if ((await readChatControlChronology(
-            tx,
-            record.endpoint,
-            { id: conversation.externalThreadId, channelId: conversation.externalConversationId },
-            { receivedAt: new Date(), normalizedEvent: { message: { providerMessageId: invocation.interactionId } } },
-          )) === "before_or_unproven") {
-            content = "This command predates an already completed chat control. Send a new command for the current conversation.";
+          } else if (
+            (await readChatControlChronology(
+              tx,
+              record.endpoint,
+              {
+                id: conversation.externalThreadId,
+                channelId: conversation.externalConversationId,
+              },
+              {
+                receivedAt: new Date(),
+                normalizedEvent: {
+                  message: { providerMessageId: invocation.interactionId },
+                },
+              },
+            )) === "before_or_unproven"
+          ) {
+            content =
+              "This command predates an already completed chat control. Send a new command for the current conversation.";
           } else {
             const publicText =
               invocation.command === "new"
@@ -26147,7 +27375,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .where(
         and(
           sql`not exists (select 1 from chat_endpoints e where e.id = ${chatDeliveries.endpointId} and e.provider = 'agentmail')`,
-            onlyDeliveryId ? eq(chatDeliveries.id, onlyDeliveryId) : undefined,
+          onlyDeliveryId ? eq(chatDeliveries.id, onlyDeliveryId) : undefined,
           inArray(chatDeliveries.eventKind, [
             "reaction_added",
             "reaction_removed",
@@ -26339,7 +27567,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   }
 
   async function listResources(endpointId: string) {
-    return db
+    const resources = await db
       .select()
       .from(chatEndpointResources)
       .where(
@@ -26349,6 +27577,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ),
       )
       .orderBy(asc(chatEndpointResources.label));
+    return resources.map((resource) => ({
+      ...resource,
+      participants:
+        resource.providerResourceId.startsWith("imessage-photon:") &&
+        Array.isArray(resource.metadata.participants)
+          ? resource.metadata.participants.flatMap((participant) => {
+              const address =
+                participant && typeof participant === "object"
+                  ? (participant as Record<string, unknown>).address
+                  : null;
+              return typeof address === "string" ? [address] : [];
+            })
+          : undefined,
+    }));
   }
 
   async function replaceResources(
@@ -26359,6 +27601,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
     if (updates.length === 0) return listResources(endpointId);
+    if (initial.endpoint.provider === "imessage-photon" && initial.endpoint.botExternalId?.startsWith("photon-project:") && updates.some((entry) => entry.enabled))
+      throw unprocessable("Photon shared channels support direct messages only; groups cannot be enabled");
     await withCredentialMutationLease(
       initial.endpoint,
       async (credentialLease) => {
@@ -26880,7 +28124,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         issueTitle: issue?.title ?? null,
         isDirectMessage: conversation.isDirectMessage,
         state:
-          issue?.status === "done" || issue?.status === "cancelled"
+          record.endpoint.provider !== "imessage-photon" &&
+          (issue?.status === "done" || issue?.status === "cancelled")
             ? "completed"
             : conversation.state,
         lastActivityAt: conversation.lastActivityAt?.toISOString() ?? null,
@@ -27670,6 +28915,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             }
           }
 
+          if (
+            initialRecord.endpoint.provider === "imessage-photon" &&
+            action === "retry_anyway"
+          ) {
+            await tx
+              .insert(chatActions)
+              .values({
+                companyId: publication.companyId,
+                endpointId,
+                conversationId: publication.conversationId,
+                kind: "photon_publication_retry",
+                providerActionId: `photon-retry:${publication.id}:${publication.attempts + 1}`,
+                payload: {
+                  publicationId: publication.id,
+                  attempt: publication.attempts + 1,
+                },
+                result: { authorizedByUserId: userId },
+                status: "processed",
+              })
+              .onConflictDoNothing();
+          }
           const now = new Date();
           await tx
             .update(chatPublications)
@@ -28697,7 +29963,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     commentId: string,
   ) {
     const emailBoundary = await endpointRecord(endpointId);
-    if (emailBoundary?.endpoint.publicationMode === "explicit") throw badRequest("Use an explicit email send action");
+    if (emailBoundary?.endpoint.publicationMode === "explicit")
+      throw badRequest("Use an explicit email send action");
     const conversation = await db
       .select()
       .from(chatConversations)
@@ -28771,7 +30038,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     attachmentIds: string[] = [],
   ) {
     const emailBoundary = await endpointRecord(endpointId);
-    if (emailBoundary?.endpoint.publicationMode === "explicit") throw badRequest("Use an explicit email send action");
+    if (emailBoundary?.endpoint.publicationMode === "explicit")
+      throw badRequest("Use an explicit email send action");
     // Browser request IDs are only unique within the conversation that issued
     // them. Include that durable task boundary so a retried key from another
     // conversation can neither suppress its send nor return the first task's
@@ -28979,8 +30247,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const attachedFileById = new Map(
         attachedFiles.map((file) => [file.id, file]),
       );
-      const orderedFiles = attachmentIds.map((attachmentId) =>
-        attachedFileById.get(attachmentId)!,
+      const orderedFiles = attachmentIds.map(
+        (attachmentId) => attachedFileById.get(attachmentId)!,
       );
       const publicationCreatedAt = new Date();
       const [created] = await tx
@@ -29457,11 +30725,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         })
       : null;
     const originalConversation = delivery.normalizedEvent.conversation as
-      Record<string, unknown> | undefined;
+      | Record<string, unknown>
+      | undefined;
     const originalMessage = delivery.normalizedEvent.message as
-      Record<string, unknown> | undefined;
+      | Record<string, unknown>
+      | undefined;
     const originalPrincipal = delivery.normalizedEvent.principal as
-      Record<string, unknown> | undefined;
+      | Record<string, unknown>
+      | undefined;
     if (
       !binding ||
       originalConversation?.isDirectMessage !== true ||
@@ -29566,7 +30837,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           issueId: conversation.issueId,
           commentId: source.comment.id,
           requestedByActorType: action.payload.requestedByActorType as
-            "user" | "system",
+            | "user"
+            | "system",
           requestedByActorId: String(action.payload.requestedByActorId),
           requestedAt: action.createdAt,
           authorize: async () => {},
@@ -29861,7 +31133,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         )
         .for("share", { noWait: true });
       const marker = run?.resultJson?.nativeCommittedChatResponse as
-        Record<string, unknown> | undefined;
+        | Record<string, unknown>
+        | undefined;
       if (
         !run ||
         !marker ||
@@ -30133,7 +31406,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             continuing && {
               ...continuing,
               phase: continuing.phase as
-                "consent_unknown" | "file_info_unknown",
+                | "consent_unknown"
+                | "file_info_unknown",
             },
           ));
         if (!current) throw denied();
@@ -31415,6 +32689,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     payload: SafeChatPublicationPayload;
     replaceProviderMessageId?: string | null;
     telegramDraftControl?: TelegramDraftControl;
+    beforePhotonWrite?(): Promise<void>;
     onSlackFileUploadAccepted?: (
       receipt: SlackFileUploadAcceptedReceipt,
     ) => Promise<void>;
@@ -31497,6 +32772,233 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           text = `${text}\n\n${attachmentFallback}`;
         }
       }
+    }
+    if (input.endpoint.provider === "imessage-photon") {
+      const adapter = endpointRuntime.getProviderAdapter();
+      if (!(adapter instanceof PhotonChatAdapter))
+        throw new Error("Photon publication runtime unavailable");
+      const assertCurrent = async () => {
+        await input.beforePhotonWrite?.();
+        const current = await endpointRecord(input.endpoint.id);
+        if (
+          !current ||
+          !["verifying", "active"].includes(current.endpoint.status) ||
+          runtimeGeneration(current.endpoint.setup) !==
+            runtimeGeneration(input.endpoint.setup) ||
+          runtime.get(input.endpoint.id) !== endpointRuntime
+        )
+          throw new PhotonError(
+            "rejected",
+            "Photon publication authority changed",
+          );
+        const resource = await db
+          .select()
+          .from(chatEndpointResources)
+          .where(
+            and(
+              eq(chatEndpointResources.companyId, current.endpoint.companyId),
+              eq(chatEndpointResources.endpointId, current.endpoint.id),
+              eq(chatEndpointResources.id, input.conversation.resourceId!),
+            ),
+          )
+          .then((rows) => rows[0]);
+        if (
+          resource?.availability !== "available" ||
+          (!input.conversation.isDirectMessage && !resource.enabled) ||
+          (input.conversation.isDirectMessage &&
+            !current.endpoint.allowDirectMessages)
+        )
+          throw new PhotonError(
+            "rejected",
+            "Photon conversation is no longer enabled",
+          );
+      };
+      const retry = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, input.endpoint.id),
+            eq(chatActions.kind, "photon_publication_retry"),
+            eq(
+              chatActions.providerActionId,
+              `photon-retry:${input.publication.id}:${input.publication.attempts + 1}`,
+            ),
+            eq(chatActions.status, "processed"),
+          ),
+        )
+        .then((rows) => rows[0]);
+      const retryUnknown = Boolean(retry);
+      const nextQuestion =
+        /^photon-question:([a-zA-Z0-9_-]{8,24}):(\d{1,2})$/.exec(
+          input.publication.idempotencyKey,
+        );
+      if (
+        input.payload.interactionId &&
+        (input.publication.idempotencyKey ===
+          `interaction:${input.payload.interactionId}:${input.endpoint.id}` ||
+          nextQuestion)
+      ) {
+        const action = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.companyId, input.endpoint.companyId),
+              eq(chatActions.endpointId, input.endpoint.id),
+              eq(chatActions.kind, "photon_interaction"),
+              nextQuestion
+                ? eq(chatActions.providerActionId, `photon:${nextQuestion[1]}`)
+                : eq(
+                    sql<string>`${chatActions.payload}->>'publicationId'`,
+                    input.publication.id,
+                  ),
+              eq(chatActions.status, "issued"),
+            ),
+          )
+          .then((rows) => rows[0]);
+        const interaction = (
+          await issueThreadInteractionService(db).listForIssue(
+            input.publication.issueId,
+          )
+        ).find((candidate) => candidate.id === input.payload.interactionId);
+        if (
+          action &&
+          interaction?.status === "pending" &&
+          nativePhotonInteraction(interaction)
+        ) {
+          const promptGuard = async () => {
+            await assertCurrent();
+            const current = await db
+              .select({ status: issueThreadInteractions.status })
+              .from(issueThreadInteractions)
+              .where(
+                and(
+                  eq(
+                    issueThreadInteractions.companyId,
+                    input.endpoint.companyId,
+                  ),
+                  eq(issueThreadInteractions.id, interaction.id),
+                ),
+              )
+              .then((rows) => rows[0]);
+            if (current?.status !== "pending")
+              throw new PhotonError(
+                "rejected",
+                "This interaction has already been resolved",
+              );
+          };
+          const receipt = await publishPhotonPrompt({
+            adapter,
+            threadId: thread.id,
+            binding: action.payload as unknown as PhotonInteractionBinding,
+            interaction,
+            questionIndex: nextQuestion ? Number(nextQuestion[2]) : 0,
+            taskUrl: safeChatTaskUrl(
+              options.publicBaseUrl,
+              input.publication.issueId,
+            ),
+            assertCurrent: promptGuard,
+            retryUnknown,
+          });
+          return { id: receipt.promptMessageGuid };
+        }
+        if (nextQuestion)
+          throw new PhotonError(
+            "rejected",
+            "This question is no longer available",
+          );
+      }
+      const reply = await adapter.state.read<{ guid: string | null }>(
+        `publication-reply:${input.publication.id}`,
+      );
+      let replyTo = reply?.guid ?? null;
+      if (!reply) {
+        const sourceRunId = await receiptReactionCompletionRunId(
+          db,
+          input.publication,
+          input.payload,
+        );
+        if (sourceRunId) {
+          const source = await db
+            .select({ guid: chatMessageLinks.providerMessageId })
+            .from(heartbeatRuns)
+            .innerJoin(
+              chatMessageLinks,
+              and(
+                eq(chatMessageLinks.companyId, input.endpoint.companyId),
+                eq(chatMessageLinks.endpointId, input.endpoint.id),
+                eq(chatMessageLinks.conversationId, input.conversation.id),
+                eq(chatMessageLinks.direction, "inbound"),
+                or(
+                  sql`${chatMessageLinks.commentId}::text = ${heartbeatRuns.contextSnapshot}->>'wakeCommentId'`,
+                  sql`coalesce(${heartbeatRuns.contextSnapshot}->'wakeCommentIds', '[]'::jsonb) ? ${chatMessageLinks.commentId}::text`,
+                ),
+              ),
+            )
+            .where(
+              and(
+                eq(heartbeatRuns.id, sourceRunId),
+                eq(heartbeatRuns.companyId, input.endpoint.companyId),
+              ),
+            )
+            .orderBy(desc(chatMessageLinks.createdAt))
+            .limit(1)
+            .then((rows) => rows[0]);
+          replyTo = source?.guid ?? null;
+        }
+        replyTo = (
+          await adapter.state.update<{ guid: string | null }>(
+            `publication-reply:${input.publication.id}`,
+            (current) => current ?? { guid: replyTo },
+          )
+        ).guid;
+      }
+      const sent = await adapter.publish(
+        thread.id,
+        input.publication.id,
+        { markdown: text, files },
+        { assertCurrent, retryUnknown, replyTo: replyTo ?? undefined },
+      );
+      if (input.publication.idempotencyKey.startsWith("photon-response:")) {
+        const notice = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.companyId, input.endpoint.companyId),
+              eq(chatActions.endpointId, input.endpoint.id),
+              eq(chatActions.kind, "photon_response_notice"),
+              eq(
+                chatActions.providerActionId,
+                `photon-notice:${input.publication.idempotencyKey}`,
+              ),
+            ),
+          )
+          .then((rows) => rows[0]);
+        if (
+          notice &&
+          typeof notice.payload.reference === "string" &&
+          typeof notice.payload.questionIndex === "number" &&
+          typeof notice.payload.publicationId === "string"
+        ) {
+          const receipt: PhotonPromptReceipt = {
+            schema: 1,
+            reference: notice.payload.reference,
+            questionIndex: notice.payload.questionIndex,
+            publicationId: notice.payload.publicationId,
+            promptMessageGuid: sent.id,
+            promptMessageGuids: sent.messageIds,
+            options: {},
+          };
+          for (const guid of sent.messageIds)
+            await adapter.state.update<PhotonPromptReceipt>(
+              `prompt-message:${guid}`,
+              (current) => current ?? receipt,
+            );
+        }
+      }
+      return sent;
     }
     if (
       input.endpoint.provider === "discord" &&
@@ -32105,6 +33607,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publication: typeof chatPublications.$inferSelect,
   ): Promise<string | null> {
     const progress = publication.payload.progressState;
+    if (progress && ["queued", "working"].includes(progress)) {
+      const endpoint = await endpointRecord(publication.endpointId);
+      if (endpoint?.endpoint.provider === "imessage-photon") return "iMessage uses typing instead of progress bubbles";
+    }
     if (
       !progress ||
       !["queued", "working", "waiting_for_input"].includes(progress)
@@ -35438,7 +36944,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 publication,
                 endpoint,
               );
-              const replaceProviderMessageId = CAPABILITIES[endpoint.provider]
+              const replaceProviderMessageId = endpoint.provider !== "imessage-photon" && CAPABILITIES[endpoint.provider]
                 .messageEdits
                 ? (closedProgress?.providerMessageId ??
                   (await interactionResolutionPublicationToReplace(
@@ -35541,6 +37047,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 payload,
                 replaceProviderMessageId,
                 telegramDraftControl: telegramDraft?.control,
+                beforePhotonWrite: () => db.transaction(async (tx) => {
+                  await credentialLease.assertOwned(tx);
+                  if (!(await authorizeRetainedChatSourcePublication(tx, publication))) throw new PhotonError("rejected", "Publication source authorization changed");
+                }),
                 onSlackFileUploadAccepted: async (receipt) => {
                   // uploadV2 has completed at this point. Mark acceptance
                   // before the durable callback so a local write failure is
@@ -36177,6 +37687,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     update,
     generateSetupSecret,
     configure,
+    inspectPhoton,
     test,
     handleWebhook,
     listResources,
