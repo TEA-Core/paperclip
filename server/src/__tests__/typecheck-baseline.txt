@@ -1527,4 +1527,3 @@ server/src/__tests__/workspace-runtime.test.ts(9858,105): TS2741
 server/src/__tests__/worktree-config.test.ts(1194,7): TS2741
 server/src/__tests__/worktree-config.test.ts(1211,7): TS2741
 server/src/__tests__/write-build-stamp.test.ts(3,36): TS7016
-server/src/services/plugin-host-services.ts(23,3): TS2305
