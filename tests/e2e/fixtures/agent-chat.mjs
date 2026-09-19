@@ -30,9 +30,20 @@ if (!task.conversationAgentId) {
     format: "markdown",
     body: `Execution received plan: ${plan.body}`,
   });
+  // FORK DIVERGENCE (fork-owned done-tier close-evidence guard, absent upstream, slice 2d):
+  // the fork refuses every non-board `done` transition whose close comment carries no
+  // machine-checkable tier declaration -- server/src/routes/issues.ts evaluateDoneTransitionGuards
+  // -> evaluateDoneTierDeclaration (server/src/services/done-transition-guard.ts), 422
+  // done_transition_missing_tier_declaration. Upstream at the cutoff dffc2b3ca has no
+  // done-transition guard at all, so its bare close comment leaves every handed-off chat task
+  // stuck short of `done`. Same adaptation the fork already carries on
+  // scripts/mcp-fixtures/servers/acp-stop-agent.mjs. A handed-off chat task has no deliverable
+  // head, so Tier 1 is the honest declaration; no assertion in tests/e2e/agent-chat.spec.ts
+  // reads this comment body, and that spec stays byte-identical to upstream.
   await api(`/issues/${task.id}`, "PATCH", {
     status: "done",
-    comment: "Execution finished with its initial plan.",
+    comment:
+      "Execution finished with its initial plan.\n\nClosed at Tier 1 (landed, not liveness-probed): the deterministic chat handoff fixture has no deliverable head. Liveness unverified.",
   });
   process.exit(0);
 }

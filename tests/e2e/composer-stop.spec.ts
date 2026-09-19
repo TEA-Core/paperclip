@@ -84,16 +84,36 @@ async function reconcileDemoExecution(
   const activity = await json(
     await request.get(`/api/issues/${issueId}/activity`),
   );
-  const settled = activity.find(
-    (entry: { action: string; runId: string }) =>
-      entry.action === "issue.execution_recovery_settled" &&
-      entry.runId === runId,
-  );
+  // FORK DIVERGENCE (D9 deferred: the fork's in-file release promotes parked input at Stop,
+  // slice 2d): upstream's wake-queue release answers an operator Stop with its
+  // `executionCancellationAcknowledged` pre-drain exit, so the queued comment stays deferred and
+  // the reconciliation action keeps naming the run that was stopped. This fold keeps the fork's
+  // in-file releaseIssueExecutionAndPromote live (operator decision 2026-09-15, D9 / SUP-16581;
+  // see server/src/__tests__/heartbeat-process-recovery.test.ts and
+  // heartbeat-comment-wake-batching.test.ts, which carry the same divergence inverted), so the
+  // Stop promotes the parked comment into a SUCCESSOR run on this card. When the subtree pause
+  // then cancels that successor, the source-scoped action is re-identified onto it
+  // (fingerprint `legacy-execution:<run.id>` + supersedeOnIdentityChange), and it settles
+  // resolved-with-replay-blocked -- so `recovery.active` is null and the settled activity names
+  // the successor, not `runId`. The child card has no successor and still matches on the first
+  // arm, which is why only the parent needed this. Reconcile whichever run the action actually
+  // settled on; restore the single-arm lookup in the change that makes the module release live.
+  const settled =
+    activity.find(
+      (entry: { action: string; runId: string }) =>
+        entry.action === "issue.execution_recovery_settled" &&
+        entry.runId === runId,
+    ) ??
+    activity.find(
+      (entry: { action: string; runId: string }) =>
+        entry.action === "issue.execution_recovery_settled",
+    );
   const recovery = await json(
     await request.get(`/api/issues/${issueId}/recovery-actions`),
   );
   const actionId = recovery.active?.id ?? settled?.details?.recoveryActionId;
   expect(actionId).toBeTruthy();
+  const reconciledRunId: string = settled?.runId ?? runId;
   await json(
     await request.post(`/api/issues/${issueId}/recovery-actions/resolve`, {
       data: {
@@ -101,7 +121,7 @@ async function reconcileDemoExecution(
         outcome: "restored",
         sourceIssueStatus: "todo",
         executionReconciliation: {
-          runId,
+          runId: reconciledRunId,
           providerStopped: true,
           actionOutcome: "not_performed",
           outcomeEvidence:
