@@ -20,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { activityRoutes } from "../routes/activity.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
@@ -122,6 +123,10 @@ describeEmbeddedPostgres(
         next();
       });
       localApp.use("/api", issueRoutes(db, {} as any));
+      // SUP-16731: mount the production activity read path so the regression
+      // proves the durable record is reachable by a consumer through
+      // GET /api/issues/:id/activity, not merely present in the table.
+      localApp.use("/api", activityRoutes(db));
       localApp.use(errorHandler);
       return localApp;
     }
@@ -304,6 +309,25 @@ describeEmbeddedPostgres(
       expect(details.message).toBeUndefined();
       expect(JSON.stringify(details)).not.toContain("fetch failed");
       expect(JSON.stringify(details)).not.toContain("test-secret");
+
+      // SUP-16731 (AC4): storage is not the acceptance distinction. The row
+      // must be observable by an authorized consumer through the production
+      // read path -- GET /api/issues/:id/activity -- so a schema, query, or
+      // authorization regression on that route fails this regression too.
+      const readback = await request(app).get(
+        `/api/issues/${identifier}/activity`,
+      );
+      expect(readback.status, JSON.stringify(readback.body)).toBe(200);
+      const readbackRows = readback.body as Array<Record<string, unknown>>;
+      const recorded = readbackRows.find(
+        (row) => row.action === "issue.patch_unhandled_error",
+      );
+      expect(recorded, JSON.stringify(readback.body)).toBeDefined();
+      expect(recorded?.entityId).toBe(issueId);
+      const recordedDetails = recorded?.details as Record<string, unknown>;
+      expect(recordedDetails.errorClass).toBe("TypeError");
+      expect(recordedDetails.identifier).toBe(identifier);
+      expect(JSON.stringify(recordedDetails)).not.toContain("test-secret");
     });
 
     it("PATCH: a typed HttpError refusal keeps its own status and body (recorder is scoped to 500s)", async () => {
