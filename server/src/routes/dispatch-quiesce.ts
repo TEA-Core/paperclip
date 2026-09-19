@@ -22,6 +22,9 @@ import {
   dispatchQuiesce,
   resolveDispatchQuiesceTtlMs,
 } from "../services/dispatch-quiesce.js";
+// The request schema lives in its own module so `openapi.ts` can import it
+// without importing this route handler (and with it `services/heartbeat.ts`).
+import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce-schemas.js";
 
 /**
  * SUP-9857. Deploy-time dispatch quiesce.
@@ -48,13 +51,6 @@ function assertCanReadDispatchQuiesce(req: Request) {
     throw forbidden("Board access required");
   }
 }
-
-export const dispatchQuiesceRequestSchema = z.object({
-  /** Free-text label for who engaged the quiesce, surfaced in `GET` and the audit log. */
-  reason: z.string().trim().min(1).max(200).optional(),
-  /** Bounded by {@link resolveDispatchQuiesceTtlMs}; see that function for the clamp. */
-  ttlSeconds: z.number().int().positive().optional(),
-});
 
 export function dispatchQuiesceRoutes(db: Db) {
   const router = Router();

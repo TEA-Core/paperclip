@@ -268,8 +268,13 @@ import {
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
 } from "@paperclipai/shared";
-import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce.js";
-import { agentInstallationTokenRequestSchema } from "./agent-github-tokens.js";
+// Schema-only modules: `openapi.ts` must not import a route handler. It is
+// reached from `services/native-runtime/runner-api-catalog.ts`, and the route
+// handlers import `services/heartbeat.ts`, so importing them here closed the
+// cycle heartbeat.ts -> native-runtime -> runner-api-catalog -> openapi.ts ->
+// route -> heartbeat.ts.
+import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce-schemas.js";
+import { agentInstallationTokenRequestSchema } from "./agent-github-tokens-schemas.js";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,

@@ -12,7 +12,7 @@ import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
 import {
   GITHUB_INSTALLATION_PERMISSION_LEVELS,
   GITHUB_INSTALLATION_PERMISSION_NAMES,
-} from "../routes/agent-github-tokens.js";
+} from "../routes/agent-github-tokens-schemas.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROUTES_DIR = path.resolve(__dirname, "../routes");
@@ -932,6 +932,25 @@ describe("openapi routes", () => {
     // terminal, or foreign session id.
     const codes = Object.keys(cancel.responses).sort();
     expect(codes).toEqual(["200", "401", "403", "404"]);
+  });
+
+  it("imports no route-handler module (the heartbeat.ts cyclic-import guard)", () => {
+    // SUP-16560. `openapi.ts` is reached from
+    // services/native-runtime/runner-api-catalog.ts, and the route handlers
+    // import services/heartbeat.ts, so a route-handler import here closes the
+    // cycle heartbeat.ts -> native-runtime -> runner-api-catalog -> openapi.ts
+    // -> route -> heartbeat.ts. Request schemas live in `*-schemas.ts` modules
+    // so this file can publish the contract without importing a handler.
+    const source = fs.readFileSync(path.join(ROUTES_DIR, "openapi.ts"), "utf8");
+    const relativeImports = [...source.matchAll(/from\s+["']\.\/([^"']+)["']/g)].map(
+      (match) => match[1].replace(/\.js$/, ".ts"),
+    );
+    const routeRegistrations = /\brouter\.(get|post|put|patch|delete|use)\(/;
+    const handlerImports = relativeImports.filter((specifier) => {
+      const target = path.join(ROUTES_DIR, specifier);
+      return fs.existsSync(target) && routeRegistrations.test(fs.readFileSync(target, "utf8"));
+    });
+    expect(handlerImports, "openapi.ts must not import a route-handler module").toEqual([]);
   });
 });
 

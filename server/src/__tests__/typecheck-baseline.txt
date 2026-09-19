@@ -1135,7 +1135,7 @@ server/src/__tests__/native-status-arbiter-corpus.test.ts(1448,29): TS18047
 server/src/__tests__/native-status-arbiter-corpus.test.ts(1448,60): TS18047
 server/src/__tests__/native-status-arbiter-corpus.test.ts(1452,11): TS2345
 server/src/__tests__/onboarding-seed-route.test.ts(58,82): TS2345
-server/src/__tests__/openapi-routes.test.ts(1500,27): TS7006
+server/src/__tests__/openapi-routes.test.ts(1519,27): TS7006
 server/src/__tests__/openclaw-gateway-adapter.test.ts(608,47): TS2741
 server/src/__tests__/paperclip-semantic-conformance.test.ts(36,13): TS2749
 server/src/__tests__/permissions-upgrade-boundary-routes.test.ts(49,5): TS2322
