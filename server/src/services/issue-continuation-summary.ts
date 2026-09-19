@@ -12,14 +12,14 @@ const PATH_CANDIDATE_RE = /(?:^|[\s`"'(])((?:server|ui|packages|doc|scripts|\.gi
 const WAITING_FOR_REVIEW_OR_APPROVAL_RE =
   /\bwait(?:ing)? for\b.{0,160}\b(?:review(?:er)?(?: feedback)?|approval|board|human|user|operator)\b/i;
 
-// SUP-16853: a prior run's `result_json.summary` sometimes narrates a comment
-// write it never actually made (or that belongs to a sibling run). When that
-// summary is re-injected under "Recent Concrete Actions" the next run reads it
-// as an achievement and does not re-post. These detectors port the SUP-16848
-// measurement's "completed-comment assertion" rule (summary-text half only; the
-// builder has no access to the run's ndjson transcript). A clause asserts a
-// completed comment write when it matches either pattern below and carries no
-// negation/intent marker.
+// SUP-16853: a prior run's narration sometimes asserts a comment write it never
+// actually made (or that belongs to a sibling run). When that narration is
+// re-injected under "Recent Concrete Actions" the next run reads it as an
+// achievement and does not re-post. These detectors port the SUP-16848
+// measurement's "completed-comment assertion" rule. A clause asserts a
+// completed comment write when it matches either pattern below, carries no
+// negation/intent marker, and is not source-code-comment narration (see the
+// over-suppression guard below).
 const COMPLETED_COMMENT_CLAIM_RES = [
   // passive/auxiliary: "comment posted", "comment was posted", "comment posted successfully"
   /\bcomments?\s+(?:was|were|is|are|has been|have been)?\s*(?:successfully\s+)?(?:posted|created|added|left|recorded|filed|written|submitted|landed)\b/i,
@@ -27,6 +27,37 @@ const COMPLETED_COMMENT_CLAIM_RES = [
   /\b(?:posted|created|added|left|recorded|filed|wrote|submitted)\s+(?:a|an|the|my|its|\d+-line|[\w-]+-line)?\s*(?:[\w-]+\s+){0,2}comments?\b/i,
 ];
 const CLAUSE_SPLIT_RE = /[.;\n,]/;
+const CLAUSE_SPLIT_CAPTURE_RE = /([.;\n,])/;
+// SUP-16853 over-suppression guard (support-CR round 1, HIGH): the comment
+// patterns above also match ordinary source-code-comment narration
+// ("Added explanatory comments to the module", "left inline comments in the
+// code", "created a comment explaining the regex"). Those are not issue-comment
+// writes, so a clause carrying code/doc context is never treated as a claim.
+// Deliberately fail-open: a real issue-comment claim that happens to mention
+// code is left verbatim rather than risking the guard eating a real action.
+const CODE_COMMENT_CONTEXT_RES = [
+  /\bcode\b/,
+  /\bcodebase\b/,
+  /\binline\b/,
+  /\bexplanatory\b/,
+  /\bexplanations?\b/,
+  /\bjsdoc\b/,
+  /\bdocstrings?\b/,
+  /\bdoc comments?\b/,
+  /\bheader comments?\b/,
+  /\bcommented out\b/,
+  /\bannotat(?:e|ed|es|ing|ion|ions)\b/,
+  /\bregex(?:es)?\b/,
+  /\bmodules?\b/,
+  /\bfunctions?\b/,
+  /\bmethods?\b/,
+  /\bclass(?:es)?\b/,
+  /\bvariables?\b/,
+  /\bparsers?\b/,
+  /\bhelpers?\b/,
+  /\bfiles?\b/,
+  /\bexplaining\b/,
+];
 const NON_CLAIM_MARKERS = [
   "no ",
   "not ",
@@ -62,6 +93,7 @@ const NON_CLAIM_MARKERS = [
 function clauseIsCompletedCommentClaim(clause: string): boolean {
   const lower = clause.toLowerCase();
   if (NON_CLAIM_MARKERS.some((marker) => lower.includes(marker))) return false;
+  if (CODE_COMMENT_CONTEXT_RES.some((re) => re.test(lower))) return false;
   return COMPLETED_COMMENT_CLAIM_RES.some((re) => re.test(clause));
 }
 
@@ -90,6 +122,15 @@ type RunSummaryInput = {
   stdoutExcerpt?: string | null;
   stderrExcerpt?: string | null;
   finishedAt?: Date | null;
+  /**
+   * SUP-16853: the run's own assistant narration, sourced from its transcript
+   * when `result_json.summary` is absent (the interrupted/orphaned case — run
+   * `50df0b3f` asserted "the comment posted successfully" with `result_json`
+   * null). Used only to *detect* an unbacked comment claim; it is never
+   * surfaced verbatim, so a non-claiming interrupted run keeps the existing
+   * "no result summary" line.
+   */
+  narrationText?: string | null;
 };
 
 type AgentSummaryInput = {
@@ -193,12 +234,89 @@ export function continuationSummaryParksExecutor(body: string | null | undefined
   return WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(nextAction);
 }
 
-function rewordUnverifiedCommentClaim(run: RunSummaryInput): string {
+function unverifiedCommentClaimCaveat(run: RunSummaryInput): string {
   const endedUnsuccessfully = run.status === "interrupted" || run.status === "failed";
   const lead = endedUnsuccessfully
-    ? `Prior run \`${run.id}\` ended \`${run.status}\` and its summary asserted a comment was posted, but`
-    : `Prior run \`${run.id}\` summary asserted a comment was posted, but`;
-  return `${lead} no comment owned by that run (createdByRunId/derivedCreatedByRunId) was found on this issue. Treat that write as unverified — re-check before relying on it.`;
+    ? `Prior run \`${run.id}\` ended \`${run.status}\` and its narration asserted a comment was posted, but`
+    : `Prior run \`${run.id}\` narrated a comment write, but`;
+  return `[${lead} no comment owned by that run (createdByRunId/derivedCreatedByRunId) was found on this issue — treat that write as unverified.]`;
+}
+
+/**
+ * SUP-16853 (support-CR round 1, HIGH): reword only the offending clause(s) and
+ * keep the rest of the summary. Replacing the whole line used to drop every
+ * other concrete action the run narrated and assert a comment claim that was
+ * not there.
+ */
+function rewriteUnbackedCommentClaims(text: string, run: RunSummaryInput): string {
+  const tokens = text.split(CLAUSE_SPLIT_CAPTURE_RE);
+  const kept: string[] = [];
+  let removed = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? "";
+    if (index % 2 === 0 && clauseIsCompletedCommentClaim(token)) {
+      removed = true;
+      continue;
+    }
+    kept.push(token);
+  }
+  if (!removed) return truncateText(text, SUMMARY_SECTION_MAX_CHARS);
+  const keptText = kept.join("").replace(/^[.;,\s]+/, "").trim();
+  const caveat = unverifiedCommentClaimCaveat(run);
+  if (keptText.length === 0) return truncateText(caveat, SUMMARY_SECTION_MAX_CHARS);
+  // Reserve room for the caveat so the unverified marker is never the part that
+  // gets truncated away on a long summary.
+  const room = Math.max(0, SUMMARY_SECTION_MAX_CHARS - caveat.length - 1);
+  return `${truncateText(keptText, room)} ${caveat}`;
+}
+
+/**
+ * SUP-16853: extract the run's own assistant narration from its persisted
+ * ndjson log. Only assistant text frames are collected — acpx streams
+ * `acpx.text_delta` (channel `output`) and opencode emits `text` items with a
+ * `part.text`. Tool-call frames are deliberately ignored so a command that
+ * merely mentions "comment posted" is not read as narration. Returns null when
+ * the log holds no assistant text (e.g. the run was orphaned before it spoke).
+ */
+export function extractRunLogAssistantNarration(content: string | null | undefined): string | null {
+  if (!content) return null;
+  const parts: string[] = [];
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const chunk = (entry as { chunk?: unknown } | null)?.chunk;
+    if (typeof chunk !== "string") continue;
+    let frame: unknown;
+    try {
+      frame = JSON.parse(chunk);
+    } catch {
+      continue;
+    }
+    if (!frame || typeof frame !== "object" || Array.isArray(frame)) continue;
+    const record = frame as Record<string, unknown>;
+    const type = record.type;
+    if (type === "acpx.text_delta" && record.channel === "output" && typeof record.text === "string") {
+      parts.push(record.text);
+      continue;
+    }
+    const part = record.part;
+    if (type === "text" && part && typeof part === "object" && !Array.isArray(part)) {
+      const partText = (part as Record<string, unknown>).text;
+      if (typeof partText === "string") parts.push(partText);
+      continue;
+    }
+    if (type === "agentMessage" && typeof record.text === "string") {
+      parts.push(record.text);
+    }
+  }
+  const narration = parts.join("").trim();
+  return narration.length > 0 ? narration : null;
 }
 
 export function buildContinuationSummaryMarkdown(input: {
@@ -217,17 +335,23 @@ export function buildContinuationSummaryMarkdown(input: {
 }) {
   const { issue, run, agent } = input;
   const resultSummary = readResultSummary(run.resultJson);
+  // The claim may live in `result_json.summary` (the six misattribution cases)
+  // or, when that is null (the interrupted named case), in the run transcript
+  // the caller supplies. Detection only — narration is never surfaced verbatim.
+  const claimSource = resultSummary ?? run.narrationText ?? null;
   const unbackedCommentClaim =
-    resultSummary != null &&
+    claimSource != null &&
     input.runOwnedCommentArtifact === false &&
-    summaryAssertsCompletedCommentWrite(resultSummary);
+    summaryAssertsCompletedCommentWrite(claimSource);
 
   const summaryLine =
-    resultSummary == null
-      ? "No adapter-provided result summary was captured for this run."
+    resultSummary != null
+      ? unbackedCommentClaim
+        ? rewriteUnbackedCommentClaims(resultSummary, run)
+        : truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS)
       : unbackedCommentClaim
-        ? rewordUnverifiedCommentClaim(run)
-        : truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS);
+        ? unverifiedCommentClaimCaveat(run)
+        : "No adapter-provided result summary was captured for this run.";
 
   const recentActions = [
     `Run \`${run.id}\` finished with status \`${run.status}\`${run.finishedAt ? ` at ${run.finishedAt.toISOString()}` : ""}.`,
