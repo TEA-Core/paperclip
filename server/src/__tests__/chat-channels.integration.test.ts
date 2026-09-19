@@ -1080,16 +1080,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         console.warn("chat fixture service shutdown failed", reason);
       if (shutdownFailures.length > 0) throw shutdownFailures[0];
     } finally {
-      if (fixtureCompanies.size > 0) {
-        await db.update(chatEndpoints).set({ status: "paused" })
-          .where(and(inArray(chatEndpoints.companyId, [...fixtureCompanies]), eq(chatEndpoints.status, "active")));
-        // The milestone scanner also considers paused endpoints while their
-        // conversations are active. Retire those bindings after assertions.
-        await db.update(chatConversations).set({ state: "completed" })
-          .where(and(inArray(chatConversations.companyId, [...fixtureCompanies]), inArray(chatConversations.state, ["active", "waiting"])));
+      // The registries must be emptied even when the database cleanup below
+      // rejects. They are shared across cases, so leaving a failed test's
+      // entries in place makes the NEXT afterEach shut down this test's
+      // services a second time and re-run its company cleanup — turning one
+      // failure into a cascade across the remaining 380-odd cases.
+      try {
+        if (fixtureCompanies.size > 0) {
+          await db.update(chatEndpoints).set({ status: "paused" })
+            .where(and(inArray(chatEndpoints.companyId, [...fixtureCompanies]), eq(chatEndpoints.status, "active")));
+          // The milestone scanner also considers paused endpoints while their
+          // conversations are active. Retire those bindings after assertions.
+          await db.update(chatConversations).set({ state: "completed" })
+            .where(and(inArray(chatConversations.companyId, [...fixtureCompanies]), inArray(chatConversations.state, ["active", "waiting"])));
+        }
+      } finally {
+        fixtureServices.clear();
+        fixtureCompanies.clear();
       }
-      fixtureServices.clear();
-      fixtureCompanies.clear();
     }
   });
 
