@@ -98,6 +98,9 @@ export interface HostRestartStrandSourceRun {
 
 export interface HostRestartStrandLatestRun extends HostRestartStrandSourceRun {
   resultJson: Record<string, unknown> | null;
+  // Selected for the shared session-goal hold probe (SUP-16557); absent on
+  // callers that only need the host-restart marker decision.
+  contextSnapshot?: Record<string, unknown> | null;
 }
 
 export interface HostRestartStrandFacts {
@@ -472,10 +475,13 @@ export interface HostRestartStrandSweepInput {
     bootId: string | null,
   ) => Promise<boolean>;
   // Injectable fact-gathering seam for the shared valid-path holds. Defaults to
-  // `collectStrandSkipFacts`; tests pass a fake to stay hermetic.
+  // `collectStrandSkipFacts`; tests pass a fake to stay hermetic. The latest
+  // run's context snapshot is threaded through so the shared collector can
+  // probe the durable session-goal hold without re-querying the run row.
   gatherStrandSkipFacts?: (
     db: Db,
     candidate: HostRestartStrandCandidate,
+    latestRunContextSnapshot: Record<string, unknown> | null,
   ) => Promise<StrandSkipFacts>;
 }
 
@@ -496,6 +502,7 @@ function emptySkipped(): HostRestartStrandSkip {
 async function defaultGatherStrandSkipFacts(
   db: Db,
   candidate: HostRestartStrandCandidate,
+  latestRunContextSnapshot: Record<string, unknown> | null,
 ): Promise<StrandSkipFacts> {
   return collectStrandSkipFacts(db, {
     companyId: candidate.companyId,
@@ -510,6 +517,7 @@ async function defaultGatherStrandSkipFacts(
       ? candidate.executionState
       : null,
     originKind: candidate.originKind ?? null,
+    latestRunContextSnapshot,
   });
 }
 
@@ -712,6 +720,7 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
         status: heartbeatRuns.status,
         errorCode: heartbeatRuns.errorCode,
         resultJson: heartbeatRuns.resultJson,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
       .where(issueRunCondition(candidate.companyId, candidate.id))
@@ -728,6 +737,10 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
           resultJson:
             latestRunRow.resultJson && typeof latestRunRow.resultJson === "object"
               ? (latestRunRow.resultJson as Record<string, unknown>)
+              : null,
+          contextSnapshot:
+            latestRunRow.contextSnapshot && typeof latestRunRow.contextSnapshot === "object"
+              ? (latestRunRow.contextSnapshot as Record<string, unknown>)
               : null,
         }
       : null;
@@ -766,7 +779,11 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
 
     const skipFacts =
       cheapDecision.action === "escalate"
-        ? await (input.gatherStrandSkipFacts ?? defaultGatherStrandSkipFacts)(db, candidate)
+        ? await (input.gatherStrandSkipFacts ?? defaultGatherStrandSkipFacts)(
+            db,
+            candidate,
+            latestRun?.contextSnapshot ?? null,
+          )
         : null;
 
     facts.set(candidate.id, { ...cheapFacts, skipFacts });

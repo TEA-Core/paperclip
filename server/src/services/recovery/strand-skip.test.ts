@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
+  agentSessionGoalActions,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   approvals,
+  heartbeatRuns,
   issueApprovals,
   issueRecoveryActions,
   issueRelations,
@@ -22,6 +25,7 @@ import {
   collectStrandSkipFacts,
   evaluateStrandSkipFacts,
   hasActiveReviewStageExecutionState,
+  isSessionGoalDrivenContext,
   type StrandSkipFacts,
 } from "./strand-skip.js";
 
@@ -126,6 +130,7 @@ function factsWith(overrides: Partial<StrandSkipFacts> = {}): StrandSkipFacts {
     pluginManagedLifecycle: false,
     hasOpenRecoveryAction: false,
     hasActiveRoutineContinuation: false,
+    hasActiveSessionGoal: false,
     isExternalPullAssignee: false,
     hasPendingWake: false,
     hasPendingInteractionOrApproval: false,
@@ -235,13 +240,31 @@ describe("strand skip predicate matches the successful-run handoff", () => {
     expect(decide().kind).toBe("enqueue");
   });
 
-  it("keeps the open recovery action as the one sweep-only hold", () => {
-    // Every other hold has a handoff twin (checked above); the recovery action
-    // is the extra signal the handoff cannot express, and it wins when paired.
+  it("keeps the sweep-only holds out of the handoff parity set", () => {
+    // Every other hold has a handoff twin (checked above). The open recovery
+    // action is the extra signal the handoff cannot express; the session-goal
+    // hold is the handoff wrapper's early return, not a
+    // `decideSuccessfulRunHandoff` reason. Each wins when paired.
     expect(evaluateStrandSkipFacts(factsWith({ hasOpenRecoveryAction: true }))).toEqual({
       skip: true,
       reason: STRAND_SKIP_REASONS.openRecoveryAction,
     });
+    expect(evaluateStrandSkipFacts(factsWith({ hasActiveSessionGoal: true }))).toEqual({
+      skip: true,
+      reason: STRAND_SKIP_REASONS.activeSessionGoal,
+    });
+  });
+});
+
+describe("isSessionGoalDrivenContext", () => {
+  it("recognises a goal-control or resume-heartbeat run context", () => {
+    expect(isSessionGoalDrivenContext(null)).toBe(false);
+    expect(isSessionGoalDrivenContext(undefined)).toBe(false);
+    expect(isSessionGoalDrivenContext({})).toBe(false);
+    expect(isSessionGoalDrivenContext({ goalControlRequestId: "" })).toBe(false);
+    expect(isSessionGoalDrivenContext({ goalControlRequestId: "req-1" })).toBe(true);
+    expect(isSessionGoalDrivenContext({ resumeSessionGoalHeartbeat: true })).toBe(true);
+    expect(isSessionGoalDrivenContext({ resumeSessionGoalHeartbeat: false })).toBe(false);
   });
 });
 
@@ -395,5 +418,73 @@ describe("collectStrandSkipFacts", () => {
     }));
     expect(facts.hasExecutionState).toBe(true);
     expect(facts.pluginManagedLifecycle).toBe(true);
+  });
+
+  // A durable session-goal wake: the goal projection the handoff wrapper reads
+  // is the one `runnerGoalService.projection` builds from the agent task session.
+  function goalState(goalStatus: string): FakeDbState {
+    return {
+      rows: new Map<unknown, unknown[]>([
+        [issues, [{ id: "issue-1", companyId: "company-1", assigneeAgentId: "agent-1" }]],
+        [agents, [{ id: "agent-1", companyId: "company-1", adapterType: "opencode_local", adapterConfig: {} }]],
+        [agentTaskSessions, [{
+          id: "session-1",
+          goalJson: { objective: "Keep going", status: goalStatus },
+          goalRevision: 1,
+        }]],
+        [agentSessionGoalActions, []],
+        [heartbeatRuns, []],
+      ]),
+    };
+  }
+
+  it("holds a goal-driven run while its session goal is not complete", async () => {
+    const facts = await collectStrandSkipFacts(fakeDb(goalState("active")), collectInput({
+      latestRunContextSnapshot: { goalControlRequestId: "req-1" },
+    }));
+    expect(facts.hasActiveSessionGoal).toBe(true);
+    expect(evaluateStrandSkipFacts(facts)).toEqual({
+      skip: true,
+      reason: STRAND_SKIP_REASONS.activeSessionGoal,
+    });
+  });
+
+  it("recognises the resume-heartbeat marker as a goal-driven run", async () => {
+    const facts = await collectStrandSkipFacts(fakeDb(goalState("paused")), collectInput({
+      latestRunContextSnapshot: { resumeSessionGoalHeartbeat: true },
+    }));
+    expect(facts.hasActiveSessionGoal).toBe(true);
+  });
+
+  it("releases the hold once the session goal is complete", async () => {
+    const facts = await collectStrandSkipFacts(fakeDb(goalState("complete")), collectInput({
+      latestRunContextSnapshot: { goalControlRequestId: "req-1" },
+    }));
+    expect(facts.hasActiveSessionGoal).toBe(false);
+  });
+
+  it("does not probe a session goal for a non-goal run", async () => {
+    const facts = await collectStrandSkipFacts(fakeDb(goalState("active")), collectInput({
+      latestRunContextSnapshot: { issueId: "issue-1" },
+    }));
+    expect(facts.hasActiveSessionGoal).toBe(false);
+  });
+
+  it("does not probe a session goal when the issue has no assignee", async () => {
+    const facts = await collectStrandSkipFacts(fakeDb(goalState("active")), collectInput({
+      assigneeAgentId: null,
+      latestRunContextSnapshot: { goalControlRequestId: "req-1" },
+    }));
+    expect(facts.hasActiveSessionGoal).toBe(false);
+  });
+
+  it("holds a goal-driven run with no resolvable session, matching the handoff", async () => {
+    // The handoff wrapper early-returns on `projection?.goal?.status !==
+    // "complete"`, and `undefined !== "complete"` — so a marker with no session
+    // still holds. Lock that parity rather than reinterpreting it.
+    const facts = await collectStrandSkipFacts(fakeDb({ rows: new Map() }), collectInput({
+      latestRunContextSnapshot: { goalControlRequestId: "req-1" },
+    }));
+    expect(facts.hasActiveSessionGoal).toBe(true);
   });
 });

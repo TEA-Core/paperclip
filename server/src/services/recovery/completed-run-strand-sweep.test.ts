@@ -672,6 +672,7 @@ const NO_SKIP_FACTS: StrandSkipFacts = {
   pluginManagedLifecycle: false,
   hasOpenRecoveryAction: false,
   hasActiveRoutineContinuation: false,
+  hasActiveSessionGoal: false,
   isExternalPullAssignee: false,
   hasPendingWake: false,
   hasPendingInteractionOrApproval: false,
@@ -699,6 +700,7 @@ const VALID_PATH_HOLDS: Array<{ hold: keyof StrandSkipFacts; label: string }> = 
   { hold: "pluginManagedLifecycle", label: "plugin-managed lifecycle" },
   { hold: "hasOpenRecoveryAction", label: "open recovery action (SUP-16504)" },
   { hold: "hasActiveRoutineContinuation", label: "active routine continuation" },
+  { hold: "hasActiveSessionGoal", label: "durable session goal" },
   { hold: "isExternalPullAssignee", label: "external-pull assignee" },
   { hold: "hasPendingWake", label: "queued or deferred wake" },
   { hold: "hasPendingInteractionOrApproval", label: "pending interaction or approval" },
@@ -821,5 +823,38 @@ describe("valid-path holds (SUP-16504)", () => {
     });
 
     expect(gatherStrandSkipFacts).not.toHaveBeenCalled();
+  });
+
+  it("threads the latest run's context snapshot into the hold gatherer", async () => {
+    // The shared collector probes the durable session-goal hold from the run
+    // context, and the sweep already selects that column — prove it is passed
+    // through rather than re-queried (SUP-16557).
+    const contextSnapshot = { issueId: "issue-1", goalControlRequestId: "req-1" };
+    const state: FakeDbState = {
+      candidates: [makeCandidate({ id: "issue-1" })],
+      liveRunQueue: [[]],
+      latestRunRows: [makeLatestRun({ contextSnapshot })],
+      escalationRows: [],
+      updates: 0,
+    };
+    const gatherStrandSkipFacts = vi.fn(
+      async () => ({ ...NO_SKIP_FACTS, hasActiveSessionGoal: true }),
+    );
+
+    const report = await sweepCompletedRunStrandedIssues({
+      db: makeFakeDb(state),
+      now: NOW,
+      idleThresholdMs: IDLE_THRESHOLD_MS,
+      escalateIssue: makeEscalateMock(),
+      gatherStrandSkipFacts,
+    });
+
+    expect(gatherStrandSkipFacts).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: "issue-1" }),
+      contextSnapshot,
+    );
+    expect(report.skipped.validPath).toEqual(["issue-1"]);
+    expect(report.escalated).toEqual([]);
   });
 });

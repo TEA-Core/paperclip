@@ -14,6 +14,7 @@ import {
 import { isExternalPullAgent } from "../agent-work-delivery.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
+import { runnerGoalService } from "../runner-goals.js";
 import { RECOVERY_ORIGIN_KINDS } from "./origins.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 
@@ -24,10 +25,12 @@ import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js"
 // card that already carried an escalated `missing_disposition` recovery action).
 //
 // The hold set mirrors the valid-path skips in `decideSuccessfulRunHandoff`
-// (see successful-run-handoff.ts) plus one row the handoff does not check: an
-// open `issue_recovery_actions` row on the source issue. Keep this as the single
-// copy — the drift between the handoff's list and a hand-copied sweep list is
-// what caused the bug.
+// (see successful-run-handoff.ts) plus two rows the pure decision does not
+// express: an open `issue_recovery_actions` row on the source issue, and a
+// durable session goal that owns the card's continuation (the handoff's wrapper
+// checks the latter before it calls the pure decision — see
+// `hasActiveSessionGoal`). Keep this as the single copy — the drift between the
+// handoff's list and a hand-copied sweep list is what caused the bug.
 
 export interface StrandSkipFacts {
   /**
@@ -45,6 +48,15 @@ export interface StrandSkipFacts {
   hasOpenRecoveryAction: boolean;
   /** An `active` routine has this issue as its `parentIssueId`. */
   hasActiveRoutineContinuation: boolean;
+  /**
+   * The card's most recent run woke for a durable session goal
+   * (`goalControlRequestId` / `resumeSessionGoalHeartbeat` in its
+   * `contextSnapshot`) and that goal's projection is not yet `complete`. Mirrors
+   * the early return in `handleSuccessfulRunHandoff` (heartbeat.ts): the durable
+   * session goal owns the card's continuation across the run boundary, so the
+   * completed run is not a strand.
+   */
+  hasActiveSessionGoal: boolean;
   /** The assignee agent receives its work out of band (`external_pull`). */
   isExternalPullAssignee: boolean;
   /** A queued/deferred/claimed `agent_wakeup_requests` row targets this issue. */
@@ -71,6 +83,7 @@ export const STRAND_SKIP_REASONS = {
   pluginManagedLifecycle: "issue lifecycle is owned by a plugin",
   openRecoveryAction: "open recovery action owns the ambiguity",
   activeRoutineContinuation: "active routine continuation owns the next action",
+  activeSessionGoal: "a durable session goal owns the next action",
   externalPull: "agent receives work out of band and cannot be judged by its run process",
   pendingWake: "issue already has a queued or deferred wake",
   pendingInteractionOrApproval: "pending interaction or approval owns the next action",
@@ -102,6 +115,7 @@ export function evaluateStrandSkipFacts(facts: StrandSkipFacts): StrandSkipDecis
   if (facts.pluginManagedLifecycle) return { skip: true, reason: STRAND_SKIP_REASONS.pluginManagedLifecycle };
   if (facts.hasOpenRecoveryAction) return { skip: true, reason: STRAND_SKIP_REASONS.openRecoveryAction };
   if (facts.hasActiveRoutineContinuation) return { skip: true, reason: STRAND_SKIP_REASONS.activeRoutineContinuation };
+  if (facts.hasActiveSessionGoal) return { skip: true, reason: STRAND_SKIP_REASONS.activeSessionGoal };
   if (facts.isExternalPullAssignee) return { skip: true, reason: STRAND_SKIP_REASONS.externalPull };
   if (facts.hasPendingWake) return { skip: true, reason: STRAND_SKIP_REASONS.pendingWake };
   if (facts.hasPendingInteractionOrApproval) return { skip: true, reason: STRAND_SKIP_REASONS.pendingInteractionOrApproval };
@@ -119,6 +133,42 @@ export interface CollectStrandSkipFactsInput {
   executionState: unknown;
   /** `issue.originKind`; passed through from the candidate row. */
   originKind: string | null;
+  /**
+   * `latestRun.contextSnapshot` for the card's most recent run. Both sweeps
+   * already select this column, so it is passed in rather than re-queried; the
+   * session-goal hold is only probed when this run was a durable goal wake.
+   */
+  latestRunContextSnapshot?: Record<string, unknown> | null;
+}
+
+// Mirrors the goal marker check in `handleSuccessfulRunHandoff` (heartbeat.ts):
+// a run that woke to deliver a session-goal control action or to resume a
+// durable session goal carries one of these markers in its context snapshot.
+export function isSessionGoalDrivenContext(
+  context: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!context) return false;
+  const requestId = context.goalControlRequestId;
+  return (
+    (typeof requestId === "string" && requestId.length > 0) ||
+    context.resumeSessionGoalHeartbeat === true
+  );
+}
+
+// A goal-driven run is only a valid continuation path while its session-goal
+// projection is not yet `complete` — the exact predicate the handoff wrapper
+// uses before it returns early. `null` (no session, or no goal) is not
+// `complete`, so it holds, matching the handoff.
+async function hasActiveSessionGoal(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  assigneeAgentId: string | null,
+  context: Record<string, unknown> | null | undefined,
+): Promise<boolean> {
+  if (!assigneeAgentId || !isSessionGoalDrivenContext(context)) return false;
+  const projection = await runnerGoalService(db).projection(companyId, issueId, assigneeAgentId);
+  return projection?.goal?.status !== "complete";
 }
 
 // Gather every hold for one card. Runs only the queries the sweeps do not
@@ -129,7 +179,7 @@ export async function collectStrandSkipFacts(
   db: Db,
   input: CollectStrandSkipFactsInput,
 ): Promise<StrandSkipFacts> {
-  const { companyId, issueId, assigneeAgentId, executionState, originKind } = input;
+  const { companyId, issueId, assigneeAgentId, executionState, originKind, latestRunContextSnapshot } = input;
 
   const [
     hasActiveRoutine,
@@ -264,11 +314,20 @@ export async function collectStrandSkipFacts(
         ).length > 0
       : false;
 
+  const hasActiveSessionGoalHold = await hasActiveSessionGoal(
+    db,
+    companyId,
+    issueId,
+    assigneeAgentId,
+    latestRunContextSnapshot,
+  );
+
   return {
     hasExecutionState: Boolean(executionState),
     pluginManagedLifecycle: Boolean(originKind?.startsWith("plugin:")),
     hasOpenRecoveryAction,
     hasActiveRoutineContinuation: hasActiveRoutine,
+    hasActiveSessionGoal: hasActiveSessionGoalHold,
     isExternalPullAssignee: assignee ? isExternalPullAgent(assignee) : false,
     hasPendingWake,
     hasPendingInteractionOrApproval: hasPendingInteraction || hasPendingApproval,
