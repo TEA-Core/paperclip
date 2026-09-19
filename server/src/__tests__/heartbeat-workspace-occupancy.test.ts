@@ -729,12 +729,14 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
         scheduledRetryReason: "transient_failure",
         scheduledRetryAttempt: 2,
       });
+      // SUP-16566: the wait budget is separate from the transient budget, so the
+      // first deferral after two transient retries is attempt 1, not 3.
       const firstWait = await scheduled(await heartbeat.scheduleBoundedRetry(secondRetry, OCCUPANCY_RETRY));
-      expect(firstWait).toMatchObject({ scheduledRetryReason: "execution_workspace_occupied", scheduledRetryAttempt: 3 });
+      expect(firstWait).toMatchObject({ scheduledRetryReason: "execution_workspace_occupied", scheduledRetryAttempt: 1 });
       expect(firstWait.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 2 });
       await cancelAsOccupied(firstWait.id);
       const secondWait = await scheduled(await heartbeat.scheduleBoundedRetry(firstWait.id, OCCUPANCY_RETRY));
-      expect(secondWait).toMatchObject({ scheduledRetryReason: "execution_workspace_occupied", scheduledRetryAttempt: 4 });
+      expect(secondWait).toMatchObject({ scheduledRetryReason: "execution_workspace_occupied", scheduledRetryAttempt: 2 });
       expect(secondWait.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 2 });
       await failBeforeProvider(secondWait.id);
       const failedAfterWait = await readRun(secondWait.id);
@@ -859,6 +861,150 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
       );
       expect(busyAfterOccupancy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 6 });
       expect(busyAfterOccupancy.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 1 });
+    }, 60_000);
+
+    // SUP-16566 (operator-mandated test group 1): the transient-retry budget and
+    // the occupancy-deferral budget are separate. A first deferral starts at 1
+    // no matter how many transient retries came before, so N transient retries
+    // never shrink — and never drop — the eight-deferral wait.
+    it.each([0, 3, 8, 9])(
+      "grants the full eight-deferral wait after %i transient-failure retries",
+      async (transientRetries) => {
+        const seeded = await seedSharedWorkspaceTargets(db, os.tmpdir());
+        const heartbeat = heartbeatService(db);
+
+        // The run that meets the occupied workspace: a transient-retry
+        // successor (its reason is transient_failure, so its attempt is the
+        // transient count) that the occupancy guard just cancelled.
+        let predecessor: string = await insertContenderRun(seeded, {
+          status: "cancelled",
+          errorCode: "execution_workspace_occupied",
+          scheduledRetryReason: "transient_failure",
+          scheduledRetryAttempt: transientRetries,
+        });
+
+        for (let deferral = 1; deferral <= 8; deferral += 1) {
+          const successor = await scheduled(await heartbeat.scheduleBoundedRetry(predecessor, OCCUPANCY_RETRY));
+          expect(successor).toMatchObject({
+            scheduledRetryReason: "execution_workspace_occupied",
+            scheduledRetryAttempt: deferral,
+          });
+          // The pre-wait failure count rides along, so the wait does not reset
+          // the transient budget.
+          expect(successor.contextSnapshot).toMatchObject({
+            failureRetriesBeforeWorkspaceWait: transientRetries,
+          });
+          await cancelAsOccupied(successor.id);
+          predecessor = successor.id;
+        }
+
+        // The wait is exhausted only after all eight deferrals, exactly as with
+        // no prior transient retries.
+        expect(await heartbeat.scheduleBoundedRetry(predecessor, OCCUPANCY_RETRY)).toMatchObject({
+          outcome: "retry_exhausted",
+          attempt: 9,
+          maxAttempts: 8,
+        });
+      },
+      60_000,
+    );
+
+    // SUP-16566 (operator-mandated test group 2): the combined transient-retry
+    // plus occupancy-deferral chain must terminate. The transient count is
+    // carried across every wait (so a wait cannot reset it) and the number of
+    // waits is bounded by the transient budget, so there is no endless
+    // ping-pong in which each counter resets the other.
+    it("bounds the combined transient-failure and occupancy-deferral chain", async () => {
+      const seeded = await seedSharedWorkspaceTargets(db, os.tmpdir());
+      const heartbeat = heartbeatService(db);
+      const TRANSIENT_MAX_ATTEMPTS = 2;
+
+      let current: string = await insertContenderRun(seeded, {
+        status: "cancelled",
+        errorCode: "execution_workspace_occupied",
+        scheduledRetryReason: "transient_failure",
+        scheduledRetryAttempt: 0,
+      });
+      let transientRetries = 0;
+      let occupancyDeferrals = 0;
+      let hops = 0;
+      let lastOutcome: Awaited<ReturnType<Heartbeat["scheduleBoundedRetry"]>> | null = null;
+      const cap = 40;
+
+      for (; hops < cap; hops += 1) {
+        // The workspace is occupied: defer once.
+        const deferred = await heartbeat.scheduleBoundedRetry(current, OCCUPANCY_RETRY);
+        if (deferred.outcome !== "scheduled" || !deferred.run) {
+          lastOutcome = deferred;
+          break;
+        }
+        const deferredRun = await readRun(deferred.run.id);
+        occupancyDeferrals += 1;
+        // Every wait starts its own deferral budget at 1 and carries the real
+        // transient count forward, so neither counter resets the other.
+        expect(deferredRun.scheduledRetryAttempt).toBe(1);
+        expect(deferredRun.contextSnapshot).toMatchObject({
+          failureRetriesBeforeWorkspaceWait: transientRetries,
+        });
+        await failBeforeProvider(deferredRun.id);
+
+        // Then the run fails for real before the provider starts.
+        const retried = await heartbeat.scheduleBoundedRetry(deferredRun.id, { random: () => 0 });
+        if (retried.outcome !== "scheduled" || !retried.run) {
+          lastOutcome = retried;
+          break;
+        }
+        transientRetries += 1;
+        current = retried.run.id;
+      }
+
+      expect(lastOutcome?.outcome).toBe("retry_exhausted");
+      expect(transientRetries).toBe(TRANSIENT_MAX_ATTEMPTS);
+      expect(occupancyDeferrals).toBe(TRANSIENT_MAX_ATTEMPTS + 1);
+      // The whole chain is bounded well below the safety cap.
+      expect(hops).toBeLessThan(cap);
+      expect(occupancyDeferrals).toBeLessThanOrEqual((TRANSIENT_MAX_ATTEMPTS + 1) * 8);
+    }, 60_000);
+
+    // SUP-16566 (operator-mandated test group 3): the attempt number a deferral
+    // notice reports is the deferral count actually written to the successor,
+    // and a real failure after a wait reports the carried transient count. The
+    // two counters never disagree with the notice (before the fix the notice
+    // said 1 while the successor was scheduled at N+1).
+    it("reports notice attempts that match the count actually used", async () => {
+      const seeded = await seedSharedWorkspaceTargets(db, os.tmpdir());
+      const heartbeat = heartbeatService(db);
+
+      let predecessor = await readRun(await insertContenderRun(seeded, {
+        status: "cancelled",
+        errorCode: "execution_workspace_occupied",
+        scheduledRetryReason: "transient_failure",
+        scheduledRetryAttempt: 2,
+      }));
+
+      for (let deferral = 1; deferral <= 3; deferral += 1) {
+        // onExecutionWorkspaceOccupied builds its "deferring attempt X/8"
+        // notice from this decision.
+        const notice = resolveExecutionWorkspaceOccupancyDecision({
+          reuseRequested: true,
+          occupied: true,
+          priorDeferrals: readExecutionWorkspaceOccupancyDeferrals(predecessor),
+        });
+        const successor = await scheduled(await heartbeat.scheduleBoundedRetry(predecessor.id, OCCUPANCY_RETRY));
+        expect(notice).toMatchObject({ action: "defer", attempt: deferral, maxDeferrals: 8 });
+        expect(successor.scheduledRetryAttempt).toBe(deferral);
+        await cancelAsOccupied(successor.id);
+        predecessor = await readRun(successor.id);
+      }
+
+      // A real failure after the wait reports the carried transient count + 1,
+      // not the deferral count.
+      await failBeforeProvider(predecessor.id);
+      expect(await heartbeat.scheduleBoundedRetry(predecessor.id, { random: () => 0 })).toMatchObject({
+        outcome: "retry_exhausted",
+        attempt: 3,
+        maxAttempts: 2,
+      });
     }, 60_000);
   });
 });

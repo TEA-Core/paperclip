@@ -15928,18 +15928,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
     // Fold 2c / occupancy-retry-count: executionFailureRetryCount now reads an
     // occupancy successor's carried pre-wait failure count, but the occupancy
-    // guard's own attempt must keep counting deferrals, so a deferral that
-    // follows a deferral still advances scheduledRetryAttempt. Every other
-    // predecessor enters the wait exactly as before.
-    const occupancyDeferralFollowsDeferral =
-      retryReason === EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON &&
-      run.scheduledRetryReason === EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON;
+    // guard's own attempt must keep counting deferrals. The wait budget is
+    // separate from the transient-failure budget: a first deferral is attempt 1
+    // no matter how many transient retries came before, and a deferral that
+    // follows a deferral advances the deferral count. Charging earlier transient
+    // retries to the wait shrank it by N and, at N >= maxDeferrals, dropped the
+    // deferral entirely (SUP-16566). Every other predecessor enters the wait
+    // exactly as before.
+    const occupancyPriorDeferrals =
+      retryReason === EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON
+        ? readExecutionWorkspaceOccupancyDeferrals(run)
+        : null;
     const nextAttempt =
       (retryReason === WORKSPACE_BUSY_RETRY_REASON ||
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
-      occupancyDeferralFollowsDeferral
+      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
         ? (run.scheduledRetryAttempt ?? 0)
-        : executionFailureRetryCount(run)) + 1;
+        : occupancyPriorDeferrals ?? executionFailureRetryCount(run)) + 1;
     const computedBaseSchedule =
       opts?.delayMs != null
         ? nextAttempt <= maxAttempts
