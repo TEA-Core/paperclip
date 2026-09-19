@@ -15657,10 +15657,20 @@ export function issueRoutes(
     // error handler renders a bare `{"error":"Internal server error"}` and the
     // close transaction has already rolled back, so the activity feed and
     // `issue_execution_decisions` retain ZERO rows about the attempt (observed
-    // live: SUP-16602's 01:05 done-close 500 left no trace of what threw). Record
-    // the error class and the issue durably, and put a `code`/`details` on the
-    // response so the caller can at least attribute the fault. Scoped to this
-    // route only — the generic 500 shape for other routes is out of scope.
+    // live: SUP-16602's 01:05 done-close 500 left no trace of what threw).
+    //
+    // Fix: attribution is DURABLE, not in-band. On a 500 the recorder settles
+    // a durable `activity_log` row before the response flushes —
+    // `action: "issue.patch_unhandled_error"` with
+    // `details: { identifier, errorClass, method, path }` — and the HTTP
+    // response stays the generic `{ error: "Internal server error" }`. Do NOT
+    // "fix" the 500 body to carry `code`/`details`/the message: the recorder's
+    // handle is narrowed to `{ error?: { name?: string } }`, so the error
+    // MESSAGE is unreachable by construction and only the error CLASS is
+    // persisted — widening the response would undo that leak-safety. To find a
+    // bare 500 here, read `GET /api/issues/:id/activity` and look for the row
+    // whose `action` is `issue.patch_unhandled_error`. Scoped to this route
+    // only — the generic 500 shape for other routes is out of scope.
     (req, res, next) => {
       const originalJson = res.json.bind(res);
       // Capture what the failure record needs WHILE the layer is still live:
