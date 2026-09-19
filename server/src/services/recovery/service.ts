@@ -7630,6 +7630,7 @@ export function recoveryService(
       deferredWakeupReplayLivePathSkipped: 0,
       deferredWakeupReplaySuppressedSkipped: 0,
       deferredWakeupReplayCutoffHeldSkipped: 0,
+      deferredWakeupReplayExecutionBlockerHeldSkipped: 0,
       deferredWakeupReplayCandidateLimitApplied: false,
       deferredWakeupReplayedIssueIds: [] as string[],
       todoStrandedParked: 0,
@@ -7697,6 +7698,7 @@ export function recoveryService(
     result.deferredWakeupReplayLivePathSkipped = deferredWakeupReplay.livePathSkipped;
     result.deferredWakeupReplaySuppressedSkipped = deferredWakeupReplay.suppressedSkipped;
     result.deferredWakeupReplayCutoffHeldSkipped = deferredWakeupReplay.cutoffHeldSkipped;
+    result.deferredWakeupReplayExecutionBlockerHeldSkipped = deferredWakeupReplay.executionBlockerHeldSkipped;
     result.deferredWakeupReplayCandidateLimitApplied = deferredWakeupReplay.candidateLimitApplied;
     result.deferredWakeupReplayedIssueIds = deferredWakeupReplay.issueIds;
 
@@ -8825,6 +8827,7 @@ export function recoveryService(
       livePathSkipped: 0,
       suppressedSkipped: 0,
       cutoffHeldSkipped: 0,
+      executionBlockerHeldSkipped: 0,
       candidateLimitApplied: false,
       wakeIds: [] as string[],
       issueIds: [] as string[],
@@ -8915,6 +8918,33 @@ export function recoveryService(
     const openIssueIds = new Set(openIssueRows.map((i) => i.id));
     const openIssueCreatedAt = new Map(openIssueRows.map((i) => [i.id, i.createdAt]));
 
+    // SUP-16879: which of these cards currently carry a durable no-replay
+    // execution hold. A `resolved` execution-reconciliation action with
+    // `automaticRecovery.replay: "blocked"` (SUP-16697) is cleared only by
+    // later real evidence, never by time. While it stands, re-driving the
+    // execution-blocked wake re-runs the SAME admission gate in enqueueWakeup,
+    // which refuses again and writes an identical deferrable receipt — so the
+    // card emits one skipped wake per sweep indefinitely (~122.5/hour, zero
+    // runs). One query for the whole candidate set, mirroring the predicate in
+    // `reconcileIssueGraphLiveness` that surfaces the hold to the board.
+    const durableNoReplayHoldIssueIds = new Set<string>();
+    if (candidateIssueIds.length > 0) {
+      const holdFilters = [
+        inArray(issueRecoveryActions.sourceIssueId, candidateIssueIds),
+        eq(issueRecoveryActions.status, "resolved"),
+        inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      ];
+      if (opts?.companyId) holdFilters.push(eq(issueRecoveryActions.companyId, opts.companyId));
+      const holdRows = await db
+        .select({ issueId: issueRecoveryActions.sourceIssueId })
+        .from(issueRecoveryActions)
+        .where(and(...holdFilters));
+      for (const holdRow of holdRows) {
+        if (holdRow.issueId) durableNoReplayHoldIssueIds.add(holdRow.issueId);
+      }
+    }
+
     for (const wake of candidates) {
       const issueId = issueIdByWake.get(wake.id);
 
@@ -8943,6 +8973,25 @@ export function recoveryService(
           && issueCreatedAt < opts.issueCreatedAtGte
         ) {
           result.cutoffHeldSkipped++;
+          continue;
+        }
+
+        // SUP-16879: the execution blocker that produced this skip is still in
+        // force as a durable no-replay hold, so the suppression has NOT lifted.
+        // Hold the row pending (no CAS, no enqueue): re-driving now takes the
+        // same execution-blocker branch in enqueueWakeup, which refuses and
+        // writes an identical deferrable receipt, once per sweep, forever. The
+        // sweep re-checks every tick and re-drives the instant the hold is
+        // cleared (board restore flips `replay` to `restored`, or the action
+        // leaves `resolved`). A transient execution blocker (an
+        // active/escalated recovery, conversation ownership) is not a resolved
+        // hold, so this guard does not match it and the prompt re-drive path is
+        // unchanged.
+        if (
+          wake.reason === "execution_reconciliation_required"
+          && durableNoReplayHoldIssueIds.has(issueId)
+        ) {
+          result.executionBlockerHeldSkipped++;
           continue;
         }
 

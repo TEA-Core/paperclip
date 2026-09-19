@@ -545,7 +545,7 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(row.finishedAt).not.toBeNull();
   });
 
-  it("SUP-16697: a plain-assignment wake held by a resolved replay-blocked execution hold is written as a durable deferral and re-driven", async () => {
+  it("SUP-16697 + SUP-16879: a wake held by a resolved replay-blocked execution hold is a durable deferral that is HELD pending, not re-driven every sweep", async () => {
     const { companyId, agentId, issueId } = await seedCard("todo");
     await db.insert(issueRecoveryActions).values({
       companyId,
@@ -561,9 +561,9 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     });
 
     // 1) enqueue → defer: the REAL write path takes the plain-assignment else
-    //    branch of deferBlockedExecution and records the execution wait. Before
-    //    SUP-16697 it hard-coded finishedAt, so the replay sweep could not see
-    //    it and the card went dark with no retry.
+    //    branch of deferBlockedExecution and records the execution wait. SUP-16697
+    //    made it unfinished so the replay sweep can SEE it instead of the card
+    //    going dark; SUP-16879 adds that seeing it must not mean re-driving it.
     const heartbeat = heartbeatService(db);
     const skippedRun = await heartbeat.wakeup(agentId, {
       source: "assignment",
@@ -590,17 +590,48 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(pending.finishedAt).toBeNull();
     expect(pending.payload).toMatchObject({ issueId });
 
-    // 2) re-drive: the deferrable reason is now in the replay predicate, so the
-    //    sweep selects the row and re-enqueues the original payload.
+    // 2) SUP-16879: while the durable hold stands the sweep must NOT re-drive.
+    //    Re-driving re-runs the SAME admission gate, which refuses again and
+    //    writes an identical deferrable receipt — one new skipped wake per sweep,
+    //    forever (~122.5/hour, zero runs). Five sweeps here stand in for five
+    //    ticks; the wake count must stay bounded at zero.
     const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
     const recovery = recoveryService(db, {
       enqueueWakeup,
       resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
     });
-    const result = await recovery.reconcileDeferredWakeupReplay();
 
-    expect(result.reDriven).toBe(1);
-    expect(result.issueIds).toContain(issueId);
+    for (let sweep = 0; sweep < 5; sweep += 1) {
+      const held = await recovery.reconcileDeferredWakeupReplay();
+      expect(held.reDriven).toBe(0);
+      expect(held.executionBlockerHeldSkipped).toBe(1);
+    }
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    // The row is neither re-driven nor retired: it stays the pending marker, so
+    // the wake is not lost and the card keeps its board surface (SUP-16697).
+    const stillPending = await db
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(stillPending.status).toBe("skipped");
+    expect(stillPending.finishedAt).toBeNull();
+
+    // 3) only when the hold is cleared by real evidence (a board restore flips
+    //    `replay`) does the sweep re-drive the original payload.
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: { automaticRecovery: { replay: "restored" } } })
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ));
+
+    const reDriven = await recovery.reconcileDeferredWakeupReplay();
+    expect(reDriven.reDriven).toBe(1);
+    expect(reDriven.issueIds).toContain(issueId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
     const [, opts] = enqueueWakeup.mock.calls[0] as [string, { payload?: Record<string, unknown> }];
     expect(opts.payload).toMatchObject({ issueId });
 
@@ -611,6 +642,50 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
       .then((rows) => rows[0]);
     expect(retired.status).toBe("skipped");
     expect(retired.finishedAt).not.toBeNull();
+  });
+
+  // SUP-16879 acceptance #3: the hold guard keys on the DURABLE hold only. An
+  // active/escalated execution-reconciliation action is a transient blocker — the
+  // recovery machinery is still working it — so the wake must keep its prompt
+  // re-drive path rather than being held behind a condition that is about to
+  // change on its own.
+  it("SUP-16879: an ACTIVE (transient) execution-reconciliation action does not hold the wake — it is re-driven promptly", async () => {
+    const { companyId, agentId, issueId } = await seedCard("in_progress");
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      returnOwnerAgentId: agentId,
+      cause: "legacy_execution_requires_reconciliation",
+      status: "active",
+      evidence: { automaticRecovery: { replay: "blocked" } },
+      fingerprint: randomUUID(),
+      nextAction: "Recovery is still working this execution.",
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_reconciliation_required",
+      status: "skipped",
+      finishedAt: null,
+      payload: { issueId },
+    });
+
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.executionBlockerHeldSkipped).toBe(0);
+    expect(result.reDriven).toBe(1);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
   // Regression (review round 1, `deferred-wake-replay-drops-generic-wake`): the
