@@ -1216,9 +1216,34 @@ export async function resolveCardDeliveryBranchOwnership(
    workspaceSourceIssueIdentifier: sourceIdentifier,
    sourceIssueDepth: sourceDepth,
  });
- if (carrier) {
-   return { branch, branchIsOwn: false, carrier: true, legitimate: true, ownerIssueId: source, refusalReason: null };
- }
+  if (carrier) {
+    // SUP-16896: a carrier whose owning card is already terminal (done/cancelled)
+    // can never be stamped — the owner's final-stage approve cannot re-fire on a
+    // completed/cancelled card — and can never be promoted, because the carrier
+    // sweep skips terminal owners (carrier-promotion-sweep.ts). Delivering onto it
+    // mints an ownerless, unstampable head (the live PR #746 fault), so the delivery
+    // is refused fail-closed instead of silently arming on a dead carrier. The
+    // commits remain on the branch for the board/operator to disposition; the
+    // refusal names where the content goes so nothing is silently stranded.
+    const [ownerRow] = await db
+      .select({ status: issues.status, identifier: issues.identifier })
+      .from(issues)
+      .where(eq(issues.id, source))
+      .limit(1);
+    const ownerStatus = ownerRow?.status ?? null;
+    if (ownerStatus === "done" || ownerStatus === "cancelled") {
+      return {
+        branch,
+        branchIsOwn: false,
+        carrier: true,
+        legitimate: false,
+        ownerIssueId: source,
+        refusalReason:
+          `ADR-083 carrier owner ${ownerRow?.identifier ?? source} is already ${ownerStatus}; a terminal owner can never stamp or promote this carrier, so the delivery is refused (SUP-16896). The commits remain on branch '${branch}' — re-file the work on a live card's branch, or have the board/operator disposition the orphan carrier PR.`,
+      };
+    }
+    return { branch, branchIsOwn: false, carrier: true, legitimate: true, ownerIssueId: source, refusalReason: null };
+  }
  return {
    branch,
    branchIsOwn: false,

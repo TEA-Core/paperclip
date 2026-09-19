@@ -33,6 +33,7 @@ import {
   recordApprovalAnchor,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
+  resolveCardDeliveryBranchOwnership,
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   writeCommitStatusWithRetry,
@@ -2091,6 +2092,50 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       if (result.kind === "resolved") {
         expect(result.headSha).toBe(APPROVED_HEAD);
       }
+    });
+
+    // SUP-16896 positive control: a carrier child whose ADR-083 owner is still live
+    // (in_review) resolves the shared branch as legitimate — the normal carrier
+    // shape my terminal-owner guard must not break.
+    it("resolves a live carrier owner's branch as legitimate (SUP-16896 positive control)", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" }); // status: in_review (live)
+      const CARRIER_BRANCH = "SUP-1-carrier-branch";
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        parentId: ownerIssueId,
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: CARRIER_BRANCH,
+      });
+      const ownership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+      expect(ownership.carrier).toBe(true);
+      expect(ownership.branchIsOwn).toBe(false);
+      expect(ownership.legitimate).toBe(true);
+      expect(ownership.ownerIssueId).toBe(ownerIssueId);
+      expect(ownership.refusalReason).toBeNull();
+    });
+
+    // SUP-16896 regression: a carrier child whose ADR-083 owner has already closed
+    // (done) must NOT resolve the shared branch as legitimate — a terminal owner can
+    // never stamp or promote the carrier, so the delivery is refused fail-closed.
+    // This is the live PR #746 fault: the branch's card closed before the carrier
+    // PR could be stamped/promoted, leaving it ownerless and undraftable.
+    it("refuses a carrier delivery when the ADR-083 owner is already done (SUP-16896)", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, ownerIssueId));
+      const CARRIER_BRANCH = "SUP-1-carrier-branch";
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        parentId: ownerIssueId,
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: CARRIER_BRANCH,
+      });
+      const ownership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+      expect(ownership.carrier).toBe(true);
+      expect(ownership.branchIsOwn).toBe(false);
+      expect(ownership.legitimate).toBe(false);
+      expect(ownership.ownerIssueId).toBe(ownerIssueId);
+      expect(ownership.refusalReason).toContain("SUP-1");
+      expect(ownership.refusalReason).toContain("done");
     });
 
     // SUP-15909 negative control (unrelated owner): the laundering vector D1 closes
