@@ -163,10 +163,11 @@ export function decideCompletedRunStrandEscalation(input: {
   if (idleMs < input.idleThresholdMs) return { action: "skip-within-threshold" };
   // Valid-path holds: a pending interaction/approval, blocker, pause hold,
   // plugin-managed lifecycle, routine, queued wake, live executionState,
-  // external-pull assignee, open recovery issue, or open recovery action already
-  // owns this card's next action. Shared verbatim with the host-restart sweep and
-  // mirroring `decideSuccessfulRunHandoff`, so the sweep stops escalating cards
-  // that are legitimately waiting (SUP-16504).
+  // external-pull assignee, open recovery issue, open recovery action, or an
+  // active durable session goal already owns this card's next action. Shared
+  // verbatim with the host-restart sweep and mirroring
+  // `decideSuccessfulRunHandoff`, so the sweep stops escalating cards that are
+  // legitimately waiting (SUP-16504).
   if (input.skipFacts) {
     const skip = evaluateStrandSkipFacts(input.skipFacts);
     if (skip.skip) return { action: "skip-valid-path", reason: skip.reason };
@@ -335,10 +336,13 @@ export interface CompletedRunStrandSweepInput {
     escalation: { sourceRun: CompletedRunStrandLatestRun },
   ) => Promise<boolean>;
   // Injectable fact-gathering seam for the shared valid-path holds. Defaults to
-  // `collectStrandSkipFacts`; tests pass a fake to stay hermetic.
+  // `collectStrandSkipFacts`; tests pass a fake to stay hermetic. The latest
+  // run's context snapshot is threaded through so the shared collector can
+  // probe the durable session-goal hold without re-querying the run row.
   gatherStrandSkipFacts?: (
     db: Db,
     candidate: CompletedRunStrandCandidate,
+    latestRunContextSnapshot: Record<string, unknown> | null,
   ) => Promise<StrandSkipFacts>;
 }
 
@@ -366,6 +370,7 @@ function emptySkipped(): CompletedRunStrandSkip {
 async function defaultGatherStrandSkipFacts(
   db: Db,
   candidate: CompletedRunStrandCandidate,
+  latestRunContextSnapshot: Record<string, unknown> | null,
 ): Promise<StrandSkipFacts> {
   return collectStrandSkipFacts(db, {
     companyId: candidate.companyId,
@@ -373,6 +378,7 @@ async function defaultGatherStrandSkipFacts(
     assigneeAgentId: candidate.assigneeAgentId,
     executionState: candidate.executionState ?? null,
     originKind: candidate.originKind ?? null,
+    latestRunContextSnapshot,
   });
 }
 
@@ -610,7 +616,11 @@ export async function sweepCompletedRunStrandedIssues(
       }).action === "escalate";
 
     const skipFacts = wouldEscalate
-      ? await (input.gatherStrandSkipFacts ?? defaultGatherStrandSkipFacts)(db, candidate)
+      ? await (input.gatherStrandSkipFacts ?? defaultGatherStrandSkipFacts)(
+          db,
+          candidate,
+          latestRun?.contextSnapshot ?? null,
+        )
       : null;
 
     facts.set(candidate.id, { ...cheapFacts, skipFacts });

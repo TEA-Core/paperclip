@@ -92,6 +92,7 @@ function makeLatestRun(overrides: Partial<HostRestartStrandLatestRun> = {}): Hos
     status: "failed",
     errorCode: null,
     resultJson: hostRestartResult(),
+    contextSnapshot: null,
     ...overrides,
   };
 }
@@ -813,6 +814,7 @@ const NO_SKIP_FACTS: StrandSkipFacts = {
   pluginManagedLifecycle: false,
   hasOpenRecoveryAction: false,
   hasActiveRoutineContinuation: false,
+  hasActiveSessionGoal: false,
   isExternalPullAssignee: false,
   hasPendingWake: false,
   hasPendingInteractionOrApproval: false,
@@ -840,6 +842,7 @@ const VALID_PATH_HOLDS: Array<{ hold: keyof StrandSkipFacts; label: string }> = 
   { hold: "pluginManagedLifecycle", label: "plugin-managed lifecycle" },
   { hold: "hasOpenRecoveryAction", label: "open recovery action (SUP-16504)" },
   { hold: "hasActiveRoutineContinuation", label: "active routine continuation" },
+  { hold: "hasActiveSessionGoal", label: "durable session goal" },
   { hold: "isExternalPullAssignee", label: "external-pull assignee" },
   { hold: "hasPendingWake", label: "queued or deferred wake" },
   { hold: "hasPendingInteractionOrApproval", label: "pending interaction or approval" },
