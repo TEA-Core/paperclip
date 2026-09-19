@@ -3413,6 +3413,250 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         // Observability only — no re-stamp.
         expect(postStatusCalls()).toHaveLength(0);
       });
+
+      it("SUP-16610 change 3: alarms the OWNER of a published-then-moved delivery PR once under stranded:head-moved, and not a child that merely mentions it", async () => {
+        // The #3581 shape: SUP-16347 published its approval at APPROVED_HEAD, the
+        // live head then moved to NEW_HEAD with a changed diff-vs-base, and Guard A
+        // refuses to re-publish. The stamp no longer covers the live head, so the
+        // PR is stranded — but only the DELIVERY card owns that drop.
+        const ownerId = await insertIssue({
+          status: "done",
+          identifier: "SUP-42",
+          executionState: approvedState({
+            approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+          }),
+        });
+        await insertDecision(ownerId);
+        const prObject = await insertMention(ownerId);
+        await seedDeliveryIdentity(ownerId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+        // A sibling/child card that merely MENTIONS the same PR (the 40-cards
+        // shape): it is not the PR's delivery card, so it must stay silent.
+        const childId = await insertIssue({
+          status: "done",
+          identifier: "SUP-43",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(childId);
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: childId,
+          sourceKind: "comment",
+          objectId: prObject!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+        await seedDeliveryIdentity(childId, "SUP-43-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          {
+            url: APPROVED_DIFF_URL,
+            body: {
+              status: "ahead",
+              ahead_by: 1,
+              files: [{ filename: "docs/payload.json", sha: "blob0000000000000000000000000000000000000001", status: "modified" }],
+            },
+          },
+          {
+            url: LIVE_DIFF_URL,
+            body: {
+              status: "ahead",
+              ahead_by: 2,
+              files: [{ filename: "docs/payload.json", sha: "blob0000000000000000000000000000000000000002", status: "modified" }],
+            },
+          },
+          { url: COMMENT_LIST_URL, body: [] },
+          { url: COMMENT_POST_URL, body: { id: 9001 } },
+          { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // Guard A refuses to re-publish the moved head; the owner is the stranded card.
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+        expect(summary.stranded).toBe(1);
+        expect(summary.strandedNew).toBe(1);
+        expect(summary.strandedDetails).toHaveLength(1);
+        expect(summary.strandedDetails[0]).toContain("SUP-42");
+        expect(summary.strandedDetails[0]).toContain("TEA-Core/paperclip#42");
+        // The reason is DISTINCT from the never-published `stranded:` drop and names
+        // BOTH the published anchor head and the moved live head.
+        expect(summary.strandedDetails[0]).toContain("stranded:head-moved");
+        expect(summary.strandedDetails[0]).toContain(APPROVED_HEAD);
+        expect(summary.strandedDetails[0]).toContain(NEW_HEAD);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+        const [errorMeta] = mockLogger.error.mock.calls[0] as [Record<string, unknown>];
+        expect(errorMeta.identifier).toBe("SUP-42");
+        expect(errorMeta.pr).toBe("TEA-Core/paperclip#42");
+        expect(errorMeta.alarmClass).toBe("head-moved");
+        expect(String(errorMeta.reason)).toMatch(/^stranded:head-moved/);
+        // Observability only — the alarm never re-stamps a status.
+        expect(postStatusCalls()).toHaveLength(0);
+        // The owner's dedupe marker records the head-moved class at the live head.
+        const [ownerRow] = await db
+          .select({ executionState: issues.executionState })
+          .from(issues)
+          .where(eq(issues.id, ownerId));
+        const ownerStatus = (ownerRow!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        const marker = ownerStatus.strandedAlarm as Record<string, unknown>;
+        expect(marker.pr).toBe("TEA-Core/paperclip#42");
+        expect(marker.headSha).toBe(NEW_HEAD);
+        expect(marker.class).toBe("head-moved");
+      });
+
+      it("SUP-16610 change 4: alarms once per PR when a done card certified the live head but the PR's owning card is cancelled", async () => {
+        // The #3536 / SUP-15728 shape: the PR's owning delivery card SUP-42 was
+        // cancelled, yet SUP-43 and SUP-44 (both done + terminally approved)
+        // certified the live head. The PR has no live delivery card, so it is
+        // stranded — reported ONCE per (PR, live head), naming both cards, never
+        // once per certifying child.
+        await insertIssue({ status: "cancelled", identifier: "SUP-42" });
+
+        const certifierA = await insertIssue({
+          status: "done",
+          identifier: "SUP-43",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifierA);
+        const prObject = await insertMention(certifierA);
+        await seedDeliveryIdentity(certifierA, "SUP-43-branch", "https://github.com/TEA-Core/paperclip");
+
+        const certifierB = await insertIssue({
+          status: "done",
+          identifier: "SUP-44",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifierB);
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: certifierB,
+          sourceKind: "comment",
+          objectId: prObject!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+        await seedDeliveryIdentity(certifierB, "SUP-44-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // Neither certifier is the PR's delivery card (the head belongs to SUP-42),
+        // so both are refused the stamp...
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["publish:skipped"]).toBe(2);
+        // ...and the orphaned PR is reported exactly ONCE, naming the cancelled
+        // owner and the certifying card.
+        expect(summary.stranded).toBe(1);
+        expect(summary.strandedNew).toBe(1);
+        expect(summary.strandedDetails).toHaveLength(1);
+        expect(summary.strandedDetails[0]).toContain("stranded:delivery-card-cancelled");
+        expect(summary.strandedDetails[0]).toContain("SUP-42");
+        expect(summary.strandedDetails[0]).toContain("TEA-Core/paperclip#42");
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+        const [errorMeta] = mockLogger.error.mock.calls[0] as [Record<string, unknown>];
+        expect(errorMeta.alarmClass).toBe("delivery-card-cancelled");
+        expect(String(errorMeta.reason)).toMatch(/^stranded:delivery-card-cancelled/);
+        expect(String(errorMeta.reason)).toContain("SUP-42");
+        // Observability only — the alarm never re-stamps a status.
+        expect(postStatusCalls()).toHaveLength(0);
+
+        // Tick 2 at the same live head: the second certifying child does not raise a
+        // second alarm, and the PR is observed (not re-armed).
+        const second = await runApprovalStatusReconcilerTick(db);
+        expect(second.stranded).toBe(1);
+        expect(second.strandedNew).toBe(0);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+      });
+
+      it("SUP-16610 change 4: dedupes the per-PR alarm across ticks when the certifying cards fall in different capped windows", async () => {
+        // The cross-tick hole a single-batch fixture cannot exercise: candidates
+        // are swept through a capped keyset window (`maxCandidates` +
+        // `nextScanKey`), so two certifying `done` cards for the SAME PR
+        // routinely land in DIFFERENT ticks. A marker readable only from the
+        // scanned card's own row would let the second card re-emit a level-50
+        // line for the same (PR, live head) — the per-(PR, live head) contract
+        // the card requires, and Acceptance #3 ("no repeat across 1h with no
+        // head change").
+        await insertIssue({ status: "cancelled", identifier: "SUP-42" });
+
+        const certifierA = await insertIssue({
+          status: "done",
+          identifier: "SUP-43",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifierA);
+        const prObject = await insertMention(certifierA);
+        await seedDeliveryIdentity(certifierA, "SUP-43-branch", "https://github.com/TEA-Core/paperclip");
+
+        const certifierB = await insertIssue({
+          status: "done",
+          identifier: "SUP-44",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifierB);
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: certifierB,
+          sourceKind: "comment",
+          objectId: prObject!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+        await seedDeliveryIdentity(certifierB, "SUP-44-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        ]);
+
+        // Tick 1 scans ONLY SUP-43 (the lexicographic head of the candidate set)
+        // and raises the one new alarm, persisting the PR-scoped marker on it.
+        const tick1 = await runApprovalStatusReconcilerTick(db, { maxCandidates: 1 });
+        expect(tick1.nextScanKey).toBe("SUP-43");
+        expect(tick1.stranded).toBe(1);
+        expect(tick1.strandedNew).toBe(1);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        // Tick 2 scans ONLY SUP-44 — the second certifier, in a DIFFERENT window.
+        // It holds no marker of its own; the PR-scoped read of the cards citing
+        // the PR must find tick 1's marker and stay deduped.
+        const tick2 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 1,
+          resumeAfter: tick1.nextScanKey,
+        });
+        expect(tick2.stranded).toBe(1);
+        expect(tick2.strandedNew).toBe(0);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        // Tick 3 wraps to the head of the set and re-scans SUP-43: still deduped.
+        const tick3 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 1,
+          resumeAfter: tick2.nextScanKey,
+        });
+        expect(tick3.stranded).toBe(1);
+        expect(tick3.strandedNew).toBe(0);
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+
+        // One new alarm and one level-50 line across the whole sweep.
+        expect(tick1.strandedNew + tick2.strandedNew + tick3.strandedNew).toBe(1);
+      });
     });
 
     it("refuses the backfill when the head is provable only through committed (client-timed) events and the earliest server timestamp is after the approval, writing no anchor (SUP-14747 D-E, backfill-committed-event-timing)", async () => {
