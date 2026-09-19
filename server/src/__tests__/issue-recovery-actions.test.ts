@@ -5361,6 +5361,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       reviewRecoveryAlreadyAttempted: boolean;
       reviewParticipantDeferred?: boolean;
       reviewDeferralRetriesExhausted?: boolean;
+      reviewPreLaunchRetriesExhausted?: boolean;
       recoveryAgentPresent?: boolean;
       recoveryAgentInvokable?: boolean;
     }) =>
@@ -5371,10 +5372,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         reviewParticipantDeferred: overrides.reviewParticipantDeferred ?? false,
         reviewDeferralRetriesExhausted:
           overrides.reviewDeferralRetriesExhausted ?? false,
+        reviewPreLaunchRetriesExhausted:
+          overrides.reviewPreLaunchRetriesExhausted ?? false,
       });
 
-    it("classifies only dispatch_unlaunched as never launched", () => {
-      expect(isNeverLaunchedDispatchRun({ errorCode: "dispatch_unlaunched" })).toBe(true);
+    // SUP-16813: the never-launched exclusion now covers the whole pre-launch allocation
+    // set, not `dispatch_unlaunched` alone. `setup_failed` stays out of the set: a retry
+    // that launched and crashed really did consume an attempt.
+    it("classifies the pre-launch allocation codes as never launched", () => {
+      for (const errorCode of [
+        "dispatch_unlaunched",
+        "workspace_validation_failed",
+        "configuration_incomplete",
+      ]) {
+        expect(isNeverLaunchedDispatchRun({ errorCode })).toBe(true);
+      }
       for (const errorCode of [
         "setup_failed",
         "opencode_exit_1",
@@ -5398,6 +5410,41 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           reviewRecoveryAlreadyAttempted: isSpentReviewParticipantRecoveryAttempt(run),
         }),
       ).toBe(false);
+    });
+
+    // SUP-16813 acceptance #1: the widened codes are also not spent attempts, so the
+    // restore re-dispatches the reviewer instead of pinning the block. This is the
+    // SUP-16775 case: the workspace provision command exited 1 before any lease.
+    it.each(["workspace_validation_failed", "configuration_incomplete"] as const)(
+      "does not treat a pre-launch allocation recovery retry as a spent attempt (%s)",
+      (errorCode) => {
+        const run = recoveryRetryRun(errorCode);
+        expect(isSpentReviewParticipantRecoveryAttempt(run)).toBe(false);
+        expect(
+          decidedBlock({
+            reviewRecoveryAlreadyAttempted: isSpentReviewParticipantRecoveryAttempt(run),
+          }),
+        ).toBe(false);
+      },
+    );
+
+    // SUP-16813 acceptance #3: the widening is bounded. Once the excluded-code retry cap
+    // is spent, block even though the latest retry is not itself a spent attempt, so a
+    // persistently-failing workspace cannot livelock the card the other way.
+    it("blocks once the pre-launch allocation retry cap is spent", () => {
+      const run = recoveryRetryRun("workspace_validation_failed");
+      expect(
+        decidedBlock({
+          reviewRecoveryAlreadyAttempted: isSpentReviewParticipantRecoveryAttempt(run),
+          reviewPreLaunchRetriesExhausted: false,
+        }),
+      ).toBe(false);
+      expect(
+        decidedBlock({
+          reviewRecoveryAlreadyAttempted: isSpentReviewParticipantRecoveryAttempt(run),
+          reviewPreLaunchRetriesExhausted: true,
+        }),
+      ).toBe(true);
     });
 
     // Acceptance #2: the retry launched and crashed - it really did consume the attempt.
