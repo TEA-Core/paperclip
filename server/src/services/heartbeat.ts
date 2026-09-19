@@ -442,6 +442,7 @@ import {
 } from "./issue-tree-control.js";
 import {
   continuationSummaryParksExecutor,
+  extractRunLogAssistantNarration,
   getIssueContinuationSummaryDocument,
   refreshIssueContinuationSummary,
 } from "./issue-continuation-summary.js";
@@ -14679,6 +14680,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  // SUP-16853: an interrupted/failed run often has no `result_json.summary`
+  // (run `50df0b3f` ended `interrupted`/`orphaned_running_run` with
+  // `result_json == null`), so its phantom comment-write claim lives only in
+  // the ndjson transcript. Read a bounded slice of the run log and extract the
+  // assistant narration so the continuation-summary guard can see it. Only
+  // consulted when the adapter result carries no summary — a succeeded run's
+  // claim is already in `result_json.summary`. Best-effort: any read/parse
+  // failure degrades to null (the guard then simply cannot fire).
+  async function readInterruptedRunNarrationText(
+    run: typeof heartbeatRuns.$inferSelect,
+  ): Promise<string | null> {
+    if (run.status !== "interrupted" && run.status !== "failed") return null;
+    if (readNonEmptyString((run.resultJson as Record<string, unknown> | null)?.summary)) return null;
+    if (!run.logStore || !run.logRef) return null;
+    const cap = 512 * 1024;
+    const knownBytes = typeof run.logBytes === "number" && run.logBytes > 0 ? run.logBytes : null;
+    let offset = knownBytes != null && knownBytes > cap ? knownBytes - cap : 0;
+    let remaining = cap;
+    let content = "";
+    try {
+      while (remaining > 0) {
+        const chunk = await runLogStore.read(
+          { store: run.logStore as "local_file", logRef: run.logRef },
+          { offset, limitBytes: remaining },
+        );
+        if (!chunk.content) break;
+        content += chunk.content;
+        remaining -= Buffer.byteLength(chunk.content, "utf8");
+        if (chunk.nextOffset == null) break;
+        offset = chunk.nextOffset;
+      }
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id },
+        "failed to read run log for continuation-summary narration guard",
+      );
+      return null;
+    }
+    return extractRunLogAssistantNarration(content);
+  }
+
   async function refreshContinuationSummaryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -14687,6 +14729,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) return null;
     try {
+      const narrationText = await readInterruptedRunNarrationText(run);
       return await refreshIssueContinuationSummary({
         db,
         issueId,
@@ -14699,6 +14742,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           stdoutExcerpt: run.stdoutExcerpt,
           stderrExcerpt: run.stderrExcerpt,
           finishedAt: run.finishedAt,
+          narrationText,
         },
         agent: {
           id: agent.id,
