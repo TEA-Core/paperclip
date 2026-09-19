@@ -15634,7 +15634,7 @@ export function issueRoutes(
       const actorCompanyId = req.actor.companyId ?? (req.actor.companyIds ?? [])[0] ?? null;
       const originalUrl = req.originalUrl;
       let recorded = false;
-      const recordUnhandled = async (errorClass: string, message: string) => {
+      const recordUnhandled = async (errorClass: string) => {
         if (recorded) return;
         recorded = true;
         try {
@@ -15663,7 +15663,6 @@ export function issueRoutes(
             details: {
               identifier: issue?.identifier ?? routeId ?? null,
               errorClass,
-              message: message.slice(0, 2000),
               method: "PATCH",
               path: originalUrl,
             },
@@ -15674,23 +15673,11 @@ export function issueRoutes(
       };
       res.json = ((body: unknown) => {
         const errorContext = (res as unknown as {
-          __errorContext?: { error?: { name?: string; message?: string } };
+          __errorContext?: { error?: { name?: string } };
         }).__errorContext;
         if (res.statusCode === 500 && errorContext?.error) {
           const errorClass = errorContext.error.name ?? "Error";
-          const message = errorContext.error.message ?? "";
-          const typedBody = {
-            error: "Issue update failed unexpectedly",
-            code: "issue_patch_unhandled_error",
-            details: {
-              issueId: routeId ?? null,
-              errorClass,
-              message,
-              remedy:
-                "The failure is recorded on the issue activity feed " +
-                "(issue.patch_unhandled_error); include it when reporting.",
-            },
-          } as never;
+          const genericBody = { error: "Internal server error" } as never;
           // Settle the durable record BEFORE the response is flushed. A
           // fire-and-forget write here commits asynchronously and races request
           // teardown: the row can land after a caller's own cleanup transaction
@@ -15699,9 +15686,9 @@ export function issueRoutes(
           // and the caller can observe the 500 before the record exists at all.
           // The error handler ignores this Promise; the body still flushes via
           // originalJson once the write settles.
-          recordUnhandled(errorClass, message).then(
-            () => originalJson(typedBody),
-            () => originalJson(typedBody),
+          recordUnhandled(errorClass).then(
+            () => originalJson(genericBody),
+            () => originalJson(genericBody),
           );
           return res;
         }

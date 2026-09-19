@@ -271,29 +271,25 @@ describeEmbeddedPostgres(
         );
     }
 
-    it("PATCH: attributes the fault and persists the error class when the guard throws a raw Error", async () => {
+    it("PATCH: records the error class and issue, and never leaks the message into the 500 body or the activity row", async () => {
       const { companyId, issueId, identifier } = await seedIssue("D16607A");
       currentActor = boardActor(companyId);
+      const sentinel = "Authorization: Bearer test-secret";
       mockEvaluateDoneTransitionGuard.mockRejectedValue(
-        new TypeError("fetch failed: socket hang up"),
+        new TypeError(`fetch failed: ${sentinel}`),
       );
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({ status: "done", comment: "Closed at Tier 2 (live): plain close." });
 
-      // Never a bare 500 body: the caller gets a code and details it can quote.
       expect(res.status).toBe(500);
-      expect(res.body.error).not.toBe("Internal server error");
-      expect(res.body.code).toBe("issue_patch_unhandled_error");
-      expect(res.body.details.issueId).toBe(issueId);
-      expect(res.body.details.errorClass).toBe("TypeError");
-      expect(res.body.details.message).toContain("fetch failed");
+      expect(res.body).toEqual({ error: "Internal server error" });
+      expect(JSON.stringify(res.body)).not.toContain("fetch failed");
+      expect(JSON.stringify(res.body)).not.toContain("test-secret");
 
-      // The transition must not have landed.
       expect(await statusOf(issueId)).toBe("in_progress");
 
-      // And the fault is durable, not just in the response.
       const rows = await vi.waitFor(
         async () => {
           const found = await errorRows(companyId, issueId);
@@ -305,7 +301,9 @@ describeEmbeddedPostgres(
       const details = rows[0]?.details as Record<string, unknown>;
       expect(details.errorClass).toBe("TypeError");
       expect(details.identifier).toBe(identifier);
-      expect(details.message).toContain("fetch failed");
+      expect(details.message).toBeUndefined();
+      expect(JSON.stringify(details)).not.toContain("fetch failed");
+      expect(JSON.stringify(details)).not.toContain("test-secret");
     });
 
     it("PATCH: a typed HttpError refusal keeps its own status and body (recorder is scoped to 500s)", async () => {
