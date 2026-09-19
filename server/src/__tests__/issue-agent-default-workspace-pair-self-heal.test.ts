@@ -312,14 +312,6 @@ describeEmbeddedPostgres("issues PATCH self-heals a stored agent_default + proje
 // preference to `reuse_existing`, which would mask the re-mint.
 // ---------------------------------------------------------------------------
 
-type SessionFreshness = {
-  reset: boolean;
-  reasons: string[];
-  changedCategories: string[];
-  nextFingerprint: string | null;
-  storedFingerprint: string | null;
-};
-
 function buildTestSessionConfigMetadata(): SessionConfigMetadata {
   const dummyFingerprint = `v${EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION}:${EFFECTIVE_RUN_CONFIG_FINGERPRINT_ALGORITHM}:0000000000000000000000000000000000000000000000000000000000000000`;
   const sessionCategories = [
@@ -650,7 +642,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace holds the agent_defau
           changedCategories: [],
           nextFingerprint: null,
           storedFingerprint: null,
-        } as unknown as SessionFreshness,
+        },
         sessionConfigMetadata: buildTestSessionConfigMetadata(),
       }),
       runLifecycle: { onExecutionWorkspaceOccupied: async () => undefined },
