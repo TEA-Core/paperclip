@@ -15668,9 +15668,11 @@ export function issueRoutes(
     // handle is narrowed to `{ error?: { name?: string } }`, so the error
     // MESSAGE is unreachable by construction and only the error CLASS is
     // persisted — widening the response would undo that leak-safety. To find a
-    // bare 500 here, read `GET /api/issues/:id/activity` and look for the row
-    // whose `action` is `issue.patch_unhandled_error`. Scoped to this route
-    // only — the generic 500 shape for other routes is out of scope.
+    // bare 500 here, read
+    // `GET /api/issues/:id/activity?action=issue.patch_unhandled_error` and
+    // look for the row whose `action` is `issue.patch_unhandled_error`. Scoped
+    // to this route only — the generic 500 shape for other routes is out of
+    // scope.
     (req, res, next) => {
       const originalJson = res.json.bind(res);
       // Capture what the failure record needs WHILE the layer is still live:
