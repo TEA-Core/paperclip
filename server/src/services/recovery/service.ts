@@ -1,5 +1,9 @@
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
+import { hasLiveLegacyController } from "../legacy-controller-lease.js";
+// `instanceSettingsService` is NOT re-imported here: the fork already imports it
+// further down this same import block (upstream's copy would duplicate it).
+import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
 import {
   and,
   asc,
@@ -95,6 +99,7 @@ import {
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { DISPATCH_UNLAUNCHED_ERROR_CODE } from "../heartbeat-stop-metadata.js";
 import { isNonRetryablePreflightFailureCode } from "../non-retryable-preflight-failure-codes.js";
+import { isWorkspaceGitScanFailureCode } from "../workspace-git-operation-scheduler.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -681,6 +686,13 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // process starts. Known transient preflight failures use dedicated bounded
   // retry paths instead of generic issue continuation recovery.
   "setup_failed",
+  // Setup owns the shared durable retry budget for temporary Git scans.
+  // Generic continuation must not retry permanent failures or reset that budget.
+  "workspace_git_scan_timeout",
+  "workspace_git_scan_saturated",
+  "workspace_git_scan_cancelled",
+  "workspace_git_scan_output_limit",
+  "workspace_git_scan_failed",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",
@@ -3506,7 +3518,13 @@ export function recoveryService(
           // `configuration_incomplete`. Binding a secret cannot clear that, so name the
           // plugin remedy for it and keep the fork's secret-binding copy for every other
           // configuration_incomplete cause (asserted by the SUP secret-binding tests).
-          ? readConfigurationIncompletePayload(input.latestRun)?.reason === SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON
+          // Upstream #13247 adds a third cause with the same shape: an unavailable AI
+          // Connection (heartbeat.ts records `ai_connection_unavailable`). Binding a
+          // secret cannot clear that either, so it gets its own remedy ahead of both --
+          // the same copy `stranded-notice.ts` already serves for this reason.
+          ? readConfigurationIncompletePayload(input.latestRun)?.reason === "ai_connection_unavailable"
+            ? "Reconnect the selected AI account or choose an available connection, then continue the task."
+          : readConfigurationIncompletePayload(input.latestRun)?.reason === SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON
             ? `The sandbox provider plugin named in the run failure is not ready; ${sandboxProviderPluginRemedy(
                 readNonEmptyString(readConfigurationIncompletePayload(input.latestRun)?.pluginStatus) ?? "error",
               )}, then resume adapter execution.`
@@ -3570,7 +3588,13 @@ export function recoveryService(
       input.ownerAgentId != null &&
       input.latestRun?.agentId != null &&
       input.ownerAgentId === input.latestRun.agentId &&
-      isNonRetryablePreflightFailureCode(input.latestRun.errorCode)
+      // Fold 2d: a workspace_git_scan_* failure is a property of the host checkout, not
+      // of the agent's policy, and setup already spent its bounded durable retry budget
+      // on it. Waking the same agent re-runs the same scan. Upstream #11961 deleted this
+      // owner wake outright; the fork keeps it (Fold 2c / D12 + SUP-16538), so the scan
+      // codes join the same-agent suppression instead.
+      (isNonRetryablePreflightFailureCode(input.latestRun.errorCode) ||
+        isWorkspaceGitScanFailureCode(input.latestRun.errorCode))
     );
   }
 
@@ -3885,7 +3909,14 @@ export function recoveryService(
     );
   }
 
-  async function healthyOpenChildIssues(issue: typeof issues.$inferSelect) {
+  // SUP-15590 (fork 6d085b472) dropped the unfiltered `openChildIssues` helper and
+  // rewired its only caller to `healthyOpenChildIssues`, so a dead-parked child is
+  // never minted as a blocker. Upstream never touched that helper; its side of this
+  // conflict only re-states it, so the fork's deletion stands. Upstream's real change
+  // here is the `sameWorkspaceOnly` arm, required by the shared-workspace child gate
+  // below -- and inert (`!false && x === x`) for the fork's existing callers.
+  async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
+    if (sameWorkspaceOnly && !issue.projectWorkspaceId) return [];
     const childCandidates = await db
       .select()
       .from(issues)
@@ -3893,6 +3924,7 @@ export function recoveryService(
         and(
           eq(issues.companyId, issue.companyId),
           eq(issues.parentId, issue.id),
+          ...(sameWorkspaceOnly ? [eq(issues.projectWorkspaceId, issue.projectWorkspaceId!)] : []),
           visibleIssueCondition(),
           notInArray(issues.status, ["done", "cancelled"]),
         ),
@@ -3904,7 +3936,7 @@ export function recoveryService(
       });
       if (
         childState.hasActiveExecutionPath ||
-        childState.hasDurableWaitingPath
+        (!sameWorkspaceOnly && childState.hasDurableWaitingPath)
       ) {
         openChildren.push({ id: child.id, identifier: child.identifier });
       }
@@ -5389,6 +5421,20 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+      if (issue.conversationAgentId) {
+        const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
+        if (lastRun?.status === "succeeded") {
+          if (await settleConversationTurn(db, (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, lastRun.id)))[0]!)) {
+            const [current] = await db.select().from(issues).where(eq(issues.id, issue.id));
+            if (current) Object.assign(issue, current);
+          }
+        }
+        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
+        {
+          await deliverConversationComments(db, issue, deps.enqueueWakeup);
+        }
+      }
+      if (isWaitingConversation(issue)) { result.skipped += 1; continue; }
       const now = new Date();
       // Parse the persisted execution state once. `executionState`/`pendingExecutionState`
       // stay gated on `in_review` so every pre-existing status-keyed path below keeps its
@@ -5700,6 +5746,18 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // A native chat can finish between the earlier settlement read and this
+      // fresh run read, before its response is materialized. Its trusted
+      // finalizer owns that settlement; generic productive-work recovery must
+      // not invent another conversation turn during the publication window.
+      if (
+        issue.conversationAgentId &&
+        latestRun?.status === "succeeded" &&
+        parseObject(latestRun.resultJson).finalizationReasonCode === "conversation_turn_finished"
+      ) {
+        result.skipped += 1;
+        continue;
+      }
 
       const agent = await getAgent(agentId);
       const agentInvokability: AgentInvokability = agent && agent.companyId === issue.companyId
@@ -6668,6 +6726,17 @@ export function recoveryService(
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
 
+        // A child with a live or durable waiting path must get a chance to use
+        // the shared workspace. Repeated automatic parent continuations can
+        // otherwise reacquire it before the child's resource retry is due.
+        // This only gates recovery; explicit messages still follow admission.
+        const workspace = parseObject(parseObject(successfulRun.contextSnapshot).paperclipWorkspace);
+        if (workspace.mode === "shared_workspace" && (await healthyOpenChildIssues(issue, true)).length > 0) {
+          result.productiveContinuationObserved += 1;
+          result.skipped += 1;
+          continue;
+        }
+
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
           result.skipped += 1;
@@ -6932,6 +7001,7 @@ export function recoveryService(
     const queryCandidates = (afterIssueId: string | null) => {
       const filters = [
         eq(issues.status, "blocked"),
+        isNull(issues.conversationAgentId),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
       ];
@@ -7747,7 +7817,9 @@ export function recoveryService(
   // state is auditable. It never overwrites a status that another path already
   // made terminal.
   //
-  // Two independent authorities terminalize the run. Either one is enough:
+  // A live controller lease owns execution and finalization across server
+  // processes. Only after that ownership ends can either authority below
+  // terminalize the run:
   //
   // - Issue-terminal authority: the run's issue already reached a terminal
   //   status (done or cancelled), but the run row is still "running". A healthy
@@ -7784,6 +7856,12 @@ export function recoveryService(
     // Authentication failure does not prove the retained provider stopped.
     // PID observations and task status edits cannot resolve its ownership.
     if (isNativeRunnerOwnershipHeld(run))
+      return { terminalized: false, status: run.status };
+
+    // Another controller may own a sandbox run whose PID has no meaning on
+    // this host. Its live lease owns both execution and finalization, even if
+    // the issue is already terminal or this process has no in-memory handle.
+    if (await hasLiveLegacyController(db, run))
       return { terminalized: false, status: run.status };
 
     const pid = run.processPid ?? null;
@@ -7897,7 +7975,22 @@ export function recoveryService(
         and(
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.status, "running"),
+          eq(heartbeatRuns.runtimeMode, run.runtimeMode),
           nativeRunnerOwnershipNotHeldCondition(),
+          // Recheck ownership in the write: a controller can renew or claim
+          // the run after the liveness read. An old snapshot cannot end a new
+          // controller's run, even if that controller's lease later expires.
+          run.runtimeMode === "legacy"
+            ? and(
+                run.controllerBootId
+                  ? eq(heartbeatRuns.controllerBootId, run.controllerBootId)
+                  : isNull(heartbeatRuns.controllerBootId),
+                or(
+                  isNull(heartbeatRuns.controllerBootId),
+                  sql`${heartbeatRuns.controllerLeaseExpiresAt} <= clock_timestamp()`,
+                ),
+              )
+            : undefined,
         ),
       )
       .returning()

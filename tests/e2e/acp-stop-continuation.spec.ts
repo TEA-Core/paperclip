@@ -9,8 +9,8 @@ async function json(response: APIResponse) {
   return JSON.parse(body);
 }
 
-for (const { unfinishedWrite, pause } of [{ unfinishedWrite: false, pause: false }, { unfinishedWrite: true, pause: false }, { unfinishedWrite: false, pause: true }]) {
-  test(`embedded ACP Stop: ${unfinishedWrite ? "Interrupt continues without replaying the write" : pause ? "composer pause requires Resume before continuation" : "Interrupt delivers queued input in the same session"}`, async ({ page, request }) => {
+for (const { unfinishedWrite, stopResponse } of [{ unfinishedWrite: false, stopResponse: false }, { unfinishedWrite: true, stopResponse: false }, { unfinishedWrite: false, stopResponse: true }]) {
+  test(`embedded ACP Stop: ${unfinishedWrite ? "Interrupt continues without replaying the write" : stopResponse ? "composer Stop preserves queued input and accepts a new direction" : "Interrupt delivers queued input in the same session"}`, async ({ page, request }) => {
     test.setTimeout(120_000);
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-stop-browser-"));
     const company = await json(await request.post("/api/companies", { data: { name: `ACP Stop ${Date.now()}` } }));
@@ -45,9 +45,9 @@ for (const { unfinishedWrite, pause } of [{ unfinishedWrite: false, pause: false
       await expect.poll(async () => JSON.stringify(await json(await request.get(`/api/issues/${issue.id}/queued-comments`))))
         .toContain("List my recent Drive files.");
 
-      // Interrupt sends the queue immediately; composer Stop pauses the task.
+      // Both actions stop the response; composer Stop must not create a task hold.
       let stopped;
-      if (pause) {
+      if (stopResponse) {
         await page.getByRole("button", { name: "Stop", exact: true }).click();
       } else {
         await page.getByRole("button", { name: "Interrupt", exact: true }).click();
@@ -60,18 +60,38 @@ for (const { unfinishedWrite, pause } of [{ unfinishedWrite: false, pause: false
       expect(stopped.resultJson.executionCancellation.state).toBe("acknowledged");
       const writesAtStop = unfinishedWrite ? await readFile(path.join(root, "writes"), "utf8") : null;
       await page.reload();
-      if (pause) {
-        await expect(page.getByTestId("paused-composer-takeover")).toBeVisible();
-        await expect(editor).toHaveCount(0);
-        await expect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(0);
-        const rejected = await request.post(`/api/issues/${issue.id}/comments`, { data: { body: "go" } });
-        expect(rejected.status()).toBe(409);
-        expect((await readFile(path.join(root, "prompts"), "utf8")).trim().split("\n")).toHaveLength(1);
-        expect(await readFile(path.join(root, "completed"), "utf8").catch(() => "")).toBe("");
-        await page.getByRole("button", { name: "Resume task", exact: true }).click();
-        const dialog = page.getByRole("dialog");
-        await dialog.getByRole("checkbox").check();
-        await dialog.getByRole("button", { name: "Resume work", exact: true }).click();
+      if (stopResponse) {
+        await expect(page.getByTestId("paused-composer-takeover")).toHaveCount(0);
+        await expect(editor).toBeVisible();
+        expect((await json(await request.get(`/api/issues/${issue.id}/tree-control/state`))).activePauseHold).toBeNull();
+        await expect(page.getByRole("button", { name: "Resume task", exact: true })).toHaveCount(0);
+        // FORK DIVERGENCE (D9/SUP-16581 keeps the fork's in-file releaseIssueExecutionAndPromote live, slice 2d):
+        // the fork adopts the saved input into a successor run the moment an acknowledged Stop lands,
+        // instead of parking it for a new direction to join.
+        //
+        // Upstream's release is the wake-queue module's, whose pre-drain rule
+        // (modules/wake-queue/domain/policy.ts `executionCancellationAcknowledged` -> released)
+        // exits before the deferred-wake drain on an operator Stop, so the queue survives the Stop
+        // and the next explicit comment coalesces both messages into one run. That module is dormant
+        // in the fork (D9 / SUP-16581); the live in-file releaseIssueExecutionAndPromote has no such
+        // exit, so the drain promotes the deferred wake shortly after the Stop. The same operator
+        // decision (2026-09-15) is already recorded server-side:
+        // server/src/__tests__/heartbeat-process-recovery.test.ts "preserves deferred input on a
+        // clean Stop and adopts it once on the next explicit comment" carries upstream's assertions
+        // INVERTED rather than deleted. Restore the five upstream lines below in that same change:
+        //   const saved = await json(await request.get(`/api/issues/${issue.id}/queued-comments`));
+        //   expect(JSON.stringify(saved.entries)).toContain("List my recent Drive files.");
+        //   expect((await readFile(path.join(root, "prompts"), "utf8")).trim().split("\n")).toHaveLength(1);
+        //   await editor.fill("Please continue with the saved request.");
+        //   await page.getByRole("button", { name: "Send", exact: true }).click();
+        //
+        // Everything else this journey guards still holds on the fork arm: Stop ends only the
+        // response (no takeover, no pause hold, no Resume gate -- asserted above), the saved input is
+        // never dropped, and it is delivered exactly once in the same session by exactly one
+        // successor run (asserted below).
+        await expect.poll(async () => (await readFile(path.join(root, "prompts"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).length, { timeout: 30_000 }).toBe(2);
+        const saved = await json(await request.get(`/api/issues/${issue.id}/queued-comments`));
+        expect(saved.entries).toHaveLength(0);
       }
       // Fork divergence (SUP-12693 done-tier close comment, slice 2c): upstream 018ca5daa posts
       // this reply only when the run finalizes, but the fork fixture closes with a reply-bearing
@@ -83,8 +103,9 @@ for (const { unfinishedWrite, pause } of [{ unfinishedWrite: false, pause: false
       const prompts = (await readFile(path.join(root, "prompts"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
       expect(prompts).toHaveLength(2);
       expect(new Set(prompts.map(prompt => prompt.sessionId)).size).toBe(1);
-      // Interrupt or Resume delivers the queued follow-up without another message.
-      const continuationPrompts = pause ? prompts.slice(1) : [prompts.at(-1)];
+      // Interrupt delivers immediately; on the fork arm, Stop's successor run carries the saved
+      // input (upstream: the new direction includes it -- see the FORK DIVERGENCE note above).
+      const continuationPrompts = prompts.slice(1);
       expect(JSON.stringify(continuationPrompts)).toContain("List my recent Drive files.");
       expect(await readFile(path.join(root, "completed"), "utf8")).toBe("follow-up\n");
       const completedIssue = await json(await request.get(`/api/issues/${issue.id}`));

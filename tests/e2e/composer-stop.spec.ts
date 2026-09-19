@@ -84,16 +84,36 @@ async function reconcileDemoExecution(
   const activity = await json(
     await request.get(`/api/issues/${issueId}/activity`),
   );
-  const settled = activity.find(
-    (entry: { action: string; runId: string }) =>
-      entry.action === "issue.execution_recovery_settled" &&
-      entry.runId === runId,
-  );
+  // FORK DIVERGENCE (D9 deferred: the fork's in-file release promotes parked input at Stop,
+  // slice 2d): upstream's wake-queue release answers an operator Stop with its
+  // `executionCancellationAcknowledged` pre-drain exit, so the queued comment stays deferred and
+  // the reconciliation action keeps naming the run that was stopped. This fold keeps the fork's
+  // in-file releaseIssueExecutionAndPromote live (operator decision 2026-09-15, D9 / SUP-16581;
+  // see server/src/__tests__/heartbeat-process-recovery.test.ts and
+  // heartbeat-comment-wake-batching.test.ts, which carry the same divergence inverted), so the
+  // Stop promotes the parked comment into a SUCCESSOR run on this card. When the subtree pause
+  // then cancels that successor, the source-scoped action is re-identified onto it
+  // (fingerprint `legacy-execution:<run.id>` + supersedeOnIdentityChange), and it settles
+  // resolved-with-replay-blocked -- so `recovery.active` is null and the settled activity names
+  // the successor, not `runId`. The child card has no successor and still matches on the first
+  // arm, which is why only the parent needed this. Reconcile whichever run the action actually
+  // settled on; restore the single-arm lookup in the change that makes the module release live.
+  const settled =
+    activity.find(
+      (entry: { action: string; runId: string }) =>
+        entry.action === "issue.execution_recovery_settled" &&
+        entry.runId === runId,
+    ) ??
+    activity.find(
+      (entry: { action: string; runId: string }) =>
+        entry.action === "issue.execution_recovery_settled",
+    );
   const recovery = await json(
     await request.get(`/api/issues/${issueId}/recovery-actions`),
   );
   const actionId = recovery.active?.id ?? settled?.details?.recoveryActionId;
   expect(actionId).toBeTruthy();
+  const reconciledRunId: string = settled?.runId ?? runId;
   await json(
     await request.post(`/api/issues/${issueId}/recovery-actions/resolve`, {
       data: {
@@ -101,7 +121,7 @@ async function reconcileDemoExecution(
         outcome: "restored",
         sourceIssueStatus: "todo",
         executionReconciliation: {
-          runId,
+          runId: reconciledRunId,
           providerStopped: true,
           actionOutcome: "not_performed",
           outcomeEvidence:
@@ -304,7 +324,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
 
       let dispatchedAt = 0;
       page.on("request", (req) => {
-        if (req.method() === "POST" && req.url().endsWith("/tree-holds"))
+        if (req.method() === "POST" && req.url().endsWith(`/heartbeat-runs/${parentRun.id}/cancel`))
           dispatchedAt = Date.now();
       });
       const clickedAt = Date.now();
@@ -313,16 +333,10 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       await expect(
         page.getByRole("button", { name: "Dismiss notification" }),
       ).toHaveCount(0);
-      for (const run of [parentRun, childRun]) {
-        await expect
-          .poll(
-            async () =>
-              (await json(await request.get(`/api/heartbeat-runs/${run.id}`)))
-                .status,
-            { timeout: 35_000 },
-          )
-          .toBe("cancelled");
-      }
+      await expect.poll(async () =>
+        (await json(await request.get(`/api/heartbeat-runs/${parentRun.id}`))).status,
+        { timeout: 35_000 },
+      ).toBe("cancelled");
       const stoppedAt = Date.now();
       expect(dispatchedAt - clickedAt).toBeLessThan(2000);
       expect(dispatchedAt).toBeGreaterThan(0);
@@ -333,7 +347,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
           .toBe(false);
         await expect
           .poll(() => processAlive(childRun.processPid), { timeout: 3000 })
-          .toBe(false);
+          .toBe(true);
       } else {
         const finalRun = await json(
           await request.get(`/api/heartbeat-runs/${parentRun.id}`),
@@ -352,6 +366,20 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         }),
         contentType: "application/json",
       });
+      expect(
+        (await json(await request.get(`/api/issues/${parent.id}/tree-control/state`))).activePauseHold,
+      ).toBeNull();
+      expect((await json(await request.get(`/api/heartbeat-runs/${childRun.id}`))).status).toBe("running");
+      await expect(editor).toBeVisible();
+      await expect(page.getByText("Subtree is paused.", { exact: true })).toHaveCount(0);
+      // Pausing future work is a separate, explicit subtree action.
+      await menu(page, "Pause subtree");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      await expect.poll(async () => (await json(await request.get(`/api/heartbeat-runs/${childRun.id}`))).status,
+        { timeout: 35_000 }).toBe("cancelled");
+      if (adapter === "process") {
+        await expect.poll(() => processAlive(childRun.processPid), { timeout: 3000 }).toBe(false);
+      }
       expect(
         (
           await json(
@@ -395,16 +423,27 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         .getByRole("button", { name: "Resume subtree", exact: true })
         .click();
       await expect(page.getByRole("dialog")).toHaveCount(0);
-      // The recovery policy parks these stopped tasks. Releasing the hold must
-      // leave them parked, even with Wake agents selected; no implicit replay.
-      expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
-      expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
-      await reconcileDemoExecution(request, parent.id, parentRun.id);
-      await reconcileDemoExecution(request, child.id, childRun.id);
+      if (adapter === "process") {
+        // Legacy processes lack runner stop/action proof, so releasing the hold
+        // preserves their recovery gate until the fixture reconciles them.
+        expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
+        expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
+        await reconcileDemoExecution(request, parent.id, parentRun.id);
+        await reconcileDemoExecution(request, child.id, childRun.id);
+      }
+      // A verified stopped native runner can honor the explicitly selected
+      // Wake agents option without another manual reconciliation step.
       const resumedParentRun = await running(request, parent.id, adapter);
       const resumedChildRun = await running(request, child.id, adapter);
       expect(resumedParentRun.id).not.toBe(parentRun.id);
       expect(resumedChildRun.id).not.toBe(childRun.id);
+      if (adapter === "paperclip_runner") {
+        await expect.poll(async () => {
+          const calls = await readFile(process.env.PAPERCLIP_STOP_CODEX_LOG!, "utf8");
+          return calls.split("turn/start").length - 1;
+        }, { timeout: 30_000 }).toBeGreaterThanOrEqual(5);
+        await page.screenshot({ path: testInfo.outputPath("native-resumed.png"), fullPage: true });
+      }
       await menu(page, "Pause subtree");
       await expect(page.getByRole("dialog")).toHaveCount(0);
       await expect(

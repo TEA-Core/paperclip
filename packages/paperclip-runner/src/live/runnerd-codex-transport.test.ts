@@ -2044,6 +2044,40 @@ it.each([99, 100])(
   },
 );
 
+it("publishes spawned runner ownership before waiting for provider startup", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runner-spawn-ownership-"));
+  let releaseOwnership!: () => void;
+  const persisted = new Promise<void>((resolve) => { releaseOwnership = resolve; });
+  const onSpawn = vi.fn(async () => persisted);
+  const activate = vi.fn();
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: fakeCodexArgs(stateDirectory),
+    stateDirectory,
+    onSpawn,
+    controlPlaneRegistration: async (authority) => {
+      await authority.start();
+      return { activate, release: () => undefined };
+    },
+  });
+  const opening = bundle.transport.request("thread/start", { cwd: tmpdir(), dynamicTools: codexSemanticToolSpecs() });
+  try {
+    await vi.waitFor(() => expect(onSpawn).toHaveBeenCalledOnce());
+    expect(onSpawn).toHaveBeenCalledWith({ pid: expect.any(Number), processGroupId: expect.any(Number), startedAt: expect.any(String) });
+    expect(bundle.transport.processInfo?.().pid).toBeGreaterThan(0);
+    expect(activate).not.toHaveBeenCalled();
+    releaseOwnership();
+    await opening;
+    expect(activate).toHaveBeenCalledOnce();
+  } finally {
+    releaseOwnership();
+    await opening.catch(() => undefined);
+    await bundle.transport.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
 it("launches runnerd with its production durable outbox limits", () => {
   expect(runnerdLaunchProfileInternals.maxOutboxBytes).toBe(16 * 1024 * 1024);
   expect(runnerdLaunchProfileInternals.p0ReserveBytes).toBe(1024 * 1024);
@@ -5286,6 +5320,93 @@ it.each(["not_suspended", "wrong_identity"] as const)(
   10_000,
 );
 
+it.each([
+  {
+    label: "interrupted",
+    args: ["--hold-turn"],
+    terminal: "turn.interrupted",
+    disposition: "needs_review",
+  },
+  {
+    label: "failed",
+    args: ["--fail-turn-immediately"],
+    terminal: "turn.failed",
+    disposition: "needs_review",
+  },
+  {
+    label: "completed",
+    args: [],
+    terminal: "turn.completed",
+    disposition: "done",
+  },
+])("retains a $label runner's result before closing its provider turn", async ({
+  label, args, terminal, disposition,
+}) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-stop-result-"));
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: fakeCodexArgs(stateDirectory, ...args),
+    stateDirectory,
+  });
+  const driver = new CodexAppServerDriver({
+    taskEnvelope: createCodexTaskEnvelope({
+      objective: "Stop and retain unfinished work.",
+    }),
+    environment: {
+      PATH: process.env.PATH,
+      HOME: join(tmpdir(), "runnerd-stop-host-home"),
+      PAPERCLIP_WORKSPACE_CWD: stateDirectory,
+    },
+    approvalPolicy: "never",
+    transportFactory: () => bundle.transport,
+  });
+  const session = await driver.openSession({
+    runId: "run-stop-result",
+    normalizedSessionId: "session-stop-result",
+    workingDirectory: stateDirectory,
+  });
+  try {
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Keep working until interrupted." },
+    });
+    if (label === "interrupted") {
+      await session.interrupt({
+        turnId: turn.turnId,
+        reason: "Stopped by the user",
+      });
+    }
+    const events: PrpEvent[] = [];
+    for await (const event of session.events()) {
+      events.push(event);
+      if (event.eventType === "session.failed" || event.eventType === terminal) {
+        break;
+      }
+    }
+    // Let already committed durable suffix events reach the facade as well.
+    await bundle.transport.request("thread/read", {});
+    const snapshot = await session.snapshot();
+    expect(events.some((event) => event.eventType === "session.failed")).toBe(false);
+    expect(events.map((event) => event.eventType)).toContain("run.result.proposed");
+    expect(events.at(-1)?.eventType).toBe(terminal);
+    expect(snapshot).toMatchObject({
+      activeTurnId: null,
+      semanticResult: {
+        turnId: turn.turnId,
+        result: { reportedWorkDisposition: disposition },
+      },
+    });
+  } finally {
+    await session.close().catch(() => undefined);
+    await rm(stateDirectory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25,
+    });
+  }
+}, 30_000);
+
 it("binds an immediately failed durable turn before exposing its terminal", async () => {
   const stateDirectory = await mkdtemp(
     join(tmpdir(), "runnerd-fast-terminal-"),
@@ -8505,6 +8626,8 @@ async function verifyLiveRunnerAdoption(
   mismatchedCheckpoint: boolean,
   mismatchedArtifact = false,
   goalMidTurn = false,
+  detachBeforeCleanup = false,
+  startWithoutCheckpoint = false,
 ) {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-live-adopt-"));
   const server = createServer();
@@ -8614,7 +8737,7 @@ async function verifyLiveRunnerAdoption(
         { mode: 0o600 },
       );
     };
-    await compactProviderIdentityEvents();
+    if (!startWithoutCheckpoint) await compactProviderIdentityEvents();
 
     const duplicateLauncher = vi.fn(() => {
       throw new Error("duplicate runner spawn attempted");
@@ -8632,7 +8755,7 @@ async function verifyLiveRunnerAdoption(
           }
         : {}),
       resumeDynamicTools: [],
-      resumeProviderSession: {
+      resumeProviderSession: startWithoutCheckpoint ? undefined : {
         driverSessionId: String(openedThread.id),
         providerSessionId: mismatchedCheckpoint
           ? "wrong-provider-session"
@@ -8698,12 +8821,18 @@ async function verifyLiveRunnerAdoption(
       expect(() => process.kill(runnerPid!, 0)).not.toThrow();
       return;
     }
-    await expect(adopted.transport.request("thread/read", {})).resolves.toEqual(
+    await expect(adopted.transport.request(startWithoutCheckpoint ? "thread/start" : "thread/read", {})).resolves.toEqual(
       expect.objectContaining({
         thread: expect.objectContaining({ id: "codex-thread-1" }),
       }),
     );
     expect(adopted.evidence().runnerPid).toBe(runnerPid);
+    if (startWithoutCheckpoint) {
+      const retained = JSON.parse(await readFile(controlPlaneStatePath, "utf8"));
+      for (const type of ["run.prepare", "session.open"]) {
+        expect(retained.commands.filter((command: { type: string }) => command.type === type)).toHaveLength(1);
+      }
+    }
     if (goalMidTurn) {
       const observed = await Promise.race([
         (async () => {
@@ -8720,12 +8849,24 @@ async function verifyLiveRunnerAdoption(
     expect(adopted.evidence().diagnostics).toContain(
       `adopted runner ${runnerPid} authenticated to its durable PRP authority`,
     );
-    expect(adopted.evidence().diagnostics).toContain(
-      "restored adopted provider identity from the exact durable checkpoint after PRP event compaction; awaiting live confirmation",
-    );
-    expect(adopted.evidence().diagnostics).toContain(
-      "confirmed adopted provider identity against authenticated recovery session.snapshot",
-    );
+    if (!startWithoutCheckpoint) {
+      expect(adopted.evidence().diagnostics).toContain(
+        "restored adopted provider identity from the exact durable checkpoint after PRP event compaction; awaiting live confirmation",
+      );
+      expect(adopted.evidence().diagnostics).toContain(
+        "confirmed adopted provider identity against authenticated recovery session.snapshot",
+      );
+    }
+    if (detachBeforeCleanup) {
+      await adopted.detachControllerForRestart();
+      await adopted.transport.close("old controller finalizer");
+      expect(signal).not.toHaveBeenCalled();
+      expect(() => process.kill(runnerPid!, 0)).not.toThrow();
+      const retained = JSON.parse(await readFile(controlPlaneStatePath, "utf8"));
+      const commandTypes = retained.commands.map((command: { type: string }) => command.type);
+      expect(commandTypes).not.toContain("turn.stop");
+      expect(commandTypes).not.toContain("runner.suspend");
+    }
   } finally {
     await adopted?.transport.close().catch(() => undefined);
     if (runnerPid) {
@@ -8764,6 +8905,10 @@ it(
 );
 
 it("binds buffered mid-goal items only after the authenticated recovery snapshot", () => verifyLiveRunnerAdoption(false, false, true), 30_000);
+
+it("keeps an adopted runner alive when the detached controller finalizer closes", () => verifyLiveRunnerAdoption(false, false, true, true), 30_000);
+
+it("adopts an opening session without a checkpoint instead of bootstrapping a duplicate provider", () => verifyLiveRunnerAdoption(false, false, false, false, true), 30_000);
 
 it("surfaces a runner exit while provider-ingress readiness is still pending", async () => {
   const neverReady = new Promise<void>(() => undefined);
@@ -8928,3 +9073,25 @@ it("persists an active provider as settled before bounded suspension", async () 
     await rm(stateDirectory, { recursive: true, force: true });
   }
 }, 30_000);
+
+
+it.each(["claude", "codex"] as const)("keeps the explicitly assigned gateway in the %s runner environment", (agent) => {
+  const gateway = {
+    PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned",
+    PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3100/mcp/gateway",
+    PAPERCLIP_NATIVE_MCP_TOKEN: "fixture-scoped-gateway-token-1234567890",
+  };
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider: "acpx",
+    options: { provider: "acpx", acpxAgent: agent, environment: {
+      PATH: "/bin", ...gateway, PAPERCLIP_API_KEY: "must-not-cross", DATABASE_URL: "must-not-cross",
+    } },
+    identity: { runnerInstanceId: "runner-1", environmentLeaseId: "lease-1", runId: "run-1",
+      normalizedSessionId: "session-1", turnId: "turn-1", itemId: "item-1" },
+    codexHome: "/isolated/home", runtimeContextPath: "/isolated/context.json", hasRuntimeContext: true,
+    acpxSidecarPath: "/verified/provider-pack/dist/cli/acpx-runtime-sidecar.cjs",
+  });
+  expect(environment).toMatchObject(gateway);
+  expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
+  expect(environment.DATABASE_URL).toBeUndefined();
+});

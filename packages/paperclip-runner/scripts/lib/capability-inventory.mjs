@@ -264,9 +264,11 @@ export function validateInventories(inventories) {
   // legacyMcpAliases was a literal 42 upstream. This fork ships its own MCP tools, so the
   // count is derived from the fold-target table above — the one place a new tool must be
   // registered — instead of being a second number to edit and to re-resolve on every fold.
-  // capabilities: 153 comes from upstream #13038, which added the
-  // "server-verified external chat turns" SKILL.md heading (and its classifySkillHeading arm).
-  const expectedCounts = { capabilities: 153, evaluations: 106, legacyMcpAliases: LEGACY_MCP_ALIAS_COUNT };
+  // capabilities stays upstream's literal and moves with upstream: 153 came from #13038
+  // ("server-verified external chat turns"), then slice 2d took it to 155 — #13284
+  // (experimental persistent agent chat) and #13317 (chief-of-staff hiring) each added one
+  // skill/reference heading.
+  const expectedCounts = { capabilities: 155, evaluations: 106, legacyMcpAliases: LEGACY_MCP_ALIAS_COUNT };
   const normativeNames = ["capabilities", "evaluations"];
   const normativeRows = new Map();
   const globalNormativeIds = new Set();

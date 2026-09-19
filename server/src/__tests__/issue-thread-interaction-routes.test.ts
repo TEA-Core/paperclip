@@ -269,6 +269,13 @@ function createIssue(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// FORK DIVERGENCE (resolving two module graphs concurrently drains vitest's pending mock queue twice, slice 2d): upstream extracts this helper so beforeEach can pre-warm the cold route import; the fork keeps the extraction but awaits the two graphs one at a time, as no-concurrent-module-imports.test.ts requires.
+async function loadAppModules() {
+  const issues = await import("../routes/issues.js");
+  const middleware = await import("../middleware/index.js");
+  return [issues, middleware] as const;
+}
+
 async function createApp(actor: Record<string, unknown> = {
   type: "board",
   userId: "local-board",
@@ -284,8 +291,7 @@ async function createApp(actor: Record<string, unknown> = {
       responsibleUserId: actor.onBehalfOfUserId ?? null,
     };
   }
-  const { issueRoutes } = await import("../routes/issues.js");
-  const { errorHandler } = await import("../middleware/index.js");
+  const [{ issueRoutes }, { errorHandler }] = await loadAppModules();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -313,7 +319,7 @@ async function resolveMockInteraction(
 }
 
 describe.sequential("issue thread interaction routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
@@ -585,7 +591,9 @@ describe.sequential("issue thread interaction routes", () => {
     mockCrossIssueInfluence.sourceIssueId = ISSUE_ID;
     mockCrossIssueInfluence.priorCount = 0;
     mockCrossIssueInfluence.inserted.length = 0;
-  });
+    // Keep cold route imports in setup rather than the HTTP assertion timeout.
+    await loadAppModules();
+  }, 60_000);
 
   // Fork divergence (first-test cold-import budget, slice 2c): upstream pins this
   // test to 10s (b847e8b6f). That pin predates upstream's own policy in
@@ -1805,7 +1813,11 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("forces a fresh workspace-aware session when accepting a planning confirmation", async () => {
+  it.each([
+    { label: "explicit", targetIssueId: ISSUE_ID },
+    { label: "omitted", targetIssueId: undefined },
+    { label: "null", targetIssueId: null },
+  ])("forces a fresh workspace-aware session when accepting a planning confirmation with $label issueId", async ({ targetIssueId }) => {
     mockIssueService.getById.mockResolvedValueOnce(createIssue({ workMode: "planning" }));
     mockInteractionService.acceptInteraction.mockResolvedValueOnce({
       interaction: {
@@ -1823,7 +1835,7 @@ describe.sequential("issue thread interaction routes", () => {
           prompt: "Approve this plan?",
           target: {
             type: "issue_document",
-            issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            ...(targetIssueId !== undefined ? { issueId: targetIssueId } : {}),
             documentId: "document-plan",
             key: "plan",
             revisionId: "revision-plan",
@@ -1895,6 +1907,45 @@ describe.sequential("issue thread interaction routes", () => {
         }),
       }),
     );
+  });
+
+  it("does not project an explicitly different issue's approved plan into the current issue wake", async () => {
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-other-plan",
+        companyId: "company-1",
+        issueId: ISSUE_ID,
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee_on_accept",
+        sourceRunId: RUN_1,
+        payload: {
+          version: 1,
+          prompt: "Approve the other issue's plan?",
+          target: {
+            type: "issue_document",
+            issueId: OTHER_ISSUE_ID,
+            key: "plan",
+            revisionId: "other-revision",
+            revisionNumber: 2,
+          },
+        },
+        result: { version: 1, outcome: "accepted" },
+      },
+      createdIssues: [],
+    });
+    const response = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-other-plan/accept`)
+      .send({});
+    expect(response.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    const wake = mockHeartbeatService.wakeup.mock.calls[0]?.[1] as unknown as {
+      contextSnapshot: Record<string, unknown>;
+      payload: Record<string, unknown>;
+    };
+    expect(wake.contextSnapshot).not.toHaveProperty("planReviewInteraction");
+    expect(wake.payload).not.toHaveProperty("planReviewInteraction");
+    expect(wake.contextSnapshot).not.toHaveProperty("forceFreshSession");
   });
 
   it("forces a fresh workspace-aware session when accepting a plan document confirmation on a standard-work issue", async () => {

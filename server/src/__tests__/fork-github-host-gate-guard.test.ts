@@ -92,7 +92,12 @@ describe("fold decision D1 call-site guard", () => {
     const expected: Record<string, Record<string, number>> = {
       createGitRemoteAuthProvider: {
         // D6 removed executeRun's sandbox-only credential probe (5 -> 4).
-        "services/heartbeat.ts": 4,
+        // Slice 2d re-raised it to 5: folding upstream #13442 (8f1905d34) adds the
+        // project-repositories preparation site, which mints a provider for each extra
+        // repo workspace. It is classified RUN-BEARING per D1 and passes environmentDriver
+        // (selectedEnvironmentForConfig?.driver ?? null) -- upstream's own version omits it,
+        // which would have silently re-armed managed identity in host mode.
+        "services/heartbeat.ts": 5,
         "services/execution-workspace-provisioning.ts": 1,
         "services/execution-workspaces.ts": 1,
         "routes/execution-workspaces.ts": 1,

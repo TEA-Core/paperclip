@@ -32,7 +32,13 @@ function runShard(args) {
 // the required checks on merge_group entries (see the comments in pr.yml). There
 // is therefore no pinned SHA to resolve, so the assertions below read the
 // working-tree pr-trusted.yml the fold brought in rather than a pinned copy.
-function readPinnedTrustedPrWorkflow() {
+//
+// FORK DIVERGENCE (fork pr.yml defines the PR jobs itself and never delegates to
+// pr-trusted.yml, slice 2d): the helper keeps upstream's post-#13470 name so every
+// call site below matches, but drops upstream's caller assertion -- there is no
+// `uses: .../pr-trusted.yml@master` line in this fork's pr.yml to assert on. The
+// divergence itself is pinned by the test below instead.
+function readTrustedPrWorkflow() {
   return readFileSync(trustedPrWorkflow, "utf8");
 }
 
@@ -157,11 +163,27 @@ test("shard arguments are validated", () => {
   }
 });
 
+// FORK DIVERGENCE (fork pr.yml runs the PR jobs directly, slice 2d): upstream's
+// `pr.yml calls the trusted PR workflow from master` asserts pr.yml delegates via
+// `uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`. This fork
+// deliberately withholds that stub, so the assertion is inverted rather than
+// dropped: it fails if the fork ever silently regains the delegating caller, and
+// it still covers upstream's other point -- that the trusted workflow is readable.
+test("pr.yml runs the PR jobs directly instead of calling the trusted PR workflow", () => {
+  const caller = readFileSync(prCallerWorkflow, "utf8");
+  assert.doesNotMatch(
+    caller,
+    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@/m,
+    "the fork's pr.yml must not delegate the PR run to the upstream trusted workflow",
+  );
+  assert.ok(readTrustedPrWorkflow().length > 0);
+});
+
 test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
   // Branch protection requires a check literally named `e2e`. The shards run
   // as `e2e shard (n/3)`, so the aggregate job below is what keeps the
   // required-check contract intact — same pattern as the `verify` aggregate.
-  const workflow = readPinnedTrustedPrWorkflow();
+  const workflow = readTrustedPrWorkflow();
   const jobs = readWorkflowJobs(workflow);
 
   const aggregate = jobs.get("e2e");
@@ -285,7 +307,7 @@ test("the stacked PR scope selector runs full CI only where intended", () => {
 test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
   // `pnpm run test:e2e -- $specs` forwards the literal separator to Playwright,
   // so the specs after it are not applied as file filters.
-  const workflow = readPinnedTrustedPrWorkflow();
+  const workflow = readTrustedPrWorkflow();
   assert.ok(
     !/pnpm run test:e2e --\s/.test(workflow),
     "pr-trusted.yml must not insert a literal `--` between `pnpm run test:e2e` and the spec filter",
@@ -298,10 +320,8 @@ test("the trusted PR workflow passes the shard's spec filter to Playwright witho
 });
 
 test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
-  // Implementation PRs validate the workflow under development here. The
-  // caller remains pinned to the last merged trusted SHA until a separate
-  // activation PR advances it, so unmerged PR code never runs on trusted
-  // infrastructure.
+  // Validate the proposed workflow here. The caller executes the merged master
+  // workflow; edits to this workflow take effect after code-owner review and merge.
   const workflow = readFileSync(trustedPrWorkflow, "utf8");
   assert.match(
     workflow,
