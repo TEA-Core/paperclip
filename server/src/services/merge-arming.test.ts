@@ -1833,6 +1833,221 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
+  // SUP-16921: head-pinned direct-merge fallback when enablePullRequestAutoMerge
+  // refuses a clean-status PR. The measured defect: on a queue-less repo, GitHub
+  // returns `errors[0].message = "Pull request Pull request is in clean status"`
+  // in a 200 body, and the actuator had no second lever. The fallback merges
+  // directly, pinned to publishedHeadSha, using the repo's default merge method.
+  // ─────────────────────────────────────────────────────────────────────────
+  describe("SUP-16921: clean-status refusal → head-pinned direct merge fallback", () => {
+    const GRAPHQL_URL = "https://api.github.com/graphql";
+    const REPO_URL = `https://api.github.com/repos/${OWNER}/${REPO}`;
+    const PUBLISHED_HEAD = "d38b413a726d93c5ddc2f28a59571afe54d49dce";
+
+    const certifiedPr = {
+      id: "obj-125",
+      owner: OWNER,
+      repo: REPO,
+      number: 125,
+      nodeId: "PR_node_125",
+      headRefName: "SUP-42-branch",
+      displayName: `${OWNER}/${REPO}#125`,
+      title: "Fix router (SUP-42)",
+      cachedState: "open",
+      lastErrorCode: null,
+      reviewDecision: "APPROVED",
+    };
+
+    async function insertApprovedCardWithPublishedHead(publishedHeadSha: string | null) {
+      const issueId = await insertIssue({ branchName: "SUP-42-branch" });
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            stages: [{ id: "stage-a", type: "review", approvalsNeeded: 1 }],
+          },
+          executionState: {
+            completedStageIds: ["stage-a"],
+            lastDecisionOutcome: "approved",
+            approvalStatus: {
+              publishedHeadSha,
+              publishedAt: "2026-09-19T02:12:10.439Z",
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+      return issueId;
+    }
+
+    it("falls through to a head-pinned direct merge with the correct expectedHeadOid on a clean-status refusal", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(PUBLISHED_HEAD);
+
+      let graphqlCalls = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === GRAPHQL_URL) {
+          graphqlCalls += 1;
+          if (graphqlCalls === 1) {
+            // enablePullRequestAutoMerge → clean-status refusal in a 200 body
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                errors: [{ message: "Pull request Pull request is in clean status" }],
+              }),
+            } as unknown as Response;
+          }
+          // mergePullRequest → success
+          const body = JSON.parse((init?.body as string) ?? "{}");
+          const query = body.query ?? "";
+          expect(query).toContain("mergePullRequest");
+          expect(query).toContain(`expectedHeadOid: "${PUBLISHED_HEAD}"`);
+          expect(query).toContain("mergeMethod: MERGE");
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: { mergePullRequest: { clientMutationId: "mut-125", pullRequest: { merged: true } } },
+            }),
+          } as unknown as Response;
+        }
+        if (url === REPO_URL) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ default_merge_method: "merge" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+      );
+
+      expect(armingOutcome.kind).toBe("armed");
+      expect(armingOutcome.message).toBe(`armed:direct-merge: ${OWNER}/${REPO}#125 (head ${PUBLISHED_HEAD})`);
+      expect(graphqlCalls).toBe(2);
+    });
+
+    it("returns skipped:no-approved-head when publishedHeadSha is null and does not call mergePullRequest", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(null);
+
+      let graphqlCalls = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url === GRAPHQL_URL) {
+          graphqlCalls += 1;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              errors: [{ message: "Pull request Pull request is in clean status" }],
+            }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+      );
+
+      expect(armingOutcome.kind).toBe("skipped");
+      expect(armingOutcome.message).toContain("skipped:no-approved-head");
+      // Only the enablePullRequestAutoMerge call was made; no mergePullRequest.
+      expect(graphqlCalls).toBe(1);
+    });
+
+    it("returns the unchanged failed:<error> for a non-clean-status provider error without attempting a merge", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(PUBLISHED_HEAD);
+
+      let graphqlCalls = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url === GRAPHQL_URL) {
+          graphqlCalls += 1;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              errors: [{ message: "Repository not found" }],
+            }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+      );
+
+      expect(armingOutcome.kind).toBe("failed");
+      expect(armingOutcome.message).toBe("failed:Repository not found");
+      // Only enablePullRequestAutoMerge was called; no fallback merge.
+      expect(graphqlCalls).toBe(1);
+    });
+
+    it("returns failed:direct_merge:<error> when mergePullRequest is rejected for a moved head", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(PUBLISHED_HEAD);
+
+      let graphqlCalls = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url === GRAPHQL_URL) {
+          graphqlCalls += 1;
+          if (graphqlCalls === 1) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                errors: [{ message: "Pull request Pull request is in clean status" }],
+              }),
+            } as unknown as Response;
+          }
+          // mergePullRequest → head moved since approval
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              errors: [{ message: "Head is not an ancestor of the branch" }],
+            }),
+          } as unknown as Response;
+        }
+        if (url === REPO_URL) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ default_merge_method: "merge" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+      );
+
+      expect(armingOutcome.kind).toBe("failed");
+      expect(armingOutcome.message).toBe("failed:direct_merge:Head is not an ancestor of the branch");
+      expect(graphqlCalls).toBe(2);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // ADR-091 D1 / SUP-14783: shared_workspace delivery identity.
   //
   // A shared execution-workspace row belongs to the PARENT issue and carries
