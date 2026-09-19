@@ -1170,6 +1170,90 @@ export async function hasPendingWakeInteraction(db: Db, companyId: string, issue
     .then((rows) => Boolean(rows[0]));
 }
 
+/**
+ * SUP-16684: an automatic no-replay disposition (`evidence.automaticRecovery.replay
+ * = "blocked"`) is a durable hold that `getExecutionBlocker` keeps reading even
+ * after the action is resolved, so a restored-stage wake would be dropped as
+ * "Automatic recovery stopped". A board restore that arms a fresh execution stage
+ * is new evidence, so clear the hold when we land one.
+ *
+ * Exported so the periodic recovery sweep (SUP-16698) can clear the same hold
+ * from actions that resolved before the restore path learned to clear it.
+ */
+export function clearRecoveryReplayHold(
+  evidence: Record<string, unknown>,
+): Record<string, unknown> {
+  const automaticRecovery = evidence.automaticRecovery;
+  if (
+    !automaticRecovery ||
+    typeof automaticRecovery !== "object" ||
+    Array.isArray(automaticRecovery)
+  ) {
+    return evidence;
+  }
+  const automatic = automaticRecovery as Record<string, unknown>;
+  if (automatic.replay !== "blocked") return evidence;
+  return { ...evidence, automaticRecovery: { ...automatic, replay: "restored" } };
+}
+
+/**
+ * SUP-16698: clear the durable no-replay hold from recovery actions that are
+ * already `resolved`. Before SUP-16684 the hold could only be set, never cleared,
+ * so every hold that predates that fix is permanent — it keeps
+ * `executionBlockerPredicate` matching a resolved row and makes every wake for
+ * the source issue fail (`skipped` / `deferred_issue_execution`) forever.
+ *
+ * Only `resolved` rows are eligible. `active`/`escalated` actions keep their hold:
+ * the live recovery ladder still owns those. Idempotent — a second pass matches
+ * nothing and writes nothing.
+ */
+export async function clearStaleRecoveryReplayHolds(
+  db: Db,
+  now = new Date(),
+): Promise<{ scanned: number; cleared: number; issueIds: string[] }> {
+  const rows = await db
+    .select({
+      id: issueRecoveryActions.id,
+      companyId: issueRecoveryActions.companyId,
+      sourceIssueId: issueRecoveryActions.sourceIssueId,
+      evidence: issueRecoveryActions.evidence,
+    })
+    .from(issueRecoveryActions)
+    .where(
+      and(
+        eq(issueRecoveryActions.status, "resolved"),
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      ),
+    );
+
+  let cleared = 0;
+  const issueIds: string[] = [];
+  for (const row of rows) {
+    const nextEvidence = clearRecoveryReplayHold(row.evidence);
+    if (nextEvidence === row.evidence) continue;
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: nextEvidence, updatedAt: now })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, row.id),
+          eq(issueRecoveryActions.companyId, row.companyId),
+        ),
+      );
+    cleared += 1;
+    issueIds.push(row.sourceIssueId);
+  }
+
+  if (cleared > 0) {
+    logger.warn(
+      { scanned: rows.length, cleared, issueIds },
+      "cleared stale no-replay holds on resolved recovery actions",
+    );
+  }
+
+  return { scanned: rows.length, cleared, issueIds };
+}
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -5361,6 +5445,7 @@ export function recoveryService(
       reviewStageArmedStranded: 0,
       noLivePathOwnerUnavailable: 0,
       executionHoldSurfaced: 0,
+      staleReplayHoldsCleared: 0,
       issueIds: [] as string[],
     };
 
@@ -6879,6 +6964,15 @@ export function recoveryService(
     result.escalated += activeRecovery.escalated;
     result.skipped += activeRecovery.skipped;
     result.issueIds.push(...activeRecovery.issueIds);
+
+    // SUP-16698: a no-replay hold that outlived its action has no clearing event
+    // anywhere else, so clear it here on the same startup + periodic recovery pass
+    // that disposes recovery actions. `reconcileActiveRecoveryActions` above covers
+    // `active`/`escalated`; this covers the already-`resolved` residual.
+    const staleReplayHolds = await clearStaleRecoveryReplayHolds(db);
+    result.staleReplayHoldsCleared += staleReplayHolds.cleared;
+    result.issueIds.push(...staleReplayHolds.issueIds);
+
     result.issueIds = [...new Set(result.issueIds)];
 
     return result;
