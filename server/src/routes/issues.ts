@@ -8319,8 +8319,16 @@ export function issueRoutes(
     const governedParticipantAgentId = activeExecutionParticipantAgentId(issue);
     const isSourceOwner = issue.assigneeAgentId === actorAgentId;
     const isExecutionParticipant = governedParticipantAgentId === actorAgentId;
+    // SUP-16705: a management grant is only meaningful when it is held over a
+    // DIFFERENT agent. `agentIsInSubtree` treats `rootAgentId === targetAgentId`
+    // as in-subtree, so `isManagerOf(X, X)` is always true and consulting the
+    // override for a self-assignee would let an agent waive its own conflicting
+    // checkout/run lock -- exactly the self-management SUP-16705 closes. The
+    // source owner already clears the authority check below via `isSourceOwner`,
+    // so excluding the self case costs nothing legitimate.
     const hasPolicyGrant = Boolean(
       issue.assigneeAgentId &&
+      issue.assigneeAgentId !== actorAgentId &&
       (await hasActiveCheckoutManagementOverride(
         actorAgentId,
         issue.companyId,
@@ -15605,6 +15613,87 @@ export function issueRoutes(
         (policy as { stages: unknown[] }).stages.length === 0;
       (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent =
         policyIsObject && !("stages" in (policy as Record<string, unknown>));
+      next();
+    },
+    // SUP-16607: the issues PATCH is a governed close path, but an unhandled
+    // non-HttpError terminating it is invisible after the fact: the app-level
+    // error handler renders a bare `{"error":"Internal server error"}` and the
+    // close transaction has already rolled back, so the activity feed and
+    // `issue_execution_decisions` retain ZERO rows about the attempt (observed
+    // live: SUP-16602's 01:05 done-close 500 left no trace of what threw). Record
+    // the error class and the issue durably, and put a `code`/`details` on the
+    // response so the caller can at least attribute the fault. Scoped to this
+    // route only — the generic 500 shape for other routes is out of scope.
+    (req, res, next) => {
+      const originalJson = res.json.bind(res);
+      // Capture what the failure record needs WHILE the layer is still live:
+      // Express 5 (`router@2`) restores `req.params` when the layer unwinds, so by
+      // the time the error handler responds `req.params.id` is gone (and an id
+      // resolved later would name the wrong route).
+      const routeId = req.params.id as string | undefined;
+      const actorCompanyId = req.actor.companyId ?? (req.actor.companyIds ?? [])[0] ?? null;
+      const originalUrl = req.originalUrl;
+      let recorded = false;
+      const recordUnhandled = async (errorClass: string) => {
+        if (recorded) return;
+        recorded = true;
+        try {
+          const issue = routeId
+            ? await svc.getById(routeId).catch(() => null)
+            : null;
+          const companyId = issue?.companyId ?? actorCompanyId;
+          if (!companyId) {
+            logger.error(
+              { routeId, errorClass },
+              "cannot record unhandled issues PATCH error without a company id",
+            );
+            return;
+          }
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: "issue-patch-error-recorder",
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: "issue.patch_unhandled_error",
+            entityType: "issue",
+            entityId: issue?.id ?? routeId ?? "unknown",
+            issueId: issue?.id ?? null,
+            details: {
+              identifier: issue?.identifier ?? routeId ?? null,
+              errorClass,
+              method: "PATCH",
+              path: originalUrl,
+            },
+          });
+        } catch (err) {
+          logger.error({ err }, "failed to record unhandled issues PATCH error");
+        }
+      };
+      res.json = ((body: unknown) => {
+        const errorContext = (res as unknown as {
+          __errorContext?: { error?: { name?: string } };
+        }).__errorContext;
+        if (res.statusCode === 500 && errorContext?.error) {
+          const errorClass = errorContext.error.name ?? "Error";
+          const genericBody = { error: "Internal server error" } as never;
+          // Settle the durable record BEFORE the response is flushed. A
+          // fire-and-forget write here commits asynchronously and races request
+          // teardown: the row can land after a caller's own cleanup transaction
+          // (measured as `delete from companies` failing on an
+          // `activity_log_company_id_companies_id_fk` in inbox-archive-routes),
+          // and the caller can observe the 500 before the record exists at all.
+          // The error handler ignores this Promise; the body still flushes via
+          // originalJson once the write settles.
+          recordUnhandled(errorClass).then(
+            () => originalJson(genericBody),
+            () => originalJson(genericBody),
+          );
+          return res;
+        }
+        return originalJson(body as never);
+      }) as typeof res.json;
       next();
     },
     validateIssueMutationBody(updateIssueRouteSchema),
