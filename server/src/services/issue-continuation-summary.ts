@@ -1,6 +1,6 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { documents, issueDocuments, issues } from "@paperclipai/db";
+import { documents, issueComments, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
 
@@ -11,6 +11,66 @@ const SUMMARY_SECTION_MAX_CHARS = 1_200;
 const PATH_CANDIDATE_RE = /(?:^|[\s`"'(])((?:server|ui|packages|doc|scripts|\.github)\/[A-Za-z0-9._/-]+)/g;
 const WAITING_FOR_REVIEW_OR_APPROVAL_RE =
   /\bwait(?:ing)? for\b.{0,160}\b(?:review(?:er)?(?: feedback)?|approval|board|human|user|operator)\b/i;
+
+// SUP-16853: a prior run's `result_json.summary` sometimes narrates a comment
+// write it never actually made (or that belongs to a sibling run). When that
+// summary is re-injected under "Recent Concrete Actions" the next run reads it
+// as an achievement and does not re-post. These detectors port the SUP-16848
+// measurement's "completed-comment assertion" rule (summary-text half only; the
+// builder has no access to the run's ndjson transcript). A clause asserts a
+// completed comment write when it matches either pattern below and carries no
+// negation/intent marker.
+const COMPLETED_COMMENT_CLAIM_RES = [
+  // passive/auxiliary: "comment posted", "comment was posted", "comment posted successfully"
+  /\bcomments?\s+(?:was|were|is|are|has been|have been)?\s*(?:successfully\s+)?(?:posted|created|added|left|recorded|filed|written|submitted|landed)\b/i,
+  // active: "posted a comment", "added revision comment"
+  /\b(?:posted|created|added|left|recorded|filed|wrote|submitted)\s+(?:a|an|the|my|its|\d+-line|[\w-]+-line)?\s*(?:[\w-]+\s+){0,2}comments?\b/i,
+];
+const CLAUSE_SPLIT_RE = /[.;\n,]/;
+const NON_CLAIM_MARKERS = [
+  "no ",
+  "not ",
+  "never",
+  "will",
+  "would",
+  "needs to",
+  "going to",
+  "must",
+  "should",
+  "intend",
+  "plans to",
+  "trying to",
+  "attempt to",
+  "about to",
+  "to post",
+  "blocked",
+  "denied",
+  "could not",
+  "unable",
+  "fail to",
+  "did not",
+  "without comment",
+  "instead of",
+  "prior run",
+  "previous run",
+  "already posted",
+  "had posted",
+  "repeatedly posting",
+  "kept posting",
+];
+
+function clauseIsCompletedCommentClaim(clause: string): boolean {
+  const lower = clause.toLowerCase();
+  if (NON_CLAIM_MARKERS.some((marker) => lower.includes(marker))) return false;
+  return COMPLETED_COMMENT_CLAIM_RES.some((re) => re.test(clause));
+}
+
+export function summaryAssertsCompletedCommentWrite(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text
+    .split(CLAUSE_SPLIT_RE)
+    .some((clause) => clauseIsCompletedCommentClaim(clause));
+}
 
 type IssueSummaryInput = {
   id: string;
@@ -133,17 +193,45 @@ export function continuationSummaryParksExecutor(body: string | null | undefined
   return WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(nextAction);
 }
 
+function rewordUnverifiedCommentClaim(run: RunSummaryInput): string {
+  const endedUnsuccessfully = run.status === "interrupted" || run.status === "failed";
+  const lead = endedUnsuccessfully
+    ? `Prior run \`${run.id}\` ended \`${run.status}\` and its summary asserted a comment was posted, but`
+    : `Prior run \`${run.id}\` summary asserted a comment was posted, but`;
+  return `${lead} no comment owned by that run (createdByRunId/derivedCreatedByRunId) was found on this issue. Treat that write as unverified — re-check before relying on it.`;
+}
+
 export function buildContinuationSummaryMarkdown(input: {
   issue: IssueSummaryInput;
   run: RunSummaryInput;
   agent: AgentSummaryInput;
   previousSummaryBody?: string | null;
+  /**
+   * SUP-16853: whether the run owns at least one comment artifact on its target
+   * issue (`issue_comments.created_by_run_id` / `derived_created_by_run_id` =
+   * `run.id`). When `false` and the summary asserts a completed comment write,
+   * the claim is reworded so it does not read as an achievement. Absent/`true`
+   * leaves the summary verbatim (never over-suppress a backed claim).
+   */
+  runOwnedCommentArtifact?: boolean | null;
 }) {
   const { issue, run, agent } = input;
   const resultSummary = readResultSummary(run.resultJson);
+  const unbackedCommentClaim =
+    resultSummary != null &&
+    input.runOwnedCommentArtifact === false &&
+    summaryAssertsCompletedCommentWrite(resultSummary);
+
+  const summaryLine =
+    resultSummary == null
+      ? "No adapter-provided result summary was captured for this run."
+      : unbackedCommentClaim
+        ? rewordUnverifiedCommentClaim(run)
+        : truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS);
+
   const recentActions = [
     `Run \`${run.id}\` finished with status \`${run.status}\`${run.finishedAt ? ` at ${run.finishedAt.toISOString()}` : ""}.`,
-    resultSummary ? truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS) : "No adapter-provided result summary was captured for this run.",
+    summaryLine,
   ];
   if (run.error) {
     recentActions.push(`Latest run error${run.errorCode ? ` (${run.errorCode})` : ""}: ${truncateText(run.error, 500)}`);
@@ -246,7 +334,7 @@ export async function refreshIssueContinuationSummary(input: {
   agent: AgentSummaryInput;
 }) {
   const { db, issueId, run, agent } = input;
-  const [issue, existing] = await Promise.all([
+  const [issue, existing, runOwnsCommentArtifact] = await Promise.all([
     db
       .select({
         id: issues.id,
@@ -260,6 +348,23 @@ export async function refreshIssueContinuationSummary(input: {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null),
     getIssueContinuationSummaryDocument(db, issueId),
+    // SUP-16853: does this run own a (non-deleted) comment on the issue? This is
+    // the "run-owned artifact" that legitimately backs a claimed comment write.
+    db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          isNull(issueComments.deletedAt),
+          or(
+            eq(issueComments.createdByRunId, run.id),
+            eq(issueComments.derivedCreatedByRunId, run.id),
+          ),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0),
   ]);
 
   if (!issue) return null;
@@ -268,6 +373,7 @@ export async function refreshIssueContinuationSummary(input: {
     run,
     agent,
     previousSummaryBody: existing?.body ?? null,
+    runOwnedCommentArtifact: runOwnsCommentArtifact,
   });
   const result = await documentService(db).upsertIssueDocument({
     issueId,

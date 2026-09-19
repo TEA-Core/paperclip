@@ -4,7 +4,27 @@ import {
   buildContinuationSummaryMarkdown,
   continuationSummaryParksExecutor,
   extractContinuationSummaryNextAction,
+  summaryAssertsCompletedCommentWrite,
 } from "../services/issue-continuation-summary.js";
+
+function baseIssue() {
+  return {
+    id: "issue-1",
+    identifier: "PAP-1579",
+    title: "Add continuation summaries",
+    description: null,
+    status: "in_progress",
+    priority: "medium",
+  };
+}
+
+function baseAgent() {
+  return {
+    id: "agent-1",
+    name: "CodexCoder",
+    adapterType: "codex_local",
+  };
+}
 
 describe("issue continuation summaries", () => {
   it("builds bounded issue-local handoff context with required sections", () => {
@@ -111,5 +131,135 @@ describe("issue continuation summaries", () => {
     ].join("\n");
 
     expect(continuationSummaryParksExecutor(body)).toBe(false);
+  });
+
+  describe("SUM-16853 comment-write narration guard", () => {
+    it("rewords an unbacked completed-comment claim so it does not read as an achievement", () => {
+      const body = buildContinuationSummaryMarkdown({
+        issue: baseIssue(),
+        run: {
+          id: "run-phantom",
+          status: "succeeded",
+          error: null,
+          resultJson: {
+            summary:
+              "The comment was posted successfully to the issue. Also updated server/src/services/foo.ts.",
+          },
+        },
+        agent: baseAgent(),
+        runOwnedCommentArtifact: false,
+      });
+
+      // The raw assertion must not surface as an achievement...
+      expect(body).not.toContain("The comment was posted successfully");
+      // ...it is reworded to flag the write as unverified...
+      expect(body).toContain("no comment owned by that run");
+      expect(body).toContain("Treat that write as unverified");
+      // ...while the non-claim content (the file path) is still captured.
+      expect(body).toContain("`server/src/services/foo.ts`");
+    });
+
+    it("keeps a completed-comment claim verbatim when a run-owned artifact backs it (no over-suppression)", () => {
+      const summary = "The comment was posted successfully. Also updated server/src/services/foo.ts.";
+      const body = buildContinuationSummaryMarkdown({
+        issue: baseIssue(),
+        run: {
+          id: "run-backed",
+          status: "succeeded",
+          error: null,
+          resultJson: { summary },
+        },
+        agent: baseAgent(),
+        runOwnedCommentArtifact: true,
+      });
+
+      // Backed claim surfaces unchanged — the guard must not eat a real action.
+      expect(body).toContain(summary);
+      expect(body).not.toContain("Treat that write as unverified");
+    });
+
+    it("suppresses completed-action narration for an interrupted run with no run-owned artifact", () => {
+      const body = buildContinuationSummaryMarkdown({
+        issue: baseIssue(),
+        run: {
+          id: "run-interrupted",
+          status: "interrupted",
+          error: "orphaned",
+          errorCode: "orphaned_running_run",
+          resultJson: { summary: "the comment posted successfully" },
+        },
+        agent: baseAgent(),
+        runOwnedCommentArtifact: false,
+      });
+
+      expect(body).toContain("ended `interrupted`");
+      expect(body).toContain("Treat that write as unverified");
+      expect(body).not.toContain("the comment posted successfully");
+    });
+
+    it("leaves a summary that merely denies a comment write untouched even when unbacked", () => {
+      const summary = "Did not post a comment; blocked on auth and will retry next run.";
+      const body = buildContinuationSummaryMarkdown({
+        issue: baseIssue(),
+        run: {
+          id: "run-negated",
+          status: "succeeded",
+          error: null,
+          resultJson: { summary },
+        },
+        agent: baseAgent(),
+        runOwnedCommentArtifact: false,
+      });
+
+      // Negation/intent markers mean it is not a completed-write claim -> keep verbatim.
+      expect(body).toContain(summary);
+      expect(body).not.toContain("Treat that write as unverified");
+    });
+
+    it("leaves the summary line untouched when the artifact flag is not supplied", () => {
+      const summary = "The comment was posted successfully.";
+      const body = buildContinuationSummaryMarkdown({
+        issue: baseIssue(),
+        run: {
+          id: "run-no-flag",
+          status: "succeeded",
+          error: null,
+          resultJson: { summary },
+        },
+        agent: baseAgent(),
+      });
+
+      expect(body).toContain(summary);
+    });
+  });
+
+  describe("summaryAssertsCompletedCommentWrite (SUM-16853 detector port)", () => {
+    it.each([
+      "the comment posted successfully", // 50df0b3f (named case)
+      "Recovery summary comment posted (comment ID: 0a141eb6)", // 5294f4d4
+      "Recovery from successful_run_missing_state, comment posted", // 6c564f2f
+      "Added revision comment to SUP-15506 issue", // bf3a34ae
+      "a recovery comment posted", // 273b8df7
+      "posted a 12-line comment",
+    ] as const)("detects the completed-comment assertion: %s", (text) => {
+      expect(summaryAssertsCompletedCommentWrite(text)).toBe(true);
+    });
+
+    it.each([
+      "did not post a comment",
+      "no comment was posted yet",
+      "will post the comment next run",
+      "blocked from posting a comment",
+      "the comment has not been created",
+      "left the summary; no comment written",
+    ] as const)("ignores negated or intent phrases: %s", (text) => {
+      expect(summaryAssertsCompletedCommentWrite(text)).toBe(false);
+    });
+
+    it("returns false for empty or comment-free summaries", () => {
+      expect(summaryAssertsCompletedCommentWrite(null)).toBe(false);
+      expect(summaryAssertsCompletedCommentWrite("")).toBe(false);
+      expect(summaryAssertsCompletedCommentWrite("Updated server/src/services/heartbeat.ts")).toBe(false);
+    });
   });
 });
