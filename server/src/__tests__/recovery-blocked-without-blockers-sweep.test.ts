@@ -55,7 +55,7 @@ vi.mock("../adapters/index.ts", async () => {
 
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
-import { isBlockedWithoutBlockers } from "../services/recovery/service.ts";
+import { hasUsableUnblockDescriptor, isBlockedWithoutBlockers } from "../services/recovery/service.ts";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../services/issue-dependency-wakeups.ts";
 
 // loadConfig() in recovery/service.ts validates bind mode eagerly.
@@ -906,6 +906,101 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows[0]);
     expect(audit?.action).toBe("issue.blocked_without_blockers_healed");
+
+    await drainAgentRuns(agentId);
+  });
+
+  it("setting ON: a card carrying a self-owned unblockDescriptor with a non-empty action is exempt — neither healed nor escalated (SUP-16951)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Deliberate operator-wait park (descriptor present)",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      unblockDescriptor: { owner: { agentId }, action: "Publish the verified body to the repo" },
+      updatedAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.unblockDescriptorExemptSkipped).toBe(1);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const row = await db
+      .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+    expect(row?.unblockDescriptor).toMatchObject({ action: "Publish the verified body to the repo" });
+
+    const wakeups = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.length);
+    expect(wakeups).toBe(0);
+
+    const actions = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows.length);
+    expect(actions).toBe(0);
+
+    const audits = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((r) => r.action));
+    expect(audits).not.toContain("issue.blocked_without_blockers_healed");
+    expect(audits).not.toContain("issue.blocked_without_blockers_escalated");
+    expect(audits).not.toContain("issue.blocked_without_blockers_suppressed");
+  });
+
+  it("setting ON: a descriptor whose action is empty/whitespace-only is NOT exempt — heals exactly as a descriptorless card (SUP-16951 contract)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    // Bypasses the API validator (which rejects a trim().min(1) action) to pin
+    // the healer's own non-empty-action bound: a whitespace action carries no
+    // usable unblock path, so the lane must still heal the card.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with a blank-action descriptor",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      unblockDescriptor: { owner: { agentId }, action: "   " },
+      updatedAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.unblockDescriptorExemptSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("todo");
 
     await drainAgentRuns(agentId);
   });
@@ -1841,5 +1936,24 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .map((r) => ((r.details as { suppressedBy: { id: string } }).suppressedBy.id))
       .sort();
     expect(suppressorIds).toEqual([firstActionId, replacementActionId].sort());
+  });
+});
+
+describe("hasUsableUnblockDescriptor (SUP-16951 exemption predicate)", () => {
+  it("is exempt only for a non-null descriptor with a non-empty action string", () => {
+    const agent = { agentId: "agent-1" };
+    expect(hasUsableUnblockDescriptor(null)).toBe(false);
+    expect(hasUsableUnblockDescriptor(undefined)).toBe(false);
+    expect(hasUsableUnblockDescriptor({ owner: "board", action: "" })).toBe(false);
+    expect(hasUsableUnblockDescriptor({ owner: "board", action: "   " })).toBe(false);
+    expect(hasUsableUnblockDescriptor({ owner: agent, action: "Publish the verified body" })).toBe(true);
+    expect(hasUsableUnblockDescriptor({ owner: "board", action: " Approve the ruleset PUT " })).toBe(true);
+  });
+
+  it("does not key on owner identity (self-owned vs board are both honoured)", () => {
+    const agent = { agentId: "agent-1" };
+    expect(hasUsableUnblockDescriptor({ owner: agent, action: "x" })).toBe(
+      hasUsableUnblockDescriptor({ owner: "board", action: "x" }),
+    );
   });
 });

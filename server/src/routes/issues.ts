@@ -17503,8 +17503,9 @@ export function issueRoutes(
               // SUP-15298: empty blocker set + no unblockDescriptor means no
               // structural resolution path exists for the card; flag it so the
               // worst combination is distinguishable from a card that still has
-              // a descriptor naming an owner + action.
-              hasUnblockDescriptor: Boolean(descriptor),
+              // a descriptor naming an owner + action. Keyed on the committed
+              // row (SUP-16951) so the log matches the healer's exemption.
+              hasUnblockDescriptor: Boolean(issue.unblockDescriptor),
             },
             "issue PATCH committed blocked with an empty blocker set",
           );
@@ -17522,7 +17523,12 @@ export function issueRoutes(
               source: "issue_update_route",
               identifier: issue.identifier,
               blockerIssueIds: committedBlockerIssueIds,
-              hasUnblockDescriptor: Boolean(descriptor),
+              // SUP-16951: key on the committed row, not just this patch, so a
+              // card that was re-parked without re-sending its descriptor (e.g.
+              // a re-park justified by a pending interaction) is still audited
+              // as descriptor-bearing — the same source of truth the
+              // blocked_without_blockers healer exempts on.
+              hasUnblockDescriptor: Boolean(issue.unblockDescriptor),
               actorSource: actor.actorSource,
               statusChanged: existing.status !== issue.status,
               blockersPatched: Array.isArray(req.body.blockedByIssueIds),
