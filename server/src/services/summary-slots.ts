@@ -29,12 +29,26 @@ import { readBuiltInAgentMarker } from "./built-in-agent-metadata.js";
 import { builtInAgentService } from "./built-in-agents.js";
 import { agentService } from "./agents.js";
 import { issueService } from "./issues.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { releaseSummarySlotBinding } from "./summary-slot-finalization.js";
 
 /** Built-in agent key for the Summarizer bundle (see PAP-13920). */
 export const SUMMARIZER_BUILT_IN_KEY = "summarizer";
 
 /** Generation issues in these statuses are no longer active and can be superseded. */
 const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
+
+/**
+ * How long a non-terminal generation issue with no live run and no active recovery
+ * action may sit before its summary-slot binding is reclaimed (SUP-16945). This
+ * clears the wedge where a generation issue loses its live path but is never
+ * terminal, so the slot stops being permanently "generating". The value sits above
+ * `IN_PROGRESS_SETTLE_WINDOW_MS` (5 min, issue-continuation-path) so a freshly
+ * re-armed generation mid-flight is not reclaimed, and far below
+ * `TODO_STRANDED_THRESHOLD_MS` (2h) so a dead wedge is cleared on the next read
+ * without waiting for a human.
+ */
+const DEAD_GENERATION_GRACE_MS = 30 * 60 * 1_000;
 
 const DEFAULT_SUMMARY_FORMAT = "markdown";
 const SUMMARY_SLOT_REVISION_LIMIT = 20;
@@ -177,6 +191,7 @@ export function summarySlotService(db: Db) {
   const builtIns = builtInAgentService(db);
   const agents = agentService(db);
   const issuesSvc = issueService(db);
+  const recoveryActions = issueRecoveryActionService(db);
 
   function resolveSelector(input: SummarySlotSelectorInput): ResolvedSelector {
     const parsed = summarySlotScopeSelectorSchema.safeParse({
@@ -280,15 +295,108 @@ export function summarySlotService(db: Db) {
     return !!row && !TERMINAL_ISSUE_STATUSES.has(row.status as IssueStatus);
   }
 
+  /**
+   * True when a slot's `generating_issue_id` binding is DEAD (SUP-16945). Two cases:
+   *
+   *   1. The bound generation issue is TERMINAL (done/cancelled). A terminal issue
+   *      can never write a summary (the write guard refuses terminal writes), so its
+   *      binding is definitively dead. `finalizeSummarySlotsForTerminalIssue`
+   *      normally clears it on the terminal transition, but a legacy/orphan binding
+   *      or an interrupted transition can leave a terminal issue still bound; this
+   *      read path reclaims it. The release is idempotent (its WHERE clause only
+   *      matches a still-armed slot) and shares the finalizer's idle/failed
+   *      predicate, so it cannot double-release or diverge from the transition path.
+   *
+   *   2. The bound issue is non-terminal but has lost its live path — no live run
+   *      (`executionRunId`/`checkoutRunId`), no in-flight recovery action (`active`
+   *      or `escalated`) — and has sat armed for at least `DEAD_GENERATION_GRACE_MS`.
+   *      Such a slot would otherwise stay wedged in `generating` forever.
+   *
+   * Conservative on purpose for case 2: a generation with a live run or any
+   * in-flight recovery action is in flight and is NEVER reclaimed, regardless of
+   * age.
+   *
+   * Age is measured from the slot's arm time (`summary_slots.updated_at`) — the
+   * moment `generate()` armed the slot to `generating` for this binding — the
+   * authoritative binding timestamp. It deliberately is NOT the issue's
+   * `created_at` (an indirection through the issue row) nor `last_generated_at`
+   * (the PREVIOUS generation's write, which would make a freshly armed generation
+   * look aged and get reclaimed out from under itself).
+   */
+  async function isDeadGenerationBinding(
+    slotRow: SummarySlotRow,
+    issueRow: typeof issues.$inferSelect | null,
+    now: Date,
+  ): Promise<boolean> {
+    if (!slotRow || slotRow.status !== "generating" || !slotRow.generatingIssueId) return false;
+    // Bound issue vanished (deleted / cross-company): the binding can never resolve,
+    // so it is definitively dead.
+    if (!issueRow) return true;
+    // Case 1: a terminal binding is definitively dead. Reclaim on read even though
+    // the terminal finalizer normally owns it — this is the safety net for a
+    // terminal transition that did not clear the binding (legacy/orphan data or an
+    // interrupted transition).
+    if (TERMINAL_ISSUE_STATUSES.has(issueRow.status as IssueStatus)) return true;
+    // Case 2, guard 1: a live run means the generation is actually in flight —
+    // never reclaim, regardless of age.
+    if (issueRow.executionRunId || issueRow.checkoutRunId) return false;
+    // Case 2, guard 2: an in-flight recovery action means the issue is being
+    // recovered — never reclaim, regardless of age.
+    const activeRecovery = await recoveryActions.getActiveForIssue(
+      slotRow.companyId,
+      slotRow.generatingIssueId,
+    );
+    if (activeRecovery) return false;
+    // Case 2, aged: armed for at least the grace window since the slot was armed.
+    return now.getTime() - slotRow.updatedAt.getTime() >= DEAD_GENERATION_GRACE_MS;
+  }
+
+  /**
+   * Reclaims a slot's dead generation binding in place: clears
+   * `generating_issue_id` and completes the slot to `idle` (this generation wrote
+   * nothing surviving) or `failed` (so the refresh sweep regenerates), decided by
+   * the same shared generation-identity predicate as terminal finalization.
+   */
+  async function releaseDeadGenerationBinding(
+    slotRow: SummarySlotRow,
+    issueRow: typeof issues.$inferSelect | null,
+  ): Promise<typeof summarySlots.$inferSelect[]> {
+    const label = issueRow
+      ? issueRow.identifier
+        ? `${issueRow.identifier}: ${issueRow.title}`
+        : issueRow.title
+      : null;
+    const failureReason = label
+      ? `Summary generation task ${label} stopped before writing a summary.`
+      : "Summary generation task is no longer available to write a summary.";
+    return releaseSummarySlotBinding(
+      db,
+      { id: slotRow.generatingIssueId!, companyId: slotRow.companyId },
+      failureReason,
+    );
+  }
+
   async function getSlot(input: SummarySlotSelectorInput): Promise<GetSummarySlotResponse> {
     const sel = resolveSelector(input);
     await assertTargetVisible(sel);
-    const slotRow = await findSlotRow(sel);
+    let slotRow = await findSlotRow(sel);
     if (!slotRow) return { slot: null, document: null, generatingIssue: null };
-    const [documentRow, issueRef] = await Promise.all([
+    let [documentRow, issueRef] = await Promise.all([
       loadDocument(sel.companyId, slotRow.documentId ?? null),
       loadIssueRef(sel.companyId, slotRow.generatingIssueId ?? null),
     ]);
+    // Reclaim a dead generation binding on read (SUP-16945): a non-terminal
+    // generation issue that lost its live path used to leave the slot wedged in
+    // `generating` forever because only the terminal transition released it. The
+    // release is idempotent (its WHERE clause only matches a still-armed slot),
+    // so concurrent readers cannot double-release.
+    if (await isDeadGenerationBinding(slotRow, issueRef.row, new Date())) {
+      const released = await releaseDeadGenerationBinding(slotRow, issueRef.row);
+      if (released.length > 0) {
+        slotRow = released[0];
+        issueRef = { ref: null, row: null };
+      }
+    }
     return {
       slot: mapSlot(slotRow),
       document: documentRow ? mapDocument(documentRow) : null,
@@ -538,11 +646,20 @@ export function summarySlotService(db: Db) {
     if (existing && existing.status === "generating" && existing.generatingIssueId) {
       const active = await loadIssueRef(sel.companyId, existing.generatingIssueId);
       if (isIssueActive(active.row)) {
-        return {
-          slot: mapSlot(existing),
-          generatingIssue: active.ref!,
-          alreadyGenerating: true,
-        };
+        // SUP-16945: a non-terminal generation issue that has lost its live path
+        // (no live run, no active recovery action, aged past the grace window) is
+        // DEAD, not in flight. Fall through and re-arm so the slot can regenerate
+        // instead of staying "generating" forever. `upsertSlot` below re-points
+        // the binding to the fresh issue; the stale dead issue id becomes the new
+        // generation's idempotency version, which makes concurrent re-arms
+        // converge on a single new issue.
+        if (!(await isDeadGenerationBinding(existing, active.row, new Date()))) {
+          return {
+            slot: mapSlot(existing),
+            generatingIssue: active.ref!,
+            alreadyGenerating: true,
+          };
+        }
       }
     }
 
