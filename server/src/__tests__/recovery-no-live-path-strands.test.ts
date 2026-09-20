@@ -2019,4 +2019,93 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     });
     expect(action?.evidence?.agentInvokabilityMessage).toBeTruthy();
   });
+
+  // -- SUP-17009: the in_progress repeated-productive escalation honours a queued wake --
+  //
+  // A one-shot monitor firing nulls monitorNextCheckAt and dispatches a
+  // continuation wake that is still `queued` (its run has not started yet). In
+  // that window the card reads as having no live path, so without a guard the
+  // repeated-productive lane parks it `blocked` and cancels the run it just
+  // created (SUP-16993, twice, to the millisecond).
+
+  async function seedRepeatedProductiveContinuationRun(
+    companyId: string,
+    agentId: string,
+    issueId: string,
+  ) {
+    const runId = randomUUID();
+    const firedAt = new Date("2026-09-20T17:20:14.097Z");
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        retryReason: "issue_continuation_needed",
+        source: "issue.productive_terminal_continuation_recovery",
+      },
+      livenessState: "advanced",
+      startedAt: firedAt,
+      finishedAt: new Date(firedAt.getTime() + 60_000),
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    });
+    return runId;
+  }
+
+  it("skips the in_progress repeated-productive escalation when a queued wake for the issue already exists (no live-path destruction)", async () => {
+    const { companyId, coderId, prefix } = await seedCompany();
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+    });
+    await seedRepeatedProductiveContinuationRun(companyId, coderId, issueId);
+    // The monitor fire dispatched a continuation wake that is still queued.
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      source: "monitor",
+      status: "queued",
+      payload: { issueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // Skipped, not escalated: the queued wake is a live execution path.
+    expect(result.skipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    // No recovery action minted, no blocked flip, no reassignment.
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toBeUndefined();
+    const [reloaded] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(reloaded?.status).toBe("in_progress");
+    expect(reloaded?.assigneeAgentId).toBe(coderId);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("still escalates the in_progress repeated-productive lane when there is no queued wake and no running run", async () => {
+    const { companyId, coderId, prefix } = await seedCompany();
+    const issueId = await createIssue(companyId, prefix, "in_progress", coderId, {
+      updatedAt: pastGraceDate(),
+    });
+    await seedRepeatedProductiveContinuationRun(companyId, coderId, issueId);
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // Genuinely no live path: the lane keeps its real purpose.
+    expect(result.escalated).toBe(1);
+    expect(result.skipped).toBe(0);
+    const [reloaded] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(reloaded?.status).toBe("blocked");
+  });
 });
