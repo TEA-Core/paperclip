@@ -181,7 +181,7 @@ function issueFixture(overrides: Record<string, unknown>) {
 
 function blockedWithoutBlockersWrites() {
   return mockLogActivity.mock.calls
-    .map(([, input]) => input)
+    .map(([, input]) => input as unknown as { action: string; details: unknown })
     .filter((input) => input.action === "issue.blocked_without_blockers_written");
 }
 
@@ -246,7 +246,7 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe("blocked");
     expect(blockedWithoutBlockersWrites()).toHaveLength(1);
-    const input = blockedWithoutBlockersWrites()[0];
+    const input = blockedWithoutBlockersWrites()[0]!;
     expect(input).toEqual(
       expect.objectContaining({
         companyId: "company-1",
@@ -304,7 +304,7 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe("blocked");
     expect(blockedWithoutBlockersWrites()).toHaveLength(1);
-    expect(blockedWithoutBlockersWrites()[0].details).toEqual(
+    expect(blockedWithoutBlockersWrites()[0]!.details).toEqual(
       expect.objectContaining({
         source: "issue_update_route",
         identifier: "PAP-300",
