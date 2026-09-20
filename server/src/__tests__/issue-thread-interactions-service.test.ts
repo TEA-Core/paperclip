@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -26,7 +26,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
+import { ONBOARDING_FIRST_TASK_ORIGIN_KIND, connectionIntentPayloadSchema } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -274,6 +274,128 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { userId: "user-board" },
     );
     expect(expiredByComment).toBeUndefined();
+  });
+
+  async function seedTwoCardsForAgent() {
+    const { companyId, goalId } = await seedConfirmationIssue("Connection intent");
+    const agentId = await seedAgent(companyId);
+    const issueA = randomUUID();
+    const issueB = randomUUID();
+    const runA = randomUUID();
+    const runB = randomUUID();
+    await db.insert(issues).values([
+      { id: issueA, companyId, goalId, title: "Card A", status: "in_progress", priority: "medium", assigneeAgentId: agentId },
+      { id: issueB, companyId, goalId, title: "Card B", status: "in_progress", priority: "medium", assigneeAgentId: agentId },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      { id: runA, companyId, agentId, status: "running", responsibleUserId: "user-board", contextSnapshot: { issueId: issueA } },
+      { id: runB, companyId, agentId, status: "running", responsibleUserId: "user-board", contextSnapshot: { issueId: issueB } },
+    ]);
+    return { companyId, goalId, agentId, issueA, issueB, runA, runB };
+  }
+
+  function githubPayload(requestingAgentId: string, requestingAgentName = "TestAgent") {
+    return {
+      version: 1 as const,
+      serviceSlug: "github",
+      serviceName: "GitHub",
+      serviceLogoUrl: null,
+      requestingAgentId,
+      requestingAgentName,
+      phase: "requested" as const,
+    };
+  }
+
+  async function countPendingConnectionIntents(companyId: string, serviceSlug: string) {
+    const rows = await db
+      .select({ status: issueThreadInteractions.status, payload: issueThreadInteractions.payload })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.kind, "connection_intent"),
+          eq(issueThreadInteractions.status, "pending"),
+        ),
+      );
+    return rows.filter((row) => connectionIntentPayloadSchema.parse(row.payload).serviceSlug === serviceSlug).length;
+  }
+
+  it("reuses the pending connection intent across cards for the same service and requesting agent", async () => {
+    const { companyId, agentId, issueA, issueB, runA, runB } = await seedTwoCardsForAgent();
+    const payload = githubPayload(agentId);
+
+    const first = await interactionsSvc.createConnectionIntent(
+      { id: issueA, companyId },
+      { payload, sourceRunId: runA, addresseeUserId: "user-board", idempotencyKey: `connection-intent:${runA}:user-board:github` },
+    );
+    expect(first).toMatchObject({ kind: "connection_intent", status: "pending", issueId: issueA });
+
+    const second = await interactionsSvc.createConnectionIntent(
+      { id: issueB, companyId },
+      { payload, sourceRunId: runB, addresseeUserId: "user-board", idempotencyKey: `connection-intent:${runB}:user-board:github` },
+    );
+
+    expect(second.id).toBe(first.id);
+    expect(second.createdAt).toEqual(first.createdAt);
+    expect(second.issueId).toBe(issueA);
+    expect(await countPendingConnectionIntents(companyId, "github")).toBe(1);
+  });
+
+  it("mints a new intent for a different serviceSlug or a different requesting agent", async () => {
+    const base = await seedTwoCardsForAgent();
+    const first = await interactionsSvc.createConnectionIntent(
+      { id: base.issueA, companyId: base.companyId },
+      { payload: githubPayload(base.agentId), sourceRunId: base.runA, addresseeUserId: "user-board", idempotencyKey: `connection-intent:${base.runA}:user-board:github` },
+    );
+    expect(first.status).toBe("pending");
+
+    const otherService = await interactionsSvc.createConnectionIntent(
+      { id: base.issueB, companyId: base.companyId },
+      {
+        payload: { ...githubPayload(base.agentId), serviceSlug: "slack", serviceName: "Slack" },
+        sourceRunId: base.runB,
+        addresseeUserId: "user-board",
+        idempotencyKey: `connection-intent:${base.runB}:user-board:slack`,
+      },
+    );
+    expect(otherService.id).not.toBe(first.id);
+    expect(otherService.payload.serviceSlug).toBe("slack");
+
+    const agent2 = await seedAgent(base.companyId);
+    const issueC = randomUUID();
+    const runC = randomUUID();
+    await db.insert(issues).values({ id: issueC, companyId: base.companyId, goalId: base.goalId, title: "Card C", status: "in_progress", priority: "medium", assigneeAgentId: agent2 });
+    await db.insert(heartbeatRuns).values({ id: runC, companyId: base.companyId, agentId: agent2, status: "running", responsibleUserId: "user-board", contextSnapshot: { issueId: issueC } });
+    const byOtherAgent = await interactionsSvc.createConnectionIntent(
+      { id: issueC, companyId: base.companyId },
+      { payload: githubPayload(agent2, "OtherAgent"), sourceRunId: runC, addresseeUserId: "user-board", idempotencyKey: `connection-intent:${runC}:user-board:github` },
+    );
+    expect(byOtherAgent.id).not.toBe(first.id);
+    expect(byOtherAgent.payload.serviceSlug).toBe("github");
+  });
+
+  it("mints a new intent once the prior intent reaches a terminal status", async () => {
+    const { companyId, agentId, issueA, issueB, runA, runB } = await seedTwoCardsForAgent();
+    const payload = githubPayload(agentId);
+    const first = await interactionsSvc.createConnectionIntent(
+      { id: issueA, companyId },
+      { payload, sourceRunId: runA, addresseeUserId: "user-board", idempotencyKey: `connection-intent:${runA}:user-board:github` },
+    );
+    expect(first.status).toBe("pending");
+
+    await db
+      .update(issueThreadInteractions)
+      .set({ status: "expired", result: { version: 1, outcome: "expired" }, resolvedAt: new Date() })
+      .where(eq(issueThreadInteractions.id, first.id));
+    expect(await interactionsSvc.getById(first.id)).toMatchObject({ status: "expired" });
+
+    const second = await interactionsSvc.createConnectionIntent(
+      { id: issueB, companyId },
+      { payload, sourceRunId: runB, addresseeUserId: "user-board", idempotencyKey: `connection-intent:${runB}:user-board:github` },
+    );
+    expect(second.id).not.toBe(first.id);
+    expect(second.status).toBe("pending");
+    expect(second.issueId).toBe(issueB);
   });
 
   it("persists addressees without allowing them to bypass human-only governance", async () => {
