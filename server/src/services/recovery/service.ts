@@ -6690,6 +6690,18 @@ export function recoveryService(
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
+          // SUP-17009: a one-shot monitor that fired moments ago has null'd
+          // `monitorNextCheckAt` and dispatched a continuation wake that is still
+          // `queued` (its run has not reached `startedAt` yet). `hasFutureMonitorCheck`
+          // and `hasActiveExecutionPath` both read that card as having no live path in
+          // this window, so the escalation below would park it `blocked` and cancel the
+          // run it just destroyed. A `queued` wake is a live execution path — stand down
+          // the whole repeated-productive branch (no escalation, no duplicate requeue),
+          // mirroring the queued-wake guard the `todo` lane applies.
+          if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
+            result.skipped += 1;
+            continue;
+          }
           // GGU-809: skip escalation if the assignee has shown visible progress
           // (comment or attachment) within the exemption window. Falling
           // through here lets the normal continuation-retry path enqueue the
