@@ -658,11 +658,14 @@ describeEmbeddedPostgres("summary slot service", () => {
   describe("dead generation binding reclaim (SUP-16945)", () => {
     const GRACE_MS = 30 * 60 * 1_000;
 
-    async function backdateIssue(issueId: string, ageMs: number) {
+    async function ageSlotBinding(issueId: string, ageMs: number) {
+      // The dead-binding age predicate measures from the slot's arm time
+      // (summary_slots.updated_at), so backdate the SLOT to age the binding — not
+      // the issue row.
       await db
-        .update(issues)
-        .set({ createdAt: new Date(Date.now() - ageMs) })
-        .where(eq(issues.id, issueId));
+        .update(summarySlots)
+        .set({ updatedAt: new Date(Date.now() - ageMs) })
+        .where(eq(summarySlots.generatingIssueId, issueId));
     }
 
     it("reclaims a dead non-terminal binding on generate and re-arms a fresh generation", async () => {
@@ -677,7 +680,7 @@ describeEmbeddedPostgres("summary slot service", () => {
 
       // The generation task loses its live path but is never terminal: no run, no
       // recovery action, and aged past the reclaim grace. This is the wedge.
-      await backdateIssue(first.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+      await ageSlotBinding(first.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
 
       const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
       expect(second.alreadyGenerating).toBe(false);
@@ -695,7 +698,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       const svc = summarySlotService(db);
 
       const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
-      await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+      await ageSlotBinding(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
 
       const result = await svc.getSlot(projectSelector(companyId, projectId));
       // The slot is no longer wedged: binding cleared and completed to failed (the
@@ -726,7 +729,7 @@ describeEmbeddedPostgres("summary slot service", () => {
         .update(issues)
         .set({ executionRunId: runId })
         .where(eq(issues.id, generated.generatingIssue.id));
-      await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+      await ageSlotBinding(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
 
       const result = await svc.getSlot(projectSelector(companyId, projectId));
       expect(result.slot!.status).toBe("generating");
@@ -756,7 +759,7 @@ describeEmbeddedPostgres("summary slot service", () => {
         evidence: {},
         nextAction: "Recover the stalled summary generation.",
       });
-      await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+      await ageSlotBinding(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
 
       const result = await svc.getSlot(projectSelector(companyId, projectId));
       expect(result.slot!.status).toBe("generating");
@@ -825,6 +828,60 @@ describeEmbeddedPostgres("summary slot service", () => {
       ]);
       expect(slotA.slot).toMatchObject({ status: "idle", generatingIssueId: null, documentId: docA.id });
       expect(slotB.slot).toMatchObject({ status: "idle", generatingIssueId: null, documentId: docB.id });
+    });
+
+    it("reclaims a terminal bound issue on getSlot when its terminal transition did not clear the binding", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      // Model an orphaned terminal binding: the generating issue is terminal but its
+      // terminal transition did NOT clear the slot binding (legacy data or an
+      // interrupted transition). A direct status write bypasses the normal
+      // finalizeSummarySlotsForTerminalIssue release path, leaving the slot still
+      // armed to a terminal issue.
+      await db
+        .update(issues)
+        .set({ status: "cancelled" })
+        .where(eq(issues.id, generated.generatingIssue.id));
+
+      // The read path reclaims it: a terminal generation can never write a summary,
+      // so the binding is dead without any age / live-run / recovery check.
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot!.status).toBe("failed");
+      expect(result.slot!.generatingIssueId).toBeNull();
+      expect(result.slot!.failureReason).toContain("stopped before writing a summary");
+      expect(result.generatingIssue).toBeNull();
+
+      // A subsequent generate re-arms a fresh task instead of the dead terminal one.
+      const regenerated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(regenerated.alreadyGenerating).toBe(false);
+      expect(regenerated.generatingIssue.id).not.toBe(generated.generatingIssue.id);
+      expect(regenerated.slot.status).toBe("generating");
+    });
+
+    it("measures binding age from the slot arm time, not the issue creation time", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      // Make the ISSUE look old but keep the slot's arm time fresh (within the grace
+      // window). If the age predicate read issue.createdAt this would be reclaimed;
+      // it must NOT be, because the binding was just armed.
+      await db
+        .update(issues)
+        .set({ createdAt: new Date(Date.now() - (GRACE_MS + 5 * 60 * 1_000)) })
+        .where(eq(issues.id, generated.generatingIssue.id));
+
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot!.status).toBe("generating");
+      expect(result.slot!.generatingIssueId).toBe(generated.generatingIssue.id);
     });
   });
 

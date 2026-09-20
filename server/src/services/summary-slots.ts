@@ -296,16 +296,32 @@ export function summarySlotService(db: Db) {
   }
 
   /**
-   * True when a slot's `generating_issue_id` binding is DEAD: the bound generation
-   * issue is still non-terminal (so it never flows through terminal finalization,
-   * the only prior release path) but has no live path left — no live run, no active
-   * recovery action — and has sat for at least `DEAD_GENERATION_GRACE_MS` since it
-   * was armed. Such a slot would otherwise stay wedged in `generating` forever.
-   * (SUP-16945)
+   * True when a slot's `generating_issue_id` binding is DEAD (SUP-16945). Two cases:
    *
-   * Conservative on purpose: a generation with a live run (`executionRunId` or
-   * `checkoutRunId`) or any in-flight recovery action (`active` or `escalated`)
-   * is in flight and is NEVER reclaimed, regardless of age.
+   *   1. The bound generation issue is TERMINAL (done/cancelled). A terminal issue
+   *      can never write a summary (the write guard refuses terminal writes), so its
+   *      binding is definitively dead. `finalizeSummarySlotsForTerminalIssue`
+   *      normally clears it on the terminal transition, but a legacy/orphan binding
+   *      or an interrupted transition can leave a terminal issue still bound; this
+   *      read path reclaims it. The release is idempotent (its WHERE clause only
+   *      matches a still-armed slot) and shares the finalizer's idle/failed
+   *      predicate, so it cannot double-release or diverge from the transition path.
+   *
+   *   2. The bound issue is non-terminal but has lost its live path — no live run
+   *      (`executionRunId`/`checkoutRunId`), no in-flight recovery action (`active`
+   *      or `escalated`) — and has sat armed for at least `DEAD_GENERATION_GRACE_MS`.
+   *      Such a slot would otherwise stay wedged in `generating` forever.
+   *
+   * Conservative on purpose for case 2: a generation with a live run or any
+   * in-flight recovery action is in flight and is NEVER reclaimed, regardless of
+   * age.
+   *
+   * Age is measured from the slot's arm time (`summary_slots.updated_at`) — the
+   * moment `generate()` armed the slot to `generating` for this binding — the
+   * authoritative binding timestamp. It deliberately is NOT the issue's
+   * `created_at` (an indirection through the issue row) nor `last_generated_at`
+   * (the PREVIOUS generation's write, which would make a freshly armed generation
+   * look aged and get reclaimed out from under itself).
    */
   async function isDeadGenerationBinding(
     slotRow: SummarySlotRow,
@@ -316,17 +332,23 @@ export function summarySlotService(db: Db) {
     // Bound issue vanished (deleted / cross-company): the binding can never resolve,
     // so it is definitively dead.
     if (!issueRow) return true;
-    // Terminal issues are owned by `finalizeSummarySlotsForTerminalIssue`; don't
-    // double-release here.
-    if (TERMINAL_ISSUE_STATUSES.has(issueRow.status as IssueStatus)) return false;
-    // A live run means the generation is actually in flight.
+    // Case 1: a terminal binding is definitively dead. Reclaim on read even though
+    // the terminal finalizer normally owns it — this is the safety net for a
+    // terminal transition that did not clear the binding (legacy/orphan data or an
+    // interrupted transition).
+    if (TERMINAL_ISSUE_STATUSES.has(issueRow.status as IssueStatus)) return true;
+    // Case 2, guard 1: a live run means the generation is actually in flight —
+    // never reclaim, regardless of age.
     if (issueRow.executionRunId || issueRow.checkoutRunId) return false;
+    // Case 2, guard 2: an in-flight recovery action means the issue is being
+    // recovered — never reclaim, regardless of age.
     const activeRecovery = await recoveryActions.getActiveForIssue(
       slotRow.companyId,
       slotRow.generatingIssueId,
     );
     if (activeRecovery) return false;
-    return now.getTime() - issueRow.createdAt.getTime() >= DEAD_GENERATION_GRACE_MS;
+    // Case 2, aged: armed for at least the grace window since the slot was armed.
+    return now.getTime() - slotRow.updatedAt.getTime() >= DEAD_GENERATION_GRACE_MS;
   }
 
   /**
