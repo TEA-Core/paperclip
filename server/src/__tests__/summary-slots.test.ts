@@ -11,6 +11,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueRecoveryActions,
   issues,
   projectWorkspaces,
   projects,
@@ -61,6 +62,7 @@ describeEmbeddedPostgres("summary slot service", () => {
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(issueRecoveryActions);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
@@ -650,6 +652,179 @@ describeEmbeddedPostgres("summary slot service", () => {
         generatingIssueId: null,
         failureReason: expect.stringContaining("was cancelled before writing a summary"),
       });
+    });
+  });
+
+  describe("dead generation binding reclaim (SUP-16945)", () => {
+    const GRACE_MS = 30 * 60 * 1_000;
+
+    async function backdateIssue(issueId: string, ageMs: number) {
+      await db
+        .update(issues)
+        .set({ createdAt: new Date(Date.now() - ageMs) })
+        .where(eq(issues.id, issueId));
+    }
+
+    it("reclaims a dead non-terminal binding on generate and re-arms a fresh generation", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const first = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(first.alreadyGenerating).toBe(false);
+      expect(first.slot.status).toBe("generating");
+
+      // The generation task loses its live path but is never terminal: no run, no
+      // recovery action, and aged past the reclaim grace. This is the wedge.
+      await backdateIssue(first.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+
+      const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(second.alreadyGenerating).toBe(false);
+      expect(second.generatingIssue.id).not.toBe(first.generatingIssue.id);
+      expect(second.slot).toMatchObject({
+        status: "generating",
+        generatingIssueId: second.generatingIssue.id,
+      });
+    });
+
+    it("reclaims a dead non-terminal binding on getSlot and clears the slot to an un-wedged state", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      // The slot is no longer wedged: binding cleared and completed to failed (the
+      // dead generation never wrote a surviving revision) so the refresh sweep can
+      // regenerate.
+      expect(result.slot.status).toBe("failed");
+      expect(result.slot.generatingIssueId).toBeNull();
+      expect(result.slot.failureReason).toContain("stopped before writing a summary");
+      expect(result.generatingIssue).toBeNull();
+
+      // A subsequent generate re-arms a fresh task (the wedge is gone).
+      const regenerated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(regenerated.alreadyGenerating).toBe(false);
+      expect(regenerated.slot.status).toBe("generating");
+      expect(regenerated.slot.generatingIssueId).toBe(regenerated.generatingIssue.id);
+    });
+
+    it("does NOT reclaim a healthy in-flight generation that holds a live run", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const runId = await seedRun(companyId, summarizerAgentId, generated.generatingIssue.id);
+      // In flight: the generation task is bound to a live run.
+      await db
+        .update(issues)
+        .set({ executionRunId: runId })
+        .where(eq(issues.id, generated.generatingIssue.id));
+      await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot.status).toBe("generating");
+      expect(result.slot.generatingIssueId).toBe(generated.generatingIssue.id);
+      expect(result.generatingIssue?.id).toBe(generated.generatingIssue.id);
+
+      const again = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(again.alreadyGenerating).toBe(true);
+      expect(again.generatingIssue.id).toBe(generated.generatingIssue.id);
+    });
+
+    it("does NOT reclaim a dead-looking generation that still has an active recovery action", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: generated.generatingIssue.id,
+        kind: "active_run_watchdog",
+        status: "active",
+        ownerType: "agent",
+        cause: "stuck_generation",
+        fingerprint: randomUUID(),
+        evidence: {},
+        nextAction: "Recover the stalled summary generation.",
+      });
+      await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot.status).toBe("generating");
+      expect(result.slot.generatingIssueId).toBe(generated.generatingIssue.id);
+    });
+
+    it("does NOT reclaim a freshly armed generation inside the grace window", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      // No run, no recovery, but only seconds old — inside the grace window.
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot.status).toBe("generating");
+      expect(result.slot.generatingIssueId).toBe(generated.generatingIssue.id);
+
+      const again = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(again.alreadyGenerating).toBe(true);
+    });
+
+    it("leaves idle slots untouched by the dead-binding reclaim", async () => {
+      const companyId = await seedCompany();
+      const projectA = await seedProject(companyId);
+      const projectB = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      // Two genuinely-idle slots (idle status, no generating binding) with their own
+      // documents — the reclaim must not touch them.
+      const docA = await db
+        .insert(documents)
+        .values({ companyId, format: "markdown", latestBody: "# A" })
+        .returning()
+        .then((rows) => rows[0]!);
+      const docB = await db
+        .insert(documents)
+        .values({ companyId, format: "markdown", latestBody: "# B" })
+        .returning()
+        .then((rows) => rows[0]!);
+      await db.insert(summarySlots).values([
+        {
+          companyId,
+          scopeKind: "project",
+          slotKey: "header",
+          scopeId: projectA,
+          documentId: docA.id,
+          status: "idle",
+          generatingIssueId: null,
+        },
+        {
+          companyId,
+          scopeKind: "project",
+          slotKey: "header",
+          scopeId: projectB,
+          documentId: docB.id,
+          status: "idle",
+          generatingIssueId: null,
+        },
+      ]);
+
+      const [slotA, slotB] = await Promise.all([
+        svc.getSlot(projectSelector(companyId, projectA)),
+        svc.getSlot(projectSelector(companyId, projectB)),
+      ]);
+      expect(slotA.slot).toMatchObject({ status: "idle", generatingIssueId: null, documentId: docA.id });
+      expect(slotB.slot).toMatchObject({ status: "idle", generatingIssueId: null, documentId: docB.id });
     });
   });
 
