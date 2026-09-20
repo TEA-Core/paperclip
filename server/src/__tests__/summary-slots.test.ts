@@ -701,9 +701,9 @@ describeEmbeddedPostgres("summary slot service", () => {
       // The slot is no longer wedged: binding cleared and completed to failed (the
       // dead generation never wrote a surviving revision) so the refresh sweep can
       // regenerate.
-      expect(result.slot.status).toBe("failed");
-      expect(result.slot.generatingIssueId).toBeNull();
-      expect(result.slot.failureReason).toContain("stopped before writing a summary");
+      expect(result.slot!.status).toBe("failed");
+      expect(result.slot!.generatingIssueId).toBeNull();
+      expect(result.slot!.failureReason).toContain("stopped before writing a summary");
       expect(result.generatingIssue).toBeNull();
 
       // A subsequent generate re-arms a fresh task (the wedge is gone).
@@ -729,8 +729,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
 
       const result = await svc.getSlot(projectSelector(companyId, projectId));
-      expect(result.slot.status).toBe("generating");
-      expect(result.slot.generatingIssueId).toBe(generated.generatingIssue.id);
+      expect(result.slot!.status).toBe("generating");
+      expect(result.slot!.generatingIssueId).toBe(generated.generatingIssue.id);
       expect(result.generatingIssue?.id).toBe(generated.generatingIssue.id);
 
       const again = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
@@ -759,8 +759,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       await backdateIssue(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
 
       const result = await svc.getSlot(projectSelector(companyId, projectId));
-      expect(result.slot.status).toBe("generating");
-      expect(result.slot.generatingIssueId).toBe(generated.generatingIssue.id);
+      expect(result.slot!.status).toBe("generating");
+      expect(result.slot!.generatingIssueId).toBe(generated.generatingIssue.id);
     });
 
     it("does NOT reclaim a freshly armed generation inside the grace window", async () => {
@@ -772,8 +772,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
       // No run, no recovery, but only seconds old — inside the grace window.
       const result = await svc.getSlot(projectSelector(companyId, projectId));
-      expect(result.slot.status).toBe("generating");
-      expect(result.slot.generatingIssueId).toBe(generated.generatingIssue.id);
+      expect(result.slot!.status).toBe("generating");
+      expect(result.slot!.generatingIssueId).toBe(generated.generatingIssue.id);
 
       const again = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
       expect(again.alreadyGenerating).toBe(true);

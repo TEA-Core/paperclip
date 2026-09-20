@@ -1372,10 +1372,10 @@ server/src/__tests__/status-cards.test.ts(309,9): TS2741
 server/src/__tests__/status-cards.test.ts(316,18): TS2352
 server/src/__tests__/status-cards.test.ts(400,7): TS2322
 server/src/__tests__/status-cards.test.ts(590,9): TS2741
-server/src/__tests__/summary-slots.test.ts(1144,11): TS2353
-server/src/__tests__/summary-slots.test.ts(615,29): TS18047
-server/src/__tests__/summary-slots.test.ts(619,50): TS2339
-server/src/__tests__/summary-slots.test.ts(630,28): TS2339
+server/src/__tests__/summary-slots.test.ts(1319,11): TS2353
+server/src/__tests__/summary-slots.test.ts(617,29): TS18047
+server/src/__tests__/summary-slots.test.ts(621,50): TS2339
+server/src/__tests__/summary-slots.test.ts(632,28): TS2339
 server/src/__tests__/task-watchdogs-classifier.test.ts(101,9): TS2322
 server/src/__tests__/task-watchdogs-incident-fixture.test.ts(3,22): TS1543
 server/src/__tests__/telemetry-client-flush.test.ts(82,30): TS2740
