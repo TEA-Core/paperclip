@@ -365,7 +365,10 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
-import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
+import {
+  isAgentDefaultProjectWorkspacePair,
+  parseIssueExecutionWorkspaceSettings,
+} from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
   buildPromotedSourceTrust,
@@ -6056,7 +6059,32 @@ export function issueRoutes(
     });
   }
 
-  function assertAgentDefaultProjectWorkspacePairValid(
+  /**
+   * SUP-16886: guard the reader of the `agent_default` + non-null
+   * `projectWorkspaceId` invariant, but do not let the guard brick the card.
+   *
+   * Before this, any PATCH whose effective state carried the pair 400'd — including
+   * a bare `{"status":"blocked"}` on a card that already stored the pair, which the
+   * provisioning write-back re-mints on every re-provision. The card's own assignee
+   * could not set a terminal status, park, or reassign.
+   *
+   * The guard now distinguishes the two directions:
+   *  - a REQUEST that itself asserts the pair (sets `executionWorkspacePreference`
+   *    to `agent_default` while a project workspace is in effect, or names a
+   *    non-null `projectWorkspaceId` while the preference is `agent_default`) is
+   *    refused, with the remedy in the message; and
+   *  - a request that merely ENCOUNTERS a stored pair (touches neither half) heals
+   *    it instead of refusing: `agent_default` wins and the project workspace is
+   *    dropped, the same write-boundary normalization SUP-16608 applies at create.
+   *
+   * `agent_default` wins because it is the card's own intent signal while
+   * `projectWorkspaceId` is the derived, system-minted field provisioning re-stamps
+   * every run; and clearing the preference is unreachable while a run is live (it
+   * requests a re-provision, refused with 409
+   * `issue_workspace_reprovision_run_active`), so dropping the project workspace is
+   * the reachable, intent-preserving repair.
+   */
+  function healAgentDefaultProjectWorkspacePair(
     existing: {
       projectWorkspaceId: string | null;
       executionWorkspacePreference: string | null;
@@ -6075,14 +6103,23 @@ export function issueRoutes(
         ? existing.projectWorkspaceId
         : body.projectWorkspaceId;
     if (
-      effectiveExecutionWorkspacePreference === "agent_default" &&
-      typeof effectiveProjectWorkspaceId === "string" &&
-      effectiveProjectWorkspaceId.trim().length > 0
+      !isAgentDefaultProjectWorkspacePair({
+        executionWorkspacePreference: effectiveExecutionWorkspacePreference,
+        projectWorkspaceId: effectiveProjectWorkspaceId,
+      })
     ) {
+      return;
+    }
+    const requestAssertsPair =
+      body.executionWorkspacePreference === "agent_default" ||
+      (typeof body.projectWorkspaceId === "string" &&
+        body.projectWorkspaceId.trim().length > 0);
+    if (requestAssertsPair) {
       throw badRequest(
         `executionWorkspacePreference "agent_default" cannot be combined with a non-null projectWorkspaceId: agent_default resolves to the agent home directory, not a project workspace. Clear one of executionWorkspacePreference or projectWorkspaceId before retrying. When a run is active on the card, clear projectWorkspaceId: clearing executionWorkspacePreference requests a re-provision, which is refused while the run is live.`,
       );
     }
+    body.projectWorkspaceId = null;
   }
 
   async function assertIssueEnvironmentSelection(
@@ -8462,8 +8499,16 @@ export function issueRoutes(
     const governedParticipantAgentId = activeExecutionParticipantAgentId(issue);
     const isSourceOwner = issue.assigneeAgentId === actorAgentId;
     const isExecutionParticipant = governedParticipantAgentId === actorAgentId;
+    // SUP-16705: a management grant is only meaningful when it is held over a
+    // DIFFERENT agent. `agentIsInSubtree` treats `rootAgentId === targetAgentId`
+    // as in-subtree, so `isManagerOf(X, X)` is always true and consulting the
+    // override for a self-assignee would let an agent waive its own conflicting
+    // checkout/run lock -- exactly the self-management SUP-16705 closes. The
+    // source owner already clears the authority check below via `isSourceOwner`,
+    // so excluding the self case costs nothing legitimate.
     const hasPolicyGrant = Boolean(
       issue.assigneeAgentId &&
+      issue.assigneeAgentId !== actorAgentId &&
       (await hasActiveCheckoutManagementOverride(
         actorAgentId,
         issue.companyId,
@@ -15753,6 +15798,99 @@ export function issueRoutes(
         policyIsObject && !("stages" in (policy as Record<string, unknown>));
       next();
     },
+    // SUP-16607: the issues PATCH is a governed close path, but an unhandled
+    // non-HttpError terminating it is invisible after the fact: the app-level
+    // error handler renders a bare `{"error":"Internal server error"}` and the
+    // close transaction has already rolled back, so the activity feed and
+    // `issue_execution_decisions` retain ZERO rows about the attempt (observed
+    // live: SUP-16602's 01:05 done-close 500 left no trace of what threw).
+    //
+    // Fix: attribution is DURABLE, not in-band. On a 500 the recorder settles
+    // a durable `activity_log` row before the response flushes —
+    // `action: "issue.patch_unhandled_error"` with
+    // `details: { identifier, errorClass, method, path }` — and the HTTP
+    // response stays the generic `{ error: "Internal server error" }`. Do NOT
+    // "fix" the 500 body to carry `code`/`details`/the message: the recorder's
+    // handle is narrowed to `{ error?: { name?: string } }`, so the error
+    // MESSAGE is unreachable by construction and only the error CLASS is
+    // persisted — widening the response would undo that leak-safety. To find a
+    // bare 500 here, read
+    // `GET /api/issues/:id/activity?action=issue.patch_unhandled_error` and
+    // look for the row whose `action` is `issue.patch_unhandled_error`. Scoped
+    // to this route only — the generic 500 shape for other routes is out of
+    // scope.
+    (req, res, next) => {
+      const originalJson = res.json.bind(res);
+      // Capture what the failure record needs WHILE the layer is still live:
+      // Express 5 (`router@2`) restores `req.params` when the layer unwinds, so by
+      // the time the error handler responds `req.params.id` is gone (and an id
+      // resolved later would name the wrong route).
+      const routeId = req.params.id as string | undefined;
+      const actorCompanyId = req.actor.companyId ?? (req.actor.companyIds ?? [])[0] ?? null;
+      const originalUrl = req.originalUrl;
+      let recorded = false;
+      const recordUnhandled = async (errorClass: string) => {
+        if (recorded) return;
+        recorded = true;
+        try {
+          const issue = routeId
+            ? await svc.getById(routeId).catch(() => null)
+            : null;
+          const companyId = issue?.companyId ?? actorCompanyId;
+          if (!companyId) {
+            logger.error(
+              { routeId, errorClass },
+              "cannot record unhandled issues PATCH error without a company id",
+            );
+            return;
+          }
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: "issue-patch-error-recorder",
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: "issue.patch_unhandled_error",
+            entityType: "issue",
+            entityId: issue?.id ?? routeId ?? "unknown",
+            issueId: issue?.id ?? null,
+            details: {
+              identifier: issue?.identifier ?? routeId ?? null,
+              errorClass,
+              method: "PATCH",
+              path: originalUrl,
+            },
+          });
+        } catch (err) {
+          logger.error({ err }, "failed to record unhandled issues PATCH error");
+        }
+      };
+      res.json = ((body: unknown) => {
+        const errorContext = (res as unknown as {
+          __errorContext?: { error?: { name?: string } };
+        }).__errorContext;
+        if (res.statusCode === 500 && errorContext?.error) {
+          const errorClass = errorContext.error.name ?? "Error";
+          const genericBody = { error: "Internal server error" } as never;
+          // Settle the durable record BEFORE the response is flushed. A
+          // fire-and-forget write here commits asynchronously and races request
+          // teardown: the row can land after a caller's own cleanup transaction
+          // (measured as `delete from companies` failing on an
+          // `activity_log_company_id_companies_id_fk` in inbox-archive-routes),
+          // and the caller can observe the 500 before the record exists at all.
+          // The error handler ignores this Promise; the body still flushes via
+          // originalJson once the write settles.
+          recordUnhandled(errorClass).then(
+            () => originalJson(genericBody),
+            () => originalJson(genericBody),
+          );
+          return res;
+        }
+        return originalJson(body as never);
+      }) as typeof res.json;
+      next();
+    },
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
     const id = req.params.id as string;
@@ -15770,7 +15908,7 @@ export function issueRoutes(
       await denyIssueWrite(req, res, existing, "issue_write_attribution_spoof_rejected");
       return;
     }
-    assertAgentDefaultProjectWorkspacePairValid(existing, req.body);
+    healAgentDefaultProjectWorkspacePair(existing, req.body);
     const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
     let mutationAccess:
       | boolean
@@ -17516,8 +17654,9 @@ export function issueRoutes(
               // SUP-15298: empty blocker set + no unblockDescriptor means no
               // structural resolution path exists for the card; flag it so the
               // worst combination is distinguishable from a card that still has
-              // a descriptor naming an owner + action.
-              hasUnblockDescriptor: Boolean(descriptor),
+              // a descriptor naming an owner + action. Keyed on the committed
+              // row (SUP-16951) so the log matches the healer's exemption.
+              hasUnblockDescriptor: Boolean(issue.unblockDescriptor),
             },
             "issue PATCH committed blocked with an empty blocker set",
           );
@@ -17535,7 +17674,12 @@ export function issueRoutes(
               source: "issue_update_route",
               identifier: issue.identifier,
               blockerIssueIds: committedBlockerIssueIds,
-              hasUnblockDescriptor: Boolean(descriptor),
+              // SUP-16951: key on the committed row, not just this patch, so a
+              // card that was re-parked without re-sending its descriptor (e.g.
+              // a re-park justified by a pending interaction) is still audited
+              // as descriptor-bearing — the same source of truth the
+              // blocked_without_blockers healer exempts on.
+              hasUnblockDescriptor: Boolean(issue.unblockDescriptor),
               actorSource: actor.actorSource,
               statusChanged: existing.status !== issue.status,
               blockersPatched: Array.isArray(req.body.blockedByIssueIds),

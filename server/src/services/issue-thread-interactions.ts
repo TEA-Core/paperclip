@@ -2566,6 +2566,12 @@ export function issueThreadInteractionService(
 
       let inserted = false;
       const created = await db.transaction(async (tx) => {
+        // Serialize on the company-wide connection-need so concurrent runs on
+        // different cards mint at most one live pending intent per
+        // (serviceSlug, requestingAgentId) instead of one per card.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`connection-intent:${issue.companyId}:${payload.serviceSlug}:${payload.requestingAgentId}`}, 0))`,
+        );
         const issueRow = await tx
           .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
           .from(issues)
@@ -2578,15 +2584,21 @@ export function issueThreadInteractionService(
           throw conflict("Cannot create an interaction on a closed issue");
         }
 
-        // Serialize on the task so retries and later runs share the same live card.
-        const pending = await tx.select().from(issueThreadInteractions).where(and(
-          eq(issueThreadInteractions.companyId, issue.companyId),
-          eq(issueThreadInteractions.issueId, issue.id),
-          eq(issueThreadInteractions.kind, "connection_intent"),
-          eq(issueThreadInteractions.status, "pending"),
-          eq(issueThreadInteractions.createdByAgentId, payload.requestingAgentId),
-          eq(issueThreadInteractions.addresseeUserId, input.addresseeUserId),
-        ));
+        // Reuse the live pending intent for this need across the whole company,
+        // not just this card: the idempotency key is
+        // (companyId, serviceSlug, requestingAgentId) over pending intents.
+        const pending = await tx
+          .select()
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.companyId, issue.companyId),
+              eq(issueThreadInteractions.kind, "connection_intent"),
+              eq(issueThreadInteractions.status, "pending"),
+              eq(issueThreadInteractions.createdByAgentId, payload.requestingAgentId),
+            ),
+          )
+          .orderBy(asc(issueThreadInteractions.createdAt));
         const reusable = pending.find((candidate) =>
           connectionIntentPayloadSchema.parse(candidate.payload).serviceSlug === payload.serviceSlug && connectionIntentPayloadSchema.parse(candidate.payload).purpose === payload.purpose);
         if (reusable) return reusable;

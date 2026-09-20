@@ -38,6 +38,7 @@ import {
   type IssueCommentMetadata,
   type IssueCommentPresentation,
   type IssueRecoveryAction,
+  type IssueUnblockDescriptor,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -1098,6 +1099,20 @@ function isRepeatedProductiveContinuationRecovery(
 
 export function isBlockedWithoutBlockers(input: { status: string; blockerIssueIds: string[] }): boolean {
   return input.status === "blocked" && input.blockerIssueIds.length === 0;
+}
+
+// SUP-16951 — a self-owned unblockDescriptor with a non-empty action is the
+// card's declaration that its park is deliberate and that it names its own
+// unblock path. The blocked_without_blockers lane must leave such a card
+// alone: healing it back to `todo` would re-dispatch the assignee into the
+// same no-op (a fresh run per sweep on a card that can do nothing), and
+// minting a board escalation would hand the board a path the card already
+// owns. Only a non-empty action string is load-bearing here; owner identity
+// is deliberately NOT keyed on (agents may only name themselves, which the
+// write path enforces, so owner adds no signal).
+export function hasUsableUnblockDescriptor(descriptor: IssueUnblockDescriptor | null | undefined): boolean {
+  if (descriptor == null) return false;
+  return typeof descriptor.action === "string" && descriptor.action.trim().length > 0;
 }
 
 async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: string) {
@@ -8244,6 +8259,7 @@ export function recoveryService(
       deadWorkspaceBindingSkipped: 0,
       rearmCapExhaustedSkipped: 0,
       exhaustedRecoverySuppressed: 0,
+      unblockDescriptorExemptSkipped: 0,
       deadBindingsCleared: 0,
       issueIds: [] as string[],
     };
@@ -8268,6 +8284,7 @@ export function recoveryService(
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         monitorNextCheckAt: issues.monitorNextCheckAt,
+        unblockDescriptor: issues.unblockDescriptor,
         totalCount: sql<number>`count(*) over()::int`,
       })
       .from(issues)
@@ -8298,6 +8315,19 @@ export function recoveryService(
       for (const candidate of companyCandidates) {
         const readiness = readinessMap.get(candidate.id);
         if (!readiness || readiness.unresolvedBlockerCount !== 0) continue;
+
+        // SUP-16951 — deliberate-park exemption. A zero-blocker card that
+        // carries a self-owned unblockDescriptor with a non-empty action is a
+        // park the lane must not touch: do not heal it back to `todo` (which
+        // would re-dispatch the assignee into the same no-op every sweep) and
+        // do not mint a board escalation (the card already names its own
+        // unblock path). The exemption is unconditional on the guards below —
+        // it holds before the grace window, live-path, and heal/escalate
+        // branches alike. Cards with no descriptor fall through unchanged.
+        if (hasUsableUnblockDescriptor(candidate.unblockDescriptor)) {
+          result.unblockDescriptorExemptSkipped++;
+          continue;
+        }
 
         const blockedAt = candidate.updatedAt ?? new Date();
         const msInViolation = now.getTime() - blockedAt.getTime();

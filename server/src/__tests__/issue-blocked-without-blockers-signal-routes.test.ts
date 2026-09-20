@@ -181,7 +181,7 @@ function issueFixture(overrides: Record<string, unknown>) {
 
 function blockedWithoutBlockersWrites() {
   return mockLogActivity.mock.calls
-    .map(([, input]) => input)
+    .map(([, input]) => input as unknown as { action: string; details: unknown })
     .filter((input) => input.action === "issue.blocked_without_blockers_written");
 }
 
@@ -232,7 +232,12 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
 
   it("emits the signal exactly once when a PATCH commits blocked with an empty blocker set", async () => {
     mockIssueService.getById.mockResolvedValue(issueFixture({ status: "todo" }));
-    mockIssueService.update.mockResolvedValue(issueFixture({ status: "blocked" }));
+    // SUP-16951: the audit row now keys hasUnblockDescriptor on the committed
+    // row, so the update mock must carry the descriptor this PATCH sent — a
+    // stale descriptor-less mock would read as false. The assertion stays `true`.
+    mockIssueService.update.mockResolvedValue(
+      issueFixture({ status: "blocked", unblockDescriptor: { owner: "board", action: "Decide the next step" } }),
+    );
 
     const res = await request(await createApp())
       .patch("/api/issues/issue-1")
@@ -241,7 +246,7 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe("blocked");
     expect(blockedWithoutBlockersWrites()).toHaveLength(1);
-    const input = blockedWithoutBlockersWrites()[0];
+    const input = blockedWithoutBlockersWrites()[0]!;
     expect(input).toEqual(
       expect.objectContaining({
         companyId: "company-1",
@@ -274,6 +279,42 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
         actorId: "local-board",
       }),
       "issue PATCH committed blocked with an empty blocker set",
+    );
+  });
+
+  // SUP-16951: a re-park that does NOT re-send its descriptor. The committed
+  // row still carries the self-owned descriptor, so the audit row must record
+  // hasUnblockDescriptor: true — keyed on the committed row, not the patch body
+  // (which under the old patch-body keying would have read false). The guard
+  // passes on a pending interaction, not the body descriptor.
+  it("records hasUnblockDescriptor:true on a re-park that omits the descriptor the committed row already carries", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      issueFixture({ status: "todo", unblockDescriptor: { owner: "board", action: "Re-probe the gate" } }),
+    );
+    mockIssueService.update.mockResolvedValue(
+      issueFixture({ status: "blocked", unblockDescriptor: { owner: "board", action: "Re-probe the gate" } }),
+    );
+    // A pending interaction justifies entering blocked without a body descriptor.
+    stubRows = [{ id: "interaction-1" }];
+
+    const res = await request(await createApp())
+      .patch("/api/issues/issue-1")
+      .send({ status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("blocked");
+    expect(blockedWithoutBlockersWrites()).toHaveLength(1);
+    expect(blockedWithoutBlockersWrites()[0]!.details).toEqual(
+      expect.objectContaining({
+        source: "issue_update_route",
+        identifier: "PAP-300",
+        blockerIssueIds: [],
+        // The PATCH body carried no unblockDescriptor, but the committed row
+        // does — the audit must record the committed-row truth, not the body.
+        hasUnblockDescriptor: true,
+        statusChanged: true,
+        blockersPatched: false,
+      }),
     );
   });
 
