@@ -162,17 +162,15 @@ the NEW schema, and whether that is tolerable is per-migration and unverified.
 
 The operator action is an **SSH-to-wonton deploy**, not a cloud API call:
 
-```bash
-ssh wonton
-cd ~/stack-admin/paperclip-docker
+On a migration-carrying tip, `auto-rollout.sh --plan` is expected to exit non-zero with `decision: blocked` — the driver refuses to ship an image that carries new migrations. Do not read this as a failure; it is the driver's way of signalling that manual intervention is required.
 
+```bash
 # 1. confirm what the driver would do, changing nothing
 ./scripts/auto-rollout.sh --plan
-```
-On a migration-carrying tip, `auto-rollout.sh --plan` is expected to exit non-zero with `decision: blocked` — the driver refuses to ship an image that carries new migrations. Do not read this as a failure; it is the driver's way of signalling that manual intervention is required.
 
 # 2. run the gated swap with a staged image
 ./scripts/deploy-image.sh tea-core/paperclip:fold-<short>
+```
 
 Do **not** hand-run `docker tag` + `docker compose up -d`. A bare restart
 SIGKILLS every in-flight `opencode run`, and runs last 20–90 minutes.
@@ -229,6 +227,7 @@ export STATE="$HOME/.paperclip/auto-rollout"
 export DUMP_DIR="$STATE/predeploy-dumps"
 export SHORT="<short from step 1 plan output>"
 mkdir -p "$DUMP_DIR"
+export COMPOSE_DIR="${PAPERCLIP_COMPOSE_DIR:-$HOME/stack-admin/paperclip-docker}"
 export DUMP="$DUMP_DIR/paperclip-pre-${SHORT}-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
 docker compose -f "$COMPOSE_DIR/docker-compose.yml" --project-directory "$COMPOSE_DIR" exec -T db sh -c \
   'pg_dump -U paperclip -d paperclip --no-owner --no-privileges' | gzip > "$DUMP"
@@ -252,7 +251,6 @@ Two further traps on this path, both load-bearing:
   `PAPERCLIP_ALLOWED_HOSTNAMES` (the server then 403s every request whose Host it
   does not know, including `paperclip.internal`) and the db memory limits.
   `deploy-image.sh` already handles this; ad-hoc commands do not.
-```
 
 ## What `deploy-image.sh` actually does
 
