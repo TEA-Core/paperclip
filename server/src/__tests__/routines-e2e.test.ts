@@ -426,8 +426,12 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       .from(issues)
       .where(eq(issues.id, runRes.body.linkedIssueId));
 
-    expect(issue?.executionPolicy?.returnAssigneeAgentId).toBe(agentId);
-    expect(issue?.executionPolicy?.stages?.[0]?.type).toBe("approval");
+    const policy = issue?.executionPolicy as
+      | { returnAssigneeAgentId?: string | null; stages?: Array<{ type: string }> }
+      | null
+      | undefined;
+    expect(policy?.returnAssigneeAgentId).toBe(agentId);
+    expect(policy?.stages?.[0]?.type).toBe("approval");
   }, 15_000);
 
   it("dispatches a routine without executionPolicy with the default issue policy", async () => {
