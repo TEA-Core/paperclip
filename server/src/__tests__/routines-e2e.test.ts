@@ -360,6 +360,32 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
 
   it("carries a routine executionPolicy onto the materialised issue", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
+    const secondReviewerId = randomUUID();
+    const approverId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: secondReviewerId,
+        companyId,
+        name: "SecondReviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: approverId,
+        companyId,
+        name: "Approver",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
     const app = await createApp({
       type: "board",
       userId,
@@ -405,17 +431,24 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       });
     expect(invalidCreateRes.status).toBe(400);
 
+    const ladder = {
+      mode: "normal",
+      stages: [
+        { type: "review", participants: [{ type: "agent", agentId }] },
+        { type: "review", participants: [{ type: "agent", agentId: secondReviewerId }] },
+        { type: "approval", participants: [{ type: "agent", agentId: approverId }] },
+      ],
+    };
+
     const patchRes = await request(app)
       .patch(`/api/routines/${routineId}`)
-      .send({
-        executionPolicy: {
-          mode: "auto",
-          returnAssigneeAgentId: agentId,
-          stages: [{ type: "approval", participants: [{ type: "agent", agentId }] }],
-        },
-      });
+      .send({ executionPolicy: ladder });
     expect(patchRes.status).toBe(200);
-    expect(patchRes.body.executionPolicy.stages[0].type).toBe("approval");
+    expect(patchRes.body.executionPolicy.stages).toHaveLength(3);
+    expect(
+      patchRes.body.executionPolicy.stages.map((stage: { type: string }) => stage.type),
+    ).toEqual(["review", "review", "approval"]);
+    expect(patchRes.body.executionPolicy.returnAssigneeAgentId ?? null).toBeNull();
 
     const runRes = await postRoutineRun(app, routineId, { source: "manual" });
     expect(runRes.status).toBe(202);
@@ -426,12 +459,64 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       .from(issues)
       .where(eq(issues.id, runRes.body.linkedIssueId));
 
+    type LadderStage = {
+      id?: string;
+      type: string;
+      approvalsNeeded?: number;
+      participants?: Array<{
+        id?: string;
+        type: string;
+        agentId?: string | null;
+        userId?: string | null;
+      }>;
+    };
     const policy = issue?.executionPolicy as
-      | { returnAssigneeAgentId?: string | null; stages?: Array<{ type: string }> }
+      | {
+          mode?: string;
+          commentRequired?: boolean;
+          returnAssigneeAgentId?: string | null;
+          stages?: LadderStage[];
+        }
       | null
       | undefined;
-    expect(policy?.returnAssigneeAgentId).toBe(agentId);
-    expect(policy?.stages?.[0]?.type).toBe("approval");
+    expect(policy).not.toBeNull();
+
+    expect({
+      mode: policy?.mode ?? null,
+      commentRequired: policy?.commentRequired ?? null,
+      returnAssigneeAgentId: policy?.returnAssigneeAgentId ?? null,
+      stages: (policy?.stages ?? []).map((stage) => ({
+        type: stage.type,
+        approvalsNeeded: stage.approvalsNeeded ?? null,
+        participants: (stage.participants ?? []).map((participant) => ({
+          type: participant.type,
+          agentId: participant.agentId ?? null,
+          userId: participant.userId ?? null,
+        })),
+      })),
+    }).toEqual({
+      mode: "normal",
+      commentRequired: true,
+      returnAssigneeAgentId: null,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId, userId: null }],
+        },
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: secondReviewerId, userId: null }],
+        },
+        {
+          type: "approval",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: approverId, userId: null }],
+        },
+      ],
+    });
+    expect(policy?.returnAssigneeAgentId ?? null).toBeNull();
   }, 15_000);
 
   it("dispatches a routine without executionPolicy with the default issue policy", async () => {
