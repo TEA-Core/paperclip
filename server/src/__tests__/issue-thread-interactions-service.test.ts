@@ -2869,6 +2869,281 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("does not reclaim an in_review card parked on a user-participant approval stage while a pending execution stage is live (SUP-16872)", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm a request",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Stage owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // SUP-16872 shape: stage 2 (approval) is live, its sole participant is a
+    // user, assigneeAgentId is null, and the card sits in_review.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Await board approval",
+      status: "in_review",
+      priority: "medium",
+      assigneeUserId: "local-board",
+      executionState: {
+        status: "pending",
+        currentStageId: "stage-2",
+        currentStageIndex: 1,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: "local-board" },
+        completedStageIds: ["stage-1"],
+        skippedStageIds: [],
+        changesRequestedCount: 0,
+        pendingSince: new Date().toISOString(),
+      },
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee_on_accept",
+      payload: {
+        version: 1,
+        prompt: "Approve this plan?",
+        acceptLabel: "Approve",
+        rejectLabel: "Ask for changes",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.interaction.status).toBe("accepted");
+    expect(accepted.continuationIssue).toBeNull();
+
+    const updatedIssue = (await db.select().from(issues)).find((issue) => issue.id === issueId);
+    expect(updatedIssue).toMatchObject({
+      id: issueId,
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+    });
+  });
+
+  it("does not reclaim an in_review card on an agent-participant review stage while a pending execution stage is live", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm a request",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Stage owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Agent-participant review stage, live and pending: the agent-assignee
+    // branch would otherwise match (in_review + creator is the assignee).
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Await review",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: creatorAgentId,
+      executionState: {
+        status: "pending",
+        currentStageId: "stage-1",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: creatorAgentId },
+        completedStageIds: [],
+        skippedStageIds: [],
+        changesRequestedCount: 0,
+        pendingSince: new Date().toISOString(),
+      },
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee_on_accept",
+      payload: {
+        version: 1,
+        prompt: "Accept the change?",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.interaction.status).toBe("accepted");
+    expect(accepted.continuationIssue).toBeNull();
+
+    const updatedIssue = (await db.select().from(issues)).find((issue) => issue.id === issueId);
+    expect(updatedIssue).toMatchObject({
+      id: issueId,
+      status: "in_review",
+      assigneeAgentId: creatorAgentId,
+      assigneeUserId: null,
+    });
+  });
+
+  it("still returns an accepted confirmation to the creator agent when the execution stage is not pending", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm a request",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Stage owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // A completed ladder is not live: the creator-return path must still fire.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Approve a plan",
+      status: "in_review",
+      priority: "medium",
+      assigneeUserId: "local-board",
+      executionState: {
+        status: "completed",
+        currentStageId: "stage-2",
+        currentStageIndex: 1,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: "local-board" },
+        completedStageIds: ["stage-1", "stage-2"],
+        skippedStageIds: [],
+        changesRequestedCount: 0,
+        pendingSince: new Date().toISOString(),
+      },
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee_on_accept",
+      payload: {
+        version: 1,
+        prompt: "Approve this plan?",
+        acceptLabel: "Approve",
+        rejectLabel: "Ask for changes",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.interaction.status).toBe("accepted");
+    expect(accepted.continuationIssue).toEqual({
+      id: issueId,
+      assigneeAgentId: creatorAgentId,
+      assigneeUserId: null,
+      status: "todo",
+    });
+
+    const updatedIssue = (await db.select().from(issues)).find((issue) => issue.id === issueId);
+    expect(updatedIssue).toMatchObject({
+      id: issueId,
+      status: "todo",
+      assigneeAgentId: creatorAgentId,
+      assigneeUserId: null,
+    });
+  });
+
   it("atomically returns an accepted Plan-mode issue to its agent in Auto mode", async () => {
     const { companyId, goalId, issueId } = await seedConfirmationIssue("Accept a plan into Auto mode");
     const agentId = randomUUID();
