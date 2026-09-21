@@ -168,12 +168,11 @@ cd ~/stack-admin/paperclip-docker
 
 # 1. confirm what the driver would do, changing nothing
 ./scripts/auto-rollout.sh --plan
-
+```
 On a migration-carrying tip, `auto-rollout.sh --plan` is expected to exit non-zero with `decision: blocked` — the driver refuses to ship an image that carries new migrations. Do not read this as a failure; it is the driver's way of signalling that manual intervention is required.
 
 # 2. run the gated swap with a staged image
 ./scripts/deploy-image.sh tea-core/paperclip:fold-<short>
-```
 
 Do **not** hand-run `docker tag` + `docker compose up -d`. A bare restart
 SIGKILLS every in-flight `opencode run`, and runs last 20–90 minutes.
@@ -185,17 +184,27 @@ must do it manually. Run the following to stage the correct image before running
 `deploy-image.sh`:
 
 ```bash
-export DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.paperclip/auto-rollout}/docker-config"
+# SHORT and DIGEST come from `auto-rollout.sh --plan` output:
+#   L632: local tag (e.g. fold-<short>)
+#   L633: digest <sha256:…>
+export SHORT="<short from step 1 plan output>"
+export DIGEST="<sha256:… from step 1 plan output>"
+
+export DOCKER_CONFIG="$HOME/.paperclip/auto-rollout/docker-config"
 mkdir -p "$DOCKER_CONFIG"
 chmod 700 "$DOCKER_CONFIG"
 printf '%s' "$(cat "$HOME/.paperclip/ghcr-read.token")" | docker login ghcr.io -u kronik187 --password-stdin
 # Pull by digest so the image is available locally regardless of tag
-# DIGEST: the image digest published by docker.yml on every fold push
 docker pull -q "ghcr.io/tea-core/paperclip@${DIGEST}"
 # Tag the image with the name deploy-image.sh expects
-docker tag "ghcr.io/tea-core/paperclip@${DIGEST}" tea-core/paperclip:fold-<short>
-# Verify the `org.opencontainers.image.revision` label equals the fold tip (the same check auto-rollout.sh:703 performs)
-docker inspect --format='{{index .Config Labels "org.opencontainers.image.revision"}}' tea-core/paperclip:fold-<short>
+docker tag "ghcr.io/tea-core/paperclip@${DIGEST}" tea-core/paperclip:fold-${SHORT}
+# Verify the `org.opencontainers.image.revision` label equals the fold tip
+# (the same check auto-rollout.sh:703 performs — must equal the fold tip, not a
+# migration-absence check; that is the separate PENDING-count check at L626–641)
+docker inspect --format='{{index .Config Labels "org.opencontainers.image.revision"}}' tea-core/paperclip:fold-${SHORT}
+# Clean up scoped docker config so a registry credential never lands in
+# ~/.docker/config.json and never outlives this script
+rm -rf "$DOCKER_CONFIG"; unset DOCKER_CONFIG
 ```
 
 ### 3.2 Pre-swap pg_dump
@@ -206,20 +215,24 @@ line 731 says it is "the ONLY automated pg_dump anywhere on the migration path"
 wonton 2026-09-08, SUP-15271). That dump is also downstream of the line-636 exit,
 and `deploy-image.sh` does not dump (`grep -n pg_dump deploy-image.sh` → no hits).
 
-The operator must create this dump before swapping:
+The operator must create this dump before swapping. Mirrors
+`auto-rollout.sh:~795`: `docker compose exec db pg_dump | gzip > "$DUMP"`:
 
 ```bash
 export STATE="$HOME/.paperclip/auto-rollout"
 export DUMP_DIR="$STATE/predeploy-dumps"
+export SHORT="<short from step 1 plan output>"
 mkdir -p "$DUMP_DIR"
-# Mirrors auto-rollout.sh:~795: docker compose exec db pg_dump | gzip
-docker compose -f "$STACK_ADMIN/paperclip-docker/docker-compose.yml" --project-directory "$STACK_ADMIN/paperclip-docker" exec -T db sh -c \
-  'pg_dump -U paperclip -d paperclip --no-owner --no-privileges' | gzip > "$DUMP_DIR/paperclip-pre-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+export DUMP="$DUMP_DIR/paperclip-pre-${SHORT}-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+docker compose -f "$COMPOSE_DIR/docker-compose.yml" --project-directory "$COMPOSE_DIR" exec -T db sh -c \
+  'pg_dump -U paperclip -d paperclip --no-owner --no-privileges' | gzip > "$DUMP"
 # Verify the dump is not corrupt
-gzip -t "$DUMP_DIR/paperclip-pre-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+gzip -t "$DUMP"
 ```
 
 This is the only restore point on the migration-carrying lane.
+
+Two further traps on this path, both load-bearing:
 
 - **Build from the right tree.** The deployed line is the
   `fold/tea-patches-v2026.722.0` worktree on wonton. A different local checkout
@@ -233,6 +246,7 @@ This is the only restore point on the migration-carrying lane.
   `PAPERCLIP_ALLOWED_HOSTNAMES` (the server then 403s every request whose Host it
   does not know, including `paperclip.internal`) and the db memory limits.
   `deploy-image.sh` already handles this; ad-hoc commands do not.
+```
 
 ## What `deploy-image.sh` actually does
 
