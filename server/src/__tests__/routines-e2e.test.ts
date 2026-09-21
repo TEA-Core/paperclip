@@ -358,6 +358,110 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     );
   }, 15_000);
 
+  it("carries a routine executionPolicy onto the materialised issue", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const executionPolicy = {
+      mode: "auto",
+      returnAssigneeAgentId: agentId,
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    };
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Laddered parent routine",
+        description: "Carries a review ladder",
+        assigneeAgentId: agentId,
+        executionPolicy,
+      });
+
+    expect([200, 201]).toContain(createRes.status);
+    expect(createRes.body.executionPolicy.returnAssigneeAgentId).toBe(agentId);
+    expect(createRes.body.executionPolicy.stages[0].type).toBe("review");
+
+    const routineId = createRes.body.id as string;
+
+    const detailRes = await request(app).get(`/api/routines/${routineId}`);
+    expect(detailRes.status).toBe(200);
+    expect(detailRes.body.executionPolicy.returnAssigneeAgentId).toBe(agentId);
+    expect(detailRes.body.executionPolicy.stages[0].type).toBe("review");
+
+    const invalidCreateRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Bad policy",
+        assigneeAgentId: agentId,
+        executionPolicy: { mode: "nonsense" },
+      });
+    expect(invalidCreateRes.status).toBe(400);
+
+    const patchRes = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({
+        executionPolicy: {
+          mode: "auto",
+          returnAssigneeAgentId: agentId,
+          stages: [{ type: "approval", participants: [{ type: "agent", agentId }] }],
+        },
+      });
+    expect(patchRes.status).toBe(200);
+    expect(patchRes.body.executionPolicy.stages[0].type).toBe("approval");
+
+    const runRes = await postRoutineRun(app, routineId, { source: "manual" });
+    expect(runRes.status).toBe(202);
+    expect(runRes.body.status).toBe("issue_created");
+
+    const [issue] = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+
+    expect(issue?.executionPolicy?.returnAssigneeAgentId).toBe(agentId);
+    expect(issue?.executionPolicy?.stages?.[0]?.type).toBe("approval");
+  }, 15_000);
+
+  it("dispatches a routine without executionPolicy with the default issue policy", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Plain routine",
+        assigneeAgentId: agentId,
+      });
+    expect([200, 201]).toContain(createRes.status);
+    expect(createRes.body.executionPolicy ?? null).toBeNull();
+
+    const runRes = await postRoutineRun(app, createRes.body.id, { source: "manual" });
+    expect(runRes.status).toBe(202);
+    expect(runRes.body.status).toBe("issue_created");
+
+    const [issue] = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+
+    expect(issue?.executionPolicy ?? null).toBeNull();
+  }, 15_000);
+
   it("runs routines with variable inputs and interpolates the execution issue description", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
     const app = await createApp({
