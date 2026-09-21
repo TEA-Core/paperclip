@@ -184,9 +184,15 @@ must do it manually. Run the following to stage the correct image before running
 `deploy-image.sh`:
 
 ```bash
-# SHORT and DIGEST come from `auto-rollout.sh --plan` output:
-#   L632: local tag (e.g. fold-<short>)
-#   L633: digest <sha256:…>
+# SHORT and DIGEST come from `auto-rollout.sh --plan` output at lines L632–L633:
+#   L632: local tag (e.g. fold-<short>) — the fold‑short tag to assign
+#   L633: digest <sha256:…> — the image sha256 digest for pull-by-digest
+# export SHORT="<short from step 1 plan output>"
+# export DIGEST="<sha256:… from step 1 plan output>"
+
+# Extract from the `--plan` output:
+#   SHORT = the tag portion (e.g. "fold-<short>")
+#   DIGEST = the sha256 digest (e.g. "sha256:abc123...")
 export SHORT="<short from step 1 plan output>"
 export DIGEST="<sha256:… from step 1 plan output>"
 
