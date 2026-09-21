@@ -47,7 +47,14 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("stalled review decision routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-  const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+  // Typed to the real `heartbeat.wakeup` arity so `mock.calls[N][0]/[1]` below
+  // resolve to a 2-element tuple instead of the empty tuple a zero-arg
+  // `vi.fn(async () => …)` infers (which is what the TS2493 tuple-index errors
+  // on).
+  type WakeupOptions = Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1];
+  const enqueueWakeup = vi.fn(async (_agentId: string, _options: WakeupOptions) => ({
+    id: randomUUID(),
+  }));
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stalled-review-decision-");
