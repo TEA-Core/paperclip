@@ -165,6 +165,8 @@ The operator action is an **SSH-to-wonton deploy**, not a cloud API call:
 On a migration-carrying tip, `auto-rollout.sh --plan` is expected to exit non-zero with `decision: blocked` — the driver refuses to ship an image that carries new migrations. Do not read this as a failure; it is the driver's way of signalling that manual intervention is required.
 
 ```bash
+ssh wonton
+cd ~/stack-admin/paperclip-docker
 # 1. confirm what the driver would do, changing nothing
 ./scripts/auto-rollout.sh --plan
 
