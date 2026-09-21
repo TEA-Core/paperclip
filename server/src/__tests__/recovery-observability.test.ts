@@ -511,16 +511,46 @@ describeEmbeddedPostgres("recovery observability report", () => {
       finalAssigneeAgentId: coderId,
       finalIssueStatus: "in_progress",
     });
+    // SUP-17034: a cancelled agent action superseded by a new failure identity.
+    await seedRecoveryAction({
+      companyId,
+      n: 7,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "superseded",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+    // SUP-17034: a cancelled agent action because the condition cleared on its own.
+    await seedRecoveryAction({
+      companyId,
+      n: 8,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "condition_cleared",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
 
     const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
     const row = report.perCauseRouting.find((entry) => entry.cause === cause);
 
-    expect(row?.total).toBe(6);
+    expect(row?.total).toBe(8);
     expect(row?.boardOwned).toBe(2);
     expect(row?.handedBack).toBe(1);
     expect(row?.ownerCompleted).toBe(1);
     expect(row?.retriedByOriginalSucceeded).toBe(1);
     expect(row?.cancelled).toBe(1);
+    expect(row?.superseded).toBe(1);
+    expect(row?.conditionCleared).toBe(1);
     expect(row?.active).toBe(0);
     expect(row?.other).toBe(0);
     expect(row?.falsePositive).toBe(0);
@@ -534,9 +564,75 @@ describeEmbeddedPostgres("recovery observability report", () => {
         entry.handedBack +
         entry.ownerCompleted +
         entry.falsePositive +
+        entry.superseded +
+        entry.conditionCleared +
         entry.cancelled +
         entry.other;
       expect(partitionSum).toBe(entry.total);
     }
+  });
+
+  it("splits historical cancelled outcomes into superseded / condition_cleared / legacy without losing the cancelled count", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    const cause = "disposition_stalled";
+    // Legacy pre-SUP-17034 row: status cancelled, bare `cancelled` outcome.
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+    // New-style superseded row.
+    await seedRecoveryAction({
+      companyId,
+      n: 2,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "superseded",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+    // New-style condition-cleared row.
+    await seedRecoveryAction({
+      companyId,
+      n: 3,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "condition_cleared",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+
+    const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
+    const row = report.perCauseRouting.find((entry) => entry.cause === cause);
+
+    // The split is a three-way partition of the cancelled rows.
+    expect(row?.total).toBe(3);
+    expect(row?.superseded).toBe(1);
+    expect(row?.conditionCleared).toBe(1);
+    expect(row?.cancelled).toBe(1);
+    expect(row?.active).toBe(0);
+    expect(row?.boardOwned).toBe(0);
+    expect(row?.other).toBe(0);
+
+    // The cross-cutting `cancelledCount` still counts every cancelled-status row,
+    // including the new split values — so mixed-history windows keep their total.
+    expect(report.byCause.find((group) => group.cause === cause)?.cancelledCount).toBe(3);
   });
 });

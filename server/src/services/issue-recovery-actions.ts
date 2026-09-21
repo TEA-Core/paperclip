@@ -550,7 +550,7 @@ export function issueRecoveryActionService(db: Db) {
           .update(issueRecoveryActions)
           .set({
             status: "cancelled",
-            outcome: "cancelled",
+            outcome: "superseded",
             resolutionNote: "A new failure with a different identity superseded this recovery action.",
             resolvedAt: now,
             updatedAt: now,

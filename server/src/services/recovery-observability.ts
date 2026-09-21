@@ -74,7 +74,15 @@ export type RecoveryCauseRouting = {
   ownerCompleted: number;
   /** Terminal outcome was a false positive. */
   falsePositive: number;
-  /** Terminal and cancelled (not a false positive). */
+  /** Terminal and cancelled, and superseded by a new failure under a new identity. */
+  superseded: number;
+  /** Terminal and cancelled because the condition cleared on its own. */
+  conditionCleared: number;
+  /**
+   * Terminal and cancelled with the historical bare `cancelled` outcome (pre-SUP-17034 rows, or
+   * a cancelled status whose outcome is null). Kept as its own cell so pre-change data is
+   * still counted and the partition columns still sum to `total`.
+   */
   cancelled: number;
   /** Terminal with an owner but no recognized routing disposition. */
   other: number;
@@ -151,6 +159,8 @@ type RoutingPartitionCell =
   | "handedBack"
   | "ownerCompleted"
   | "falsePositive"
+  | "superseded"
+  | "conditionCleared"
   | "cancelled"
   | "other";
 
@@ -161,7 +171,11 @@ type RoutingPartitionCell =
  *   1. board-owned (no recovery owner agent) — these lanes land in their own
  *      row, which is the SUP-17029 finding
  *   2. false_positive outcome
- *   3. cancelled status
+ *   3. cancelled status, subdivided by outcome: `superseded` (still broken,
+ *      re-detected under a new identity), `condition_cleared` (condition
+ *      cleared on its own), or the legacy bare `cancelled` (pre-SUP-17034 rows
+ *      / null outcome) which is kept as its own cell so historical data still
+ *      counts and the columns keep summing to `total`
  *   4. owner-relationship class (self_recovery / handed_back / owner_completed)
  * Anything else is `other`. `escalated` is deliberately not a cell here: it is
  * a cross-cutting subset of `active` and is excluded from the partition so the
@@ -170,7 +184,11 @@ type RoutingPartitionCell =
 export function routingPartitionCell(row: RecoveryActionFacts): RoutingPartitionCell {
   if (!row.ownerAgentId) return "boardOwned";
   if (row.outcome === "false_positive") return "falsePositive";
-  if (row.status === "cancelled") return "cancelled";
+  if (row.status === "cancelled") {
+    if (row.outcome === "superseded") return "superseded";
+    if (row.outcome === "condition_cleared") return "conditionCleared";
+    return "cancelled";
+  }
   // Terminal and not cancelled here, so the status is `resolved`.
   switch (classifyRecoveryHandoff(row)) {
     case "self_recovery":
@@ -350,6 +368,8 @@ export function recoveryObservabilityService(db: Db) {
           ownerCompleted: 0,
           escalated: 0,
           falsePositive: 0,
+          superseded: 0,
+          conditionCleared: 0,
           cancelled: 0,
           other: 0,
         };
@@ -393,6 +413,12 @@ export function recoveryObservabilityService(db: Db) {
           break;
         case "falsePositive":
           routing.falsePositive += 1;
+          break;
+        case "superseded":
+          routing.superseded += 1;
+          break;
+        case "conditionCleared":
+          routing.conditionCleared += 1;
           break;
         case "cancelled":
           routing.cancelled += 1;
