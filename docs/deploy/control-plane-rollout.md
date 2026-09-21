@@ -169,14 +169,56 @@ cd ~/stack-admin/paperclip-docker
 # 1. confirm what the driver would do, changing nothing
 ./scripts/auto-rollout.sh --plan
 
-# 2. resolve and pull the approved image, then run the gated swap
+On a migration-carrying tip, `auto-rollout.sh --plan` is expected to exit non-zero with `decision: blocked` — the driver refuses to ship an image that carries new migrations. Do not read this as a failure; it is the driver's way of signalling that manual intervention is required.
+
+# 2. run the gated swap with a staged image
 ./scripts/deploy-image.sh tea-core/paperclip:fold-<short>
 ```
 
 Do **not** hand-run `docker tag` + `docker compose up -d`. A bare restart
-SIGKILLs every in-flight `opencode run`, and runs last 20–90 minutes.
+SIGKILLS every in-flight `opencode run`, and runs last 20–90 minutes.
 
-Two further traps on this path, both load-bearing:
+### 3.1 Image staging
+
+On this lane `deploy-image.sh` does not pull or stage the image — the operator
+must do it manually. Run the following to stage the correct image before running
+`deploy-image.sh`:
+
+```bash
+export DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.paperclip/auto-rollout}/docker-config"
+mkdir -p "$DOCKER_CONFIG"
+chmod 700 "$DOCKER_CONFIG"
+printf '%s' "$(cat "$HOME/.paperclip/ghcr-read.token")" | docker login ghcr.io -u kronik187 --password-stdin
+# Pull by digest so the image is available locally regardless of tag
+docker pull -q "ghcr.io/tea-core/paperclip@${DIGEST}"
+# Tag the image with the name deploy-image.sh expects
+docker tag "ghcr.io/tea-core/paperclip@${DIGEST}" tea-core/paperclip:fold-<short>
+# Verify the image carries no new migrations (the same check auto-rollout.sh:703 performs: revision must equal fold tip)
+docker inspect --format='{{index .Config Labels "org.opencontainers.image.revision"}}' tea-core/paperclip:fold-<short>
+```
+
+### 3.2 Pre-swap pg_dump
+
+`auto-rollout.sh:~795` takes a `pg_dump` before every swap and its own comment at
+line 731 says it is "the ONLY automated pg_dump anywhere on the migration path"
+— no backup cron has existed since the 2026-08-24 Backrest cutover (verified on
+wonton 2026-09-08, SUP-15271). That dump is also downstream of the line-636 exit,
+and `deploy-image.sh` does not dump (`grep -n pg_dump deploy-image.sh` → no hits).
+
+The operator must create this dump before swapping:
+
+```bash
+export STATE="$HOME/.paperclip/auto-rollout"
+export DUMP_DIR="$STATE/predeploy-dumps"
+mkdir -p "$DUMP_DIR"
+# Mirrors auto-rollout.sh:~795: docker compose exec db pg_dump | gzip
+docker compose -f "$STACK_ADMIN/docker-compose.yml" exec -T db sh -c \
+  'pg_dump -U paperclip -d paperclip --no-owner --no-privileges' | gzip > "$DUMP_DIR/paperclip-pre-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+# Verify the dump is not corrupt
+gzip -t "$DUMP_DIR/paperclip-pre-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+```
+
+This is the only restore point on the migration-carrying lane.
 
 - **Build from the right tree.** The deployed line is the
   `fold/tea-patches-v2026.722.0` worktree on wonton. A different local checkout
