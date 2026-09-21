@@ -421,4 +421,122 @@ describeEmbeddedPostgres("recovery observability report", () => {
       active: 1,
     });
   });
+
+  it("keeps per-cause routing a true partition of total across every terminal disposition", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    const cause = "stranded_assigned_issue";
+    // Board-owned resolved action — must land in its lane, not vanish.
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "process_lost",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: null,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "done",
+    });
+    // Board-owned cancelled action — also lands in boardOwned.
+    await seedRecoveryAction({
+      companyId,
+      n: 2,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "process_lost",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: null,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "todo",
+    });
+    // Agent takeover that landed elsewhere (handed back).
+    await seedRecoveryAction({
+      companyId,
+      n: 3,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+    // Agent takeover that kept and completed the work.
+    await seedRecoveryAction({
+      companyId,
+      n: 4,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: managerId,
+      finalIssueStatus: "done",
+    });
+    // Original agent recovered its own issue (self recovery).
+    await seedRecoveryAction({
+      companyId,
+      n: 5,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "process_lost",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "done",
+    });
+    // Agent-owned action that cancelled while the issue landed elsewhere: must
+    // count as `cancelled`, NOT also as `handedBack` (the old double-count).
+    await seedRecoveryAction({
+      companyId,
+      n: 6,
+      createdAt: regressionWeek,
+      cause,
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+
+    const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
+    const row = report.perCauseRouting.find((entry) => entry.cause === cause);
+
+    expect(row?.total).toBe(6);
+    expect(row?.boardOwned).toBe(2);
+    expect(row?.handedBack).toBe(1);
+    expect(row?.ownerCompleted).toBe(1);
+    expect(row?.retriedByOriginalSucceeded).toBe(1);
+    expect(row?.cancelled).toBe(1);
+    expect(row?.active).toBe(0);
+    expect(row?.other).toBe(0);
+    expect(row?.falsePositive).toBe(0);
+
+    // The partition invariant must hold for every cause row, not just this one.
+    for (const entry of report.perCauseRouting) {
+      const partitionSum =
+        entry.active +
+        entry.boardOwned +
+        entry.retriedByOriginalSucceeded +
+        entry.handedBack +
+        entry.ownerCompleted +
+        entry.falsePositive +
+        entry.cancelled +
+        entry.other;
+      expect(partitionSum).toBe(entry.total);
+    }
+  });
 });

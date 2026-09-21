@@ -61,14 +61,29 @@ export type RecoveryHandoffSummary = {
 export type RecoveryCauseRouting = {
   cause: string;
   total: number;
+  // --- outcome partition: mutually exclusive; these columns sum to `total` ---
+  /** Still in flight (`active` or `escalated` status). */
   active: number;
+  /** Terminal, board-owned (no recovery owner agent) — the SUP-17029 lanes. */
+  boardOwned: number;
   /** Original agent recovered its own issue and resolved it. */
   retriedByOriginalSucceeded: number;
+  /** Recovery owner handed the work to another actor that landed elsewhere. */
   handedBack: number;
+  /** Recovery owner kept and completed the work. */
   ownerCompleted: number;
-  escalated: number;
+  /** Terminal outcome was a false positive. */
   falsePositive: number;
+  /** Terminal and cancelled (not a false positive). */
   cancelled: number;
+  /** Terminal with an owner but no recognized routing disposition. */
+  other: number;
+  /**
+   * Cross-cutting count (a subset of `active`), NOT part of the outcome
+   * partition: it overlaps `active`, so it is excluded from the sum that must
+   * equal `total`.
+   */
+  escalated: number;
 };
 
 export type RecoveryObservabilityReport = {
@@ -106,12 +121,13 @@ const TERMINAL_ISSUE_STATUSES = new Set(["done"]);
 /**
  * Classify a recovery action by who ended up owning the deliverable work.
  *
- * The plan's `handed_back` vs `owner_completed` outcomes were never added to the
- * outcome vocabulary (recovery track 1 kept `restored`/`cancelled`/…), so we
- * derive the distinction from the durable relationship between the recovery
- * owner, the original assignee (`returnOwnerAgentId`), and where the source
- * issue actually landed. This directly measures the product goal — "managers
- * doing the work becomes rare".
+ * `handed_back` and `owner_completed` ARE part of the outcome vocabulary
+ * (`packages/shared/src/constants.ts`, `ISSUE_RECOVERY_ACTION_OUTCOMES`), but
+ * almost no writer actually persists them — the `outcome` column is sparse in
+ * practice. So we derive the distinction from the durable relationship between
+ * the recovery owner, the original assignee (`returnOwnerAgentId`), and where
+ * the source issue actually landed. This directly measures the product goal —
+ * "managers doing the work becomes rare".
  */
 export function classifyRecoveryHandoff(facts: RecoveryActionFacts): HandoffClass {
   if (ACTIVE_STATUSES.has(facts.status)) return "active";
@@ -127,6 +143,45 @@ export function classifyRecoveryHandoff(facts: RecoveryActionFacts): HandoffClas
     return "owner_completed";
   }
   return "other";
+}
+
+type RoutingPartitionCell =
+  | "boardOwned"
+  | "retriedByOriginalSucceeded"
+  | "handedBack"
+  | "ownerCompleted"
+  | "falsePositive"
+  | "cancelled"
+  | "other";
+
+/**
+ * Assign a terminal (non-active) recovery action to exactly one outcome-
+ * partition cell so the per-cause routing columns form a true partition of
+ * `total`. Priority:
+ *   1. board-owned (no recovery owner agent) — these lanes land in their own
+ *      row, which is the SUP-17029 finding
+ *   2. false_positive outcome
+ *   3. cancelled status
+ *   4. owner-relationship class (self_recovery / handed_back / owner_completed)
+ * Anything else is `other`. `escalated` is deliberately not a cell here: it is
+ * a cross-cutting subset of `active` and is excluded from the partition so the
+ * partition columns still sum to `total`.
+ */
+export function routingPartitionCell(row: RecoveryActionFacts): RoutingPartitionCell {
+  if (!row.ownerAgentId) return "boardOwned";
+  if (row.outcome === "false_positive") return "falsePositive";
+  if (row.status === "cancelled") return "cancelled";
+  // Terminal and not cancelled here, so the status is `resolved`.
+  switch (classifyRecoveryHandoff(row)) {
+    case "self_recovery":
+      return "retriedByOriginalSucceeded";
+    case "handed_back":
+      return "handedBack";
+    case "owner_completed":
+      return "ownerCompleted";
+    default:
+      return "other";
+  }
 }
 
 /**
@@ -289,12 +344,14 @@ export function recoveryObservabilityService(db: Db) {
           cause,
           total: 0,
           active: 0,
+          boardOwned: 0,
           retriedByOriginalSucceeded: 0,
           handedBack: 0,
           ownerCompleted: 0,
           escalated: 0,
           falsePositive: 0,
           cancelled: 0,
+          other: 0,
         };
         routingByCause.set(cause, entry);
       }
@@ -308,6 +365,9 @@ export function recoveryObservabilityService(db: Db) {
 
       if (klass === "active") {
         routing.active += 1;
+        // `escalated` is a cross-cutting count (a subset of `active`), not a
+        // partition cell: it is excluded from the outcome partition so the
+        // partition columns still sum to `total`.
         if (row.status === "escalated") routing.escalated += 1;
         if (!row.ownerAgentId) {
           handoff.boardOwned += 1;
@@ -317,25 +377,45 @@ export function recoveryObservabilityService(db: Db) {
         continue;
       }
 
-      // Routing verification counters (resolved actions).
-      if (row.status === "escalated") routing.escalated += 1;
-      if (row.outcome === "false_positive") routing.falsePositive += 1;
-      if (row.status === "cancelled" && row.outcome !== "false_positive") routing.cancelled += 1;
+      // Terminal: exactly one outcome-partition cell per action.
+      switch (routingPartitionCell(row)) {
+        case "boardOwned":
+          routing.boardOwned += 1;
+          break;
+        case "retriedByOriginalSucceeded":
+          routing.retriedByOriginalSucceeded += 1;
+          break;
+        case "handedBack":
+          routing.handedBack += 1;
+          break;
+        case "ownerCompleted":
+          routing.ownerCompleted += 1;
+          break;
+        case "falsePositive":
+          routing.falsePositive += 1;
+          break;
+        case "cancelled":
+          routing.cancelled += 1;
+          break;
+        case "other":
+          routing.other += 1;
+          break;
+      }
 
+      // Company-wide handoff summary. Kept on its original semantics (derived
+      // from the owner-relationship `klass`), independent of the routing
+      // partition.
       switch (klass) {
         case "self_recovery":
           handoff.selfRecovery += 1;
-          if (row.status === "resolved") routing.retriedByOriginalSucceeded += 1;
           break;
         case "handed_back":
           handoff.handedBack += 1;
           handoff.resolvedTakeovers += 1;
-          routing.handedBack += 1;
           break;
         case "owner_completed":
           handoff.ownerCompleted += 1;
           handoff.resolvedTakeovers += 1;
-          routing.ownerCompleted += 1;
           break;
         case "board_owned":
           handoff.boardOwned += 1;
