@@ -135,7 +135,7 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   originId?: string | null;
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
-  executionPolicy: Record<string, unknown> | null;
+  executionPolicy?: Record<string, unknown> | null;
   responsibleUserId: string | null;
 }
 
