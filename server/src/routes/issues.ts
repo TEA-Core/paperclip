@@ -363,6 +363,7 @@ import {
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
+import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
   isAgentDefaultProjectWorkspacePair,
@@ -977,137 +978,8 @@ const REVIEW_ESCALATION_INTERACTION_KEY_PREFIX = "review-escalation:";
 const REVIEW_ESCALATION_APPROVED_DECISION_BODY =
   "Review approved via the round-cap escalation.";
 
-type ReviewEscalationDecisionIssue = {
-  id: string;
-  companyId: string;
-  status: string;
-  assigneeAgentId?: string | null;
-  assigneeUserId?: string | null;
-  responsibleUserId?: string | null;
-  createdByUserId?: string | null;
-  executionPolicy?: Record<string, unknown> | null;
-  executionState?: Record<string, unknown> | null;
-};
-
 function isReviewEscalationInteraction(interaction: { idempotencyKey?: string | null }): boolean {
   return interaction.idempotencyKey?.startsWith(REVIEW_ESCALATION_INTERACTION_KEY_PREFIX) ?? false;
-}
-
-/**
- * SUP-14919: a review round-cap escalation is resolved on an interaction (accept
- * or reject) rather than through a PATCH, but the stage's decision must still be
- * recorded and the card handed to its return assignee. Without this the
- * confirmation resolves in a void: no `issue_execution_decisions` row is written,
- * `assigneeAgentId` stays null, and `queueResolvedInteractionContinuationWakeup`
- * wakes nobody — the card strands permanently.
- *
- * Runs the pure execution-policy transition as the escalated human, stamps the
- * decision id onto the patched state, then in one transaction inserts the
- * decision row and applies the patch. For a final-stage approval the engine
- * completes every stage without touching the issue status, so the card is routed
- * back to its return assignee in_progress — matching what a changes-requested
- * hand-back produces and what the issue's continuation wake expects.
- */
-async function applyReviewEscalationDecision(args: {
-  db: Db;
-  issue: ReviewEscalationDecisionIssue;
-  requestedStatus: "done" | "in_progress";
-  decisionBody: string;
-  actor: { agentId: string | null; userId: string | null; runId: string | null };
-}): Promise<{
-  id: string;
-  status: string;
-  assigneeAgentId: string | null;
-  assigneeUserId: string | null;
-} | null> {
-  const { db, issue, requestedStatus, decisionBody, actor } = args;
-  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
-  const existingState = parseIssueExecutionState(issue.executionState);
-  if (!policy || !existingState) return null;
-
-  // Re-opening an escalated review bounces the summary-generation task back to
-  // the Summarizer, never to a policy `returnAssigneeAgentId` (SUP-15768).
-  // Resolve it only when this decision is a pending review changes_requested
-  // bounce, so unrelated decisions never trigger the summary-slot lookup.
-  const summaryForcedReturnAssignee = isReviewChangesRequestedTransition({
-    policy,
-    executionState: existingState,
-    requestedStatus,
-  })
-    ? await resolveSummaryGenerationReturnAssignee(db, issue)
-    : null;
-  const transition = applyIssueExecutionPolicyTransition({
-    issue,
-    policy,
-    previousPolicy: policy,
-    requestedStatus,
-    requestedAssigneePatch: {},
-    actor,
-    commentBody: decisionBody,
-    forcedReturnAssignee: summaryForcedReturnAssignee,
-  });
-  if (!transition.decision) return null;
-  const decisionId = randomUUID();
-  const nextExecutionState = transition.patch.executionState;
-  if (!nextExecutionState || typeof nextExecutionState !== "object") {
-    throw new Error("Review escalation decision patch is missing executionState");
-  }
-  const updateFields: Record<string, unknown> = {
-    ...transition.patch,
-    executionState: {
-      ...(nextExecutionState as Record<string, unknown>),
-      lastDecisionId: decisionId,
-    },
-  };
-  // A final-stage approval completes every execution stage; the engine leaves the
-  // issue status untouched, so route the card back to its return assignee to close.
-  if (requestedStatus === "done" && updateFields.status === undefined) {
-    // A summary-generation card's approval hand-back must land on the Summarizer
-    // (the only writer of its slot), never on a policy `returnAssigneeAgentId`
-    // (SUP-15768). Ordinary issues resolve to null here, so they keep routing to
-    // their stored return assignee.
-    const returnAssignee =
-      (await resolveSummaryGenerationReturnAssignee(db, issue)) ??
-      existingState.returnAssignee ??
-      null;
-    updateFields.status = "in_progress";
-    if (returnAssignee?.type === "agent") {
-      updateFields.assigneeAgentId = returnAssignee.agentId ?? null;
-      updateFields.assigneeUserId = null;
-    } else if (returnAssignee?.type === "user") {
-      updateFields.assigneeAgentId = null;
-      updateFields.assigneeUserId = returnAssignee.userId ?? null;
-    }
-  }
-  updateFields.actorAgentId = actor.agentId ?? null;
-  updateFields.actorUserId = actor.userId ?? null;
-
-  await db.transaction(async (tx) => {
-    await tx.insert(issueExecutionDecisions).values({
-      id: decisionId,
-      companyId: issue.companyId,
-      issueId: issue.id,
-      stageId: transition.decision!.stageId,
-      stageType: transition.decision!.stageType,
-      actorAgentId: actor.agentId ?? null,
-      actorUserId: actor.userId ?? null,
-      outcome: transition.decision!.outcome,
-      body: transition.decision!.body,
-      createdByRunId: actor.runId ?? null,
-    });
-    await issueService(db).update(
-      issue.id,
-      updateFields,
-      tx,
-    );
-  });
-
-  return {
-    id: issue.id,
-    status: updateFields.status as string,
-    assigneeAgentId: (updateFields.assigneeAgentId as string | null) ?? null,
-    assigneeUserId: (updateFields.assigneeUserId as string | null) ?? null,
-  };
 }
 
 async function auditAgentIssueCreateAttributionSpoof(input: {

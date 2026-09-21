@@ -1,13 +1,18 @@
 import { and, eq } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
 import type { StalledReviewDecisionAction } from "@paperclipai/shared";
-import { conflict, notFound } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import {
   logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import {
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "./issue-execution-policy.js";
+import { applyReviewEscalationDecision } from "./issue-stage-decision.js";
 import {
   executeIssuePostCommitActions,
   issueService,
@@ -79,6 +84,77 @@ export function stalledReviewDecisionService(db: Db) {
             issueId: lockedIssue.id,
             reviewAttentionState: reviewAttention?.state ?? "none",
           });
+        }
+
+        // A live pending stage whose currentParticipant is the acting user is a real
+        // stage decision, not just a status change. Record it through the
+        // execution-policy transition so exactly one issue_execution_decisions row
+        // is written and the card routes per the engine, instead of the old raw
+        // status update that skipped the ladder (ADR-073, SUP-16872). Without a
+        // resolvable policy/state, or when the acting user is not the participant,
+        // keep the ladder-bypassing path below verbatim (the ordinary stalled case
+        // and no-policy escalated holds).
+        const executionPolicy = normalizeIssueExecutionPolicy(
+          lockedIssue.executionPolicy ?? null,
+        );
+        const executionState = parseIssueExecutionState(lockedIssue.executionState);
+        const isStageDecision =
+          !!executionPolicy &&
+          executionState?.status === "pending" &&
+          executionState.currentParticipant?.type === "user" &&
+          executionState.currentParticipant.userId === input.actor.userId;
+
+        if (isStageDecision) {
+          // Every stage-decision branch of the engine requires a comment body. The
+          // schema only enforces it for request_changes, so pre-check here to fail
+          // with a clear error instead of a raw transition 422.
+          if (!input.note?.trim()) {
+            throw unprocessable("A note is required to record this review stage decision", {
+              issueId: lockedIssue.id,
+              stageType: executionState?.currentStageType ?? null,
+            });
+          }
+          const requestedStatus = input.action === "approve" ? "done" : "in_progress";
+          const resolution = await applyReviewEscalationDecision({
+            db: txDb,
+            issue: lockedIssue,
+            requestedStatus,
+            decisionBody: input.note,
+            actor: {
+              agentId: null,
+              userId: input.actor.userId,
+              runId: input.actor.runId ?? null,
+            },
+          });
+          if (!resolution) {
+            // The transition could not record a decision for this shape. Fail closed
+            // rather than fall through to the ladder-bypassing status update.
+            throw unprocessable("Could not record this review stage decision", {
+              issueId: lockedIssue.id,
+            });
+          }
+          const updated = resolution.issue;
+          await logActivityInTransaction(txDb, {
+            companyId: updated.companyId,
+            actorType: "user",
+            actorId: input.actor.userId,
+            runId: input.actor.runId ?? null,
+            action: "issue.stalled_review_decided",
+            entityType: "issue",
+            entityId: updated.id,
+            issueId: updated.id,
+            details: {
+              action: input.action,
+              status: resolution.status,
+              identifier: updated.identifier,
+              decisionId: resolution.decisionId,
+              stageId: resolution.stageId,
+              outcome: resolution.outcome,
+              source: "execution_policy_transition",
+              _previous: { status: lockedIssue.status },
+            },
+          });
+          return { issue: updated, comment: null };
         }
 
         const comment = input.note
