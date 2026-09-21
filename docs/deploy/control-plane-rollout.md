@@ -190,10 +190,11 @@ mkdir -p "$DOCKER_CONFIG"
 chmod 700 "$DOCKER_CONFIG"
 printf '%s' "$(cat "$HOME/.paperclip/ghcr-read.token")" | docker login ghcr.io -u kronik187 --password-stdin
 # Pull by digest so the image is available locally regardless of tag
+# DIGEST: the image digest published by docker.yml on every fold push
 docker pull -q "ghcr.io/tea-core/paperclip@${DIGEST}"
 # Tag the image with the name deploy-image.sh expects
 docker tag "ghcr.io/tea-core/paperclip@${DIGEST}" tea-core/paperclip:fold-<short>
-# Verify the image carries no new migrations (the same check auto-rollout.sh:703 performs: revision must equal fold tip)
+# Verify the `org.opencontainers.image.revision` label equals the fold tip (the same check auto-rollout.sh:703 performs)
 docker inspect --format='{{index .Config Labels "org.opencontainers.image.revision"}}' tea-core/paperclip:fold-<short>
 ```
 
@@ -212,7 +213,7 @@ export STATE="$HOME/.paperclip/auto-rollout"
 export DUMP_DIR="$STATE/predeploy-dumps"
 mkdir -p "$DUMP_DIR"
 # Mirrors auto-rollout.sh:~795: docker compose exec db pg_dump | gzip
-docker compose -f "$STACK_ADMIN/docker-compose.yml" exec -T db sh -c \
+docker compose -f "$STACK_ADMIN/paperclip-docker/docker-compose.yml" --project-directory "$STACK_ADMIN/paperclip-docker" exec -T db sh -c \
   'pg_dump -U paperclip -d paperclip --no-owner --no-privileges' | gzip > "$DUMP_DIR/paperclip-pre-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
 # Verify the dump is not corrupt
 gzip -t "$DUMP_DIR/paperclip-pre-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
