@@ -4862,15 +4862,19 @@ function reviewAttentionNone(): IssueReviewAttention {
   return { state: "none", paths: [], reason: null };
 }
 
-// An escalated hold parks a user as the pending executionState.currentParticipant
-// and hands the assignment to that same user. That user's own paths are not a
-// maintained action path: the whole point of escalating is that the agent stopped
-// and a human is waiting, so counting their paths would mark the hold "covered"
-// and leave the stalled-review release route (which only accepts `stalled`)
-// unreachable for exactly the population it exists to serve (SUP-14806). Returns
-// the hold user id when the issue is that shape, else null. Narrow on purpose: a
-// plain human reviewer (assigneeUserId set, no user currentParticipant) still
-// reports its human_reviewer path and stays "covered".
+// Any pending stage whose currentParticipant is a user — whether that user is a
+// configured stage participant or the responsible/creator human the round-cap
+// escalation bumped in — parks the assignment on that same user. That user's own
+// paths are not a maintained action path: the point is that a human is now waiting
+// to act, so counting their paths would mark the hold "covered" and leave the
+// stalled-review release route (which only accepts `stalled`) unreachable for
+// exactly the population it exists to serve (SUP-14806, ADR-073). This is
+// deliberately NOT limited to "escalated holds": a configured user participant is
+// reported `stalled` the same way, because the id is returned for ANY pending user
+// currentParticipant. The one case that stays `covered` is a human reviewer who is
+// not the currentParticipant (e.g. assigneeUserId set while the current participant
+// is an agent, or no user currentParticipant at all) — their human_reviewer path is
+// untouched.
 function escalatedHoldUserId(issue: IssueRow): string | null {
   const state = parseObject(issue.executionState);
   if (state.status !== "pending") return null;
