@@ -1081,11 +1081,25 @@ export async function countLadderedChildren(
   db: Db,
   companyId: string,
   parentId: string,
+  options?: {
+    /**
+     * SUP-17158: the close-guard (mechanisms A/D and the missing-approval-stage
+     * route probe) counts a child only once its ladder has RUN — a completed or
+     * skipped stage. The proactive acquisition flag must fire while those
+     * children are still open, so it passes `false` to count a child that merely
+     * CARRIES a ladder. Only the completion gate is relaxed: the
+     * origin/status/carve-out exclusions and the `>= 2` threshold (applied by
+     * `diagnoseMissingApprovalStage`) are shared, so the two consumers can never
+     * drift. Defaults to `true` (the guard behaviour).
+     */
+    requireCompletedLadder?: boolean;
+  },
 ): Promise<{
   count: number;
   identifiers: string[];
   excludedChildIdentifiers: string[];
 }> {
+  const requireCompletedLadder = options?.requireCompletedLadder !== false;
   // Children link up via `issues.parent_id`. Dependency edges
   // (`issue_relations` rows of type `blocks`) are not decomposition edges
   // and are not consulted here (SUP-15233; supersedes the SUP-15031
@@ -1164,7 +1178,18 @@ export async function countLadderedChildren(
     const state = parseIssueExecutionState(row.executionState);
     const completed = state?.completedStageIds?.length ?? 0;
     const skipped = state?.skippedStageIds?.length ?? 0;
-    if (completed === 0 && skipped === 0) continue;
+    if (requireCompletedLadder) {
+      if (completed === 0 && skipped === 0) continue;
+    } else {
+      // SUP-17158 (acquisition-counts-stage-less-child): the acquisition-time
+      // exception relaxes ONLY the "has the ladder run" gate above. A child whose
+      // policy carries no stages is not a laddered child, so it must not be
+      // counted here either — requiring an actual ladder before relaxing the
+      // completion gate keeps the eligible-child predicate aligned with the done
+      // guard, and only that one gate is what changes between the two consumers.
+      const policyStages = (row.executionPolicy as { stages?: unknown }).stages;
+      if (!Array.isArray(policyStages) || policyStages.length === 0) continue;
+    }
     // SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177: a `work-type:redo`,
     // `work-type:delivery`, `work-type:architecture-review`, or `work-type:process`
     // child is not "which child gated this work?" — the first two re-deliver the
