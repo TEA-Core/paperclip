@@ -661,6 +661,42 @@ describe("issue execution policy missing approval stage", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  // SUP-17125 (HIGH finding, round-1 self-repair): the thread refusal record is what
+  // the NEXT run reads, so persisting it is part of the refusal guarantee, not
+  // best-effort. If the record write cannot persist, the route must fail closed — it
+  // may not return the typed 409 (which claims the refusal was recorded) when no
+  // thread-readable code or remedy actually landed. Forcing the record write to
+  // reject proves the persistence error surfaces as a 5xx rather than being swallowed
+  // and the 409 returned. This pins the write-failure behavior of the shared
+  // postTerminalStatusRefusalComment helper (delivery 409 / tier 422 /
+  // missing-approval-stage 409 all call it); the audit-row fail-closed test above
+  // covers the durable row, this covers the thread record.
+  it("fails closed with an error (not the typed 409) when the thread refusal record cannot persist", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockIssueService.listComments.mockResolvedValue([]);
+    mockIssueService.addComment.mockRejectedValueOnce(new Error("refusal record write failed"));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    // No successful-looking 409 may coexist with a missing thread record: the
+    // persistence error surfaces as a 5xx and the refusal is not claimed as recorded.
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.body.code).not.toBe("done_transition_missing_approval_stage");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   // Regression: a `done` request that does not otherwise require a transaction
   // (no execution policy at all, so no decision, no relay stop, no review
   // activity) must STILL be refused with the typed signal. Pre-fix this took the
