@@ -2678,6 +2678,292 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("work-type:process children are not decomposition children (SUP-17177)", () => {
+    const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
+    const parentStageId = "30000000-0000-4000-8000-000000000005";
+    const processLabelId = "60000000-0000-4000-8000-00000000000b";
+
+    const agents = [
+      { id: supportCrId, name: "support-CR", role: "support" },
+    ];
+
+    // The shape-incomplete parent (a single satisfied support-CR review stage)
+    // that only arms mechanism D when the laddered child count reaches >= 2.
+    const parentLadder = {
+      stages: [
+        { id: parentStageId, type: "review", participants: [{ type: "agent", agentId: supportCrId }] },
+      ],
+    };
+
+    const satisfiedState = (stageIds: string[]) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: stageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    // A process child (courier / review-routing / unblock): origin_kind manual,
+    // a ran review ladder, and (via the issue_labels join) the process label. It
+    // gates no slice of the parent's deliverable — it is procedural, not sub-work.
+    const processChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    // A genuine manual decomposition child (no carve-out label).
+    const manualChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    const processLabelRow = {
+      id: processLabelId,
+      companyId: "company-1",
+      name: "work-type:process",
+      color: "#000000",
+    };
+
+    it("excludes two work-type:process children so a process-only parent owes no ADR-072 close ladder (SUP-16872 live shape, AC1 main regression)", async () => {
+      // Two procedural process children (the SUP-16900 unblock + SUP-16884 courier
+      // shape over SUP-16872): both carry the process label, so the laddered count
+      // is 0 (< 2). Neither mechanism arms. This fails against the pre-change
+      // guard: `work-type:process` is not in the carve-out set, so both process
+      // children count -> count 2 -> mechanism A / D refuse the close, leaving the
+      // final paperclip/approved transition unreachable.
+      const children = [
+        processChild("process-1", "SUP-16900", "40000000-0000-4000-8000-000000000001"),
+        processChild("process-2", "SUP-16884", "50000000-0000-4000-8000-000000000002"),
+      ];
+      const issueLabels = [
+        { issueId: "process-1", labelId: processLabelId, companyId: "company-1" },
+        { issueId: "process-2", labelId: processLabelId, companyId: "company-1" },
+      ];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("excludes a process child so a 1-genuine + 1-process pair arms neither mechanism A nor D (AC1)", async () => {
+      // One genuine manual decomposition child + one process child: the process
+      // child is excluded, so the count is 1 (< 2). Neither mechanism arms.
+      const children = [
+        manualChild("child-1", "SUP-17101", "40000000-0000-4000-8000-000000000001"),
+        processChild("process-1", "SUP-17102", "50000000-0000-4000-8000-000000000002"),
+      ];
+      const issueLabels = [{ issueId: "process-1", labelId: processLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("counts only the genuine children in a mixed set: 1-process + 2-genuine still arms mechanism A and D (AC2)", async () => {
+      // Mixed children count only the genuine children: two genuine manual
+      // decomposition children + one process child -> the process child is
+      // excluded, but the two genuine children still reach the >= 2 threshold, so
+      // both mechanisms keep refusing. Preserves genuine-decomposition behavior.
+      const children = [
+        manualChild("genuine-1", "SUP-17103", "40000000-0000-4000-8000-000000000001"),
+        manualChild("genuine-2", "SUP-17104", "50000000-0000-4000-8000-000000000002"),
+        processChild("process-1", "SUP-17105", "60000001-0000-4000-8000-000000000003"),
+      ];
+      const issueLabels = [{ issueId: "process-1", labelId: processLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+    });
+
+    it("still arms mechanism A and D when two genuine children carry no process label (AC2 negative control)", async () => {
+      // Same two genuine children with no process label anywhere: both count, the
+      // count reaches >= 2, and both mechanisms arm. Proves the exclusion — not
+      // the setup — clears the main cases above.
+      const children = [
+        manualChild("genuine-1", "SUP-17106", "40000000-0000-4000-8000-000000000001"),
+        manualChild("genuine-2", "SUP-17107", "50000000-0000-4000-8000-000000000002"),
+      ];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels: [] });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels: [], agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+    });
+
+    it("records excludedChildIdentifiers for a process child in the mechanism A and D audit payloads while counting the genuine children (AC3)", async () => {
+      // Two genuine children + one process child: the process child is carved out
+      // (the count stays 2, so both mechanisms still refuse), and its identifier
+      // must be visible in the audit trail so a mislabel is detectable.
+      const children = [
+        manualChild("genuine-1", "SUP-17108", "40000000-0000-4000-8000-000000000001"),
+        manualChild("genuine-2", "SUP-17109", "50000000-0000-4000-8000-000000000002"),
+        processChild("process-1", "SUP-17110", "60000001-0000-4000-8000-000000000003"),
+      ];
+      const issueLabels = [{ issueId: "process-1", labelId: processLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-17108", "SUP-17109"],
+            excludedChildIdentifiers: ["SUP-17110"],
+          }),
+        }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-17108", "SUP-17109"],
+            excludedChildIdentifiers: ["SUP-17110"],
+          }),
+        }),
+      );
+    });
+
+    it("skips the process carve-out when the company has no work-type:process label (AC4, company-scoped)", async () => {
+      // The exclusion is gated on resolving a label named `work-type:process` in
+      // the company. When that label does not exist, even two process-labelled
+      // children (mapped to a label id the company does not own) count, the count
+      // reaches >= 2, and mechanism D arms. The guard must not throw on this path.
+      const children = [
+        processChild("process-1", "SUP-17111", "40000000-0000-4000-8000-000000000001"),
+        processChild("process-2", "SUP-17112", "50000000-0000-4000-8000-000000000002"),
+      ];
+      // issue_labels reference a label id, but the company has NO label row named
+      // work-type:process, so the label read returns [] and the exclusion set is
+      // never populated.
+      const issueLabels = [
+        { issueId: "process-1", labelId: "99999999-0000-4000-8000-000000000001", companyId: "company-1" },
+        { issueId: "process-2", labelId: "99999999-0000-4000-8000-000000000002", companyId: "company-1" },
+      ];
+
+      setupDbMock({ issues: children, labels: [], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
