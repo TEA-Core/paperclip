@@ -311,6 +311,10 @@ import {
   findExistingIssueBlockersResolvedWakeForReadyState,
   buildIssueBlockersResolvedWakeEmittedActivity,
 } from "../services/issue-dependency-wakeups.js";
+import {
+  buildDependencyWakeWithheldActivity,
+  readAttributedLandingDischarge,
+} from "../services/blocker-closure.js";
 import { isBlockedWithoutBlockers } from "../services/recovery/service.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS } from "../services/execution-workspaces.js";
@@ -4603,6 +4607,39 @@ export function issueRoutes(
     actor: ReturnType<typeof getActorInfo>;
     dedupeContext: string;
   }) => {
+    // SUP-17092/A: withhold the dependent wake when the resolved blocker's landing
+    // was attributed away to a shared carrier. A done that discharged no delivery
+    // on the shared branch must not fire a phantom issue_blockers_resolved cascade;
+    // record the withhold durably instead. Level-triggered: clause 2 of the
+    // predicate reads live executionState, so a later cleared publishSkipped emits
+    // the wake on the next reconciliation pass.
+    const discharge = await readAttributedLandingDischarge(
+      db,
+      input.companyId,
+      input.resolvedBlockerIssueId,
+    );
+    if (discharge.attributed) {
+      void logActivity(
+        db,
+        buildDependencyWakeWithheldActivity({
+          companyId: input.companyId,
+          agentId: null,
+          runId: input.actor.runId,
+          agentApiKeyId: input.actor.agentApiKeyId,
+          dependentIssueId: input.dependentIssueId,
+          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          blockerIssueIds: input.blockerIssueIds,
+          producer: "issue_recovery_action_resolution",
+          discharge,
+        }),
+      ).catch((err) =>
+        logger.warn(
+          { err, issueId: input.dependentIssueId },
+          "failed to audit withheld dependency wake after recovery action resolution",
+        ),
+      );
+      return null;
+    }
     // Upstream's level-triggered ready-state key: one wake per dependency-ready
     // state rather than one per resolved blocker edge. The wake body is unchanged,
     // so the emitted-activity audit record keeps the same shape.
@@ -17926,6 +17963,36 @@ export function issueRoutes(
         source: string;
         mutation: string;
       }) => {
+        // SUP-17092/A: withhold the dependent wake when the resolved blocker's
+        // landing was attributed away to a shared carrier; record the withhold
+        // durably instead of firing a phantom issue_blockers_resolved cascade.
+        const discharge = await readAttributedLandingDischarge(
+          db,
+          issue.companyId,
+          input.resolvedBlockerIssueId,
+        );
+        if (discharge.attributed) {
+          void logActivity(
+            db,
+            buildDependencyWakeWithheldActivity({
+              companyId: issue.companyId,
+              agentId: input.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              dependentIssueId: input.dependentIssueId,
+              resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+              blockerIssueIds: input.blockerIssueIds,
+              producer: "issue_update",
+              discharge,
+            }),
+          ).catch((err) =>
+            logger.warn(
+              { err, issueId: input.dependentIssueId },
+              "failed to audit withheld dependency wake on issue update",
+            ),
+          );
+          return;
+        }
         const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: input.dependentIssueId,
           blockerIssueIds: input.blockerIssueIds,
@@ -21385,6 +21452,36 @@ export function issueRoutes(
         blockerIssueIds: string[];
         blockedTransitionAt?: Date | string | null;
       }) => {
+        // SUP-17092/A: withhold the dependent wake when the resolved blocker's
+        // landing was attributed away to a shared carrier; record the withhold
+        // durably instead of firing a phantom issue_blockers_resolved cascade.
+        const discharge = await readAttributedLandingDischarge(
+          db,
+          currentIssue.companyId,
+          input.resolvedBlockerIssueId,
+        );
+        if (discharge.attributed) {
+          void logActivity(
+            db,
+            buildDependencyWakeWithheldActivity({
+              companyId: currentIssue.companyId,
+              agentId: input.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              dependentIssueId: input.dependentIssueId,
+              resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+              blockerIssueIds: input.blockerIssueIds,
+              producer: "issue_comment",
+              discharge,
+            }),
+          ).catch((err) =>
+            logger.warn(
+              { err, issueId: input.dependentIssueId },
+              "failed to audit withheld dependency wake on issue comment",
+            ),
+          );
+          return;
+        }
         const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: input.dependentIssueId,
           blockerIssueIds: input.blockerIssueIds,
