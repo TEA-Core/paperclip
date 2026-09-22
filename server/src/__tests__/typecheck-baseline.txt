@@ -677,11 +677,11 @@ server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.
 server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(52,15): TS2322
 server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(68,15): TS2322
 server/src/__tests__/heartbeat-worktree-suppression.test.ts(297,7): TS2322
-server/src/__tests__/helpers/paperclip-semantic-conformance.ts(294,9): TS2322
-server/src/__tests__/helpers/paperclip-semantic-conformance.ts(332,7): TS2322
-server/src/__tests__/helpers/paperclip-semantic-conformance.ts(505,92): TS2345
-server/src/__tests__/helpers/paperclip-semantic-conformance.ts(509,91): TS2345
-server/src/__tests__/helpers/paperclip-semantic-conformance.ts(513,93): TS2345
+server/src/__tests__/helpers/paperclip-semantic-conformance.ts(305,9): TS2322
+server/src/__tests__/helpers/paperclip-semantic-conformance.ts(343,7): TS2322
+server/src/__tests__/helpers/paperclip-semantic-conformance.ts(516,92): TS2345
+server/src/__tests__/helpers/paperclip-semantic-conformance.ts(520,91): TS2345
+server/src/__tests__/helpers/paperclip-semantic-conformance.ts(524,93): TS2345
 server/src/__tests__/helpers/paperclip-semantic-conformance.ts(54,24): TS2749
 server/src/__tests__/helpers/route-test-harness.ts(24,14): TS4023
 server/src/__tests__/http-log-redaction.test.ts(237,20): TS2339
@@ -848,7 +848,7 @@ server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(717,52): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(740,52): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(761,52): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(797,52): TS2345
-server/src/__tests__/issue-execution-policy-missing-approval-stage.test.ts(424,25): TS2493
+server/src/__tests__/issue-execution-policy-missing-approval-stage.test.ts(425,25): TS2493
 server/src/__tests__/issue-execution-policy-routes.test.ts(1073,7): TS2322
 server/src/__tests__/issue-execution-policy-routes.test.ts(368,24): TS2741
 server/src/__tests__/issue-execution-policy-routes.test.ts(370,48): TS2739
