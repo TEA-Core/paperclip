@@ -60,12 +60,33 @@ const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues 
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
 }));
-const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
-const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
-  orderBy: mockDbSelectOrderBy,
-  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([]).then(onFulfilled, onRejected),
-})));
+// SUP-17098: readAttributedLandingDischarge() in blocker-closure.ts runs
+// `.where(...).orderBy(...).limit(1).then(...)` (clause 1) and
+// `.where(...).limit(1).then(...)` (clause 2). This self-referential node
+// supports both chains and still resolves `[]` when awaited, so the terminal
+// `await ...where()` shape these routes tests already rely on is unchanged.
+const makeDbSelectWhereNode = vi.hoisted(() => () => {
+  const node: {
+    orderBy: (...args: unknown[]) => unknown;
+    limit: (...args: unknown[]) => unknown;
+    then: (
+      onFulfilled: (rows: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => unknown;
+    catch: (onRejected?: (reason: unknown) => unknown) => unknown;
+  } = {
+    orderBy: () => node,
+    limit: () => node,
+    then: (
+      onFulfilled: (rows: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => Promise.resolve([]).then(onFulfilled, onRejected),
+    catch: (onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).catch(onRejected),
+  };
+  return node;
+});
+const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => makeDbSelectWhereNode()));
 const mockDbSelectFrom = vi.hoisted(() =>
   vi.fn(() => ({ where: mockDbSelectWhere })),
 );
@@ -269,13 +290,7 @@ describe.sequential("issue PATCH authz denial copy", () => {
     mockDbSelect.mockReset();
     mockDbSelectFrom.mockReset();
     mockDbSelectWhere.mockReset();
-    mockDbSelectOrderBy.mockReset();
-    mockDbSelectOrderBy.mockResolvedValue([]);
-    mockDbSelectWhere.mockImplementation(() => ({
-      orderBy: mockDbSelectOrderBy,
-      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([]).then(onFulfilled, onRejected),
-    }));
+    mockDbSelectWhere.mockImplementation(() => makeDbSelectWhereNode());
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockAccessService.isManagerOf.mockResolvedValue(false);

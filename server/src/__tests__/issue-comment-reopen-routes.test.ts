@@ -48,16 +48,33 @@ const mockTxInsert = vi.hoisted(() =>
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
 }));
-const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
-const mockDbSelectWhere = vi.hoisted(() =>
-  vi.fn(() => ({
-    orderBy: mockDbSelectOrderBy,
+// SUP-17098: readAttributedLandingDischarge() in blocker-closure.ts runs
+// `.where(...).orderBy(...).limit(1).then(...)` (clause 1) and
+// `.where(...).limit(1).then(...)` (clause 2). This self-referential node
+// supports both chains and still resolves `[]` when awaited, so the terminal
+// `await ...where()` shape these routes tests already rely on is unchanged.
+const makeDbSelectWhereNode = vi.hoisted(() => () => {
+  const node: {
+    orderBy: (...args: unknown[]) => unknown;
+    limit: (...args: unknown[]) => unknown;
+    then: (
+      onFulfilled: (rows: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => unknown;
+    catch: (onRejected?: (reason: unknown) => unknown) => unknown;
+  } = {
+    orderBy: () => node,
+    limit: () => node,
     then: (
       onFulfilled: (rows: unknown[]) => unknown,
       onRejected?: (reason: unknown) => unknown,
     ) => Promise.resolve([]).then(onFulfilled, onRejected),
-  })),
-);
+    catch: (onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).catch(onRejected),
+  };
+  return node;
+});
+const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => makeDbSelectWhereNode()));
 // The done-transition guard resolves linked pull requests with a joined
 // select. These route tests only need that lookup to answer "no linked PRs".
 const mockDbSelectJoined = vi.hoisted(() => () => {
@@ -397,18 +414,10 @@ describe.sequential("issue comment reopen routes", () => {
     mockDbSelect.mockReset();
     mockDbSelectFrom.mockReset();
     mockDbSelectWhere.mockReset();
-    mockDbSelectOrderBy.mockReset();
     mockDb.transaction.mockReset();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
-    mockDbSelectOrderBy.mockResolvedValue([]);
-    mockDbSelectWhere.mockImplementation(() => ({
-      orderBy: mockDbSelectOrderBy,
-      then: (
-        onFulfilled: (rows: unknown[]) => unknown,
-        onRejected?: (reason: unknown) => unknown,
-      ) => Promise.resolve([]).then(onFulfilled, onRejected),
-    }));
+    mockDbSelectWhere.mockImplementation(() => makeDbSelectWhereNode());
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(
