@@ -518,6 +518,62 @@ export interface WorkspaceDiscoveryResult {
 }
 
 /**
+ * SUP-17162: the discovery-side ownership boundary. A PR is a candidate for a
+ * card ONLY when it is ANCHORED to that card. An identifier CITED anywhere —
+ * mid-slug in a branch, mid-string in a title, or anywhere in the body — is a
+ * cross-reference, not a delivery claim, and must never by itself establish
+ * ownership (the SUP-17075 -> #760 false re-open: a sibling's PR whose branch
+ * slug and body both cite the card's identifier). This brings discovery under the
+ * same boundary the ADR-091 D1 publish gate already enforces:
+ *   - branch: the head ref carries the card's identifier PREFIX (`{identifier}-`),
+ *     or IS the card's own legitimate delivery branch (exact-branch, the
+ *     `branchIsOwn` half of the D1 gate); and
+ *   - title: the identifier LEADS the title (the SUP-13361 shared-branch shape,
+ *     where a child PR carries the approving card's identifier in the title, not
+ *     the branch).
+ * `deliveryBranch` is the card's control-plane delivery branch (its legitimate
+ * execution-workspace branch), lowercased, or null when it has no such branch.
+ * `branchIsOwn` mirrors the publish gate: only the card's OWN delivery branch uses
+ * the exact-branch predicate; a shared carrier branch resolves by prefix, never by
+ * an exact match on a branch this card does not own. `headRef`/`title`/`identifier`
+ * are pre-lowercased by the caller.
+ */
+function isAnchoredCardPullRequest(
+  headRef: string,
+  title: string,
+  identifier: string,
+  deliveryBranch: string | null,
+  branchIsOwn: boolean,
+): boolean {
+  if (headRef.startsWith(`${identifier}-`)) return true;
+  if (branchIsOwn && deliveryBranch !== null && deliveryBranch !== "" && headRef === deliveryBranch) {
+    return true;
+  }
+  return isTitleLedByIdentifier(title, identifier);
+}
+
+/**
+ * SUP-17162: true when the identifier LEADS the title — the conventional leading
+ * form, not a citation anywhere in the string. Accepts the identifier at the very
+ * head ("SUP-42: ..." / "sup-42 ...") and the conventional-commit leading verb
+ * form ("fix(SUP-42): ..."). A longer identifier that merely shares the prefix
+ * (sup-17075 vs sup-170750) is rejected by the non-digit boundary. Lowercased.
+ */
+function isTitleLedByIdentifier(title: string, identifier: string): boolean {
+  const boundaryOk = (s: string) => {
+    const next = s.charAt(identifier.length);
+    return next === "" || !/\d/.test(next);
+  };
+  if (title.startsWith(identifier) && boundaryOk(title)) return true;
+  const conventional = /^[a-z0-9]+\(/.exec(title);
+  if (conventional) {
+    const rest = title.slice(conventional[0].length);
+    if (rest.startsWith(identifier) && boundaryOk(rest)) return true;
+  }
+  return false;
+}
+
+/**
  * SUP-14917: the shared live workspace re-resolve. Derives candidate
  * owner/repo pairs from the card's cached mentions (any state) and, when there
  * are none, from the card's own repo context (closing transitions only). For
@@ -570,6 +626,16 @@ async function discoverCardPullRequestByWorkspace(
   }
 
   const needle = issueIdentifier.toLowerCase();
+  // SUP-17162: resolve the card's control-plane delivery branch ONCE so the
+  // per-PR ownership test below is anchored to the same boundary the ADR-091 D1
+  // publish gate enforces. `legitimate`/`branchIsOwn` mirror the gate: only the
+  // card's own legitimate delivery branch contributes the exact-branch half.
+  const deliveryOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+  const deliveryBranch =
+    deliveryOwnership.legitimate && deliveryOwnership.branch !== null
+      ? deliveryOwnership.branch.toLowerCase()
+      : null;
+  const deliveryBranchIsOwn = deliveryOwnership.branchIsOwn;
   const matched: WorkspacePullRequestMatch[] = [];
   let terminalFailure: WorkspaceDiscoveryFailure | null = null;
 
@@ -639,8 +705,16 @@ async function discoverCardPullRequestByWorkspace(
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
         const title = (item.title ?? "").toLowerCase();
-        const body = (item.body ?? "").toLowerCase();
-        if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) continue;
+        // SUP-17162: an identifier cited anywhere — mid-slug in the branch,
+        // mid-string in the title, or anywhere in the body — is a cross-reference,
+        // not a delivery claim, and must never by itself establish ownership. A PR
+        // is a candidate only when it is ANCHORED to the card: the branch carries
+        // the card's identifier prefix (or IS its own legitimate delivery branch),
+        // or the title leads with the card's identifier (the SUP-13361
+        // shared-branch shape). This mirrors the ADR-091 D1 publish gate.
+        if (!isAnchoredCardPullRequest(headRef, title, needle, deliveryBranch, deliveryBranchIsOwn)) {
+          continue;
+        }
         matched.push({
           owner: pair.owner,
           repo: pair.repo,

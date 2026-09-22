@@ -1504,6 +1504,155 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
   });
 
+  describe("SUP-17162: workspace discovery must not resolve a card from a citation of its identifier", () => {
+    // The pre-fix defect: discovery matched by identifier SUBSTRING on head ref /
+    // title / body, so any PR that merely CITES a card's identifier (mid-branch
+    // slug, mid-title, or anywhere in the body) resolved as that card's PR. The
+    // SUP-17075 close falsely resolved its sibling SUP-17079's in-review PR #760
+    // and knocked the ruling card back to in_progress. Every test below asserts the
+    // anchored boundary instead of a substring hit.
+
+    it("AC5: does NOT resolve a sibling's PR that merely cites the card's identifier (SUP-17075 -> #760, verbatim)", async () => {
+      // SUP-17075 is a ruling card: no code, no branch commits, zero external-object
+      // PR mentions. Its close fell through to live workspace discovery, which on
+      // pre-fix code matched the sibling card SUP-17079's in-review PR #760 — that
+      // PR's branch slug AND body both cite SUP-17075. Assert none. This test FAILS
+      // on pre-fix code, where headRef.includes("sup-17075") matched the mid-slug.
+      const issueId = await insertIssue({ identifier: "SUP-17075", branchName: "SUP-17075-ruling" });
+      installRoutes([
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [
+            openPrsListItem({
+              number: 760,
+              head: { ref: "SUP-17079-fix-interaction-acceptance-cards-sup-17075-d1-ppc-be" },
+              title: "fix: interaction acceptance cards (SUP-17075 D1)",
+              body: "**Parent ruling: SUP-17075**\n\nDelivers the D1 acceptance cards.",
+            }),
+          ],
+        },
+      ]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-17075", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({ kind: "none" });
+    });
+
+    it("AC1: a branch that carries the identifier only mid-slug is NOT resolved", async () => {
+      const issueId = await insertIssue();
+      installRoutes([
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [
+            openPrsListItem({
+              number: 761,
+              head: { ref: "SUP-99-feature-sup-42-hotfix" },
+              title: "Unrelated feature",
+              body: "no identifier citations",
+            }),
+          ],
+        },
+      ]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({ kind: "none" });
+    });
+
+    it("AC2: a body citation alone (no anchored branch or title match) is NOT resolved", async () => {
+      const issueId = await insertIssue();
+      installRoutes([
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [
+            openPrsListItem({
+              number: 762,
+              head: { ref: "SUP-99-unrelated-branch" },
+              title: "Some unrelated change",
+              body: "Closes SUP-42\n\n(see also the discussion)",
+            }),
+          ],
+        },
+      ]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({ kind: "none" });
+    });
+
+    it("AC3: still resolves a shared-branch child PR whose TITLE leads with the card's identifier (SUP-13361)", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      const PARENT_BRANCH = "SUP-1-parent-architecture-review";
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: PARENT_BRANCH,
+      });
+      // Zero cached mentions; the child PR rides the CARRIER's branch (not a SUP-42-
+      // branch) and carries the child's identifier only in the title, which LEADS
+      // with it. The anchored title-lead predicate must still match.
+      installRoutes([
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [
+            openPrsListItem({
+              number: 455,
+              head: { ref: PARENT_BRANCH },
+              title: "SUP-42: unify resolution",
+              body: "shared worktree deliverable",
+            }),
+          ],
+        },
+      ]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({
+        kind: "single",
+        owner: OWNER,
+        repo: REPO,
+        number: 455,
+        displayName: `${OWNER}/${REPO}#455`,
+        headRefName: PARENT_BRANCH,
+        source: "workspace",
+        draft: false,
+      });
+    });
+
+    it("AC4: still resolves a card's own delivery PR whose branch carries its identifier prefix (no regression)", async () => {
+      const issueId = await insertIssue({ identifier: "SUP-42", branchName: "SUP-42-branch" });
+      installRoutes([
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [openPrsListItem({ number: 455, head: { ref: "SUP-42-branch" } })],
+        },
+      ]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({
+        kind: "single",
+        owner: OWNER,
+        repo: REPO,
+        number: 455,
+        displayName: `${OWNER}/${REPO}#455`,
+        headRefName: "SUP-42-branch",
+        source: "workspace",
+        draft: false,
+      });
+    });
+  });
+
   describe("SUP-16689: linked-PR draft filter (arming stays draft-blind; backstop opts in)", () => {
     it("AC3: the default resolver stays draft-blind — a linked draft is excluded (regression guard)", async () => {
       const issueId = await insertIssue();
