@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, desc, eq, gte, inArray, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -54,6 +55,65 @@ const DEFAULT_SUMMARY_FORMAT = "markdown";
 const SUMMARY_SLOT_REVISION_LIMIT = 20;
 const SUMMARY_SNAPSHOT_GROUP_LIMIT = 12;
 const SUMMARY_SNAPSHOT_INITIAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1_000;
+
+/**
+ * Template literal that must never reach a live generation-issue description
+ * (SUP-17156). If it survives into the minted token block, the Summarizer is
+ * handed an unsatisfiable task and loops 403s forever.
+ */
+export const GENERATION_ISSUE_ID_PLACEHOLDER = "NEW-ISSUE-ID-PLACEHOLDER";
+
+const GENERATION_ISSUE_ID_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function readGenerationToken(
+  description: string | null | undefined,
+): Record<string, unknown> | null {
+  const match = description?.match(/```json\n([\s\S]*?)\n```/);
+  if (!match) return null;
+  try {
+    const parsed: unknown = JSON.parse(match[1]);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * SUP-17156: mint-time guard. The generation issue's description must carry the
+ * issue's OWN UUID in the token block the write path parses back. If the
+ * rendered description still contains the template placeholder, or the token's
+ * `generationIssueId` does not parse as that issue's UUID, minting fails closed
+ * instead of shipping an unsatisfiable, assignable task to the Summarizer.
+ */
+export function assertSummaryGenerationTokenMinted(
+  description: string | null | undefined,
+  generationIssueId: string,
+): void {
+  if (description?.includes(GENERATION_ISSUE_ID_PLACEHOLDER)) {
+    throw unprocessable(
+      "Summary generation description still contains the " +
+        GENERATION_ISSUE_ID_PLACEHOLDER +
+        " literal",
+      { code: "summary_generation_placeholder_token", generationIssueId },
+    );
+  }
+  const token = readGenerationToken(description);
+  const tokenIssueId =
+    token && typeof token.generationIssueId === "string"
+      ? token.generationIssueId
+      : null;
+  if (
+    !tokenIssueId ||
+    !GENERATION_ISSUE_ID_UUID_PATTERN.test(tokenIssueId) ||
+    tokenIssueId !== generationIssueId
+  ) {
+    throw unprocessable("Summary generation token must carry the real generation issue UUID", {
+      code: "summary_generation_invalid_token",
+      generationIssueId,
+    });
+  }
+}
 
 export interface SummarySlotSelectorInput {
   companyId: string;
@@ -668,12 +728,20 @@ export function summarySlotService(db: Db) {
     const createdAt = new Date();
     const generationVersion = existing?.generatingIssueId ?? existing?.updatedAt.toISOString() ?? "initial";
     let issueDeduplicated = false;
+    // SUP-17156: mint the issue's own UUID up front so the token block is correct
+    // in the single insert. The previous create-with-null-then-backfill update
+    // left the assigned issue briefly carrying an unsatisfiable token (and the
+    // backfill's silent `?? created` fallback could ship it that way for good).
+    const generationIssueId = randomUUID();
+    const description = generationIssueDescription(sel, scopeSnapshot, generationIssueId);
+    assertSummaryGenerationTokenMinted(description, generationIssueId);
     const created = await issuesSvc.create(sel.companyId, {
+      id: generationIssueId,
       projectId,
       projectWorkspaceId,
       executionWorkspaceId,
       title: generationIssueTitle(sel, createdAt),
-      description: generationIssueDescription(sel, scopeSnapshot),
+      description,
       status: "todo",
       priority: "medium",
       assigneeAgentId: summarizerAgentId,
@@ -691,11 +759,23 @@ export function summarySlotService(db: Db) {
         issueDeduplicated = reason === "idempotency_key";
       },
     });
-    const generationIssue = (
-      await issuesSvc.update(created.id, {
+    let generationIssue = created;
+    if (created.id !== generationIssueId) {
+      // Idempotency dedup returned a pre-existing issue; backfill its own id into
+      // that issue's token block before it can be acted on.
+      const backfilled = await issuesSvc.update(created.id, {
         description: generationIssueDescription(sel, scopeSnapshot, created.id),
-      })
-    ) ?? created;
+      });
+      if (!backfilled) {
+        throw unprocessable("Summary generation token backfill did not land", {
+          code: "summary_generation_backfill_failed",
+          generationIssueId: created.id,
+        });
+      }
+      assertSummaryGenerationTokenMinted(backfilled.description, backfilled.id);
+    } else {
+      assertSummaryGenerationTokenMinted(generationIssue.description, generationIssue.id);
+    }
 
     const slotRow = await upsertSlot(sel, {
       status: "generating",
