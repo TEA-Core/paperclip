@@ -309,7 +309,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       });
       const clickedAt = Date.now();
       await stop.click();
-      await expect(page.getByRole("dialog")).toHaveCount(0);
+      await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 30_000 });
       await expect(
         page.getByRole("button", { name: "Dismiss notification" }),
       ).toHaveCount(0);
@@ -394,7 +394,12 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         .getByRole("dialog")
         .getByRole("button", { name: "Resume subtree", exact: true })
         .click();
-      await expect(page.getByRole("dialog")).toHaveCount(0);
+      // Closing this dialog waits on a server-backed subtree resume, so the 5s
+      // default expect timeout is not enough on a loaded shard: PR #748's
+      // merge_group run saw "14 x locator resolved to 1 element" here before
+      // timing out. The rest of this spec already uses 15-35s for its
+      // server-backed waits; match that.
+      await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 30_000 });
       // The recovery policy parks these stopped tasks. Releasing the hold must
       // leave them parked, even with Wake agents selected; no implicit replay.
       expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
@@ -406,7 +411,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       expect(resumedParentRun.id).not.toBe(parentRun.id);
       expect(resumedChildRun.id).not.toBe(childRun.id);
       await menu(page, "Pause subtree");
-      await expect(page.getByRole("dialog")).toHaveCount(0);
+      await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 30_000 });
       await expect(
         page.getByText("Subtree is paused.", { exact: true }),
       ).toBeVisible();
