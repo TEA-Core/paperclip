@@ -10,7 +10,9 @@ import { logActivity } from "./activity-log.js";
 import {
   fetchOpenPullRequests,
   GITHUB_GRAPHQL_URL,
+  isAnchoredCardPullRequest,
   parseRepoUrl,
+  resolveCardDeliveryBranchOwnership,
   resolveIssueRepoContext,
   resolveLinkedPullRequestsWithState,
   type IssueRepoContext,
@@ -756,9 +758,13 @@ export async function evaluateDoneTierDeclaration(
  * mention rows. Mention rows are only created when a comment posts a full PR
  * URL; repos that name a PR without the URL (e.g. "PR #3264") leave the
  * external-object table empty, so the cached resolver sees nothing even when
- * an open PR blocks. Ask GitHub directly for open, non-draft PRs that carry
- * the issue identifier in the head ref, title, or body — the same ownership
- * rule the live re-resolve in merge-arming uses.
+ * an open PR blocks. Ask GitHub directly for open, non-draft PRs ANCHORED to
+ * the issue identifier — the same `isAnchoredCardPullRequest` boundary the
+ * live re-resolve in merge-arming uses. SUP-17162: a card's identifier cited
+ * anywhere (mid-slug in a branch, mid-string in a title, anywhere in the body)
+ * is a cross-reference, not a delivery claim, and must never by itself make a
+ * PR count as this card's open delivery; a cited-but-unowned PR must not block
+ * the card from closing `done`.
  *
  * Failures never throw: they surface as `error` so the caller can count them
  * in skipReason, and the guard falls back to the cached-empty state plus the
@@ -766,7 +772,7 @@ export async function evaluateDoneTierDeclaration(
  */
 async function liveDiscoverOpenLinkedPullRequests(
   db: Db,
-  issue: { companyId: string; identifier: string | null },
+  issue: { companyId: string; id: string; identifier: string | null },
   ctx: IssueRepoContext | null,
 ): Promise<{ prs: LinkedPullRequest[]; error: string | null }> {
   if (!issue.identifier || !ctx?.repoUrl) return { prs: [], error: null };
@@ -798,14 +804,24 @@ async function liveDiscoverOpenLinkedPullRequests(
   }
 
   const needle = issue.identifier.toLowerCase();
+  // SUP-17162: resolve the card's control-plane delivery branch ONCE so the
+  // per-PR ownership test below is anchored to the same boundary the ADR-091 D1
+  // publish gate enforces — the exact inputs `discoverCardPullRequestByWorkspace`
+  // feeds the shared `isAnchoredCardPullRequest` predicate. A cited-but-unowned
+  // open PR must not block this card from closing `done`.
+  const deliveryOwnership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+  const deliveryBranch =
+    deliveryOwnership.legitimate && deliveryOwnership.branch !== null
+      ? deliveryOwnership.branch.toLowerCase()
+      : null;
+  const deliveryBranchIsOwn = deliveryOwnership.branchIsOwn;
   const seen = new Set<string>();
   const prs: LinkedPullRequest[] = [];
   for (const item of listResult.items) {
     if (item.draft === true) continue;
     const headRef = (item.headRef ?? "").toLowerCase();
     const title = (item.title ?? "").toLowerCase();
-    const body = (item.body ?? "").toLowerCase();
-    if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) {
+    if (!isAnchoredCardPullRequest(headRef, title, needle, deliveryBranch, deliveryBranchIsOwn)) {
       continue;
     }
     const key = `${parsed.owner.toLowerCase()}/${parsed.repo.toLowerCase()}#${item.number}`;

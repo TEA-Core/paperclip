@@ -2647,11 +2647,13 @@ describeEmbeddedPostgres(
     );
 
     // The live-discovery path (SUP-13313/SUP-13831) is reached with ZERO cached
-    // mentions and authorizes by identifier SUBSTRING on head ref / title / body.
-    // It is a second stamp path and takes the same gate — a gate on only one of
-    // the two paths is not a gate.
+    // mentions and resolves a PR only via the anchored card-pull-request predicate
+    // (SUP-17162): head ref == the card's own delivery branch, OR head ref leading
+    // with the card identifier, OR a title that leads with the identifier. A
+    // body-only citation (or a mid-slug / mid-title mention) is not an anchor and
+    // is not resolved. It is a second stamp path and takes the same gate.
     it(
-      "refuses a zero-mention card whose live-discovered PR only CITES its identifier — not_delivered, zero status writes",
+      "does NOT resolve a zero-mention card whose live-discovered PR only CITES its identifier — no-pr, zero status writes (SUP-17162)",
       async () => {
         await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
         // No cached mentions at all: a coordination card. The open PR in the
@@ -2675,7 +2677,7 @@ describeEmbeddedPostgres(
 
         expect(result.kind).toBe("skipped");
         expect(result.message).toBe(
-          "status:skipped:not_delivered: TEA-Core/paperclip#99 head TEA-Core/paperclip:SUP-14671-other-card-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+          "status:skipped:no-pr: no OPEN linked PR (cached mentions filtered: none; live re-resolve found 0)",
         );
         // Only the open-PR listing; no head-SHA read and no status POST.
         expect(mockGhFetch).toHaveBeenCalledTimes(1);

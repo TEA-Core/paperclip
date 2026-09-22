@@ -538,7 +538,7 @@ export interface WorkspaceDiscoveryResult {
  * an exact match on a branch this card does not own. `headRef`/`title`/`identifier`
  * are pre-lowercased by the caller.
  */
-function isAnchoredCardPullRequest(
+export function isAnchoredCardPullRequest(
   headRef: string,
   title: string,
   identifier: string,

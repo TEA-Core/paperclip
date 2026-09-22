@@ -4513,6 +4513,78 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.aheadBy).toBe(0);
       expect(result.skipReason).toBeNull();
     });
+
+    // SUP-17162 second symptom: the live-discovery path must consume the SAME
+    // anchored ownership predicate as discovery (merge-arming.ts), not a second
+    // looser copy. A card's identifier cited anywhere — mid-slug in a sibling's
+    // branch, mid-string in a title, anywhere in the body — is a cross-reference,
+    // not a delivery claim, and must not block the card from closing `done`.
+    it("does NOT block a plain done when the only open PR merely cites the card's identifier (SUP-17162 second symptom: SUP-17075 -> #760 verbatim)", async () => {
+      // headRef belongs to a sibling (SUP-7799) and only cites SUP-12345 mid-slug;
+      // the title leads with the sibling's identifier; the body cites SUP-12345.
+      // Pre-fix, the unanchored headRef.includes / body.includes test counted this
+      // as the card's open PR and fired done_transition_missing_delivery; the fix
+      // lets the card close `done` with no doneTransitionOverride.
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({
+        ok: true,
+        status: 200,
+        message: null,
+        items: [
+          {
+            number: 760,
+            draft: false,
+            headRef:
+              "SUP-7799-fix-interaction-acceptance-must-not-reclaim-a-card-whose-execution-stage-is-pending-sup-12345-d1-ppc-be",
+            title: "fix(SUP-7799): interaction acceptance must not reclaim a pending card",
+            body: "**Parent ruling: SUP-12345**\n\nThe implementation ships on SUP-7799.",
+          },
+        ],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      // The cited PR must not surface as this card's open linked delivery.
+      expect(result.skipReason).toBeNull();
+      expect(result.reason).not.toContain("open linked PR");
+      // Prove we actually ran live discovery (not a token/context failure).
+      expect(mockFetchOpenPullRequests).toHaveBeenCalledTimes(1);
+    });
+
+    it("still blocks a plain done on a genuinely OWNED open PR (headRef identifier prefix) — anchoring did not become always-allow (SUP-17162)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({
+        ok: true,
+        status: 200,
+        message: null,
+        items: [
+          {
+            number: 3264,
+            draft: false,
+            headRef: "SUP-12345-work",
+            title: "fix(SUP-12345): rework the transition guard",
+            body: null,
+          },
+        ],
+      });
+      ghFetchMock.mockImplementation(async (_url: string) => {
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip#3264");
+    });
   });
 });
 
