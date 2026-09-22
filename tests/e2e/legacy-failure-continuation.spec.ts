@@ -92,7 +92,12 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       }
       if (action === "queued_interrupt") {
         const interrupt = page.getByRole("button", { name: "Interrupt", exact: true });
-        await expect(interrupt).toBeEnabled();
+        // Fork divergence (merge_group flake hardening, slice 2d): upstream leaves this on the
+        // 5s default expect timeout, but the button only renders once the recovered legacy run
+        // reaches a running state, which on a loaded shard takes longer -- PR #748's merge_group
+        // run failed here with "element(s) not found". Upstream's semantics are unchanged; only
+        // the wait is widened, to the same 45s this spec already allows for its reply assertion.
+        await expect(interrupt).toBeEnabled({ timeout: 45_000 });
         await db.update(heartbeatRuns).set({ processPid: 999999999 }).where(eq(heartbeatRuns.id, sourceRunId));
         await interrupt.click();
       } else if (action === "automatic_message") {

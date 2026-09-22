@@ -8,6 +8,12 @@ import {
 } from "../__tests__/helpers/embedded-postgres.js";
 
 const mockCaptureRunFailure = vi.hoisted(() => vi.fn());
+
+/** Captures recorded after `since` that belong to `runId`. */
+const capturesForRun = (since: number, runId: string) =>
+  mockCaptureRunFailure.mock.calls
+    .slice(since)
+    .filter((call) => (call[0] as { runId?: unknown } | undefined)?.runId === runId);
 vi.mock("../sentry.js", async () => {
   const actual = await vi.importActual<typeof import("../sentry.js")>("../sentry.js");
   return {
@@ -85,7 +91,10 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     expect(run?.status).toBe("failed");
     expect(run?.errorCode).toBe("execution_finalization_deadline_exceeded");
 
-    const newCaptures = mockCaptureRunFailure.mock.calls.slice(captureCallsBefore);
+    // Scope to this test's run. `mockCaptureRunFailure` is shared across the
+    // file, so a positional slice alone also picks up a capture emitted by a
+    // sibling test whose async work settled after captureCallsBefore was read.
+    const newCaptures = capturesForRun(captureCallsBefore, runId);
     expect(newCaptures).toHaveLength(1);
     expect(newCaptures[0]?.[0]).toMatchObject({
       runId,
@@ -111,6 +120,9 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     // The run is already terminal ("failed"), so the early terminal-status
     // guard applies and no second "failed" write happens.
     expect(result.surfaced).toBe(1);
-    expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(0);
+    // Scoped by runId for the same reason as above: PR #748's merge_group run
+    // saw a length of 1 here from a leaked sibling capture. A genuine second
+    // capture for THIS run still fails the assertion.
+    expect(capturesForRun(captureCallsBefore, runId)).toHaveLength(0);
   });
 });
