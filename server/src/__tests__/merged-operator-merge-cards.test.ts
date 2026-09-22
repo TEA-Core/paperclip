@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -12,14 +12,19 @@ import {
   issueRelations,
   issues,
 } from "@paperclipai/db";
-import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
+import { buildIssueBlockersResolvedWakeStateKey, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, type IssueBlockersResolvedWakeup } from "../services/issue-dependency-wakeups.js";
 import {
   createMergedOperatorMergeCardPullRequestResolver,
   createMergedOperatorMergeCardSweepService,
   MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID,
   MERGED_OPERATOR_MERGE_CARDS_CLOSED_ACTION,
+  MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
   type MergedOperatorMergeCardPullRequestEvidence,
 } from "../services/merged-operator-merge-cards.js";
+import {
+  DEPENDENCY_WAKE_WITHHELD_ACTION,
+  SHARED_CARRIER_REFUSAL_MARKER,
+} from "../services/blocker-closure.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -713,6 +718,281 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       .where(eq(issues.id, fixture.cardId))
       .then((rows) => rows[0] ?? null);
     expect(card?.status).toBe("todo");
+  });
+
+  describe("SUP-17092/A attributed-landing withhold (fifth issue_blockers_resolved producer)", () => {
+    // The ADR-091 D1 shared-carrier refusal reason. It carries the verbatim
+    // SHARED_CARRIER_REFUSAL_MARKER so clause 2 of readAttributedLandingDischarge
+    // recognises it; it is what the withhold audit row must carry back verbatim.
+    const sharedCarrierReason =
+      `status:skipped:head_unresolvable: not_delivered: shared branch head abc123 ` +
+      `${SHARED_CARRIER_REFUSAL_MARKER} SUP-9999; this card shares execution workspace branch (ADR-091 D1)`;
+
+    /**
+     * Seed a merged-operator card + wakeable dependent, with the card's landing
+     * attributed away. Clause 1 = a durable issue.done_close_landing_attributed
+     * activity row; clause 2 = the live executionState.approvalStatus.publishSkipped
+     * marker. The card is a merge-card candidate (non-terminal, agent-unassigned,
+     * Merge-gate marker, merged PR) so the sweep closes it and would fire the
+     * dependent wake — unless the attribution withholds it.
+     */
+    async function seedAttributedCard(opts: {
+      cardTitle: string;
+      cardDescription?: string | null;
+      executionState?: Record<string, unknown> | null;
+      attributionRow?: boolean;
+    }): Promise<SweepFixture> {
+      const { companyId, goalId, agentId } = await seedCompany(db);
+      const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+        cardTitle: opts.cardTitle,
+        cardDescription: opts.cardDescription,
+      });
+      if (opts.executionState !== undefined) {
+        await db
+          .update(issues)
+          .set({ executionState: opts.executionState })
+          .where(eq(issues.id, fixture.cardId));
+      }
+      if (opts.attributionRow) {
+        await db.insert(activityLog).values({
+          companyId: fixture.companyId,
+          actorType: "system",
+          actorId: "done_close_landing_backstop",
+          action: "issue.done_close_landing_attributed",
+          entityType: "issue",
+          entityId: fixture.cardId,
+          details: {
+            skipReason: "shared-carrier deferral",
+            carrierIdentifier: "SUP-8888",
+            pr: "corp/repo#42",
+            deadlocked: true,
+          },
+        });
+      }
+      return fixture;
+    }
+
+    // The sweep receives `enqueueWakeup` as an injected dependency; production
+    // wires the real heartbeat wakeup, but a bare `vi.fn()` records the call
+    // without writing the observable `agent_wakeup_requests` row. To assert the
+    // acceptance "zero agent_wakeup_requests rows ... by row count", the mock
+    // persists the row it was handed, so the DB row count IS the wake count.
+    function makeService(companyId: string) {
+      const resolvePullRequest = vi.fn(async () => ({ ...MERGED_EVIDENCE }));
+      const enqueueWakeup = vi.fn(
+        async (
+          agentId: string,
+          wakeup: IssueBlockersResolvedWakeup,
+        ): Promise<{ id: string }> => {
+          await db.insert(agentWakeupRequests).values({
+            companyId,
+            agentId,
+            source: wakeup.source,
+            reason: wakeup.reason,
+            status: "queued",
+            idempotencyKey: wakeup.idempotencyKey,
+          });
+          return { id: "wake-1" };
+        },
+      );
+      const service = createMergedOperatorMergeCardSweepService(db, {
+        resolvePullRequest,
+        enqueueWakeup,
+      });
+      return { enqueueWakeup, service };
+    }
+
+    // Asserted by row count against a fresh company, per the acceptance bullet.
+    async function countWakes(companyId: string) {
+      return db
+        .select({
+          id: agentWakeupRequests.id,
+          reason: agentWakeupRequests.reason,
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON),
+          ),
+        );
+    }
+
+    async function countWithheld(companyId: string, dependentId: string) {
+      return db
+        .select({
+          action: activityLog.action,
+          entityId: activityLog.entityId,
+          details: activityLog.details,
+        })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, dependentId),
+          ),
+        );
+    }
+
+    it("withholds the dependent wake when the resolved card is attributed away (clause 2, live publishSkipped): 0 wake rows + 1 withheld row", async () => {
+      const fixture = await seedAttributedCard({
+        cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+        cardDescription: mergeGateMarker([404]),
+        executionState: { approvalStatus: { publishSkipped: { reason: sharedCarrierReason } } },
+      });
+      const { enqueueWakeup, service } = makeService(fixture.companyId);
+
+      await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+        checked: 1,
+        candidates: 1,
+        closed: 1,
+        woken: 0,
+      });
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      const wakes = await countWakes(fixture.companyId);
+      expect(wakes, "no issue_blockers_resolved wake may be enqueued").toHaveLength(0);
+
+      const withheld = await countWithheld(fixture.companyId, fixture.dependentId);
+      expect(withheld, "exactly one dependency_wake_withheld audit row").toHaveLength(1);
+      expect(withheld[0]!.details).toMatchObject({
+        wakeReason: "issue_blockers_resolved",
+        dependentIssueId: fixture.dependentId,
+        resolvedBlockerIssueId: fixture.cardId,
+        producer: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
+        attributionSource: "publish_skipped",
+        refusalReason: sharedCarrierReason,
+        carrierIdentifier: null,
+      });
+
+      const card = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0] ?? null);
+      expect(card?.status, "the operator merge card is still closed").toBe("done");
+    });
+
+    it("withholds the dependent wake when the resolved card is attributed away (clause 1, attribution row): 0 wake rows + 1 withheld row", async () => {
+      const fixture = await seedAttributedCard({
+        cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+        cardDescription: mergeGateMarker([404]),
+        attributionRow: true,
+        executionState: { approvalStatus: { publishedHeadSha: "deadbeef" } },
+      });
+      const { enqueueWakeup, service } = makeService(fixture.companyId);
+
+      await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+        checked: 1,
+        candidates: 1,
+        closed: 1,
+        woken: 0,
+      });
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      expect(await countWakes(fixture.companyId), "no wake row").toHaveLength(0);
+
+      const withheld = await countWithheld(fixture.companyId, fixture.dependentId);
+      expect(withheld).toHaveLength(1);
+      expect(withheld[0]!.details).toMatchObject({
+        producer: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
+        attributionSource: "attribution_row",
+        refusalReason: "shared-carrier deferral",
+        carrierIdentifier: "SUP-8888",
+        resolvedBlockerIssueId: fixture.cardId,
+        dependentIssueId: fixture.dependentId,
+      });
+    });
+
+    it("emits the dependent wake with the same idempotency key when the landing is NOT attributed (positive)", async () => {
+      const fixture = await seedAttributedCard({
+        cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+        cardDescription: mergeGateMarker([404]),
+        executionState: { approvalStatus: { publishedHeadSha: "publishedHead123" } },
+      });
+      const { enqueueWakeup, service } = makeService(fixture.companyId);
+
+      await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+        checked: 1,
+        candidates: 1,
+        closed: 1,
+        woken: 1,
+      });
+      expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+
+      const wakes = await countWakes(fixture.companyId);
+      expect(wakes, "the dependent wake must be enqueued").toHaveLength(1);
+      expect(wakes[0]!.reason).toBe(ISSUE_BLOCKERS_RESOLVED_WAKE_REASON);
+      // The level-triggered state key the sweep computes today; unchanged by the guard.
+      expect(wakes[0]!.idempotencyKey).toBe(
+        buildIssueBlockersResolvedWakeStateKey({
+          dependentIssueId: fixture.dependentId,
+          blockerIssueIds: [fixture.cardId],
+          blockedTransitionAt: null,
+        }),
+      );
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "no withhold row when the wake is emitted").toHaveLength(0);
+    });
+
+    it("is level-triggered: pass 1 (attributed) withholds, pass 2 (cleared) re-emits the wake", async () => {
+      const fixture = await seedAttributedCard({
+        cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+        cardDescription: mergeGateMarker([404]),
+        executionState: { approvalStatus: { publishSkipped: { reason: sharedCarrierReason } } },
+      });
+      const { enqueueWakeup, service } = makeService(fixture.companyId);
+
+      // Pass 1: live shared-carrier marker -> withhold.
+      await service.sweepMergedOperatorMergeCards();
+      expect(enqueueWakeup, "pass 1 must not enqueue a wake").not.toHaveBeenCalled();
+      expect(await countWakes(fixture.companyId), "pass 1: zero wake rows").toHaveLength(0);
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "pass 1: one withhold row").toHaveLength(1);
+
+      // Clear the live marker (re-published -> publishedHeadSha, no publishSkipped)
+      // and re-open the card so the sweep re-evaluates the SAME resolved blocker on
+      // a subsequent pass. The withhold is a live predicate, not a permanent drop.
+      await db
+        .update(issues)
+        .set({
+          status: "todo",
+          executionState: { approvalStatus: { publishedHeadSha: "republished456" } },
+        })
+        .where(eq(issues.id, fixture.cardId));
+
+      // Pass 2: cleared -> predicate returns attributed:false -> the wake re-emits.
+      await service.sweepMergedOperatorMergeCards();
+      expect(enqueueWakeup, "pass 2 must re-emit the wake").toHaveBeenCalledTimes(1);
+      const emitted = await countWakes(fixture.companyId);
+      expect(emitted, "pass 2: the dependent wake re-emits on the cleared pass").toHaveLength(1);
+      expect(emitted[0]!.idempotencyKey).toBe(
+        buildIssueBlockersResolvedWakeStateKey({
+          dependentIssueId: fixture.dependentId,
+          blockerIssueIds: [fixture.cardId],
+          blockedTransitionAt: null,
+        }),
+      );
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "no second withhold row").toHaveLength(1);
+    });
+
+    it("writes at most one withhold row across repeated sweeps of the still-attributed card (dedup)", async () => {
+      const fixture = await seedAttributedCard({
+        cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+        cardDescription: mergeGateMarker([404]),
+        executionState: { approvalStatus: { publishSkipped: { reason: sharedCarrierReason } } },
+      });
+      const { enqueueWakeup, service } = makeService(fixture.companyId);
+
+      await service.sweepMergedOperatorMergeCards();
+      // Re-open the still-attributed card and sweep again; attribution unchanged.
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, fixture.cardId));
+      await service.sweepMergedOperatorMergeCards();
+
+      expect(enqueueWakeup, "no wake across either pass").not.toHaveBeenCalled();
+      expect(await countWakes(fixture.companyId)).toHaveLength(0);
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "deduped to a single row across passes").toHaveLength(1);
+    });
   });
 
   describe("default pull-request evidence resolver", () => {

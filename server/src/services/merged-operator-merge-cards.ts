@@ -1,6 +1,6 @@
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRelations, issues } from "@paperclipai/db";
+import { activityLog, issueRelations, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { isGitHubTokenResolution, resolveGitHubTokenForRepo } from "./github-credential.js";
@@ -16,6 +16,11 @@ import {
   findExistingIssueBlockersResolvedWakeForReadyState,
   type IssueBlockersResolvedWakeup,
 } from "./issue-dependency-wakeups.js";
+import {
+  buildDependencyWakeWithheldActivity,
+  DEPENDENCY_WAKE_WITHHELD_ACTION,
+  readAttributedLandingDischarge,
+} from "./blocker-closure.js";
 import { issueService } from "./issues.js";
 import { logActivity } from "./activity-log.js";
 
@@ -369,11 +374,69 @@ export function createMergedOperatorMergeCardSweepService(
       await issueSvc.update(row.id, { status: "done" });
 
       const dependents = await issueSvc.listWakeableBlockedDependents(row.id);
+
+      // SUP-17092/A (ADR-091 D1): this merge-card sweep is an issue_blockers_resolved
+      // producer. Withhold each dependent's wake when the RESOLVED BLOCKER's landing
+      // was attributed away to a shared carrier: a done card that discharged no
+      // delivery on the shared branch must not fire a phantom cascade into the cards
+      // blocked on it. The card was just set `done` above, so it is the resolved
+      // blocker; the discharge is a property of that blocker, shared by all of its
+      // dependents. Level-triggered: clause 2 of the predicate reads live
+      // executionState, so a later cleared publishSkipped re-emits the wake on a
+      // subsequent pass.
+      const discharge = await readAttributedLandingDischarge(db, row.companyId, row.id);
+
       const enqueued: Array<{
         dependent: { id: string; assigneeAgentId: string; blockerIssueIds: string[] };
         wakeup: IssueBlockersResolvedWakeup;
       }> = [];
       for (const dependent of dependents) {
+        if (discharge.attributed) {
+          // Withhold: enqueue zero agent_wakeup_requests for this dependent and write
+          // exactly one durable issue.dependency_wake_withheld row carrying the
+          // verbatim refusal reason, the dependent id, the resolved-blocker id, and
+          // the carrier identifier. Deduped per (dependent, resolved blocker,
+          // producer) so repeated sweeps write at most one row.
+          try {
+            const alreadyWithheld = await db
+              .select({ id: activityLog.id })
+              .from(activityLog)
+              .where(
+                and(
+                  eq(activityLog.companyId, row.companyId),
+                  eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
+                  eq(activityLog.entityType, "issue"),
+                  eq(activityLog.entityId, dependent.id),
+                  sql`${activityLog.details}->>'resolvedBlockerIssueId' = ${row.id}`,
+                  sql`${activityLog.details}->>'producer' = ${MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE}`,
+                ),
+              )
+              .limit(1);
+            if (alreadyWithheld.length === 0) {
+              await logActivity(
+                db,
+                buildDependencyWakeWithheldActivity({
+                  companyId: row.companyId,
+                  agentId: dependent.assigneeAgentId,
+                  runId: null,
+                  agentApiKeyId: null,
+                  dependentIssueId: dependent.id,
+                  resolvedBlockerIssueId: row.id,
+                  blockerIssueIds: dependent.blockerIssueIds,
+                  producer: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
+                  discharge,
+                }),
+              );
+            }
+          } catch (err) {
+            logger.warn(
+              { err, dependentIssueId: dependent.id, resolvedBlockerIssueId: row.id },
+              "merged operator merge-card sweep: failed to audit withheld dependency wake",
+            );
+          }
+          continue;
+        }
+
         // Upstream's level-triggered ready-state key: one wake per dependency-ready
         // state, rather than one per resolved blocker edge. The wake body itself is
         // unchanged, so `issue.blockers_resolved_wake_emitted` consumers still match.
