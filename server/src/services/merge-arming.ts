@@ -1664,7 +1664,7 @@ function isDeliveredByCard(
  * case-insensitive, mirroring isDeliveredByCard, so the message half and the
  * verdict never disagree on which half mismatched.
  */
-function notDeliveredReasonForPr(
+export function notDeliveredReasonForPr(
   pr: { displayName: string; owner: string; repo: string; headRefName: string | null },
   deliveryRepo: { owner: string; repo: string },
   deliveryBranch: string,
