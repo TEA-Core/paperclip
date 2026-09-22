@@ -4555,11 +4555,23 @@ export function issueRoutes(
       }
     }
     if (!guardResult.allowed) {
-      const remedy = guardResult.ladderUnsatisfied
-        ? "Record the unsatisfied review stage's approval (or skip it) before marking the issue done — the review ladder must be complete before a close, and a no-deliverable-head override does not clear a review-ladder refusal."
-        : decisionCarried
-          ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
-          : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.";
+      // ADR-103 M3: the remedy must speak in the voice of the mechanism that
+      // refused, not the caller's door. Mechanisms A/C/D carry their own remedy
+      // through from the guard; the merge-first / deliver.sh strings are reachable
+      // ONLY on a true delivery/head refusal. Before M3 every refusal selected the
+      // remedy from `decisionCarried`/`ladderUnsatisfied`, so a mechanism A/D
+      // refusal on a decision-carrying close emitted the circular merge-first
+      // instruction ("Merge the issue's pull request") even though the approval
+      // being refused is the only thing that publishes paperclip/approved.
+      const mechanism =
+        guardResult.mechanism ?? (guardResult.ladderUnsatisfied ? "C" : "delivery");
+      const remedy =
+        mechanism === "delivery"
+          ? decisionCarried
+            ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+            : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+          : guardResult.remedy ??
+            "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 409 with no thread-readable code/remedy (SUP-15878 precedent).
@@ -4585,6 +4597,13 @@ export function issueRoutes(
             owner: guardResult.owner,
             repo: guardResult.repo,
             decisionCarried,
+            // ADR-103 M3.5: the mechanism travels in details beside the counted
+            // identifiers and the carve-out-excluded set, so a refusal is
+            // diagnosable without re-deriving the gate. The wire `code` stays
+            // `done_transition_missing_delivery` for compatibility (M3.7).
+            mechanism,
+            ladderedChildIdentifiers: guardResult.ladderedChildIdentifiers ?? null,
+            excludedChildIdentifiers: guardResult.excludedChildIdentifiers ?? null,
             remedy,
           },
         },
