@@ -88,6 +88,22 @@ type DbState = {
   sweptIssueId?: string;
   /** SUP-15315: the card's executionState (drives the approval-stamp read). */
   issueExecutionState?: Record<string, unknown> | null;
+  /**
+   * SUP-17133: the card's control-plane delivery identity, as
+   * `resolveDeliveryIdentity` resolves it — the issue row's
+   * `executionWorkspaceId` plus the execution-workspace row's `repoUrl` +
+   * `branchName` (`workspaceRows`). Left undefined in every pre-existing test so
+   * `narrowToDelivered` returns `identity-unresolved` and the new delivery-repo
+   * guard is inert on them (byte-identical legacy behaviour).
+   */
+  deliveryIdentity?: {
+    identifier?: string | null;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  };
+  /** Execution-workspace rows read by `resolveIssueRepoContext` / branch-ownership. */
+  workspaceRows?: Array<Record<string, unknown>>;
 };
 
 /**
@@ -98,7 +114,17 @@ type DbState = {
  */
 function makeDb(state: DbState) {
   return {
-    select: vi.fn((cols: Record<string, unknown>) => {
+    select: vi.fn((cols?: Record<string, unknown>) => {
+      // SUP-17133: `resolveIssueRepoContext` reads the execution-workspace row
+      // (repoUrl + branchName) with a no-arg `select()`. Undefined in every
+      // pre-existing test, so returning [] here cannot perturb them.
+      if (cols === undefined) {
+        return {
+          from: () => ({
+            where: () => Promise.resolve(state.workspaceRows ?? []),
+          }),
+        };
+      }
       if ("issue" in cols) {
         return {
           from: () => ({
@@ -116,6 +142,46 @@ function makeDb(state: DbState) {
                 ? [{ mergeArmingEnabled: state.companyMergeArmingEnabled }]
                 : [],
             ),
+          }),
+        };
+      }
+      // SUP-17133: `resolveCardDeliveryBranchOwnership` reads the
+      // execution-workspace row by branch columns.
+      if ("branchName" in cols) {
+        return {
+          from: () => ({
+            where: () => Promise.resolve(state.workspaceRows ?? []),
+          }),
+        };
+      }
+      // SUP-17133: `resolveDeliveryIdentity` reads the issue row by `identifier`
+      // (its projection also carries `executionWorkspaceId`, so this must be
+      // checked before the `executionWorkspaceId`-only read below).
+      if ("identifier" in cols) {
+        return {
+          from: () => ({
+            where: () =>
+              Promise.resolve([
+                {
+                  identifier: state.deliveryIdentity?.identifier ?? null,
+                  projectId: state.deliveryIdentity?.projectId ?? null,
+                  projectWorkspaceId: state.deliveryIdentity?.projectWorkspaceId ?? null,
+                  executionWorkspaceId: state.deliveryIdentity?.executionWorkspaceId ?? null,
+                  executionState: state.issueExecutionState ?? null,
+                },
+              ]),
+          }),
+        };
+      }
+      // SUP-17133: `resolveCardDeliveryBranchOwnership` reads the issue row's
+      // `executionWorkspaceId` (distinct from the `executionState` read below).
+      if ("executionWorkspaceId" in cols) {
+        return {
+          from: () => ({
+            where: () =>
+              Promise.resolve([
+                { executionWorkspaceId: state.deliveryIdentity?.executionWorkspaceId ?? null },
+              ]),
           }),
         };
       }
@@ -2593,6 +2659,266 @@ describe("SUP-16689: draft-stranded done cards", () => {
     });
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
+  });
+
+  // SUP-17133: the done-close re-enqueue leg must apply the SAME delivery-repo
+  // predicate merge-arming does (ADR-091 D5). A PR whose head repo is not this
+  // card's delivery repo must be refused structurally — reported with the D5
+  // remedy — and must NOT be armed, must NOT be read through any GitHub token,
+  // and must NOT consume a MAX_REENQUEUE_ATTEMPTS slot.
+  describe("SUP-17133: re-enqueue leg applies the merge-arming delivery-repo guard", () => {
+    // The card's control-plane delivery identity: an isolated worktree whose
+    // branch is SUP-17133-branch and whose repo is TEA-Core/Trading-Signal-Platform.
+    const delivery = {
+      deliveryIdentity: { identifier: "SUP-13326", executionWorkspaceId: "ws-17133" },
+      workspaceRows: [
+        {
+          branchName: "SUP-17133-branch",
+          repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+          sourceIssueId: null,
+          mode: "isolated_workspace",
+        },
+      ],
+    };
+
+    it("refuses a cross-repo head: names the ADR-091 D5 remedy, arms nothing, spends no quota", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+          ...delivery,
+        },
+        { wakeup },
+      );
+      // The card's close artifact is a PR in a DIFFERENT repo than its delivery repo.
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({
+          owner: "tea-core",
+          repo: "tsp-obsidian-vault",
+          number: 493,
+          nodeId: "PRNode_vault493",
+          headRefName: "SUP-17047-vault-note",
+          displayName: "tea-core/tsp-obsidian-vault#493",
+        }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      // Pre-fix these gates would PASS, and the sweep would arm the cross-repo PR
+      // with the head repo's own token. The delivery guard must short-circuit
+      // before any of them — none is reached (asserted below).
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // A token WOULD resolve for the head repo — proving the delivery guard, not
+      // a missing credential, is what stops the re-enqueue (the pre-fix bug).
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_vault_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({
+        success: true,
+        alreadyQueued: false,
+        error: null,
+        status: 200,
+      });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 1,
+        draftStranded: 0,
+      });
+
+      // Arming readers/writers never ran, nor did the ejection/head gates.
+      expect(mockResolveGitHubTokenForRepo).not.toHaveBeenCalled();
+      expect(mockFetchGitHubNodeId).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      expect(mockFetchLastMergeQueueEjectionViaTokenCandidates).not.toHaveBeenCalled();
+      expect(mockFetchHeadViaTokenCandidates).not.toHaveBeenCalled();
+
+      // The reported reason is the structural cross-repo cause + the D5 remedy,
+      // NOT the old "no resolvable GitHub token or API error" misreport.
+      const escalated = mockLogActivity.mock.calls.find(
+        (call) => (call[1] as { action?: string })?.action === "issue.done_close_landing_escalated",
+      );
+      const reason = (escalated?.[1] as { details?: { reason?: string } })?.details?.reason ?? "";
+      expect(reason).toContain("tea-core/tsp-obsidian-vault");
+      expect(reason).toContain("is not this card's delivery repo");
+      expect(reason).toContain("TEA-Core/Trading-Signal-Platform");
+      expect(reason).toContain("must be filed under a project bound to that repo (ADR-091 D5)");
+      expect(reason).not.toContain("re-enqueue attempt failed");
+
+      // No re-enqueue row → no MAX_REENQUEUE_ATTEMPTS slot consumed.
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_close_landing_reenqueued" }),
+      );
+
+      expect(mockUpdate).toHaveBeenCalledWith(
+        ISSUE,
+        expect.objectContaining({
+          status: "blocked",
+          unblockDescriptor: expect.objectContaining({
+            owner: "board",
+            action: expect.stringContaining(
+              "File the deliverable under a project bound to tea-core/tsp-obsidian-vault (ADR-091 D5)",
+            ),
+          }),
+        }),
+      );
+      expect(wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("replaces the observed SUP-17047 token/API escalation with the D5 cause (no token resolvable)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+          ...delivery,
+        },
+        { wakeup },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({
+          owner: "tea-core",
+          repo: "tsp-obsidian-vault",
+          number: 493,
+          headRefName: "SUP-17047-vault-note",
+          displayName: "tea-core/tsp-obsidian-vault#493",
+        }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // Exactly what the vault repo resolved to on SUP-17047: no token.
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: null,
+        reason: "No GitHub token resolvable for tea-core/tsp-obsidian-vault",
+      });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 1,
+        draftStranded: 0,
+      });
+
+      // Pre-fix this exact setup escalated with "re-enqueue attempt failed (no
+      // resolvable GitHub token or API error)"; now it names the structural cause.
+      const escalated = mockLogActivity.mock.calls.find(
+        (call) => (call[1] as { action?: string })?.action === "issue.done_close_landing_escalated",
+      );
+      const reason = (escalated?.[1] as { details?: { reason?: string } })?.details?.reason ?? "";
+      expect(reason).toContain("is not this card's delivery repo");
+      expect(reason).not.toContain("re-enqueue attempt failed");
+      // The guard short-circuits before the token read.
+      expect(mockResolveGitHubTokenForRepo).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      expect(wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("bounds the cross-repo disposition to one escalated row per PR key", async () => {
+      const { service } = makeService({
+        candidates: [candidateRow()],
+        existingLandingRows: [
+          {
+            action: "issue.done_close_landing_escalated",
+            entityId: ISSUE,
+            details: { pr: "tea-core/tsp-obsidian-vault#493" },
+          },
+        ],
+        companyMergeArmingEnabled: true,
+        issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        ...delivery,
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({
+          owner: "tea-core",
+          repo: "tsp-obsidian-vault",
+          number: 493,
+          displayName: "tea-core/tsp-obsidian-vault#493",
+        }),
+      ]);
+      mockResolver(async () => openSnapshot);
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
+        draftStranded: 0,
+      });
+      expect(mockLogActivity).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
+
+    it("still re-enqueues a same-repo head (delivery predicate narrowed, not refused)", async () => {
+      const { service } = makeService({
+        candidates: [candidateRow()],
+        existingLandingRows: [],
+        companyMergeArmingEnabled: true,
+        issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        ...delivery,
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({
+          owner: "TEA-Core",
+          repo: "Trading-Signal-Platform",
+          number: 514,
+          nodeId: "PRNode_abc123",
+          headRefName: "SUP-17133-branch",
+          displayName: "TEA-Core/Trading-Signal-Platform#514",
+        }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({
+        success: true,
+        alreadyQueued: false,
+        error: null,
+        status: 200,
+      });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 1,
+        escalated: 0,
+        draftStranded: 0,
+      });
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_close_landing_reenqueued",
+          details: expect.objectContaining({ pr: "TEA-Core/Trading-Signal-Platform#514" }),
+        }),
+      );
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
   });
 });
 
