@@ -22,19 +22,24 @@ import {
   resetProjectBaseRepoWithRescue,
 } from "./workspace-runtime.js";
 
-// SUP-15722 R2 / SUP-17093 ruling §5 (amended P1 acceptance, bounded corrective):
-// the P1 proof restores the carrier-lineage operator-winner scenario (P1-α) using
-// the PATH-shim barrier: the operator acquires the on-disk lease, captures the
-// stale tip, and reaches the destructive pin where the shim blocks it. The auto
-// is serialized behind the lock and is explicitly refused non-destructively when
-// it acquires the lease after the operator has moved the tip.
+// SUP-15722 R2 / SUP-17093 ruling §5 (amended P1 acceptance):
+// the P1 proof uses a deterministic CAPTURE barrier (gating `rev-parse HEAD` with
+// caller identity via AsyncLocalStorage). Both authoritative captures sit inside a
+// mutually exclusive lease (`base-repo-reset-lease.ts:137-153`), and the operator
+// has NO pre-lease HEAD read at all (`workspace-runtime.ts:4561-4582`), so a single
+// orientation can never produce two same-tipped SHAs. §5 therefore splits P1 into
+// three cooperating proofs:
 //
-// P1-α: operator-winner — the carrier-lineage PATH-shim proof. The operator is
-//       launched first, acquires the lease, captures the stale tip, and is
-//       blocked at the pin by the PATH shim. The auto blocks at lease
-//       acquisition. Exactly one destructive move lands; the auto is refused.
+// P1-α: operator-winner — the DISTINGUISHING proof. Both real callers hold the SAME
+//       stale tip at the pre-destructive boundary: the operator's in-lease capture
+//       (`:4582`) and the auto's pre-lease observation (`:5262`) are both frozen at
+//       `priorTip` before any pin/CAS/reset. Exactly one destructive move lands; the
+//       auto is explicitly refused non-destructively and never records its in-lease
+//       capture (`:4367-4369` → `:5381`).
 // P1-β: auto-winner — the lease ORDERS two real captures (`auto:2 === priorTip`,
-//       `operator:1 === originMain`) and exactly one destructive move lands.
+//       `operator:1 === originMain`) and exactly one destructive move lands. It can
+//       prove only that ordering: the operator contributes no pre-lease SHA, so the
+//       same-tip proof is P1-α's, not P1-β's.
 // P1-γ: lease-disabled red — an EXECUTING test (a test-only passthrough seam over
 //       `withBaseRepoResetLease`) that proves the lease is load-bearing: with the
 //       lock not held, BOTH in-lease captures read `priorTip` and `pinLines` === 2.
@@ -465,75 +470,93 @@ function waitForCapture(identity: string, seq: number, timeoutMs = 12000): Promi
 // (the auto-winner ordering, retained from the prior delivery), and P1-γ (the
 // executing lease-disabled red).
 
-describe("P1-α — operator-winner: the lease serializes and the auto is refused non-destructively (carrier-lineage PATH-shim proof)", () => {
-  it("operator acquires the lease, captures the stale tip, and is the sole destructive winner; the auto blocks at the lock and is refused as alreadyAtTarget", async () => {
+describe("P1-α — operator-winner: both real callers hold the SAME stale tip at the pre-destructive boundary (the distinguishing proof)", () => {
+  it("freezes the operator's in-lease capture (:4582) and the auto's pre-lease observation (:5262) at the same priorTip; one move lands, the auto is refused", async () => {
     const f = await makeOriginAndClone("sup15722-p1a-");
     const { priorTip, originMain } = await makeAheadByDuplicates(f);
-    const shim = await installBarrierShim(f);
+
+    // One recording PATH shim for the whole test, installed BEFORE the contenders
+    // launch, so the frozen read and the post-settle read come from the same log.
+    // The deterministic freeze is the Node-level capture barrier, not this shim.
+    const shim = await installLogShim(f);
     try {
-      // The operator is launched first: it acquires the on-disk lease, captures
-      // the stale tip via `rev-parse HEAD`, and reaches the destructive pin
-      // (`update-ref refs/paperclip/rescue/base-repo <priorTip> <all-zeros>`)
-      // where the PATH shim blocks it. The auto is launched second and blocks at
-      // lease acquisition because the operator holds the lock.
-      const pOperator = resetProjectBaseRepoWithRescue({ repoRoot: f.work, baseRef: "origin/main" });
+      // §5 step 1: gate the operator's in-lease capture (:4582) and the auto's
+      // pre-lease observation (:5262). Do NOT arm auto:[2] — in this orientation
+      // the operator moves the tip first, so the auto's in-lease upstream gate
+      // (`workspace-runtime.ts:4367-4369`) reports no ahead commits and the auto
+      // refuses at `:5381` before ever reaching `:5382`; arming it would hang.
+      armCapture(f.work, { operator: [1], auto: [1] });
+
+      // §5 step 2: start the operator; it acquires the lease, then freezes at its
+      // in-lease capture while still holding the lock.
+      const pOperator = cap.als.run("operator", () =>
+        resetProjectBaseRepoWithRescue({ repoRoot: f.work, baseRef: "origin/main" }),
+      );
       void pOperator.catch(() => {});
+      expect(await waitForCapture("operator", 1)).toBe(priorTip);
 
-      // Wait for the operator to reach the pin and be blocked by the shim.
-      await waitForFile(shim.frozenMarker);
-
-      // Now launch the auto: it blocks at lease acquisition (the operator holds
-      // the on-disk lock). It cannot capture, pin, or move anything until the
-      // operator releases the lease.
-      const pAuto = prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" });
+      // §5 step 3: start the auto; it freezes at its pre-lease read, having
+      // contended for the same repo.
+      const pAuto = cap.als.run("auto", () =>
+        prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" }),
+      );
       void pAuto.catch(() => {});
+      expect(await waitForCapture("auto", 1)).toBe(priorTip);
 
-      // Frozen state: the operator has pinned the stale tip but has NOT yet done
-      // the CAS or reset. The auto has not entered the destructive section at all.
+      // §5 step 4 — the frozen-window barrier: both real callers are present, their
+      // identities are distinct, BOTH hold the SAME stale tip, and ZERO destructive
+      // moves have landed. This is the property no pin-only barrier could prove: it
+      // freezes the two callers at the moment both have observed one shared tip,
+      // before either can pin, verify, CAS, or reset.
+      expect(cap.log).toHaveLength(2);
+      expect(new Set(cap.log.map((e) => e.identity))).toEqual(new Set(["operator", "auto"]));
+      expect(cap.log.every((e) => e.sha === priorTip)).toBe(true);
       const frozen = await readLog(shim.logFile);
-      expect(pinLines(frozen)).toHaveLength(1);
+      expect(pinLines(frozen)).toHaveLength(0);
       expect(casLines(frozen)).toEqual([]);
       expect(resetLines(frozen)).toEqual([]);
       expect(await git(["rev-parse", "HEAD"], f.work)).toBe(priorTip);
-      // The pin recorded the stale prior tip — the very tip the reset protects.
-      expect(capturedTips(pinLines(frozen))).toEqual([priorTip]);
 
-      // Release: the operator completes its one destructive move (CAS + reset),
-      // releases the lease. The auto then acquires the lease, reads HEAD
-      // (now originMain), finds it already at target, and refuses non-destructively.
-      await shim.release();
+      // §5 step 5: release the auto first. It proceeds past its pre-lease read and
+      // computes its divergence against the still-stale tip. Deterministically wait
+      // for that pre-lease `rev-list --left-right --count` to be logged — proof the
+      // auto observed HEAD=priorTip while the operator still held the lock — before
+      // releasing the operator. Only then is the operator allowed to move the tip.
+      releaseCapture("auto", 1);
+      await waitForLogLine(
+        shim.logFile,
+        (line) => line.includes("rev-list") && line.includes("--left-right") && line.includes("--count"),
+      );
+      releaseCapture("operator", 1);
+
       const [operatorResult, autoResult] = await Promise.all([pOperator, pAuto]);
 
-      // Post-settle: exactly one destructive move across both contenders.
+      // §5 step 6 — post-settle: exactly one destructive move; the stale tip is
+      // pinned, the repo ends on the upstream tip, and the stale tip stays reachable.
       const full = await readLog(shim.logFile);
       expect(pinLines(full)).toHaveLength(1);
       expect(casLines(full)).toHaveLength(1);
       expect(resetLines(full)).toHaveLength(1);
       expect(capturedTips(pinLines(full))).toEqual([priorTip]);
-
-      // The repo ends on the upstream tip; the stale tip is preserved and
-      // reachable via the rescue pin ref.
       expect(await git(["rev-parse", "HEAD"], f.work)).toBe(originMain);
       expect(await objectExists(f.work, priorTip)).toBe(true);
-      const pinnedRefs = (
-        await git(["for-each-ref", "--format=%(objectname)", "refs/paperclip/rescue/base-repo"], f.work)
-      ).split("\n").map((line) => line.trim()).filter(Boolean);
-      expect(pinnedRefs).toContain(priorTip);
 
-      // Explicit winner/loser branches: the operator performed the destructive
-      // reset; the auto was refused non-destructively (it re-read the tip under
-      // the lease, found it already at the upstream target, and made no move).
+      // §5 step 7 — the operator is the winner.
       expect(operatorResult.ok).toBe(true);
       if (!operatorResult.ok) throw new Error("operator reset did not succeed");
       expect(operatorResult.alreadyAtTarget).toBe(false);
       expect(operatorResult.previousTip).toBe(priorTip);
-      expect(operatorResult.resetToSha).toBe(originMain);
 
-      const autoDidReset = autoResult.warnings.some(
-        (w) => w.includes("Auto reset: Base repository") && w.includes(" was reset to "),
-      );
-      expect(autoDidReset).toBe(false);
+      // §5 step 8 — the auto is the explicit, non-destructive loser. It warns "Local
+      // commits preserved — no reset performed." and performs NO reset. Its in-lease
+      // capture never occurs: once the operator moved the tip, the in-lease upstream
+      // gate reports no ahead commits (workspace-runtime.ts:4367-4369), so the auto
+      // refuses at `:5381` and never reaches the in-lease `rev-parse HEAD` at `:5382`.
       expect(autoResult.warnings.some((w) => w.includes("Local commits preserved — no reset performed."))).toBe(true);
+      expect(autoResult.warnings.some((w) => w.includes(" was reset to "))).toBe(false);
+      // No auto seq-2 capture exists — the in-lease capture is structurally unreachable
+      // in this orientation (workspace-runtime.ts:4367-4369 → :5381).
+      expect(cap.log.some((e) => e.identity === "auto" && e.seq === 2)).toBe(false);
     } finally {
       shim.restore();
     }
