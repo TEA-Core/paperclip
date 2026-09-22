@@ -4032,9 +4032,14 @@ export function issueRoutes(
     await issueSvc.addComment(issueId, lines.join("\n"), {}, { authorType: "system" });
   }
 
-  // SUP-13904: shared post-transition merge-arming hook, run by BOTH doors that
-  // record an approved review decision (the PATCH decision path and the comment
-  // auto-approval path). Publishes paperclip/approved on the approved head,
+  // SUP-13904 / SUP-17163: shared post-transition merge-arming hook, run by every
+  // door that records an approved review decision:
+  //   1. the PATCH status path (a board/agent review approval landing `done`),
+  //   2. the stage-decision POST (`/issues/:id/execution-stage/board-decision`),
+  //   3. the comment auto-approval path,
+  //   4. the review round-cap escalation-accept door (SUP-17163), and
+  //   5. the recovery-resolution path when its recorded decision is an approval.
+  // It publishes paperclip/approved on the approved head,
   // persists Guard A's executionState.approvalStatus.publishedHeadSha (so the
   // approval-status reconciler can verify content identity before re-publishing),
   // and arms the merge when the company has merge arming enabled. A hook failure
@@ -11639,6 +11644,15 @@ export function issueRoutes(
           decisionBody: string;
           runId: string | null;
         } | null = null;
+        // SUP-17163: the execution-policy decision this resolution records (if any),
+        // threaded out of the transaction so the post-commit merge-arming hook can
+        // run the same approved-decision arming every other door runs.
+        let recordedRecoveryDecision: {
+          stageId: string;
+          stageType: string;
+          outcome: string;
+          body: string;
+        } | null = null;
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
           lockedIssue.id,
@@ -11909,6 +11923,14 @@ export function issueRoutes(
                 ...nextExecutionState,
                 lastDecisionId: decisionId,
               };
+              // SUP-17163: remember the recorded decision so the post-commit
+              // merge-arming hook can stamp/arm on an approved outcome.
+              recordedRecoveryDecision = {
+                stageId: transition.decision.stageId,
+                stageType: transition.decision.stageType,
+                outcome: transition.decision.outcome,
+                body: transition.decision.body,
+              };
               await tx.insert(issueExecutionDecisions).values({
                 id: decisionId,
                 companyId: lockedIssue.companyId,
@@ -12003,6 +12025,7 @@ export function issueRoutes(
           chatRetry,
           reviewEscalation: recoveryEscalationPayload,
           restoredLandsArmedStage,
+          recordedRecoveryDecision,
         };
       });
       if (result.replayed) {
@@ -12036,9 +12059,24 @@ export function issueRoutes(
               issueId: result.issue.id,
               stageId: result.reviewEscalation.escalation.stageId,
             },
-            "failed to mint review escalation interaction (recovery resolve)",
-          );
-        }
+          "failed to mint review escalation interaction (recovery resolve)",
+           );
+         }
+       }
+
+      // SUP-17163: a recovery resolution can record an approved execution-policy
+      // decision (an agent participant restoring an in_review card to `done` on its
+      // final review stage). Run the same post-approval merge-arming hook the other
+      // doors run, post-commit, so that approved head is stamped + armed. The hook
+      // is a no-op unless the recorded decision is an approval, so the common
+      // changes_requested / non-decision resolutions are untouched. Non-fatal: a
+      // hook failure never rejects the resolution.
+      if (result.recordedRecoveryDecision) {
+        await runApprovalMergeArming({
+          issue: result.issue,
+          decision: result.recordedRecoveryDecision,
+          closingTransition: sourceIssueStatus === "done",
+        });
       }
 
       await routinesSvc.syncRunStatusForIssue(result.issue.id);
@@ -19609,6 +19647,25 @@ export function issueRoutes(
         });
         if (escalationResolution) {
           resolvedContinuationIssue = escalationResolution;
+          // SUP-17163: accepting a review round-cap escalation records an
+          // approved review decision (the 4th door, alongside the PATCH status,
+          // stage-decision POST, and comment auto-approval doors). Run the shared
+          // post-approval merge-arming hook here, post-commit, so the approved
+          // head is stamped + armed exactly like the other doors. It is non-fatal:
+          // a hook failure never rejects the escalation (ADR-073 D3).
+          // closingTransition is false: the escalation acceptance hands the card
+          // back to its return assignee (status `in_progress`), it does not close
+          // the card — matching the stage-decision door's hand-back semantic.
+          await runApprovalMergeArming({
+            issue: escalationResolution.issue,
+            decision: {
+              stageId: escalationResolution.stageId,
+              stageType: escalationResolution.stageType,
+              outcome: escalationResolution.outcome,
+              body: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
+            },
+            closingTransition: false,
+          });
         }
       }
       const toolAction =

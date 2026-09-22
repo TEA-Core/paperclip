@@ -13,7 +13,9 @@ import {
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
+  issueComments,
   issueExecutionDecisions,
+  issueThreadInteractions,
   issues,
   projectWorkspaces,
   projects,
@@ -76,7 +78,12 @@ vi.mock("./github-fetch.js", () => ({
 const guardRouteControl = vi.hoisted(() => ({
   active: false,
   stageIntegrity: "pass" as "pass" | "finding" | "throw",
-  publishMode: "fail" as "fail" | "throw",
+  publishMode: "fail" as "fail" | "throw" | "armed",
+  // SUP-17163: the escape-hatch door suites drive a full arm by stubbing the
+  // publish as `armed` and the actuator as a controlled ArmingOutcome. The
+  // publishMode "fail"/"throw" cases never reach the actuator, so the actuator
+  // stub is inert for the pre-existing guard-outcome tests.
+  armMode: "armed" as "armed" | "skipped" | "failed",
   headSha: "approved00000000000000000000000000000000001",
 }));
 
@@ -124,13 +131,34 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
       guardRouteControl.active
         ? guardRouteControl.publishMode === "throw"
           ? Promise.reject(new Error("injected first-publish exception"))
-          : Promise.resolve({
-              kind: "failed" as const,
-              message:
-                "status:failed:scope_missing: HTTP 403 Resource not accessible by integration",
-              headSha: guardRouteControl.headSha,
-            } as unknown as ReturnType<typeof actual.publishApprovalStatus>)
+          : guardRouteControl.publishMode === "armed"
+            ? Promise.resolve({
+                kind: "armed" as const,
+                message: "status:published: approved head stamped",
+                headSha: guardRouteControl.headSha,
+                certifiedPr: null,
+              } as unknown as ReturnType<typeof actual.publishApprovalStatus>)
+            : Promise.resolve({
+                kind: "failed" as const,
+                message:
+                  "status:failed:scope_missing: HTTP 403 Resource not accessible by integration",
+                headSha: guardRouteControl.headSha,
+              } as unknown as ReturnType<typeof actual.publishApprovalStatus>)
         : actual.publishApprovalStatus(...args),
+    // SUP-17163: the escape-hatch door suites stub the actuator so the wiring
+    // (route -> runApprovalMergeArming -> armMergeOnApproval -> [Merge-arming]
+    // comment + armOutcome) is provable without a live GitHub merge. The real
+    // actuator is exercised by this file's D2A suite.
+    armMergeOnApproval: (
+      ...args: Parameters<typeof actual.armMergeOnApproval>
+    ) =>
+      guardRouteControl.active
+        ? Promise.resolve({
+            kind: guardRouteControl.armMode,
+            message: `status:${guardRouteControl.armMode}: test actuator outcome`,
+            headSha: guardRouteControl.headSha,
+          } as unknown as Awaited<ReturnType<typeof actual.armMergeOnApproval>>)
+        : actual.armMergeOnApproval(...args),
   };
 });
 
@@ -3002,6 +3030,221 @@ describeGuardRoute(
       expect(failure).toBeDefined();
       expect(String(failure!.reason)).toMatch(/^status:failed:internal:/);
       expect(String(failure!.reason)).toContain("injected first-publish exception");
+    });
+
+    // ==========================================================================
+    // SUP-17163: the review round-cap escalation-accept door is the 4th
+    // decision-writer that records an approved review decision. Before this fix
+    // it alone never ran runApprovalMergeArming, so an accepted escalation on a
+    // fully-approved ladder stamped no head and armed no merge.
+    // ==========================================================================
+
+    /**
+     * Seed a card sitting at the review round cap with a PENDING review-escalation
+     * interaction — the exact shape the escalation-accept/reject doors resolve.
+     * The company has merge arming enabled so the hook's actuator branch runs.
+     */
+    async function seedEscalatedRoundCapCard() {
+      const companyId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const returnAssigneeAgentId = randomUUID();
+      const issueId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const interactionId = randomUUID();
+      const now = new Date();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Escalation Door Co",
+        issuePrefix: "SUP",
+        requireBoardApprovalForNewAgents: false,
+        mergeArmingEnabled: true,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: USER_ID,
+        status: "active",
+        membershipRole: "owner",
+        updatedAt: now,
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Escalation Door/paperclip",
+        status: "in_progress",
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary",
+        cwd: "/tmp/test",
+        isPrimary: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(agents).values({
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(agents).values({
+        id: returnAssigneeAgentId,
+        companyId,
+        name: "Return Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated",
+        strategyType: "git_worktree",
+        name: "card-workspace",
+        status: "active",
+        branchName: "SUP-17163-escalation",
+        repoUrl: "https://github.com/TEA-Core/paperclip",
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        identifier: "SUP-17163-1",
+        issueNumber: 1,
+        title: "Escalated round-cap card",
+        status: "in_review",
+        priority: "medium",
+        assigneeUserId: USER_ID,
+        createdByUserId: USER_ID,
+        projectId,
+        projectWorkspaceId,
+        executionWorkspaceId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          returnAssigneeAgentId,
+          stages: [
+            {
+              id: STAGE_A,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ type: "agent", agentId: reviewerAgentId }],
+            },
+          ],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: STAGE_A,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          // The reviewer agents exhausted their rounds; the escalated human is now
+          // the current participant (the shape the round-cap escalation mints).
+          currentParticipant: { type: "user", userId: USER_ID },
+          returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: null,
+          changesRequestedCount: 3,
+        },
+      });
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        createdByUserId: USER_ID,
+        idempotencyKey: `review-escalation:${issueId}:${STAGE_A}:3:0123456789abcdef`,
+        payload: {
+          version: 1,
+          prompt: "Approve this review, or request further changes (round cap reached).",
+          acceptLabel: "Approve & advance",
+        },
+      });
+
+      return { companyId, issueId, interactionId };
+    }
+
+    it("SUP-17163 AC#3: accepting a round-cap escalation runs the merge-arming hook (stamp + arm)", async () => {
+      guardRouteControl.stageIntegrity = "pass";
+      guardRouteControl.publishMode = "armed";
+      guardRouteControl.armMode = "armed";
+      const { companyId, issueId, interactionId } = await seedEscalatedRoundCapCard();
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+        .send({});
+
+      expect(res.status).toBe(200);
+
+      const executionState = await readApprovalStatus(issueId);
+      const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+      expect(approvalStatus).toBeDefined();
+      // The hook stamped the approved head...
+      expect(approvalStatus!.publishedHeadSha).toBe(guardRouteControl.headSha);
+      // ...and recorded the actuator's arm outcome on the card.
+      const armOutcome = approvalStatus!.armOutcome as Record<string, unknown> | undefined;
+      expect(armOutcome).toBeDefined();
+      expect(armOutcome!.kind).toBe("armed");
+
+      // A [Merge-arming] comment exists (the hook's durable on-card trace).
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments.some((c) => c.body.startsWith("[Merge-arming]"))).toBe(true);
+    });
+
+    it("SUP-17163 AC#4: rejecting a round-cap escalation does NOT stamp or arm", async () => {
+      // A publish posture that WOULD arm if the hook ran — proves the refusal
+      // direction never invokes the hook, rather than merely a publishing no-op.
+      guardRouteControl.stageIntegrity = "pass";
+      guardRouteControl.publishMode = "armed";
+      guardRouteControl.armMode = "armed";
+      const { companyId, issueId, interactionId } = await seedEscalatedRoundCapCard();
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/reject`)
+        .send({ reason: "Needs more edge-case tests before approval." });
+
+      expect(res.status).toBe(200);
+
+      const executionState = await readApprovalStatus(issueId);
+      const approvalStatus = executionState.approvalStatus as Record<string, unknown> | undefined;
+      // No stamp, no arm: the hook is not invoked on the changes_requested door.
+      expect(approvalStatus?.publishedHeadSha).toBeUndefined();
+      expect(approvalStatus?.armOutcome).toBeUndefined();
+
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments.some((c) => c.body.startsWith("[Merge-arming]"))).toBe(false);
     });
   },
 );
