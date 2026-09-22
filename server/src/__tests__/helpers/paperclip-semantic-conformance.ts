@@ -253,9 +253,20 @@ class PaperclipRouteSemanticPort {
     if (issue === undefined) throw new Error("semantic_conformance_task_missing");
     const [run] = await this.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, this.binding.runId));
     if (run === undefined) throw new Error("semantic_conformance_run_missing");
-    const comments = await this.db.select().from(issueComments)
+    const allComments = await this.db.select().from(issueComments)
       .where(eq(issueComments.issueId, issue.id))
       .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+    // SUP-17125: a refused terminal write leaves a production-only refusal record
+    // ("[Terminal status refused] ...") in the issue thread so the NEXT run reads the
+    // guard code + remedy before re-deriving the same close. That record is part of
+    // this fork's production-only terminal divergence (like the done-tier declaration)
+    // and is NOT part of the vendor-neutral semantic contract the mock adapter models —
+    // the mock never posts it. Exclude it from the semantic comment observation so the
+    // intended finish_task vector stays consistent between mock and production while the
+    // record stays thread-readable in the real issue thread.
+    const comments = allComments.filter(
+      (comment) => !String(comment.body ?? "").startsWith("[Terminal status refused]"),
+    );
     const linkedDocuments = await this.db.select({ link: issueDocuments, document: documents })
       .from(issueDocuments)
       .innerJoin(documents, eq(issueDocuments.documentId, documents.id))

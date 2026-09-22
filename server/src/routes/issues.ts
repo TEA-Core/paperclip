@@ -3989,6 +3989,56 @@ export function issueRoutes(
     await issueSvc.addComment(issueId, body, {}, { authorType: "system" });
   }
 
+  // SUP-17125: a rejected terminal status write must leave a record the next run on
+  // the issue can read, so a close loop ends on the second attempt, not the 27th.
+  // The record is a system comment in the issue thread — the surface every run
+  // reads — carrying the HTTP status, the guard code, the reason, and the remedy.
+  // Deduped per guard code within the last 50 comments so a retry does not stack
+  // an identical record.
+  const TERMINAL_STATUS_REFUSAL_MARKER = "[Terminal status refused]";
+
+  async function postTerminalStatusRefusalComment(
+    issueSvc: ReturnType<typeof issueService>,
+    issueId: string,
+    input: {
+      httpStatus: 409 | 422;
+      code: string;
+      error: string;
+      remedy: string;
+      runId: string | null;
+    },
+  ): Promise<void> {
+    const marker = `${TERMINAL_STATUS_REFUSAL_MARKER} ${input.code}`;
+    // Best-effort dedupe read: a read failure must not block the refusal itself. If
+    // recent comments cannot be listed, post without dedupe — a stacked duplicate is
+    // harmless next to a missing record.
+    let recent: Awaited<ReturnType<typeof issueSvc.listComments>> = [];
+    try {
+      recent = await issueSvc.listComments(issueId, { order: "desc", limit: 50 });
+    } catch (err) {
+      logger.warn({ err, issueId }, "failed to list recent comments for terminal-status refusal dedupe; posting without dedupe");
+    }
+    if (recent.some((c) => c.authorType === "system" && c.body?.includes(marker))) {
+      return;
+    }
+    const lines = [
+      marker,
+      "",
+      `A terminal status write on this issue (status -> done) was refused with HTTP ${input.httpStatus} (\`${input.code}\`).`,
+      `Reason: ${input.error}`,
+      `Remedy: ${input.remedy}`,
+    ];
+    if (input.runId) lines.push(`Refusing run: ${input.runId}`);
+    // Fail-closed (SUP-15878 precedent, SUP-17125): the thread record is the surface the
+    // NEXT run reads, so persisting it is part of the refusal guarantee. A failure to
+    // write it must NOT be swallowed and the 409/422 returned with no thread-readable
+    // code or remedy — that is the silent-close loop this change prevents. The write
+    // therefore propagates to the route's error handler (5xx) rather than reporting a
+    // successful-looking refusal with a missing record. The refusal itself is still
+    // enforced either way.
+    await issueSvc.addComment(issueId, lines.join("\n"), {}, { authorType: "system" });
+  }
+
   // SUP-13904: shared post-transition merge-arming hook, run by BOTH doors that
   // record an approved review decision (the PATCH decision path and the comment
   // auto-approval path). Publishes paperclip/approved on the approved head,
@@ -4512,6 +4562,21 @@ export function issueRoutes(
       }
     }
     if (!guardResult.allowed) {
+      const remedy = guardResult.ladderUnsatisfied
+        ? "Record the unsatisfied review stage's approval (or skip it) before marking the issue done — the review ladder must be complete before a close, and a no-deliverable-head override does not clear a review-ladder refusal."
+        : decisionCarried
+          ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+          : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.";
+      // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
+      // a record-write failure propagates to the route's error handler (5xx) rather than
+      // returning a 409 with no thread-readable code/remedy (SUP-15878 precedent).
+      await postTerminalStatusRefusalComment(svc, issue.id, {
+        httpStatus: 409,
+        code: "done_transition_missing_delivery",
+        error: guardResult.reason,
+        remedy,
+        runId,
+      });
       return {
         ok: false,
         status: 409,
@@ -4527,11 +4592,7 @@ export function issueRoutes(
             owner: guardResult.owner,
             repo: guardResult.repo,
             decisionCarried,
-            remedy: guardResult.ladderUnsatisfied
-              ? "Record the unsatisfied review stage's approval (or skip it) before marking the issue done — the review ladder must be complete before a close, and a no-deliverable-head override does not clear a review-ladder refusal."
-              : decisionCarried
-                ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
-                : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.",
+            remedy,
           },
         },
       };
@@ -4570,6 +4631,22 @@ export function issueRoutes(
       // closing actor writes in the comment they are already writing, and D6 makes
       // a Tier-1 substitution always writable, so a missing declaration is a 422,
       // never a deadlock.
+      const remedy =
+        "Include a done-tier declaration in the close comment: " +
+        `"Closed at Tier 2 (live): <probe evidence>"` +
+        ` or ` +
+        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        ` — per SUP-12693.`;
+      // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
+      // a record-write failure propagates to the route's error handler (5xx) rather than
+      // returning a 422 with no thread-readable code/remedy (SUP-15878 precedent).
+      await postTerminalStatusRefusalComment(svc, issue.id, {
+        httpStatus: 422,
+        code: "done_transition_missing_tier_declaration",
+        error: tierResult.reason,
+        remedy,
+        runId,
+      });
       return {
         ok: false,
         status: 422,
@@ -4579,12 +4656,7 @@ export function issueRoutes(
           details: {
             issueId: issue.id,
             identifier: issue.identifier ?? null,
-            remedy:
-              "Include a done-tier declaration in the close comment: " +
-              `"Closed at Tier 2 (live): <probe evidence>"` +
-              ` or ` +
-              `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
-              ` — per SUP-12693.`,
+            remedy,
           },
         },
       };
@@ -17389,6 +17461,18 @@ export function issueRoutes(
               source: "done",
             },
           });
+        });
+        // SUP-17125: the activity row above is the durable evidence; the thread record is
+        // what the NEXT run on this issue reads, so it does not re-derive the same close
+        // into the same silent refusal. Fail-closed like the row: a record-write failure
+        // propagates to a 5xx rather than returning the 409 with a missing thread record
+        // (SUP-15878 precedent).
+        await postTerminalStatusRefusalComment(svc, existing.id, {
+          httpStatus: 409,
+          code: MISSING_APPROVAL_STAGE_ERROR_CODE,
+          error: err.message,
+          remedy: missingApprovalStageGap.remediation,
+          runId: actor.runId ?? null,
         });
       }
       throw err;

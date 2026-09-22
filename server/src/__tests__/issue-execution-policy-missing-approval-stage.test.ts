@@ -21,6 +21,7 @@ const mockIssueService = vi.hoisted(() => ({
   create: vi.fn(),
   createChild: vi.fn(),
   addComment: vi.fn(),
+  listComments: vi.fn(async () => []),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
@@ -581,6 +582,50 @@ describe("issue execution policy missing approval stage", () => {
     });
   });
 
+  // SUP-17125 (the SUP-16420 incident, measured cause): a bare `done` PATCH on a
+  // card with >=2 laddered children and no approval stage is refused 409 with
+  // `done_transition_missing_approval_stage`. The refusal names its own remedy,
+  // yet it reached the agent's report 0 of 27 times — nothing in the thread
+  // recorded it. A refused terminal status write must now leave a readable
+  // system record (guard code + remediation) so the NEXT run sees WHY the close
+  // was refused before re-deriving it. This pins the ACTUAL-cause path, which
+  // the tier/delivery refusal tests do not cover. Fails without the route's
+  // postTerminalStatusRefusalComment call on this path.
+  it("leaves a readable thread refusal record on the missing-approval-stage 409 (SUP-17125)", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockIssueService.listComments.mockResolvedValue([]);
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_approval_stage");
+    expect(res.body.details.ladderedChildCount).toBe(2);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    const refusalCall = mockIssueService.addComment.mock.calls.find(
+      (call) => typeof call[1] === "string" && call[1].includes("[Terminal status refused]"),
+    );
+    expect(refusalCall, JSON.stringify(mockIssueService.addComment.mock.calls)).toBeDefined();
+    const body = refusalCall![1] as string;
+    expect(body).toContain("[Terminal status refused] done_transition_missing_approval_stage");
+    expect(body).toContain("HTTP 409");
+    expect(body).toContain("Remedy:");
+    expect(body).toContain(`Refusing run: ${RUN_ID}`);
+    expect(refusalCall![3]).toMatchObject({ authorType: "system" });
+  });
+
   // Distinguishing regression (SUP-15878 R2 / SUP-16024): the durable refusal
   // row is REQUIRED evidence, not best-effort. If its write cannot persist, the
   // route must fail closed — it may not return the typed 409 (which claims the
@@ -613,6 +658,42 @@ describe("issue execution policy missing approval stage", () => {
     expect(res.status).toBeGreaterThanOrEqual(500);
     expect(res.body.code).not.toBe("done_transition_missing_approval_stage");
     expect(res.body.error).not.toContain("no approval stage");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // SUP-17125 (HIGH finding, round-1 self-repair): the thread refusal record is what
+  // the NEXT run reads, so persisting it is part of the refusal guarantee, not
+  // best-effort. If the record write cannot persist, the route must fail closed — it
+  // may not return the typed 409 (which claims the refusal was recorded) when no
+  // thread-readable code or remedy actually landed. Forcing the record write to
+  // reject proves the persistence error surfaces as a 5xx rather than being swallowed
+  // and the 409 returned. This pins the write-failure behavior of the shared
+  // postTerminalStatusRefusalComment helper (delivery 409 / tier 422 /
+  // missing-approval-stage 409 all call it); the audit-row fail-closed test above
+  // covers the durable row, this covers the thread record.
+  it("fails closed with an error (not the typed 409) when the thread refusal record cannot persist", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-a-id", "PAP-2"),
+      ladderedChildRow("child-b-id", "PAP-3"),
+    ];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockIssueService.listComments.mockResolvedValue([]);
+    mockIssueService.addComment.mockRejectedValueOnce(new Error("refusal record write failed"));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    // No successful-looking 409 may coexist with a missing thread record: the
+    // persistence error surfaces as a 5xx and the refusal is not claimed as recorded.
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.body.code).not.toBe("done_transition_missing_approval_stage");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 

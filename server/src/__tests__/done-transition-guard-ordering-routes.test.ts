@@ -1219,10 +1219,16 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(statusRows[0]?.status).toBe("todo");
 
       const comments = await db
-        .select({ body: issueComments.body })
+        .select({ body: issueComments.body, authorType: issueComments.authorType })
         .from(issueComments)
         .where(eq(issueComments.issueId, issueId));
-      expect(comments).toHaveLength(0);
+      // The agent's own close comment is not written; SUP-17125 leaves exactly
+      // one readable system refusal record in the thread.
+      expect(comments.filter((c) => c.authorType !== "system")).toHaveLength(0);
+      const records = comments.filter((c) => c.authorType === "system");
+      expect(records).toHaveLength(1);
+      expect(records[0]?.body).toContain("[Terminal status refused] done_transition_missing_tier_declaration");
+      expect(records[0]?.body).toContain("HTTP 422");
     });
 
     it("AC2: the verbatim Tier 1 substitution line closes the card", async () => {
