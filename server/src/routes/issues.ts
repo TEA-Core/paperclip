@@ -14723,6 +14723,97 @@ export function issueRoutes(
     },
   );
 
+  // SUP-17134: a card that acquires laddered children while its executionPolicy
+  // has no `approval` stage can never reach a recorded approval decision — every
+  // bare `done` PATCH is refused with `done_transition_missing_approval_stage`
+  // (SUP-15878 `diagnoseMissingApprovalStage`). Today that gap is only diagnosed
+  // at the close attempt, long after the card became unclosable. Flag it at the
+  // moment the children are filed: a durable `issue.missing_approval_stage_acquired`
+  // activity row plus a system comment on the parent carrying the done-guard's own
+  // `remediation` string, so the next run can re-arm the ladder before the close.
+  const MISSING_APPROVAL_STAGE_ACQUIRED_MARKER =
+    "[Missing approval stage acquired]";
+
+  async function flagMissingApprovalStageOnChildAcquisition(
+    parent: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      executionPolicy: unknown;
+    },
+    source: "child_create" | "accepted_plan_decomposition",
+  ): Promise<void> {
+    try {
+      // Reuse the canonical post-exclusion child scope from the done-guard. The
+      // close-guard count requires each child's ladder to have RUN; the proactive
+      // flag must fire while those children are still open, so it relaxes only that
+      // completion gate — origin/status/carve-out exclusions and the `>= 2`
+      // threshold are shared.
+      const laddered = await countLadderedChildren(
+        db,
+        parent.companyId,
+        parent.id,
+        { requireCompletedLadder: false },
+      );
+      const gap = diagnoseMissingApprovalStage({
+        policy: normalizeIssueExecutionPolicy(parent.executionPolicy),
+        ladderedChildCount: laddered.count,
+        ladderedChildIdentifiers: laddered.identifiers,
+        excludedChildIdentifiers: laddered.excludedChildIdentifiers,
+      });
+      if (!gap) return;
+      // Flag once per parent: a later child-create on the same unladdered parent
+      // must not re-post the marker comment or re-emit the activity.
+      const recentComments = await svc.listComments(parent.id, {
+        order: "desc",
+        limit: 50,
+      });
+      if (
+        recentComments.some(
+          (comment) =>
+            comment.authorType === "system" &&
+            (comment.body ?? "").includes(
+              MISSING_APPROVAL_STAGE_ACQUIRED_MARKER,
+            ),
+        )
+      ) {
+        return;
+      }
+      await logActivity(db, {
+        companyId: parent.companyId,
+        actorType: "system",
+        actorId: "missing-approval-stage-acquisition",
+        action: "issue.missing_approval_stage_acquired",
+        entityType: "issue",
+        entityId: parent.id,
+        issueId: parent.id,
+        details: {
+          identifier: parent.identifier ?? null,
+          ladderedChildCount: gap.ladderedChildCount,
+          ladderedChildIdentifiers: gap.ladderedChildIdentifiers,
+          excludedChildIdentifiers: gap.excludedChildIdentifiers,
+          stageTypes: gap.stageTypes,
+          remediation: gap.remediation,
+          source,
+        },
+      });
+      await svc.addComment(
+        parent.id,
+        `${MISSING_APPROVAL_STAGE_ACQUIRED_MARKER}\n\n${gap.remediation}`,
+        {},
+        { authorType: "system" },
+      );
+    } catch (err) {
+      // Proactive audit signal only: the child create has already committed, so a
+      // failure here must never fail the request — a 500 would invite a retry that
+      // duplicates the child. Log and move on.
+      logger.warn(
+        { err, companyId: parent.companyId, issueId: parent.id, source },
+        "missing-approval-stage acquisition flag failed",
+      );
+    }
+  }
+
   router.post(
     "/issues/:id/children",
     applyCreateIssueStatusDefault,
@@ -15018,6 +15109,7 @@ export function issueRoutes(
           issue.id,
         );
       }
+      await flagMissingApprovalStageOnChildAcquisition(parent, "child_create");
       res.status(201).json(issue);
     },
   );
@@ -15287,6 +15379,11 @@ export function issueRoutes(
         currentChildIssueId:
           existingSerializedChild?.id ?? result.newlyCreatedIssues[0]?.id,
       });
+
+      await flagMissingApprovalStageOnChildAcquisition(
+        sourceIssue,
+        "accepted_plan_decomposition",
+      );
 
       res.json({
         decomposition: result.decomposition,

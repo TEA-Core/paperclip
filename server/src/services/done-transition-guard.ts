@@ -1068,11 +1068,24 @@ export async function countLadderedChildren(
   db: Db,
   companyId: string,
   parentId: string,
+  options?: {
+    /**
+     * SUP-17134: the close-guard (mechanisms A/D and the missing-approval-stage
+     * route probe) counts a child only once its ladder has RUN — a completed or
+     * skipped stage. The proactive acquisition flag has to fire while those
+     * children are still open, so it passes `false` to count a child that merely
+     * CARRIES a ladder. Only the completion gate is relaxed: the origin/status/
+     * carve-out exclusions and the `>= 2` threshold below are shared, so the two
+     * consumers can never drift. Defaults to `true` (the guard behaviour).
+     */
+    requireCompletedLadder?: boolean;
+  },
 ): Promise<{
   count: number;
   identifiers: string[];
   excludedChildIdentifiers: string[];
 }> {
+  const requireCompletedLadder = options?.requireCompletedLadder !== false;
   // Children link up via `issues.parent_id`. Dependency edges
   // (`issue_relations` rows of type `blocks`) are not decomposition edges
   // and are not consulted here (SUP-15233; supersedes the SUP-15031
@@ -1146,7 +1159,7 @@ export async function countLadderedChildren(
     const state = parseIssueExecutionState(row.executionState);
     const completed = state?.completedStageIds?.length ?? 0;
     const skipped = state?.skippedStageIds?.length ?? 0;
-    if (completed === 0 && skipped === 0) continue;
+    if (requireCompletedLadder && completed === 0 && skipped === 0) continue;
     // SUP-15464 / SUP-15533 / SUP-16586: a `work-type:redo`, `work-type:delivery`,
     // or `work-type:architecture-review` child is not "which child gated this
     // work?" — the first two re-deliver the same deliverable this parent already
