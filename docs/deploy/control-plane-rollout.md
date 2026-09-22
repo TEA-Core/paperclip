@@ -162,19 +162,82 @@ the NEW schema, and whether that is tolerable is per-migration and unverified.
 
 The operator action is an **SSH-to-wonton deploy**, not a cloud API call:
 
+On a migration-carrying tip, `auto-rollout.sh --plan` is expected to exit non-zero with `decision: blocked` — the driver refuses to ship an image that carries new migrations. Do not read this as a failure; it is the driver's way of signalling that manual intervention is required.
+
 ```bash
 ssh wonton
 cd ~/stack-admin/paperclip-docker
-
 # 1. confirm what the driver would do, changing nothing
 ./scripts/auto-rollout.sh --plan
 
-# 2. resolve and pull the approved image, then run the gated swap
+# 2. run the gated swap with a staged image
 ./scripts/deploy-image.sh tea-core/paperclip:fold-<short>
 ```
 
 Do **not** hand-run `docker tag` + `docker compose up -d`. A bare restart
-SIGKILLs every in-flight `opencode run`, and runs last 20–90 minutes.
+SIGKILLS every in-flight `opencode run`, and runs last 20–90 minutes.
+
+### 3.1 Image staging
+
+On this lane `deploy-image.sh` does not pull or stage the image — the operator
+must do it manually. Run the following to stage the correct image before running
+`deploy-image.sh`:
+
+```bash
+# SHORT and DIGEST come from `auto-rollout.sh --plan` output at lines L632–L633:
+#   L632: local tag (e.g. fold-<short>) — the fold‑short tag to assign
+#   L633: digest <sha256:…> — the image sha256 digest for pull-by-digest
+# export SHORT="<short from step 1 plan output>"
+# export DIGEST="<sha256:… from step 1 plan output>"
+
+# Extract from the `--plan` output:
+#   SHORT = the tag portion (e.g. "fold-<short>")
+#   DIGEST = the sha256 digest (e.g. "sha256:abc123...")
+export SHORT="<short from step 1 plan output>"
+export DIGEST="<sha256:… from step 1 plan output>"
+
+export DOCKER_CONFIG="$HOME/.paperclip/auto-rollout/docker-config"
+mkdir -p "$DOCKER_CONFIG"
+chmod 700 "$DOCKER_CONFIG"
+printf '%s' "$(cat "$HOME/.paperclip/ghcr-read.token")" | docker login ghcr.io -u kronik187 --password-stdin
+# Pull by digest so the image is available locally regardless of tag
+docker pull -q "ghcr.io/tea-core/paperclip@${DIGEST}"
+# Tag the image with the name deploy-image.sh expects
+docker tag "ghcr.io/tea-core/paperclip@${DIGEST}" tea-core/paperclip:fold-${SHORT}
+# Verify the `org.opencontainers.image.revision` label equals the fold tip
+# (the same check auto-rollout.sh:703 performs — must equal the fold tip, not a
+# migration-absence check; that is the separate PENDING-count check at L626–641)
+docker inspect --format='{{index .Config Labels "org.opencontainers.image.revision"}}' tea-core/paperclip:fold-${SHORT}
+# Clean up scoped docker config so a registry credential never lands in
+# ~/.docker/config.json and never outlives this script
+rm -rf "$DOCKER_CONFIG"; unset DOCKER_CONFIG
+```
+
+### 3.2 Pre-swap pg_dump
+
+`auto-rollout.sh:~795` takes a `pg_dump` before every swap and its own comment at
+line 731 says it is "the ONLY automated pg_dump anywhere on the migration path"
+— no backup cron has existed since the 2026-08-24 Backrest cutover (verified on
+wonton 2026-09-08, SUP-15271). That dump is also downstream of the line-636 exit,
+and `deploy-image.sh` does not dump (`grep -n pg_dump deploy-image.sh` → no hits).
+
+The operator must create this dump before swapping. Mirrors
+`auto-rollout.sh:~795`: `docker compose exec db pg_dump | gzip > "$DUMP"`:
+
+```bash
+export STATE="$HOME/.paperclip/auto-rollout"
+export DUMP_DIR="$STATE/predeploy-dumps"
+export SHORT="<short from step 1 plan output>"
+mkdir -p "$DUMP_DIR"
+export COMPOSE_DIR="${PAPERCLIP_COMPOSE_DIR:-$HOME/stack-admin/paperclip-docker}"
+export DUMP="$DUMP_DIR/paperclip-pre-${SHORT}-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+docker compose -f "$COMPOSE_DIR/docker-compose.yml" --project-directory "$COMPOSE_DIR" exec -T db sh -c \
+  'pg_dump -U paperclip -d paperclip --no-owner --no-privileges' | gzip > "$DUMP"
+# Verify the dump is not corrupt
+gzip -t "$DUMP"
+```
+
+This is the only restore point on the migration-carrying lane.
 
 Two further traps on this path, both load-bearing:
 
