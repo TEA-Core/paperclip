@@ -77,9 +77,30 @@ async function invokeHeartbeat(
   // with the participant's queued run. If the legacy invoke is skipped and
   // that run has already released the issue lock, recover it from the agent's
   // recent run receipts.
-  const deadline = Date.now() + 3_000;
+  //
+  // Budget: the stage-transition invokes this suite makes (every `agentPatch`
+  // for a reviewer/approver) answer 202 with a bare `{ status }` body and no
+  // run id, so they *always* land here rather than on the fast path above.
+  // Each iteration then costs at least three HTTP round trips (the issue, the
+  // agent's recent runs, then one fetch per candidate run) plus a 50ms sleep,
+  // and under CI load the server frequently queues a stale-run handoff before
+  // the issue binding appears. The original 3s budget was measured expiring on
+  // ~0.7% of CI e2e shard executions (6 of 815, 2026-09-15..22, across
+  // unrelated branches) -- one failing instance needed 3.8s where a passing one
+  // took 2.1s -- so the budget is sized well clear of that tail. At most three
+  // invokes run per test, so even three exhausted budgets stay inside the 60s
+  // per-test timeout and surface the diagnostic below instead of a timeout.
+  //
+  // This does not slow the suite's negative-authorization paths: those invoke
+  // a non-participant, so the assignee check below returns on the very first
+  // iteration (measured at 18ms) and never reaches the deadline.
+  const startedAt = Date.now();
+  const deadline = startedAt + 12_000;
+  const inspectedCandidates = new Set<string>();
+  let lastRunLock: IssueRunLockState | null = null;
   do {
     const issueRunLock = await getIssueRunLockState(board, issueId);
+    lastRunLock = issueRunLock;
     if (issueRunLock.assigneeAgentId !== agentId) {
       // Negative authorization cases intentionally invoke a non-participant.
       // Preserve the server rejection instead of waiting for a run that must
@@ -101,6 +122,7 @@ async function invokeHeartbeat(
       }
     }
     for (const candidate of candidates) {
+      inspectedCandidates.add(candidate);
       const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${candidate}`);
       if (!runRes.ok()) continue;
       const candidateRun = await runRes.json();
@@ -115,7 +137,15 @@ async function invokeHeartbeat(
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
 
-  throw new Error(`No issue-bound heartbeat run became available for agent ${agentId}`);
+  throw new Error(
+    `No issue-bound heartbeat run became available for agent ${agentId} ` +
+      `on issue ${issueId} after ${Date.now() - startedAt}ms. ` +
+      `Issue lock: assignee=${lastRunLock?.assigneeAgentId ?? "none"}, ` +
+      `checkoutRunId=${lastRunLock?.checkoutRunId ?? "none"}, ` +
+      `executionRunId=${lastRunLock?.executionRunId ?? "none"}. ` +
+      `Inspected ${inspectedCandidates.size} candidate run(s): ` +
+      `${inspectedCandidates.size > 0 ? [...inspectedCandidates].join(", ") : "none"}.`,
+  );
 }
 
 async function getIssueRunLockState(board: APIRequestContext, issueId: string): Promise<IssueRunLockState> {
