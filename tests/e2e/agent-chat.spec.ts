@@ -144,24 +144,6 @@ async function send(page: Page, value: unknown) {
     );
   await page.getByTestId("task-chat-composer-send").last().click();
 }
-// Fork divergence (merge_group flake hardening, slice 2d): `send` returns as soon as it
-// has clicked, so upstream's three back-to-back post-Stop sends can land inside the
-// `/new` reset's read window. When they do, the fixture re-resolves to the hold comment
-// and the conversation never reaches generation 2 -- measured at ~12.5% of e2e shard
-// (3/3) runs. Awaiting each comment before the next send removes the interleave without
-// changing what the test asserts.
-async function sendAndAwaitComment(
-  page: Page,
-  request: APIRequestContext,
-  issueId: string,
-  value: unknown,
-) {
-  const count = async () =>
-    (await json(await request.get(`/api/issues/${issueId}/comments`))).length;
-  const before = await count();
-  await send(page, value);
-  await expect.poll(count, { timeout: 30_000 }).toBeGreaterThan(before);
-}
 async function idle(
   request: APIRequestContext,
   chatPath: string,
@@ -358,9 +340,9 @@ test("Stop then queued /new resets unpause the conversation without losing histo
     expect(
       await json(await request.get(`/api/companies/${f.company.id}/projects`)),
     ).toHaveLength(0);
-    await sendAndAwaitComment(page, request, issue.id, "/new");
-    await sendAndAwaitComment(page, request, issue.id, "/new");
-    await sendAndAwaitComment(page, request, issue.id, "Fresh followup");
+    await send(page, "/new");
+    await send(page, "/new");
+    await send(page, "Fresh followup");
     await idle(request, f.chatPath, 2);
     const fresh = await json(await request.get(f.chatPath));
     expect(fresh.id).toBe(issue.id);
