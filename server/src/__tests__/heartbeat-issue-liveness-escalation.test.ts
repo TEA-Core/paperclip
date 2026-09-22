@@ -29,6 +29,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  DEPENDENCY_WAKE_WITHHELD_ACTION,
+  SHARED_CARRIER_REFUSAL_MARKER,
+} from "../services/blocker-closure.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -260,6 +264,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   async function seedResolvedDependencyBackstopFixture(opts: {
     workspaceState?: "none" | "not_finalized" | "finalized";
     assignee?: "agent" | null;
+    blockerExecutionState?: Record<string, unknown>;
   } = {}) {
     const workspaceState = opts.workspaceState ?? "none";
     const companyId = randomUUID();
@@ -343,6 +348,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         status: "done",
         priority: "medium",
         executionWorkspaceId: workspaceState === "none" ? null : executionWorkspaceId,
+        executionState: opts.blockerExecutionState,
         issueNumber: 2,
         identifier: `${issuePrefix}-2`,
       },
@@ -586,6 +592,151 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       entityId: blockedIssueId,
       details: expect.objectContaining({ source: "issue_graph_liveness.backstop" }),
     });
+  });
+
+  const sharedCarrierReason = `shared-workspace head ${SHARED_CARRIER_REFUSAL_MARKER} (ADR-091 D1 carrier)`;
+
+  it("withholds the resolved dependency wake when the done blocker's landing is attributed away (publish_skipped)", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "none",
+        blockerExecutionState: {
+          approvalStatus: { publishSkipped: { reason: sharedCarrierReason } },
+        },
+      });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.dependencyWakeWithheld).toBe(1);
+    expect(result.healed).toBe(0);
+
+    const wake = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake).toBeNull();
+
+    const events = await db
+      .select({
+        action: activityLog.action,
+        entityId: activityLog.entityId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
+        ),
+      );
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      entityId: blockedIssueId,
+      details: expect.objectContaining({
+        dependentIssueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        producer: "issue_graph_liveness_backstop",
+        attributionSource: "publish_skipped",
+        refusalReason: sharedCarrierReason,
+        wakeReason: "issue_blockers_resolved",
+      }),
+    });
+  });
+
+  it("still enqueues the resolved dependency wake for an exact-head blocker landing", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "none",
+        blockerExecutionState: {
+          approvalStatus: { publishedHeadSha: "exacthead", publishArmed: true },
+        },
+      });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.dependencyWakeWithheld).toBe(0);
+    expect(result.healed).toBe(1);
+
+    const wake = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake?.reason).toBe("issue_blockers_resolved");
+    expect(wake?.idempotencyKey).toBe(
+      buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+    );
+
+    const withheld = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
+        ),
+      );
+    expect(withheld).toHaveLength(0);
+  });
+
+  it("re-emits the resolved dependency wake once the attribution clears (level-triggered two-pass)", async () => {
+    const { agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "none",
+        blockerExecutionState: {
+          approvalStatus: { publishSkipped: { reason: sharedCarrierReason } },
+        },
+      });
+    const heartbeat = heartbeatService(db);
+
+    const pass1 = await heartbeat.reconcileResolvedDependencyWakes();
+    expect(pass1.dependencyWakeWithheld).toBe(1);
+    expect(pass1.healed).toBe(0);
+
+    const wakeCountAfterPass1 = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.length);
+    expect(wakeCountAfterPass1).toBe(0);
+
+    // The shared-carrier refusal clears: the card landed on its exact head, so the
+    // level-triggered predicate must now read "not attributed" and re-emit.
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          approvalStatus: { publishedHeadSha: "exacthead", publishArmed: true },
+        },
+      })
+      .where(eq(issues.id, blockerIssueId));
+
+    const pass2 = await heartbeat.reconcileResolvedDependencyWakes();
+    expect(pass2.dependencyWakeWithheld).toBe(0);
+    expect(pass2.healed).toBe(1);
+
+    const wake = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake?.reason).toBe("issue_blockers_resolved");
+    expect(wake?.idempotencyKey).toBe(
+      buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+    );
   });
 
   // Fork divergence: upstream #12681 retired the escalation pass along with its scheduling, but the

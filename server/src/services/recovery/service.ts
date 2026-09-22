@@ -135,6 +135,10 @@ import {
   findExistingIssueBlockersResolvedWakeForAnyKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
+import {
+  readAttributedLandingDischarge,
+  buildDependencyWakeWithheldActivity,
+} from "../blocker-closure.js";
 import { evaluateAgentInvokabilityFromDb, type AgentInvokability } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled, parseHeartbeatPolicy } from "../heartbeat-policy.js";
 // SUP-15552: shared with the heartbeat skip write path. Imported from the
@@ -6927,6 +6931,7 @@ export function recoveryService(
       reArmCapSkipped: 0,
       reArmCapEscalated: 0,
       reArmCapEscalatedIssueIds: [] as string[],
+      dependencyWakeWithheld: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
       zeroBlockerObserved: 0,
@@ -7094,6 +7099,42 @@ export function recoveryService(
         if (zeroBlockerHeal && (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id))) {
           result.zeroBlockerActiveRecoverySkipped += 1;
           continue;
+        }
+
+        // SUP-17098 (recovery-backstop attributed-landing guard): the periodic
+        // backstop is an `issue_blockers_resolved` producer, so it must apply the
+        // same withhold as the route/native producers. If this resolved blocker's
+        // landing was attributed away to a shared carrier, a done that discharged
+        // no delivery must not phantom-wake this dependent: withhold the wake and
+        // persist the durable audit row instead of re-arming, capping, or
+        // enqueuing. The zero-blocker heal has no resolved blocker, so the guard
+        // does not apply there. Level-triggered: clause 2 of the predicate reads
+        // live executionState, so a later cleared publishSkipped / re-park re-emits
+        // the wake normally on the next pass.
+        if (!zeroBlockerHeal && resolvedBlockerIssueId) {
+          const discharge = await readAttributedLandingDischarge(
+            db,
+            companyId,
+            resolvedBlockerIssueId,
+          );
+          if (discharge.attributed) {
+            result.dependencyWakeWithheld += 1;
+            await logActivity(
+              db,
+              buildDependencyWakeWithheldActivity({
+                companyId,
+                agentId,
+                runId: opts?.runId ?? null,
+                agentApiKeyId: null,
+                dependentIssueId: candidate.id,
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness?.blockerIssueIds ?? [],
+                producer: "issue_graph_liveness_backstop",
+                discharge,
+              }),
+            );
+            continue;
+          }
         }
 
         // Level-triggered dedup: key on the full blocker set (the current ready
