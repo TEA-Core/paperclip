@@ -471,6 +471,7 @@ type IssueResolutionContext = {
   reviewPolicy: IssueReviewPolicy | null;
   createdByAgentId: string | null;
   createdByUserId: string | null;
+  executionState: Record<string, unknown> | null;
 };
 
 async function assertRequestConfirmationResolutionAllowedUnderLock(
@@ -803,6 +804,14 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   if (!args.current.createdByAgentId) return false;
   if (!args.actor.userId) return false;
   if (isTerminalIssueStatus(args.issue.status)) return false;
+  // SUP-17075 / SUP-17079: a card carrying a live pending execution stage is
+  // driven by the stage machine, and this write path (issueService.update)
+  // never consults it. Reclaiming such a card would knock it off in_review and
+  // hand it to this interaction's author, permanently stranding a
+  // user-participant stage that isReviewLivenessEligible can no longer see.
+  // Decline both assignee branches so the resolution falls through to
+  // touchIssue and the card keeps its status and ladder assignment.
+  if (args.issue.executionState?.status === "pending") return false;
   if (args.issue.assigneeAgentId) {
     return (
       args.issue.status === "in_review" &&
@@ -2123,6 +2132,7 @@ export function issueThreadInteractionService(
           reviewPolicy: issues.reviewPolicy,
           createdByAgentId: issues.createdByAgentId,
           createdByUserId: issues.createdByUserId,
+          executionState: issues.executionState,
         })
         .from(issues)
         .where(eq(issues.id, args.issue.id))
@@ -2395,6 +2405,7 @@ export function issueThreadInteractionService(
           reviewPolicy: issues.reviewPolicy,
           createdByAgentId: issues.createdByAgentId,
           createdByUserId: issues.createdByUserId,
+          executionState: issues.executionState,
         })
         .from(issues)
         .where(eq(issues.id, args.issue.id))
