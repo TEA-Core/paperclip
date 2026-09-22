@@ -23,6 +23,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { writeSummarySlotSchema, type WriteSummarySlotResponse } from "@paperclipai/shared";
 import {
+  assertSummaryGenerationTokenMinted,
+  GENERATION_ISSUE_ID_PLACEHOLDER,
   resolveSummaryGenerationReturnAssignee,
   summarySlotService,
 } from "../services/summary-slots.ts";
@@ -45,6 +47,55 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping embedded Postgres summary-slot tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+describe("assertSummaryGenerationTokenMinted (SUP-17156 fail-closed mint guard)", () => {
+  const issueId = "3f0c1a2e-5b6d-4e7f-8a9b-0c1d2e3f4a5b";
+
+  function tokenDescription(generationIssueId: unknown): string {
+    return [
+      "Generate the project summary.",
+      "",
+      "```json",
+      JSON.stringify({ scopeKind: "project", scopeId: "scope", slotKey: "header", generationIssueId }, null, 2),
+      "```",
+    ].join("\n");
+  }
+
+  it("accepts a token block carrying the issue's own UUID", () => {
+    expect(() => assertSummaryGenerationTokenMinted(tokenDescription(issueId), issueId)).not.toThrow();
+  });
+
+  it("rejects a description that still contains the NEW-ISSUE-ID-PLACEHOLDER literal", () => {
+    expect(() =>
+      assertSummaryGenerationTokenMinted(
+        tokenDescription(GENERATION_ISSUE_ID_PLACEHOLDER),
+        issueId,
+      ),
+    ).toThrow("still contains the NEW-ISSUE-ID-PLACEHOLDER literal");
+  });
+
+  it("rejects a non-UUID generationIssueId at mint time instead of creating an assignable issue", () => {
+    expect(() => assertSummaryGenerationTokenMinted(tokenDescription("not-a-uuid"), issueId)).toThrow(
+      "must carry the real generation issue UUID",
+    );
+  });
+
+  it("rejects a UUID that does not match the issued issue id", () => {
+    const otherId = "9e8d7c6b-5a4f-4321-89ab-cdef01234567";
+    expect(() => assertSummaryGenerationTokenMinted(tokenDescription(otherId), issueId)).toThrow(
+      "must carry the real generation issue UUID",
+    );
+  });
+
+  it("rejects a null or missing generationIssueId in the token", () => {
+    expect(() => assertSummaryGenerationTokenMinted(tokenDescription(null), issueId)).toThrow(
+      "must carry the real generation issue UUID",
+    );
+    expect(() =>
+      assertSummaryGenerationTokenMinted("no token block at all", issueId),
+    ).toThrow("must carry the real generation issue UUID");
+  });
+});
 
 describeEmbeddedPostgres("summary slot service", () => {
   let db!: ReturnType<typeof createDb>;
@@ -342,6 +393,31 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(issueRow.description).not.toContain("Other project issue");
     });
 
+    it("mints the token block with the issue's own UUID and no template placeholder (SUP-17156)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      const result = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+
+      const issueRow = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, result.generatingIssue.id))
+        .then((rows) => rows[0]!);
+      expect(issueRow.description).not.toContain(GENERATION_ISSUE_ID_PLACEHOLDER);
+      const tokenMatch = issueRow.description?.match(/```json\n([\s\S]*?)\n```/);
+      expect(tokenMatch).not.toBeNull();
+      const token = JSON.parse(tokenMatch![1]) as Record<string, unknown>;
+      expect(token.scopeKind).toBe("project");
+      expect(token.scopeId).toBe(projectId);
+      expect(token.slotKey).toBe("header");
+      expect(token.generationIssueId).toBe(issueRow.id);
+      expect(result.slot.generatingIssueId).toBe(issueRow.id);
+      expect(result.generatingIssue.id).toBe(issueRow.id);
+    });
+
     it("does not label the token block as the PUT request body and documents the actual body shape", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
@@ -471,6 +547,15 @@ describeEmbeddedPostgres("summary slot service", () => {
 
       const issueRows = await db.select().from(issues).where(eq(issues.companyId, companyId));
       expect(issueRows).toHaveLength(1);
+
+      // The surviving issue's token block must carry its own UUID after the
+      // dedup-path backfill (SUP-17156).
+      const surviving = issueRows[0]!;
+      expect(surviving.description).not.toContain(GENERATION_ISSUE_ID_PLACEHOLDER);
+      const tokenMatch = surviving.description?.match(/```json\n([\s\S]*?)\n```/);
+      expect(tokenMatch).not.toBeNull();
+      const token = JSON.parse(tokenMatch![1]) as Record<string, unknown>;
+      expect(token.generationIssueId).toBe(surviving.id);
     });
 
     it("creates a fresh task once the previous generation task is terminal", async () => {
