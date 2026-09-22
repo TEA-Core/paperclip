@@ -15,6 +15,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issueExecutionDecisions,
   issueInboxArchives,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -46,7 +47,14 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("stalled review decision routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-  const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+  // Typed to the real `heartbeat.wakeup` arity so `mock.calls[N][0]/[1]` below
+  // resolve to a 2-element tuple instead of the empty tuple a zero-arg
+  // `vi.fn(async () => …)` infers (which is what the TS2493 tuple-index errors
+  // on).
+  type WakeupOptions = Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1];
+  const enqueueWakeup = vi.fn(async (_agentId: string, _options: WakeupOptions) => ({
+    id: randomUUID(),
+  }));
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stalled-review-decision-");
@@ -212,6 +220,57 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       },
     });
     return issueId;
+  }
+
+  // A live pending review stage whose currentParticipant is a CONFIGURED user
+  // participant (the round-cap escalation is not in play: changesRequestedCount
+  // is unset). Unlike seedEscalatedHold this carries a real executionPolicy, so
+  // the board's decision must be recorded through the execution-policy transition
+  // as a decision row, not the old ladder-bypassing status update (SUP-16872 /
+  // SUP-17080). The user is also the assignee, so the card classifies as
+  // `stalled` (the user's own paths are stripped), which is what the route needs.
+  async function seedPolicyStage(input: {
+    companyId: string;
+    identifier: string;
+    participantUserId: string;
+    returnAssigneeAgentId: string;
+  }) {
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      identifier: input.identifier,
+      title: input.identifier,
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: input.participantUserId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "user", userId: input.participantUserId }],
+          },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: input.participantUserId },
+        returnAssignee: { type: "agent", agentId: input.returnAssigneeAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    return { issueId, stageId };
   }
 
   function app(actor: Record<string, unknown>) {
@@ -617,6 +676,209 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       assigneeAgentId: seeded.peerAgentId,
       assigneeUserId: null,
     });
+  });
+
+  it("records a decision row when the board approves a live pending stage", async () => {
+    const seeded = await seedCompany("STG");
+    const { issueId, stageId } = await seedPolicyStage({
+      companyId: seeded.companyId,
+      identifier: "STG-1",
+      participantUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+
+    const res = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Looks good, ship it." })
+      .expect(200);
+
+    // The note becomes the stage decision, not a free-form comment.
+    expect(res.body).toMatchObject({ action: "approve", comment: null, wakeQueued: false });
+    // A final-stage approval completes every stage; the engine routes the card
+    // back to its return assignee in_progress rather than forcing `done`.
+    expect(res.body.issue).toMatchObject({
+      id: issueId,
+      status: "in_progress",
+      assigneeAgentId: seeded.peerAgentId,
+      assigneeUserId: null,
+    });
+
+    // Exactly one decision row, minted as the acting user on the decided stage.
+    const all = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({
+      issueId,
+      stageId,
+      stageType: "review",
+      actorUserId: seeded.memberUserId,
+      actorAgentId: null,
+      outcome: "approved",
+      body: "Looks good, ship it.",
+    });
+
+    // The stage is no longer pending: it is completed and the decision id is
+    // stamped onto the state.
+    const [persisted] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const state = persisted!.executionState as {
+      status: string;
+      completedStageIds: string[];
+      lastDecisionId: string | null;
+      currentParticipant: unknown;
+    };
+    expect(state.status).not.toBe("pending");
+    expect(state.completedStageIds).toContain(stageId);
+    expect(state.lastDecisionId).toBe(all[0].id);
+    expect(state.currentParticipant).toBeNull();
+  });
+
+  it("records a changes_requested row and routes per the transition on request_changes", async () => {
+    const seeded = await seedCompany("STC");
+    const { issueId, stageId } = await seedPolicyStage({
+      companyId: seeded.companyId,
+      identifier: "STC-1",
+      participantUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+
+    const res = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "request_changes", note: "Fix the failing test first." })
+      .expect(200);
+
+    // Routed per the engine (in_progress back to the return assignee), NOT the
+    // old hardcoded `todo` the raw status update used to write.
+    expect(res.body.issue).toMatchObject({
+      id: issueId,
+      status: "in_progress",
+      assigneeAgentId: seeded.peerAgentId,
+      assigneeUserId: null,
+    });
+    expect(res.body.wakeQueued).toBe(true);
+    expect(enqueueWakeup.mock.calls[0]?.[0]).toBe(seeded.peerAgentId);
+
+    const all = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({
+      issueId,
+      stageId,
+      stageType: "review",
+      actorUserId: seeded.memberUserId,
+      outcome: "changes_requested",
+      body: "Fix the failing test first.",
+    });
+  });
+
+  it("records a changes_requested row on send_back too", async () => {
+    const seeded = await seedCompany("STB");
+    const { issueId, stageId } = await seedPolicyStage({
+      companyId: seeded.companyId,
+      identifier: "STB-1",
+      participantUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+
+    const res = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "send_back", note: "Rework the API before review." })
+      .expect(200);
+
+    expect(res.body.issue).toMatchObject({
+      id: issueId,
+      status: "in_progress",
+      assigneeAgentId: seeded.peerAgentId,
+      assigneeUserId: null,
+    });
+
+    const all = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ issueId, stageId, outcome: "changes_requested" });
+  });
+
+  it("refuses to approve a live pending stage without a note and records nothing", async () => {
+    const seeded = await seedCompany("STN");
+    const { issueId } = await seedPolicyStage({
+      companyId: seeded.companyId,
+      identifier: "STN-1",
+      participantUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+
+    await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve" })
+      .expect(422);
+
+    const all = await db
+      .select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(all).toHaveLength(0);
+    const [persisted] = await db
+      .select({ status: issues.status, executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(persisted!.status).toBe("in_review");
+    expect((persisted!.executionState as { status: string }).status).toBe("pending");
+  });
+
+  it("refuses request_changes without a note at the schema boundary and records nothing", async () => {
+    const seeded = await seedCompany("STR");
+    const { issueId } = await seedPolicyStage({
+      companyId: seeded.companyId,
+      identifier: "STR-1",
+      participantUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+
+    await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "request_changes" })
+      .expect(400);
+
+    const all = await db
+      .select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(all).toHaveLength(0);
+    const [persisted] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(persisted!.status).toBe("in_review");
+  });
+
+  it("records no decision row for a no-policy pending hold (old path preserved)", async () => {
+    const seeded = await seedCompany("NOP");
+    const issueId = await seedEscalatedHold({
+      companyId: seeded.companyId,
+      identifier: "NOP-1",
+      holdUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+
+    const res = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve" })
+      .expect(200);
+    expect(res.body).toMatchObject({ issue: { id: issueId, status: "done" } });
+
+    const all = await db
+      .select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(all).toHaveLength(0);
   });
 
   it("rejects stale or covered reviews and serializes concurrent decisions", async () => {

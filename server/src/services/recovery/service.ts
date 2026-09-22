@@ -85,6 +85,10 @@ import {
 } from "../local-service-supervisor.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
+import {
+  buildDependencyWakeWithheldActivity,
+  readAttributedLandingDischarge,
+} from "../blocker-closure.js";
 // Fold 2c / SUP-9856 (fork audit contract since 77ad35d95): the fork's `logActivity` is
 // best-effort and swallows failures, which is only right after a commit. Audits written inside a
 // transaction use the propagating `logActivityInTransaction` so a failed audit rolls the mutation
@@ -6759,6 +6763,18 @@ export function recoveryService(
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
+          // SUP-17009: a one-shot monitor that fired moments ago has null'd
+          // `monitorNextCheckAt` and dispatched a continuation wake that is still
+          // `queued` (its run has not reached `startedAt` yet). `hasFutureMonitorCheck`
+          // and `hasActiveExecutionPath` both read that card as having no live path in
+          // this window, so the escalation below would park it `blocked` and cancel the
+          // run it just destroyed. A `queued` wake is a live execution path — stand down
+          // the whole repeated-productive branch (no escalation, no duplicate requeue),
+          // mirroring the queued-wake guard the `todo` lane applies.
+          if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
+            result.skipped += 1;
+            continue;
+          }
           // GGU-809: skip escalation if the assignee has shown visible progress
           // (comment or attachment) within the exemption window. Falling
           // through here lets the normal continuation-retry path enqueue the
@@ -6980,6 +6996,7 @@ export function recoveryService(
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       notReadySkipped: 0,
+      attributedWithheld: 0,
       candidateLimitSkipped: 0,
       reArmCapSkipped: 0,
       reArmCapEscalated: 0,
@@ -7200,6 +7217,70 @@ export function recoveryService(
           result.existingWakeSkipped += 1;
           continue;
         }
+
+        // SUP-17092/A: withhold the dependent wake when the RESOLVED BLOCKER's
+        // landing was attributed away to a shared carrier (ADR-091 D1). The
+        // backstop is an additional issue_blockers_resolved producer; a done
+        // that discharged no delivery on the shared branch must not fire a
+        // phantom cascade during periodic reconciliation, even while the live
+        // publishSkipped marker is still inside the grace window. This is the
+        // fifth producer wired to readAttributedLandingDischarge — the other
+        // four are the issue-update, issue-comment, and recovery-action-
+        // resolution routes plus the native status-decision committer.
+        // Level-triggered: clause 2 of the predicate reads live
+        // executionState, so a later cleared publishSkipped (or a re-parked
+        // non-terminal blocker) emits the wake on a subsequent pass. Deduped so
+        // the backstop writes at most one durable withhold row per
+        // (dependent, resolved blocker).
+        if (resolvedBlockerIssueId) {
+          const discharge = await readAttributedLandingDischarge(
+            db,
+            companyId,
+            resolvedBlockerIssueId,
+          );
+          if (discharge.attributed) {
+            const alreadyWithheldRows = await db
+              .select({ id: activityLog.id })
+              .from(activityLog)
+              .where(
+                and(
+                  eq(activityLog.companyId, companyId),
+                  eq(activityLog.action, "issue.dependency_wake_withheld"),
+                  eq(activityLog.entityType, "issue"),
+                  eq(activityLog.entityId, candidate.id),
+                  sql`${activityLog.details}->>'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
+                  sql`${activityLog.details}->>'producer' = 'issue_graph_liveness_backstop'`,
+                ),
+              )
+              .limit(1);
+            if (alreadyWithheldRows.length === 0) {
+              try {
+                await logActivity(
+                  db,
+                  buildDependencyWakeWithheldActivity({
+                    companyId,
+                    agentId,
+                    runId: opts?.runId ?? null,
+                    agentApiKeyId: null,
+                    dependentIssueId: candidate.id,
+                    resolvedBlockerIssueId,
+                    blockerIssueIds: readiness?.blockerIssueIds ?? [],
+                    producer: "issue_graph_liveness_backstop",
+                    discharge,
+                  }),
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, issueId: candidate.id, resolvedBlockerIssueId, source },
+                  "failed to audit withheld dependency wake from the resolved dependency wake backstop",
+                );
+              }
+            }
+            result.attributedWithheld += 1;
+            continue;
+          }
+        }
+
         const consumedWakes = idempotencyKeys.length > 0 ? await db
           .select({ count: count() })
           .from(agentWakeupRequests)

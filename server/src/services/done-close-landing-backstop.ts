@@ -14,6 +14,8 @@ import {
   fetchHeadViaTokenCandidates,
   fetchHeadApprovedStatusViaTokenCandidates,
   fetchLastMergeQueueEjectionViaTokenCandidates,
+  narrowToDelivered,
+  notDeliveredReasonForPr,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
@@ -895,6 +897,32 @@ export function createDoneCloseLandingBackstopService(
       const priorReenqueues = reenqueueCounts.get(prKey) ?? 0;
       const reenqueueExhausted = priorReenqueues >= MAX_REENQUEUE_ATTEMPTS;
 
+      // SUP-17133: delivery-repo guard. Merge-arming refuses to stamp a PR whose
+      // head repo is not this card's delivery repo (`notDeliveredReasonForPr`,
+      // ADR-091 D5), but the re-enqueue leg had no such check — it would call
+      // `enableAutoMerge` on the very PR arming had deliberately refused, and
+      // report the structural cross-repo case to the board as a token/API fault.
+      // Apply the IDENTICAL merge-arming predicate (single source of truth —
+      // `narrowToDelivered`), BEFORE any ejection/head/token/node-id/enableAutoMerge
+      // work, and spend no MAX_REENQUEUE_ATTEMPTS slot on a cross-repo head. A
+      // predicate that cannot be evaluated (`identity-unresolved`: the card has no
+      // resolvable delivery identity) preserves the pre-existing re-enqueue
+      // behaviour — it is never a silent widen to arming an unproven head.
+      let deliveryRefusal: { reason: string; headRepo: string; deliveryRepo: string } | null = null;
+      const delivery = await narrowToDelivered(db, issue.companyId, issue.id, [pr]);
+      if (delivery.outcome === "not-delivered") {
+        deliveryRefusal = {
+          reason: notDeliveredReasonForPr(
+            pr,
+            delivery.deliveryRepo,
+            delivery.deliveryBranch,
+            delivery.requiredIdentifier,
+          ),
+          headRepo: `${pr.owner}/${pr.repo}`,
+          deliveryRepo: `${delivery.deliveryRepo.owner}/${delivery.deliveryRepo.repo}`,
+        };
+      }
+
       // SUP-15315: head-authorization gate. Set when the live head is positively
       // UNSTAMPED (refused); the pair then falls through to the escalation path
       // below with the head-moved cause instead of being armed.
@@ -904,7 +932,7 @@ export function createDoneCloseLandingBackstopService(
       // to one row per PR+head), and no MAX_REENQUEUE_ATTEMPTS slot is consumed.
       let ejectionRefusal: { headSha: string; reason: string; ejectedAt: string | null } | null = null;
 
-      if (!reenqueueExhausted && mergeArmingEnabled) {
+      if (deliveryRefusal === null && !reenqueueExhausted && mergeArmingEnabled) {
         // SUP-15953 predicate FIRST: a conflict-ejected PR cannot be landed by
         // re-enqueueing the same head, so never spend a head-authorization read or
         // a queue add on it. An unreadable ejection read or reason fails closed.
@@ -969,19 +997,22 @@ export function createDoneCloseLandingBackstopService(
         continue;
       }
 
-      // Escalate: re-enqueue cap exhausted (still open), lane closed, the
-      // re-enqueue attempt failed this tick, or the live head was positively
-      // UNSTAMPED (head-authorization refusal).
+      // Escalate: the PR's head repo is not this card's delivery repo (SUP-17133,
+      // ADR-091 D5), the re-enqueue cap is exhausted (still open), the lane is
+      // closed, the re-enqueue attempt failed this tick, or the live head was
+      // positively UNSTAMPED (head-authorization refusal).
       if (!alreadyEscalated.has(prKey)) {
-        const reason = reenqueueExhausted
-          ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
-          : refusedHead
-            ? refusedHead.reason
-            : ejectionRefusal
-              ? ejectionRefusal.reason
-              : mergeArmingEnabled
-                ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
-                : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+        const reason = deliveryRefusal
+          ? deliveryRefusal.reason
+          : reenqueueExhausted
+            ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
+            : refusedHead
+              ? refusedHead.reason
+              : ejectionRefusal
+                ? ejectionRefusal.reason
+                : mergeArmingEnabled
+                  ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
+                  : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
         if (refusedHead) {
           // SUP-15315 (AC2): durable refusal row — the live head is not covered
           // by an authorized head, so no re-enqueue row is written for it.
@@ -1027,13 +1058,15 @@ export function createDoneCloseLandingBackstopService(
         });
         await deps.svc.addComment(
           issue.id,
-          reenqueueExhausted
-            ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window after ${MAX_REENQUEUE_ATTEMPTS} re-enqueue attempts — the merge queue is not landing it (${reason}). Board/operator must fix the PR (checks/conflicts/rebase) and merge it, or re-open the card.`
-            : refusedHead
-              ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${refusedHead.reason}. Re-review and re-approve the PR at its current head to re-stamp paperclip/approved (or land it through the review lane); the merge queue will not arm an unauthorized head.`
-              : ejectionRefusal
-                ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${ejectionRefusal.reason}. Rebase the branch onto the base branch to produce a new head; the sweep re-enqueues a conflict-ejected PR automatically once its head has moved.`
-                : `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
+          deliveryRefusal
+            ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${deliveryRefusal.reason}. The backstop will not arm a merge on a PR this card did not deliver.`
+            : reenqueueExhausted
+              ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window after ${MAX_REENQUEUE_ATTEMPTS} re-enqueue attempts — the merge queue is not landing it (${reason}). Board/operator must fix the PR (checks/conflicts/rebase) and merge it, or re-open the card.`
+              : refusedHead
+                ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${refusedHead.reason}. Re-review and re-approve the PR at its current head to re-stamp paperclip/approved (or land it through the review lane); the merge queue will not arm an unauthorized head.`
+                : ejectionRefusal
+                  ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${ejectionRefusal.reason}. Rebase the branch onto the base branch to produce a new head; the sweep re-enqueues a conflict-ejected PR automatically once its head has moved.`
+                  : `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
           {},
           { authorType: "system" },
         );
@@ -1041,13 +1074,15 @@ export function createDoneCloseLandingBackstopService(
           status: "blocked",
           unblockDescriptor: {
             owner: "board",
-            action: reenqueueExhausted
-              ? `Fix and merge PR ${prKey} (re-enqueued ${MAX_REENQUEUE_ATTEMPTS}x, still not landing — check CI checks, conflicts, or rebase onto the base branch) or re-open the card`
-              : refusedHead
-                ? `Re-approve PR ${prKey} at its current head ${refusedHead.headSha.slice(0, 7)} to re-stamp paperclip/approved (approval stamp is ${refusedHead.approvedHeadSha ? `stranded on ${refusedHead.approvedHeadSha.slice(0, 7)}` : "missing"}) — re-review, not rebase/CI, is the unblock; the merge queue will not arm an unauthorized head`
-                : ejectionRefusal
-                  ? `Rebase PR ${prKey} onto its base branch to produce a new head (last merge_conflict ejection left head ${ejectionRefusal.headSha.slice(0, 7)} unchanged) — the sweep re-enqueues it automatically once the head has moved`
-                  : `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
+            action: deliveryRefusal
+              ? `File the deliverable under a project bound to ${deliveryRefusal.headRepo} (ADR-091 D5); ${prKey} is not this card's delivery repo (${deliveryRefusal.deliveryRepo}), so the backstop will not re-enqueue it`
+              : reenqueueExhausted
+                ? `Fix and merge PR ${prKey} (re-enqueued ${MAX_REENQUEUE_ATTEMPTS}x, still not landing — check CI checks, conflicts, or rebase onto the base branch) or re-open the card`
+                : refusedHead
+                  ? `Re-approve PR ${prKey} at its current head ${refusedHead.headSha.slice(0, 7)} to re-stamp paperclip/approved (approval stamp is ${refusedHead.approvedHeadSha ? `stranded on ${refusedHead.approvedHeadSha.slice(0, 7)}` : "missing"}) — re-review, not rebase/CI, is the unblock; the merge queue will not arm an unauthorized head`
+                  : ejectionRefusal
+                    ? `Rebase PR ${prKey} onto its base branch to produce a new head (last merge_conflict ejection left head ${ejectionRefusal.headSha.slice(0, 7)} unchanged) — the sweep re-enqueues it automatically once the head has moved`
+                    : `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
           },
         });
         if (opts.wakeup && issue.assigneeAgentId) {

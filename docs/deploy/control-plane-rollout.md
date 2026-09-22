@@ -68,7 +68,7 @@ A cron entry on wonton runs the driver once a day, unattended:
 
 `auto-rollout.sh` never deploys blindly. Before it calls `deploy-image.sh` it
 requires all of the following, and emits a single `decision:` line recording the
-outcome (`deploy`, `hold`, or `blocked`):
+outcome (`deploy`, `skip`, `hold`, or `blocked` — the full set, see below):
 
 - the target commit is the tip of the deployed fold branch;
 - `fold-deploy-gate` **and** `docker` are both green on that exact SHA;
@@ -76,6 +76,29 @@ outcome (`deploy`, `hold`, or `blocked`):
   `org.opencontainers.image.revision` label equals that commit — a tag whose
   label names a different commit is `blocked`, not deployed;
 - the image carries **no new migrations** (see below).
+
+**The four `decision:` values.** Source of truth is `decide <value> "<reason>"`
+in `~/stack-admin/paperclip-docker/scripts/auto-rollout.sh` on wonton — readable
+without host access at
+[`TEA-Core/sectoid-stack-admin`](https://github.com/TEA-Core/sectoid-stack-admin/blob/main/paperclip-docker/scripts/auto-rollout.sh),
+last changed by `07d1d2ffa` (2026-09-10), which is the revision described here:
+
+| `decision:` | Exit | Meaning | Trigger |
+|---|---|---|---|
+| `deploy` | 0 | The swap ran. | All gates above passed. |
+| `skip` | 0 | Nothing to do — **no drain, no swap**. | The tip is *already the running revision*: `--force` was not passed, the running revision resolved non-empty, and it equals the target commit. Evaluated **before** the CI/registry/migration gates, so a `skip` says nothing about them. |
+| `hold` | 0 | "Not yet" — the artifact is not ready, so the window closes without a swap. | A required workflow has no *completed* run on the tip, or ghcr has no manifest for `sha-<short>` yet. Both are re-checked until `--retry-window` is spent; `hold` is what is recorded once it is. A *red* conclusion is never a `hold`. |
+| `blocked` | 1 | Refused — needs a human or a fixed input. | Stale quiesce state, a red gate on the tip, a `sha-<short>` tag whose revision label is missing or names another commit, or pending migrations. |
+
+`skip` is the one value whose **premise can be wrong**. The running revision is
+read from the container's `org.opencontainers.image.revision` label, falling
+back to the `last-deployed` state file; a stale state file that happens to equal
+the tip makes the window `skip` with "already running" while the plane is in
+fact behind — the SUP-15547 defect-4 failure that left production four commits
+dark. The file is now cleared at the start of a swap and rewritten only after a
+verified deploy, so an *absent* file reads as unknown and can only cause a
+redundant deploy, never suppress one. A pinned `--tip` naming the *running*
+commit also yields `skip` legitimately.
 
 Batching is deliberate. Every rollout costs a drain, and the fold branch has
 taken merges as often as one per ~80 minutes; a per-merge rollout would leave
@@ -89,6 +112,20 @@ gates is exactly the 2026-07-31 failure that destroyed 17 in-flight agent runs.
 from the gate `success` lines above it. A driver that dies before deciding
 prints a plausible-looking partial log. Alerts go to ntfy topic
 `paperclip-rollout`.
+
+When the line *is* present, read it against the served commit before trusting
+it. `deploy`, `skip` and `hold` all exit 0 and only `blocked` alerts, so a
+silent window is not evidence of a healthy plane. In particular, a `skip`
+alongside a `/api/health` commit that is **not** the branch tip is a
+contradiction, not a no-op: the driver believed the tip was already running.
+Resolve it from the running container's revision label
+(`docker inspect paperclip-server-1 --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'`,
+the container named by `$PAPERCLIP_SERVER_CONTAINER`) and the state file
+`~/.paperclip/auto-rollout/last-deployed-sha` it falls back to, plus the
+reason string on the
+`decision:` line — and check whether that window
+was a pinned `--tip` invocation naming the running commit, which skips by
+design.
 
 ### 2. Urgent lane (agent-initiated, approval-gated)
 
@@ -265,8 +302,10 @@ fi
 
 An empty list means the plane is current. A non-empty list is normal *within* a
 daily window; it is a fault only if it spans more than one window, which points
-at a `blocked`/`hold` decision (or a driver that never reached its `decision:`
-line) rather than at the merges themselves.
+at a `blocked`/`hold`/`skip` decision (or a driver that never reached its
+`decision:` line) rather than at the merges themselves. A `skip` in that
+position is the most misleading of the three — see the decision-value table
+above.
 
 ## Related
 
@@ -276,3 +315,4 @@ line) rather than at the merges themselves.
 - [`docs/deploy/docker.md`](docker.md) — the Docker Compose deployment this plane is an instance of.
 - [`docs/deploy/aws-ecs.md`](aws-ecs.md) — **product documentation** for users deploying Paperclip to AWS. Not this deployment. Nothing in this runbook depends on it.
 - `~/stack-admin/paperclip-docker/README.md` **on wonton** — the operational runbook for this host: image build, merge-queue gates, deploy, and recovery.
+- [`TEA-Core/sectoid-stack-admin`](https://github.com/TEA-Core/sectoid-stack-admin) — the host's `stack-admin` tree in git, including `paperclip-docker/scripts/auto-rollout.sh`. **Reading the driver does not require host access**; only running it, and reading the host's logs and state files, do. Treat the repo as the source for behaviour questions and wonton as the source for what actually happened.
