@@ -532,7 +532,94 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(res.body.code).toBe("done_transition_missing_tier_declaration");
       expect(await statusOf(issueId)).toBe("in_review");
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      expect(comments).toHaveLength(0);
+      // The reviewer's own approval comment stays unwritten (the pre-transaction
+      // contract, SUP-14367); SUP-17125 adds exactly one system refusal record.
+      expect(comments.filter((c) => c.authorType !== "system")).toHaveLength(0);
+      const records = comments.filter((c) => c.authorType === "system");
+      expect(records).toHaveLength(1);
+      expect(records[0]?.body).toContain("[Terminal status refused] done_transition_missing_tier_declaration");
+      expect(records[0]?.body).toContain("HTTP 422");
+    });
+
+    // SUP-17125 (the SUP-16420 incident): 27 runs each re-derived the same close
+    // and each died without a thread-readable refusal record, so no run could see
+    // why the close was refused. A rejected terminal status write must now leave
+    // exactly one system record in the thread, and a retry must not stack a second.
+    it("PATCH: a plain close refused 422 leaves a readable system refusal record (SUP-17125)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D17125A");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockMergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "All tests pass. Shipping it." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(await statusOf(issueId)).toBe("in_review");
+
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      // The agent's own close comment is not written (pre-transaction contract);
+      // the refusal record is the only thread content.
+      expect(comments.filter((c) => c.authorType !== "system")).toHaveLength(0);
+      const records = comments.filter((c) => c.authorType === "system");
+      expect(records).toHaveLength(1);
+      const body = records[0]!.body ?? "";
+      expect(body).toContain("[Terminal status refused] done_transition_missing_tier_declaration");
+      expect(body).toContain("HTTP 422");
+      expect(body).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+      expect(body).toContain(`Refusing run: ${runId}`);
+    });
+
+    it("PATCH: a plain close refused 409 leaves a readable system refusal record (SUP-17125)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D17125B");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockUnmergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Closed at Tier 2 (live): probed the endpoint after deploy and it holds.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("done_transition_missing_delivery");
+      expect(res.body.details.decisionCarried).toBe(false);
+      expect(await statusOf(issueId)).toBe("in_review");
+
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      const records = comments.filter((c) => c.authorType === "system");
+      expect(records).toHaveLength(1);
+      const body = records[0]!.body ?? "";
+      expect(body).toContain("[Terminal status refused] done_transition_missing_delivery");
+      expect(body).toContain("HTTP 409");
+      expect(body).toContain("deliver.sh");
+    });
+
+    it("PATCH: retrying a refused close does not stack a second refusal record (SUP-17125 dedupe)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D17125C");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranch();
+
+      const first = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "All tests pass. Shipping it." });
+      expect(first.status, JSON.stringify(first.body)).toBe(422);
+
+      const second = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "All tests pass. Shipping it." });
+      expect(second.status, JSON.stringify(second.body)).toBe(422);
+
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter((c) => c.authorType === "system")).toHaveLength(1);
+      expect(await statusOf(issueId)).toBe("in_review");
     });
 
     // SUP-14429 (mechanism B): an open linked PR held by an undismissed external
@@ -583,7 +670,13 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(res.body.details.decisionCarried).toBe(true);
       expect(await statusOf(issueId)).toBe("in_review");
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      expect(comments).toHaveLength(0);
+      // The reviewer's own approval comment stays unwritten; SUP-17125 adds
+      // exactly one system refusal record.
+      expect(comments.filter((c) => c.authorType !== "system")).toHaveLength(0);
+      const records = comments.filter((c) => c.authorType === "system");
+      expect(records).toHaveLength(1);
+      expect(records[0]?.body).toContain("[Terminal status refused] done_transition_missing_delivery");
+      expect(records[0]?.body).toContain("HTTP 409");
 
       // The retroactive-audit consume-contract: the stable refusal token on both
       // reason and skipReason, with the held PR display name.
@@ -618,7 +711,13 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(res.body.code).toBe("done_transition_missing_delivery");
       expect(await statusOf(issueId)).toBe("in_review");
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      expect(comments).toHaveLength(0);
+      // The reviewer's own approval comment stays unwritten; SUP-17125 adds
+      // exactly one system refusal record.
+      expect(comments.filter((c) => c.authorType !== "system")).toHaveLength(0);
+      const records = comments.filter((c) => c.authorType === "system");
+      expect(records).toHaveLength(1);
+      expect(records[0]?.body).toContain("[Terminal status refused] done_transition_missing_delivery");
+      expect(records[0]?.body).toContain("HTTP 409");
 
       const rows = await vi.waitFor(
         async () => {
