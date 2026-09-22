@@ -372,6 +372,16 @@ function armArchitectureReviewCarveOutFor(childId: string) {
   carveOutIssueLabelRowsState.rows = [{ issueId: childId }];
 }
 
+// SUP-17177: arm the `work-type:process` carve-out so the named child is excluded
+// from the laddered count by the real helper, identically to the redo/delivery/
+// architecture-review carve-outs.
+function armProcessCarveOutFor(childId: string) {
+  carveOutLabelRowsState.rows = [
+    { id: "label-work-type-process", name: "work-type:process" },
+  ];
+  carveOutIssueLabelRowsState.rows = [{ issueId: childId }];
+}
+
 function reviewOnlyPolicy() {
   return normalizeIssueExecutionPolicy({
     stages: [
@@ -915,6 +925,41 @@ describe("issue execution policy missing approval stage", () => {
       ladderedChildRow("child-genuine-id", "PAP-3"),
     ];
     armArchitectureReviewCarveOutFor("child-arch-id");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.code).not.toBe("done_transition_missing_approval_stage");
+    expect(gapActivityInputs()).toEqual([]);
+  });
+
+  // Distinguishing regression (SUP-17177): the SUP-16872 shape — a work card whose
+  // children are a pair of procedurally-filed process children (courier /
+  // review-routing / unblock), not slices of its deliverable. Both carry the
+  // `work-type:process` label, so the shared countLadderedChildren predicate
+  // excludes them and the laddered count is 0 (< 2): the card does not owe a
+  // close ladder and the `done` transition is NOT refused. This exercises the
+  // SUP-15878 route call site directly (not the shared helper in isolation),
+  // proving the route gap inherits the process carve-out. It fails against the
+  // pre-change code, where the `work-type:process` name is not in the carve-out
+  // set so both process children count (2) and the route refuses with
+  // `done_transition_missing_approval_stage`.
+  it("does not refuse done on a work card whose children are two process children (SUP-17177 route regression)", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-process-1", "PAP-2"),
+      ladderedChildRow("child-process-2", "PAP-3"),
+    ];
+    armProcessCarveOutFor("child-process-1");
+    carveOutIssueLabelRowsState.rows.push({ issueId: "child-process-2" });
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
