@@ -10,6 +10,7 @@ import {
   index,
   uniqueIndex,
   unique,
+  check,
   bigint,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
@@ -51,6 +52,7 @@ export const issues = pgTable(
     issueNumber: integer("issue_number"),
     identifier: text("identifier"),
     originKind: text("origin_kind").notNull().default("manual"),
+    parentLinkKind: text("parent_link_kind").notNull().default("decomposition"),
     originId: text("origin_id"),
     originRunId: text("origin_run_id"),
     originIdentityContextId: uuid("origin_identity_context_id"),
@@ -84,6 +86,7 @@ export const issues = pgTable(
   },
   (table) => ({
     companyIdUq: unique("issues_company_id_uq").on(table.companyId, table.id),
+    parentLinkKindCheck: check("issues_parent_link_kind_check", sql`${table.parentLinkKind} in ('decomposition', 'process')`),
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
     companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(
