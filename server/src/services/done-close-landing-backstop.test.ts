@@ -2919,6 +2919,58 @@ describe("SUP-16689: draft-stranded done cards", () => {
       );
       expect(mockUpdate).not.toHaveBeenCalled();
     });
+
+    it("is inert when the card has no resolvable delivery identity (identity-unresolved): re-enqueues, never a delivery-refusal", async () => {
+      // A card with NO delivery identity (no execution workspace / repoUrl) makes
+      // `narrowToDelivered` return `identity-unresolved`. The guard keys ONLY off
+      // `outcome === "not-delivered"`; a regression that treats any non-`narrowed`
+      // outcome as a refusal would escalate here instead of re-enqueueing. This
+      // pins that boundary: identity-unresolved preserves the pre-existing
+      // re-enqueue path (byte-identical legacy behaviour).
+      const { service } = makeService({
+        candidates: [candidateRow()],
+        existingLandingRows: [],
+        companyMergeArmingEnabled: true,
+        issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({
+        success: true,
+        alreadyQueued: false,
+        error: null,
+        status: 200,
+      });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 1,
+        escalated: 0,
+        draftStranded: 0,
+      });
+
+      // Re-enqueue proceeded through the pre-existing path (guard inert).
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      // No delivery-refusal / escalation was emitted and the card was not blocked.
+      expect(mockUpdate).not.toHaveBeenCalled();
+      for (const call of mockLogActivity.mock.calls) {
+        const action = (call[1] as { action?: string })?.action;
+        expect(action).not.toBe("issue.done_close_landing_escalated");
+      }
+    });
   });
 });
 
