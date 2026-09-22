@@ -14,6 +14,7 @@ const mockIssueService = vi.hoisted(() => ({
   create: vi.fn(),
   createChild: vi.fn(),
   addComment: vi.fn(),
+  listComments: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
@@ -41,6 +42,12 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
   hasPermission: vi.fn(async () => false),
 }));
+// SUP-17134: the rows the canonical `countLadderedChildren` child-count query
+// resolves. The projection (id/identifier/status/executionPolicy/executionState/
+// originKind) is matched by signature in `mockDbSelect` below, so seeding this
+// state arms the shared predicate for the acquisition-flag route tests without
+// disturbing the other reads on the route.
+const childRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   for: () => ({
     then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -69,7 +76,7 @@ const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({
   where: mockDbSelectWhere,
   innerJoin: () => ({ where: () => Promise.resolve([]) }),
 })));
-const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+const mockDbSelect = vi.hoisted(() => vi.fn());
 // Generic chainable/thenable for tx.insert/update/delete, which the
 // decision-recording transaction path needs (SUP-14805 escalation mints after
 // inserting an issue_execution_decisions row inside the same transaction).
@@ -331,6 +338,7 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../services/external-objects.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    childRowsState.rows = [];
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -338,6 +346,14 @@ describe("issue execution policy routes", () => {
       id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
       body,
     }));
+    // `svc.listComments` is unstubbed in this harness by default: the done-tier
+    // declaration lookup calls it and treats a throw as "comment store lookup
+    // failed" (transition allowed). Preserve that for every existing test; the
+    // SUP-17134 acquisition-flag tests stub it to `[]` where they need the
+    // dedupe read to succeed.
+    mockIssueService.listComments.mockImplementation(() => {
+      throw new Error("listComments is not stubbed for this test");
+    });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.getAncestors.mockResolvedValue([]);
@@ -359,7 +375,33 @@ describe("issue execution policy routes", () => {
     });
     mockIssueThreadInteractionService.rejectInteraction.mockResolvedValue(null);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
-    mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
+    mockDbSelect.mockImplementation((columns: unknown) => {
+      // SUP-17134: route ONLY the canonical laddered-child projection to the
+      // seeded child rows. Every other read on the route keeps the hoisted
+      // handoff default, so the acquisition flag is the sole consumer of the
+      // seeded state.
+      const keys =
+        columns && typeof columns === "object" && !Array.isArray(columns)
+          ? Object.keys(columns as object)
+          : [];
+      const isLadderedChildProjection =
+        keys.length === 6 &&
+        keys.includes("id") &&
+        keys.includes("identifier") &&
+        keys.includes("status") &&
+        keys.includes("executionPolicy") &&
+        keys.includes("executionState") &&
+        keys.includes("originKind");
+      if (isLadderedChildProjection) {
+        return {
+          from: () => ({
+            where: () => dbChainNode(childRowsState.rows),
+            innerJoin: () => dbChainNode([]),
+          }),
+        };
+      }
+      return { from: mockDbSelectFrom };
+    });
     mockDbSelectFrom.mockImplementation(() => ({
       where: mockDbSelectWhere,
       // See the hoisted default above: the fork's merge-arming done-transition
@@ -3232,6 +3274,190 @@ describe("issue execution policy routes", () => {
       expect(nulled.status, JSON.stringify(nulled.body)).toBe(200);
       const nulledPatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
       expect(nulledPatch.executionPolicy ?? null).toBeNull();
+    });
+  });
+
+  // SUP-17134: a card that acquires laddered children while its executionPolicy
+  // has no `approval` stage can never reach a recorded approval decision — the
+  // close attempt is refused 409 `done_transition_missing_approval_stage`. The
+  // acquisition flag surfaces that gap at the moment the children are filed,
+  // reusing the canonical `countLadderedChildren` + `diagnoseMissingApprovalStage`
+  // predicate and the done-guard's own remediation string.
+  describe("SUP-17134 missing-approval-stage acquisition flag", () => {
+    const acquisitionParentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const reviewStage = {
+      id: "11111111-1111-4111-8111-111111111111",
+      type: "review" as const,
+      participants: [{ type: "agent" as const, agentId: "33333333-3333-4333-8333-333333333333" }],
+    };
+    const approvalStage = {
+      id: "22222222-2222-4222-8222-222222222222",
+      type: "approval" as const,
+      participants: [{ type: "agent" as const, agentId: "33333333-3333-4333-8333-333333333333" }],
+    };
+
+    function parentWith(stages: Array<typeof reviewStage | typeof approvalStage>) {
+      return {
+        id: acquisitionParentId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: "11111111-1111-4111-8111-111111111111",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1001",
+        title: "Parent issue",
+        executionPolicy: normalizeIssueExecutionPolicy({ stages }),
+        executionState: null,
+      };
+    }
+
+    // A child that CARRIES a ladder but has not run it yet (`executionState`
+    // null). The acquisition flag must fire while the children are still open,
+    // so the prospective predicate counts this row; the close-guard predicate
+    // (which requires a completed/skipped stage) does not. Seeding only this
+    // shape is what makes the test fail without the flag.
+    function ladderCarryingChildRow(id: string, identifier: string) {
+      return {
+        id,
+        identifier,
+        status: "todo",
+        executionPolicy: {
+          stages: [
+            {
+              id: "11111111-1111-4111-8111-111111111111",
+              type: "review",
+              participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+            },
+          ],
+        },
+        executionState: null,
+        originKind: "manual",
+      };
+    }
+
+    function acquisitionActivityCalls() {
+      return mockLogActivity.mock.calls
+        .map(
+          (call) =>
+            (call as unknown[])[1] as Record<string, unknown> | undefined,
+        )
+        .filter(
+          (input): input is Record<string, unknown> =>
+            input?.action === "issue.missing_approval_stage_acquired",
+        );
+    }
+
+    function seedTwoLadderedChildren() {
+      childRowsState.rows = [
+        ladderCarryingChildRow("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "PAP-2"),
+        ladderCarryingChildRow("dddddddd-dddd-4ddd-8ddd-dddddddddddd", "PAP-3"),
+      ];
+    }
+
+    it("flags a parent that acquires two laddered children with no approval stage", async () => {
+      mockIssueService.getById.mockResolvedValue(parentWith([reviewStage]));
+      mockIssueService.listComments.mockResolvedValue([]);
+      seedTwoLadderedChildren();
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${acquisitionParentId}/children`)
+        .send({ title: "Child three", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const flags = acquisitionActivityCalls();
+      expect(flags).toHaveLength(1);
+      expect(flags[0]).toMatchObject({
+        companyId: "company-1",
+        actorType: "system",
+        action: "issue.missing_approval_stage_acquired",
+        entityType: "issue",
+        entityId: acquisitionParentId,
+        issueId: acquisitionParentId,
+        details: {
+          identifier: "PAP-1001",
+          ladderedChildCount: 2,
+          ladderedChildIdentifiers: ["PAP-2", "PAP-3"],
+          excludedChildIdentifiers: [],
+          stageTypes: ["review"],
+          source: "child_create",
+        },
+      });
+      const remediation = (
+        flags[0]?.details as { remediation?: string } | undefined
+      )?.remediation;
+      // The flag carries the done-guard's own remediation verbatim.
+      expect(remediation).toContain('Add an "approval" stage');
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        acquisitionParentId,
+        expect.stringContaining("[Missing approval stage acquired]"),
+        {},
+        { authorType: "system" },
+      );
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        acquisitionParentId,
+        expect.stringContaining('Add an "approval" stage'),
+        {},
+        { authorType: "system" },
+      );
+    });
+
+    it("does not flag when the parent already has an approval stage", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        parentWith([reviewStage, approvalStage]),
+      );
+      seedTwoLadderedChildren();
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${acquisitionParentId}/children`)
+        .send({ title: "Child three", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(acquisitionActivityCalls()).toHaveLength(0);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("does not flag a parent with fewer than two laddered children", async () => {
+      mockIssueService.getById.mockResolvedValue(parentWith([reviewStage]));
+      childRowsState.rows = [
+        ladderCarryingChildRow("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "PAP-2"),
+      ];
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${acquisitionParentId}/children`)
+        .send({ title: "Child two", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(acquisitionActivityCalls()).toHaveLength(0);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("flags once per parent and dedupes the marker comment across child creates", async () => {
+      mockIssueService.getById.mockResolvedValue(parentWith([reviewStage]));
+      mockIssueService.listComments.mockResolvedValue([]);
+      seedTwoLadderedChildren();
+
+      const app = await createApp();
+      const first = await request(app)
+        .post(`/api/issues/${acquisitionParentId}/children`)
+        .send({ title: "Child three", status: "todo" });
+      expect(first.status, JSON.stringify(first.body)).toBe(201);
+      expect(acquisitionActivityCalls()).toHaveLength(1);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+
+      // The marker comment the first create posted is now the newest comment on
+      // the parent, so the next create must not re-post or re-emit the flag.
+      mockIssueService.listComments.mockResolvedValue([
+        {
+          authorType: "system",
+          body: '[Missing approval stage acquired]\n\nAdd an "approval" stage ...',
+        },
+      ]);
+      const second = await request(app)
+        .post(`/api/issues/${acquisitionParentId}/children`)
+        .send({ title: "Child four", status: "todo" });
+      expect(second.status, JSON.stringify(second.body)).toBe(201);
+      expect(acquisitionActivityCalls()).toHaveLength(1);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
     });
   });
 });
