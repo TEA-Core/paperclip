@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
@@ -22,11 +24,13 @@ import {
   SHARED_CARRIER_REFUSAL_MARKER,
 } from "../services/blocker-closure.js";
 import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
+import { recoveryService } from "../services/recovery/service.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeStatusDecision,
 } from "../services/native-runtime/status-arbiter.js";
 import {
+  buildIssueBlockersResolvedWakeStateKey,
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
 } from "../services/issue-dependency-wakeups.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -566,5 +570,245 @@ describe("SUP-17092/A dependency wake attributed-landing withhold", () => {
     expect(emitted[0]!.idempotencyKey).toBe(
       `issue_blockers_resolved:${pass2.dependentId}:${pass2.blockerId}`,
     );
+  });
+
+  // ---- Producer behavior via the periodic recovery backstop (5th producer) ----
+
+  describe("recovery backstop (issue_graph_liveness_backstop producer)", () => {
+    // Isolated company so the backstop's candidate query never picks up the
+    // blocked dependents seeded by the native committer scenarios above.
+    const backstopCompanyId = randomUUID();
+    const bsCarrierAgentId = randomUUID();
+    const bsDependentAgentId = randomUUID();
+
+    beforeAll(async () => {
+      // The backstop calls loadConfig(), which reads .paperclip/config.json from
+      // the worktree; that file is not readable in the test sandbox (EACCES).
+      // Point PAPERCLIP_CONFIG at a path that does not exist so readConfigFile()
+      // returns null and loadConfig() falls back to env-only defaults.
+      process.env.PAPERCLIP_CONFIG = path.join(
+        os.tmpdir(),
+        `paperclip-backstop-test-noconfig-${randomUUID()}.json`,
+      );
+      // loadConfig's bind validation rejects the sandbox HOST=0.0.0.0 under the
+      // default local_trusted deployment mode; force the loopback bind it expects.
+      process.env.PAPERCLIP_BIND = "loopback";
+      await db.insert(companies).values({
+        id: backstopCompanyId,
+        name: "Backstop company",
+        issuePrefix: "BSPK",
+      });
+      await db.insert(agents).values([
+        { id: bsCarrierAgentId, companyId: backstopCompanyId, name: "BS carrier", adapterType: "codex_local", status: "running" },
+        { id: bsDependentAgentId, companyId: backstopCompanyId, name: "BS dependent", adapterType: "codex_local", status: "idle" },
+      ]);
+    });
+
+    /**
+     * Seed a "resolved blocker + one blocked dependent" pair for the backstop.
+     * The blocker is done with no executionWorkspaceId so the workspace-finalize
+     * barrier does not gate the dependent's readiness. `resolvedBlockerIssueId`
+     * therefore resolves to the blocker and the backstop's not-ready skip does
+     * not fire.
+     */
+    async function seedBackstopScenario(
+      suffix: string,
+      options: { publishSkippedReason?: string; publishedHeadSha?: string; attributionRow?: boolean } = {},
+    ) {
+      const blockerId = randomUUID();
+      const dependentId = randomUUID();
+      const executionState =
+        options.publishSkippedReason || options.publishedHeadSha
+          ? {
+              approvalStatus: {
+                ...(options.publishSkippedReason
+                  ? { publishSkipped: { reason: options.publishSkippedReason } }
+                  : {}),
+                ...(options.publishedHeadSha ? { publishedHeadSha: options.publishedHeadSha } : {}),
+              },
+            }
+          : null;
+
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId: backstopCompanyId,
+        title: `backstop blocker ${suffix}`,
+        status: "done",
+        assigneeAgentId: bsCarrierAgentId,
+        workMode: "standard",
+        executionState,
+      });
+      await db.insert(issues).values({
+        id: dependentId,
+        companyId: backstopCompanyId,
+        title: `backstop dependent ${suffix}`,
+        status: "blocked",
+        assigneeAgentId: bsDependentAgentId,
+        workMode: "standard",
+      });
+      await db.insert(issueRelations).values({
+        companyId: backstopCompanyId,
+        type: "blocks",
+        issueId: blockerId,
+        relatedIssueId: dependentId,
+      });
+      if (options.attributionRow) {
+        await db.insert(activityLog).values({
+          companyId: backstopCompanyId,
+          actorType: "system",
+          actorId: "done_close_landing_backstop",
+          action: ATTRIBUTED_LANDING_ACTION,
+          entityType: "issue",
+          entityId: blockerId,
+          details: {
+            skipReason: "shared-carrier deferral",
+            carrierIdentifier: "SUP-8888",
+            pr: "corp/repo#42",
+            deadlocked: true,
+          },
+        });
+      }
+      return { blockerId, dependentId };
+    }
+
+    function makeService() {
+      const calls: Array<{ agentId: string; opts?: Record<string, unknown> }> = [];
+      const enqueueWakeup = (async (
+        agentId: string,
+        opts?: Record<string, unknown>,
+      ) => {
+        calls.push({ agentId, opts });
+        return { id: randomUUID() };
+      }) as unknown as Parameters<typeof recoveryService>[1]["enqueueWakeup"];
+      return { calls, service: recoveryService(db, { enqueueWakeup }) };
+    }
+
+    // The shared countWithheldActivity helper filters by the outer company id;
+    // the backstop seeds its own company, so count within backstopCompanyId.
+    async function countBackstopWithheld(dependentId: string) {
+      return db
+        .select({
+          action: activityLog.action,
+          entityId: activityLog.entityId,
+          details: activityLog.details,
+        })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, backstopCompanyId),
+            eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, dependentId),
+          ),
+        );
+    }
+
+    // Scope each sweep to the single dependent of this blocker so the backstop
+    // never picks up candidates from sibling tests sharing backstopCompanyId.
+    const backstopOpts = (blockerIssueId: string) => ({
+      rearmWindowMs: 3_600_000,
+      rearmMaxCount: 10,
+      companyId: backstopCompanyId,
+      blockerIssueId,
+    });
+
+    it("withholds via clause 2 (live publishSkipped marker): enqueueWakeup not called + 1 withheld row", async () => {
+      const { blockerId, dependentId } = await seedBackstopScenario("rs-clause2", {
+        publishSkippedReason: sharedCarrierReason,
+      });
+      const { calls, service } = makeService();
+
+      await service.reconcileResolvedDependencyWakeBackstop(backstopOpts(blockerId));
+
+      expect(calls, "the backstop must not call enqueueWakeup when attributed").toHaveLength(0);
+      const withheld = await countBackstopWithheld(dependentId);
+      expect(withheld, "exactly one dependency_wake_withheld audit row").toHaveLength(1);
+      expect(withheld[0]!.details).toMatchObject({
+        wakeReason: "issue_blockers_resolved",
+        dependentIssueId: dependentId,
+        resolvedBlockerIssueId: blockerId,
+        producer: "issue_graph_liveness_backstop",
+        attributionSource: "publish_skipped",
+        refusalReason: sharedCarrierReason,
+        carrierIdentifier: null,
+      });
+    });
+
+    it("withholds via clause 1 (attribution row): enqueueWakeup not called + 1 withheld row", async () => {
+      const { blockerId, dependentId } = await seedBackstopScenario("rs-clause1", {
+        attributionRow: true,
+        publishedHeadSha: "deadbeef",
+      });
+      const { calls, service } = makeService();
+
+      await service.reconcileResolvedDependencyWakeBackstop(backstopOpts(blockerId));
+
+      expect(calls).toHaveLength(0);
+      const withheld = await countBackstopWithheld(dependentId);
+      expect(withheld).toHaveLength(1);
+      expect(withheld[0]!.details).toMatchObject({
+        producer: "issue_graph_liveness_backstop",
+        attributionSource: "attribution_row",
+        carrierIdentifier: "SUP-8888",
+        resolvedBlockerIssueId: blockerId,
+      });
+    });
+
+    it("emits the wake when the landing is NOT attributed (positive): enqueueWakeup called once, 0 withheld", async () => {
+      const { blockerId, dependentId } = await seedBackstopScenario("rs-positive", {
+        publishedHeadSha: "publishedHead123",
+      });
+      const { calls, service } = makeService();
+
+      await service.reconcileResolvedDependencyWakeBackstop(backstopOpts(blockerId));
+
+      expect(calls, "the backstop must enqueue the wake when not attributed").toHaveLength(1);
+      expect(calls[0]!.agentId).toBe(bsDependentAgentId);
+      expect(calls[0]!.opts).toMatchObject({
+        reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+          dependentIssueId: dependentId,
+          blockerIssueIds: [blockerId],
+          blockedTransitionAt: null,
+        }),
+        payload: { issueId: dependentId, resolvedBlockerIssueId: blockerId },
+      });
+      expect(await countBackstopWithheld(dependentId), "no withhold row when the wake is emitted").toHaveLength(0);
+    });
+
+    it("writes at most one withhold row across repeated backstop passes (dedup)", async () => {
+      const { blockerId, dependentId } = await seedBackstopScenario("rs-dedup", {
+        publishSkippedReason: sharedCarrierReason,
+      });
+      const { calls, service } = makeService();
+
+      await service.reconcileResolvedDependencyWakeBackstop(backstopOpts(blockerId));
+      await service.reconcileResolvedDependencyWakeBackstop(backstopOpts(blockerId));
+
+      expect(calls).toHaveLength(0);
+      expect(await countBackstopWithheld(dependentId), "deduped to a single row across passes").toHaveLength(1);
+    });
+
+    it("is level-triggered: pass 1 (attributed) withholds, pass 2 (cleared) emits", async () => {
+      const { blockerId, dependentId } = await seedBackstopScenario("rs-2pass", {
+        publishSkippedReason: sharedCarrierReason,
+      });
+      const { calls, service } = makeService();
+
+      await service.reconcileResolvedDependencyWakeBackstop(backstopOpts(blockerId));
+      expect(calls).toHaveLength(0);
+      expect(await countBackstopWithheld(dependentId)).toHaveLength(1);
+
+      // Clear the live marker: republished -> publishedHeadSha set, no publishSkipped.
+      await db
+        .update(issues)
+        .set({ executionState: { approvalStatus: { publishedHeadSha: "republished456" } } })
+        .where(eq(issues.id, blockerId));
+
+      await service.reconcileResolvedDependencyWakeBackstop(backstopOpts(blockerId));
+      expect(calls, "the wake must be emitted on the cleared pass").toHaveLength(1);
+      expect(calls[0]!.agentId).toBe(bsDependentAgentId);
+      expect(await countBackstopWithheld(dependentId), "no second withhold row").toHaveLength(1);
+    });
   });
 });
