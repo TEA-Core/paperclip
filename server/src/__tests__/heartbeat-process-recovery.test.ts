@@ -12053,13 +12053,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     // The wake is minted inside the recovery run's settle, so it is present
     // after the drain; keep a small bounded wait only as a safety net.
+    const continuationAttemptOf = (row: { payload: Record<string, unknown> | null }) =>
+      Number(
+        (row.payload as { continuationAttempt?: unknown } | null)
+          ?.continuationAttempt ?? 0,
+      );
     const livenessWake = await waitForValue(async () => {
       const rows = await db
         .select()
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.agentId, agentId));
+      // A bounded continuation mints one row PER attempt -- the idempotency key
+      // in run-liveness-continuations.ts includes `nextAttempt` -- so once the
+      // attempt-1 continuation has itself run, an attempt-2 row exists too.
+      // This select has no ORDER BY, so a plain `.find()` returns whichever row
+      // Postgres emitted first and the attempt assertion below flakes on load
+      // (observed in the merge_group run for PR #748: received attempt 2).
+      // Take the first continuation explicitly instead of an arbitrary one.
       return (
-        rows.find((row) => row.reason === "run_liveness_continuation") ?? null
+        rows
+          .filter((row) => row.reason === "run_liveness_continuation")
+          .sort((a, b) => continuationAttemptOf(a) - continuationAttemptOf(b))[0] ??
+        null
       );
     });
     expect(livenessWake).toBeTruthy();
