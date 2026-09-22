@@ -2647,11 +2647,9 @@ describeEmbeddedPostgres(
     );
 
     // The live-discovery path (SUP-13313/SUP-13831) is reached with ZERO cached
-    // mentions and resolves a PR only via the anchored card-pull-request predicate
-    // (SUP-17162): head ref == the card's own delivery branch, OR head ref leading
-    // with the card identifier, OR a title that leads with the identifier. A
-    // body-only citation (or a mid-slug / mid-title mention) is not an anchor and
-    // is not resolved. It is a second stamp path and takes the same gate.
+    // mentions and resolves a PR only via the anchored card-pull-request
+    // predicate (SUP-17162): a body-only citation is not an anchor and is not
+    // resolved. It is a second stamp path and takes the same gate.
     it(
       "does NOT resolve a zero-mention card whose live-discovered PR only CITES its identifier — no-pr, zero status writes (SUP-17162)",
       async () => {
