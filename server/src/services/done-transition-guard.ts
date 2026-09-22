@@ -103,6 +103,14 @@ const TIER_1_SUFFIX = "Liveness unverified.";
 const TIER2_FORM = '"Closed at Tier 2 (live): <probe evidence>"';
 const TIER1_FORM = '"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."';
 
+/**
+ * ADR-103 M3: the gate that produced a refusal, carried so the route can speak
+ * in the voice of the mechanism that actually refused instead of substituting a
+ * remedy derived from the caller's door. `delivery` is the catch-all for the
+ * head/delivery checks (open PR, branch-ahead, absent branch, foreign branch).
+ */
+export type DoneTransitionMechanism = "A" | "C" | "D" | "delivery";
+
 export interface DoneTransitionGuardResult {
   allowed: boolean;
   reason: string;
@@ -113,8 +121,35 @@ export interface DoneTransitionGuardResult {
   repo: string | null;
   /** True when the refusal is a review-ladder refusal (mechanism C): a no-deliverable-head override does not clear it. */
   ladderUnsatisfied?: boolean;
+  /**
+   * ADR-103 M3: the mechanism that refused. Undefined on an allowed transition.
+   * Supersedes `ladderUnsatisfied` as the sole axis (which is retained for
+   * back-compat and still set by mechanism C).
+   */
+  mechanism?: DoneTransitionMechanism;
+  /**
+   * ADR-103 M3: the mechanism-specific remedy. Set on every refusal; the route
+   * emits it verbatim for mechanisms A/C/D and only falls back to a door-derived
+   * string for `delivery`.
+   */
+  remedy?: string;
+  /** ADR-103 M3.5: the laddered children counted by mechanism A/D, printed beside the excluded set. */
+  ladderedChildIdentifiers?: string[];
+  /** ADR-103 M3.5: the carve-out-excluded children, printed so an exclusion is never silent. */
+  excludedChildIdentifiers?: string[];
   skipped: boolean;
   skipReason: string | null;
+}
+
+/**
+ * ADR-103 M3.6: the laddered-child census the guard already computed during an
+ * evaluation, surfaced to the wrapper so a below-threshold carve-out can be
+ * audited on a successful close without a second query.
+ */
+interface DoneTransitionCensus {
+  count: number;
+  identifiers: string[];
+  excludedChildIdentifiers: string[];
 }
 
 export interface DoneTransitionOverride {
@@ -1420,7 +1455,7 @@ async function findMissingAdr072CloseLadderStages(
  * decision-carrying board closes. Every refusal, override, and skip records an
  * audit row.
  */
-export async function evaluateDoneTransitionGuard(
+async function evaluateDoneTransitionGuardCore(
   db: Db,
   issue: {
     id: string;
@@ -1436,6 +1471,10 @@ export async function evaluateDoneTransitionGuard(
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
+  // ADR-103 M3.6: out-parameter the census the core already computed, so the
+  // exported wrapper can audit a below-threshold carve-out on a successful close
+  // without issuing a second countLadderedChildren query.
+  observer?: { census?: DoneTransitionCensus },
 ): Promise<DoneTransitionGuardResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
@@ -1494,6 +1533,7 @@ export async function evaluateDoneTransitionGuard(
     reviewLadder === null
       ? await countLadderedChildren(db, issue.companyId, issue.id)
       : null;
+  if (mechanismA !== null && observer) observer.census = mechanismA;
 
   // SUP-14579 (mechanism D / ADR-072 close-ladder shape): a decomposed parent
   // whose review ladder is satisfied but shape-incomplete (missing one of the
@@ -1513,6 +1553,7 @@ export async function evaluateDoneTransitionGuard(
   } | null = null;
   if (reviewLadder !== null && reviewLadder.satisfied) {
     const laddered = await countLadderedChildren(db, issue.companyId, issue.id);
+    if (observer) observer.census = laddered;
     if (laddered.count >= 2) {
       const { missingStageLabels, outOfOrderStageLabels } =
         await findMissingAdr072CloseLadderStages(
@@ -1568,6 +1609,11 @@ export async function evaluateDoneTransitionGuard(
       owner: null,
       repo: null,
       ladderUnsatisfied: true,
+      mechanism: "C",
+      remedy:
+        "Record the unsatisfied review stage's approval (or skip it) before marking the issue done — " +
+        "the review ladder must be complete before a close, and a no-deliverable-head override does not " +
+        "clear a review-ladder refusal.",
       skipped: false,
       skipReason: null,
     };
@@ -1599,6 +1645,12 @@ export async function evaluateDoneTransitionGuard(
       defaultRef: null,
       owner: null,
       repo: null,
+      mechanism: "A",
+      remedy:
+        "Attach an execution policy with a review ladder to this issue, then record each stage's decision " +
+        "before marking it done.",
+      ladderedChildIdentifiers: mechanismA.identifiers,
+      excludedChildIdentifiers: mechanismA.excludedChildIdentifiers,
       skipped: false,
       skipReason: null,
     };
@@ -1636,6 +1688,17 @@ export async function evaluateDoneTransitionGuard(
       ladderShape.outOfOrderStageLabels.length > 0
         ? "Add any missing review/approval stages and place every close-ladder stage in the ADR-072 order (review:support-QAE, review:coder-LE, approval:exec-CTO)."
         : "Add the missing review/approval stages to this issue's execution policy.";
+    // ADR-103 M3.4: name the actual remedies in the SUP-17167 shape first —
+    // re-parent the procedural child to an ancestor, or declare it process —
+    // before the "add the missing stages" step, which is legal only while the
+    // pointer has not advanced past the first close-ladder rung (ADR-102 M1).
+    // The procedural child that armed this gate is what makes the ladder
+    // non-conforming; adding stages to an already-advanced ladder wedges it.
+    const mechanismRemedy =
+      "Re-parent the procedural child that armed this close gate to an ancestor, or declare it " +
+      "`work-type:process` (or `parent_link_kind: 'process'` once the column ships); adding a stage " +
+      "to this ladder is legal only while the pointer has not advanced past the first close-ladder " +
+      `rung (ADR-102 M1). Then ${remedy.charAt(0).toLowerCase()}${remedy.slice(1)}`;
     return {
       allowed: false,
       reason:
@@ -1650,6 +1713,10 @@ export async function evaluateDoneTransitionGuard(
       defaultRef: null,
       owner: null,
       repo: null,
+      mechanism: "D",
+      remedy: mechanismRemedy,
+      ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+      excludedChildIdentifiers: ladderShape.excludedChildIdentifiers,
       skipped: false,
       skipReason: null,
     };
@@ -1801,6 +1868,7 @@ export async function evaluateDoneTransitionGuard(
           defaultRef: null,
           owner: null,
           repo: null,
+          mechanism: "delivery",
           skipped: false,
           skipReason: refusalToken,
         };
@@ -1846,6 +1914,7 @@ export async function evaluateDoneTransitionGuard(
       defaultRef: null,
       owner: null,
       repo: null,
+      mechanism: "delivery",
       skipped: false,
       skipReason: null,
     };
@@ -2070,6 +2139,7 @@ export async function evaluateDoneTransitionGuard(
           defaultRef: ctx.defaultRef,
           owner: parsed.owner,
           repo: parsed.repo,
+          mechanism: "delivery",
           skipped: false,
           skipReason: null,
         };
@@ -2274,6 +2344,7 @@ export async function evaluateDoneTransitionGuard(
       defaultRef: ctx.defaultRef,
       owner: parsed.owner,
       repo: parsed.repo,
+      mechanism: "delivery",
       skipped: false,
       skipReason: prSkipReason,
     };
@@ -2346,9 +2417,45 @@ export async function evaluateDoneTransitionGuard(
     defaultRef: ctx.defaultRef,
     owner: parsed.owner,
     repo: parsed.repo,
+    mechanism: "delivery",
     skipped: false,
     skipReason: prSkipReason,
   };
+}
+
+/**
+ * ADR-103 M3: the exported entry point. Runs the guard core, then records the
+ * M3.6 exclusion audit on a successful close whose laddered-child count fell
+ * below the `>= 2` threshold only because of carve-out exclusions. The census
+ * comes from the core's own countLadderedChildren read (the observer
+ * out-parameter), so no second query is issued. The audit row is written before
+ * the transition write, matching the guard's existing pre-transaction rows —
+ * exclusion must never be silent in the direction that OPENS a gate.
+ */
+export async function evaluateDoneTransitionGuard(
+  db: Db,
+  issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
+  override: DoneTransitionOverride | null,
+  decisionCarried: boolean = false,
+): Promise<DoneTransitionGuardResult> {
+  const observer: { census?: DoneTransitionCensus } = {};
+  const result = await evaluateDoneTransitionGuardCore(db, issue, override, decisionCarried, observer);
+  const census = observer.census;
+  if (
+    result.allowed
+    && census
+    && census.count < 2
+    && census.count + census.excludedChildIdentifiers.length >= 2
+  ) {
+    void writeAuditLog(db, issue, "issue.done_transition_exclusion_below_threshold", {
+      reason: "carve_out_below_threshold",
+      ladderedChildCount: census.count,
+      ladderedChildIdentifiers: census.identifiers,
+      excludedChildIdentifiers: census.excludedChildIdentifiers,
+      source: "done_transition_guard",
+    });
+  }
+  return result;
 }
 
 export { writeAuditLog };

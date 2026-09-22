@@ -12,7 +12,9 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueLabels,
   issues,
+  labels,
   projectWorkspaces,
   projects,
   type Db,
@@ -265,6 +267,273 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
 
     return { companyId, reviewerAgentId, implementerAgentId, issueId, identifier };
+  }
+
+  /**
+   * ADR-103 M3 seed: a decomposed parent sitting on an ADR-072 close ladder whose
+   * shape is incomplete (missing review:coder-LE, approval:exec-CTO out of order),
+   * parked pending on the approval stage, over N laddered children plus an
+   * optional `work-type:delivery` excluded child. The approval stage exists so
+   * the SUP-15878 missing-approval-stage route probe does NOT preempt the guard
+   * (it only preempts when the policy lacks an approval stage AND the laddered
+   * count is >= 2). With the pointer on the approval stage a decision-carrying
+   * close satisfies the review ladder and reaches mechanism D.
+   */
+  async function seedDecomposedCloseLadder(
+    issuePrefix: string,
+    opts: { ladderedChildren: number; excludedChildren: number },
+  ) {
+    const companyId = randomUUID();
+    const supportQaeAgentId = randomUUID();
+    const coderLeAgentId = randomUUID();
+    const execCtoAgentId = randomUUID();
+    const implementerAgentId = randomUUID();
+    const childReviewerAgentId = randomUUID();
+    const parentIssueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const reviewStageId = randomUUID();
+    const approvalStageId = randomUUID();
+    const identifier = `${issuePrefix}-1`;
+    const branchName = `${identifier}-test-branch`;
+    const repoUrl = "https://github.com/TEA-Core/paperclip";
+    const defaultRef = "fold/tea-patches-v2026.722.0";
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "cloud-user-1",
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: now,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Test Project",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: "/tmp/test",
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    for (const [agentId, name] of [
+      [supportQaeAgentId, "Support-QAE"],
+      [coderLeAgentId, "coder-LE"],
+      [execCtoAgentId, "exec-CTO"],
+      [implementerAgentId, "Implementer"],
+      [childReviewerAgentId, "ChildReviewer"],
+    ] as const) {
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId: null,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: branchName,
+      status: "active",
+      cwd: "/tmp/test",
+      repoUrl,
+      baseRef: defaultRef,
+      branchName,
+      providerType: "git_worktree",
+      providerRef: "/tmp/test",
+      lastUsedAt: now,
+      openedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      identifier,
+      issueNumber: 1,
+      title: "Decomposed parent with a shape-incomplete ADR-072 close ladder",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: execCtoAgentId,
+      createdByUserId: "cloud-user-1",
+      executionWorkspaceId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: reviewStageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId: supportQaeAgentId, userId: null }],
+          },
+          {
+            id: approvalStageId,
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId: execCtoAgentId, userId: null }],
+          },
+        ],
+        returnAssigneeAgentId: implementerAgentId,
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: approvalStageId,
+        currentStageIndex: 1,
+        currentStageType: "approval",
+        currentParticipant: { type: "agent", agentId: execCtoAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: implementerAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [reviewStageId],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+        changesRequestedCount: 0,
+      },
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId: parentIssueId })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    const childIdentifiers: { id: string; identifier: string; excluded: boolean }[] = [];
+    const totalChildren = opts.ladderedChildren + opts.excludedChildren;
+    for (let i = 0; i < totalChildren; i += 1) {
+      const excluded = i >= opts.ladderedChildren;
+      const childId = randomUUID();
+      const childStageId = randomUUID();
+      const childIdentifier = `${issuePrefix}-${i + 2}`;
+      await db.insert(issues).values({
+        id: childId,
+        companyId,
+        identifier: childIdentifier,
+        issueNumber: i + 2,
+        parentId: parentIssueId,
+        title: excluded ? "Delivery carrier child" : "Decomposed work child",
+        status: "done",
+        priority: "medium",
+        originKind: "manual",
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              id: childStageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ type: "agent", agentId: childReviewerAgentId, userId: null }],
+            },
+          ],
+          returnAssigneeAgentId: implementerAgentId,
+        },
+        executionState: {
+          status: "completed",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [childStageId],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "approved",
+          monitor: null,
+          changesRequestedCount: 0,
+        },
+      });
+      childIdentifiers.push({ id: childId, identifier: childIdentifier, excluded });
+    }
+
+    if (opts.excludedChildren > 0) {
+      const labelId = randomUUID();
+      await db.insert(labels).values({
+        id: labelId,
+        companyId,
+        name: "work-type:delivery",
+        color: "#888888",
+      });
+      for (const child of childIdentifiers.filter((c) => c.excluded)) {
+        await db.insert(issueLabels).values({ issueId: child.id, labelId, companyId });
+      }
+    }
+
+    const ladderedChildIdentifiers = childIdentifiers.filter((c) => !c.excluded).map((c) => c.identifier);
+    const excludedChildIdentifiers = childIdentifiers.filter((c) => c.excluded).map((c) => c.identifier);
+
+    return {
+      companyId,
+      execCtoAgentId,
+      parentIssueId,
+      identifier,
+      branchName,
+      ladderedChildIdentifiers,
+      excludedChildIdentifiers,
+    };
+  }
+
+  /** A live open linked PR whose undismissed review is CHANGES_REQUESTED. */
+  function mockChangesRequestedPr(identifier: string, branchName: string) {
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/graphql")) {
+        return new Response(
+          JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: "CHANGES_REQUESTED" } } } }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+      if (url.includes("/pulls?")) {
+        return new Response(
+          JSON.stringify([
+            {
+              number: 42,
+              draft: false,
+              merged: false,
+              merged_at: null,
+              head: { ref: branchName },
+              title: `${identifier}: the carrier PR`,
+              body: null,
+            },
+          ]),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/pulls/42")) {
+        return new Response(JSON.stringify({ state: "open", head: { sha: "a".repeat(40) } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
   }
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
@@ -945,5 +1214,100 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(typeof approvalStatus?.certifiedAt).toBe("string");
     // publishedHeadSha must still mean "published" — nothing was published.
     expect(approvalStatus?.publishedHeadSha).toBeUndefined();
+  });
+
+  it("PATCH: a decision-carrying close refused by mechanism D carries the mechanism's own remedy, not merge-first (ADR-103 M3)", async () => {
+    const {
+      companyId,
+      execCtoAgentId,
+      parentIssueId,
+      identifier,
+      ladderedChildIdentifiers,
+      excludedChildIdentifiers,
+    } = await seedDecomposedCloseLadder("MD3D", { ladderedChildren: 2, excludedChildren: 1 });
+    currentActor = agentActor(companyId, execCtoAgentId, await seedRun(companyId, execCtoAgentId, parentIssueId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Approved.\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+      });
+
+    // Before M3 the route selected the remedy from `ladderUnsatisfied`/`decisionCarried`,
+    // so a mechanism D refusal on a decision-carrying close emitted the circular
+    // merge-first instruction ("Merge the issue's pull request") even though the
+    // approval being refused is the only thing that publishes paperclip/approved
+    // (ADR-103 §3.2). The remedy must now be D's own.
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    expect(res.body.details.remedy).not.toContain("Merge the issue's pull request");
+    expect(res.body.details.remedy).toContain("Re-parent");
+    expect(res.body.details.remedy).toContain("process");
+    expect(res.body.details.mechanism).toBe("D");
+    // M3.5: the counted identifiers and the carve-out-excluded set both travel in details.
+    expect(res.body.details.ladderedChildIdentifiers).toEqual(
+      expect.arrayContaining(ladderedChildIdentifiers),
+    );
+    expect(res.body.details.excludedChildIdentifiers).toEqual(excludedChildIdentifiers);
+    expect(await statusOf(parentIssueId)).toBe("in_review");
+  });
+
+  it("PATCH: a true delivery/head refusal on the same decision-carrying door still carries merge-first (ADR-103 M3)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("MD3B");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockChangesRequestedPr(identifier, `${identifier}-test-branch`);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    expect(res.body.details.mechanism).toBe("delivery");
+    expect(res.body.details.remedy).toContain("Merge the issue's pull request");
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: a close that succeeds with count 1 after exclusions writes the below-threshold audit row (ADR-103 M3.6)", async () => {
+    const { companyId, execCtoAgentId, parentIssueId, identifier, excludedChildIdentifiers } =
+      await seedDecomposedCloseLadder("MD3S", { ladderedChildren: 1, excludedChildren: 1 });
+    currentActor = agentActor(companyId, execCtoAgentId, await seedRun(companyId, execCtoAgentId, parentIssueId));
+    mockMergedBranch();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Approved.\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(parentIssueId)).toBe("done");
+
+    // One laddered child + one excluded carrier = beneath the >= 2 threshold, so the
+    // parent does not owe the close ladder — but the carve-out that let it close must
+    // be recorded naming every excluded identifier (ADR-103 §3.1 / M3.6).
+    const rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(
+          companyId,
+          parentIssueId,
+          "issue.done_transition_exclusion_below_threshold",
+        );
+        if (found.length === 0) throw new Error("waiting for exclusion audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    const details = rows[0]?.details as Record<string, unknown>;
+    expect(details.ladderedChildCount).toBe(1);
+    expect(details.excludedChildIdentifiers).toEqual(excludedChildIdentifiers);
   });
 });
