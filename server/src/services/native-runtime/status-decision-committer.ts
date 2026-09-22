@@ -47,6 +47,10 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "../activity-log.js";
+import {
+  buildDependencyWakeWithheldActivity,
+  readAttributedLandingDischarge,
+} from "../blocker-closure.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 
 export class NativeStatusRaceError extends Error {
@@ -1881,6 +1885,21 @@ export async function commitNativeStatusDecision(input: {
       const dependents = await issueSvc.listWakeableBlockedDependents(
         input.issueId,
       );
+      // SUP-17092/A: if this done's landing was attributed away to a shared
+      // carrier, the issue_blockers_resolved wakes for its non-parent dependents
+      // are withheld (a done that discharged no delivery on the shared branch must
+      // not fire a phantom cascade). The parent's issue_children_completed wake is
+      // a distinct effect and is unaffected. Level-triggered: clause 2 of the
+      // predicate reads live executionState, so a later cleared publishSkipped
+      // emits the wake on the next reconciliation pass.
+      const attributedLanding =
+        dependents.length > 0
+          ? await readAttributedLandingDischarge(
+              tx as unknown as Db,
+              input.companyId,
+              input.issueId,
+            )
+          : null;
       const completedResultSummary = await tx
         .select({ resultJson: nativeRunResults.resultJson })
         .from(nativeRunResults)
@@ -1908,6 +1927,37 @@ export async function commitNativeStatusDecision(input: {
         : false;
       for (const dependent of dependents) {
         const isCompletedChildParent = parent?.id === dependent.id;
+        if (!isCompletedChildParent && attributedLanding?.attributed) {
+          const {
+            publication,
+            activity: withheldActivity,
+          } = await persistActivity(
+            tx as unknown as Db,
+            buildDependencyWakeWithheldActivity({
+              companyId: input.companyId,
+              agentId: dependent.assigneeAgentId,
+              runId: input.runId,
+              agentApiKeyId: null,
+              dependentIssueId: dependent.id,
+              resolvedBlockerIssueId: input.issueId,
+              blockerIssueIds: dependent.blockerIssueIds,
+              producer: "native_status_decision",
+              discharge: attributedLanding,
+            }),
+          );
+          publications.push(publication);
+          materialized.push({
+            effectKind: "dependency_wake_withheld",
+            targetType: "activity_log",
+            targetId: withheldActivity?.id ?? null,
+            payload: {
+              dependentIssueId: dependent.id,
+              resolvedBlockerIssueId: input.issueId,
+              attributionSource: attributedLanding.source,
+            },
+          });
+          continue;
+        }
         const idempotencyKey = isCompletedChildParent
           ? `issue_children_completed:${dependent.id}:${input.issueId}`
           : buildIssueBlockersResolvedWakeIdempotencyKey({

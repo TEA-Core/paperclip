@@ -1,0 +1,570 @@
+import { randomUUID } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { and, eq } from "drizzle-orm";
+import {
+  activityLog,
+  agents,
+  agentWakeupRequests,
+  companies,
+  completionContracts,
+  createDb,
+  heartbeatRuns,
+  issueRelations,
+  issueWorkProducts,
+  issues,
+  nativeRunFinalizations,
+  nativeRunResults,
+  workAssessments,
+} from "@paperclipai/db";
+import {
+  DEPENDENCY_WAKE_WITHHELD_ACTION,
+  readAttributedLandingDischarge,
+  SHARED_CARRIER_REFUSAL_MARKER,
+} from "../services/blocker-closure.js";
+import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
+import {
+  NATIVE_STATUS_ARBITER_POLICY_VERSION,
+  type NativeStatusDecision,
+} from "../services/native-runtime/status-arbiter.js";
+import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+} from "../services/issue-dependency-wakeups.js";
+import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+
+const ATTRIBUTED_LANDING_ACTION = "issue.done_close_landing_attributed";
+const sharedCarrierReason = `shared branch head abc123 does not carry this card's identifier prefix SUP-9999; landing deferred to carrier SUP-8888`;
+const benignReason = "publish blocked: missing sign-off";
+
+describe("SUP-17092/A dependency wake attributed-landing withhold", () => {
+  let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: ReturnType<typeof createDb>;
+  const companyId = randomUUID();
+  const carrierAgentId = randomUUID();
+  const dependentAgentId = randomUUID();
+
+  beforeAll(async () => {
+    temporary = await startEmbeddedPostgresTestDatabase("paperclip-dep-wake-");
+    db = createDb(temporary.connectionString);
+    await db.insert(companies).values({ id: companyId, name: "Dep wake", issuePrefix: "DEPW" });
+    await db.insert(agents).values([
+      { id: carrierAgentId, companyId, name: "Carrier agent", adapterType: "codex_local", status: "running" },
+      { id: dependentAgentId, companyId, name: "Dependent agent", adapterType: "codex_local", status: "idle" },
+    ]);
+  }, 30_000);
+
+  afterAll(async () => temporary?.cleanup());
+
+  describe("readAttributedLandingDischarge predicate (bullet 1)", () => {
+    it("reads clause 1 (attribution row) with priority and rich fields", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "clause1",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+        executionState: {
+          approvalStatus: { publishSkipped: { reason: sharedCarrierReason } },
+        },
+      });
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "done_close_landing_backstop",
+        action: ATTRIBUTED_LANDING_ACTION,
+        entityType: "issue",
+        entityId: issueId,
+        details: {
+          skipReason: "shared-carrier deferral",
+          carrierIdentifier: "SUP-8888",
+          pr: "corp/repo#42",
+          deadlocked: true,
+        },
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge).toEqual({
+        attributed: true,
+        source: "attribution_row",
+        reason: "shared-carrier deferral",
+        carrierIdentifier: "SUP-8888",
+        pr: "corp/repo#42",
+        deadlocked: true,
+      });
+    });
+
+    it("reads clause 2 (live publishSkipped marker) with no attribution row", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "clause2",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+        executionState: {
+          approvalStatus: { publishSkipped: { reason: sharedCarrierReason } },
+        },
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge).toEqual({
+        attributed: true,
+        source: "publish_skipped",
+        reason: sharedCarrierReason,
+        carrierIdentifier: null,
+        pr: null,
+        deadlocked: null,
+      });
+    });
+
+    it("resolves carrierIdentifier from carrierOwnerId when carrierIdentifier is absent", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "carrier-owner",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+      });
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "done_close_landing_backstop",
+        action: ATTRIBUTED_LANDING_ACTION,
+        entityType: "issue",
+        entityId: issueId,
+        details: { skipReason: "owner-based", carrierOwnerId: "SUP-7777" },
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge.attributed).toBe(true);
+      expect(discharge.source).toBe("attribution_row");
+      expect(discharge.carrierIdentifier).toBe("SUP-7777");
+    });
+
+    it("is NOT attributed when publishSkipped.reason is present but lacks the marker", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "benign",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+        executionState: {
+          approvalStatus: { publishSkipped: { reason: benignReason } },
+        },
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge.attributed).toBe(false);
+      expect(discharge.source).toBeNull();
+      expect(discharge.reason).toBeNull();
+    });
+
+    it("is NOT attributed when neither clause holds", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "clean",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge).toEqual({
+        attributed: false,
+        source: null,
+        reason: null,
+        carrierIdentifier: null,
+        pr: null,
+        deadlocked: null,
+      });
+    });
+
+    it("is NOT attributed for an armed/exact-head close", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "armed",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+        executionState: {
+          approvalStatus: { publishedHeadSha: "exacthead1234", publishArmed: true },
+        },
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge.attributed).toBe(false);
+    });
+
+    it("is NOT attributed for a publishFailure", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "publish-failure",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+        executionState: {
+          approvalStatus: { publishFailure: { reason: "network unreachable" } },
+        },
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge.attributed).toBe(false);
+    });
+
+    it("prioritizes clause 1 over clause 2 when both are present", async () => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "both",
+        status: "done",
+        assigneeAgentId: carrierAgentId,
+        workMode: "standard",
+        executionState: {
+          approvalStatus: { publishSkipped: { reason: sharedCarrierReason } },
+        },
+      });
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "done_close_landing_backstop",
+        action: ATTRIBUTED_LANDING_ACTION,
+        entityType: "issue",
+        entityId: issueId,
+        details: { skipReason: "row-wins", carrierIdentifier: "SUP-5555" },
+      });
+
+      const discharge = await readAttributedLandingDischarge(db, companyId, issueId);
+      expect(discharge.source).toBe("attribution_row");
+      expect(discharge.reason).toBe("row-wins");
+      expect(discharge.carrierIdentifier).toBe("SUP-5555");
+    });
+  });
+
+  // ---- Producer behavior via the native status-decision committer (bullets 2/3/5) ----
+
+  interface Scenario {
+    blockerId: string;
+    dependentId: string;
+    runId: string;
+    assessmentId: string;
+  }
+
+  /**
+   * Seed a fresh native "blocker done + one wakeable dependent" scenario.
+   * The blocker has no executionWorkspaceId so the workspace-finalize barrier
+   * does not gate the dependent's readiness (readiness resolves purely on the
+   * in-transaction done status).
+   */
+  async function seedNativeBlockerDone(
+    suffix: string,
+    options: { publishSkippedReason?: string; publishedHeadSha?: string; attributionRow?: boolean } = {},
+  ): Promise<Scenario> {
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    const runId = randomUUID();
+    const contractId = randomUUID();
+    const resultId = randomUUID();
+    const assessmentId = randomUUID();
+    const workProductId = randomUUID();
+    const now = new Date();
+
+    const executionState =
+      options.publishSkippedReason || options.publishedHeadSha
+        ? {
+            approvalStatus: {
+              ...(options.publishSkippedReason
+                ? { publishSkipped: { reason: options.publishSkippedReason } }
+                : {}),
+              ...(options.publishedHeadSha ? { publishedHeadSha: options.publishedHeadSha } : {}),
+            },
+          }
+        : null;
+
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: `blocker ${suffix}`,
+      status: "in_progress",
+      assigneeAgentId: carrierAgentId,
+      workMode: "standard",
+      executionState,
+    });
+    await db.insert(issues).values({
+      id: dependentId,
+      companyId,
+      title: `dependent ${suffix}`,
+      status: "blocked",
+      assigneeAgentId: dependentAgentId,
+      workMode: "standard",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      type: "blocks",
+      issueId: blockerId,
+      relatedIssueId: dependentId,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: carrierAgentId,
+      status: "succeeded",
+      runtimeMode: "native",
+      runtimeModeResolvedAt: now,
+      nativeIssueId: blockerId,
+      contextSnapshot: { issueId: blockerId, suffix },
+      completionContractId: contractId,
+      completionContractSha256: `contract:${suffix}`,
+    });
+    await db.insert(completionContracts).values({
+      id: contractId,
+      companyId,
+      issueId: blockerId,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "phase6-v1",
+      risk: "standard",
+      completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "depwake-v1", criteria: [{ id: "objective", requirement: suffix }] },
+      canonicalSha256: `contract:${suffix}`,
+      createdByActorType: "system",
+      createdByActorId: "dep-wake-test",
+    });
+    await db.insert(nativeRunResults).values({
+      id: resultId,
+      companyId,
+      issueId: blockerId,
+      runId,
+      completionContractId: contractId,
+      serverFingerprint: `fingerprint:${suffix}`,
+      schemaStatus: "accepted",
+      resultJson: {
+        suffix,
+        result: {
+          reportedWorkDisposition: "done",
+          summary: `blocker ${suffix} done`,
+          completionClaim: {
+            contractRevision: "depwake-v1",
+            objectiveSatisfied: true,
+            criteria: [{ criterionId: "objective", status: "satisfied", evidenceRefs: [`work_product:${workProductId}`] }],
+            remainingWork: [],
+          },
+          verification: [{ commandOrCheck: "fixture", status: "passed", artifactRef: `work_product:${workProductId}` }],
+        },
+        terminal: { runTerminalState: "succeeded" },
+      },
+      canonicalSha256: `result:${suffix}`,
+    });
+    await db.insert(issueWorkProducts).values({
+      id: workProductId,
+      companyId,
+      issueId: blockerId,
+      type: "artifact",
+      provider: "paperclip",
+      title: `${suffix} evidence`,
+      status: "ready_for_review",
+      reviewState: "approved",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(workAssessments).values({
+      id: assessmentId,
+      companyId,
+      issueId: blockerId,
+      runId,
+      contractId,
+      resultId,
+      triggerKind: "native_result",
+      triggerActorCompanyId: companyId,
+      priorIssueStatus: "in_progress",
+      priorStatusVersion: 0,
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      assessmentJson: { suffix },
+      inputDigest: `assessment:${suffix}`,
+      createdAt: now,
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId,
+      companyId,
+      issueId: blockerId,
+      phase: "assessing",
+      resultId,
+      assessmentId,
+    });
+
+    if (options.attributionRow) {
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "done_close_landing_backstop",
+        action: ATTRIBUTED_LANDING_ACTION,
+        entityType: "issue",
+        entityId: blockerId,
+        details: {
+          skipReason: "shared-carrier deferral",
+          carrierIdentifier: "SUP-8888",
+          pr: "corp/repo#42",
+          deadlocked: true,
+        },
+      });
+    }
+
+    return { blockerId, dependentId, runId, assessmentId };
+  }
+
+  async function commitDone(scenario: Scenario) {
+    const decision: NativeStatusDecision = {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "done",
+      toStatus: "done",
+      reasonCode: "completion_contract_satisfied",
+      unblockDescriptor: null,
+      effects: [{ kind: "release_checkout" }],
+    };
+    return commitNativeStatusDecision({
+      db,
+      companyId,
+      issueId: scenario.blockerId,
+      runId: scenario.runId,
+      assessmentId: scenario.assessmentId,
+      priorStatus: "in_progress",
+      priorStatusVersion: 0,
+      priorDecisionId: null,
+      decision,
+    });
+  }
+
+  async function countDependentWakes(dependentId: string, blockerId: string) {
+    const idempotencyKey = `issue_blockers_resolved:${dependentId}:${blockerId}`;
+    const rows = await db
+      .select({
+        id: agentWakeupRequests.id,
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+        agentId: agentWakeupRequests.agentId,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ),
+      );
+    return rows;
+  }
+
+  async function countWithheldActivity(dependentId: string) {
+    const rows = await db
+      .select({
+        action: activityLog.action,
+        entityId: activityLog.entityId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, dependentId),
+        ),
+      );
+    return rows;
+  }
+
+  it("withholds the dependent wake via clause 2 (live publishSkipped marker): 0 wake rows + 1 withheld activity", async () => {
+    const scenario = await seedNativeBlockerDone("w-clause2", {
+      publishSkippedReason: sharedCarrierReason,
+    });
+
+    await commitDone(scenario);
+
+    const wakes = await countDependentWakes(scenario.dependentId, scenario.blockerId);
+    expect(wakes, "no issue_blockers_resolved wake may be enqueued").toHaveLength(0);
+
+    const withheld = await countWithheldActivity(scenario.dependentId);
+    expect(withheld, "exactly one dependency_wake_withheld audit row").toHaveLength(1);
+    expect(withheld[0]!.details).toMatchObject({
+      wakeReason: "issue_blockers_resolved",
+      dependentIssueId: scenario.dependentId,
+      resolvedBlockerIssueId: scenario.blockerId,
+      producer: "native_status_decision",
+      attributionSource: "publish_skipped",
+      refusalReason: sharedCarrierReason,
+    });
+  });
+
+  it("withholds the dependent wake via clause 1 (attribution row): 0 wake rows + 1 withheld activity", async () => {
+    const scenario = await seedNativeBlockerDone("w-clause1", {
+      attributionRow: true,
+      publishedHeadSha: "deadbeef",
+    });
+
+    await commitDone(scenario);
+
+    const wakes = await countDependentWakes(scenario.dependentId, scenario.blockerId);
+    expect(wakes, "no issue_blockers_resolved wake may be enqueued").toHaveLength(0);
+
+    const withheld = await countWithheldActivity(scenario.dependentId);
+    expect(withheld).toHaveLength(1);
+    expect(withheld[0]!.details).toMatchObject({
+      producer: "native_status_decision",
+      attributionSource: "attribution_row",
+      carrierIdentifier: "SUP-8888",
+    });
+  });
+
+  it("emits the dependent wake with the idempotency key when the landing is NOT attributed (positive)", async () => {
+    const scenario = await seedNativeBlockerDone("positive", {
+      publishedHeadSha: "published123",
+    });
+
+    await commitDone(scenario);
+
+    const wakes = await countDependentWakes(scenario.dependentId, scenario.blockerId);
+    expect(wakes, "the dependent wake must be enqueued").toHaveLength(1);
+    expect(wakes[0]!.reason).toBe(ISSUE_BLOCKERS_RESOLVED_WAKE_REASON);
+    expect(wakes[0]!.idempotencyKey).toBe(
+      `issue_blockers_resolved:${scenario.dependentId}:${scenario.blockerId}`,
+    );
+
+    const withheld = await countWithheldActivity(scenario.dependentId);
+    expect(withheld, "no withhold audit row when the wake is emitted").toHaveLength(0);
+  });
+
+  it("is level-triggered (clause 2): pass 1 withholds, pass 2 (publishSkipped cleared) emits", async () => {
+    // Pass 1: live publishSkipped marker, no attribution row -> withhold.
+    const pass1 = await seedNativeBlockerDone("2pass-p1", {
+      publishSkippedReason: sharedCarrierReason,
+    });
+    await commitDone(pass1);
+    expect(await countDependentWakes(pass1.dependentId, pass1.blockerId)).toHaveLength(0);
+    expect(await countWithheldActivity(pass1.dependentId)).toHaveLength(1);
+
+    // Pass 2: same card shape, but the landing republished -> publishSkipped
+    // cleared and publishedHeadSha set -> predicate returns attributed:false.
+    const pass2 = await seedNativeBlockerDone("2pass-p2", {
+      publishedHeadSha: "republished456",
+    });
+    await commitDone(pass2);
+    const emitted = await countDependentWakes(pass2.dependentId, pass2.blockerId);
+    expect(emitted, "the dependent wake must be emitted on the cleared pass").toHaveLength(1);
+    expect(emitted[0]!.idempotencyKey).toBe(
+      `issue_blockers_resolved:${pass2.dependentId}:${pass2.blockerId}`,
+    );
+  });
+});
