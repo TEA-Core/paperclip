@@ -814,6 +814,59 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       expect(await runsForWakeup(companyId, wakeId)).toEqual([]);
     });
 
+    /**
+     * Fold D9 regression, second half. The gate must sit at the promotion step, not at the head
+     * of this loop. The loop disposes of stale queued wakes before it promotes anything, so a
+     * loop-head gate skips the disposal too and the wake sits `deferred_issue_execution` forever
+     * instead of being cancelled. Measured on upstream #13284's reset test: 0/12 passes with the
+     * loop-head gate against 11/12 with the gate at the promotion step.
+     */
+    it("still disposes of a stale queued wake while a no-replay disposition holds the issue", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
+
+      // A queued comment that is no longer live: the disposal path cancels a wake whose queued
+      // comments have all been discarded.
+      const [queued] = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorUserId: "board-user",
+          body: "Queued before the stop",
+          deletedAt: new Date(),
+        })
+        .returning();
+
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        requestedByActorType: "user",
+        wakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [queued.id] },
+      });
+
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "active_run_watchdog",
+        ownerType: "board",
+        cause: "uncertain_provider_action",
+        status: "resolved",
+        fingerprint: randomUUID(),
+        evidence: { automaticRecovery: { replay: "blocked" } },
+        nextAction: "Do not replay the stopped turn.",
+      });
+
+      const [endingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingRun);
+
+      // Disposed of, not promoted and not left deferred.
+      const wake = await fetchWakeRow(wakeId);
+      expect(wake?.status).toBe("cancelled");
+      expect(await runsForWakeup(companyId, wakeId)).toEqual([]);
+    });
+
     it("still promotes the same deferred wake once no execution blocker holds the issue", async () => {
       const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
       const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
