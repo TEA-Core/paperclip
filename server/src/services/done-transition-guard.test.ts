@@ -116,10 +116,19 @@ function requestedLabelNames(condition: unknown): Set<string> {
   return values;
 }
 
+// SUP-17180: record each company-scoped labels read countLadderedChildren
+// issues, so a test can assert the four carve-out names resolve in ONE single
+// inArray read (not a second query for the process name). filterLabelRowsByName
+// is invoked exactly once per labels read, so this sequence is the read sequence.
+// The SUP-17177 carve-out (already merged) implemented the single-read behavior
+// but did not pin it; this probe asserts the query count, not just the outcome.
+const labelReadProbe: { conditions: unknown[] } = { conditions: [] };
+
 function filterLabelRowsByName(
   rows: Record<string, unknown>[],
   condition: unknown,
 ): Record<string, unknown>[] {
+  labelReadProbe.conditions.push(condition);
   const requested = requestedLabelNames(condition);
   return rows.filter((row) => typeof row.name === "string" && requested.has(row.name));
 }
@@ -2682,6 +2691,10 @@ describe("evaluateDoneTransitionGuard", () => {
     const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
     const parentStageId = "30000000-0000-4000-8000-000000000005";
     const processLabelId = "60000000-0000-4000-8000-00000000000b";
+    // SUP-17180 query-count probe: a redo label id so the probe can seed a
+    // redo-labelled child and assert `work-type:redo` rides in the SAME single
+    // labels read as the other carve-out names (one inArray, not four queries).
+    const redoLabelId = "60000000-0000-4000-8000-000000000009";
 
     const agents = [
       { id: supportCrId, name: "support-CR", role: "support" },
@@ -2961,6 +2974,48 @@ describe("evaluateDoneTransitionGuard", () => {
       );
       expect(d.allowed).toBe(false);
       expect(d.reason).toContain("Mechanism D");
+    });
+
+    // SUP-17180 (ADR-103 M1): the SUP-17177 carve-out already merged added
+    // `work-type:process` to the single company-scoped labels read but did not pin
+    // the QUERY COUNT. This probe asserts what the card requires — all four
+    // carve-out names resolve in ONE single inArray, not a second query for the
+    // process. If a regression re-introduces a second labels query for the process
+    // name, labelReadProbe would record two reads; if a single read dropped a
+    // carve-out name, the requested-set assertion fails. It pins the "assert the
+    // query count, not just the outcome" bullet the SUP-17177 carve-out left open.
+    it("resolves all four carve-out names in a SINGLE company-scoped labels read — one inArray covers four, not a second query (SUP-17180 AC: query count)", async () => {
+      const redoLabelRow = {
+        id: redoLabelId,
+        companyId: "company-1",
+        name: "work-type:redo",
+        color: "#000000",
+      };
+      labelReadProbe.conditions = [];
+      setupDbMock({
+        issues: [
+          manualChild("redo-1", "SUP-17191", "60000003-0000-4000-8000-000000000001"),
+          processChild("process-1", "SUP-17192", "60000003-0000-4000-8000-000000000002"),
+        ],
+        labels: [redoLabelRow, processLabelRow],
+        issueLabels: [
+          { issueId: "redo-1", labelId: redoLabelId, companyId: "company-1" },
+          { issueId: "process-1", labelId: processLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(labelReadProbe.conditions).toHaveLength(1);
+      const requested = requestedLabelNames(labelReadProbe.conditions[0]);
+      expect(requested.has("work-type:redo")).toBe(true);
+      expect(requested.has("work-type:delivery")).toBe(true);
+      expect(requested.has("work-type:architecture-review")).toBe(true);
+      expect(requested.has("work-type:process")).toBe(true);
     });
   });
 
