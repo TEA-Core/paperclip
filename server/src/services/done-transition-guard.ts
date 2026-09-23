@@ -22,6 +22,10 @@ import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import {
+  isLadderArmingParentEdge,
+  LADDERED_CHILD_CARVE_OUT_LABEL_NAMES,
+} from "./laddered-child-eligibility.js";
 import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
 
 export class GitHubAuthError extends Error {
@@ -61,39 +65,17 @@ const ADR072_CLOSE_LADDER: {
    { stageType: "approval", agentUrlKey: "exec-cto", label: "approval:exec-CTO" },
 ];
 
-// SUP-15464: the label name that marks a work-type:redo child. A redo card
-// re-delivers the same deliverable its parent already gated, so it is not a
-// decomposition child. Matched by name and resolved company-scoped — the label
-// id is company-scoped and this guard is not.
-// SUP-15533: the second non-decomposition label name, `work-type:delivery`,
-// marks a carrier/delivery helper child (the SUP-15410/SUP-15405 shape over the
-// coding leaf SUP-15140) that lands and re-delivers the parent's already-gated
-// deliverable. It is resolved by the same single company-scoped name read as
-// `work-type:redo` and feeds the same exclusion set, so both mechanism A and D
-// inherit the carve-out.
-// SUP-16586: the third non-decomposition label name,
-// `work-type:architecture-review`, marks a card filed to adjudicate a parent's
-// close gate (SUP-16569 over SUP-15805; SUP-16584). An architecture-review card
-// is a chain terminator per escalation.md — it is never sub-work and can never
-// be a decomposition child at any depth, so its parent must not be armed by it.
-// It is resolved by the SAME single company-scoped name read as the other two
-// and feeds the same exclusion set, so both mechanism A and D inherit it.
-const REDO_LABEL_NAME = "work-type:redo";
-const DELIVERY_LABEL_NAME = "work-type:delivery";
-const ARCHITECTURE_REVIEW_LABEL_NAME = "work-type:architecture-review";
-// SUP-17177 / SUP-17167: the fourth non-decomposition label name,
-// `work-type:process`, marks a procedurally-filed process child — a courier /
-// review-routing / unblock card parented to a work card during a rough round
-// (the SUP-16872 shape over SUP-16900 + SUP-16884). It does not gate a slice of
-// the parent's deliverable, so it is not a decomposition child. Without this
-// carve-out, two such procedural children silently arm mechanism D on an
-// otherwise-normal work card and can make its final `paperclip/approved`
-// transition unreachable (`process-child-reclassified-as-decomposed-parent`). It
-// is resolved by the SAME single company-scoped name read as the other three and
-// feeds the same exclusion set, so both mechanism A and D inherit it. A process
-// child that does NOT carry this label still counts — the carve-out is
-// label-gated, exactly like the three above.
-const PROCESS_LABEL_NAME = "work-type:process";
+// SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177: the four non-decomposition
+// label names (`work-type:redo`, `work-type:delivery`,
+// `work-type:architecture-review`, `work-type:process`) used to live here as
+// four private consts. They now live in laddered-child-eligibility.ts beside
+// the edge-time predicate, as the SINGLE copy, because the ADR-103 M4
+// create/re-parent gate has to resolve exactly the same names against an
+// INCOMING edge: a second copy is how that gate came to 409 children this
+// counter demonstrably excludes. The per-label reasoning travels with the
+// constant — see LADDERED_CHILD_CARVE_OUT_LABEL_NAMES. All four are still
+// matched by NAME and resolved company-scoped in one read below, because the
+// label id is company-scoped and this guard is not.
 
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
@@ -1193,7 +1175,7 @@ export async function countLadderedChildren(
         eq(labels.companyId, companyId),
         inArray(
           labels.name,
-          [REDO_LABEL_NAME, DELIVERY_LABEL_NAME, ARCHITECTURE_REVIEW_LABEL_NAME, PROCESS_LABEL_NAME],
+          [...LADDERED_CHILD_CARVE_OUT_LABEL_NAMES],
         ),
       ),
     );
@@ -1214,22 +1196,40 @@ export async function countLadderedChildren(
   const identifiers: string[] = [];
   const excludedChildIdentifiers: string[] = [];
   for (const row of rows) {
-    // SUP-16025: the child scope is non-cancelled qualifying children only.
-    // A cancelled row is not a decomposition signal even when it still carries
-    // a qualifying policy and a completed/skipped stage, so a cancelled-only
-    // parent stays legal on both `done` and `in_review`. Skip it BEFORE the
-    // origin/policy/state/carve-out qualification so it neither counts toward
-    // the `>= 2` threshold nor is recorded in the carve-out audit trail.
-    if (row.status === "cancelled") continue;
-    // SUP-15451: only decomposition children count. A platform-generated card
-    // parented to this issue (issue_productivity_review, task_watchdog,
-    // stale_active_run_evaluation, ...) is not a decomposition signal — it is
-    // not "which child gated this work?". The same reasoning as the SUP-15233
-    // drop of the blocks edge: an edge the platform itself draws must not arm
-    // the guard. The column defaults to 'manual' (notNull), so a missing value
-    // is an ordinary manually-filed card and counts.
-    const originKind = row.originKind ?? "manual";
-    if (originKind !== "manual" && !originKind.startsWith("plugin:")) continue;
+    // SUP-16025 (cancelled status) and SUP-15451 (platform-drawn origin): two
+    // exclusions that are decided by the edge alone — a cancelled row is not a
+    // decomposition signal even when it still carries a qualifying policy and a
+    // completed/skipped stage (so a cancelled-only parent stays legal on both
+    // `done` and `in_review`), and a platform-generated card parented to this
+    // issue (issue_productivity_review, task_watchdog,
+    // stale_active_run_evaluation, ...) is not an answer to "which child gated
+    // this work?" — the same reasoning as the SUP-15233 drop of the blocks
+    // edge: an edge the platform itself draws must not arm the guard.
+    //
+    // Both are applied through {@link isLadderArmingParentEdge}, the predicate
+    // the ADR-103 M4 create/re-parent gate also runs against the INCOMING edge.
+    // Sharing it is the point: M4 shipped with the gate adding the new child to
+    // this count unconditionally, so it refused platform-drawn edges this loop
+    // would never have counted (see laddered-child-eligibility.ts). Skip BEFORE
+    // the policy/state/carve-out qualification so an excluded row neither counts
+    // toward the `>= 2` threshold nor is recorded in the carve-out audit trail.
+    //
+    // `parentLinkKind` and `hasCarveOutLabel` are deliberately NOT passed here.
+    // The shared predicate knows both rules and the gate feeds it both, but on
+    // this side a `process` edge and a carve-out-labelled child must land in the
+    // arm below so the exclusion is recorded in `excludedChildIdentifiers` —
+    // that trail is what makes a mislabelled genuine child detectable in the
+    // mechanism A / D audit. Folding either into this call would silently drop
+    // it from the trail. The two sides therefore apply the SAME four edge-time
+    // rules; only where the last two are applied differs, and that difference
+    // exists solely to keep the audit trail complete.
+    if (
+      !isLadderArmingParentEdge({
+        status: row.status,
+        originKind: row.originKind,
+      })
+    )
+      continue;
     if (row.executionPolicy == null) continue;
     const state = parseIssueExecutionState(row.executionState);
     const completed = state?.completedStageIds?.length ?? 0;

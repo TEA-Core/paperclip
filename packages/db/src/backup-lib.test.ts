@@ -4,7 +4,12 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  runDatabaseBackup,
+  runDatabaseRestore,
+  splitConnectionStringPassword,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -613,4 +618,181 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     },
     20_000,
   );
+
+  it(
+    "never puts the database password in pg_dump argv",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-argv-");
+      const harnessDir = createTempDir("paperclip-db-backup-stub-");
+      const argvFile = path.join(harnessDir, "argv.txt");
+      const pgPasswordFile = path.join(harnessDir, "pgpassword.txt");
+      const stub = path.join(harnessDir, "fake-pg-dump.sh");
+
+      // Records exactly what a local user would see in `ps -eo args`, then emits a
+      // plausible dump so the gzip pipeline completes.
+      fs.writeFileSync(
+        stub,
+        [
+          "#!/bin/sh",
+          `: > ${JSON.stringify(argvFile)}`,
+          `for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argvFile)}; done`,
+          `printf '%s' "\${PGPASSWORD-}" > ${JSON.stringify(pgPasswordFile)}`,
+          'echo "-- stub pg_dump output"',
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+
+      const sourceUrl = new URL(connectionString);
+      const password = decodeURIComponent(sourceUrl.password);
+      expect(password).not.toBe("");
+      const expectedUrl = new URL(connectionString);
+      expectedUrl.password = "";
+
+      const previousPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = stub;
+      try {
+        await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 1, weeklyWeeks: 1, monthlyMonths: 1 },
+          backupEngine: "pg_dump",
+        });
+      } finally {
+        if (previousPgDumpPath === undefined) delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        else process.env.PAPERCLIP_PG_DUMP_PATH = previousPgDumpPath;
+      }
+
+      const argv = fs.readFileSync(argvFile, "utf8").split("\n").filter((line) => line.length > 0);
+      expect(argv).toContain(`--dbname=${expectedUrl.toString()}`);
+      for (const arg of argv) {
+        expect(arg).not.toContain(`:${password}@`);
+        expect(arg).not.toContain(`password=${password}`);
+      }
+      expect(fs.readFileSync(pgPasswordFile, "utf8")).toBe(password);
+    },
+    20_000,
+  );
+});
+
+describe("splitConnectionStringPassword", () => {
+  it("moves a URI password out of the connection string", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip:s3cr3t@db:5432/paperclip");
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+    expect(result.connectionString).not.toContain("s3cr3t");
+  });
+
+  it("percent-decodes the password and preserves query parameters", () => {
+    const result = splitConnectionStringPassword(
+      "postgresql://paperclip:p%40ss%3Aword@db:5432/paperclip?sslmode=disable",
+    );
+    expect(result.password).toBe("p@ss:word");
+    expect(result.connectionString).toBe("postgresql://paperclip@db:5432/paperclip?sslmode=disable");
+  });
+
+  it("strips the password from a Unix-socket URI, which has no host", () => {
+    const result = splitConnectionStringPassword(
+      "postgresql://paperclip:s3cr3t@/paperclip?host=/var/run/postgresql",
+    );
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).toBe("postgresql://paperclip@/paperclip?host=/var/run/postgresql");
+  });
+
+  it("strips an unencoded ? or # from the userinfo password", () => {
+    // Verified against a real server: libpq's userinfo scan stops only at `/`,
+    // so both of these authenticate with the full password.
+    const withQuestion = splitConnectionStringPassword("postgres://paperclip:p?ss@db:5432/paperclip");
+    expect(withQuestion.password).toBe("p?ss");
+    expect(withQuestion.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+
+    const withHash = splitConnectionStringPassword("postgres://paperclip:p#ss@db:5432/paperclip");
+    expect(withHash.password).toBe("p#ss");
+    expect(withHash.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("treats # as an ordinary character in a query password, as libpq does", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=a#b");
+    expect(result.password).toBe("a#b");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("finds the real query after a ? inside the userinfo password", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip:p?ss@db:5432/paperclip?sslmode=require");
+    expect(result.password).toBe("p?ss");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip?sslmode=require");
+  });
+
+  it("strips the password from a multi-host URI", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip:s3cr3t@h1:5432,h2:5432/paperclip");
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).toBe("postgres://paperclip@h1:5432,h2:5432/paperclip");
+  });
+
+  it("reads a plus sign in the password literally, as libpq does", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=a+b");
+    expect(result.password).toBe("a+b");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("leaves neighbouring query parameters byte for byte", () => {
+    const result = splitConnectionStringPassword(
+      "postgres://paperclip@db:5432/paperclip?options=-c%20search_path%3Dfoo&password=s3cr3t&sslmode=require",
+    );
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).toBe(
+      "postgres://paperclip@db:5432/paperclip?options=-c%20search_path%3Dfoo&sslmode=require",
+    );
+  });
+
+  it("removes every repeated password parameter and keeps the last, as libpq does", () => {
+    const result = splitConnectionStringPassword(
+      "postgres://paperclip@db:5432/paperclip?password=first&sslmode=require&password=last",
+    );
+    // Verified against a real server: libpq applies parameters left to right and
+    // each overwrites the last, so the final copy is the one that authenticates.
+    expect(result.password).toBe("last");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip?sslmode=require");
+    expect(result.connectionString).not.toContain("password");
+  });
+
+  it("drops the whole query when every parameter was a password", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=a&password=b");
+    expect(result.password).toBe("b");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("removes both copies and prefers the query parameter, as libpq does", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip:fromuserinfo@db:5432/paperclip?password=fromquery");
+    expect(result.password).toBe("fromquery");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("throws rather than pass a postgres URI through with its password intact", () => {
+    expect(() => splitConnectionStringPassword("postgres://paperclip:bad%2@db:5432/paperclip")).toThrow(
+      /Malformed percent-encoding/,
+    );
+  });
+
+  it("strips a password passed as a URI query parameter", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=s3cr3t&sslmode=require");
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).not.toContain("s3cr3t");
+    expect(result.connectionString).toContain("sslmode=require");
+  });
+
+  it("strips a password from the keyword form without disturbing other values", () => {
+    const result = splitConnectionStringPassword("host=db port=5432 password='s3 cr3t' dbname=paperclip options='-c a  b'");
+    expect(result.password).toBe("s3 cr3t");
+    expect(result.connectionString).toBe("host=db port=5432 dbname=paperclip options='-c a  b'");
+  });
+
+  it("returns passwordless connection strings unchanged", () => {
+    for (const input of ["postgres://paperclip@db:5432/paperclip", "host=db dbname=paperclip"]) {
+      const result = splitConnectionStringPassword(input);
+      expect(result.password).toBeUndefined();
+      expect(result.connectionString).toBe(input);
+    }
+  });
 });

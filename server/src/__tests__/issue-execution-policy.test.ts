@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -4138,5 +4138,214 @@ describe("delivery author record (SUP-13899)", () => {
       deliveryAuthor: { type: "agent", agentId: ctoAgentId },
       returnAssignee: { type: "agent", agentId: coderAgentId },
     });
+  });
+});
+
+describe("approvalStatus preservation across monitor transitions (SUP-16977)", () => {
+  // Measured shape from the SUP-16825 instance: the out-of-band publish record
+  // merge-arming writes via jsonb_set into executionState.approvalStatus.
+  const approvalStatus = {
+    approvedAt: "2026-09-19T01:07:28.641Z",
+    publishedAt: "2026-09-19T01:07:28.641Z",
+    approvedHeadSha: "a82663a4bb0cfd8927c9cbe58ff6665a3bdeba74",
+    publishedHeadSha: "a82663a4bb0cfd8927c9cbe58ff6665a3bdeba74",
+    armOutcome: {
+      kind: "armed",
+      at: "2026-09-19T01:07:30.835Z",
+      message: "armed: Auto-merge enabled for tea-core/trading-signal-platform#3651",
+    },
+  };
+
+  function monitorPolicy() {
+    return normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: {
+        nextCheckAt: "2026-04-11T12:30:00.000Z",
+        notes: "Check deployment",
+        scheduledBy: "assignee",
+      },
+    })!;
+  }
+
+  // A fully-formed ladder state carrying the out-of-band approvalStatus key.
+  function ladderStateWithApproval(monitor: Record<string, unknown> | null = null) {
+    return {
+      status: "pending",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      deliveryAuthor: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor,
+      changesRequestedCount: 0,
+      pendingSince: "2026-04-11T12:00:00.000Z",
+      approvalStatus,
+    };
+  }
+
+  function scheduledMonitorState() {
+    return {
+      status: "scheduled",
+      nextCheckAt: "2026-04-11T12:30:00.000Z",
+      lastTriggeredAt: null,
+      attemptCount: 0,
+      notes: "Check deployment",
+      scheduledBy: "assignee",
+      clearedAt: null,
+      clearReason: null,
+    };
+  }
+
+  it("arming a monitor via executionPolicy.monitor leaves approvalStatus byte-identical", () => {
+    const policy = monitorPolicy();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: null,
+        executionState: ladderStateWithApproval(null),
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      },
+      policy,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    const state = result.patch.executionState as Record<string, unknown>;
+    expect(JSON.stringify(state.approvalStatus)).toBe(JSON.stringify(approvalStatus));
+    expect(state.monitor).toMatchObject({
+      status: "scheduled",
+      nextCheckAt: "2026-04-11T12:30:00.000Z",
+    });
+  });
+
+  it("buildIssueMonitorClearedPatch leaves approvalStatus byte-identical", () => {
+    const policy = monitorPolicy();
+    const patch = buildIssueMonitorClearedPatch({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: ladderStateWithApproval(scheduledMonitorState()),
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+        monitorLastTriggeredAt: null,
+        monitorNotes: "Check deployment",
+        monitorScheduledBy: "assignee",
+      },
+      policy,
+      clearReason: "manual",
+      clearedAt: new Date("2026-04-11T13:00:00.000Z"),
+    });
+
+    const state = patch.executionState as Record<string, unknown>;
+    expect(JSON.stringify(state.approvalStatus)).toBe(JSON.stringify(approvalStatus));
+    expect(state.monitor).toMatchObject({ status: "cleared", clearReason: "manual" });
+  });
+
+  it("buildIssueMonitorTriggeredPatch leaves approvalStatus byte-identical", () => {
+    const policy = monitorPolicy();
+    const patch = buildIssueMonitorTriggeredPatch({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: ladderStateWithApproval(scheduledMonitorState()),
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+        monitorLastTriggeredAt: null,
+        monitorNotes: "Check deployment",
+        monitorScheduledBy: "assignee",
+      },
+      policy,
+      triggeredAt: new Date("2026-04-11T12:35:00.000Z"),
+    });
+
+    const state = patch.executionState as Record<string, unknown>;
+    expect(JSON.stringify(state.approvalStatus)).toBe(JSON.stringify(approvalStatus));
+    expect(state.monitor).toMatchObject({ status: "triggered" });
+  });
+
+  it("P3 shape: a column holding only approvalStatus (no valid ladder) survives a monitor arm", () => {
+    // This shape fails the schema parse (no ladder fields), so it exercises the
+    // parse-failure residue path that only P3 covers. MUST fail with P1+P2 alone.
+    const policy = monitorPolicy();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: null,
+        // Raw column: out-of-band key only, no ladder — parse returns null.
+        executionState: { approvalStatus },
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      },
+      policy,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    const state = result.patch.executionState as Record<string, unknown>;
+    expect(JSON.stringify(state.approvalStatus)).toBe(JSON.stringify(approvalStatus));
+    expect(state.monitor).toMatchObject({
+      status: "scheduled",
+      nextCheckAt: "2026-04-11T12:30:00.000Z",
+    });
+  });
+
+  it("blank path: a card with no executionState still gets a well-formed monitor state", () => {
+    const policy = monitorPolicy();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: null,
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      },
+      policy,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    const state = result.patch.executionState as Record<string, unknown>;
+    expect(state).toMatchObject({
+      status: "idle",
+      monitor: {
+        status: "scheduled",
+        nextCheckAt: "2026-04-11T12:30:00.000Z",
+        scheduledBy: "assignee",
+      },
+    });
+    // No approvalStatus key is invented on a blank card.
+    expect(state.approvalStatus).toBeUndefined();
   });
 });

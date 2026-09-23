@@ -21,6 +21,11 @@
 #   GET repos/{owner}/{repo}/pulls/{n}/reviews   (only when a waiver is
 #                                                 present on a fold-sync head)
 #
+# All three go through `gh_api_retry`, which re-issues them on an HTTP 5xx or a
+# transport failure (3 attempts, 2s then 5s, so at most +7s per call site) and
+# never on a 4xx. See the long note at that function for why a 403 is excluded
+# and for the incident that motivated it.
+#
 # ATTRIBUTION. `paperclip/approved` is a plain commit status and the
 # `fleet-only` installation grants `statuses:write` to every Paperclip-assigned
 # agent, so possession of the signal proves nothing on its own — any agent could
@@ -162,6 +167,153 @@ fail() {
   exit 0
 }
 
+# --- transient-failure retry for the read-only API calls ---------------------
+# Measured 2026-09-23. Merge window attempt 3 for fold PR #748 was ejected from
+# the merge queue on this job, and the whole log was:
+#
+#   [paperclip-approved] checking TEA-Core/paperclip PR #748 (mode: enforcing)
+#   [paperclip-approved][error] API failure: GET repos/TEA-Core/paperclip/pulls/748 — Unexpected error
+#   gh: HTTP 500
+#
+# Every other precondition was green — CI 30/0, 0 commits behind, an empty
+# queue, and the merged tree proved byte-identical to the PR head tree that had
+# just passed CI. A single transient GitHub 5xx on one read-only GET cost the
+# whole window, which is about 98 runner-minutes (see the merge-queue ejection
+# cost note). This leg is fail-closed on merge_group by design and MUST stay
+# that way — an error must never read as approved — so the only correct fix is
+# to stop treating a server-side blip as an answer.
+#
+# WHAT IS RETRIED, AND WHY ONLY THIS. All three call sites are read-only GETs,
+# so re-issuing one has no side effect and cannot double-apply anything. The
+# retry is therefore scoped to the transport/server layer:
+#
+#   HTTP 5xx        retried. A 500/502/503/504 is GitHub saying "I failed",
+#                   not "the answer is no". It is exactly the class that
+#                   clears on its own within seconds.
+#   transport       retried. Connection reset/refused, unexpected EOF, i/o or
+#                   TLS-handshake timeout, DNS blips: same shape, no answer
+#                   was ever produced.
+#   HTTP 4xx        NOT retried, checked FIRST so it can never be overridden
+#                   by a 5xx-looking substring in a response body. A 401, 404
+#                   or 422 is a real, stable answer and repeating it only
+#                   delays a correct failure by the whole backoff budget.
+#
+#   403 IN PARTICULAR IS NOT RETRIED, deliberately. A 403 here is either a
+#   permissions answer (stable — retrying is pure delay) or a rate limit. Both
+#   GitHub rate limits are far longer-lived than any backoff a CI gate may
+#   spend: the primary limit resets on the hour and returns a Retry-After that
+#   is routinely minutes, and secondary limits persist for minutes and are
+#   documented to EXTEND when you keep requesting while limited. A 7-second
+#   budget cannot clear either one, so retrying a 403 would convert a fast,
+#   correct, legible failure into a slower identical failure — and, in the
+#   secondary-limit case, make the underlying condition worse for every other
+#   job on the same token. Both workflows that invoke this script (pr.yml and
+#   paperclip-approved.yml) pass `GH_TOKEN: ${{ github.token }}`, the per-job
+#   installation token — NOT the fleet personal PAT — so the blast radius is
+#   this repository's jobs rather than the whole fleet. It is still real. A
+#   rate-limited gate is a capacity problem to fix at the token, not a blip to
+#   paper over here.
+#
+# BOUNDED, AND FREE IN THE HAPPY PATH. Attempts = 1 + ${#GH_API_BACKOFF[@]},
+# i.e. 3 attempts, with sleeps of 2s then 5s. Worst-case ADDED wall time is
+# therefore exactly 7 seconds per call site. Across a whole run the reachable
+# worst case is 14 seconds, not 21: `fail` always exits, so if the first call
+# (GET pulls/{n}) exhausts its attempts the script terminates there and the
+# other two never run. Only the reviews and statuses reads can both exhaust in
+# one execution — that happens when a waiver is present but its countersignature
+# read exhausts, which returns advisory rather than exiting, and the run then
+# falls through to the statuses read. Bounded by construction either way,
+# because the backoff list is finite and is the only thing that produces a
+# sleep. When the first attempt succeeds the function
+# returns before reaching any sleep, so the ordinary run is not one millisecond
+# slower than before.
+GH_API_BACKOFF=(2 5)
+
+# gh_api_retryable <combined-output>
+#   0 -> the failure looks transient and re-issuing the GET may help
+#   1 -> the failure is an answer (or unrecognised): do not retry
+gh_api_retryable() {
+  # Lowercased once so every pattern below can be written in one case. gh's
+  # wording is not stable across versions ("gh: HTTP 500" for a non-JSON body,
+  # "gh: <message> (HTTP 502)" when the body parses), so the patterns match the
+  # code anywhere in the text rather than anchoring on a fixed prefix.
+  local text="${1,,}" client_error='http 4[0-9][0-9]' server_error='http 5[0-9][0-9]' transport
+
+  # 4xx first and unconditionally. See the 403 reasoning above.
+  [[ "$text" =~ $client_error ]] && return 1
+
+  [[ "$text" =~ $server_error ]] && return 0
+
+  transport='connection reset|connection refused|broken pipe|unexpected eof'
+  transport+='|i/o timeout|client\.timeout|tls handshake timeout'
+  transport+='|context deadline exceeded|dial tcp|no such host|server misbehaving'
+  transport+='|temporary failure in name resolution'
+  [[ "$text" =~ $transport ]] && return 0
+
+  return 1
+}
+
+# gh_api_retry <gh api args...>
+# Drop-in replacement for `gh api "$@" 2>&1` in a command substitution: it emits
+# the combined stdout+stderr of the LAST attempt on stdout and returns that
+# attempt's exit status, so each call site's existing error text, control flow
+# and exit codes are byte-for-byte what they were before.
+#
+# The `2>&1` moved INSIDE this function on purpose. It still merges gh's stderr
+# into the caller's variable — that is what makes `${PR_JSON}` carry "gh: HTTP
+# 500" in the failure message — but it now applies to gh ONLY. The retry log
+# lines below go through `err`, which writes to the script's real stderr; had
+# they used `note` (stdout) or had a call site kept its own `2>&1`, the retry
+# chatter would be captured into the payload variable and fed straight to `jq`.
+#
+# --paginate + --jq: THE ONE WAY TO GET THIS WRONG. With `--paginate`, gh
+# streams each page's `--jq` output as it arrives, so a call that dies on page 3
+# has ALREADY emitted pages 1-2 before exiting non-zero. Accumulating output
+# across attempts — appending, or teeing to a file — would therefore splice a
+# truncated first attempt onto a complete second one and hand the caller a
+# duplicated status/review list. That is avoided structurally rather than by
+# care: every attempt captures into the SAME local `out` via a fresh command
+# substitution, so each attempt's result wholly REPLACES the previous one and a
+# partial page stream is discarded the moment the retry begins. There is no
+# concatenation operator anywhere in this function, and there must never be.
+gh_api_retry() {
+  local attempt=1 attempts=$(( ${#GH_API_BACKOFF[@]} + 1 )) rc=0 out="" wait_s line
+
+  while :; do
+    # Fresh capture, never an append. See the --paginate note above.
+    out="$(gh api "$@" 2>&1)" && rc=0 || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+      if [ "$attempt" -gt 1 ]; then
+        err "gh api recovered on attempt ${attempt}/${attempts}: gh api $*"
+      fi
+      printf '%s\n' "$out"
+      return 0
+    fi
+
+    if [ "$attempt" -ge "$attempts" ] || ! gh_api_retryable "$out"; then
+      break
+    fi
+
+    wait_s="${GH_API_BACKOFF[$(( attempt - 1 ))]}"
+    # Logged, never silent: a gate that quietly papers over 5xx hides a
+    # degrading API until it degrades past three attempts.
+    err "gh api attempt ${attempt}/${attempts} failed with a transient error (rc=${rc}), retrying in ${wait_s}s: gh api $*"
+    # Prefix EVERY line: a multi-line gh payload would otherwise land in the
+    # merge-queue log as bare unprefixed lines, and any `::`-prefixed line
+    # inside an API payload would sit at column 0 where Actions reads it as a
+    # workflow command.
+    while IFS= read -r line; do err "  ${line}"; done <<<"$out"
+    sleep "$wait_s"
+    attempt=$(( attempt + 1 ))
+  done
+
+  # Exhausted, or a non-transient answer. Hand the caller exactly what a single
+  # unretried `gh api ... 2>&1` would have handed it.
+  printf '%s\n' "$out"
+  return "$rc"
+}
+
 # --- reporting the verdict to the PR checks view (advisory leg) -------------
 # The pull_request leg is green on purpose (advisory), so a bare exit 0 is all
 # an operator sees in the PR checks view even when the merge queue is about to
@@ -301,7 +453,7 @@ fi
 note "checking ${REPO} PR #${PR_NUMBER} (mode: ${MODE})"
 
 # --- PR head SHA + waiver metadata (one read-only call) ----------------------
-PR_JSON="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" 2>&1)" \
+PR_JSON="$(gh_api_retry "repos/${REPO}/pulls/${PR_NUMBER}")" \
   || fail "API failure: GET repos/${REPO}/pulls/${PR_NUMBER} — ${PR_JSON}"
 jq -e . >/dev/null 2>&1 <<<"$PR_JSON" \
   || fail "malformed PR payload from GET repos/${REPO}/pulls/${PR_NUMBER}"
@@ -353,9 +505,9 @@ esac
 #                     because this gate is what a compromised token would aim at.
 human_countersigner() {
   local reviews state commit login utype assoc approver
-  reviews="$(gh api --paginate \
+  reviews="$(gh_api_retry --paginate \
     "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" \
-    --jq '.[] | [(.state // ""), (.commit_id // ""), (.user.login // ""), (.user.type // ""), (.author_association // "")] | @tsv' 2>&1)" \
+    --jq '.[] | [(.state // ""), (.commit_id // ""), (.user.login // ""), (.user.type // ""), (.author_association // "")] | @tsv')" \
     || { err "API failure: GET repos/${REPO}/pulls/${PR_NUMBER}/reviews — ${reviews}"; return 2; }
 
   # Reviews come back in submission order, so a later state for a login
@@ -471,9 +623,9 @@ fi
 # unpaginated read sees `missing` and — this leg being fail-closed — blocks an
 # approved entry out of the queue. Pagination preserves order across pages, so
 # the first matching row is still the newest.
-STATUSES_TSV="$(gh api --paginate \
+STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-  --jq '.[] | [(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")] | @tsv' 2>&1)" \
+  --jq '.[] | [(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")] | @tsv')" \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
