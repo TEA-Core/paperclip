@@ -1732,7 +1732,7 @@ async function evaluateDoneTransitionGuardCore(
     // non-conforming; adding stages to an already-advanced ladder wedges it.
     const mechanismRemedy =
       "Re-parent the procedural child that armed this close gate to an ancestor, or declare it " +
-      "`work-type:process` (or `parent_link_kind: 'process'` once the column ships); adding a stage " +
+      "`work-type:process` (or `parent_link_kind: 'process'`); adding a stage " +
       "to this ladder is legal only while the pointer has not advanced past the first close-ladder " +
       `rung (ADR-102 M1). Then ${remedy.charAt(0).toLowerCase()}${remedy.slice(1)}`;
     return {
