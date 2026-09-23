@@ -1163,6 +1163,11 @@ export async function countLadderedChildren(
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
       originKind: issues.originKind,
+      // ADR-103 M2: the edge's own kind, read lazily at close from the live row.
+      // A `process` edge is not a decomposition signal (the child gates no slice
+      // of this parent's deliverable), so it is excluded below just like a
+      // carve-out-labelled child.
+      parentLinkKind: issues.parentLinkKind,
     })
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
@@ -1250,7 +1255,13 @@ export async function countLadderedChildren(
     // so the carve-out is visible in the mechanism A / D audit trail (a
     // mislabelled genuine child is detectable there), and do not count it toward
     // the decomposition.
-    if (carveOutChildIds?.has(row.id)) {
+    // ADR-103 M2: a `parent_link_kind = 'process'` edge is not a decomposition
+    // signal either — it is declared procedural at the edge and gates no slice of
+    // this parent's deliverable. Exclude it (and record it in the audit trail)
+    // identically to a carve-out-labelled child. Back-compat keeps the label
+    // check, so a child carrying any of the four carve-out labels is treated as
+    // `process` regardless of the column value (no relabelling campaign needed).
+    if (row.parentLinkKind === "process" || carveOutChildIds?.has(row.id)) {
       excludedChildIdentifiers.push(row.identifier ?? "<unnamed>");
       continue;
     }
@@ -1721,7 +1732,7 @@ async function evaluateDoneTransitionGuardCore(
     // non-conforming; adding stages to an already-advanced ladder wedges it.
     const mechanismRemedy =
       "Re-parent the procedural child that armed this close gate to an ancestor, or declare it " +
-      "`work-type:process` (or `parent_link_kind: 'process'` once the column ships); adding a stage " +
+      "`work-type:process` (or `parent_link_kind: 'process'`); adding a stage " +
       "to this ladder is legal only while the pointer has not advanced past the first close-ladder " +
       `rung (ADR-102 M1). Then ${remedy.charAt(0).toLowerCase()}${remedy.slice(1)}`;
     return {

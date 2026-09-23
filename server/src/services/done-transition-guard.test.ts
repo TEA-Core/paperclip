@@ -3019,6 +3019,175 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("ADR-103 M2: parent_link_kind read in the done-transition guard (SUP-17182)", () => {
+    const supportCrId = "eeeeeee4-0000-4000-8000-000000000004";
+    const parentStageId = "31000000-0000-4000-8000-000000000005";
+    const processLabelId = "61000000-0000-4000-8000-00000000000b";
+
+    const agents = [
+      { id: supportCrId, name: "support-CR", role: "support" },
+    ];
+
+    const parentLadder = {
+      stages: [
+        { id: parentStageId, type: "review", participants: [{ type: "agent", agentId: supportCrId }] },
+      ],
+    };
+
+    const satisfiedState = (stageIds: string[]) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: stageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    const processLabelRow = {
+      id: processLabelId,
+      companyId: "company-1",
+      name: "work-type:process",
+      color: "#000000",
+    };
+
+    // A genuine decomposition child: parent_link_kind 'decomposition', a ran review
+    // ladder, no carve-out label. Counts toward the >= 2 threshold.
+    const decomposedChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      parentLinkKind: "decomposition",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    // A procedural child declared at the EDGE: parent_link_kind 'process', NO label.
+    // The exclusion must come from the column, not from any issue_labels join.
+    const processKindChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      parentLinkKind: "process",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    it("excludes a parent_link_kind='process' child so a process-only parent owes no close ladder — no label required (SUP-17182 AC: column read)", async () => {
+      // Two procedural children declared at the edge. Pre-change the guard ignores
+      // parent_link_kind, so both count -> count 2 -> mechanism A and D refuse the
+      // close. Post-change the column read excludes both -> count 0 -> the close
+      // is legal. This is the direct red->green for M2.
+      const children = [
+        processKindChild("process-1", "SUP-17201", "42000000-0000-4000-8000-000000000001"),
+        processKindChild("process-2", "SUP-17202", "43000000-0000-4000-8000-000000000002"),
+      ];
+
+      // Mechanism A (null policy): no carve-out label is seeded, so the exclusion
+      // can only come from the column.
+      setupDbMock({ issues: children, labels: [], issueLabels: [] });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [], issueLabels: [], agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("counts a child whose parent_link_kind is defaulted/omitted, so every pre-migration row keeps today's meaning (SUP-17182 AC: default)", async () => {
+      // Two ordinary children whose parent_link_kind is NOT 'process' (here omitted,
+      // as a pre-migration row read before the column was ever written). The column
+      // read must not over-exclude: only an explicit 'process' value excludes. Both
+      // count -> count 2 -> mechanism D still refuses.
+      const children = [
+        { ...decomposedChild("child-1", "SUP-17203", "44000000-0000-4000-8000-000000000001"), parentLinkKind: undefined },
+        { ...decomposedChild("child-2", "SUP-17204", "45000000-0000-4000-8000-000000000002"), parentLinkKind: undefined },
+      ];
+      setupDbMock({ issues: children, labels: [], issueLabels: [], agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+    });
+
+    it("still excludes a carve-out-labelled child regardless of its parent_link_kind (back-compat, SUP-17182 AC)", async () => {
+      // A child carrying the work-type:process label must be excluded even when the
+      // column says 'decomposition' (or is unset) — M2 must not withdraw M1's label
+      // protection. No relabelling campaign, and M1's protection is never withdrawn.
+      const children = [
+        { ...decomposedChild("labelled-1", "SUP-17205", "46000000-0000-4000-8000-000000000001") },
+        { ...decomposedChild("labelled-2", "SUP-17206", "47000000-0000-4000-8000-000000000002"), parentLinkKind: undefined },
+      ];
+      const issueLabels = [
+        { issueId: "labelled-1", labelId: processLabelId, companyId: "company-1" },
+        { issueId: "labelled-2", labelId: processLabelId, companyId: "company-1" },
+      ];
+      setupDbMock({ issues: children, labels: [processLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+    });
+
+    it("records a parent_link_kind='process' child in excludedChildIdentifiers (SUP-17182 AC: audit)", async () => {
+      // Two genuine decomposition children + one edge-declared process child (no
+      // label): the count stays 2 so both mechanisms still refuse, and the process
+      // child must be recorded so a procedural edge masquerading as work is
+      // detectable in the audit trail.
+      const children = [
+        decomposedChild("genuine-1", "SUP-17207", "48000000-0000-4000-8000-000000000001"),
+        decomposedChild("genuine-2", "SUP-17208", "49000000-0000-4000-8000-000000000002"),
+        processKindChild("process-1", "SUP-17209", "52000000-0000-4000-8000-000000000003"),
+      ];
+
+      setupDbMock({ issues: children, labels: [], issueLabels: [], agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-17207", "SUP-17208"],
+            excludedChildIdentifiers: ["SUP-17209"],
+          }),
+        }),
+      );
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
