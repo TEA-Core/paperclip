@@ -3021,6 +3021,120 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("armed");
       expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
     });
+
+    it("a force-push that lands between scan and the arm-boundary re-check suppresses the re-arm (finding: stale-live-head-authorization-race)", async () => {
+      // The call-site reads /pulls/42 and sees NEW_HEAD (the head that carries
+      // the stamp). By the time the arm-boundary guard re-reads /pulls/42, the
+      // head has force-pushed to MOVED_HEAD. arming an UNSTAMPED new head would
+      // violate the "queue only stamped heads" invariant, so the re-arm must be
+      // suppressed WITHOUT reserving a slot (no arm I/O, no counter write).
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      const movedPrBody = { ...OPEN_PR_BODY, head: { ref: "SUP-42-branch", sha: MOVED_HEAD } };
+      let pullsReads = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url === PR_URL) {
+          pullsReads += 1;
+          // Call-site read -> NEW_HEAD (stamped). Arm-boundary re-read -> MOVED_HEAD.
+          const body = pullsReads === 1 ? OPEN_PR_BODY : movedPrBody;
+          return { ok: true, status: 200, json: async () => body } as unknown as Response;
+        }
+        if (url === COMBINED_STATUS_URL) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(0);
+      expect(summary.rearmDetails).toHaveLength(0);
+      // The actuator was never reached: no arming I/O.
+      const graphqlCalls = mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+      expect(graphqlCalls).toHaveLength(0);
+      // No slot was consumed: the per-head counter was never written.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.armReattempt).toBeUndefined();
+    });
+
+    it("the per-head cap holds under concurrent ticks: with attempts at cap-1, two parallel ticks arm exactly once (finding: retry-cap-not-concurrency-safe)", async () => {
+      // armReattempt.attempts = 2 (= MAX_REARM_ATTEMPTS_PER_HEAD - 1). Two ticks
+      // run in parallel; both pass the read-side pre-check (2 < 3), but only one
+      // reservation can claim the 3rd slot — the other sees attempts = 3 once the
+      // first reservation commits and suppresses. Exactly one arm, and the
+      // counter lands at exactly 3 (not 4).
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "failed", message: "failed:HTTP 502 Bad Gateway", at: APPROVED_AT },
+            armReattempt: { headSha: NEW_HEAD, attempts: 2, at: APPROVED_AT },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      await Promise.all([runApprovalStatusReconcilerTick(db), runApprovalStatusReconcilerTick(db)]);
+
+      // Exactly one arm I/O across both ticks.
+      const graphqlCalls = mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+      expect(graphqlCalls).toHaveLength(1);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 3 });
+    });
+
+    it("a recorded skipped:already-queued armOutcome is terminal, equivalent to armed — not re-armed (finding: already-queued-retried)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: {
+              kind: "skipped",
+              message: "skipped:already-queued: TEA-Core/paperclip#42 already queued to merge",
+              at: APPROVED_AT,
+            },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(0);
+      expect(summary.rearmDetails).toHaveLength(0);
+      // No arm I/O and no slot write: the merge is already queued.
+      const graphqlCalls = mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+      expect(graphqlCalls).toHaveLength(0);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.armReattempt).toBeUndefined();
+      expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("skipped");
+    });
   });
 
   describe("first publish anchored on approvedHeadSha (SUP-14715 D-B)", () => {
