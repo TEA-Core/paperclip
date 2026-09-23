@@ -4,6 +4,7 @@ import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
   checkoutIssueSchema,
+  createChildIssueSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   issueExecutionMonitorPolicySchema,
@@ -1173,6 +1174,69 @@ describe("issue validators", () => {
     expect(parsed.executionPolicy?.monitor?.scheduledBy).toBe("assignee");
     expect(parsed.executionPolicy?.stages).toHaveLength(1);
     expect(parsed.executionPolicy?.stages[0].type).toBe("review");
+  });
+
+  describe("ADR-103 M2: parentLinkKind edge field (SUP-17182)", () => {
+    const parentId = "31000000-0000-4000-8000-000000000005";
+
+    it("create accepts and preserves parentLinkKind alongside parentId (written beside the edge)", () => {
+      const parsed = createIssueSchema.parse({
+        title: "Edge-declared process child",
+        parentId,
+        parentLinkKind: "process",
+      });
+      expect(parsed.parentId).toBe(parentId);
+      expect(parsed.parentLinkKind).toBe("process");
+      expect(
+        createIssueSchema.parse({
+          title: "Decomposition child",
+          parentId,
+          parentLinkKind: "decomposition",
+        }).parentLinkKind,
+      ).toBe("decomposition");
+    });
+
+    it("create omits parentLinkKind when not provided so the column default applies", () => {
+      expect(createIssueSchema.parse({ title: "No kind" }).parentLinkKind).toBeUndefined();
+    });
+
+    it("create rejects an invalid parentLinkKind value (400)", () => {
+      expect(
+        createIssueSchema.safeParse({
+          title: "Bad",
+          parentId,
+          parentLinkKind: "other",
+        }).success,
+      ).toBe(false);
+    });
+
+    it("update accepts and preserves parentLinkKind so a re-parent PATCH carries the kind", () => {
+      expect(updateIssueSchema.parse({ parentLinkKind: "process" }).parentLinkKind).toBe(
+        "process",
+      );
+      expect(
+        updateIssueSchema.parse({ parentLinkKind: "decomposition" }).parentLinkKind,
+      ).toBe("decomposition");
+    });
+
+    it("update omits parentLinkKind when not provided (preserve-on-omit: the column is left untouched)", () => {
+      expect(updateIssueSchema.parse({ title: "Re-parent only" })).not.toHaveProperty(
+        "parentLinkKind",
+      );
+    });
+
+    it("update rejects an invalid parentLinkKind value (400)", () => {
+      expect(updateIssueSchema.safeParse({ parentLinkKind: "other" }).success).toBe(false);
+    });
+
+    it("child create rejects a supplied parentLinkKind — child edges are always decomposition", () => {
+      expect(
+        createChildIssueSchema.safeParse({
+          title: "Child",
+          parentLinkKind: "process",
+        }).success,
+      ).toBe(false);
+    });
   });
 });
 
