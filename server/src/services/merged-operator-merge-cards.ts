@@ -20,9 +20,19 @@ import {
   buildDependencyWakeWithheldActivity,
   DEPENDENCY_WAKE_WITHHELD_ACTION,
   readAttributedLandingDischarge,
+  type AttributedLandingDischarge,
 } from "./blocker-closure.js";
-import { issueService } from "./issues.js";
-import { logActivity } from "./activity-log.js";
+import {
+  executeIssuePostCommitActions,
+  issueService,
+  type IssuePostCommitAction,
+} from "./issues.js";
+import {
+  logActivity,
+  logActivityInTransaction,
+  publishActivity,
+  type ActivityPublication,
+} from "./activity-log.js";
 
 export const MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID = "system:merged-operator-merge-cards";
 export const MERGED_OPERATOR_MERGE_CARDS_CLOSED_ACTION = "issue.merged_operator_merge_card_closed";
@@ -84,6 +94,11 @@ function pullRequestEvidenceKey(
   reference: GitHubPullRequestReference,
 ): string {
   return `${companyId}:${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
+}
+
+/** Per-card advisory-lock key: serializes concurrent closes of the same card. */
+function mergedOperatorMergeCardLockKey(companyId: string, cardId: string): string {
+  return `merged-operator-merge-card:${companyId}:${cardId}`;
 }
 
 const UNMEASURABLE_EVIDENCE: MergedOperatorMergeCardPullRequestEvidence = {
@@ -239,6 +254,10 @@ export function createMergedOperatorMergeCardSweepService(
     opts.resolvePullRequest ?? createMergedOperatorMergeCardPullRequestResolver(db);
   const issueSvc = issueService(db);
 
+  type WakeableDependents = Awaited<
+    ReturnType<ReturnType<typeof issueService>["listWakeableBlockedDependents"]>
+  >;
+
   async function resolvePullRequestEvidence(
     companyId: string,
     reference: GitHubPullRequestReference,
@@ -342,20 +361,6 @@ export function createMergedOperatorMergeCardSweepService(
       }
       if (!allMerged) continue;
 
-      // The candidate scan is a snapshot; re-read the status so a card closed
-      // between the scan and the write is not re-closed or re-commented.
-      const current = await db
-        .select({ id: issues.id, status: issues.status })
-        .from(issues)
-        .where(eq(issues.id, row.id))
-        .then((rows) => rows[0] ?? null);
-      if (
-        !current ||
-        !(CANDIDATE_ISSUE_STATUSES as readonly string[]).includes(current.status)
-      ) {
-        continue;
-      }
-
       const evidenceLines = references.map((reference) => {
         const item = evidence.get(pullRequestEvidenceKey(row.companyId, reference))!;
         const mergedAt = item.mergedAt ? ` at ${item.mergedAt}` : "";
@@ -370,129 +375,202 @@ export function createMergedOperatorMergeCardSweepService(
         ...evidenceLines,
       ].join("\n");
 
-      await issueSvc.addComment(row.id, commentBody, {}, { authorType: "system" });
-      await issueSvc.update(row.id, { status: "done" });
-
-      const dependents = await issueSvc.listWakeableBlockedDependents(row.id);
-
-      // SUP-17092/A (ADR-091 D1): this merge-card sweep is an issue_blockers_resolved
-      // producer. Withhold each dependent's wake when the RESOLVED BLOCKER's landing
-      // was attributed away to a shared carrier: a done card that discharged no
-      // delivery on the shared branch must not fire a phantom cascade into the cards
-      // blocked on it. The card was just set `done` above, so it is the resolved
-      // blocker; the discharge is a property of that blocker, shared by all of its
-      // dependents. Level-triggered: clause 2 of the predicate reads live
-      // executionState, so a later cleared publishSkipped re-emits the wake on a
-      // subsequent pass.
-      const discharge = await readAttributedLandingDischarge(db, row.companyId, row.id);
+      // The candidate scan is a snapshot; the close happens under a per-card
+      // advisory lock so two concurrent sweeps (this process or another) cannot
+      // both close the card or both write the withhold audit. Discharge read,
+      // comment, terminal write and audit rows share one transaction: a failure
+      // anywhere rolls back the whole close, so the card never becomes terminal
+      // without its wake/audit decision (SUP-17166 round-2 repair).
+      const publications: ActivityPublication[] = [];
+      const postCommitActions: IssuePostCommitAction[] = [];
+      let decision:
+        | { discharge: AttributedLandingDischarge; dependents: WakeableDependents }
+        | null;
+      try {
+        decision = await db.transaction(async (tx) => {
+          const txDb = tx as unknown as Db;
+          // Hold the per-card advisory lock for the whole transaction so the
+          // status re-check, the close, and the audit inserts are one atomic
+          // unit at the database write boundary. pg_advisory_xact_lock is
+          // released when the transaction commits/rolls back.
+          await txDb.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${mergedOperatorMergeCardLockKey(row.companyId, row.id)}, 0))`,
+          );
+          const current = await txDb
+            .select({ id: issues.id, status: issues.status })
+            .from(issues)
+            .where(eq(issues.id, row.id))
+            .then((rows) => rows[0] ?? null);
+          if (
+            !current ||
+            !(CANDIDATE_ISSUE_STATUSES as readonly string[]).includes(current.status)
+          ) {
+            return null;
+          }
+          const issueSvcTx = issueService(txDb);
+          // SUP-17092/A (ADR-091 D1): this merge-card sweep is an
+          // issue_blockers_resolved producer. Withhold each dependent's wake
+          // when the RESOLVED BLOCKER's landing was attributed away to a shared
+          // carrier: a done card that discharged no delivery on the shared
+          // branch must not fire a phantom cascade into the cards blocked on
+          // it. The card is the resolved blocker; the discharge is a property
+          // of that blocker, shared by all of its dependents.
+          //
+          // Read/validate the discharge BEFORE the terminal close: if the read
+          // throws, the transaction aborts and the card is never left
+          // permanently done with its wake/audit decision lost. This is the
+          // explicit recoverable failure path — the card stays scannable
+          // (CANDIDATE_ISSUE_STATUSES) and the next sweep re-derives the
+          // decision from live state. The close runs in the same transaction,
+          // so any later failure rolls the terminal write back too.
+          // Level-triggered: clause 2 of the predicate reads live
+          // executionState, so a later cleared publishSkipped re-emits the
+          // wake when the card is reconsidered.
+          const discharge = await readAttributedLandingDischarge(
+            txDb,
+            row.companyId,
+            row.id,
+          );
+          // addComment/update run through the pool-based service with the tx
+          // passed explicitly: passing the tx handle as the service's own
+          // connection would make update's internal `dbOrTx === db` check open
+          // a nested transaction on the tx handle.
+          await issueSvc.addComment(row.id, commentBody, {}, {
+            authorType: "system",
+          }, txDb);
+          const updated = await issueSvc.update(
+            row.id,
+            { status: "done" },
+            txDb,
+            publications,
+            postCommitActions,
+          );
+          if (!updated) {
+            throw new Error("merged operator merge card vanished before close");
+          }
+          // Dependent readiness requires the card to be done, so read it after
+          // the (still uncommitted) terminal write, in this same transaction.
+          const dependents =
+            await issueSvcTx.listWakeableBlockedDependents(row.id);
+          if (discharge.attributed) {
+            // Withhold: enqueue zero agent_wakeup_requests for each wakeable
+            // dependent and write exactly one durable
+            // issue.dependency_wake_withheld row carrying the verbatim refusal
+            // reason, the dependent id, the resolved-blocker id, and the
+            // carrier identifier. The advisory lock serializes concurrent
+            // closes of this card at the database write boundary; the check
+            // below keeps re-closes after a re-open to at most one row per
+            // (dependent, resolved blocker, producer).
+            for (const dependent of dependents) {
+              const alreadyWithheld = await txDb
+                .select({ id: activityLog.id })
+                .from(activityLog)
+                .where(
+                  and(
+                    eq(activityLog.companyId, row.companyId),
+                    eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
+                    eq(activityLog.entityType, "issue"),
+                    eq(activityLog.entityId, dependent.id),
+                    sql`${activityLog.details}->>'resolvedBlockerIssueId' = ${row.id}`,
+                    sql`${activityLog.details}->>'producer' = ${MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE}`,
+                  ),
+                )
+                .limit(1);
+              if (alreadyWithheld.length === 0) {
+                await logActivityInTransaction(
+                  txDb,
+                  buildDependencyWakeWithheldActivity({
+                    companyId: row.companyId,
+                    agentId: dependent.assigneeAgentId,
+                    runId: null,
+                    agentApiKeyId: null,
+                    dependentIssueId: dependent.id,
+                    resolvedBlockerIssueId: row.id,
+                    blockerIssueIds: dependent.blockerIssueIds,
+                    producer: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
+                    discharge,
+                  }),
+                );
+              }
+            }
+          }
+          return { discharge, dependents };
+        });
+      } catch (err) {
+        logger.warn(
+          { err, cardId: row.id, companyId: row.companyId },
+          "merged operator merge-card sweep: close transaction failed; card stays open and the next sweep retries",
+        );
+        continue;
+      }
+      if (!decision) continue;
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
+      const { discharge, dependents } = decision;
 
       const enqueued: Array<{
         dependent: { id: string; assigneeAgentId: string; blockerIssueIds: string[] };
         wakeup: IssueBlockersResolvedWakeup;
       }> = [];
-      for (const dependent of dependents) {
-        if (discharge.attributed) {
-          // Withhold: enqueue zero agent_wakeup_requests for this dependent and write
-          // exactly one durable issue.dependency_wake_withheld row carrying the
-          // verbatim refusal reason, the dependent id, the resolved-blocker id, and
-          // the carrier identifier. Deduped per (dependent, resolved blocker,
-          // producer) so repeated sweeps write at most one row.
-          try {
-            const alreadyWithheld = await db
-              .select({ id: activityLog.id })
-              .from(activityLog)
-              .where(
-                and(
-                  eq(activityLog.companyId, row.companyId),
-                  eq(activityLog.action, DEPENDENCY_WAKE_WITHHELD_ACTION),
-                  eq(activityLog.entityType, "issue"),
-                  eq(activityLog.entityId, dependent.id),
-                  sql`${activityLog.details}->>'resolvedBlockerIssueId' = ${row.id}`,
-                  sql`${activityLog.details}->>'producer' = ${MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE}`,
-                ),
-              )
-              .limit(1);
-            if (alreadyWithheld.length === 0) {
-              await logActivity(
-                db,
-                buildDependencyWakeWithheldActivity({
-                  companyId: row.companyId,
-                  agentId: dependent.assigneeAgentId,
-                  runId: null,
-                  agentApiKeyId: null,
-                  dependentIssueId: dependent.id,
-                  resolvedBlockerIssueId: row.id,
-                  blockerIssueIds: dependent.blockerIssueIds,
-                  producer: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
-                  discharge,
-                }),
-              );
-            }
-          } catch (err) {
-            logger.warn(
-              { err, dependentIssueId: dependent.id, resolvedBlockerIssueId: row.id },
-              "merged operator merge-card sweep: failed to audit withheld dependency wake",
-            );
-          }
-          continue;
-        }
-
-        // Upstream's level-triggered ready-state key: one wake per dependency-ready
-        // state, rather than one per resolved blocker edge. The wake body itself is
-        // unchanged, so `issue.blockers_resolved_wake_emitted` consumers still match.
-        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
-          dependentIssueId: dependent.id,
-          blockerIssueIds: dependent.blockerIssueIds,
-          blockedTransitionAt: dependent.blockedTransitionAt,
-        });
-        const wakeup: IssueBlockersResolvedWakeup = {
-          source: "automation",
-          triggerDetail: "system",
-          reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-          payload: {
-            issueId: dependent.id,
-            resolvedBlockerIssueId: row.id,
-            blockerIssueIds: dependent.blockerIssueIds,
-            mutation: "blocker_done",
-          },
-          idempotencyKey,
-          requestedByActorType: "system",
-          requestedByActorId: MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID,
-          contextSnapshot: {
-            issueId: dependent.id,
-            taskId: dependent.id,
-            wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-            source: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
-            resolvedBlockerIssueId: row.id,
-            blockerIssueIds: dependent.blockerIssueIds,
-          },
-        };
-        try {
-          const existingWake = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
-            companyId: row.companyId,
+      if (!discharge.attributed) {
+        for (const dependent of dependents) {
+          // Upstream's level-triggered ready-state key: one wake per dependency-ready
+          // state, rather than one per resolved blocker edge. The wake body itself is
+          // unchanged, so `issue.blockers_resolved_wake_emitted` consumers still match.
+          const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
             dependentIssueId: dependent.id,
             blockerIssueIds: dependent.blockerIssueIds,
             blockedTransitionAt: dependent.blockedTransitionAt,
           });
-          if (existingWake) continue;
-        } catch (err) {
-          logger.warn(
-            { err, dependentIssueId: dependent.id, idempotencyKey },
-            "merged operator merge-card sweep: wake dedupe lookup failed; attempting enqueue",
-          );
+          const wakeup: IssueBlockersResolvedWakeup = {
+            source: "automation",
+            triggerDetail: "system",
+            reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+            payload: {
+              issueId: dependent.id,
+              resolvedBlockerIssueId: row.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+              mutation: "blocker_done",
+            },
+            idempotencyKey,
+            requestedByActorType: "system",
+            requestedByActorId: MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID,
+            contextSnapshot: {
+              issueId: dependent.id,
+              taskId: dependent.id,
+              wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              source: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
+              resolvedBlockerIssueId: row.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+            },
+          };
+          try {
+            const existingWake = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
+              companyId: row.companyId,
+              dependentIssueId: dependent.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+              blockedTransitionAt: dependent.blockedTransitionAt,
+            });
+            if (existingWake) continue;
+          } catch (err) {
+            logger.warn(
+              { err, dependentIssueId: dependent.id, idempotencyKey },
+              "merged operator merge-card sweep: wake dedupe lookup failed; attempting enqueue",
+            );
+          }
+          if (!opts.enqueueWakeup) continue;
+          try {
+            await opts.enqueueWakeup(dependent.assigneeAgentId, wakeup);
+          } catch (err) {
+            logger.warn(
+              { err, dependentIssueId: dependent.id },
+              "merged operator merge-card sweep: issue_blockers_resolved wake enqueue failed",
+            );
+            continue;
+          }
+          result.woken += 1;
+          enqueued.push({ dependent, wakeup });
         }
-        if (!opts.enqueueWakeup) continue;
-        try {
-          await opts.enqueueWakeup(dependent.assigneeAgentId, wakeup);
-        } catch (err) {
-          logger.warn(
-            { err, dependentIssueId: dependent.id },
-            "merged operator merge-card sweep: issue_blockers_resolved wake enqueue failed",
-          );
-          continue;
-        }
-        result.woken += 1;
-        enqueued.push({ dependent, wakeup });
       }
 
       await logActivity(db, {

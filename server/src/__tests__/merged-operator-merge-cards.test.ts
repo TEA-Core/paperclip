@@ -25,6 +25,7 @@ import {
   DEPENDENCY_WAKE_WITHHELD_ACTION,
   SHARED_CARRIER_REFUSAL_MARKER,
 } from "../services/blocker-closure.js";
+import { issueService } from "../services/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -41,6 +42,26 @@ vi.mock("../services/github-credential.js", async (importOriginal) => {
       credentialMock.tokenForTest
         ? { token: credentialMock.tokenForTest, scope: "company", secretName: "GITHUB_TOKEN" }
         : { token: null, reason: "no GitHub token bound in fixture" },
+  };
+});
+
+// Durability seam: when set, logActivityInTransaction rejects for exactly one
+// action (the withhold audit row) so a test can prove that an audit failure
+// aborts the whole close transaction instead of leaving a terminal card with
+// zero audit rows.
+const activityLogMock = vi.hoisted(() => ({
+  failingAction: null as string | null,
+}));
+vi.mock("../services/activity-log.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/activity-log.js")>();
+  return {
+    ...actual,
+    logActivityInTransaction: async (tx: unknown, input: { action: string }) => {
+      if (activityLogMock.failingAction !== null && input.action === activityLogMock.failingAction) {
+        throw new Error(`simulated audit insert failure for ${input.action}`);
+      }
+      return actual.logActivityInTransaction(tx as never, input as never);
+    },
   };
 });
 
@@ -166,6 +187,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
   }, 20_000);
 
   afterEach(async () => {
+    activityLogMock.failingAction = null;
     await db.delete(activityLog);
     await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
@@ -936,7 +958,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       expect(await countWithheld(fixture.companyId, fixture.dependentId), "no withhold row when the wake is emitted").toHaveLength(0);
     });
 
-    it("is level-triggered: pass 1 (attributed) withholds, pass 2 (cleared) re-emits the wake", async () => {
+    it("is level-triggered: pass 1 (attributed) withholds; a cleared marker re-emits the wake once the card is re-opened through the production status path", async () => {
       const fixture = await seedAttributedCard({
         cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
         cardDescription: mergeGateMarker([404]),
@@ -950,22 +972,36 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       expect(await countWakes(fixture.companyId), "pass 1: zero wake rows").toHaveLength(0);
       expect(await countWithheld(fixture.companyId, fixture.dependentId), "pass 1: one withhold row").toHaveLength(1);
 
-      // Clear the live marker (re-published -> publishedHeadSha, no publishSkipped)
-      // and re-open the card so the sweep re-evaluates the SAME resolved blocker on
-      // a subsequent pass. The withhold is a live predicate, not a permanent drop.
+      // Pass 2 (negative): clear the live marker (re-published -> publishedHeadSha,
+      // no publishSkipped) but leave the card terminal. The sweep's candidate scan
+      // is status-gated on non-terminal rows, so a done card is never re-scanned:
+      // no re-close, no new audit row, no wake. This documents the terminal-set
+      // boundary — the level trigger re-fires only when the card is back in a
+      // scannable status.
       await db
         .update(issues)
-        .set({
-          status: "todo",
-          executionState: { approvalStatus: { publishedHeadSha: "republished456" } },
-        })
+        .set({ executionState: { approvalStatus: { publishedHeadSha: "republished456" } } })
         .where(eq(issues.id, fixture.cardId));
+      await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+        checked: 0,
+        candidates: 0,
+        closed: 0,
+        woken: 0,
+      });
+      expect(enqueueWakeup, "terminal card: still no wake").not.toHaveBeenCalled();
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "terminal card: no second withhold row").toHaveLength(1);
 
-      // Pass 2: cleared -> predicate returns attributed:false -> the wake re-emits.
+      // Pass 3: re-open the card through the production status path (the same
+      // issueService.update call the operator API routes use) so the sweep
+      // re-evaluates the SAME resolved blocker on a subsequent pass. The
+      // withhold is a live predicate, not a permanent drop: cleared marker ->
+      // the wake re-emits.
+      const reopened = await issueService(db).update(fixture.cardId, { status: "todo" });
+      expect(reopened?.status, "the production status path re-opens the card").toBe("todo");
       await service.sweepMergedOperatorMergeCards();
-      expect(enqueueWakeup, "pass 2 must re-emit the wake").toHaveBeenCalledTimes(1);
+      expect(enqueueWakeup, "pass 3 must re-emit the wake").toHaveBeenCalledTimes(1);
       const emitted = await countWakes(fixture.companyId);
-      expect(emitted, "pass 2: the dependent wake re-emits on the cleared pass").toHaveLength(1);
+      expect(emitted, "pass 3: the dependent wake re-emits on the cleared pass").toHaveLength(1);
       expect(emitted[0]!.idempotencyKey).toBe(
         buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: fixture.dependentId,
@@ -985,13 +1021,116 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       const { enqueueWakeup, service } = makeService(fixture.companyId);
 
       await service.sweepMergedOperatorMergeCards();
-      // Re-open the still-attributed card and sweep again; attribution unchanged.
-      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, fixture.cardId));
+      // Re-open the still-attributed card through the production status path
+      // and sweep again; attribution unchanged.
+      await issueService(db).update(fixture.cardId, { status: "todo" });
       await service.sweepMergedOperatorMergeCards();
 
       expect(enqueueWakeup, "no wake across either pass").not.toHaveBeenCalled();
       expect(await countWakes(fixture.companyId)).toHaveLength(0);
       expect(await countWithheld(fixture.companyId, fixture.dependentId), "deduped to a single row across passes").toHaveLength(1);
+    });
+
+    it("serializes concurrent sweeps of the same attributed card: one close, one withhold audit, zero wakes", async () => {
+      const fixture = await seedAttributedCard({
+        cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+        cardDescription: mergeGateMarker([404]),
+        executionState: { approvalStatus: { publishSkipped: { reason: sharedCarrierReason } } },
+      });
+      const { enqueueWakeup, service } = makeService(fixture.companyId);
+
+      // Two sweeps race the same card. The per-card advisory lock held for the
+      // whole close transaction serializes them at the database write boundary;
+      // the loser re-reads the status inside its own transaction and finds the
+      // card already terminal.
+      const [first, second] = await Promise.all([
+        service.sweepMergedOperatorMergeCards(),
+        service.sweepMergedOperatorMergeCards(),
+      ]);
+      const closed = first.closed + second.closed;
+      const woken = first.woken + second.woken;
+      expect(closed, "exactly one sweep closes the card").toBe(1);
+      expect(woken, "no dependent wake across either sweep").toBe(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      const card = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0] ?? null);
+      expect(card?.status).toBe("done");
+      expect(await countWakes(fixture.companyId), "no wake rows").toHaveLength(0);
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "exactly one withhold row despite the race").toHaveLength(1);
+      const closeAudits = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, fixture.companyId),
+            eq(activityLog.action, MERGED_OPERATOR_MERGE_CARDS_CLOSED_ACTION),
+          ),
+        );
+      expect(closeAudits, "exactly one close audit row").toHaveLength(1);
+    });
+
+    it("rolls back the whole close when the withhold audit insert fails; the next sweep retries cleanly", async () => {
+      const fixture = await seedAttributedCard({
+        cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+        cardDescription: mergeGateMarker([404]),
+        executionState: { approvalStatus: { publishSkipped: { reason: sharedCarrierReason } } },
+      });
+      const { enqueueWakeup, service } = makeService(fixture.companyId);
+
+      // Simulate the audit insert failing: the close and the audit share one
+      // transaction, so the failure must roll back the terminal write too —
+      // the card must never become done without its withhold row.
+      activityLogMock.failingAction = DEPENDENCY_WAKE_WITHHELD_ACTION;
+      try {
+        await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+          checked: 1,
+          candidates: 1,
+          closed: 0,
+          woken: 0,
+        });
+      } finally {
+        activityLogMock.failingAction = null;
+      }
+      expect(enqueueWakeup, "no wake when the close transaction aborted").not.toHaveBeenCalled();
+
+      const card = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0] ?? null);
+      expect(card?.status, "the card stays open after the rolled-back close").toBe("todo");
+      expect(await countWakes(fixture.companyId), "no wake rows").toHaveLength(0);
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "no orphaned withhold row").toHaveLength(0);
+      const failedCloseAudits = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, fixture.companyId),
+            eq(activityLog.action, MERGED_OPERATOR_MERGE_CARDS_CLOSED_ACTION),
+          ),
+        );
+      expect(failedCloseAudits, "no close audit for the rolled-back close").toHaveLength(0);
+
+      // Retry with the audit insert healthy: the sweep re-derives the whole
+      // decision from live state and lands it atomically.
+      await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+        checked: 1,
+        candidates: 1,
+        closed: 1,
+        woken: 0,
+      });
+      const reopenedCard = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0] ?? null);
+      expect(reopenedCard?.status).toBe("done");
+      expect(await countWithheld(fixture.companyId, fixture.dependentId), "the retry writes exactly one withhold row").toHaveLength(1);
     });
   });
 
