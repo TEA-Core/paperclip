@@ -5,7 +5,7 @@ import {
   issueExecutionDecisions,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, ne, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, ilike, ne, sql, type SQL } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import {
@@ -2905,19 +2905,17 @@ async function resolvePrOwningCard(
   headRef: string,
   title: string | null,
 ): Promise<{ identifier: string | null; status: string | null; found: boolean }> {
-  const branchMatch = /^([A-Za-z][A-Za-z0-9]*-\d+)/.exec(headRef);
-  const titleIds = (title ?? "").match(/[A-Za-z][A-Za-z0-9]*-\d+/g) ?? [];
+  const branchMatch = /^([A-Za-z][A-Za-z0-9]*-\d+)(?![A-Za-z0-9])/.exec(headRef);
+  const titleMatch = (title ?? "").match(/([A-Za-z][A-Za-z0-9]*-\d+)(?![A-Za-z0-9])/);
   const candidates: string[] = [];
   if (branchMatch) candidates.push(branchMatch[1]!);
-  for (const id of titleIds) {
-    if (!candidates.includes(id)) candidates.push(id);
-  }
+  if (titleMatch && !candidates.includes(titleMatch[1]!)) candidates.push(titleMatch[1]!);
   if (candidates.length === 0) return { identifier: null, status: null, found: false };
   for (const identifier of candidates) {
     const [owner] = await db
       .select({ identifier: issues.identifier, status: issues.status })
       .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.identifier, identifier)))
+      .where(and(eq(issues.companyId, companyId), ilike(issues.identifier, identifier)))
       .limit(1);
     if (owner) return { identifier: owner.identifier ?? identifier, status: owner.status, found: true };
   }

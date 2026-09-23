@@ -3581,6 +3581,120 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(mockLogger.error).toHaveBeenCalledTimes(1);
       });
 
+      it("SUP-16610 change 4: does NOT fire a false alarm when the head ref is lowercase and the owning card is live (case-insensitive lookup)", async () => {
+        // A lowercase `sup-42-branch` head ref must still identify the live `SUP-42`
+        // card. The old case-sensitive `eq` lookup would miss it and report the
+        // owner as "missing" despite a live owner — a false stranded alarm.
+        const ownerId = await insertIssue({ status: "done", identifier: "SUP-42" });
+
+        const certifier = await insertIssue({
+          status: "done",
+          identifier: "SUP-43",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifier);
+        const prObject = await db
+          .insert(externalObjects)
+          .values({
+            companyId,
+            providerKey: "github",
+            objectType: "pull_request",
+            externalId: "TEA-Core/paperclip#pull/42",
+            data: {
+              state: "open",
+              draft: false,
+              node_id: "PR_node_id_12345",
+              head: { ref: "some-branch-name" },
+              title: "Unrelated title without identifier",
+            },
+          })
+          .returning();
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: certifier,
+          sourceKind: "comment",
+          objectId: prObject[0]!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+        await seedDeliveryIdentity(certifier, "SUP-43-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: { state: "open", merged: false, head: { ref: "sup-42-branch", sha: NEW_HEAD }, base: { ref: "main", sha: BASE_SHA } } },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // The live owner SUP-42 is found via case-insensitive lookup and is not
+        // cancelled, so no alarm fires.
+        expect(summary.stranded).toBe(0);
+        expect(summary.strandedNew).toBe(0);
+        expect(mockLogger.error).not.toHaveBeenCalled();
+      });
+
+      it("SUP-16610 change 4: does NOT misattribute ownership when the head ref has an alphanumeric continuation after the digits (identifier boundary)", async () => {
+        // A head ref of `SUP-42foo-branch` must NOT match `SUP-42` — the identifier
+        // boundary requires a non-alphanumeric character after the digits. The old
+        // regex would extract `SUP-42` and report it as the (cancelled) owner.
+        await insertIssue({ status: "cancelled", identifier: "SUP-42" });
+
+        const certifier = await insertIssue({
+          status: "done",
+          identifier: "SUP-43",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifier);
+        const prObject = await db
+          .insert(externalObjects)
+          .values({
+            companyId,
+            providerKey: "github",
+            objectType: "pull_request",
+            externalId: "TEA-Core/paperclip#pull/42",
+            data: {
+              state: "open",
+              draft: false,
+              node_id: "PR_node_id_12345",
+              head: { ref: "some-branch-name" },
+              title: "Unrelated title without identifier",
+            },
+          })
+          .returning();
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: certifier,
+          sourceKind: "comment",
+          objectId: prObject[0]!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+        await seedDeliveryIdentity(certifier, "SUP-43-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: { state: "open", merged: false, head: { ref: "SUP-42foo-branch", sha: NEW_HEAD }, base: { ref: "main", sha: BASE_SHA } } },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // The branch regex correctly rejects `SUP-42` from `SUP-42foo-branch`
+        // (alphanumeric continuation), so no owner is identified. The alarm fires
+        // but names the owner as MISSING (not as cancelled SUP-42).
+        expect(summary.stranded).toBe(1);
+        expect(summary.strandedNew).toBe(1);
+        expect(summary.strandedDetails[0]).toContain("stranded:delivery-card-cancelled");
+        // Must NOT attribute to SUP-42 (the boundary prevented the match).
+        expect(summary.strandedDetails[0]).not.toContain("SUP-42");
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+        const [errorMeta] = mockLogger.error.mock.calls[0] as [Record<string, unknown>];
+        expect(errorMeta.alarmClass).toBe("delivery-card-cancelled");
+      });
+
       it("SUP-16610 change 4: dedupes the per-PR alarm across ticks when the certifying cards fall in different capped windows", async () => {
         // The cross-tick hole a single-batch fixture cannot exercise: candidates
         // are swept through a capped keyset window (`maxCandidates` +
