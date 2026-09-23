@@ -700,6 +700,30 @@ describe("splitConnectionStringPassword", () => {
     expect(result.connectionString).toBe("postgresql://paperclip@/paperclip?host=/var/run/postgresql");
   });
 
+  it("strips an unencoded ? or # from the userinfo password", () => {
+    // Verified against a real server: libpq's userinfo scan stops only at `/`,
+    // so both of these authenticate with the full password.
+    const withQuestion = splitConnectionStringPassword("postgres://paperclip:p?ss@db:5432/paperclip");
+    expect(withQuestion.password).toBe("p?ss");
+    expect(withQuestion.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+
+    const withHash = splitConnectionStringPassword("postgres://paperclip:p#ss@db:5432/paperclip");
+    expect(withHash.password).toBe("p#ss");
+    expect(withHash.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("treats # as an ordinary character in a query password, as libpq does", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=a#b");
+    expect(result.password).toBe("a#b");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("finds the real query after a ? inside the userinfo password", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip:p?ss@db:5432/paperclip?sslmode=require");
+    expect(result.password).toBe("p?ss");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip?sslmode=require");
+  });
+
   it("strips the password from a multi-host URI", () => {
     const result = splitConnectionStringPassword("postgres://paperclip:s3cr3t@h1:5432,h2:5432/paperclip");
     expect(result.password).toBe("s3cr3t");

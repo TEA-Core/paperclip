@@ -388,41 +388,51 @@ function readKeywordValue(raw: string, start: number): { value: string; end: num
 function splitUriPassword(raw: string): ConnectionStringSecret {
   const schemeEnd = raw.indexOf("://") + 3;
 
-  let authorityEnd = raw.length;
+  // `conninfo_uri_parse_options` looks for the userinfo terminator with
+  // `while (*p && *p != '@' && *p != '/')`. Only `/` ends that search — `?` and
+  // `#` do not, and both occur unencoded in generated passwords. Stopping early
+  // would leave such a password in argv while libpq still authenticated with it,
+  // so the dump would succeed and nothing would signal the leak.
+  let atIndex = -1;
   for (let i = schemeEnd; i < raw.length; i += 1) {
     const c = raw[i];
-    if (c === "/" || c === "?" || c === "#") {
-      authorityEnd = i;
+    if (c === "/") break;
+    if (c === "@") {
+      atIndex = i;
       break;
     }
   }
 
-  // The authority and everything after it are edited independently, so neither
-  // edit can shift offsets the other still depends on.
-  let head = raw.slice(0, authorityEnd);
-  const tail = raw.slice(authorityEnd);
+  // The query can only begin after the authority; a `?` before it belongs to the
+  // password. libpq treats `#` as an ordinary character everywhere, so the query
+  // runs to the end of the string — there is no fragment.
+  const afterAuthority = atIndex === -1 ? schemeEnd : atIndex + 1;
+  const queryStart = raw.indexOf("?", afterAuthority);
+
+  // Edited as two independent pieces so neither edit shifts offsets the other
+  // still depends on. The userinfo always precedes the query.
+  let head = queryStart === -1 ? raw : raw.slice(0, queryStart);
+  const query = queryStart === -1 ? "" : raw.slice(queryStart);
 
   let userinfoPassword: string | undefined;
-  const authority = head.slice(schemeEnd);
-  const at = authority.indexOf("@");
-  if (at !== -1) {
-    const colon = authority.slice(0, at).indexOf(":");
+  if (atIndex !== -1) {
+    const userinfo = raw.slice(schemeEnd, atIndex);
+    // libpq splits the userinfo at its FIRST `:`, and takes the FIRST `@` above,
+    // which is why its documentation tells you to percent-encode both.
+    const colon = userinfo.indexOf(":");
     if (colon !== -1) {
-      userinfoPassword = decodeUriComponentStrict(authority.slice(colon + 1, at), "password");
-      head = head.slice(0, schemeEnd + colon) + head.slice(schemeEnd + at);
+      userinfoPassword = decodeUriComponentStrict(userinfo.slice(colon + 1), "password");
+      head = head.slice(0, schemeEnd + colon) + head.slice(atIndex);
     }
   }
 
   let queryPassword: string | undefined;
-  let newTail = tail;
-  const queryStart = tail.indexOf("?");
-  if (queryStart !== -1) {
-    const hash = tail.indexOf("#", queryStart);
-    const queryEnd = hash === -1 ? tail.length : hash;
+  let newQuery = query;
+  if (query !== "") {
     // Segments are kept as raw slices and rejoined, never re-encoded, so every
     // surviving value reaches libpq byte for byte.
     const kept: string[] = [];
-    for (const segment of tail.slice(queryStart + 1, queryEnd).split("&")) {
+    for (const segment of query.slice(1).split("&")) {
       const eq = segment.indexOf("=");
       const key = eq === -1 ? segment : segment.slice(0, eq);
       if (decodeUriComponentStrict(key, "parameter name") === "password") {
@@ -434,14 +444,12 @@ function splitUriPassword(raw: string): ConnectionStringSecret {
       }
       kept.push(segment);
     }
-    if (queryPassword !== undefined) {
-      newTail = tail.slice(0, queryStart) + (kept.length > 0 ? `?${kept.join("&")}` : "") + tail.slice(queryEnd);
-    }
+    if (queryPassword !== undefined) newQuery = kept.length > 0 ? `?${kept.join("&")}` : "";
   }
 
   const password = queryPassword ?? userinfoPassword;
   if (password === undefined) return { connectionString: raw };
-  return { connectionString: head + newTail, password };
+  return { connectionString: head + newQuery, password };
 }
 
 /**
