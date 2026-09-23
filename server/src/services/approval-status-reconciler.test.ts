@@ -159,6 +159,10 @@ const APPROVED_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compa
 const LIVE_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${NEW_HEAD}`;
 const COMMENT_LIST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments?per_page=100&direction=desc";
 const COMMENT_POST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments";
+// SUP-17274: the arming mutation's endpoint and the response shape that arms —
+// a 200 body without an `errors` array is a success (not already-queued).
+const GRAPHQL_URL = "https://api.github.com/graphql";
+const GRAPHQL_ARM_OK_BODY = { data: { enablePullRequestAutoMerge: { clientMutationId: "rearm-ok" } } };
 // SUP-16122 D-B: the sha-existence proof reads check-SUITES (which carry
 // `head_branch` + a server `created_at`), NOT check-runs (whose LIST response
 // carries neither). The check-runs URL below is kept only to assert the code no
@@ -357,6 +361,8 @@ function zeroSummary(): ApprovalStatusReconcilerTickSummary {
     stranded: 0,
     strandedNew: 0,
     strandedDetails: [],
+    rearmed: 0,
+    rearmDetails: [],
   };
 }
 
@@ -663,6 +669,9 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: POST_STATUS_URL, body: { id: 12345 } },
+        // SUP-17274: the card records no successful decision-time arm, so the
+        // tick re-attempts it after the republish heals the stamp.
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -684,7 +693,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       // Pre-publish reads are the live PR read and the head combined-status
       // read only — no head-history or compare probes. The delegated publish
-      // re-reads the PR itself (live re-resolve, SUP-13313).
+      // re-reads the PR itself (live re-resolve, SUP-13313). The re-arm adds a
+      // graphql POST only (excluded from the GET set below).
       const getUrls = mockGhFetch.mock.calls
         .filter((call) => (call[1] as RequestInit | undefined)?.method !== "POST")
         .map((call) => String(call[0]));
@@ -696,6 +706,22 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       // so no PR warning.
       expect(postCommentCalls()).toHaveLength(0);
       expect(summary.voidWarnings).toBe(0);
+
+      // SUP-17274: the healed stamp's arm was re-attempted and armed.
+      expect(summary.rearmed).toBe(1);
+      expect(summary.rearmDetails[0]).toContain("SUP-42");
+      expect(summary.rearmDetails[0]).toContain("armed:");
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("armed");
+      expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments.map((c) => c.body)).toEqual([
+        expect.stringMatching(/^\[Merge-arming\] armed: Auto-merge enabled for TEA-Core\/paperclip#42/),
+      ]);
     });
 
     it("SUP-15459: a mid-ladder approved card is skipped:non-terminal-ladder and never re-stamps paperclip/approved", async () => {
@@ -1188,7 +1214,17 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     });
 
     it("performs zero writes when the head already carries paperclip/approved=success", async () => {
-      const issueId = await insertIssue();
+      // SUP-17274: the card records a successful decision-time arm, so the
+      // healed-stamp re-arm is suppressed and the tick stays at zero writes.
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "armed", message: "armed: Auto-merge enabled for TEA-Core/paperclip#42", at: APPROVED_AT },
+          },
+        }),
+      });
       await insertDecision(issueId);
       await insertMention(issueId);
 
@@ -2710,10 +2746,15 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
           { url: APPROVED_DIFF_URL, body: { status: "ahead", ahead_by: 1, files: STABLE_DIFF } },
           { url: LIVE_DIFF_URL, body: { status: "ahead", ahead_by: 1, files: STABLE_DIFF } },
           { url: POST_STATUS_URL, body: { id: 12345 } },
+          // SUP-17274: the first tick's republish heals the stamp and re-arms it;
+          // the armed armOutcome persisted here is what keeps the re-run below
+          // at zero writes.
+          { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
         ]);
 
         const first = await runApprovalStatusReconcilerTick(db);
         expect(first.republished).toBe(1);
+        expect(first.rearmed).toBe(1);
 
         const callsBeforeSecondTick = mockGhFetch.mock.calls.length;
         installRoutes([
@@ -2739,6 +2780,246 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(secondTickUrls).not.toContain(PR_43_URL);
         expect(postStatusCalls()).toHaveLength(1);
       });
+    });
+  });
+
+  describe("SUP-17274: re-arm a healed stamp whose decision-time arm never succeeded", () => {
+    it("an already-success head with no recorded armOutcome is re-armed once, persists armOutcome + armReattempt, and posts the [Merge-arming] comment", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        {
+          url: COMBINED_STATUS_URL,
+          body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.rearmed).toBe(1);
+      expect(summary.rearmDetails[0]).toContain("SUP-42");
+      expect(summary.rearmDetails[0]).toContain("armed:");
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("armed");
+      expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
+
+      const comments = await db
+        .select({ body: issueComments.body, authorType: issueComments.authorType })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain("[Merge-arming]");
+      expect(comments[0]!.body).toContain("armed:");
+      expect(comments[0]!.authorType).toBe("system");
+    });
+
+    it("an already-success head with a recorded armed armOutcome is not re-armed (no arm actuator I/O)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "armed", message: "armed: Auto-merge enabled for TEA-Core/paperclip#42", at: APPROVED_AT },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        {
+          url: COMBINED_STATUS_URL,
+          body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(0);
+      expect(summary.rearmDetails).toHaveLength(0);
+      const graphqlCalls = mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+      expect(graphqlCalls).toHaveLength(0);
+    });
+
+    it("a failed decision-time armOutcome is re-attempted on the post-publish path and the failure is persisted (fail-safe)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "failed", message: "failed:HTTP 502 Bad Gateway", at: APPROVED_AT },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, ok: false, status: 403, body: { errors: [{ message: "HTTP 403" }] } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // The stamp still republishes; the re-arm failure must not fail the tick.
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.rearmed).toBe(1);
+      expect(summary.rearmDetails[0]).toContain("failed:");
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("failed");
+      expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
+
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments.map((c) => c.body)).toEqual([expect.stringMatching(/^\[Merge-arming\] failed:/)]);
+    });
+
+    it("the per-head re-arm cap suppresses further attempts on the same head", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "failed", message: "failed:HTTP 502 Bad Gateway", at: APPROVED_AT },
+            armReattempt: { headSha: NEW_HEAD, attempts: 3, at: APPROVED_AT },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        {
+          url: COMBINED_STATUS_URL,
+          body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(0);
+      const graphqlCalls = mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+      expect(graphqlCalls).toHaveLength(0);
+    });
+
+    it("a moved live head resets the per-head re-arm counter", async () => {
+      // The cap was exhausted on the OLD head (APPROVED_HEAD); the live head is
+      // NEW_HEAD with a healed stamp — a fresh head starts a fresh counter.
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "failed", message: "failed:HTTP 502 Bad Gateway", at: APPROVED_AT },
+            armReattempt: { headSha: APPROVED_HEAD, attempts: 3, at: APPROVED_AT },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        {
+          url: COMBINED_STATUS_URL,
+          body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(1);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
+    });
+
+    it("mergeArmingEnabled=false suppresses the re-arm (the decision-door gate)", async () => {
+      await db.update(companies).set({ mergeArmingEnabled: false }).where(eq(companies.id, companyId));
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        {
+          url: COMBINED_STATUS_URL,
+          body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(0);
+      const graphqlCalls = mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+      expect(graphqlCalls).toHaveLength(0);
+    });
+
+    it("AC#5 regression (631 shape): a decision-time head_unresolvable refusal is backfilled, republished, AND re-armed in one tick", async () => {
+      // The first publish was refused at decision time (no anchor persisted —
+      // the arm never ran); the stamp was later healed on the live head. The
+      // tick must recover the anchor from the timeline, publish, and re-arm.
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            approvedHeadSha: null,
+            publishedHeadSha: null,
+            publishSkipped: {
+              reason: "status:skipped:head_unresolvable: pr_error: HTTP 500",
+              headSha: null,
+              at: APPROVED_AT,
+            },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_SAME_HEAD_BODY },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.backfilled).toBe(1);
+      expect(summary.rearmed).toBe(1);
+      expect(Object.keys(summary.skipped)).toEqual([]);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
+      expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+      expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("armed");
+      expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
     });
   });
 
