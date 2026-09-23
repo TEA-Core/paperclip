@@ -1,5 +1,9 @@
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import {
+  buildUndischargeableLadderEdgeConflict,
+  evaluateUndischargeableLadderEdge,
+} from "../services/parent-edge-close-ladder-gate.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -17064,6 +17068,31 @@ export function issueRoutes(
     const nextParentId = updateFields.parentId === undefined
       ? existing.parentId
       : updateFields.parentId as string | null;
+
+    // ADR-103 M4: keep the parent_id edge total. Refuse a re-parent into a new
+    // parent that would arm the ADR-072 close ladder on a parent that has
+    // already advanced past the stages it can no longer add. A rejected
+    // re-parent persists nothing (the update is never issued).
+    if (nextParentId !== null && nextParentId !== existing.parentId) {
+      const effectiveParentLinkKind =
+        updateFields.parentLinkKind !== undefined
+          ? updateFields.parentLinkKind
+          : existing.parentLinkKind;
+      const ladderVerdict = await evaluateUndischargeableLadderEdge(
+        db,
+        existing.companyId,
+        nextParentId,
+        effectiveParentLinkKind,
+      );
+      if (!ladderVerdict.ok) {
+        const { message, details } = buildUndischargeableLadderEdgeConflict(
+          ladderVerdict,
+          `the child ${existing.identifier ?? existing.id}`,
+        );
+        throw conflict(message, details);
+      }
+    }
+
     const shouldRelayStop =
       Boolean(nextParentId) &&
       existing.status !== updateFields.status &&

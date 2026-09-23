@@ -145,6 +145,10 @@ import {
   normalizeIssueExecutionPolicy,
   resolveProjectDefaultIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
+import {
+  buildUndischargeableLadderEdgeConflict,
+  evaluateUndischargeableLadderEdge,
+} from "./parent-edge-close-ladder-gate.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
   type CurrentUserRedactionOptions,
@@ -10878,6 +10882,27 @@ export function issueService(db: Db) {
               trustExplicitResponsibleUserId === true,
           },
         );
+
+        // ADR-103 M4: keep the parent_id edge total. Reject (rolling back this
+        // transaction, persisting nothing) a decomposition edge that would arm
+        // the ADR-072 close ladder on a parent that has already advanced past
+        // the stages it can no longer add. The gate is a read-only validity
+        // check in the same transaction as the edge write.
+        if (issueData.parentId) {
+          const ladderVerdict = await evaluateUndischargeableLadderEdge(
+            tx as unknown as Db,
+            companyId,
+            issueData.parentId,
+            issueData.parentLinkKind,
+          );
+          if (!ladderVerdict.ok) {
+            const { message, details } = buildUndischargeableLadderEdgeConflict(
+              ladderVerdict,
+              `the new child "${issueData.title}"`,
+            );
+            throw conflict(message, details);
+          }
+        }
 
         const values = {
           ...issueData,
