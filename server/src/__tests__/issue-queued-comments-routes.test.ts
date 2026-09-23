@@ -395,28 +395,12 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
       status: "running", contextSnapshot: { issueId: randomUUID() },
     });
-    // FORK DIVERGENCE (D9 deferred: the fork's in-file release never consults the execution hold, slice 2d):
-    // upstream's wake-queue release leaves a blocked queue deferred -- the legacy-reconciliation pre-drain
-    // exit, reinforced by #13236's execution-blocker gate -- so #13327's delivery path owns the successor and
-    // sends the saved messages once the previous process is gone. This fold keeps the fork's in-file
-    // releaseIssueExecutionAndPromote live (operator decision 2026-09-15, D9 / SUP-16581), and the same sweep
-    // promotes the deferred wake into a queued successor that already carries the saved messages, so the queue
-    // ends "queued" instead of "coalesced" and the delivery path never runs. #13327's delivery attempt itself
-    // is unchanged and still declines while the previous process is alive: that is the executionWait receipt
-    // asserted below. Inverted rather than deleted so the divergence stays guarded. The D9 port must restore
-    // upstream's assertions: deferred after the first sweep, "coalesced" with previousRunId/forceFreshSession
-    // after the second, wakeCommentIds filtered to the undelivered set, and the #13315 operator-identity
-    // checks on the manual_receipt_other_actor dispatch.
     await heartbeatService(db).resumeQueuedRuns();
-    const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
-    expect(held).toMatchObject({ status: "queued", reason: "issue_execution_promoted" });
-    expect(held.payload?.executionWait).toMatchObject({ reason: "process_running" });
-    const [promoted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, held.runId!));
-    expect(promoted).toMatchObject({ status: "queued", wakeupRequestId: seeded.wakeId });
-    expect(promoted.contextSnapshot).toMatchObject({ issueId: seeded.issueId, wakeCommentIds: seeded.commentIds });
-    expect((await db.select().from(issues).where(eq(issues.id, seeded.issueId)))[0].executionRunId).toBe(held.runId);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+      .toBe("deferred_issue_execution");
     await db.update(heartbeatRuns).set({ processPid: 999999999 }).where(eq(heartbeatRuns.id, seeded.runId));
     const excludedIndex = actorType === "consumed_last" ? 1 : 0;
+    const filtersInput = ["consumed_first", "consumed_last", "deleted_first", "agent_first"].includes(actorType);
     if (actorType.startsWith("consumed_")) await db.update(heartbeatRuns).set({
       contextSnapshot: { issueId: seeded.issueId, wakeCommentIds: [seeded.commentIds[excludedIndex]] },
     }).where(eq(heartbeatRuns.id, seeded.runId));
@@ -425,6 +409,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     if (actorType === "agent_first") await db.update(issueComments).set({
       authorType: "agent", authorUserId: null, authorAgentId: seeded.agentId,
     }).where(eq(issueComments.id, seeded.commentIds[0]));
+    const expectedIds = seeded.commentIds.filter((_, index) => !filtersInput || index !== excludedIndex);
     if (actorType === "cancelled_queued") await db.insert(heartbeatRuns).values({
       companyId: seeded.companyId, agentId: seeded.agentId, status: "cancelled", runtimeMode: "legacy",
       errorCode: "agent_paused", createdAt: new Date(0), finishedAt: new Date(1),
@@ -437,13 +422,17 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       });
     }
     await Promise.all([heartbeatService(db).resumeQueuedRuns(), heartbeatService(db).resumeQueuedRuns()]);
-    // The promoted successor holds the issue's execution lock and the queue is no longer deferred, so both
-    // later sweeps are no-ops: no delivery, no second successor, and the saved messages ride the promoted run.
     const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
-    expect(delivered).toMatchObject({ status: "queued", runId: held.runId });
+    expect(delivered.status).toBe("coalesced");
     const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
-    expect(successor.contextSnapshot).toMatchObject({ wakeCommentIds: seeded.commentIds });
-    expect(successor.contextSnapshot?.previousRunId).toBeUndefined();
+    expect(successor.contextSnapshot).toMatchObject({ wakeCommentIds: expectedIds,
+      previousRunId: seeded.runId, forceFreshSession: true });
+    if (actorType === "manual_receipt_other_actor") {
+      const [dispatch] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, successor.wakeupRequestId!));
+      expect(dispatch.requestedByActorId).toBe("queue-owner");
+      expect(dispatch.payload?.manualUserWake).toBeUndefined();
+      expect(successor.responsibleUserId).toBe("queue-owner");
+    }
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId))).toHaveLength(["rejected_admission", "cancelled_queued"].includes(actorType) ? 4 : 3);
     const [recovery] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, seeded.issueId));
     expect(recovery.evidence.automaticRecovery).toMatchObject({ actionOutcome: "unknown" });
