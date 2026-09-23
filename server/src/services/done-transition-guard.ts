@@ -1321,7 +1321,7 @@ interface Adr072CloseLadderShape {
   outOfOrderStageLabels: string[];
 }
 
-async function findMissingAdr072CloseLadderStages(
+export async function findMissingAdr072CloseLadderStages(
   db: Db,
   companyId: string,
   executionPolicy: unknown,
