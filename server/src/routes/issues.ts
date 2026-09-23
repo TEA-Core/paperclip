@@ -559,15 +559,25 @@ type IssueRouteSnapshot = typeof issueRows.$inferSelect;
  * for perf, so a row handed to recovery revalidation may legitimately be
  * missing them. They are absent (not `null`) there — callers must treat the
  * absence as "not projected", not as "no ladder".
+ *
+ * SUP-17184 (ADR-103 M2a): `parentLinkKind` is likewise omitted from the list
+ * projection (list reads do not yet consume it — M2b), so it is made optional
+ * here to stay in sync with `issueListSelect`.
  */
 type IssueRouteSnapshotExecutionOptional = Omit<
   IssueRouteSnapshot,
-  "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+  | "executionPolicy"
+  | "executionState"
+  | "executionWorkspaceSettings"
+  | "parentLinkKind"
 > &
   Partial<
     Pick<
       IssueRouteSnapshot,
-      "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+      | "executionPolicy"
+      | "executionState"
+      | "executionWorkspaceSettings"
+      | "parentLinkKind"
     >
   >;
 type RecoveryRevalidationTrigger =
