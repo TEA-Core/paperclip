@@ -270,16 +270,108 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+export type ConnectionStringSecret = {
+  /** The connection string with any inline password removed, safe to place in argv. */
+  connectionString: string;
+  /** The password that was removed, to be passed out-of-band via PGPASSWORD. */
+  password?: string;
+};
+
+function readKeywordValue(raw: string, start: number): { value: string; end: number } {
+  let i = start;
+  let value = "";
+  if (raw[i] === "'") {
+    i += 1;
+    while (i < raw.length && raw[i] !== "'") {
+      if (raw[i] === "\\" && i + 1 < raw.length) i += 1;
+      value += raw[i];
+      i += 1;
+    }
+    if (i < raw.length) i += 1; // closing quote
+    return { value, end: i };
+  }
+  while (i < raw.length && !/\s/.test(raw[i]!)) {
+    if (raw[i] === "\\" && i + 1 < raw.length) i += 1;
+    value += raw[i];
+    i += 1;
+  }
+  return { value, end: i };
+}
+
+/**
+ * Splits an inline password out of a libpq connection string.
+ *
+ * Anything handed to `pg_dump`/`psql` as `--dbname=` lands in argv, which every local
+ * user can read via `ps -eo args` or `/proc/<pid>/cmdline`. The password therefore has
+ * to travel out-of-band in `PGPASSWORD` instead. libpq prefers an inline password over
+ * the environment, so the inline copy must be removed, not merely duplicated.
+ *
+ * Handles both accepted forms: the URI form (`postgres://user:pw@host/db`, including a
+ * `?password=` query parameter) and the keyword form (`host=... password=...`). Returns
+ * the input unchanged when it carries no password.
+ */
+export function splitConnectionStringPassword(connectionString: string): ConnectionStringSecret {
+  let url: URL | undefined;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    url = undefined;
+  }
+
+  if (url && (url.protocol === "postgres:" || url.protocol === "postgresql:")) {
+    let password: string | undefined;
+    if (url.password) {
+      password = decodeURIComponent(url.password);
+      url.password = "";
+    }
+    const queryPassword = url.searchParams.get("password");
+    if (queryPassword) {
+      password = password ?? queryPassword;
+      url.searchParams.delete("password");
+    }
+    if (password === undefined) return { connectionString };
+    return { connectionString: url.toString(), password };
+  }
+
+  // Keyword form: splice the whole `password=<value>` token out, leaving the rest byte
+  // for byte so we never have to re-quote values we did not parse.
+  let i = 0;
+  while (i < connectionString.length) {
+    while (i < connectionString.length && /\s/.test(connectionString[i]!)) i += 1;
+    if (i >= connectionString.length) break;
+    const keyStart = i;
+    while (i < connectionString.length && connectionString[i] !== "=" && !/\s/.test(connectionString[i]!)) i += 1;
+    const key = connectionString.slice(keyStart, i);
+    while (i < connectionString.length && /\s/.test(connectionString[i]!)) i += 1;
+    if (connectionString[i] !== "=") continue;
+    i += 1;
+    while (i < connectionString.length && /\s/.test(connectionString[i]!)) i += 1;
+    const { value, end } = readKeywordValue(connectionString, i);
+    if (key === "password") {
+      // Only the seam is rewritten; other values may legitimately contain runs of
+      // whitespace (`options='-c a  b'`) that must survive verbatim.
+      const before = connectionString.slice(0, keyStart).replace(/\s+$/, "");
+      const after = connectionString.slice(end).replace(/^\s+/, "");
+      const stripped = before && after ? `${before} ${after}` : `${before}${after}`;
+      return { connectionString: stripped, password: value };
+    }
+    i = end;
+  }
+
+  return { connectionString };
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const { connectionString, password } = splitConnectionStringPassword(opts.connectionString);
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connectionString}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -292,6 +384,7 @@ async function runPgDumpBackup(opts: {
       env: {
         ...process.env,
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+        ...(password === undefined ? {} : { PGPASSWORD: password }),
       },
     },
   );
@@ -308,10 +401,11 @@ async function runPgDumpBackup(opts: {
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
+  const { connectionString, password } = splitConnectionStringPassword(opts.connectionString);
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connectionString}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -321,6 +415,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       env: {
         ...process.env,
         PGCONNECT_TIMEOUT: String(connectTimeout),
+        ...(password === undefined ? {} : { PGPASSWORD: password }),
       },
     },
   );
