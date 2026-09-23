@@ -5,6 +5,10 @@ import {
   countLadderedChildren,
   findMissingAdr072CloseLadderStages,
 } from "./done-transition-guard.js";
+import {
+  isLadderArmingParentEdge,
+  type LadderArmingParentEdge,
+} from "./laddered-child-eligibility.js";
 
 /**
  * ADR-103 M4 (SUP-17183): a write-time gate that keeps the `parent_id` edge
@@ -24,6 +28,14 @@ import {
  * helpers (`countLadderedChildren` and `findMissingAdr072CloseLadderStages`)
  * are reused verbatim — never a second copy of the counting or the close-
  * ladder shape.
+ *
+ * The same "never a second copy" rule applies to the `+ 1` this gate adds for
+ * the incoming edge: whether that edge would itself be counted is decided by
+ * {@link isLadderArmingParentEdge}, the predicate `countLadderedChildren` runs
+ * against the existing rows. M4 shipped without that, adding the incoming child
+ * to the count unconditionally, which 409'd the platform's own watchdog and
+ * recovery cards — see laddered-child-eligibility.ts for the measured defect and
+ * for which exclusions are deliberately left fail-closed on an incoming edge.
  */
 export type UndischargeableLadderEdgeVerdict =
   | { ok: true }
@@ -37,14 +49,26 @@ export type UndischargeableLadderEdgeVerdict =
     };
 
 /**
+ * The incoming edge, described by the facts the gate can judge it on. Both
+ * write paths can supply all four: on create they come off the insert payload
+ * (including `labelIds`, resolved through `edgeCarriesLadderCarveOutLabel`), on
+ * re-parent off the existing child row plus whatever this PATCH restates.
+ */
+export type IncomingParentEdge = LadderArmingParentEdge;
+
+/**
  * Evaluate whether writing a decomposition edge onto `newParentId` would add an
  * undischargeable close ladder. Returns `{ ok: true }` to allow the edge, or a
  * structured rejection.
  *
  * Rejection requires ALL of the following to hold:
- *   1. the incoming edge is a decomposition edge (`incomingEdgeKind` is not
- *      `'process'` — the ADR-103 default is decomposition, so the gate stays
- *      fail-closed for an omitted kind);
+ *   1. the incoming edge would itself be counted as a laddered child by
+ *      `countLadderedChildren` — it is not procedural (`parentLinkKind` is not
+ *      `'process'`; the ADR-103 default is decomposition, so the gate stays
+ *      fail-closed for an omitted kind), not platform-drawn (`originKind` is
+ *      `'manual'` or `plugin:*`), not cancelled, and carries none of the four
+ *      carve-out labels (`hasCarveOutLabel`, resolved by the caller through
+ *      `edgeCarriesLadderCarveOutLabel` before this is called);
  *   2. the parent's close-ladder pointer has already advanced (a completed or
  *      skipped stage);
  *   3. the parent's policy lacks a conforming ADR-072 close ladder (a rung is
@@ -55,12 +79,17 @@ export async function evaluateUndischargeableLadderEdge(
   db: Db,
   companyId: string,
   newParentId: string | null | undefined,
-  incomingEdgeKind: string | null | undefined,
+  incomingEdge: IncomingParentEdge,
 ): Promise<UndischargeableLadderEdgeVerdict> {
   if (!newParentId) return { ok: true };
-  // A procedural edge gates no slice of the parent's deliverable, so it is not
-  // a decomposition signal regardless of the parent's ladder state.
-  if (incomingEdgeKind === "process") return { ok: true };
+  // Condition 1, run through the same predicate `countLadderedChildren` applies
+  // to the existing rows, so the `+ 1` below can only ever be added for an edge
+  // that side would have counted. This is checked first because it needs no
+  // read at all, so a procedural, platform-drawn, cancelled or carve-out-labelled
+  // edge costs neither the parent row lock nor the child scan. (The one read the
+  // carve-out arm does need — names to ids — is the caller's, and it is skipped
+  // outright when the edge names no labels.)
+  if (!isLadderArmingParentEdge(incomingEdge)) return { ok: true };
 
   const parentRows = await db
     .select({
@@ -85,7 +114,10 @@ export async function evaluateUndischargeableLadderEdge(
   if (!advanced) return { ok: true };
 
   // Condition 4: count the existing laddered children, add this new edge, and
-  // only reject when the count reaches the >=2 threshold.
+  // only reject when the count reaches the >=2 threshold. The `+ 1` is sound
+  // only because condition 1 above already established, through the SAME
+  // predicate this counter uses, that the incoming edge is one this counter
+  // would count.
   const { count } = await countLadderedChildren(db, companyId, newParentId);
   const wouldReachCount = count + 1;
   if (wouldReachCount < 2) return { ok: true };

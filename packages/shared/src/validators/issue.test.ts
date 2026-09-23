@@ -4,6 +4,7 @@ import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
   checkoutIssueSchema,
+  createAcceptedPlanDecompositionSchema,
   createChildIssueSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
@@ -1229,13 +1230,60 @@ describe("issue validators", () => {
       expect(updateIssueSchema.safeParse({ parentLinkKind: "other" }).success).toBe(false);
     });
 
-    it("child create rejects a supplied parentLinkKind — child edges are always decomposition", () => {
+    // Replaces the M2 assertion "child create rejects a supplied parentLinkKind
+    // — child edges are always decomposition". That premise was refuted by the
+    // M4 close-ladder gate, whose 409 tells the caller to set
+    // `parent_link_kind: 'process'` — unreachable on the child route, where
+    // `.strict()` turned the documented remedy into a 400. The premise was also
+    // unenforced: the same procedural edge has always been writable through the
+    // top-level create with `parentId` + `parentLinkKind`.
+    it("child create accepts parentLinkKind so the gate's advertised remedy is reachable", () => {
+      expect(
+        createChildIssueSchema.parse({
+          title: "Child",
+          parentLinkKind: "process",
+        }).parentLinkKind,
+      ).toBe("process");
+    });
+
+    it("child create leaves parentLinkKind undefined when omitted (column default applies)", () => {
+      expect(
+        createChildIssueSchema.parse({ title: "Child" }).parentLinkKind,
+      ).toBeUndefined();
+    });
+
+    it("child create still rejects an invalid parentLinkKind value (400)", () => {
       expect(
         createChildIssueSchema.safeParse({
           title: "Child",
-          parentLinkKind: "process",
+          parentLinkKind: "other",
         }).success,
       ).toBe(false);
+    });
+
+    it("child create still rejects parentId, which the route takes from the URL", () => {
+      expect(
+        createChildIssueSchema.safeParse({ title: "Child", parentId }).success,
+      ).toBe(false);
+    });
+
+    // The one place "always decomposition" genuinely holds: these children ARE
+    // the decomposition of the accepted plan revision they are filed against, so
+    // a `process` child there is a contradiction in terms and would let a plan
+    // decomposition sidestep the close ladder it is supposed to arm.
+    it("accepted-plan decomposition children still reject parentLinkKind", () => {
+      expect(
+        createAcceptedPlanDecompositionSchema.safeParse({
+          acceptedPlanRevisionId: parentId,
+          children: [{ title: "Slice", parentLinkKind: "process" }],
+        }).success,
+      ).toBe(false);
+      expect(
+        createAcceptedPlanDecompositionSchema.safeParse({
+          acceptedPlanRevisionId: parentId,
+          children: [{ title: "Slice" }],
+        }).success,
+      ).toBe(true);
     });
   });
 });

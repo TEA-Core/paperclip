@@ -899,28 +899,59 @@ export const upsertIssueWatchdogSchema = z
 
 export type UpsertIssueWatchdog = z.infer<typeof upsertIssueWatchdogSchema>;
 
+/**
+ * `parentId` stays omitted because the child route takes the parent from the
+ * URL, so a body-level `parentId` has no correct reading.
+ *
+ * `parentLinkKind` does NOT stay omitted. M2 dropped it here on the premise
+ * that "child edges are always decomposition", but M4's own close-ladder gate
+ * refutes that: when it refuses an edge it tells the caller, in the 409 body, to
+ * `set parent_link_kind: 'process'` — and on this route, the one agents use to
+ * file sub-work, `.strict()` turned that documented remedy into a 400
+ * `unrecognized_keys`. A remedy the wire refuses is not a remedy. The premise
+ * was never enforced anywhere either: the same procedural edge has always been
+ * writable through `POST /companies/:id/issues` with `parentId` +
+ * `parentLinkKind`, so the omission bought no invariant — it only made the
+ * lawful escape hatch unreachable from the ergonomic route (the one that also
+ * carries workspace inheritance, acceptance criteria and blockParentUntilDone).
+ */
+const createChildIssueObjectSchema = createIssueBaseSchema
+  .omit({
+    parentId: true,
+    inheritExecutionWorkspaceFromIssueId: true,
+    watchdogDiscovery: true,
+  })
+  .extend({
+    acceptanceCriteria: z
+      .array(z.string().trim().min(1).max(500))
+      .max(20)
+      .optional(),
+    blockParentUntilDone: z.boolean().optional().default(false),
+  });
+
 export const createChildIssueSchema = withCreateIssueStatusDefault(
-  createIssueBaseSchema
-    .omit({
-      parentId: true,
-      parentLinkKind: true,
-      inheritExecutionWorkspaceFromIssueId: true,
-      watchdogDiscovery: true,
-    })
-    .extend({
-      acceptanceCriteria: z
-        .array(z.string().trim().min(1).max(500))
-        .max(20)
-        .optional(),
-      blockParentUntilDone: z.boolean().optional().default(false),
-    }),
+  createChildIssueObjectSchema,
 ).superRefine(requireBlockedStatusForUnblockDescriptor);
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 
+/**
+ * The accepted-plan decomposition route keeps the omission, because this is the
+ * one place where "always decomposition" is true by construction: these children
+ * ARE the decomposition of the accepted plan revision they are filed against.
+ * A `process` child here would be a contradiction in terms and would let a plan
+ * decomposition sidestep the very close ladder it is supposed to arm.
+ */
 export const createAcceptedPlanDecompositionSchema = z.object({
   acceptedPlanRevisionId: z.string().guid(),
-  children: z.array(createChildIssueSchema).min(1).max(25),
+  children: z
+    .array(
+      withCreateIssueStatusDefault(
+        createChildIssueObjectSchema.omit({ parentLinkKind: true }),
+      ).superRefine(requireBlockedStatusForUnblockDescriptor),
+    )
+    .min(1)
+    .max(25),
 });
 
 export type CreateAcceptedPlanDecomposition = z.infer<
