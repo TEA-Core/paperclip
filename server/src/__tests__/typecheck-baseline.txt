@@ -848,7 +848,7 @@ server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(717,52): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(740,52): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(761,52): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(797,52): TS2345
-server/src/__tests__/issue-execution-policy-missing-approval-stage.test.ts(435,25): TS2493
+server/src/__tests__/issue-execution-policy-missing-approval-stage.test.ts(487,25): TS2493
 server/src/__tests__/issue-execution-policy-routes.test.ts(1073,7): TS2322
 server/src/__tests__/issue-execution-policy-routes.test.ts(368,24): TS2741
 server/src/__tests__/issue-execution-policy-routes.test.ts(370,48): TS2739
@@ -941,8 +941,6 @@ server/src/__tests__/issue-review-attention.test.ts(697,21): TS2339
 server/src/__tests__/issue-review-policy.test.ts(115,48): TS2558
 server/src/__tests__/issue-review-policy.test.ts(159,31): TS2558
 server/src/__tests__/issue-review-policy.test.ts(230,48): TS2558
-server/src/__tests__/issue-stalled-review-decision-routes.test.ts(526,55): TS2493
-server/src/__tests__/issue-stalled-review-decision-routes.test.ts(608,42): TS2493
 server/src/__tests__/issue-thread-interaction-routes.test.ts(1054,7): TS2353
 server/src/__tests__/issue-thread-interaction-routes.test.ts(1298,56): TS2493
 server/src/__tests__/issue-thread-interaction-routes.test.ts(1298,60): TS2339
@@ -1524,4 +1522,3 @@ server/src/__tests__/workspace-runtime.test.ts(9858,105): TS2741
 server/src/__tests__/worktree-config.test.ts(1194,7): TS2741
 server/src/__tests__/worktree-config.test.ts(1211,7): TS2741
 server/src/__tests__/write-build-stamp.test.ts(3,36): TS7016
-server/src/services/plugin-host-services.ts(23,3): TS2305

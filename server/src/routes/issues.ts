@@ -14889,6 +14889,101 @@ export function issueRoutes(
     },
   );
 
+  // SUP-17158 (corrective carrier for SUP-17134; review SUP-17139): a card that
+  // acquires laddered children while its executionPolicy has no `approval` stage
+  // can never reach a recorded approval decision — every bare `done` PATCH is
+  // refused with `done_transition_missing_approval_stage`. That gap is otherwise
+  // diagnosed only at the close attempt, long after the card became unclosable.
+  // Flag it at the moment the children are filed: a durable
+  // `issue.missing_approval_stage_acquired` activity row plus a system comment on
+  // the parent carrying the done-guard's own `remediation` string verbatim, so
+  // the next run can re-arm the ladder before the close.
+  const MISSING_APPROVAL_STAGE_ACQUIRED_ACTION = "issue.missing_approval_stage_acquired";
+  const MISSING_APPROVAL_STAGE_ACQUIRED_MARKER = "[Missing approval stage acquired]";
+
+  async function flagMissingApprovalStageOnChildAcquisition(
+    parent: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      executionPolicy: unknown;
+    },
+    source: "child_create" | "accepted_plan_decomposition",
+  ): Promise<void> {
+    // Shared predicate, no drift (acquisition-counts-stage-less-child): the
+    // close-guard count requires each child's ladder to have RUN; the proactive
+    // flag fires while those children are still open, so it relaxes ONLY the
+    // completion gate. Origin/status/carve-out exclusions and the `>= 2`
+    // threshold (in `diagnoseMissingApprovalStage`) are shared, so the two
+    // consumers can never disagree on which children count.
+    const laddered = await countLadderedChildren(db, parent.companyId, parent.id, {
+      requireCompletedLadder: false,
+    });
+    const gap = diagnoseMissingApprovalStage({
+      policy: normalizeIssueExecutionPolicy(parent.executionPolicy),
+      ladderedChildCount: laddered.count,
+      ladderedChildIdentifiers: laddered.identifiers,
+      excludedChildIdentifiers: laddered.excludedChildIdentifiers,
+    });
+    if (!gap) return;
+    // Durable + race-safe + deduped (acquisition-flag-dedup-race /
+    // acquisition-flag-not-durable). The child create has already committed, so
+    // the flag is its own awaited transaction that PROPAGATES failures — a
+    // swallowed failure would silently drop the required durable record and turn
+    // a successful acquisition back into a silent-unclosable card. The parent
+    // row is the transaction fence: concurrent acquisitions on the same parent
+    // serialize here, and the dedup is a history-independent read of the durable
+    // activity table — never a bounded comment scan — so a marker is never
+    // forgotten just because newer comments pushed it out of a `limit`.
+    await db.transaction(async (tx) => {
+      await tx
+        .select({ id: issueRows.id })
+        .from(issueRows)
+        .where(eq(issueRows.id, parent.id))
+        .for("update");
+      const alreadyFlagged = await tx
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, parent.companyId),
+            eq(activityLog.action, MISSING_APPROVAL_STAGE_ACQUIRED_ACTION),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, parent.id),
+          ),
+        );
+      if (alreadyFlagged.length > 0) return;
+      await logActivityInTransaction(tx as unknown as Db, {
+        companyId: parent.companyId,
+        actorType: "system",
+        actorId: "missing-approval-stage-acquisition",
+        action: MISSING_APPROVAL_STAGE_ACQUIRED_ACTION,
+        entityType: "issue",
+        entityId: parent.id,
+        issueId: parent.id,
+        details: {
+          identifier: parent.identifier ?? null,
+          ladderedChildCount: gap.ladderedChildCount,
+          ladderedChildIdentifiers: gap.ladderedChildIdentifiers,
+          excludedChildIdentifiers: gap.excludedChildIdentifiers,
+          stageTypes: gap.stageTypes,
+          remediation: gap.remediation,
+          source,
+        },
+      });
+      // Retryable, deduped system comment: created inside the same fenced
+      // transaction, so a rerun after this commits is a no-op by the
+      // history-independent dedup read above.
+      await svc.addComment(
+        parent.id,
+        `${MISSING_APPROVAL_STAGE_ACQUIRED_MARKER}\n\n${gap.remediation}`,
+        {},
+        { authorType: "system" },
+        tx,
+      );
+    });
+  }
+
   router.post(
     "/issues/:id/children",
     applyCreateIssueStatusDefault,
@@ -15184,6 +15279,7 @@ export function issueRoutes(
           issue.id,
         );
       }
+      await flagMissingApprovalStageOnChildAcquisition(parent, "child_create");
       res.status(201).json(issue);
     },
   );
@@ -15453,6 +15549,11 @@ export function issueRoutes(
         currentChildIssueId:
           existingSerializedChild?.id ?? result.newlyCreatedIssues[0]?.id,
       });
+
+      await flagMissingApprovalStageOnChildAcquisition(
+        sourceIssue,
+        "accepted_plan_decomposition",
+      );
 
       res.json({
         decomposition: result.decomposition,
