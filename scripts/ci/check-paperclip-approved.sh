@@ -207,15 +207,24 @@ fail() {
 #   budget cannot clear either one, so retrying a 403 would convert a fast,
 #   correct, legible failure into a slower identical failure — and, in the
 #   secondary-limit case, make the underlying condition worse for every other
-#   job on the same token. The fleet GH_TOKEN is a shared personal PAT, so that
-#   blast radius is real. A rate-limited gate is a capacity problem to fix at
-#   the token, not a blip to paper over here.
+#   job on the same token. Both workflows that invoke this script (pr.yml and
+#   paperclip-approved.yml) pass `GH_TOKEN: ${{ github.token }}`, the per-job
+#   installation token — NOT the fleet personal PAT — so the blast radius is
+#   this repository's jobs rather than the whole fleet. It is still real. A
+#   rate-limited gate is a capacity problem to fix at the token, not a blip to
+#   paper over here.
 #
 # BOUNDED, AND FREE IN THE HAPPY PATH. Attempts = 1 + ${#GH_API_BACKOFF[@]},
 # i.e. 3 attempts, with sleeps of 2s then 5s. Worst-case ADDED wall time is
-# therefore exactly 7 seconds per call site, 21 seconds if all three exhaust —
-# bounded by construction, because the backoff list is finite and is the only
-# thing that produces a sleep. When the first attempt succeeds the function
+# therefore exactly 7 seconds per call site. Across a whole run the reachable
+# worst case is 14 seconds, not 21: `fail` always exits, so if the first call
+# (GET pulls/{n}) exhausts its attempts the script terminates there and the
+# other two never run. Only the reviews and statuses reads can both exhaust in
+# one execution — that happens when a waiver is present but its countersignature
+# read exhausts, which returns advisory rather than exiting, and the run then
+# falls through to the statuses read. Bounded by construction either way,
+# because the backoff list is finite and is the only thing that produces a
+# sleep. When the first attempt succeeds the function
 # returns before reaching any sleep, so the ordinary run is not one millisecond
 # slower than before.
 GH_API_BACKOFF=(2 5)
@@ -268,7 +277,7 @@ gh_api_retryable() {
 # partial page stream is discarded the moment the retry begins. There is no
 # concatenation operator anywhere in this function, and there must never be.
 gh_api_retry() {
-  local attempt=1 attempts=$(( ${#GH_API_BACKOFF[@]} + 1 )) rc=0 out="" wait_s
+  local attempt=1 attempts=$(( ${#GH_API_BACKOFF[@]} + 1 )) rc=0 out="" wait_s line
 
   while :; do
     # Fresh capture, never an append. See the --paginate note above.
@@ -290,7 +299,11 @@ gh_api_retry() {
     # Logged, never silent: a gate that quietly papers over 5xx hides a
     # degrading API until it degrades past three attempts.
     err "gh api attempt ${attempt}/${attempts} failed with a transient error (rc=${rc}), retrying in ${wait_s}s: gh api $*"
-    err "  ${out}"
+    # Prefix EVERY line: a multi-line gh payload would otherwise land in the
+    # merge-queue log as bare unprefixed lines, and any `::`-prefixed line
+    # inside an API payload would sit at column 0 where Actions reads it as a
+    # workflow command.
+    while IFS= read -r line; do err "  ${line}"; done <<<"$out"
     sleep "$wait_s"
     attempt=$(( attempt + 1 ))
   done
