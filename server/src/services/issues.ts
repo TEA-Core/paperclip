@@ -1912,10 +1912,17 @@ type IssueScheduledRetryRow = {
  * indistinguishable from "this card has no ladder", and an armed gate has
  * already been misread as an absent one in production. Keeping the omission in
  * the type stops any consumer from reading these off a list row by accident.
+ *
+ * SUP-17184 (ADR-103 M2a): `parentLinkKind` is likewise omitted from the list
+ * projection — list reads do not yet consume it (that is M2b) — so the row type
+ * must keep it absent to stay in sync with `issueListSelect`.
  */
 type IssueListRow = Omit<
   IssueRow,
-  "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+  | "executionPolicy"
+  | "executionState"
+  | "executionWorkspaceSettings"
+  | "parentLinkKind"
 >;
 type IssueLabelEnrichment = {
   labels: IssueLabelRow[];

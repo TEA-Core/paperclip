@@ -116,10 +116,19 @@ function requestedLabelNames(condition: unknown): Set<string> {
   return values;
 }
 
+// SUP-17180: record each company-scoped labels read countLadderedChildren
+// issues, so a test can assert the four carve-out names resolve in ONE single
+// inArray read (not a second query for the process name). filterLabelRowsByName
+// is invoked exactly once per labels read, so this sequence is the read sequence.
+// The SUP-17177 carve-out (already merged) implemented the single-read behavior
+// but did not pin it; this probe asserts the query count, not just the outcome.
+const labelReadProbe: { conditions: unknown[] } = { conditions: [] };
+
 function filterLabelRowsByName(
   rows: Record<string, unknown>[],
   condition: unknown,
 ): Record<string, unknown>[] {
+  labelReadProbe.conditions.push(condition);
   const requested = requestedLabelNames(condition);
   return rows.filter((row) => typeof row.name === "string" && requested.has(row.name));
 }
@@ -2682,6 +2691,10 @@ describe("evaluateDoneTransitionGuard", () => {
     const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
     const parentStageId = "30000000-0000-4000-8000-000000000005";
     const processLabelId = "60000000-0000-4000-8000-00000000000b";
+    // SUP-17180 query-count probe: a redo label id so the probe can seed a
+    // redo-labelled child and assert `work-type:redo` rides in the SAME single
+    // labels read as the other carve-out names (one inArray, not four queries).
+    const redoLabelId = "60000000-0000-4000-8000-000000000009";
 
     const agents = [
       { id: supportCrId, name: "support-CR", role: "support" },
@@ -2961,6 +2974,48 @@ describe("evaluateDoneTransitionGuard", () => {
       );
       expect(d.allowed).toBe(false);
       expect(d.reason).toContain("Mechanism D");
+    });
+
+    // SUP-17180 (ADR-103 M1): the SUP-17177 carve-out already merged added
+    // `work-type:process` to the single company-scoped labels read but did not pin
+    // the QUERY COUNT. This probe asserts what the card requires — all four
+    // carve-out names resolve in ONE single inArray, not a second query for the
+    // process. If a regression re-introduces a second labels query for the process
+    // name, labelReadProbe would record two reads; if a single read dropped a
+    // carve-out name, the requested-set assertion fails. It pins the "assert the
+    // query count, not just the outcome" bullet the SUP-17177 carve-out left open.
+    it("resolves all four carve-out names in a SINGLE company-scoped labels read — one inArray covers four, not a second query (SUP-17180 AC: query count)", async () => {
+      const redoLabelRow = {
+        id: redoLabelId,
+        companyId: "company-1",
+        name: "work-type:redo",
+        color: "#000000",
+      };
+      labelReadProbe.conditions = [];
+      setupDbMock({
+        issues: [
+          manualChild("redo-1", "SUP-17191", "60000003-0000-4000-8000-000000000001"),
+          processChild("process-1", "SUP-17192", "60000003-0000-4000-8000-000000000002"),
+        ],
+        labels: [redoLabelRow, processLabelRow],
+        issueLabels: [
+          { issueId: "redo-1", labelId: redoLabelId, companyId: "company-1" },
+          { issueId: "process-1", labelId: processLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(labelReadProbe.conditions).toHaveLength(1);
+      const requested = requestedLabelNames(labelReadProbe.conditions[0]);
+      expect(requested.has("work-type:redo")).toBe(true);
+      expect(requested.has("work-type:delivery")).toBe(true);
+      expect(requested.has("work-type:architecture-review")).toBe(true);
+      expect(requested.has("work-type:process")).toBe(true);
     });
   });
 
@@ -4798,6 +4853,78 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(true);
       expect(result.aheadBy).toBe(0);
       expect(result.skipReason).toBeNull();
+    });
+
+    // SUP-17162 second symptom: the live-discovery path must consume the SAME
+    // anchored ownership predicate as discovery (merge-arming.ts), not a second
+    // looser copy. A card's identifier cited anywhere — mid-slug in a sibling's
+    // branch, mid-string in a title, anywhere in the body — is a cross-reference,
+    // not a delivery claim, and must not block the card from closing `done`.
+    it("does NOT block a plain done when the only open PR merely cites the card's identifier (SUP-17162 second symptom: SUP-17075 -> #760 verbatim)", async () => {
+      // headRef belongs to a sibling (SUP-7799) and only cites SUP-12345 mid-slug;
+      // the title leads with the sibling's identifier; the body cites SUP-12345.
+      // Pre-fix, the unanchored headRef.includes / body.includes test counted this
+      // as the card's open PR and fired done_transition_missing_delivery; the fix
+      // lets the card close `done` with no doneTransitionOverride.
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({
+        ok: true,
+        status: 200,
+        message: null,
+        items: [
+          {
+            number: 760,
+            draft: false,
+            headRef:
+              "SUP-7799-fix-interaction-acceptance-must-not-reclaim-a-card-whose-execution-stage-is-pending-sup-12345-d1-ppc-be",
+            title: "fix(SUP-7799): interaction acceptance must not reclaim a pending card",
+            body: "**Parent ruling: SUP-12345**\n\nThe implementation ships on SUP-7799.",
+          },
+        ],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      // The cited PR must not surface as this card's open linked delivery.
+      expect(result.skipReason).toBeNull();
+      expect(result.reason).not.toContain("open linked PR");
+      // Prove we actually ran live discovery (not a token/context failure).
+      expect(mockFetchOpenPullRequests).toHaveBeenCalledTimes(1);
+    });
+
+    it("still blocks a plain done on a genuinely OWNED open PR (headRef identifier prefix) — anchoring did not become always-allow (SUP-17162)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({
+        ok: true,
+        status: 200,
+        message: null,
+        items: [
+          {
+            number: 3264,
+            draft: false,
+            headRef: "SUP-12345-work",
+            title: "fix(SUP-12345): rework the transition guard",
+            body: null,
+          },
+        ],
+      });
+      ghFetchMock.mockImplementation(async (_url: string) => {
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip#3264");
     });
   });
 });

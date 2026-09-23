@@ -64,6 +64,13 @@ const childRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 // default so the carve-out is inert unless a test arms it.
 const carveOutLabelRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 const carveOutIssueLabelRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
+// SUP-17158 (acquisition-flag-dedup-race / -not-durable): the durable
+// acquisition-flag dedup read. The flag serializes on the parent row and
+// dedups by reading the activity table for a prior
+// `issue.missing_approval_stage_acquired` row on this parent — a
+// history-independent uniqueness check (never a bounded comment scan). Empty by
+// default so a fresh acquisition is not deduped.
+const activityFlagState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
@@ -272,6 +279,20 @@ function dbChainNode(rows: unknown[]): Record<string, unknown> {
   };
 }
 
+// SUP-17158: read a drizzle table's name without object-identity assumptions.
+// The guard's `@paperclipai/db` module instance differs from this test's, so
+// `table === labels` is always false — but the table name is stored under the
+// GLOBAL symbol registry (`Symbol.for("drizzle:Name")`), so the string is
+// reliable across instances. Used to route the acquisition-flag dedup read
+// (a 1-key `id` projection on the activity_log table, indistinguishable from
+// the carve-out label read by projection signature alone).
+const DRIZZLE_TABLE_NAME = Symbol.for("drizzle:Name");
+function drizzleTableName(table: unknown): string | undefined {
+  if (!table || typeof table !== "object") return undefined;
+  const name = (table as Record<PropertyKey, unknown>)[DRIZZLE_TABLE_NAME];
+  return typeof name === "string" ? name : undefined;
+}
+
 // SUP-16586: `countLadderedChildren` resolves the carve-out label names through
 // `inArray(labels.name, [...])`. A plain mock that returns every seeded label
 // row regardless of that predicate would make the new carve-out look honored
@@ -351,6 +372,37 @@ function ladderedChildRow(
       changesRequestedCount: 0,
     },
     originKind,
+  };
+}
+
+// SUP-17158: a decomposition child that CARRIES a ladder but has not yet run it
+// (executionState still null) — the shape the proactive acquisition flag counts
+// while the children are still open. Distinct from `ladderedChildRow`, whose
+// completed stage models the close-guard's "ladder has run" state.
+function openLadderedChildRow(id: string, identifier: string, originKind: string = "manual") {
+  return {
+    id,
+    identifier,
+    status: "todo",
+    executionPolicy: {
+      stages: [{ id: "stage-x", type: "review", participants: [{ type: "agent", agentId: AGENT_ID }] }],
+    },
+    executionState: null,
+    originKind,
+  };
+}
+
+// SUP-17158 (acquisition-counts-stage-less-child): a child whose executionPolicy
+// carries no stages. It is not a laddered child and must NOT be counted by the
+// acquisition flag, even though the "has the ladder run" gate is relaxed.
+function stageLessChildRow(id: string, identifier: string) {
+  return {
+    id,
+    identifier,
+    status: "todo",
+    executionPolicy: { stages: [] },
+    executionState: null,
+    originKind: "manual",
   };
 }
 
@@ -453,6 +505,7 @@ describe("issue execution policy missing approval stage", () => {
     childRowsState.rows = [];
     carveOutLabelRowsState.rows = [];
     carveOutIssueLabelRowsState.rows = [];
+    activityFlagState.rows = [];
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -500,6 +553,12 @@ describe("issue execution policy missing approval stage", () => {
           let filterLabelNames = false;
           if (childSignature) {
             rows = childRowsState.rows;
+          } else if (drizzleTableName(table) === "activity_log") {
+            // SUP-17158: the acquisition-flag dedup is a 1-key `id` projection on
+            // the activity_log table, signature-colliding with the carve-out
+            // label read. It is routed by drizzle table name, which is reliable
+            // across module instances even when object identity is not.
+            rows = activityFlagState.rows;
           } else if (keys.length === 1 && keys[0] === "id") {
             // The carve-out labels read is the only single-key `id` projection on
             // this route path (the child decomposition is a 6-key projection and
@@ -1049,5 +1108,141 @@ describe("issue execution policy missing approval stage", () => {
       expect.anything(),
     );
     expect(gapActivityInputs()).toEqual([]);
+  });
+
+  describe("SUP-17158 acquisition-time missing-approval-stage flag (review SUP-17139)", () => {
+    // The proactive flag is written through the SAME transactional logger the
+    // close guard uses, but under its own acquisition action — so it is
+    // distinguishable from the close-guard's refused/recorded signals.
+    function acquisitionFlagInputs() {
+      return mockLogActivityInTransaction.mock.calls
+        .map((call) => (call as unknown[])[1] as Record<string, unknown> | undefined)
+        .filter((input): input is Record<string, unknown> =>
+          input?.action === "issue.missing_approval_stage_acquired");
+    }
+
+    function createChildFixture() {
+      mockIssueService.createChild.mockResolvedValue({
+        issue: {
+          id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          companyId: "company-1",
+          identifier: "PAP-NEW",
+          title: "New child",
+          status: "todo",
+        },
+        parentBlockerAdded: false,
+      });
+    }
+
+    it("F1: does not flag a parent whose open children carry no stages (no predicate drift from the close guard)", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      childRowsState.rows = [
+        stageLessChildRow("child-a-id", "PAP-2"),
+        stageLessChildRow("child-b-id", "PAP-3"),
+      ];
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      // Two open, non-cancelled children that are NOT laddered: the relaxed
+      // completion gate must still require an actual ladder, so the count is 0
+      // and no gap is diagnosed.
+      expect(acquisitionFlagInputs()).toEqual([]);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("flags a parent that now carries two ladder-carrying open children with no approval stage", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      childRowsState.rows = [
+        openLadderedChildRow("child-a-id", "PAP-2"),
+        openLadderedChildRow("child-b-id", "PAP-3"),
+      ];
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const flags = acquisitionFlagInputs();
+      expect(flags).toHaveLength(1);
+      expect(flags[0]!.issueId).toBe(PARENT_ID);
+      const details = flags[0]!.details as Record<string, unknown>;
+      expect(details.ladderedChildCount).toBe(2);
+      expect(details.ladderedChildIdentifiers).toEqual(["PAP-2", "PAP-3"]);
+      expect(details.stageTypes).toEqual(["review"]);
+      // The remediation string is the done-guard's own, verbatim.
+      expect(typeof details.remediation).toBe("string");
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        PARENT_ID,
+        expect.stringContaining("[Missing approval stage acquired]"),
+        {},
+        { authorType: "system" },
+        // SUP-17158: the comment is written INSIDE the fenced transaction
+        // (retryable, durable), not as a fire-and-forget side effect.
+        expect.anything(),
+      );
+    });
+
+    it("does not flag when the parent already has an approval stage", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewPlusApprovalPolicy()));
+      childRowsState.rows = [
+        openLadderedChildRow("child-a-id", "PAP-2"),
+        openLadderedChildRow("child-b-id", "PAP-3"),
+      ];
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(acquisitionFlagInputs()).toEqual([]);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("F2: dedups via the durable activity table — a prior flag on the same parent is a no-op", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      childRowsState.rows = [
+        openLadderedChildRow("child-a-id", "PAP-2"),
+        openLadderedChildRow("child-b-id", "PAP-3"),
+      ];
+      // A prior durable flag row on this parent: the history-independent dedup
+      // read finds it, so a second acquisition is a no-op (no second row, no
+      // second comment) — regardless of how old the marker is.
+      activityFlagState.rows = [{ id: "99999999-9999-4999-8999-999999999999" }];
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(acquisitionFlagInputs()).toEqual([]);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("F3: propagates a durable-flag write failure instead of swallowing it", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      childRowsState.rows = [
+        openLadderedChildRow("child-a-id", "PAP-2"),
+        openLadderedChildRow("child-b-id", "PAP-3"),
+      ];
+      // The flag's own fenced transaction fails: a swallowed failure would drop
+      // the required durable record and turn a successful acquisition back into
+      // a silent-unclosable card, so it must surface as a 5xx.
+      mockDb.transaction.mockRejectedValueOnce(new Error("durable flag write failed"));
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
   });
 });

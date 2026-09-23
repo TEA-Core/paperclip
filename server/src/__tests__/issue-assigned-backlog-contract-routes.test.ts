@@ -118,6 +118,26 @@ vi.mock("../services/index.js", () => ({
   }),
 }));
 
+// SUP-17158: the child-acquisition flag (flagMissingApprovalStageOnChildAcquisition)
+// now reads the parent's laddered children before a successful create
+// (countLadderedChildren -> db.select). This contract test is about the
+// assigned-backlog status rules, not that flag, so it keeps the db empty: every
+// read resolves to zero rows, the flag sees no laddered children and no-ops, and
+// the create path still returns its 201/422 contract. The mock mirrors the
+// production drizzle surface (reads plus a transaction executor); the write
+// path is unreachable while no children are counted.
+const mockDb = {
+  select: () => ({
+    from: () => ({
+      where: () => Promise.resolve([]),
+      for: () => Promise.resolve([]),
+    }),
+  }),
+  transaction: async (
+    callback: (tx: { select: unknown }) => Promise<unknown>,
+  ) => callback({ select: mockDb.select }),
+};
+
 async function createApp() {
   const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
     "../routes/issues.js",
@@ -137,7 +157,7 @@ async function createApp() {
     };
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use("/api", issueRoutes(mockDb as any, {} as any));
   app.use(reportUnexpectedRouteError("issue-assigned-backlog-contract-routes"));
   app.use(errorHandler);
   return app;

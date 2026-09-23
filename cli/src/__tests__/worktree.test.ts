@@ -165,12 +165,18 @@ async function seedValidWorktreeSource(
     principalId: userId,
     status: "active",
   });
-  // This helper also seeds an intentionally older schema. Current Drizzle
-  // insert builders include defaults for newly added columns absent there.
-  await db.$client`
-    insert into issues (id, company_id, title, status, priority, issue_number, identifier)
-    values (${issueId}, ${companyId}, 'Representative seed issue', 'backlog', 'medium', 1, 'SEED-1')
-  `;
+  // Seed the issue through the raw client with an explicit column list rather
+  // than `db.insert(issues).values(...)`. The Drizzle insert builder names every
+  // `issues` column (using `default` for the ones left out), so it references
+  // whichever column the newest migration added. The lagging-source test builds
+  // an all-but-last migration schema on purpose, so that newest column does not
+  // exist there yet and the insert fails. Naming only the stable core columns
+  // lets the database apply defaults for the rest in any schema revision.
+  await db.$client.unsafe(
+    `insert into "issues" ("id", "company_id", "title", "status", "priority", "issue_number", "identifier")
+     values ($1, $2, $3, $4, $5, $6, $7)`,
+    [issueId, companyId, "Representative seed issue", "backlog", "medium", 1, "SEED-1"],
+  );
   await db.$client.end({ timeout: 5 });
   return { companyId, issueId };
 }

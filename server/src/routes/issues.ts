@@ -563,15 +563,25 @@ type IssueRouteSnapshot = typeof issueRows.$inferSelect;
  * for perf, so a row handed to recovery revalidation may legitimately be
  * missing them. They are absent (not `null`) there — callers must treat the
  * absence as "not projected", not as "no ladder".
+ *
+ * SUP-17184 (ADR-103 M2a): `parentLinkKind` is likewise omitted from the list
+ * projection (list reads do not yet consume it — M2b), so it is made optional
+ * here to stay in sync with `issueListSelect`.
  */
 type IssueRouteSnapshotExecutionOptional = Omit<
   IssueRouteSnapshot,
-  "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+  | "executionPolicy"
+  | "executionState"
+  | "executionWorkspaceSettings"
+  | "parentLinkKind"
 > &
   Partial<
     Pick<
       IssueRouteSnapshot,
-      "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+      | "executionPolicy"
+      | "executionState"
+      | "executionWorkspaceSettings"
+      | "parentLinkKind"
     >
   >;
 type RecoveryRevalidationTrigger =
@@ -4567,11 +4577,23 @@ export function issueRoutes(
       }
     }
     if (!guardResult.allowed) {
-      const remedy = guardResult.ladderUnsatisfied
-        ? "Record the unsatisfied review stage's approval (or skip it) before marking the issue done — the review ladder must be complete before a close, and a no-deliverable-head override does not clear a review-ladder refusal."
-        : decisionCarried
-          ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
-          : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.";
+      // ADR-103 M3: the remedy must speak in the voice of the mechanism that
+      // refused, not the caller's door. Mechanisms A/C/D carry their own remedy
+      // through from the guard; the merge-first / deliver.sh strings are reachable
+      // ONLY on a true delivery/head refusal. Before M3 every refusal selected the
+      // remedy from `decisionCarried`/`ladderUnsatisfied`, so a mechanism A/D
+      // refusal on a decision-carrying close emitted the circular merge-first
+      // instruction ("Merge the issue's pull request") even though the approval
+      // being refused is the only thing that publishes paperclip/approved.
+      const mechanism =
+        guardResult.mechanism ?? (guardResult.ladderUnsatisfied ? "C" : "delivery");
+      const remedy =
+        mechanism === "delivery"
+          ? decisionCarried
+            ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+            : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+          : guardResult.remedy ??
+            "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 409 with no thread-readable code/remedy (SUP-15878 precedent).
@@ -4597,6 +4619,13 @@ export function issueRoutes(
             owner: guardResult.owner,
             repo: guardResult.repo,
             decisionCarried,
+            // ADR-103 M3.5: the mechanism travels in details beside the counted
+            // identifiers and the carve-out-excluded set, so a refusal is
+            // diagnosable without re-deriving the gate. The wire `code` stays
+            // `done_transition_missing_delivery` for compatibility (M3.7).
+            mechanism,
+            ladderedChildIdentifiers: guardResult.ladderedChildIdentifiers ?? null,
+            excludedChildIdentifiers: guardResult.excludedChildIdentifiers ?? null,
             remedy,
           },
         },
@@ -15016,6 +15045,101 @@ export function issueRoutes(
     },
   );
 
+  // SUP-17158 (corrective carrier for SUP-17134; review SUP-17139): a card that
+  // acquires laddered children while its executionPolicy has no `approval` stage
+  // can never reach a recorded approval decision — every bare `done` PATCH is
+  // refused with `done_transition_missing_approval_stage`. That gap is otherwise
+  // diagnosed only at the close attempt, long after the card became unclosable.
+  // Flag it at the moment the children are filed: a durable
+  // `issue.missing_approval_stage_acquired` activity row plus a system comment on
+  // the parent carrying the done-guard's own `remediation` string verbatim, so
+  // the next run can re-arm the ladder before the close.
+  const MISSING_APPROVAL_STAGE_ACQUIRED_ACTION = "issue.missing_approval_stage_acquired";
+  const MISSING_APPROVAL_STAGE_ACQUIRED_MARKER = "[Missing approval stage acquired]";
+
+  async function flagMissingApprovalStageOnChildAcquisition(
+    parent: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      executionPolicy: unknown;
+    },
+    source: "child_create" | "accepted_plan_decomposition",
+  ): Promise<void> {
+    // Shared predicate, no drift (acquisition-counts-stage-less-child): the
+    // close-guard count requires each child's ladder to have RUN; the proactive
+    // flag fires while those children are still open, so it relaxes ONLY the
+    // completion gate. Origin/status/carve-out exclusions and the `>= 2`
+    // threshold (in `diagnoseMissingApprovalStage`) are shared, so the two
+    // consumers can never disagree on which children count.
+    const laddered = await countLadderedChildren(db, parent.companyId, parent.id, {
+      requireCompletedLadder: false,
+    });
+    const gap = diagnoseMissingApprovalStage({
+      policy: normalizeIssueExecutionPolicy(parent.executionPolicy),
+      ladderedChildCount: laddered.count,
+      ladderedChildIdentifiers: laddered.identifiers,
+      excludedChildIdentifiers: laddered.excludedChildIdentifiers,
+    });
+    if (!gap) return;
+    // Durable + race-safe + deduped (acquisition-flag-dedup-race /
+    // acquisition-flag-not-durable). The child create has already committed, so
+    // the flag is its own awaited transaction that PROPAGATES failures — a
+    // swallowed failure would silently drop the required durable record and turn
+    // a successful acquisition back into a silent-unclosable card. The parent
+    // row is the transaction fence: concurrent acquisitions on the same parent
+    // serialize here, and the dedup is a history-independent read of the durable
+    // activity table — never a bounded comment scan — so a marker is never
+    // forgotten just because newer comments pushed it out of a `limit`.
+    await db.transaction(async (tx) => {
+      await tx
+        .select({ id: issueRows.id })
+        .from(issueRows)
+        .where(eq(issueRows.id, parent.id))
+        .for("update");
+      const alreadyFlagged = await tx
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, parent.companyId),
+            eq(activityLog.action, MISSING_APPROVAL_STAGE_ACQUIRED_ACTION),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, parent.id),
+          ),
+        );
+      if (alreadyFlagged.length > 0) return;
+      await logActivityInTransaction(tx as unknown as Db, {
+        companyId: parent.companyId,
+        actorType: "system",
+        actorId: "missing-approval-stage-acquisition",
+        action: MISSING_APPROVAL_STAGE_ACQUIRED_ACTION,
+        entityType: "issue",
+        entityId: parent.id,
+        issueId: parent.id,
+        details: {
+          identifier: parent.identifier ?? null,
+          ladderedChildCount: gap.ladderedChildCount,
+          ladderedChildIdentifiers: gap.ladderedChildIdentifiers,
+          excludedChildIdentifiers: gap.excludedChildIdentifiers,
+          stageTypes: gap.stageTypes,
+          remediation: gap.remediation,
+          source,
+        },
+      });
+      // Retryable, deduped system comment: created inside the same fenced
+      // transaction, so a rerun after this commits is a no-op by the
+      // history-independent dedup read above.
+      await svc.addComment(
+        parent.id,
+        `${MISSING_APPROVAL_STAGE_ACQUIRED_MARKER}\n\n${gap.remediation}`,
+        {},
+        { authorType: "system" },
+        tx,
+      );
+    });
+  }
+
   router.post(
     "/issues/:id/children",
     applyCreateIssueStatusDefault,
@@ -15311,6 +15435,7 @@ export function issueRoutes(
           issue.id,
         );
       }
+      await flagMissingApprovalStageOnChildAcquisition(parent, "child_create");
       res.status(201).json(issue);
     },
   );
@@ -15580,6 +15705,11 @@ export function issueRoutes(
         currentChildIssueId:
           existingSerializedChild?.id ?? result.newlyCreatedIssues[0]?.id,
       });
+
+      await flagMissingApprovalStageOnChildAcquisition(
+        sourceIssue,
+        "accepted_plan_decomposition",
+      );
 
       res.json({
         decomposition: result.decomposition,

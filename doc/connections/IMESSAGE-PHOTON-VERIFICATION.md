@@ -6,7 +6,7 @@ Initial implementation checked: `7ada38eb7ef5dff5441f23c02131798b11d57712`.
 **Status: experimental; Pro shared-DM live journeys verified below. Dedicated groups and the remaining release matrix are not yet qualified.**
 
 [PR #13299](https://github.com/paperclipai/paperclip/pull/13299) carries the current
-CI and review results. The Photon migration is `0291_easy_dragon_man.sql`, regenerated after master added its own 0274 agent-chat migration. Greptile reviewed the implementation commit at 5/5 with no
+CI and review results. The Photon migration is `0292_easy_dragon_man.sql`, regenerated after master added its own 0274 agent-chat migration. Greptile reviewed the implementation commit at 5/5 with no
 actionable comments. This record distinguishes local evidence from live proof.
 
 ## Environment and versions
