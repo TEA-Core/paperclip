@@ -3,7 +3,6 @@ name: Refresh Lockfile
 on:
   push:
     branches:
-      - master
       - "fold/**"
   workflow_dispatch:
 
