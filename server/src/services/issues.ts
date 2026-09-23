@@ -149,6 +149,7 @@ import {
   buildUndischargeableLadderEdgeConflict,
   evaluateUndischargeableLadderEdge,
 } from "./parent-edge-close-ladder-gate.js";
+import { edgeCarriesLadderCarveOutLabel } from "./laddered-child-eligibility.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
   type CurrentUserRedactionOptions,
@@ -10888,12 +10889,48 @@ export function issueService(db: Db) {
         // the ADR-072 close ladder on a parent that has already advanced past
         // the stages it can no longer add. The gate is a read-only validity
         // check in the same transaction as the edge write.
+        //
+        // The origin kind and status travel with the edge because the gate
+        // judges the incoming child by the same predicate the close guard
+        // applies to the existing children. Without them the gate counted every
+        // incoming child, including the ones the close guard never counts: the
+        // task watchdog files its review card here with
+        // `originKind: 'task_watchdog'` and `parentId` set to the watched card,
+        // and it fires exactly when that parent has advanced — so a watchdog or
+        // recovery card on a decomposed, advanced, non-conforming parent took a
+        // 409 at the one moment the platform most needed it to land.
+        // `originKind` is defaulted to 'manual' below when absent, which is what
+        // the predicate reads an absent value as.
+        //
+        // The carve-out labels travel with the edge for the same reason. The
+        // close guard excludes any child carrying `work-type:redo`,
+        // `work-type:delivery`, `work-type:architecture-review` or
+        // `work-type:process` (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177),
+        // and those names are resolvable HERE because `labelIds` is on the
+        // create payload — the same `inputLabelIds` that `syncIssueLabels`
+        // attaches a few dozen lines below, so the gate judges the child by the
+        // labels this very insert is about to give it. `work-type:redo` is the
+        // largest affected population by some distance: an ADR-041 bounce files
+        // redo children under a parent that has by definition already advanced
+        // through a review stage, which is precisely condition 2 of the gate.
+        // The resolve is skipped entirely when the payload names no labels, so
+        // an ordinary child create pays no extra read.
         if (issueData.parentId) {
+          const hasCarveOutLabel = await edgeCarriesLadderCarveOutLabel(
+            tx as unknown as Db,
+            companyId,
+            inputLabelIds,
+          );
           const ladderVerdict = await evaluateUndischargeableLadderEdge(
             tx as unknown as Db,
             companyId,
             issueData.parentId,
-            issueData.parentLinkKind,
+            {
+              parentLinkKind: issueData.parentLinkKind,
+              originKind: issueData.originKind,
+              status: issueData.status,
+              hasCarveOutLabel,
+            },
           );
           if (!ladderVerdict.ok) {
             const { message, details } = buildUndischargeableLadderEdgeConflict(

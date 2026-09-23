@@ -235,4 +235,54 @@ describeEmbeddedPostgres("parent_link_kind write paths", () => {
     expect(edge?.parentId).toBe(parentB);
     expect(edge?.parentLinkKind).toBe("process");
   });
+
+  it("accepts parent_link_kind on the child-create route and writes it", async () => {
+    // M2 omitted the field from `createChildIssueSchema` on the premise that
+    // child edges are always decomposition, which made the ADR-103 M4 gate's own
+    // advertised remedy — "declare the edge procedural by setting
+    // parent_link_kind: 'process'" — a 400 `unrecognized_keys` on the very route
+    // agents file sub-work through. The remedy has to be reachable where the
+    // refusal is raised.
+    const { companyId, parentA } = await seedCompanyWithParents();
+
+    const res = await request(createApp(companyId))
+      .post(`/api/issues/${parentA}/children`)
+      .send({ title: "Procedural courier child", parentLinkKind: "process" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const edge = await edgeFor(res.body.id);
+    expect(edge?.parentId).toBe(parentA);
+    expect(edge?.parentLinkKind).toBe("process");
+  });
+
+  it("still defaults a child-route edge to decomposition when the kind is omitted", async () => {
+    const { companyId, parentA } = await seedCompanyWithParents();
+
+    const res = await request(createApp(companyId))
+      .post(`/api/issues/${parentA}/children`)
+      .send({ title: "Ordinary sub-work child" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const edge = await edgeFor(res.body.id);
+    expect(edge?.parentId).toBe(parentA);
+    expect(edge?.parentLinkKind).toBe("decomposition");
+  });
+
+  it("still rejects an invalid parent_link_kind on the child-create route", async () => {
+    const { companyId, parentA } = await seedCompanyWithParents();
+
+    const res = await request(createApp(companyId))
+      .post(`/api/issues/${parentA}/children`)
+      .send({ title: "Bad child kind", parentLinkKind: "other" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(
+      await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(eq(issues.companyId, companyId), eq(issues.title, "Bad child kind")),
+        ),
+    ).toHaveLength(0);
+  });
 });

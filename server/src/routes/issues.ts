@@ -4,6 +4,7 @@ import {
   buildUndischargeableLadderEdgeConflict,
   evaluateUndischargeableLadderEdge,
 } from "../services/parent-edge-close-ladder-gate.js";
+import { edgeCarriesLadderCarveOutLabel } from "../services/laddered-child-eligibility.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -17276,11 +17277,51 @@ export function issueRoutes(
           // rejection throws before updateIssue is issued, so the refused edge
           // persists nothing.
           if (parentEdgeWriteRequested && nextParentId !== null) {
+            // Unlike the create path, this edge has a REAL child row behind it,
+            // so the origin kind is a stored fact rather than a payload field:
+            // `origin_kind` is create-only and immutable, so `existing` is the
+            // authority. The status, by contrast, is whatever this PATCH will
+            // LEAVE the child at — a re-parent that also cancels the child must
+            // be judged on the cancelled status it is about to write, not on the
+            // status it is replacing — so the transition's effective status wins
+            // over the stored one.
+            //
+            // The two paths stay deliberately asymmetric in what they READ and
+            // deliberately symmetric in what they DECIDE. A re-parent could in
+            // principle also consult the child's real executionPolicy and
+            // ladder progress, which the create path cannot know; it does not,
+            // because a re-parent that admitted a policy-less child would turn
+            // this route into a laundering path around the create gate (file the
+            // child policy-less under a benign parent, then move it). See
+            // laddered-child-eligibility.ts for the fail-closed reasoning.
+            //
+            // The carve-out labels follow the STATUS rule, not the origin-kind
+            // rule: labels are mutable, and this PATCH may restate them in the
+            // same body that moves the edge, so the gate has to judge the child
+            // by the label set the write will LEAVE it with. `updateFields`
+            // carries `labelIds` through to `svc.update` (which pulls it out as
+            // `nextLabelIds` and hands it to `syncIssueLabels`), so a restated
+            // array is authoritative and an absent key means the stored set from
+            // `getById` stands. Reading `existing.labelIds` alone would refuse a
+            // re-parent that carves the child out in the very same request.
+            const effectiveLabelIds = Array.isArray(updateFields.labelIds)
+              ? (updateFields.labelIds as string[])
+              : existing.labelIds;
+            const hasCarveOutLabel = await edgeCarriesLadderCarveOutLabel(
+              tx as unknown as Db,
+              existing.companyId,
+              effectiveLabelIds,
+            );
             const ladderVerdict = await evaluateUndischargeableLadderEdge(
               tx as unknown as Db,
               existing.companyId,
               nextParentId,
-              effectiveParentLinkKind,
+              {
+                parentLinkKind: effectiveParentLinkKind,
+                originKind: existing.originKind,
+                status: effectiveStatus ?? existing.status,
+                hasCarveOutLabel,
+              },
             );
             if (!ladderVerdict.ok) {
               const { message, details } =
