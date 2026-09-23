@@ -7,11 +7,16 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const workflow = readFileSync(path.join(repoRoot, ".github/workflows/refresh-lockfile.yml"), "utf8");
 
-// `Refresh Lockfile` runs on pushes to `master` and to every `fold/**` branch,
-// but the auto-merge step used to be gated on `master` only. On a fold branch
-// the lockfile PR was created and then sat open forever, so the fold branch kept
-// a stale `pnpm-lock.yaml` and every image build failed on the frozen install in
-// `Dockerfile`. These tests pin the gate to both lines.
+// `Refresh Lockfile` runs on pushes to every `fold/**` branch, and the auto-merge
+// step must stay gated on that same set. It was once gated on `master` only: the
+// lockfile PR for a fold branch was created and then sat open forever, so the
+// branch kept a stale `pnpm-lock.yaml` and every image build failed on the frozen
+// install in `Dockerfile`. These tests pin the trigger and the gate together so
+// they cannot drift apart again.
+//
+// `master` was deleted on 2026-09-23 (archived as `archive/master-2026-09-23`)
+// after the fold lane became the default branch, so the arms that named it are
+// gone from both the workflow and these assertions.
 
 const lines = workflow.split("\n");
 
@@ -57,20 +62,15 @@ function evaluateGate(condition, { refName, prUrl }) {
   return Boolean(new Function("refName", "prUrl", `return (${js});`)(refName, prUrl));
 }
 
-test("the workflow still runs on master and on every fold branch", () => {
-  assert.match(workflow, /^\s+- master$/m, "push trigger must keep master");
+test("the workflow still runs on every fold branch", () => {
   assert.match(workflow, /^\s+- "fold\/\*\*"$/m, "push trigger must keep fold/** branches");
+  assert.doesNotMatch(workflow, /^\s+- ["']?master["']?$/m, "master was deleted; the trigger must not name it");
 });
 
-test("auto-merge is enabled for lockfile PRs on master and fold branches", () => {
+test("auto-merge is enabled for lockfile PRs on fold branches", () => {
   const condition = stepCondition("Enable auto-merge for lockfile PR");
   const prUrl = "https://github.com/TEA-Core/paperclip/pull/1";
 
-  assert.equal(
-    evaluateGate(condition, { refName: "master", prUrl }),
-    true,
-    "master lockfile PRs must keep auto-merge",
-  );
   assert.equal(
     evaluateGate(condition, { refName: "fold/tea-patches-v2026.722.0", prUrl }),
     true,
@@ -79,7 +79,12 @@ test("auto-merge is enabled for lockfile PRs on master and fold branches", () =>
   assert.equal(
     evaluateGate(condition, { refName: "chore/some-branch", prUrl }),
     false,
-    "only master and fold branches may auto-merge lockfile PRs",
+    "only fold branches may auto-merge lockfile PRs",
+  );
+  assert.equal(
+    evaluateGate(condition, { refName: "master", prUrl }),
+    false,
+    "master was deleted; no gate may still resolve true for it",
   );
   assert.equal(
     evaluateGate(condition, { refName: "fold/tea-patches-v2026.722.0", prUrl: "" }),
