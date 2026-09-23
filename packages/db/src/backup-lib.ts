@@ -328,6 +328,28 @@ export type ConnectionStringSecret = {
   password?: string;
 };
 
+const POSTGRES_URI_SCHEME = /^postgres(?:ql)?:\/\//i;
+
+/**
+ * Percent-decodes exactly the way libpq's `conninfo_uri_decode` does: `%XX` only.
+ *
+ * `URLSearchParams` is deliberately not used here — it applies form rules, turning
+ * `+` into a space, which libpq never does. A password of `a+b` would otherwise be
+ * handed to the child as `a b` and authentication would fail.
+ *
+ * Throws on a malformed escape rather than guessing. libpq rejects the same input, so
+ * a connection string that trips this could not have been working; guessing would risk
+ * leaving a password behind, and this function exists to guarantee it does not.
+ */
+function decodeUriComponentStrict(value: string, what: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    // Never echo the value: it is, or sits beside, the credential.
+    throw new Error(`Malformed percent-encoding in the ${what} of the database connection string`);
+  }
+}
+
 function readKeywordValue(raw: string, start: number): { value: string; end: number } {
   let i = start;
   let value = "";
@@ -350,42 +372,84 @@ function readKeywordValue(raw: string, start: number): { value: string; end: num
 }
 
 /**
- * Splits an inline password out of a libpq connection string.
+ * Splits an inline password out of a libpq URI, by byte offsets.
  *
- * Anything handed to `pg_dump`/`psql` as `--dbname=` lands in argv, which every local
- * user can read via `ps -eo args` or `/proc/<pid>/cmdline`. The password therefore has
- * to travel out-of-band in `PGPASSWORD` instead. libpq prefers an inline password over
- * the environment, so the inline copy must be removed, not merely duplicated.
+ * Everything outside the removed span survives verbatim. Re-serializing through a URL
+ * parser is not safe here: libpq and WHATWG disagree about `+`, about empty hosts
+ * (`postgresql://user:pw@/db?host=/var/run/postgresql`, the Unix-socket form) and about
+ * comma-separated multi-host authorities, and a rewritten `options=` value changes what
+ * the server is told to do.
  *
- * Handles both accepted forms: the URI form (`postgres://user:pw@host/db`, including a
- * `?password=` query parameter) and the keyword form (`host=... password=...`). Returns
- * the input unchanged when it carries no password.
+ * Mirrors `conninfo_uri_parse_baseinfo`: scan to the first `@` that precedes any `/`,
+ * and split that userinfo at its first `:`. A `password=` query parameter is applied
+ * after the base info, so when both are present the query parameter is the effective
+ * one — both are still removed.
  */
-export function splitConnectionStringPassword(connectionString: string): ConnectionStringSecret {
-  let url: URL | undefined;
-  try {
-    url = new URL(connectionString);
-  } catch {
-    url = undefined;
+function splitUriPassword(raw: string): ConnectionStringSecret {
+  const schemeEnd = raw.indexOf("://") + 3;
+
+  let authorityEnd = raw.length;
+  for (let i = schemeEnd; i < raw.length; i += 1) {
+    const c = raw[i];
+    if (c === "/" || c === "?" || c === "#") {
+      authorityEnd = i;
+      break;
+    }
   }
 
-  if (url && (url.protocol === "postgres:" || url.protocol === "postgresql:")) {
-    let password: string | undefined;
-    if (url.password) {
-      password = decodeURIComponent(url.password);
-      url.password = "";
+  // [start, end) spans to excise, collected against the original string.
+  const spans: Array<[number, number]> = [];
+  let userinfoPassword: string | undefined;
+  let queryPassword: string | undefined;
+
+  const authority = raw.slice(schemeEnd, authorityEnd);
+  const at = authority.indexOf("@");
+  if (at !== -1) {
+    const colon = authority.slice(0, at).indexOf(":");
+    if (colon !== -1) {
+      userinfoPassword = decodeUriComponentStrict(authority.slice(colon + 1, at), "password");
+      spans.push([schemeEnd + colon, schemeEnd + at]);
     }
-    const queryPassword = url.searchParams.get("password");
-    if (queryPassword) {
-      password = password ?? queryPassword;
-      url.searchParams.delete("password");
-    }
-    if (password === undefined) return { connectionString };
-    return { connectionString: url.toString(), password };
   }
 
-  // Keyword form: splice the whole `password=<value>` token out, leaving the rest byte
-  // for byte so we never have to re-quote values we did not parse.
+  const queryStart = raw.indexOf("?", authorityEnd);
+  if (queryStart !== -1) {
+    const hash = raw.indexOf("#", queryStart);
+    const queryEnd = hash === -1 ? raw.length : hash;
+    let segmentStart = queryStart + 1;
+    while (segmentStart < queryEnd) {
+      const next = raw.indexOf("&", segmentStart);
+      const segmentEnd = next === -1 || next > queryEnd ? queryEnd : next;
+      const segment = raw.slice(segmentStart, segmentEnd);
+      const eq = segment.indexOf("=");
+      const key = eq === -1 ? segment : segment.slice(0, eq);
+      if (decodeUriComponentStrict(key, "parameter name") === "password") {
+        queryPassword = eq === -1 ? "" : decodeUriComponentStrict(segment.slice(eq + 1), "password");
+        // Take a delimiter with the segment so the query stays well-formed.
+        if (segmentEnd < queryEnd) spans.push([segmentStart, segmentEnd + 1]);
+        else if (segmentStart > queryStart + 1) spans.push([segmentStart - 1, segmentEnd]);
+        else spans.push([queryStart, segmentEnd]);
+        break;
+      }
+      segmentStart = segmentEnd + 1;
+    }
+  }
+
+  const password = queryPassword ?? userinfoPassword;
+  if (password === undefined) return { connectionString: raw };
+
+  let connectionString = raw;
+  for (const [start, end] of spans.sort((a, b) => b[0] - a[0])) {
+    connectionString = connectionString.slice(0, start) + connectionString.slice(end);
+  }
+  return { connectionString, password };
+}
+
+/**
+ * Splits an inline password out of a libpq keyword connection string
+ * (`host=... password=...`), leaving every other value byte for byte.
+ */
+function splitKeywordPassword(connectionString: string): ConnectionStringSecret {
   let i = 0;
   while (i < connectionString.length) {
     while (i < connectionString.length && /\s/.test(connectionString[i]!)) i += 1;
@@ -410,6 +474,24 @@ export function splitConnectionStringPassword(connectionString: string): Connect
   }
 
   return { connectionString };
+}
+
+/**
+ * Splits an inline password out of a libpq connection string.
+ *
+ * Anything handed to `pg_dump`/`psql` as `--dbname=` lands in argv, which every local
+ * user can read via `ps -eo args` or `/proc/<pid>/cmdline`. The password therefore has
+ * to travel out-of-band in `PGPASSWORD` instead. libpq prefers an inline password over
+ * the environment, so the inline copy must be removed, not merely duplicated.
+ *
+ * The scheme alone selects the parser, so a URI that some other parser would reject can
+ * never fall through to the keyword branch and be returned with its password intact.
+ * Returns the input unchanged when it carries no password.
+ */
+export function splitConnectionStringPassword(connectionString: string): ConnectionStringSecret {
+  return POSTGRES_URI_SCHEME.test(connectionString)
+    ? splitUriPassword(connectionString)
+    : splitKeywordPassword(connectionString);
 }
 
 async function runPgDumpBackup(opts: {

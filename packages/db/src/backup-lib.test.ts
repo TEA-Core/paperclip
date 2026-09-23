@@ -692,6 +692,48 @@ describe("splitConnectionStringPassword", () => {
     expect(result.connectionString).toBe("postgresql://paperclip@db:5432/paperclip?sslmode=disable");
   });
 
+  it("strips the password from a Unix-socket URI, which has no host", () => {
+    const result = splitConnectionStringPassword(
+      "postgresql://paperclip:s3cr3t@/paperclip?host=/var/run/postgresql",
+    );
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).toBe("postgresql://paperclip@/paperclip?host=/var/run/postgresql");
+  });
+
+  it("strips the password from a multi-host URI", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip:s3cr3t@h1:5432,h2:5432/paperclip");
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).toBe("postgres://paperclip@h1:5432,h2:5432/paperclip");
+  });
+
+  it("reads a plus sign in the password literally, as libpq does", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=a+b");
+    expect(result.password).toBe("a+b");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("leaves neighbouring query parameters byte for byte", () => {
+    const result = splitConnectionStringPassword(
+      "postgres://paperclip@db:5432/paperclip?options=-c%20search_path%3Dfoo&password=s3cr3t&sslmode=require",
+    );
+    expect(result.password).toBe("s3cr3t");
+    expect(result.connectionString).toBe(
+      "postgres://paperclip@db:5432/paperclip?options=-c%20search_path%3Dfoo&sslmode=require",
+    );
+  });
+
+  it("removes both copies and prefers the query parameter, as libpq does", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip:fromuserinfo@db:5432/paperclip?password=fromquery");
+    expect(result.password).toBe("fromquery");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
+  it("throws rather than pass a postgres URI through with its password intact", () => {
+    expect(() => splitConnectionStringPassword("postgres://paperclip:bad%2@db:5432/paperclip")).toThrow(
+      /Malformed percent-encoding/,
+    );
+  });
+
   it("strips a password passed as a URI query parameter", () => {
     const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=s3cr3t&sslmode=require");
     expect(result.password).toBe("s3cr3t");
