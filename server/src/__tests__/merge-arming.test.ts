@@ -1859,12 +1859,15 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
       );
 
-      mockGhFetch.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+      // SUP-17273: a transient network failure is retried on the same token with a
+      // bounded backoff; a PERSISTENT outage exhausts the retry budget (3 attempts
+      // by default) and still yields the terminal pr_network outcome.
+      mockGhFetch.mockRejectedValue(new Error("ECONNREFUSED"));
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
       expect(result.message).toBe("status:failed:pr_network: network_error");
-      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+      expect(mockGhFetch).toHaveBeenCalledTimes(3);
     });
 
     it("returns status:failed:pr_error when REST API does not return head.sha", async () => {

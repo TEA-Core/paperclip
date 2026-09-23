@@ -2794,7 +2794,7 @@ export async function fetchLastMergeQueueEjectionViaTokenCandidates(
  * (GET, read-only) and reports whether a `paperclip/approved` status with state
  * `success` is present. Uses the shared ghFetch transport — no new HTTP layer.
  */
-async function fetchHeadCommitStatuses(
+async function fetchHeadCommitStatusesOnce(
   token: string,
   owner: string,
   repo: string,
@@ -2837,6 +2837,21 @@ async function fetchHeadCommitStatuses(
   return { ok: true, approved, status: response.status, message: null };
 }
 
+/**
+ * SUP-17273: read a head's commit statuses, retrying transient transport
+ * failures (network error / 5xx) with a bounded backoff before yielding the
+ * terminal result. A deterministic result (success, 4xx) returns after the first
+ * attempt — byte-for-byte unchanged from the single-attempt read.
+ */
+async function fetchHeadCommitStatuses(
+  token: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+): Promise<{ ok: boolean; approved: boolean; status: number; message: string | null }> {
+  return withTransientReadRetry(() => fetchHeadCommitStatusesOnce(token, owner, repo, headSha));
+}
+
 export interface HeadShaSuccess extends GitHubFetchResult {
   ok: true;
   headSha: string;
@@ -2870,7 +2885,7 @@ async function fetchHeadShaAcrossCandidates(
   return null;
 }
 
-async function fetchPullRequestHeadSha(
+async function fetchPullRequestHeadShaOnce(
   token: string,
   owner: string,
   repo: string,
@@ -2906,6 +2921,21 @@ async function fetchPullRequestHeadSha(
     return { ok: true, status: response.status, message: null, headSha: sha };
   }
   return { ok: false, status: response.status, message: "head.sha missing from response", headSha: null };
+}
+
+/**
+ * SUP-17273: one PR's live head SHA, retrying transient transport failures
+ * (network error / 5xx) with a bounded backoff before yielding the terminal
+ * HeadShaResult. A deterministic result (success, 4xx, malformed body) returns
+ * after the first attempt — byte-for-byte unchanged from the single-attempt read.
+ */
+async function fetchPullRequestHeadSha(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<HeadShaResult> {
+  return withTransientReadRetry(() => fetchPullRequestHeadShaOnce(token, owner, repo, number));
 }
 
 export interface OpenPullRequestListItem {
@@ -3054,6 +3084,58 @@ export function isTransientHttpStatus(status: number): boolean {
   if (status === 0) return true;
   if (status === 408 || status === 429) return true;
   return status >= 500 && status <= 599;
+}
+
+/**
+ * SUP-17273: transient-vs-deterministic split for a head/PR RESOLUTION read.
+ * Transient = the transport may succeed if retried: no response (network error,
+ * status 0) or a server error (5xx). Every 4xx — including 401/403/404/429 — is a
+ * deterministic refusal and must NOT be retried on the read path: the candidate
+ * loops already advance tokens on 401/403 and treat 404/429 as terminal. This is
+ * intentionally NARROWER than isTransientHttpStatus, which also treats 408/429 as
+ * retryable for the status-WRITE path.
+ */
+export function isTransientReadStatus(status: number): boolean {
+  if (status === 0) return true;
+  return status >= 500 && status <= 599;
+}
+
+export interface TransientReadRetryOptions {
+  /** Total attempts (default 3). */
+  attempts?: number;
+  /** Milliseconds between attempts (default 1000). */
+  delayMs?: number;
+  /** Injectable delay seam for tests (defaults to a real setTimeout). */
+  delay?: (ms: number) => Promise<void>;
+}
+
+/**
+ * SUP-17273. Wrap a head/PR resolution READ with a bounded retry over the
+ * transient class only (network error / 5xx). A non-transient result — success
+ * (2xx), a deterministic 4xx, or a malformed body — returns after the first
+ * attempt. A transient failure is retried on the SAME token up to `attempts`
+ * total times with `delayMs` between attempts; the loop stops the moment a
+ * non-transient result is observed. The retry never advances token candidates
+ * (that is the caller's job on 401/403) — a transient failure is transport, not
+ * auth, so re-reading with the same token is the correct recovery.
+ */
+export async function withTransientReadRetry<T extends { status: number }>(
+  fetchOnce: () => Promise<T>,
+  options: TransientReadRetryOptions = {},
+): Promise<T> {
+  const attempts = Math.max(1, options.attempts ?? 3);
+  const delayMs = options.delayMs ?? 1000;
+  const delay =
+    options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  let result = await fetchOnce();
+  let made = 1;
+  while (isTransientReadStatus(result.status) && made < attempts) {
+    await delay(delayMs);
+    result = await fetchOnce();
+    made += 1;
+  }
+  return result;
 }
 
 export interface WriteCommitStatusRetryOptions {
