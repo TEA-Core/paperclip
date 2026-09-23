@@ -549,6 +549,14 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   pendingSince: z.string().nullable().optional(),
+  /**
+   * Out-of-band publish record written by merge-arming / the approval-status
+   * reconciler via jsonb_set (SUP-16977). Enumerated, not modeled: consumers
+   * read the raw jsonb column and cast, so the schema must preserve the key
+   * without owning its shape. An enumerated `z.unknown()` member — NOT a
+   * catchall — keeps typo-checking on every other key of the ladder intact.
+   */
+  approvalStatus: z.unknown().optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({

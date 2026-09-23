@@ -771,6 +771,13 @@ export interface IssueExecutionState {
    * issue's `updatedAt`.
    */
   pendingSince?: string | null;
+  /**
+   * Out-of-band publish record written by merge-arming / the approval-status
+   * reconciler via jsonb_set (SUP-16977). Kept as `unknown`: the consumers
+   * read the raw jsonb column and cast, so the control plane only guarantees
+   * the key survives round-trips and does not own its shape.
+   */
+  approvalStatus?: unknown;
 }
 
 export interface IssueExecutionDecision {
