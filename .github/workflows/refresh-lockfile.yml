@@ -91,9 +91,40 @@ jobs:
           git config user.name "lockfile-bot"
           git config user.email "lockfile-bot@users.noreply.github.com"
 
+          PR_BODY=$(cat <<EOF
+## Thinking Path
+
+> - Paperclip is the open source app people use to manage AI agents for work.
+> - The Refresh Lockfile workflow keeps dependency lockfiles aligned with patch changes.
+> - This generated pull request carries the lockfile update for the target branch.
+
+## Linked Issues or Issue Description
+
+This is an automated lockfile refresh. It changes only pnpm-lock.yaml after dependencies changed on the target branch.
+
+## What Changed
+
+- Refreshed pnpm-lock.yaml.
+
+## Verification
+
+- The workflow checks that no unexpected files changed.
+
+## Risks
+
+Low risk. This pull request contains only generated lockfile metadata.
+
+## Model Used
+
+None — workflow-generated.
+
+Paperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)
+EOF
+)
+
           # The exact command a human runs to open the PR by hand. Emitted in the
           # ::error:: remediation below so the pushed branch is never left unpointed.
-          PR_CMD="gh pr create --head \"${BRANCH}\" --base \"${BASE_REF}\" --title \"chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}\" --body \$'Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\n\nPaperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)'"
+          PR_CMD="gh pr create --head \"${BRANCH}\" --base \"${BASE_REF}\" --title \"chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}\" --body \"${PR_BODY}\""
 
           if [ -z "$GH_TOKEN" ]; then
             echo "::error title=Lockfile push not performed::No bot token (TEA_CORE_APP_PRIVATE_KEY) is available, so the branch update was NOT pushed: a push we could not bind to the app installation token would create runs held at action_required. Generate the token, push, and open the PR manually: ${PR_CMD}" >&2
@@ -121,7 +152,7 @@ jobs:
               --head "$BRANCH" \
               --base "$BASE_REF" \
               --title "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}" \
-              --body $'Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\n\nPaperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)' > "$RUNNER_TEMP/pr-create.out"; then
+              --body "$PR_BODY" > "$RUNNER_TEMP/pr-create.out"; then
               echo "::error title=Lockfile PR not created::Failed to open a PR for pushed branch '${BRANCH}'. Open it manually with: ${PR_CMD}"
               echo "pr_url=" >> "$GITHUB_OUTPUT"
               exit 0

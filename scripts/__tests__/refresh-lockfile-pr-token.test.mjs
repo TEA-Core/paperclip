@@ -44,6 +44,13 @@ test("the PR step uses the bot token, not the blocked GITHUB_TOKEN", () => {
   assert.doesNotMatch(body, /GH_TOKEN:\s*\${{ github\.token }}/, "must not create the PR with GITHUB_TOKEN");
 });
 
+test("the generated lockfile PR includes the required review sections", () => {
+  const body = stepBody("Create or update pull request").join("\n");
+  for (const section of ["## Thinking Path", "## What Changed", "## Verification", "## Risks", "## Model Used"]) {
+    assert.match(body, new RegExp(section.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")), `generated PR body must include ${section}`);
+  }
+});
+
 test("the PR step fails loudly with the branch and the exact gh pr create command", () => {
   const body = stepBody("Create or update pull request").join("\n");
   assert.match(body, /::error title=Lockfile PR not created::/, "must emit an ::error:: annotation when the PR cannot be opened");
