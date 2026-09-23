@@ -3987,12 +3987,18 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     >;
     type PortabilityIssueRow = Omit<
       PortabilityIssueRecord,
-      "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+      | "executionPolicy"
+      | "executionState"
+      | "executionWorkspaceSettings"
+      | "parentLinkKind"
     > &
       Partial<
         Pick<
           PortabilityIssueRecord,
-          "executionPolicy" | "executionState" | "executionWorkspaceSettings"
+          | "executionPolicy"
+          | "executionState"
+          | "executionWorkspaceSettings"
+          | "parentLinkKind"
         >
       >;
     const selectedIssues = new Map<string, PortabilityIssueRow>();
