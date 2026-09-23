@@ -15,6 +15,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -770,6 +771,66 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
           expect(await contextIssueOf(runId)).toBe(card.id);
         }
       }
+    });
+
+    /**
+     * Fold D9 regression. Upstream gates deferred promotion on the issue's execution blocker in
+     * the dormant wake-queue adapter's `releaseIssueExecution` ("A release must leave deferred
+     * messages intact while execution is held"). While D9 is deferred, this in-file loop is the
+     * only live release path, and it carried no such gate: a Stop's no-replay recovery
+     * disposition did not stop it promoting the stopped session's queued wake, so a freshly
+     * reset chat re-ran the old topic. Upstream #13284's reset test caught it as a ~37%
+     * failure on the fork against ~7% on pure upstream at the same cutoff.
+     */
+    it("does NOT promote a deferred wake while a no-replay execution blocker holds the issue", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        requestedByActorType: "agent",
+      });
+
+      // The disposition a Stop leaves behind: resolved bookkeeping that still forbids a replay.
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "active_run_watchdog",
+        ownerType: "board",
+        cause: "uncertain_provider_action",
+        status: "resolved",
+        fingerprint: randomUUID(),
+        evidence: { automaticRecovery: { replay: "blocked" } },
+        nextAction: "Do not replay the stopped turn.",
+      });
+
+      const [endingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingRun);
+
+      // Left intact, not cancelled: upstream withholds the promotion, it does not consume the wake.
+      const wake = await fetchWakeRow(wakeId);
+      expect(wake?.status).toBe("deferred_issue_execution");
+      expect(await runsForWakeup(companyId, wakeId)).toEqual([]);
+    });
+
+    it("still promotes the same deferred wake once no execution blocker holds the issue", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        requestedByActorType: "agent",
+      });
+
+      const [endingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingRun);
+
+      const wake = await fetchWakeRow(wakeId);
+      expect(wake?.reason).toBe("issue_execution_promoted");
+      expect(["queued", "claimed", "processing"]).toContain(wake?.status);
+      expect(await runsForWakeup(companyId, wakeId)).toHaveLength(1);
     });
   });
 });
