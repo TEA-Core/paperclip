@@ -8,17 +8,22 @@ import {
 
 /**
  * ADR-103 M4 (SUP-17183): a write-time gate that keeps the `parent_id` edge
- * TOTAL. It refuses, as a read-only validity check, any decomposition edge
- * (create or re-parent) that would arm the ADR-072 close ladder on a parent
- * that can no longer discharge it — a parent whose close-ladder pointer has
- * already advanced and whose policy no longer carries the conforming close
- * ladder.
+ * TOTAL. It refuses, as a validity check, any decomposition edge (create or
+ * re-parent) that would arm the ADR-072 close ladder on a parent that can no
+ * longer discharge it — a parent whose close-ladder pointer has already
+ * advanced and whose policy no longer carries the conforming close ladder.
  *
- * The gate persists nothing: it only reads the parent and its children, and a
- * rejection makes the caller abort the edge write before it is committed. The
- * two close-guard helpers (`countLadderedChildren` and
- * `findMissingAdr072CloseLadderStages`) are reused verbatim — never a second
- * copy of the counting or the close-ladder shape.
+ * The gate persists no derived value: it only reads the parent and its
+ * children, and a rejection makes the caller abort the edge write before it is
+ * committed. To keep the count/pointer/ladder snapshot atomic with the edge
+ * write it validates, the gate takes an exclusive row lock on the parent
+ * (`SELECT ... FOR UPDATE`) so concurrent parent-edge writes into the same
+ * parent serialize on it; the lock is released with the surrounding
+ * transaction's commit or rollback. Callers must therefore run it inside their
+ * write transaction (passing the transaction handle). The two close-guard
+ * helpers (`countLadderedChildren` and `findMissingAdr072CloseLadderStages`)
+ * are reused verbatim — never a second copy of the counting or the close-
+ * ladder shape.
  */
 export type UndischargeableLadderEdgeVerdict =
   | { ok: true }
@@ -65,7 +70,8 @@ export async function evaluateUndischargeableLadderEdge(
       createdByAgentId: issues.createdByAgentId,
     })
     .from(issues)
-    .where(and(eq(issues.companyId, companyId), eq(issues.id, newParentId)));
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, newParentId)))
+    .for("update");
   const parent = parentRows[0];
   if (!parent) return { ok: true };
 

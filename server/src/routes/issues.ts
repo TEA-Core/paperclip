@@ -17069,29 +17069,23 @@ export function issueRoutes(
       ? existing.parentId
       : updateFields.parentId as string | null;
 
-    // ADR-103 M4: keep the parent_id edge total. Refuse a re-parent into a new
-    // parent that would arm the ADR-072 close ladder on a parent that has
-    // already advanced past the stages it can no longer add. A rejected
-    // re-parent persists nothing (the update is never issued).
-    if (nextParentId !== null && nextParentId !== existing.parentId) {
-      const effectiveParentLinkKind =
-        updateFields.parentLinkKind !== undefined
-          ? updateFields.parentLinkKind
-          : existing.parentLinkKind;
-      const ladderVerdict = await evaluateUndischargeableLadderEdge(
-        db,
-        existing.companyId,
-        nextParentId,
-        effectiveParentLinkKind,
-      );
-      if (!ladderVerdict.ok) {
-        const { message, details } = buildUndischargeableLadderEdgeConflict(
-          ladderVerdict,
-          `the child ${existing.identifier ?? existing.id}`,
-        );
-        throw conflict(message, details);
-      }
-    }
+    // ADR-103 M4: keep the parent_id edge total. A re-parent that points the
+    // child at a new parent must be validated in the SAME transaction as the
+    // write (ADR-103 §4): the count/pointer/ladder snapshot has to be atomic
+    // with the commit, and the parent row must be locked so a concurrent child
+    // edge cannot pass a stale snapshot and commit first. Evaluating the gate on
+    // the outer pool before the transaction — or letting a plain re-parent fall
+    // through to the non-transactional update below — breaks that atomicity.
+    // So: force the transactional path for any re-parent, and run the gate
+    // (against the parent-row lock) inside that transaction, before the update
+    // is issued. A rejection throws, rolling the whole transaction back so the
+    // refused edge persists nothing.
+    const parentEdgeWriteRequested =
+      nextParentId !== null && nextParentId !== existing.parentId;
+    const effectiveParentLinkKind =
+      updateFields.parentLinkKind !== undefined
+        ? updateFields.parentLinkKind
+        : existing.parentLinkKind;
 
     const shouldRelayStop =
       Boolean(nextParentId) &&
@@ -17249,6 +17243,12 @@ export function issueRoutes(
       || persistReviewActivityTransactionally
       || reviewPolicySensitiveMutationRequested
       || workspaceReprovisionCloseId !== null
+      // ADR-103 M4: a re-parent must commit atomically with its close-ladder
+      // check, so force every parent-edge mutation through the transactional
+      // path (a plain re-parent otherwise falls through to the non-
+      // transactional update below, where the gate would have no transaction to
+      // run in).
+      || parentEdgeWriteRequested
       // SUP-16525: a policy write that must satisfy INV-LADDER-1 is re-asserted
       // against the locked row, so it has to run on the transactional path.
       || invariantPolicyToRecheck !== null
@@ -17268,6 +17268,29 @@ export function issueRoutes(
     try {
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
+          // ADR-103 M4: validate the re-parent edge inside the write
+          // transaction. The gate takes an exclusive lock on the parent row so
+          // concurrent parent-edge writes into the same parent serialize on it,
+          // and it evaluates the count/pointer/ladder snapshot against the
+          // transaction handle so the check is atomic with the commit. A
+          // rejection throws before updateIssue is issued, so the refused edge
+          // persists nothing.
+          if (parentEdgeWriteRequested && nextParentId !== null) {
+            const ladderVerdict = await evaluateUndischargeableLadderEdge(
+              tx as unknown as Db,
+              existing.companyId,
+              nextParentId,
+              effectiveParentLinkKind,
+            );
+            if (!ladderVerdict.ok) {
+              const { message, details } =
+                buildUndischargeableLadderEdgeConflict(
+                  ladderVerdict,
+                  `the child ${existing.identifier ?? existing.id}`,
+                );
+              throw conflict(message, details);
+            }
+          }
           if (
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
