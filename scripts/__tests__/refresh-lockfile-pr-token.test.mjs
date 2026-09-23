@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -66,10 +68,34 @@ test("checkout does not persist the default GitHub token", () => {
 test("the branch push uses a temporary helper bound to the app token", () => {
   const body = stepBody("Create or update pull request").join("\n");
   assert.match(body, /PUSH_CREDENTIAL_HELPER="\$\(mktemp\)"/, "must create an ephemeral credential helper");
-  assert.match(body, /password=%s\\\\n.*\$GH_TOKEN/, "the helper must read the app token from GH_TOKEN");
+  assert.match(body, /password=%%s\\\\n.*\$GH_TOKEN/, "the outer printf must preserve the helper's password placeholder");
   assert.match(body, /git -c credential\.helper="!\$PUSH_CREDENTIAL_HELPER" push --force origin "\$BRANCH"/, "push must bind the helper explicitly");
   assert.doesNotMatch(body, /PUSH_URL|https:\/\/x-access-token:\$\{GH_TOKEN\}/, "must not put the token in a URL or command argument");
   assert.doesNotMatch(body, /git push[^\n]*\$\{GH_TOKEN\}/, "push must not use the token as a command argument");
+});
+
+test("the generated credential helper emits a non-empty password", () => {
+  const body = stepBody("Create or update pull request");
+  const command = body.find(line => line.includes("printf '#!/bin/sh"))?.trim();
+  assert.ok(command, "the workflow must generate the credential helper");
+
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "refresh-lockfile-helper-"));
+  const helperPath = path.join(tempDir, "helper.sh");
+  try {
+    execFileSync("sh", ["-c", command], {
+      env: { ...process.env, GH_TOKEN: "test-token", PUSH_CREDENTIAL_HELPER: helperPath },
+      encoding: "utf8",
+    });
+    const helper = readFileSync(helperPath, "utf8");
+    const credentials = execFileSync("sh", [helperPath], {
+      env: { ...process.env, GH_TOKEN: "test-token" },
+      encoding: "utf8",
+    });
+    assert.match(helper, /password=%s/, "the helper source must retain its password placeholder");
+    assert.match(credentials, /password=test-token/, "the helper must emit the app token as a non-empty password");
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("the branch push is unreachable without an app token and fails nonzero", () => {

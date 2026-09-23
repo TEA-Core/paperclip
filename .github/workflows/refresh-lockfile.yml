@@ -102,7 +102,7 @@ jobs:
 
           PUSH_CREDENTIAL_HELPER="$(mktemp)"
           trap 'rm -f "$PUSH_CREDENTIAL_HELPER"' EXIT
-          printf '#!/bin/sh\nprintf "username=x-access-token\\npassword=%s\\n" "$GH_TOKEN"\n' > "$PUSH_CREDENTIAL_HELPER"
+          printf '#!/bin/sh\nprintf "username=x-access-token\\npassword=%%s\\n" "$GH_TOKEN"\n' > "$PUSH_CREDENTIAL_HELPER"
           chmod 700 "$PUSH_CREDENTIAL_HELPER"
           git checkout -B "$BRANCH"
           git add pnpm-lock.yaml
