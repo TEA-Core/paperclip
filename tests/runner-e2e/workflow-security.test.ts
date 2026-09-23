@@ -3,8 +3,8 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
-const ordinaryPrTrustedWorkflowRevision =
-  "03609aa6ecc9a047ed53d6b6469d8be554fbc46d";
+// PR #13470 uses the code-owner-reviewed default branch for this first-party workflow.
+const ordinaryPrTrustedWorkflowRevision = "master";
 const fullStackTestNeeds =
   /needs:\s*\[\s*authorize,\s*target_lock,\s*catalog,\s*daytona_image,\s*build_runner_artifacts,\s*build_remote_provider_pack,?\s*\]/u;
 const buildRunnerNeeds =
@@ -14,27 +14,34 @@ const buildRemoteProviderPackNeeds =
 
 describe("public repository paid workflow security", () => {
   // TEA-Core fork: upstream's pr.yml delegates the whole PR run to a reusable pr-trusted.yml
-  // pinned at an immutable SHA. This fork's pr.yml runs its jobs inline so it can gate
-  // `fold/**` branches and report the required checks on merge_group entries, so there is no
-  // pinned call to assert (see scripts/__tests__/e2e-shard.test.mjs for the same divergence).
-  it.skip("pins ordinary PR CI to the trusted Node-before-pnpm workflow", async () => {
+  // (pinned at an immutable SHA before #13470, at `@master` after it). This fork's pr.yml runs
+  // its jobs inline so it can gate `fold/**` branches and report the required checks on
+  // merge_group entries, so there is no delegating call to assert
+  // (see scripts/__tests__/e2e-shard.test.mjs for the same divergence).
+  //
+  // FORK DIVERGENCE (fork pr.yml has no `uses: .../pr-trusted.yml@...` call at all, slice 2d):
+  // upstream's `expect(trustedWorkflowCalls).toHaveLength(1)` cannot hold here. Rather than
+  // leave the case skipped as slice 2b did, the count is inverted so the divergence is actually
+  // pinned -- it fails the moment the fork regains a delegating caller -- and upstream's
+  // revision assertions are kept verbatim, guarding any call that ever reappears.
+  it("keeps ordinary PR CI inline, and pins the reviewed revision for any trusted PR workflow call", async () => {
     const ordinaryPrWorkflow = await readFile(
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",
     );
     const trustedWorkflowCalls = [
       ...ordinaryPrWorkflow.matchAll(
-        /^\s+uses:\s+(paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml)@([0-9a-f]{40})$/gmu,
+        /^\s+uses:\s+(paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml)@([^\s#]+)$/gmu,
       ),
     ];
 
-    expect(trustedWorkflowCalls).toHaveLength(1);
-    expect(trustedWorkflowCalls[0]?.[1]).toBe(
-      "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
-    );
-    expect(trustedWorkflowCalls[0]?.[2]).toBe(
-      ordinaryPrTrustedWorkflowRevision,
-    );
+    expect(trustedWorkflowCalls).toHaveLength(0);
+    for (const trustedWorkflowCall of trustedWorkflowCalls) {
+      expect(trustedWorkflowCall[1]).toBe(
+        "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
+      );
+      expect(trustedWorkflowCall[2]).toBe(ordinaryPrTrustedWorkflowRevision);
+    }
   });
 
   it("keeps pnpm bootstrap registry telemetry out of trusted workflow setup", async () => {
@@ -50,7 +57,9 @@ describe("public repository paid workflow security", () => {
         .split(/\n(?= {6}- )/u)
         .filter((step) => step.includes("uses: pnpm/action-setup@"));
 
-      expect(pnpmSetupSteps, workflowName).toHaveLength(7);
+      expect(pnpmSetupSteps, workflowName).toHaveLength(
+        workflowName === "pr-trusted.yml" ? 8 : 7,
+      );
       for (const step of pnpmSetupSteps) {
         expect(step, workflowName).toContain('NPM_CONFIG_AUDIT: "false"');
         expect(step, workflowName).toContain('NPM_CONFIG_FUND: "false"');
@@ -79,7 +88,8 @@ describe("public repository paid workflow security", () => {
       },
       {
         name: "pr-trusted.yml",
-        expectedCachedSetupNodeSteps: 7,
+        // PR #13300 restores shared stores directly without setup-node cache writes.
+        expectedCachedSetupNodeSteps: 0,
       },
     ];
 
@@ -93,7 +103,9 @@ describe("public repository paid workflow security", () => {
         step.includes("uses: pnpm/action-setup@") ? [index] : [],
       );
 
-      expect(pnpmSetupStepIndexes, name).toHaveLength(7);
+      expect(pnpmSetupStepIndexes, name).toHaveLength(
+        name === "pr-trusted.yml" ? 8 : 7,
+      );
       for (const pnpmSetupStepIndex of pnpmSetupStepIndexes) {
         const pnpmSetupStep = steps[pnpmSetupStepIndex]!;
         const nodeBootstrapStep = steps[pnpmSetupStepIndex - 1]!;
@@ -117,7 +129,7 @@ describe("public repository paid workflow security", () => {
         );
       }
 
-      expect(workflow.match(/^\s+cache: pnpm$/gmu), name).toHaveLength(
+      expect(workflow.match(/^\s+cache: pnpm$/gmu) ?? [], name).toHaveLength(
         expectedCachedSetupNodeSteps,
       );
     }

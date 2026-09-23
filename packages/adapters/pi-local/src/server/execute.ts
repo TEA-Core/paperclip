@@ -45,10 +45,12 @@ import {
   removeMaintainerOnlySkillSymlinks,
   renderTemplate,
   renderPaperclipWakePrompt,
+  selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayloadForEnv,
   sanitizeInheritedPaperclipEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
@@ -234,7 +236,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const promptTemplate = asString(
     config.promptTemplate,
-    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+    context.conversationMode === true
+      ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "pi");
   const model = asString(config.model, "").trim();
@@ -590,7 +594,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsFileDir}.\n\n` +
           `Your execution workspace path is: ${cwd} (also available as the environment variable $PAPERCLIP_WORKSPACE_CWD).\n\n` +
-          DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
+          (context.conversationMode === true
+            ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+            : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
       } catch (err) {
         instructionsReadFailed = true;
         const reason = err instanceof Error ? err.message : String(err);
@@ -620,7 +626,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !canResumeSession && bootstrapPromptTemplate.trim().length > 0
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: canResumeSession });
+    const taskContextNote = context.conversationMode === true
+      ? selectPaperclipTaskMarkdown(context, { resumedSession: canResumeSession })
+      : "";
+    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+      conversationMode: context.conversationMode === true,
+      resumedSession: canResumeSession,
+      suppressIssueDescription: taskContextNote.length > 0,
+    });
     const shouldUseResumeDeltaPrompt = canResumeSession && wakePrompt.length > 0;
     const renderedHeartbeatPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
       ? ""
@@ -629,6 +642,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const userPrompt = joinPromptSections([
       renderedBootstrapPrompt,
       wakePrompt,
+      taskContextNote,
       sessionHandoffNote,
       renderedHeartbeatPrompt,
     ]);
@@ -637,6 +651,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       promptChars: userPrompt.length,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
       wakePromptChars: wakePrompt.length,
+      taskContextChars: taskContextNote.length,
       sessionHandoffChars: sessionHandoffNote.length,
       heartbeatPromptChars: renderedHeartbeatPrompt.length,
     };

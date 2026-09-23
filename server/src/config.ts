@@ -113,6 +113,8 @@ export interface Config {
   companyDeletionEnabled: boolean;
   externalObjectRefreshIntervalMs: number;
   telemetryEnabled: boolean;
+  announcementsEnabled: boolean;
+  announcementsFeedUrl: string;
 }
 
 function detectTailnetBindHost(): string | undefined {
@@ -483,5 +485,7 @@ export function loadConfig(): Config {
     companyDeletionEnabled,
     externalObjectRefreshIntervalMs: Math.max(60000, Number(process.env.EXTERNAL_OBJECT_REFRESH_INTERVAL_MS) || 60_000),
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
+    announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",
+    announcementsFeedUrl: process.env.PAPERCLIP_ANNOUNCEMENTS_FEED_URL?.trim() || "https://pages.paperclip.ing/announcements/v1/current.json",
   };
 }

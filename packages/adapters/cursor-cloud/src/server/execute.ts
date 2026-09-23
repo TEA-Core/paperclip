@@ -12,6 +12,7 @@ import {
 import type { AdapterExecutionContext, AdapterExecutionResult, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   asBoolean,
   asString,
   buildPaperclipEnv,
@@ -20,6 +21,7 @@ import {
   parseObject,
   readPaperclipIssueWorkModeFromContext,
   renderPaperclipWakePrompt,
+  selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
   renderTemplate,
   stringifyPaperclipWakePayloadForEnv,
@@ -403,7 +405,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     : null);
   const canReuseSession = sessionMatches(session, envType, envName, repos);
-  const promptTemplate = asString(config.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
+  const promptTemplate = asString(config.promptTemplate, context.conversationMode === true
+    ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+    : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const templateData = {
     agentId: agent.id,
@@ -415,7 +419,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     context,
   };
   const instructions = await buildInstructionsPrefix(config, onLog, asString(workspace.cwd, ""));
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: canReuseSession });
+  const taskContextNote = context.conversationMode === true
+    ? selectPaperclipTaskMarkdown(context, { resumedSession: canReuseSession })
+    : "";
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    conversationMode: context.conversationMode === true,
+    resumedSession: canReuseSession,
+    suppressIssueDescription: taskContextNote.length > 0,
+  });
   const renderedBootstrapPrompt =
     !canReuseSession && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
@@ -429,6 +440,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructions.prefix,
     renderedBootstrapPrompt,
     wakePrompt,
+    taskContextNote,
     paperclipEnvNote,
     renderedPrompt,
   ]);
@@ -468,6 +480,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         instructionsChars: instructions.chars,
         bootstrapPromptChars: renderedBootstrapPrompt.length,
         wakePromptChars: wakePrompt.length,
+    taskContextChars: taskContextNote.length,
         heartbeatPromptChars: renderedPrompt.length,
       },
       context: {

@@ -5,6 +5,8 @@ and shipping Paperclip app connections.
 
 Status: canonical end-to-end authoring guide for Apps v2 catalog connections.
 
+For connector artwork, follow [Connector icons](./CONNECTOR-ICONS.md): fixed gray Paperclip frames, authentic vendor artwork, explicit theme variants, optical fit and exact provenance. Brand-library additions do not activate connectors. Use the shared registry/resolver and branding generator; do not introduce per-screen logos or outer-surface overrides.
+
 This runbook is the repeatable, agent-executable procedure for adding a vendor
 to the Apps catalog as data, not as a plugin. It follows the accepted
 connections framework in [PAP-13211](/PAP/issues/PAP-13211), the first-30
@@ -34,6 +36,13 @@ durable provider credentials remain in the operator's Vercel account and
 Paperclip resolves short-lived tokens at invocation time. Before writing a
 connector, read [Identity vs. connections](./README.md#identity-vs-connections)
 for the P1/P2/P3 boundary and the D7 standing rule.
+
+AI provider credentials use the same vault, applications, grants, installations,
+and delegation model with `connectionPurpose: ai` and `transport: runtime_auth`.
+They authenticate provider execution and never enter MCP discovery or tool/channel
+execution. Extend the provider's existing catalog entry with typed AI methods;
+reuse the existing login controllers. See [AI Connections](./AI-CONNECTIONS.md)
+for compatibility, personal defaults, resolver isolation, and legacy adoption.
 
 ## Contents
 
@@ -80,7 +89,7 @@ scripts/ingest-app-definitions.mjs                # human-authored definition so
 packages/shared/src/app-definitions/<slug>.json  # generated definition
 packages/shared/src/app-definitions.generated.ts # generated registry
 ui/public/brands/apps/<slug>.svg                  # official, sanitized mark
-ui/public/brands/apps/manifest.json               # branding provenance
+ui/public/brands/apps/manifest.json               # runtime branding paths
 packages/shared/src/app-definitions.test.ts       # manifest/provider assertions
 ```
 
@@ -138,6 +147,14 @@ These axes produce combinations such as:
 `api_key` in a method means an authentication mode; it does not mean the
 transport is a REST API. Most current API-key catalog entries authenticate a
 remote MCP server.
+
+Anthropic accounts use the `runtime_auth` AI connection methods. Its obsolete
+`api-key` REST tool method is no longer offered. Existing unsupported REST tool
+connections fail health and catalog checks with HTTP 422 and
+`tool_connection_transport_unsupported`; they never use local stdio templates
+or report a successful MCP probe. Add the provider through its supported account
+flow, then remove the obsolete connection. This does not transfer credentials
+or grants automatically.
 
 For `mcp_remote`, header credentials and secret-bearing generated URLs have the
 complete generic runtime path. The schema also names `query`, `body_json`, and
@@ -556,15 +573,15 @@ only a runtime image-failure fallback.
    external executable content, or unsafe references.
 5. Save assets under `ui/public/brands/apps/`. Add a `-dark` variant only when
    the normal mark loses contrast in dark mode.
-6. Add the provider to `ui/public/brands/apps/manifest.json` with slug, local
-   asset, optional dark asset, official source URL, exact upstream asset URL,
-   asset type, visibility, and dark-variant requirement.
+6. Add the provider to `ui/public/brands/apps/manifest.json` with slug, name,
+   local asset, optional dark asset, visibility, and optional aliases. Keep source
+   URLs and verification notes in the review record, outside the public manifest.
 7. Let the ingestion script derive `branding.logoUrl` and `darkLogoUrl` from the
-   provenance manifest.
+   runtime manifest.
 
 The manifest test decodes PNG headers, requires at least 128 by 128 pixels,
 sanity-checks SVG markup, verifies files exist, and requires store-visible
-definitions and visible provenance entries to match exactly.
+definitions and visible manifest entries to match exactly.
 
 ### Phase 5: Author the definition at the durable source
 

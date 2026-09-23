@@ -1,3 +1,8 @@
+import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
+import { agentChatDraft } from "@/lib/agent-chat-draft";
+import { Settings as ChatSettings } from "lucide-react";
+import { agentDetailHref } from "./agent-detail-navigation";
+import { deriveInitials } from "@/components/Identity";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
@@ -218,6 +223,7 @@ import { waitForStoppedRuns } from "../lib/wait-for-stopped-runs";
 import { useIssueExternalObjects } from "../hooks/useIssueExternalObjects";
 import { IssueGalleryContext } from "../context/IssueGalleryContext";
 import { useIssuePlanDocument } from "../hooks/useIssuePlanDocument";
+import { useTaskArtifactArrival } from "../hooks/useTaskArtifactArrival";
 import { IssueRunLedger } from "../components/IssueRunLedger";
 import { IssueWorkspaceCard } from "../components/IssueWorkspaceCard";
 import type { MentionOption } from "../components/MarkdownEditor";
@@ -934,14 +940,14 @@ function IssueChatSkeleton() {
   );
 }
 
-function useTaskDetailInterfaceMode() {
+function useTaskDetailInterfaceMode(conversationMode = false) {
   const {
     enabled: classicTaskInterfacePreferenceEnabled,
     loaded: classicTaskInterfaceLoaded,
   } = useClassicTaskInterfaceEnabled();
   const { enabled: streamlinedUiEnabled, loaded: streamlinedUiLoaded } =
     useStreamlinedUiEnabled();
-  const classicTaskInterfaceEnabled = classicTaskInterfacePreferenceEnabled;
+  const classicTaskInterfaceEnabled = classicTaskInterfacePreferenceEnabled && !conversationMode;
   const taskChatShellEnabled = !classicTaskInterfaceEnabled;
 
   return {
@@ -1255,6 +1261,7 @@ type IssueDetailChatTabProps = {
   currentAssigneeValue: string;
   suggestedAssigneeValue: string;
   mentions: MentionOption[];
+  conversationMode?: boolean;
   composerPause?: TaskComposerPause | null;
   composerDisabledReason: string | null;
   composerHint: string | null;
@@ -1269,13 +1276,16 @@ type IssueDetailChatTabProps = {
     reopen?: boolean,
     reassignment?: CommentReassignment,
     attachmentIds?: string[],
+    clientRequestId?: string,
   ) => Promise<void>;
   onReviewConversation: () => Promise<void>;
   onImageUpload: (file: File) => Promise<string>;
   onAttachImage: (file: File) => Promise<IssueAttachment | void>;
-  onInterruptQueued: (runId: string) => Promise<void>;
+  onInterruptQueued: (runId: string | null) => Promise<void>;
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onPauseWorkRun?: (runId: string, feedback?: "composer") => Promise<void>;
+  onStopResponse?: (runId: string) => Promise<void>;
+  stopResponsePending?: boolean;
   pauseWorkPending?: boolean;
   pauseWorkScope?: "leaf" | "subtree";
   runFinalizationActions?: readonly IssueChatRunFinalizationAction[];
@@ -1377,6 +1387,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   currentAssigneeValue,
   suggestedAssigneeValue,
   mentions,
+  conversationMode,
   composerPause,
   composerDisabledReason,
   composerHint,
@@ -1389,6 +1400,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   onInterruptQueued,
   onDeleteComment,
   onPauseWorkRun,
+  onStopResponse,
+  stopResponsePending,
   pauseWorkPending,
   pauseWorkScope,
   runFinalizationActions,
@@ -1415,7 +1428,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   // Preserve master's Classic Task Interface seam: Streamlined UI changes the
   // TaskChatThread presentation but never swaps it for IssueChatThread.
   const { classicTaskInterfaceEnabled, streamlinedTaskDetailEnabled } =
-    useTaskDetailInterfaceMode();
+    useTaskDetailInterfaceMode(!!conversationMode);
   const ThreadComponent = classicTaskInterfaceEnabled
     ? IssueChatThread
     : TaskChatThread;
@@ -1431,6 +1444,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   } = useQuery({
     queryKey: queryKeys.issues.activity(issueId),
     queryFn: () => activityApi.forIssue(issueId),
+    enabled: !!issueId,
     placeholderData: keepPreviousDataForSameQueryTail<ActivityEvent[]>(issueId),
   });
   const {
@@ -1441,6 +1455,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   } = useQuery({
     queryKey: queryKeys.issues.liveRuns(issueId),
     queryFn: () => heartbeatsApi.liveRunsForIssue(issueId),
+    enabled: !!issueId,
     refetchInterval: 1000,
     placeholderData:
       keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueId),
@@ -1527,6 +1542,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   } = useQuery({
     queryKey: queryKeys.issues.runs(issueId),
     queryFn: () => activityApi.runsForIssue(issueId),
+    enabled: !!issueId,
     refetchInterval:
       hasLiveRuns || issueStatus === "in_progress" ? 1000 : false,
     placeholderData: keepPreviousDataForSameQueryTail<RunForIssue[]>(issueId),
@@ -2115,16 +2131,6 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         throw new Error(
           "The queued message no longer has an active run target.",
         );
-      const anchorAt = new Date().toISOString();
-      setLocalSteeringPlacements((current) => {
-        const next = new Map(current);
-        const sequence = [...current.values()].filter(
-          (placement) => placement.targetRunId === targetRunId,
-        ).length;
-        next.set(commentId, { targetRunId, anchorAt, sequence });
-        return next;
-      });
-      setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
       try {
         const nextQueue = await issuesApi.steerQueuedComment(
           issueId,
@@ -2135,6 +2141,18 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             revision,
           },
         );
+        // Keep the queue component mounted until the server accepts steering:
+        // its pending/error state must survive a rejected last-row action.
+        const anchorAt = new Date().toISOString();
+        setLocalSteeringPlacements((current) => {
+          const next = new Map(current);
+          const sequence = [...current.values()].filter(
+            (placement) => placement.targetRunId === targetRunId,
+          ).length;
+          next.set(commentId, { targetRunId, anchorAt, sequence });
+          return next;
+        });
+        setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
         // The local steering placement already promoted the message into the
         // active turn. Refresh its durable acknowledgement before publishing
         // the returned queue so the local and server anchors hand off without a
@@ -2297,13 +2315,14 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         >
           <EmailThreadProvider companyId={companyId} issueId={issueId}>
           <ThreadComponent
-            key={issueId}
-            initialHistoryPending={
+            key={conversationMode ? draftKey : issueId}
+            {...(!classicTaskInterfaceEnabled ? { creationActivity: resolvedActivity } : {})}
+            initialHistoryPending={!!issueId && (
               initialHistoryPending ||
               commentsInitialLoading ||
               activityPending ||
               linkedRunsPending ||
-              !runtimeSelectionKnown
+              !runtimeSelectionKnown)
             }
             initialHistoryError={
               initialHistoryError ||
@@ -2385,7 +2404,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             userLabelMap={userLabelMap}
             userProfileMap={userProfileMap}
             draftKey={draftKey}
-            enableReassign
+            conversationMode={conversationMode}
+            enableReassign={!conversationMode}
             reassignOptions={reassignOptions}
             currentAssigneeValue={currentAssigneeValue}
             suggestedAssigneeValue={suggestedAssigneeValue}
@@ -2431,13 +2451,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             onSubmitInteractionVerdicts={onSubmitInteractionVerdicts}
             issueWorkMode={issueWorkMode}
             onWorkModeChange={onWorkModeChange}
-            stopPending={pauseWorkPending}
-            stopScope={pauseWorkScope}
+            stopPending={stopResponsePending}
             onCancelRun={
-              interruptibleIssueRun && onPauseWorkRun
-                ? async () => {
-                    await onPauseWorkRun(interruptibleIssueRun.id, "composer");
-                  }
+              interruptibleIssueRun && onStopResponse
+                ? () => onStopResponse(interruptibleIssueRun.id)
                 : undefined
             }
             onImageClick={onImageClick}
@@ -2825,11 +2842,17 @@ function IssueDetailActivityTab({
   );
 }
 
-export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasksTab"] }) {
-  const { issueId, companyPrefix } = useParams<{
-    issueId: string;
-    companyPrefix: string;
-  }>();
+export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasksTab"] }) { return <TaskDetailSurface tasksTab={tasksTab} />; }
+
+/** One controller and surface for both task URLs and agent conversations. */
+export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskSidePanelProps["tasksTab"]; conversation?: {
+  agent: Agent; issue: Issue | null; ensureIssue: () => Promise<Issue>;
+} }) {
+  const { issueId: routeIssueId, companyPrefix } = useParams<{ issueId: string; companyPrefix: string }>();
+  const issueId = conversation ? conversation.issue?.id : routeIssueId;
+  const [draftWorkMode, setDraftWorkMode] = useState<IssueWorkMode>("standard");
+  const draftIssue = useMemo(() => conversation ? agentChatDraft(conversation.agent, draftWorkMode) : undefined, [conversation?.agent, draftWorkMode]);
+  const pendingDraftWorkMode = useRef<IssueWorkMode | null>(null);
   const { companies, selectedCompanyId } = useCompany();
   // Classic Task Interface remains the sole task-chat-vs-pre-chat switch from
   // master. Streamlined UI only layers the new task-detail presentation onto
@@ -2840,7 +2863,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
     streamlinedTaskDetailEnabled,
     streamlinedUiEnabled,
     loaded: taskInterfaceSettingsLoaded,
-  } = useTaskDetailInterfaceMode();
+  } = useTaskDetailInterfaceMode(!!conversation);
   // Chat-style: the page wrapper spans the full center pane so the thread's
   // scroll viewport (and its scrollbar) reaches the properties-pane border;
   // every non-thread section re-centers itself at the 60rem shell cap instead.
@@ -2871,6 +2894,11 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   const [moreOpen, setMoreOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
+  const [artifactsOpenRequest, setArtifactsOpenRequest] = useState<{
+    issueId: string;
+    requestId: number;
+    handled?: boolean;
+  } | null>(null);
   const [documentDeepLink, setDocumentDeepLink] = useState<
     (IssuePropertiesDocumentDeepLink & { issueId: string }) | null
   >(null);
@@ -2942,7 +2970,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   );
 
   const {
-    data: issue,
+    data: queriedIssue,
     isLoading,
     isPlaceholderData,
     error,
@@ -2957,6 +2985,17 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
     }),
     enabled: !!issueId,
   });
+  const issue = queriedIssue ?? conversation?.issue ?? draftIssue;
+  const resolveWritableIssueId = async () => {
+    if (!conversation) return issueId!;
+    const resolved = await conversation.ensureIssue();
+    const requestedMode = pendingDraftWorkMode.current;
+    if (requestedMode !== null && requestedMode !== resolved.workMode) {
+      await issuesApi.update(resolved.id, { workMode: requestedMode });
+    }
+    pendingDraftWorkMode.current = null;
+    return resolved.id;
+  };
   // A cached header seed can paint during navigation, but must not redirect
   // or upload against the previous task while the requested task is loading.
   const loadedIssue =
@@ -2971,14 +3010,14 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   const loadedIssueCompany = loadedIssue
     ? companies.find((company) => company.id === loadedIssue.companyId)
     : undefined;
-  const taskRouteReady = Boolean(
+  const taskRouteReady = Boolean(conversation || (
     loadedIssue &&
     issueId === (loadedIssue.identifier ?? loadedIssue.id) &&
     (!loadedIssueCompany || companyPrefix === loadedIssueCompany.issuePrefix) &&
-    !hasLegacyIssueDetailQuery(location.search),
-  );
+    !hasLegacyIssueDetailQuery(location.search)
+  ));
   const resolvedCompanyId = issue?.companyId ?? selectedCompanyId;
-  const externalObjectsState = useIssueExternalObjects(issue?.id ?? null);
+  const externalObjectsState = useIssueExternalObjects(conversation && !conversation.issue ? null : issue?.id ?? null);
   // A closed isolated workspace no longer blocks the composer. The server reopens
   // the workspace when the next comment or resume arrives, so the composer stays
   // enabled and a hint tells the user what happens.
@@ -3197,7 +3236,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
         descendantOf: issue!.id,
         includeBlockedBy: true,
       }),
-    enabled: !!resolvedCompanyId && !!issue?.id,
+    enabled: !!resolvedCompanyId && !!issue?.id && !issue.id.startsWith("chat:"),
     placeholderData: keepPreviousDataForSameQueryTail<Issue[]>(
       issue?.id ?? "pending",
     ),
@@ -3547,6 +3586,27 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
     }
     setPanelVisible(true);
   }, [issue?.id, setPanelVisible, suppressPanelUntilPlan]);
+  const revealNewArtifact = useCallback(() => {
+    if (!issue?.id) return;
+    setDocumentDeepLink(null);
+    setArtifactsOpenRequest((previous) => ({
+      issueId: issue.id,
+      requestId: (previous?.requestId ?? 0) + 1,
+    }));
+    if (isMobile) setMobilePropsOpen(true);
+    else openTaskSidePanel();
+  }, [issue?.id, isMobile, openTaskSidePanel]);
+  const handleArtifactsOpened = useCallback((requestId: number) => {
+    setArtifactsOpenRequest((request) => request?.requestId === requestId
+      ? { ...request, handled: true } : request);
+  }, []);
+  useTaskArtifactArrival({
+    issueId: taskChatShellEnabled ? issue?.id : undefined,
+    attachments,
+    workProducts,
+    documents: issue?.documentSummaries,
+    onArrival: revealNewArtifact,
+  });
   const toggleTaskSidePanel = useCallback(() => {
     if (!panelVisible || suppressPanelUntilPlan) {
       openTaskSidePanel();
@@ -4147,6 +4207,16 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
       }
     },
   });
+  const stopResponse = useMutation({
+    mutationFn: async (runId: string) => {
+      await heartbeatsApi.cancel(runId);
+      await waitForStoppedRuns([runId]);
+    },
+    onSettled: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) }),
+    ]),
+  });
   const stopAndFinalizeRun = useMutation({
     mutationFn: async ({
       runId,
@@ -4366,18 +4436,12 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   });
 
   const addComment = useMutation({
-    mutationFn: ({
-      body,
-      reopen,
-      interrupt,
-      attachmentIds,
-    }: {
-      body: string;
-      reopen?: boolean;
-      interrupt?: boolean;
-      attachmentIds?: string[];
-    }) =>
-      issuesApi.addComment(issueId!, body, reopen, interrupt, attachmentIds),
+    mutationFn: async ({ body, reopen, interrupt, attachmentIds, clientRequestId }: {
+      body: string; reopen?: boolean; interrupt?: boolean; attachmentIds?: string[]; clientRequestId?: string;
+    }) => {
+      if (issue?.conversationAgentId) clearLegacyChatMessageRequests(`${issue.companyId}:${currentUserId}:${issue.conversationAgentId}`);
+      return issuesApi.addComment(await resolveWritableIssueId(), body, reopen, interrupt, attachmentIds, clientRequestId ?? crypto.randomUUID());
+    },
     onMutate: async ({ body, reopen, interrupt }) => {
       // Start cache cancellation immediately but do not put it in front of the
       // optimistic echo. The new-runner startup placeholder must paint in the
@@ -4442,7 +4506,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
           ),
         );
         try {
-          await issuesApi.cancelComment(issueId!, comment.id);
+          await issuesApi.cancelComment(comment.issueId, comment.id);
           invalidateIssueDetail();
           invalidateIssueThreadLazily();
           invalidateIssueCollections();
@@ -4465,14 +4529,14 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
           return next;
         });
         void queryClient.invalidateQueries({
-          queryKey: queryKeys.issues.queuedComments(issueId!),
+          queryKey: queryKeys.issues.queuedComments(issueId ?? comment.issueId),
         });
       }
       if (context?.optimisticCommentId) {
         commentRenderKeys.current.set(comment.id, context.optimisticCommentId);
       }
       queryClient.setQueryData<InfiniteData<IssueComment[], string | null>>(
-        queryKeys.issues.comments(issueId!),
+        queryKeys.issues.comments(issueId ?? comment.issueId),
         (current) =>
           current
             ? {
@@ -4522,7 +4586,8 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
         tone: "error",
       });
     },
-    onSettled: (_result, _error, variables) => {
+    onSettled: (result, _error, variables) => {
+      if (result && !issueId) void queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(result.issueId) });
       if (_error) void queryClient.invalidateQueries({ queryKey: ["issues", "tree-control-state"] });
       invalidateIssueThreadLazily();
       // Binding happens when the comment saves, after the upload's earlier
@@ -4753,15 +4818,18 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
       interrupt,
       reassignment,
       attachmentIds,
+      clientRequestId,
     }: {
       body: string;
       reopen?: boolean;
       interrupt?: boolean;
       reassignment: CommentReassignment;
       attachmentIds?: string[];
+      clientRequestId?: string;
     }) =>
       issuesApi.update(issueId!, {
         comment: body,
+        commentClientRequestId: clientRequestId,
         ...(attachmentIds?.length ? { attachmentIds } : {}),
         assigneeAgentId: reassignment.assigneeAgentId,
         assigneeUserId: reassignment.assigneeUserId,
@@ -4932,21 +5000,13 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   });
 
   const interruptQueuedComment = useMutation({
-    mutationFn: async (runId: string) => {
-      const queue = await issuesApi.getQueuedComments(issueId!);
-      if (!queue.queueId || queue.targetRunId !== runId) {
-        throw new Error("The queued messages changed. Refresh and try again.");
-      }
-      return issuesApi.interruptQueuedComments(issueId!, {
-        queueId: queue.queueId, revision: queue.revision, targetRunId: runId,
-      });
-    },
+    mutationFn: (runId: string | null) => issuesApi.interruptLatestQueuedComments(issueId!, runId),
     onSuccess: () => {
       invalidateIssueDetail();
       invalidateIssueRunState();
       pushToast({
         title: "Interrupt requested",
-        body: "The active run is stopping so queued comments can continue next.",
+        body: "Queued messages will be sent when the previous run has stopped.",
         tone: "success",
       });
     },
@@ -5125,6 +5185,9 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
 
   const uploadAttachment = useMutation({
     mutationFn: async (file: File) => {
+      if (conversation) {
+        return issuesApi.uploadAttachment(conversation.agent.companyId, await resolveWritableIssueId(), file);
+      }
       if (!loadedIssue)
         throw new Error("Task details are still loading. Please try again.");
       return issuesApi.uploadAttachment(
@@ -5133,12 +5196,13 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
         file,
       );
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       setAttachmentError(null);
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.attachments(issueId!),
+        queryKey: queryKeys.issues.attachments(issueId ?? result.issueId),
       });
       invalidateIssueDetail();
+      if (!issueId) void queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(result.issueId) });
     },
     onError: (err) => {
       setAttachmentError(err instanceof Error ? err.message : "Upload failed");
@@ -5154,18 +5218,19 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
       const body = await file.text();
       const inferredTitle = titleizeFilename(baseName);
       const nextTitle = existing?.title ?? inferredTitle ?? null;
-      return issuesApi.upsertDocument(issueId!, key, {
+      return issuesApi.upsertDocument(await resolveWritableIssueId(), key, {
         title: key === "plan" ? null : nextTitle,
         format: "markdown",
         body,
         baseRevisionId: existing?.latestRevisionId ?? null,
       });
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       setAttachmentError(null);
       invalidateIssueDetail();
+      if (!issueId) void queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(result.issueId) });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.documents(issueId!),
+        queryKey: queryKeys.issues.documents(issueId ?? result.issueId),
       });
     },
     onError: (err) => {
@@ -5260,7 +5325,18 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
     },
   });
 
+  const conversationAgent = conversation?.agent ?? agents?.find(agent => agent.id === issue?.conversationAgentId);
   useEffect(() => {
+    if (conversationAgent) {
+      setBreadcrumbs([{
+        label: conversationAgent.name,
+        leading: <Avatar className="size-6 shrink-0"><AvatarFallback>{deriveInitials(conversationAgent.name)}</AvatarFallback></Avatar>,
+        leadingKey: `agent:${conversationAgent.id}`,
+        trailing: <Button variant="ghost" size="icon-xs" asChild aria-label={`Configure ${conversationAgent.name}`}><Link to={agentDetailHref(conversationAgent.id, "runtime")}><ChatSettings /></Link></Button>,
+        trailingKey: `configure:${conversationAgent.id}`,
+      }]);
+      return;
+    }
     setBreadcrumbs([
       sourceBreadcrumb,
       {
@@ -5273,6 +5349,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
       },
     ]);
   }, [
+    conversationAgent,
     breadcrumbTitle,
     breadcrumbIdentifier,
     hasLiveRuns,
@@ -5361,7 +5438,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   // Resolve external UUID links and wrong-prefix task links from the loaded
   // task's company, not the organization that happened to be selected first.
   useEffect(() => {
-    if (!loadedIssue) return;
+    if (conversation || !loadedIssue) return;
     const nextState = resolvedIssueDetailState ?? location.state;
     const taskCompany = loadedIssueCompany;
     const canonicalRef = loadedIssue.identifier ?? loadedIssue.id;
@@ -5390,6 +5467,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
       );
     }
   }, [
+    conversation,
     loadedIssue,
     loadedIssueCompany,
     companyPrefix,
@@ -5402,7 +5480,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   ]);
 
   useEffect(() => {
-    if (!issue?.id) return;
+    if (!issueId || !issue?.id) return;
     if (lastMarkedReadIssueIdRef.current === issue.id) return;
     lastMarkedReadIssueIdRef.current = issue.id;
     markIssueRead.mutate(issue.id);
@@ -5498,7 +5576,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   );
 
   useLayoutEffect(() => {
-    if (!panelIssue || suppressPanelUntilPlan) {
+    if (!panelIssue || suppressPanelUntilPlan || (conversation && !conversation.issue)) {
       closePanel();
       return;
     }
@@ -5539,6 +5617,9 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
             streamlinedTabs={streamlinedTaskDetailEnabled}
             showSubtasksTab={streamlinedTaskDetailEnabled}
             tasksTab={resolvedTasksTab}
+            artifactsOpenRequestId={!isMobile && !artifactsOpenRequest?.handled && artifactsOpenRequest?.issueId === panelIssue.id
+              ? artifactsOpenRequest.requestId : undefined}
+            onArtifactsOpened={handleArtifactsOpened}
           />
         </IssueGalleryContext.Provider>,
         { contentMode: "full-bleed" },
@@ -5576,6 +5657,9 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
     currentUserId,
     fileViewerEnabled,
     resolvedTasksTab,
+    artifactsOpenRequest,
+    handleArtifactsOpened,
+    isMobile,
   ]);
 
   const goToInboxShortcutArmedRef = useRef(false);
@@ -6088,6 +6172,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
       reopen?: boolean,
       reassignment?: CommentReassignment,
       attachmentIds?: string[],
+      clientRequestId?: string,
     ) => {
       if (reassignment) {
         await addCommentAndReassign.mutateAsync({
@@ -6095,10 +6180,11 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
           reopen,
           reassignment,
           attachmentIds,
+          clientRequestId,
         });
         return;
       }
-      await addComment.mutateAsync({ body, reopen, attachmentIds });
+      await addComment.mutateAsync({ body, reopen, attachmentIds, clientRequestId });
     },
     [addComment, addCommentAndReassign],
   );
@@ -6116,7 +6202,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
     [uploadAttachment],
   );
   const handleInterruptQueuedRun = useCallback(
-    async (runId: string) => {
+    async (runId: string | null) => {
       await interruptQueuedComment.mutateAsync(runId);
     },
     [interruptQueuedComment],
@@ -6749,7 +6835,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
     />
   );
 
-  const issueHeaderBlock = (
+  const issueHeaderBlock = issue.conversationAgentId ? null : (
     <div
       data-testid="issue-detail-header"
       className={cn(
@@ -7250,7 +7336,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
   ) : undefined;
 
   return (
-    <FileViewerProvider issueId={issue.id} enabled={fileViewerEnabled}>
+    <FileViewerProvider issueId={conversation && !conversation.issue ? "" : issue.id} enabled={fileViewerEnabled}>
       <IssueGalleryContext.Provider value={openIssueGallery}>
         <div
           data-task-chat-shell={taskChatShellEnabled ? "" : undefined}
@@ -7589,7 +7675,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
                     // Suppress the seeded-description bubble for the onboarding first
                     // task: its description is agent instructions, not something the
                     // user typed. The user lands on a seeded agent greeting instead.
-                    taskChatShellEnabled &&
+                    taskChatShellEnabled && !issue.conversationAgentId &&
                     issue.originKind !== ONBOARDING_FIRST_TASK_ORIGIN_KIND
                       ? {
                           description: issue.description ?? "",
@@ -7619,7 +7705,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
                         }
                       : undefined
                   }
-                  issueId={issue.id}
+                  issueId={conversation && !conversation.issue ? "" : issue.id}
                   companyId={issue.companyId}
                   projectId={issue.projectId ?? null}
                   issueStatus={issue.status}
@@ -7711,11 +7797,12 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
                   currentUserId={currentUserId}
                   userLabelMap={userLabelMap}
                   userProfileMap={userProfileMap}
-                  draftKey={`paperclip:issue-comment-draft:${issue.id}`}
+                  draftKey={conversationAgent ? `paperclip:agent-chat-draft:${issue.companyId}:${currentUserId}:${conversationAgent.id}` : `paperclip:issue-comment-draft:${issue.id}`}
                   reassignOptions={commentReassignOptions}
                   currentAssigneeValue={actualAssigneeValue}
                   suggestedAssigneeValue={suggestedAssigneeValue}
                   mentions={mentionOptions}
+                  conversationMode={!!issue.conversationAgentId}
                   composerPause={activePauseHold ? {
                     scope: activePauseHold.isRoot && childIssues.length === 0 ? "leaf" : "subtree",
                     pending: executeTreeControl.isPending && executeTreeControl.variables?.mode === "resume",
@@ -7727,7 +7814,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
                     } : undefined,
                     resumeHref: !activePauseHold.isRoot ? createIssueDetailPath(activePauseHoldRoot?.identifier ?? activePauseHold.rootIssueId) : undefined,
                   } : null}
-                  composerDisabledReason={treeControlStatePending ? "Checking task status…" : treeControlStateError ? "Couldn’t check whether this task is paused. Refresh to try again." : null}
+                  composerDisabledReason={issue.conversationAgentId && !instanceExperimentalSettings?.enableAgentChat ? "Agent Chat is disabled in Experimental settings." : issueId && treeControlStatePending ? "Checking task status…" : treeControlStateError ? "Couldn’t check whether this task is paused. Refresh to try again." : null}
                   composerHint={composerHint}
                   queuedCommentReason={queuedCommentReason}
                   onVote={handleCommentVote}
@@ -7749,6 +7836,10 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
                       .mutateAsync({ commentId })
                       .then(() => undefined)
                   }
+                  onStopResponse={canManageTreeControl
+                    ? (runId) => stopResponse.mutateAsync(runId)
+                    : undefined}
+                  stopResponsePending={stopResponse.isPending}
                   pauseWorkPending={
                     executeTreeControl.isPending &&
                     executeTreeControl.variables?.mode === "pause"
@@ -7772,6 +7863,7 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
                     const currentMode: IssueWorkMode =
                       issue.workMode ?? "standard";
                     if (currentMode === nextMode) return;
+                    if (conversation && (!conversation.issue || pendingDraftWorkMode.current !== null)) { pendingDraftWorkMode.current = nextMode; setDraftWorkMode(nextMode); return; }
                     return updateIssue
                       .mutateAsync({ workMode: nextMode })
                       .then(() => undefined);
@@ -8006,6 +8098,9 @@ export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasks
                     streamlinedTabs={streamlinedTaskDetailEnabled}
                     showSubtasksTab={streamlinedTaskDetailEnabled}
                     tasksTab={resolvedTasksTab}
+                    artifactsOpenRequestId={isMobile && !artifactsOpenRequest?.handled && artifactsOpenRequest?.issueId === issue.id
+                      ? artifactsOpenRequest.requestId : undefined}
+                    onArtifactsOpened={handleArtifactsOpened}
                     documentDeepLink={
                       documentDeepLink?.issueId === issue.id
                         ? documentDeepLink

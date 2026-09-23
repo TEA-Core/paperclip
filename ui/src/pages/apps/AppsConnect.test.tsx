@@ -6,13 +6,18 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CONNECTABLE_APP_DEFINITIONS, GOOGLE_WORKSPACE_CONNECTOR_PROFILES, getAppStoreDefinition } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
+import { aiConnectionsApi } from "@/api/ai-connections";
 import { queryKeys } from "@/lib/queryKeys";
 import { ConnectionSetupFlow } from "@/features/connections/ConnectionSetupFlow";
 import { AppsConnect } from "./AppsConnect";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
 const experimentalMock = vi.hoisted(() => vi.fn());
-vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: experimentalMock } }));
+vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: {
+  getExperimental: experimentalMock,
+  get: async () => ({ defaultEnvironmentId: "local-env" }),
+  getGeneral: async () => ({}),
+} }));
 const listApplicationsMock = vi.hoisted(() => vi.fn());
 const listConnectionsMock = vi.hoisted(() => vi.fn());
 const getConnectionMock = vi.hoisted(() => vi.fn());
@@ -437,6 +442,46 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
   // Access step (PAP-17835). Identity and agent reach are chosen before any
   // credential is entered.
   // -------------------------------------------------------------------------
+
+  it.each([false, true])("offers both Anthropic methods without the obsolete REST option (task repair: %s)", async (taskRepair) => {
+    const createAiAccount = vi.spyOn(aiConnectionsApi, "create").mockResolvedValue({
+      connectionId: "anthropic-ai-account", grantId: "anthropic-ai-grant",
+    });
+    mockParams.appKey = "anthropic";
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("anthropic")] });
+    const client = new QueryClient({ defaultOptions: { queries: {
+      retry: false,
+      staleTime: Infinity,
+    } } });
+    client.setQueryData(queryKeys.environments.list("company-1"), [
+      { id: "local-env", name: "Local", driver: "local", status: "active", config: {} },
+    ]);
+    client.setQueryData(queryKeys.environments.capabilities("company-1"), {});
+    client.setQueryData(queryKeys.instance.settings, { defaultEnvironmentId: "local-env" });
+    client.setQueryData(queryKeys.instance.generalSettings, {});
+    client.setQueryData(queryKeys.health, { deploymentMode: "authenticated", localAiLoginSupported: false });
+    await render(client, false, taskRepair ? <ConnectionSetupFlow host="dialog" serviceSlug="anthropic" interactionId="ai-intent" requestedAgentId="agent-1" aiConnection={{ provider: "anthropic", method: "subscription", mode: "responsible_user" }} /> : undefined);
+    await passAccessStep();
+    expect(container.textContent).toContain("Connect account");
+    expect(container.textContent).toContain("Connection name");
+    expect(container.textContent).not.toContain("How do you want to connect?");
+    expect(radioContaining("Use an API key")).toBeUndefined();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => buttonContaining("Use API key instead")!.click());
+    await act(async () => buttonContaining("Claude")!.click());
+    await flushReact();
+    const key = container.querySelector<HTMLInputElement>('input[type="password"]');
+    expect(key).toBeTruthy();
+    await act(async () => setInputValue(key!, "fixture-anthropic-ai-key"));
+    await act(async () => buttonByText("Connect")!.click());
+    await flushReact();
+    expect(createAiAccount).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      provider: "anthropic", method: "api_key", apiKey: "fixture-anthropic-ai-key",
+    }));
+    if (!taskRepair) expect(mockNavigate).toHaveBeenCalledWith("/apps/anthropic-ai-account/permissions");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain("Connect for tool access instead");
+  });
 
   it("asks for a GitHub identity and defaults to the current user and every agent", async () => {
     mockParams.appKey = "github";

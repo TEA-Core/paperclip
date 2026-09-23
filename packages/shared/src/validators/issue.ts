@@ -858,6 +858,7 @@ function requireBlockedStatusForUnblockDescriptor(
 }
 
 const createIssueDuplicateGuardSchema = {
+  initialPlan: z.string().min(1).max(200000).optional().nullable(),
   idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
   allowDuplicate: z
     .boolean()
@@ -1016,6 +1017,7 @@ export const updateIssueObjectSchema = objectWithoutDefaults(
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
+    commentClientRequestId: z.string().uuid().optional(),
     /** Only valid with a comment; the route binds these in the update transaction. */
     attachmentIds: issueCommentAttachmentIdsSchema.optional(),
     onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
@@ -1188,6 +1190,7 @@ export const issueCommentMetadataSectionSchema = z
 export const issueCommentMetadataSchema = z
   .object({
     version: z.literal(1),
+    sourceChannel: z.literal("imessage-photon").optional(),
     sourceRunId: z.string().guid().nullable().optional(),
     authorizationReason: z
       .string()
@@ -1203,6 +1206,7 @@ export const issueCommentMetadataSchema = z
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 
 export const addIssueCommentSchema = z.object({
+  clientRequestId: z.string().uuid().optional(),
   body: multilineTextSchema.pipe(z.string().min(1)),
   attachmentIds: issueCommentAttachmentIdsSchema.optional(),
   onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
@@ -1260,6 +1264,7 @@ const connectionIntentBrandAssetSchema = z
 
 export const connectionIntentPayloadSchema = z
   .object({
+    purpose: z.literal("ai").optional(),
     version: z.literal(1),
     serviceSlug: z.string().trim().min(1).max(120),
     serviceName: z.string().trim().min(1).max(160),

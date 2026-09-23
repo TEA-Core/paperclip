@@ -45,10 +45,12 @@ import {
   readPaperclipIssueWorkModeFromContext,
   renderTemplate,
   renderPaperclipWakePrompt,
+  selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayloadForEnv,
   sanitizeInheritedPaperclipEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -617,7 +619,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const promptTemplate = asString(
     config.promptTemplate,
-    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+    context.conversationMode === true
+      ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "codex");
   const model = asString(config.model, "");
@@ -701,7 +705,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // holds no credential it does nothing (no random pick). This keeps the change
   // additive: the managed home still symlinks the shared `auth.json`, now at its
   // freshest same-identity copy. The off-switch (default on) skips the vend.
-  if (isCodexAuthCacheEnabled(process.env)) {
+  if (!config.managedAiConnection && isCodexAuthCacheEnabled(process.env)) {
     const sharedHomeAuthPath = path.join(resolveSharedCodexHomeDir(process.env), "auth.json");
     // This caller reads `process.env` directly and holds no separate `env`
     // object, so `selectVendCredential` falls back to its own `process.env`
@@ -881,14 +885,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 restore: async ({ assetDir, readFile }) =>
                   void (await copyBackCodexAuth({
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
-                    hostAuthPath: path.join(resolveSharedCodexHomeDir(process.env), "auth.json"),
+                    hostAuthPath: path.join(config.managedAiConnection ? effectiveCodexHome : resolveSharedCodexHomeDir(process.env), "auth.json"),
                     log: (line) => onLog("stdout", `${line}\n`),
                     // Additive cache write (sandbox to host): also cache the
                     // sandbox subscription credential in its per-identity slot,
                     // keyed by the real `account_id`. Company-scoped root; the
                     // helper ensures the slot directory private and containment-
                     // guarded. The off-switch (default on) is read inside.
-                    resolveCacheEntryPath: (accountId) =>
+                    resolveCacheEntryPath: config.managedAiConnection ? undefined : (accountId) =>
                       ensureCodexAuthCacheEntryDir(process.env, accountId, agent.companyId),
                     // spawn-env-guard: read-only. `copyBackCodexAuth` only reads
                     // PAPERCLIP_CODEX_AUTH_CACHE out of this env to honour the
@@ -1195,7 +1199,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !sessionId && bootstrapPromptTemplate.trim().length > 0
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
+    const taskContextNote = selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId) });
+    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+      resumedSession: Boolean(sessionId),
+      conversationMode: context.conversationMode === true,
+      suppressIssueDescription: taskContextNote.length > 0,
+    });
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
     const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
     instructionsChars = promptInstructionsPrefix.length;
@@ -1291,6 +1300,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       wakePrompt,
       codexFallbackHandoffNote,
       sessionHandoffNote,
+      taskContextNote,
       renderedPrompt,
     ]);
     const promptMetrics = {
@@ -1299,6 +1309,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       bootstrapPromptChars: renderedBootstrapPrompt.length,
       wakePromptChars: wakePrompt.length,
       sessionHandoffChars: sessionHandoffNote.length,
+      taskContextChars: taskContextNote.length,
       heartbeatPromptChars: renderedPrompt.length,
     };
 

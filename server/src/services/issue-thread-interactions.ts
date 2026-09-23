@@ -10,6 +10,7 @@ import {
   isNotNull,
   isNull,
   ne,
+  or,
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -2228,7 +2229,23 @@ export function issueThreadInteractionService(
         acceptedPlanTarget.key === "plan" &&
         issueContext.workMode === "planning";
       if (isNativeCompletionReview(lockedCurrent)) {
-        const completedIssue = await issueService(db).update(
+        const otherPending = await tx.select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions).where(and(
+            eq(issueThreadInteractions.companyId, issueContext.companyId),
+            eq(issueThreadInteractions.issueId, issueContext.id),
+            ne(issueThreadInteractions.id, lockedCurrent.id),
+            or(
+              eq(issueThreadInteractions.status, "pending"),
+              and(
+                ne(issueThreadInteractions.status, "accepted"),
+                sql`${issueThreadInteractions.payload}->'target'->>'key' = 'native_completion_review'`,
+                sql`${issueThreadInteractions.payload}->'target'->>'revisionId' = ${JSON.stringify(lockedCurrent.payload)}::jsonb->'target'->>'revisionId'`,
+              ),
+            ),
+          )).limit(1);
+        // Each explicit reviewer must be able to answer independently. Completing
+        // on the first answer would cancel the other pending decisions.
+        const completedIssue = otherPending.length > 0 || issueContext.status !== "in_review" ? null : await issueService(db).update(
           args.issue.id,
           {
             status: "done",
@@ -2545,7 +2562,7 @@ export function issueThreadInteractionService(
           || existing.sourceRunId !== input.sourceRunId
           || existing.addresseeUserId !== input.addresseeUserId
           || (existing.kind === "connection_intent"
-            ? connectionIntentPayloadSchema.parse(existing.payload).serviceSlug !== payload.serviceSlug
+            ? (connectionIntentPayloadSchema.parse(existing.payload).serviceSlug !== payload.serviceSlug || connectionIntentPayloadSchema.parse(existing.payload).purpose !== payload.purpose)
             : !isDeepStrictEqual(existing.payload, payload))
         ) {
           throw conflict(
@@ -2594,7 +2611,7 @@ export function issueThreadInteractionService(
           )
           .orderBy(asc(issueThreadInteractions.createdAt));
         const reusable = pending.find((candidate) =>
-          connectionIntentPayloadSchema.parse(candidate.payload).serviceSlug === payload.serviceSlug);
+          connectionIntentPayloadSchema.parse(candidate.payload).serviceSlug === payload.serviceSlug && connectionIntentPayloadSchema.parse(candidate.payload).purpose === payload.purpose);
         if (reusable) return reusable;
 
         const [sourceRun] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
@@ -2648,7 +2665,7 @@ export function issueThreadInteractionService(
             );
             return (
               candidatePayload.success &&
-              candidatePayload.data.serviceSlug === payload.serviceSlug
+              candidatePayload.data.serviceSlug === payload.serviceSlug && candidatePayload.data.purpose === payload.purpose
             );
           })
           .map((candidate) => candidate.id);

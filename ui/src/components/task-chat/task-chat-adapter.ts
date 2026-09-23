@@ -69,6 +69,11 @@ export function commentsToTaskChatItems(
   const items: TaskChatItem[] = [];
   for (const comment of comments) {
     if (comment.deletedAt) continue;
+    if (comment.conversationSessionGeneration != null) {
+      items.push({ id: comment.id, kind: "marker", variant: "session_start", label: "New session",
+        detail: "Earlier messages and files are still available.", createdAtIso: new Date(comment.createdAt).toISOString() });
+      continue;
+    }
     const kind = authorKind(comment);
     let authorName: string | undefined;
     let agentIcon: string | null | undefined;
@@ -116,6 +121,7 @@ export function commentsToTaskChatItems(
       author: kind,
       authorName,
       text: comment.body,
+      sourceChannel: kind === "human" ? comment.metadata?.sourceChannel : undefined,
       timestamp: formatTaskChatCommentTimestamp(comment, kind),
       optimistic,
       queueTargetRunId: queued ? comment.queueTargetRunId ?? null : null,

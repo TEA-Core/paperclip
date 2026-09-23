@@ -155,13 +155,19 @@ function makeIssue(status: "todo" | "done") {
   };
 }
 
-async function createApp(actor: Record<string, unknown>) {
-  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+// FORK DIVERGENCE (resolving two module graphs concurrently drains vitest's pending mock queue twice, slice 2d): upstream extracts this helper so beforeEach can pre-warm the cold route import; the fork keeps the extraction but awaits the two graphs one at a time, as no-concurrent-module-imports.test.ts requires.
+async function loadAppModules() {
+  const middleware = await vi.importActual<typeof import("../middleware/index.js")>(
     "../middleware/index.js",
   );
-  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+  const issues = await vi.importActual<typeof import("../routes/issues.js")>(
     "../routes/issues.js",
   );
+  return [middleware, issues] as const;
+}
+
+async function createApp(actor: Record<string, unknown>) {
+  const [{ errorHandler }, { issueRoutes }] = await loadAppModules();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -175,7 +181,7 @@ async function createApp(actor: Record<string, unknown>) {
 }
 
 describe("issue telemetry routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -216,7 +222,9 @@ describe("issue telemetry routes", () => {
           permissions: null,
         }]).then(onFulfilled, onRejected),
     }));
-  });
+    // Keep cold route imports in setup rather than the HTTP assertion timeout.
+    await loadAppModules();
+  }, 60_000);
 
   // Fork divergence (first-test cold-import budget, slice 2c): upstream pins this
   // test to 10s (fe21ab324). That pin predates upstream's own policy in

@@ -5,6 +5,12 @@ export function executionFailureRetryCount(run: {
   contextSnapshot?: Record<string, unknown> | null;
 }): number {
   if (run.scheduledRetryReason === "max_turns_continuation") return 0;
+  // Upstream #13438: a subscription wait is a resource wait too, and its
+  // scheduler carries the predecessor's durable count in its own field.
+  if (run.scheduledRetryReason === "ai_connection_busy") {
+    const count = run.contextSnapshot?.failureRetriesBeforeAiConnectionWait;
+    if (typeof count === "number" && Number.isInteger(count) && count >= 0) return count;
+  }
   if (
     run.scheduledRetryReason === "workspace_busy" ||
     // Fold 2c / occupancy-retry-count (operator ruling 2026-09-16): the fork's

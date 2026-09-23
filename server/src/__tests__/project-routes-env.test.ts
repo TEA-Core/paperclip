@@ -55,6 +55,11 @@ vi.mock("../services/workspace-runtime.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/activity-log.js", async () => ({
+    ...await vi.importActual<typeof import("../services/activity-log.js")>("../services/activity-log.js"),
+    persistActivity: async (db: unknown, input: unknown) => { await mockLogActivity(db, input); return { activity: { id: "activity" }, publication: null }; },
+    publishActivity: vi.fn(),
+  }));
   vi.doMock("../telemetry.js", () => ({
     getTelemetryClient: mockGetTelemetryClient,
   }));
@@ -101,7 +106,7 @@ async function createApp() {
     };
     next();
   });
-  app.use("/api", projectRoutes({} as any));
+  app.use("/api", projectRoutes({ transaction: async (effect: (tx: unknown) => unknown) => effect({}) } as any));
   app.use(reportUnexpectedRouteError("project-routes-env"));
   app.use(errorHandler);
   return app;

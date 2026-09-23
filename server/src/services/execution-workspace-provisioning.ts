@@ -972,7 +972,21 @@ export async function provisionIssueExecutionWorkspace(
       // operator, so it must not trip the allowIssueOverride guard — otherwise an
       // `allowIssueOverride: false` project could never provision any issue at all
       // (SUP-13058).
-      await issuesSvc.update(issueId, { ...nextIssuePatch, systemWorkspaceBinding: true });
+      // Ported from upstream #13442 (slice 2d): the tenancy guard narrows this UPDATE's WHERE
+      // to the agent's company. The fork extracted this block out of heartbeat.ts, so the fold's
+      // merge could not carry upstream's change here -- it lands in a file neither parent
+      // conflicts on and would otherwise be dropped in silence.
+      // NOT ported: upstream also passes `{ bindRuntimeSharedWorkspace: warmReusableExecutionWorkspace
+      // && workspace.mode === "shared_workspace" }`. That option THROWS `unprocessable` unless the
+      // issue's stored executionWorkspacePreference is already "reuse_existing" AND its
+      // executionWorkspaceSettings.mode is "shared_workspace", which the fork's patch path does not
+      // guarantee at this point. It only matters when enableIsolatedWorkspaces is OFF (it is ON in
+      // prod), so it is deferred to an operator ruling rather than guessed at.
+      await issuesSvc.update(issueId, {
+        ...nextIssuePatch,
+        systemWorkspaceBinding: true,
+        companyGuard: agent.companyId,
+      });
       issueExecutionWorkspaceIdForRun = persistedExecutionWorkspace.id;
       issueProjectWorkspaceIdForRun = issueProjectWorkspaceIdForBinding ?? issueProjectWorkspaceIdForRun;
       if (shouldSwitchIssueToExistingWorkspace) {
