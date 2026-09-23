@@ -2905,7 +2905,7 @@ async function resolvePrOwningCard(
   headRef: string,
   title: string | null,
 ): Promise<{ identifier: string | null; status: string | null; found: boolean }> {
-  const branchMatch = /^([A-Za-z][A-Za-z0-9]*-\d+)(?![A-Za-z0-9])/.exec(headRef);
+  const branchMatch = /^([A-Za-z][A-Za-z0-9]*-\d+)(?:-|$)/.exec(headRef);
   const titleMatch = (title ?? "").match(/([A-Za-z][A-Za-z0-9]*-\d+)(?![A-Za-z0-9])/);
   const candidates: string[] = [];
   if (branchMatch) candidates.push(branchMatch[1]!);

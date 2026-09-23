@@ -3695,6 +3695,65 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(errorMeta.alarmClass).toBe("delivery-card-cancelled");
       });
 
+      it("SUP-16610 change 4: does NOT misattribute ownership when the head ref uses a non-hyphen continuation (literal hyphen boundary)", async () => {
+        // The delivery ownership contract (isDeliveredByCardIdentifierPrefix)
+        // requires the identifier to be followed by a literal `-`. A head ref
+        // like `SUP-42_feature` or `SUP-42/feature` must NOT resolve to `SUP-42`.
+        await insertIssue({ status: "cancelled", identifier: "SUP-42" });
+
+        const certifier = await insertIssue({
+          status: "done",
+          identifier: "SUP-43",
+          executionState: approvedState({
+            approvalStatus: { approvedHeadSha: NEW_HEAD, publishedHeadSha: null },
+          }),
+        });
+        await insertDecision(certifier);
+        const prObject = await db
+          .insert(externalObjects)
+          .values({
+            companyId,
+            providerKey: "github",
+            objectType: "pull_request",
+            externalId: "TEA-Core/paperclip#pull/42",
+            data: {
+              state: "open",
+              draft: false,
+              node_id: "PR_node_id_12345",
+              head: { ref: "some-branch-name" },
+              title: "Unrelated title without identifier",
+            },
+          })
+          .returning();
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: certifier,
+          sourceKind: "comment",
+          objectId: prObject[0]!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+        await seedDeliveryIdentity(certifier, "SUP-43-branch", "https://github.com/TEA-Core/paperclip");
+
+        installRoutes([
+          { url: PR_URL, body: { state: "open", merged: false, head: { ref: "SUP-42_feature", sha: NEW_HEAD }, base: { ref: "main", sha: BASE_SHA } } },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        // `SUP-42_feature` does not satisfy the literal-hyphen boundary, so no
+        // owner is identified from the branch. The alarm fires but names the
+        // owner as MISSING (not as cancelled SUP-42).
+        expect(summary.stranded).toBe(1);
+        expect(summary.strandedNew).toBe(1);
+        expect(summary.strandedDetails[0]).toContain("stranded:delivery-card-cancelled");
+        expect(summary.strandedDetails[0]).not.toContain("SUP-42");
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
+        const [errorMeta] = mockLogger.error.mock.calls[0] as [Record<string, unknown>];
+        expect(errorMeta.alarmClass).toBe("delivery-card-cancelled");
+      });
+
       it("SUP-16610 change 4: dedupes the per-PR alarm across ticks when the certifying cards fall in different capped windows", async () => {
         // The cross-tick hole a single-batch fixture cannot exercise: candidates
         // are swept through a capped keyset window (`maxCandidates` +
