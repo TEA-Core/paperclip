@@ -51,6 +51,15 @@ type TransitionInput = {
   requestedStatus?: string;
   requestedAssigneePatch: RequestedAssigneePatch;
   actor: ActorLike;
+  /**
+   * SUP-16977: the RAW `issues.executionState` column exactly as read from the
+   * database, before schema parsing/pruning. `input.issue.executionState` is
+   * already the pruned, parsed state by the time `applyMonitorTransition` runs
+   * (`applyIssueExecutionPolicyTransition` rebuilds it from `pruned.state`),
+   * so the live out-of-band `approvalStatus` subtree can only be re-applied
+   * from this raw column.
+   */
+  rawExecutionState?: Record<string, unknown> | null;
   allowBoardOverride?: boolean;
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
@@ -185,16 +194,39 @@ function monitorStatesEqual(left: IssueExecutionMonitorState | null, right: Issu
   return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 }
 
+function liveApprovalStatus(rawColumn: unknown): unknown {
+  if (rawColumn && typeof rawColumn === "object" && "approvalStatus" in rawColumn) {
+    return (rawColumn as Record<string, unknown>).approvalStatus;
+  }
+  return undefined;
+}
+
+/**
+ * SUP-16977: `rawColumn` is the raw `issues.executionState` column read from
+ * the database. The live out-of-band `approvalStatus` subtree is re-applied
+ * LAST so it always wins over any stale parsed copy — the same
+ * "live subtree is authoritative" rule the merge-arming jsonb_set writers
+ * state. When the column holds only `{"approvalStatus": {...}}` the schema
+ * parse fails (`parseIssueExecutionState` -> null) and `base` is the blank
+ * state, which carries no `approvalStatus` key at all; re-applying here is
+ * the only path that keeps the record alive across monitor transitions.
+ */
 function executionStateWithMonitor(
   stageState: IssueExecutionState | null,
   monitorState: IssueExecutionMonitorState | null,
+  rawColumn?: unknown,
 ): IssueExecutionState | null {
   if (!stageState && !monitorState) return null;
   const base = stageState ? { ...stageState } : blankExecutionState();
-  return {
+  const state: IssueExecutionState = {
     ...base,
     monitor: monitorState,
   };
+  const approvalStatus = liveApprovalStatus(rawColumn);
+  if (approvalStatus !== undefined) {
+    return { ...state, approvalStatus };
+  }
+  return state;
 }
 
 function derivePersistedMonitorState(input: {
@@ -1023,6 +1055,7 @@ function buildCompletedState(
     lastDecisionOutcome: "approved",
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
+    approvalStatus: previous?.approvalStatus,
   };
 }
 
@@ -1046,6 +1079,7 @@ function buildStateWithCompletedStages(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    approvalStatus: input.previous?.approvalStatus,
   };
 }
 
@@ -1069,6 +1103,7 @@ function buildSkippedStageCompletedState(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    approvalStatus: input.previous?.approvalStatus,
   };
 }
 
@@ -1098,6 +1133,7 @@ function buildPendingState(input: {
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
     pendingSince: new Date().toISOString(),
+    approvalStatus: input.previous?.approvalStatus,
   };
 }
 
@@ -1783,7 +1819,13 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
   }
 
   if (stagePatch.executionState !== undefined || !monitorStatesEqual(currentMonitorState, targetMonitorState)) {
-    patch.executionState = executionStateWithMonitor(stageState, targetMonitorState);
+    // SUP-16977: thread the raw column so the live approvalStatus subtree is
+    // re-applied last even when the parsed state was pruned or failed to parse.
+    // Direct callers (recovery paths) pass the raw DB row as issue.executionState;
+    // the policy-transition path threads it explicitly via rawExecutionState.
+    const rawColumn =
+      input.rawExecutionState ?? (input.issue.executionState as Record<string, unknown> | null | undefined);
+    patch.executionState = executionStateWithMonitor(stageState, targetMonitorState, rawColumn);
   }
 
   return patch;
@@ -1836,7 +1878,7 @@ export function buildIssueMonitorTriggeredPatch(input: {
 
   return {
     executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
-    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState, input.issue.executionState) as Record<string, unknown> | null,
     monitorNextCheckAt: null,
     monitorWakeRequestedAt: null,
     monitorLastTriggeredAt: input.triggeredAt,
@@ -1866,7 +1908,7 @@ export function buildIssueMonitorClearedPatch(input: {
 
   return {
     executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
-    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState, input.issue.executionState) as Record<string, unknown> | null,
     monitorNextCheckAt: null,
     monitorWakeRequestedAt: null,
   };
@@ -1923,6 +1965,10 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
       ...input.issue,
       executionState: pruned.state as Record<string, unknown> | null,
     },
+    // SUP-16977: capture the raw column BEFORE the scoped input replaces it
+    // with the pruned parsed state, so the monitor path can re-apply the live
+    // approvalStatus subtree.
+    rawExecutionState: input.rawExecutionState ?? (input.issue.executionState as Record<string, unknown> | null | undefined),
   };
 
   // SUP-16525 §4: an explicit re-arm request bypasses the stage-advance logic

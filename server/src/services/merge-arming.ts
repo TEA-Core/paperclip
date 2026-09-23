@@ -3111,10 +3111,18 @@ export async function writeCommitStatusWithRetry(
  * SUP-16081 fix #1. Persist the outcome of a FIRST `paperclip/approved` publish
  * to `issues.executionState.approvalStatus` so a dropped publish is never silent.
  *
- * The record is TOTAL: after a closing transition the `approvalStatus` key is
- * never absent. Every terminating outcome leaves a named record carrying the
- * publisher's own refusal vocabulary, the attempted/certified head, and a
- * timestamp:
+ * This writer is TOTAL within its own scope: after a closing transition the
+ * `approvalStatus` key is never absent FROM THE MINT ITSELF. Every terminating
+ * outcome leaves a named record carrying the publisher's own refusal
+ * vocabulary, the attempted/certified head, and a timestamp:
+ *
+ * Its real scope (SUP-16977): the invariant holds against the atomic subtree
+ * helpers (jsonb_set writers) and, after the SUP-16977 control-plane patch,
+ * against the whole-object ladder writers, which now preserve the key across
+ * schema round-trips and re-apply the live subtree. It was never total
+ * against a FAILED PARSE of the column — a schema strip or a parse that
+ * returns null could still drop the key, which is exactly the residue the
+ * SUP-16977 patch closes on the control plane.
  *
  *   - `armed`   -> `publishedHeadSha` + `publishedAt` (the success shape, as today)
  *   - `skipped` -> `publishSkipped` { reason, headSha, at }; when
