@@ -3,7 +3,6 @@ name: Refresh Lockfile
 on:
   push:
     branches:
-      - master
       - "fold/**"
   workflow_dispatch:
 
@@ -137,7 +136,7 @@ jobs:
         # branch becomes unbuildable (`Dockerfile` installs --frozen-lockfile).
         if: >-
           steps.upsert-pr.outputs.pr_url != '' &&
-          (github.ref_name == 'master' || startsWith(github.ref_name, 'fold/'))
+          startsWith(github.ref_name, 'fold/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -3,7 +3,6 @@ name: Docker
 on:
   push:
     branches:
-      - "master"
       # Fold branches publish images too (SUP-12507): the fork deploys from
       # the image a fold-branch merge produces, so a fold push must build.
       - "fold/**"
