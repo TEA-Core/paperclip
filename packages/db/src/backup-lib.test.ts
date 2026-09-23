@@ -722,6 +722,23 @@ describe("splitConnectionStringPassword", () => {
     );
   });
 
+  it("removes every repeated password parameter and keeps the last, as libpq does", () => {
+    const result = splitConnectionStringPassword(
+      "postgres://paperclip@db:5432/paperclip?password=first&sslmode=require&password=last",
+    );
+    // Verified against a real server: libpq applies parameters left to right and
+    // each overwrites the last, so the final copy is the one that authenticates.
+    expect(result.password).toBe("last");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip?sslmode=require");
+    expect(result.connectionString).not.toContain("password");
+  });
+
+  it("drops the whole query when every parameter was a password", () => {
+    const result = splitConnectionStringPassword("postgres://paperclip@db:5432/paperclip?password=a&password=b");
+    expect(result.password).toBe("b");
+    expect(result.connectionString).toBe("postgres://paperclip@db:5432/paperclip");
+  });
+
   it("removes both copies and prefers the query parameter, as libpq does", () => {
     const result = splitConnectionStringPassword("postgres://paperclip:fromuserinfo@db:5432/paperclip?password=fromquery");
     expect(result.password).toBe("fromquery");

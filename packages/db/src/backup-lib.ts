@@ -397,52 +397,51 @@ function splitUriPassword(raw: string): ConnectionStringSecret {
     }
   }
 
-  // [start, end) spans to excise, collected against the original string.
-  const spans: Array<[number, number]> = [];
-  let userinfoPassword: string | undefined;
-  let queryPassword: string | undefined;
+  // The authority and everything after it are edited independently, so neither
+  // edit can shift offsets the other still depends on.
+  let head = raw.slice(0, authorityEnd);
+  const tail = raw.slice(authorityEnd);
 
-  const authority = raw.slice(schemeEnd, authorityEnd);
+  let userinfoPassword: string | undefined;
+  const authority = head.slice(schemeEnd);
   const at = authority.indexOf("@");
   if (at !== -1) {
     const colon = authority.slice(0, at).indexOf(":");
     if (colon !== -1) {
       userinfoPassword = decodeUriComponentStrict(authority.slice(colon + 1, at), "password");
-      spans.push([schemeEnd + colon, schemeEnd + at]);
+      head = head.slice(0, schemeEnd + colon) + head.slice(schemeEnd + at);
     }
   }
 
-  const queryStart = raw.indexOf("?", authorityEnd);
+  let queryPassword: string | undefined;
+  let newTail = tail;
+  const queryStart = tail.indexOf("?");
   if (queryStart !== -1) {
-    const hash = raw.indexOf("#", queryStart);
-    const queryEnd = hash === -1 ? raw.length : hash;
-    let segmentStart = queryStart + 1;
-    while (segmentStart < queryEnd) {
-      const next = raw.indexOf("&", segmentStart);
-      const segmentEnd = next === -1 || next > queryEnd ? queryEnd : next;
-      const segment = raw.slice(segmentStart, segmentEnd);
+    const hash = tail.indexOf("#", queryStart);
+    const queryEnd = hash === -1 ? tail.length : hash;
+    // Segments are kept as raw slices and rejoined, never re-encoded, so every
+    // surviving value reaches libpq byte for byte.
+    const kept: string[] = [];
+    for (const segment of tail.slice(queryStart + 1, queryEnd).split("&")) {
       const eq = segment.indexOf("=");
       const key = eq === -1 ? segment : segment.slice(0, eq);
       if (decodeUriComponentStrict(key, "parameter name") === "password") {
+        // libpq applies parameters left to right and each one overwrites the
+        // last, so a repeated password resolves to the final copy. Every copy is
+        // dropped regardless — one left behind is one left in argv.
         queryPassword = eq === -1 ? "" : decodeUriComponentStrict(segment.slice(eq + 1), "password");
-        // Take a delimiter with the segment so the query stays well-formed.
-        if (segmentEnd < queryEnd) spans.push([segmentStart, segmentEnd + 1]);
-        else if (segmentStart > queryStart + 1) spans.push([segmentStart - 1, segmentEnd]);
-        else spans.push([queryStart, segmentEnd]);
-        break;
+        continue;
       }
-      segmentStart = segmentEnd + 1;
+      kept.push(segment);
+    }
+    if (queryPassword !== undefined) {
+      newTail = tail.slice(0, queryStart) + (kept.length > 0 ? `?${kept.join("&")}` : "") + tail.slice(queryEnd);
     }
   }
 
   const password = queryPassword ?? userinfoPassword;
   if (password === undefined) return { connectionString: raw };
-
-  let connectionString = raw;
-  for (const [start, end] of spans.sort((a, b) => b[0] - a[0])) {
-    connectionString = connectionString.slice(0, start) + connectionString.slice(end);
-  }
-  return { connectionString, password };
+  return { connectionString: head + newTail, password };
 }
 
 /**
