@@ -15,6 +15,7 @@ import {
   ISSUE_COMMENT_PRESENTATION_DENSITIES,
   ISSUE_HARNESS_KINDS,
   ISSUE_MONITOR_SCHEDULED_BY,
+  ISSUE_PARENT_LINK_KINDS,
   ISSUE_PRIORITIES,
   ISSUE_RECOVERY_ACTION_KINDS,
   ISSUE_RECOVERY_ACTION_OUTCOMES,
@@ -752,6 +753,10 @@ const createIssueBaseSchema = z.object({
   projectWorkspaceId: z.string().guid().optional().nullable(),
   goalId: z.string().guid().optional().nullable(),
   parentId: z.string().guid().optional().nullable(),
+  // ADR-103 M2: the parent edge's kind, written beside parent_id. Optional on the
+  // wire so an omitted kind keeps the column's `decomposition` default (and, on a
+  // re-parent, leaves the stored kind untouched); an invalid value is a 400.
+  parentLinkKind: z.enum(ISSUE_PARENT_LINK_KINDS).optional(),
   blockedByIssueIds: z.array(z.string().guid()).optional(),
   unblockDescriptor: z
     .object({
@@ -890,6 +895,7 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(
   createIssueBaseSchema
     .omit({
       parentId: true,
+      parentLinkKind: true,
       inheritExecutionWorkspaceFromIssueId: true,
       watchdogDiscovery: true,
     })
