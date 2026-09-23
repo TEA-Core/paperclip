@@ -27861,28 +27861,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         run.runtimeMode !== "native" && run.status === "cancelled"
           ? readNonEmptyString(parseObject(run.resultJson).queuedCommentInterruptQueueId)
           : null;
-      // Fold D9 (narrow): a Stop leaves a no-replay disposition -- an execution-reconciliation
-      // recovery action carrying `evidence.automaticRecovery.replay = 'blocked'`, i.e. literally
-      // "do not replay the stopped turn". Upstream honours it before promoting, in the dormant
-      // wake-queue adapter's `releaseIssueExecution`. This in-file loop is the live release while
-      // D9 is deferred and honoured no such disposition, so it promoted the stopped session's
-      // queued wake and the freshly reset chat re-ran the old topic. Measured on upstream
-      // #13284's reset test at the slice-2d cutoff: ~37% failures on the fork (11/30) against
-      // ~7% on pure upstream (1/15); pinned deterministically by the release-path regression
-      // test in heartbeat-issue-rewake-throttle.test.ts.
+      // Fold D9: a Stop leaves a no-replay disposition -- an execution-reconciliation recovery
+      // action carrying `evidence.automaticRecovery.replay = 'blocked'`, i.e. literally "do not
+      // replay the stopped turn". Upstream honours it before promoting, in the dormant wake-queue
+      // adapter's `releaseIssueExecution`. This in-file loop is the live release while D9 is
+      // deferred and honoured no such disposition, so it promoted the stopped session's queued
+      // wake and the freshly reset chat re-ran the old topic.
       //
-      // Deliberately keyed on the no-replay disposition, NOT on `getExecutionBlocker` as a whole.
-      // A blanket blocker gate also suppresses the cancel-with-unknown-provider-outcome promotion
-      // that this fork promotes through on purpose (the inverted divergence guard in
-      // heartbeat-comment-wake-batching.test.ts) -- that half belongs to D9, not here.
-      //
-      // Gate the LOOP, not the release: upstream returns `released` at its equivalent point
-      // because its release ends there, while this body continues past the loop into the
-      // chat-ownership fence and unknown-provider-outcome reconciliation. Returning early skipped
-      // that bookkeeping and reddened 8 tests across durable-chat-wakeup,
-      // heartbeat-comment-wake-batching and heartbeat-process-recovery.
-      //
-      // The D9 port replaces this with the module's rule; delete it in that change.
+      // Read once; the hold cannot change inside the loop. The CHECK is sited at the promotion
+      // step below, not here -- see the note there.
       const [noReplayDisposition] = await tx
         .select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions)
@@ -27895,8 +27882,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         )
         .limit(1);
-      const promotionHeldByNoReplayDisposition = Boolean(noReplayDisposition);
-      while (!promotionHeldByNoReplayDisposition) {
+      while (true) {
         let deferred = await tx
           .select()
           .from(agentWakeupRequests)
@@ -28301,6 +28287,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           }
         }
+
+        // Fold D9: stop HERE, at the promotion step, not at the loop head. This loop does two
+        // jobs -- it disposes of stale queued wakes (every cancel/skip path above ends in
+        // `continue`) and then promotes what survives. Gating the loop HEAD skips the disposal
+        // too, so a stopped session's wake sits `deferred_issue_execution` forever instead of
+        // reaching `cancelled`. Measured against upstream #13284's reset test on the slice-2d
+        // fold: 0/12 passes with the loop-head gate, 11/12 with this one, 5/6 with no gate.
+        // Everything above has already run for this wake.
+        //
+        // `break`, not `continue`: the wake stays deferred, so `continue` re-selects the same row
+        // forever. The remaining deferred wakes stay queued for the next release, which is
+        // upstream's behaviour while execution is held.
+        //
+        // The D9 port replaces this with the module's rule; delete it in that change.
+        if (noReplayDisposition) break;
 
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
         if (activePauseHold) {
