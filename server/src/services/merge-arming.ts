@@ -937,8 +937,24 @@ export interface GitHubNodeIdResult extends GitHubFetchResult {
  * Resolves a pull request's GraphQL node id via the REST pulls endpoint.
  * Exported so the carrier promotion sweep can fall back to it when a cached
  * external object row has no node id.
+ *
+ * SUP-17273: the approval-time node-id read is a head/PR resolution read, so it
+ * gets the same bounded transient retry as the PR-head reads. A transient
+ * 500/502/503/504 or network error is retried on the SAME token; a 4xx (incl.
+ * 401/403/404) is deterministic and returns immediately, so the caller's
+ * candidate rotation and the `failed:node_id_missing` / `failed:pr_auth`
+ * message prefixes are preserved exactly.
  */
 export async function fetchGitHubNodeId(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<GitHubNodeIdResult> {
+  return withTransientReadRetry(() => fetchGitHubNodeIdOnce(token, owner, repo, number));
+}
+
+async function fetchGitHubNodeIdOnce(
   token: string,
   owner: string,
   repo: string,
@@ -2444,13 +2460,31 @@ async function fetchBranchHeadShaAcrossCandidates(
   return null;
 }
 
-/** Reads one delivery-branch ref's live head SHA from the GitHub refs API. */
-async function fetchBranchHeadSha(
+/**
+ * Reads one delivery-branch ref's live head SHA from the GitHub refs API.
+ * SUP-17273: the no-PR approval path certifies the delivery-branch head through
+ * this read, so it gets the same bounded transient retry as the PR-head reads.
+ * A transient 500/502/503/504 or network error is retried on the SAME token; a
+ * 4xx (incl. 404) is deterministic and returns immediately so
+ * fetchBranchHeadShaAcrossCandidates' candidate rotation is preserved.
+ * Exported so the no-PR approval-time branch-head read's retry is directly
+ * testable (mirrors the other exported arming reads).
+ */
+export async function fetchBranchHeadSha(
   token: string,
   owner: string,
   repo: string,
   branch: string,
-): Promise<{ ok: true; headSha: string } | { ok: false; status: number }> {
+): Promise<{ ok: true; headSha: string; status: number } | { ok: false; status: number }> {
+  return withTransientReadRetry(() => fetchBranchHeadShaOnce(token, owner, repo, branch));
+}
+
+async function fetchBranchHeadShaOnce(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<{ ok: true; headSha: string; status: number } | { ok: false; status: number }> {
   const refPath = branch.split("/").map(encodeURIComponent).join("/");
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
     repo,
@@ -2474,7 +2508,7 @@ async function fetchBranchHeadSha(
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
   const object = body?.object as Record<string, unknown> | undefined | null;
   const sha = object?.sha as string | undefined;
-  if (typeof sha === "string" && sha.length > 0) return { ok: true, headSha: sha };
+  if (typeof sha === "string" && sha.length > 0) return { ok: true, headSha: sha, status: response.status };
   return { ok: false, status: response.status };
 }
 
@@ -2958,7 +2992,23 @@ export interface OpenPullRequestsFailure extends GitHubFetchResult {
 
 export type OpenPullRequestsResult = OpenPullRequestsSuccess | OpenPullRequestsFailure;
 
+/**
+ * Lists a repo's open PRs for the approval-time discovery loop.
+ * SUP-17273: this is a head/PR resolution read, so it gets the same bounded
+ * transient retry as the other arming reads. A transient 500/502/503/504 or
+ * network error is retried on the SAME token; a 4xx (incl. 404/429) is
+ * deterministic and returns immediately.
+ */
 export async function fetchOpenPullRequests(
+  token: string,
+  owner: string,
+  repo: string,
+  hostname: string = "github.com",
+): Promise<OpenPullRequestsResult> {
+  return withTransientReadRetry(() => fetchOpenPullRequestsOnce(token, owner, repo, hostname));
+}
+
+async function fetchOpenPullRequestsOnce(
   token: string,
   owner: string,
   repo: string,
@@ -3089,15 +3139,18 @@ export function isTransientHttpStatus(status: number): boolean {
 /**
  * SUP-17273: transient-vs-deterministic split for a head/PR RESOLUTION read.
  * Transient = the transport may succeed if retried: no response (network error,
- * status 0) or a server error (5xx). Every 4xx — including 401/403/404/429 — is a
- * deterministic refusal and must NOT be retried on the read path: the candidate
- * loops already advance tokens on 401/403 and treat 404/429 as terminal. This is
- * intentionally NARROWER than isTransientHttpStatus, which also treats 408/429 as
- * retryable for the status-WRITE path.
+ * status 0) or one of the four gateway/server-unavailable errors a short wait can
+ * clear — 500, 502, 503, 504. This is the EXACT allowlist the arming read retry is
+ * contracted to: the other 5xx (501 Not Implemented, 505 HTTP Version Not
+ * Supported, 599) are deterministic and must NOT be retried. Every 4xx — including
+ * 401/403/404/429 — is a deterministic refusal and must NOT be retried on the read
+ * path: the candidate loops already advance tokens on 401/403 and treat 404/429 as
+ * terminal. This is intentionally NARROWER than isTransientHttpStatus, which also
+ * treats 408/429 and the full 5xx band as retryable for the status-WRITE path.
  */
 export function isTransientReadStatus(status: number): boolean {
   if (status === 0) return true;
-  return status >= 500 && status <= 599;
+  return status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 export interface TransientReadRetryOptions {
@@ -3111,13 +3164,14 @@ export interface TransientReadRetryOptions {
 
 /**
  * SUP-17273. Wrap a head/PR resolution READ with a bounded retry over the
- * transient class only (network error / 5xx). A non-transient result — success
- * (2xx), a deterministic 4xx, or a malformed body — returns after the first
- * attempt. A transient failure is retried on the SAME token up to `attempts`
- * total times with `delayMs` between attempts; the loop stops the moment a
- * non-transient result is observed. The retry never advances token candidates
- * (that is the caller's job on 401/403) — a transient failure is transport, not
- * auth, so re-reading with the same token is the correct recovery.
+ * transient class only (network error / 500/502/503/504 — see
+ * isTransientReadStatus). A non-transient result — success (2xx), a
+ * deterministic 4xx or non-allowlisted 5xx, or a malformed body — returns after
+ * the first attempt. A transient failure is retried on the SAME token up to
+ * `attempts` total times with `delayMs` between attempts; the loop stops the
+ * moment a non-transient result is observed. The retry never advances token
+ * candidates (that is the caller's job on 401/403) — a transient failure is
+ * transport, not auth, so re-reading with the same token is the correct recovery.
  */
 export async function withTransientReadRetry<T extends { status: number }>(
   fetchOnce: () => Promise<T>,

@@ -28,7 +28,10 @@ import {
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
+  fetchBranchHeadSha,
+  fetchGitHubNodeId,
   fetchHeadApprovedStatusViaTokenCandidates,
+  fetchOpenPullRequests,
   isTransientHttpStatus,
   isTransientReadStatus,
   ladderIsTerminallyApproved,
@@ -282,16 +285,15 @@ describe("isTransientHttpStatus", () => {
 // it retries a network error (0) and 5xx ONLY, and treats every 4xx (incl. 429)
 // as deterministic. AC2: deterministic statuses are NOT retried.
 describe("isTransientReadStatus", () => {
-  it("treats no-response (0) and 5xx as transient", () => {
+  it("treats only no-response (0) and the gateway allowlist (500/502/503/504) as transient", () => {
     expect(isTransientReadStatus(0)).toBe(true);
     expect(isTransientReadStatus(500)).toBe(true);
     expect(isTransientReadStatus(502)).toBe(true);
     expect(isTransientReadStatus(503)).toBe(true);
     expect(isTransientReadStatus(504)).toBe(true);
-    expect(isTransientReadStatus(599)).toBe(true);
   });
 
-  it("treats every 4xx (incl. 401/403/404/429), 2xx/3xx as deterministic", () => {
+  it("treats every 4xx (incl. 401/403/404/429), 2xx/3xx, and non-allowlisted 5xx as deterministic", () => {
     expect(isTransientReadStatus(401)).toBe(false);
     expect(isTransientReadStatus(403)).toBe(false);
     expect(isTransientReadStatus(404)).toBe(false);
@@ -300,6 +302,10 @@ describe("isTransientReadStatus", () => {
     expect(isTransientReadStatus(400)).toBe(false);
     expect(isTransientReadStatus(200)).toBe(false);
     expect(isTransientReadStatus(301)).toBe(false);
+    // Non-allowlisted 5xx are deterministic: a short retry cannot clear them.
+    expect(isTransientReadStatus(501)).toBe(false);
+    expect(isTransientReadStatus(505)).toBe(false);
+    expect(isTransientReadStatus(599)).toBe(false);
     expect(isTransientReadStatus(600)).toBe(false);
   });
 });
@@ -362,6 +368,110 @@ describe("withTransientReadRetry (SUP-17273)", () => {
     expect(result.status).toBe(404);
     // Operator signal: exactly one attempt, never retried.
     expect(calls).toBe(1);
+  });
+});
+
+// SUP-17273 findings approval-node-id-read-unretried /
+// approval-live-pr-discovery-unretried / approval-branch-head-read-unretried: the
+// remaining approval-time head/PR resolution reads are each wrapped in
+// withTransientReadRetry. These Postgres-free leaf tests prove the wrapper is
+// actually WIRED to each read — a transient 5xx is retried on the SAME token
+// (2 attempts for transient-then-success), while a deterministic 4xx returns
+// after exactly one attempt. (The wrapper's own AC logic is covered above; this
+// covers the leaf<->wrapper wiring the findings called out.)
+describe("approval-time read retry wiring (SUP-17273)", () => {
+  beforeEach(() => {
+    mockGhFetch.mockReset();
+  });
+
+  it("fetchGitHubNodeId: retries a transient 503 to success on the same token", async () => {
+    mockGhFetch
+      .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ node_id: "PR_node_id_abc" }),
+      } as unknown as Response);
+
+    const result = await fetchGitHubNodeId("tok", "owner", "repo", 42);
+
+    expect(result.ok).toBe(true);
+    expect(result.nodeId).toBe("PR_node_id_abc");
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fetchGitHubNodeId: does not retry a deterministic 404", async () => {
+    mockGhFetch.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ message: "Not Found" }),
+    } as unknown as Response);
+
+    const result = await fetchGitHubNodeId("tok", "owner", "repo", 42);
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(404);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetchOpenPullRequests: retries a transient 502 to success on the same token", async () => {
+    mockGhFetch
+      .mockResolvedValueOnce({ ok: false, status: 502, json: async () => ({}) } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [{ number: 42, draft: false, head: { ref: "b" }, title: "t", body: "b" }],
+      } as unknown as Response);
+
+    const result = await fetchOpenPullRequests("tok", "owner", "repo");
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.items).toHaveLength(1);
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fetchOpenPullRequests: does not retry a deterministic 404", async () => {
+    mockGhFetch.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ message: "Not Found" }),
+    } as unknown as Response);
+
+    const result = await fetchOpenPullRequests("tok", "owner", "repo");
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(404);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetchBranchHeadSha: retries a transient 503 to success on the same token", async () => {
+    mockGhFetch
+      .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ object: { sha: "abc123def" } }),
+      } as unknown as Response);
+
+    const result = await fetchBranchHeadSha("tok", "owner", "repo", "SUP-42/branch");
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.headSha).toBe("abc123def");
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fetchBranchHeadSha: does not retry a deterministic 404", async () => {
+    mockGhFetch.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ message: "Not Found" }),
+    } as unknown as Response);
+
+    const result = await fetchBranchHeadSha("tok", "owner", "repo", "SUP-42/branch");
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(404);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
   });
 });
 
