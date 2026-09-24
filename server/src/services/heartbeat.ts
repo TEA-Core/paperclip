@@ -19543,12 +19543,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } catch (error) {
         // SUP-17429: if a sibling routine-execution execution activated its
         // slot between the guard read above and this stamp, the write hits the
-        // `issues_open_routine_execution_uq` partial index. That collision is
-        // a known, recoverable state: leave the run claimed so it proceeds to
-        // execute and releases the lock on completion, and let periodic
-        // recovery / the orphan reaper reconcile the issue execution lock. Do
-        // NOT let this specific unique violation propagate — on the startup
-        // recovery path it would otherwise take the whole server down. Every
+        // `issues_open_routine_execution_uq` partial index. The heartbeatRuns
+        // claim and wakeup claim already committed above, so release them back
+        // to "queued" and return no executable run. Dispatching without the
+        // issue execution lock would violate the issue-lock invariant. Every
         // other error rethrows so a genuine failure stays fatal.
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
           logger.error(
@@ -19558,9 +19556,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               companyId: claimed.companyId,
               err: error,
             },
-            "claimQueuedRun: routine-execution open-slot collision on lazy execution-lock stamp; run proceeds without the issue lock",
+            "claimQueuedRun: routine-execution open-slot collision on lazy execution-lock stamp; releasing run and skipping candidate",
           );
-          return claimed;
+          await releaseRunClaimedJustBeforeSuppression(claimed.id);
+          return null;
         }
         throw error;
       }

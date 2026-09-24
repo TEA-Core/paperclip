@@ -349,6 +349,76 @@ describeEmbeddedPostgres("heartbeat startup recovery vs open routine execution s
     );
   }, 20_000);
 
+  it("releases the run when the lazy-lock stamp hits the routine-execution unique violation", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } =
+      await seedPlainQueuedRun();
+
+    // Fault ONLY the top-level db.update(issues) call with the exact
+    // issues_open_routine_execution_uq unique violation. The release path
+    // inside releaseRunClaimedJustBeforeSuppression uses a transaction (tx),
+    // so its tx.update(issues) is not intercepted by this proxy.
+    const origUpdate = (db as unknown as { update: (t: unknown) => unknown }).update.bind(db);
+    const uniqueViolationError = Object.assign(
+      new Error(
+        'duplicate key value violates unique constraint "issues_open_routine_execution_uq"',
+      ),
+      { code: "23505", constraint: "issues_open_routine_execution_uq" },
+    );
+    const faultedDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "update") {
+          return (table: unknown) => {
+            if (table === issues) {
+              return {
+                set: () => ({
+                  where: () => Promise.reject(uniqueViolationError),
+                }),
+              };
+            }
+            return origUpdate(table);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const heartbeat = heartbeatService(faultedDb);
+
+    // The plain (non-routine) candidate bypasses the pre-claim open-slot
+    // guard, so the claim proceeds and the lazy-lock write is faulted with
+    // the routine-execution unique violation. The catch block must release
+    // the run back to "queued" and return null, so resumeQueuedRuns resolves
+    // instead of propagating the error.
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    // The run must be back to "queued" — not dispatched, not running.
+    const run = await db
+      .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("queued");
+    expect(run?.startedAt).toBeNull();
+
+    // The wakeup must be back to "queued" with no claimedAt.
+    const wakeup = await db
+      .select({ status: agentWakeupRequests.status, claimedAt: agentWakeupRequests.claimedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("queued");
+    expect(wakeup?.claimedAt).toBeNull();
+
+    // The issue must not have an execution lock stamped.
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+  }, 20_000);
+
   it("detects an open sibling holding the routine-execution slot", async () => {
     const { companyId, routineOriginId, openIssueId, candidateIssueId } =
       await seedConflictingRoutineExecution();
