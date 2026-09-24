@@ -127,6 +127,14 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     // `captureCallsBefore` was read, and it was then counted as a second capture
     // that never happened.
     await settleRunFailureReports();
+    // Assert the drain actually completed. `waitForPendingRunFailureReports`
+    // returns the same `void` whether every report settled or its 5s timeout
+    // expired, so the wait alone is not proof. If the first sweep's report has
+    // not landed by now, the baseline below would be taken too early and the
+    // original race would be back — fail here, where the cause is legible,
+    // rather than three lines later as a phantom second capture.
+    expect(capturesForRun(0, runId)).toHaveLength(1);
+
     // The first sweep already cleared executionControlDeadlineAt and moved the
     // run to "failed". Restore the deadline to simulate a second sweep still
     // observing the same run as a candidate.
