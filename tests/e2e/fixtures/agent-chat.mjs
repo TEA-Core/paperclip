@@ -100,7 +100,25 @@ console.log("Deterministic chat provider received a turn");
 if (command.action === "hold") {
   await comment("Provider is streaming and ready to stop.");
   // Keep a real provider process alive so Stop exercises cancellation and tree holds.
-  setInterval(() => console.log("Streaming discussion"), 250);
+  const streaming = setInterval(() => console.log("Streaming discussion"), 250);
+  // The interval is the only thing holding the event loop open, so without a
+  // bound this provider is immortal: if the Stop it is waiting for never lands,
+  // nothing here ever ends the process and the shard hangs on a live process
+  // tree rather than failing. Bound it instead.
+  //
+  // 90s sits between the two deadlines that matter. The spec's longest poll
+  // before it clicks Stop is 60s (tests/e2e/agent-chat.spec.ts), so a real Stop
+  // always arrives first and still cancels a running process — the assertion
+  // under test is unchanged. The spec's own limit is test.setTimeout(120_000),
+  // so the provider can never outlive the test that started it.
+  //
+  // Bound the FIXTURE, not the spec: serializing the spec side was tried and
+  // reverted in b5fd8f33a.
+  const HOLD_LIMIT_MS = 90_000;
+  setTimeout(() => {
+    clearInterval(streaming);
+    console.log("Hold window elapsed without a Stop; provider exiting.");
+  }, HOLD_LIMIT_MS);
 } else if (command.action === "delayed") {
   await comment("Turn started before feature disable.");
   await new Promise((resolve) => setTimeout(resolve, 3000));
