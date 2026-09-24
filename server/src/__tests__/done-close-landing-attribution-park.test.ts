@@ -362,40 +362,84 @@ describe("SUP-17092/B: deadlocked shared-carrier attribution parks instead of re
     expect(commentBody).toContain("No re-open or park is recorded here");
   });
 
-  it("(c) non-shared-carrier open PR past grace → the existing escalate-and-park path fires; the attribution branch is NOT entered", async () => {
+  it("(c) non-shared-carrier open PR that is CONFLICTING past grace → the existing conflict-ejection refusal + escalate-and-park path fires; the attribution branch is NOT entered", async () => {
     // No carrier owner + a plain decision-carried candidate (not an ADR-091 D1
-    // marker) → isSharedCarrierRefusal is false, so the code must fall through to
-    // the bounded re-enqueue-then-escalate path, unchanged by the split.
+    // marker) → isSharedCarrierRefusal is false. With merge arming OPEN and the
+    // PR conflict-ejected from the merge queue on an UNCHANGED head, the code
+    // must traverse the existing conflict-ejection refusal path (bounded
+    // re-enqueue refused → escalate-and-park at the :888-1052 shape), unchanged
+    // by the split, and never enter the shared-carrier attribution branch.
     const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
     const { service } = makeService(
-      { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: false },
+      {
+        candidates: [candidateRow()],
+        existingLandingRows: [],
+        companyMergeArmingEnabled: true,
+        issueExecutionState: {
+          approvalStatus: { approvedHeadSha: "57726532dcd765819df8f76f102d15db68afd99a" },
+        },
+      },
       { wakeup },
     );
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([
       linkedPr({ number: 3145, displayName: "paperclipai/paperclip#3145" }),
     ]);
     mockResolver(async () => openSnapshot);
+    // The PR is DIRTY/conflicting: the merge queue ejected it with
+    // merge_conflict and the head has NOT moved since (head commit predates the
+    // ejection) — the #662 shape the SUP-15953 ejection predicate refuses.
+    mockFetchLastMergeQueueEjectionViaTokenCandidates.mockResolvedValue({
+      ok: true,
+      headRefOid: "57726532dcd765819df8f76f102d15db68afd99a",
+      headCommitAt: "2026-08-18T16:07:16Z",
+      lastEjection: { reason: "merge_conflict", createdAt: "2026-08-18T20:00:00Z" },
+    });
 
     const result = await service.sweep();
 
     expect(result.escalated).toBe(1);
     expect(result.confirmed).toBe(0);
+    expect(result.reenqueued).toBe(0);
+    // The ejection gate refuses BEFORE the head-authorization gate: no queue
+    // add, and no wasted head read either.
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockFetchHeadViaTokenCandidates).not.toHaveBeenCalled();
+
+    // Durable ejection-refusal row keyed on the conflict.
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_reenqueue_refused",
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#3145",
+        ejectionReason: "merge_conflict",
+        refusalKind: "merge_conflict_head_unchanged",
+        reason: expect.stringContaining("merge_conflict"),
+      }),
+    }));
+    // Escalation names the conflict, parks the card, and wakes the assignee.
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_escalated",
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#3145",
+        prState: "open",
+        reason: expect.stringContaining("merge_conflict"),
+      }),
+    }));
+    const [, commentBody] = mockAddComment.mock.calls[0]!;
+    expect(commentBody).toContain("Rebase the branch onto the base branch");
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+      status: "blocked",
+      unblockDescriptor: expect.objectContaining({
+        owner: "board",
+        action: expect.stringContaining("Rebase PR paperclipai/paperclip#3145"),
+      }),
+    }));
+    expect(wakeup).toHaveBeenCalledTimes(1);
+
     // The shared-carrier attribution branch was never entered.
     expect(mockResolveCarrierOwner).not.toHaveBeenCalled();
     expect(mockIssueInBlockerClosure).not.toHaveBeenCalled();
-    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "issue.done_close_landing_escalated",
-      details: expect.objectContaining({ pr: "paperclipai/paperclip#3145", prState: "open" }),
-    }));
-    // No attribution row was recorded for this card.
     const actions = mockLogActivity.mock.calls.map((call) => (call[1] as { action?: string })?.action);
     expect(actions).not.toContain("issue.done_close_landing_attributed");
-    // The existing escalate-and-park shape still applies.
-    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
-      status: "blocked",
-      unblockDescriptor: expect.objectContaining({ owner: "board" }),
-    }));
-    expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
   it("(d) exact-head delivery whose PR merged → confirmed; the attribution branch is never entered", async () => {
