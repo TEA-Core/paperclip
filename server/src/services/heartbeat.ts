@@ -176,6 +176,7 @@ import {
   scrubGitCredentialText,
   type GitRemoteAuthProvider,
 } from "./git-credentials.js";
+import { normalizeRepoUrl } from "./github-credential.js";
 // Re-exported because heartbeat's workspace surface exposed the scrubber before the
 // git-credentials module became its canonical home; existing importers keep working.
 export { scrubGitCredentialText };
@@ -2627,6 +2628,60 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
 }
 
 /**
+ * Host of a git remote URL, or null when the URL carries no recoverable host.
+ *
+ * `new URL()` drops any embedded userinfo, so a remote whose origin was written
+ * with credentials in it (`https://<token>@github.com/owner/repo`) still yields
+ * the bare host rather than a value that can never match anything.
+ */
+function extractGitRemoteHost(repoUrl: string): string | null {
+  const trimmed = repoUrl.trim();
+  if (!trimmed) return null;
+  const scpLike = /^[\w.-]+@([\w.-]+):/.exec(trimmed);
+  if (scpLike) return scpLike[1]!.toLowerCase();
+  try {
+    return new URL(trimmed).hostname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether two remote URLs name the same repository: same host and same
+ * `owner/repo`, regardless of scheme, `.git` suffix, trailing slash, casing, or
+ * embedded credentials.
+ *
+ * The exact string comparison this replaces read a cosmetic difference as a
+ * different repository. On 2026-09-23 a project whose recorded repoUrl was
+ * `https://github.com/<owner>/<repo>` met a checkout whose own origin carried
+ * the `.git` suffix, so the managed checkout diverted to a hashed sibling
+ * directory and cloned afresh — abandoning a 34-day-old checkout that held 134
+ * registered worktrees. Every persisted worktree then validated against a clone
+ * that did not contain it, and 198 runs failed with "path is not registered in
+ * `git worktree list`": a true statement about the wrong repository.
+ *
+ * The two errors are not symmetric. A false "same" adopts a checkout of the
+ * repository that was asked for. A false "different" strands every worktree
+ * already on disk, so the comparison must not turn spelling into identity.
+ */
+export function isSameManagedRepoUrl(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  if (normalizeRepoUrl(a) !== normalizeRepoUrl(b)) return false;
+  // `normalizeRepoUrl` reduces to `owner/repo` and drops the host, which would
+  // make two same-named repositories on different hosts compare equal. Keep the
+  // host in the comparison when both URLs carry one.
+  const hostA = extractGitRemoteHost(a);
+  const hostB = extractGitRemoteHost(b);
+  // Only treat a missing host as agreement when BOTH sides lack one, which is
+  // the local-path case where neither URL carries a host to compare. A hostless
+  // URL against a hosted one is not evidence of the same repository: the
+  // normalized path alone can collide, and answering "same" there would reuse a
+  // checkout of a different repository.
+  if (!hostA || !hostB) return !hostA && !hostB;
+  return hostA === hostB;
+}
+
+/**
  * In-flight managed-checkout materializations keyed by target cwd. Two issues on the same
  * project can wake within seconds of each other; without this, both runs raced the same
  * clone target — the loser saw "destination path already exists" and its failure cleanup
@@ -2653,8 +2708,25 @@ export async function ensureManagedProjectWorkspace(input: {
   if (input.repoUrl && await fs.stat(path.join(cwd, ".git")).catch(() => null)) {
     const origin = await execFile("git", ["-C", cwd, "remote", "get-url", "origin"], { timeout: 10_000 })
       .then((result) => result.stdout.trim()).catch(() => null);
-    if (origin && origin !== input.repoUrl) {
+    if (origin && !isSameManagedRepoUrl(origin, input.repoUrl)) {
       cwd = `${cwd}-${createHash("sha256").update(input.repoUrl).digest("hex").slice(0, 12)}`;
+      // Diverting abandons whatever is already checked out at defaultCwd,
+      // including its registered worktrees. It was silent before, which is how
+      // one divert stranded 15 issues for a day without naming itself.
+      logger.warn(
+        {
+          projectId: input.projectId,
+          // Basenames, not the absolute paths. The directory name is the whole
+          // diagnostic — `<repo>` against `<repo>-<hash>` is what names a
+          // divert — and the parent path adds nothing but the instance layout
+          // and the account the server runs under.
+          defaultCheckout: path.basename(defaultCwd),
+          divertedCheckout: path.basename(cwd),
+          originRepo: normalizeRepoUrl(origin),
+          requestedRepo: normalizeRepoUrl(input.repoUrl),
+        },
+        "Managed checkout diverted: the existing checkout's origin names a different repository",
+      );
     }
   }
   const inFlight = managedCheckoutMaterializations.get(cwd);
@@ -2673,7 +2745,7 @@ export async function ensureManagedProjectWorkspace(input: {
     // initial origin check and the atomic rename. Never adopt its other repo.
     const origin = await execFile("git", ["-C", cwd, "remote", "get-url", "origin"], { timeout: 10_000 })
       .then((value) => value.stdout.trim()).catch(() => null);
-    if (origin && origin !== input.repoUrl) {
+    if (origin && !isSameManagedRepoUrl(origin, input.repoUrl)) {
       if (cwd !== defaultCwd) throw new Error("Managed checkout origin does not match the requested repository");
       return ensureManagedProjectWorkspace(input);
     }

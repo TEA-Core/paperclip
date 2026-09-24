@@ -84,3 +84,39 @@ describe("inspectManagedGitWorktreeBranch worktree-list triage (SUP-17380)", () 
     expect(result.actualBranchName).toBe("feature-branch");
   });
 });
+
+describe("inspectManagedGitWorktreeBranch names the repository root it consulted", () => {
+  // The production incident: a live worktree, registered in the checkout that owns it, was
+  // validated against a SECOND clone of the same repository. `not_registered` is true of that
+  // clone and false of the repository, and the verdict alone cannot tell the two apart. The
+  // returned `repoRoot` is what distinguishes them, so it must name the root actually listed.
+  it("returns the wrong root verbatim when a live worktree is validated against a second clone", async () => {
+    const owner = await createGitRepo();
+    const parentDir = trackTempDir(await mkdtemp(path.join(os.tmpdir(), "pc-wt-owner-parent-")));
+    const worktree = path.join(parentDir, "live-worktree");
+    await runGit(owner, ["worktree", "add", "-b", "live-branch", worktree]);
+
+    // A second clone of the same repository — what a diverted managed checkout looks like.
+    const secondClone = trackTempDir(await mkdtemp(path.join(os.tmpdir(), "pc-wt-second-")));
+    await execFileAsync("git", ["clone", owner, secondClone]);
+
+    const againstOwner = await inspectManagedGitWorktreeBranch({
+      worktreePath: worktree,
+      expectedBranchName: "live-branch",
+      repoRoot: owner,
+    });
+    expect(againstOwner.valid).toBe(true);
+
+    const againstSecondClone = await inspectManagedGitWorktreeBranch({
+      worktreePath: worktree,
+      expectedBranchName: "live-branch",
+      repoRoot: secondClone,
+    });
+    expect(againstSecondClone.valid).toBe(false);
+    expect(againstSecondClone.reasonCode).toBe("not_registered");
+    // The same worktree is valid against one root and not_registered against the other, so the
+    // root is the only thing that separates a real defect from a misdirected lookup.
+    expect(againstSecondClone.repoRoot).toBe(secondClone);
+    expect(againstSecondClone.repoRoot).not.toBe(againstOwner.repoRoot);
+  });
+});

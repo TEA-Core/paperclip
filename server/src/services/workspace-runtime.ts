@@ -6207,12 +6207,21 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     });
     if (!validation.valid) {
       throw new WorkspaceRuntimeValidationFailure(
-        `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,
+        // `repoRoot` is the repository the registration was looked up in, and
+        // `baseCwd` is what it was derived from. Without them a `not_registered`
+        // verdict cannot be told apart from the same verdict read out of the
+        // wrong repository: the worktree path is persisted, but the repository
+        // it is compared against is re-derived on every run and can move. That
+        // ambiguity is what made one such move take a day to find.
+        `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}), `
+          + `as resolved against repository root "${repoRoot}".`,
         {
           workspaceValidation: {
             reason: "git_worktree_not_reusable",
             reasonCode: validation.reasonCode,
             worktreePath: reuseWorktreePath,
+            repoRoot,
+            baseCwd,
             executionWorkspaceId: input.workspace.id ?? null,
           },
         },
