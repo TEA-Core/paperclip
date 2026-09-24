@@ -49,6 +49,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { prepareGitExecutionEnvironmentWithHostFallback } from "./git-context-probe-fallback.js";
 import { agentService } from "./agents.js";
+import { isUniqueViolation } from "../db-errors.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -19031,6 +19032,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // SUP-17429: before claiming, detect the routine-execution open-slot
+    // collision that the lazy execution-lock stamp below would otherwise turn
+    // into a fatal unique violation on `issues_open_routine_execution_uq`. Two
+    // routine-execution issues sharing an origin
+    // (company, origin_kind, origin_id, origin_fingerprint) can only ever have
+    // one open execution at a time. If a sibling already holds that slot,
+    // claiming this run would stamp executionRunId on this issue and activate
+    // it in the partial index while the sibling's open execution is still
+    // there — a unique-constraint crash that, on the startup recovery path,
+    // takes the whole server down. Skip the claim instead: leave the run
+    // queued so the next sweep retries once the sibling's execution settles,
+    // and name both issues so an operator can see why.
+    if (issueId) {
+      const targetOrigin = await db
+        .select({
+          originKind: issues.originKind,
+          originId: issues.originId,
+          originFingerprint: issues.originFingerprint,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (
+        targetOrigin?.originKind === "routine_execution" &&
+        targetOrigin.originId
+      ) {
+        const openSibling = await db
+          .select({
+            id: issues.id,
+            title: issues.title,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, run.companyId),
+              eq(issues.originKind, "routine_execution"),
+              eq(issues.originId, targetOrigin.originId),
+              eq(issues.originFingerprint, targetOrigin.originFingerprint),
+              ne(issues.id, issueId),
+              isNotNull(issues.executionRunId),
+              isNull(issues.hiddenAt),
+              inArray(issues.status, [
+                "backlog",
+                "todo",
+                "in_progress",
+                "in_review",
+                "blocked",
+              ]),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (openSibling) {
+          logger.warn(
+            {
+              runId: run.id,
+              issueId,
+              siblingIssueId: openSibling.id,
+              siblingExecutionRunId: openSibling.executionRunId,
+              originId: targetOrigin.originId,
+              originFingerprint: targetOrigin.originFingerprint,
+            },
+            "claimQueuedRun: skipping routine-execution run; a sibling issue already holds the open execution slot for this origin (issues_open_routine_execution_uq)",
+          );
+          return null;
+        }
+      }
+    }
+
     const claimedAt = new Date();
     const hostBootId = await resolveHostBootId();
     const responsibleUserId = await resolveResponsibleUserIdForRun({
@@ -19441,33 +19512,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            claimed.scheduledRetryReason === "native_safe_replacement"
-              ? or(
-                  isNull(issues.checkoutRunId),
-                  eq(issues.checkoutRunId, claimed.id),
-                )
-              : undefined,
-            or(
-              isNull(issues.executionRunId),
-              eq(issues.executionRunId, claimed.id),
+      try {
+        await db
+          .update(issues)
+          .set({
+            executionRunId: claimed.id,
+            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, claimedIssueId),
+              eq(issues.companyId, claimed.companyId),
+              // Mention/context runs can touch an issue, but only the current assignee
+              // owns the issue execution lock shown as the active run.
+              eq(issues.assigneeAgentId, claimed.agentId),
+              claimed.scheduledRetryReason === "native_safe_replacement"
+                ? or(
+                    isNull(issues.checkoutRunId),
+                    eq(issues.checkoutRunId, claimed.id),
+                  )
+                : undefined,
+              or(
+                isNull(issues.executionRunId),
+                eq(issues.executionRunId, claimed.id),
+              ),
             ),
-          ),
-        );
+          );
+      } catch (error) {
+        // SUP-17429: if a sibling routine-execution execution activated its
+        // slot between the guard read above and this stamp, the write hits the
+        // `issues_open_routine_execution_uq` partial index. That collision is
+        // a known, recoverable state: leave the run claimed so it proceeds to
+        // execute and releases the lock on completion, and let periodic
+        // recovery / the orphan reaper reconcile the issue execution lock. Do
+        // NOT let this specific unique violation propagate — on the startup
+        // recovery path it would otherwise take the whole server down. Every
+        // other error rethrows so a genuine failure stays fatal.
+        if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+          logger.error(
+            {
+              runId: claimed.id,
+              issueId: claimedIssueId,
+              companyId: claimed.companyId,
+              err: error,
+            },
+            "claimQueuedRun: routine-execution open-slot collision on lazy execution-lock stamp; run proceeds without the issue lock",
+          );
+          return claimed;
+        }
+        throw error;
+      }
     }
 
     return claimed;
