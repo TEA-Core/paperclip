@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import {
+  companies,
   externalObjectMentions,
   externalObjects,
   issueExecutionDecisions,
@@ -15,6 +16,7 @@ import {
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { issueService } from "./issues.js";
 import {
+  armMergeOnApproval,
   ladderIsTerminallyApproved,
   narrowToDelivered,
   postPullRequestComment,
@@ -22,7 +24,9 @@ import {
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   type ApprovalCandidateAnchor,
+  type ArmingOutcome,
   type LinkedPullRequest,
+  type MergeArmingDecision,
 } from "./merge-arming.js";
 
 // SUP-13535. The paperclip/approved commit status is written exactly once, on
@@ -125,6 +129,15 @@ const USER_AGENT = "paperclip-approval-status-reconciler";
 // SUP-14747: bound on the PR-timeline fan-out for the pre-D-B anchor backfill.
 const MAX_BACKFILL_TIMELINE_PAGES = 5;
 const BACKFILL_TIMELINE_PER_PAGE = 100;
+// SUP-17274: the re-arm retry budget. The decision-time arming hook runs exactly
+// once per card, on the approval transition; when it misses (a transient GitHub
+// 5xx, or the publish refusal that short-circuits the hook before arming — the
+// SUP-11580 / PR #631 shape), the stamp can heal on a later tick while the merge
+// stays unqueued until the 1.5-4h done-close-landing backstop. The re-arm below
+// retries once per tick on the same live head, bounded to this many attempts so
+// a deterministic miss cannot loop forever; a head move (new SHA) resets the
+// counter, and a successful arm suppresses re-arms permanently.
+const MAX_REARM_ATTEMPTS_PER_HEAD = 3;
 
 export interface ApprovalStatusReconcilerTickOptions {
   /** Upper bound on candidates handled in one tick. Excess is reported as `capped`. */
@@ -200,6 +213,15 @@ export interface ApprovalStatusReconcilerTickSummary {
    * error log every ~15 min. A moved live head re-arms (counts again).
    */
   strandedNew: number;
+  /**
+   * SUP-17274: cards whose live head carries the success `paperclip/approved`
+   * stamp but whose card shows the decision-time arm never succeeded, and where
+   * a re-attempt of `armMergeOnApproval` was made this tick (attempt count,
+   * regardless of the arm outcome — the outcome kind is in `rearmDetails`).
+   */
+  rearmed: number;
+  /** Bounded "IDENTIFIER: detail" re-arm outcomes. */
+  rearmDetails: string[];
 }
 
 export interface CandidateRow {
@@ -244,9 +266,9 @@ export interface EvaluateStageIntegrityOptions {
 }
 
 type CandidateResult =
-  | { kind: "republished"; detail: string; backfilledDetail?: string }
-  | { kind: "skipped"; reason: string; detail: string; backfilledDetail?: string; voidWarning?: "posted" | "already-posted" }
-  | { kind: "failed"; detail: string; backfilledDetail?: string };
+  | { kind: "republished"; detail: string; backfilledDetail?: string; rearm?: string }
+  | { kind: "skipped"; reason: string; detail: string; backfilledDetail?: string; voidWarning?: "posted" | "already-posted"; rearm?: string }
+  | { kind: "failed"; detail: string; backfilledDetail?: string; rearm?: string };
 
 interface GitHubReadOutcome {
   ok: boolean;
@@ -2380,6 +2402,268 @@ async function surfaceGuardBArmingRefusal(
   }
 }
 
+/**
+ * SUP-17274 finding-2 (retry-cap-concurrency-safe): atomically reserve ONE
+ * per-head re-arm slot BEFORE the actuator is called. A single conditional
+ * JSONB update claims the slot: it matches the row only when the stored counter
+ * is for a DIFFERENT head (a force-push reset it to 1) or the counter for THIS
+ * head is still under MAX_REARM_ATTEMPTS_PER_HEAD. When the cap is already
+ * reached for this head the UPDATE matches nothing, so the caller never calls
+ * the actuator. Postgres row-locks the UPDATE, so two ticks racing the same
+ * head serialize: the first N claim 1..N and the (N+1)th re-evaluates the WHERE
+ * against the committed row, sees N, and stops — the documented max holds under
+ * concurrency, not just sequentially. The counter itself is written by this
+ * UPDATE (jsonb armReattempt); completion adds only the armOutcome.
+ *
+ * Returns true when the slot was reserved, false when the cap is reached.
+ */
+async function reserveRearmSlot(
+  db: Db,
+  row: CandidateRow,
+  headSha: string,
+): Promise<boolean> {
+  const attemptsExpr = sql`CASE
+    WHEN coalesce(${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'headSha', '') = ${headSha}
+      THEN coalesce(${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'attempts', '0')::int + 1
+    ELSE 1
+  END`;
+  const reserved = await db
+    .update(issues)
+    .set({
+      executionState: sql`(
+        jsonb_set(
+          coalesce(${issues.executionState}, '{}'::jsonb),
+          '{approvalStatus}',
+          coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
+          || jsonb_build_object(
+            'armReattempt',
+            jsonb_build_object(
+              'headSha', ${headSha}::text,
+              'attempts', ${attemptsExpr},
+              'at', ${new Date().toISOString()}::text
+            )
+          )
+        )
+      )`,
+    })
+    .where(
+      and(
+        eq(issues.id, row.id),
+        sql`(
+          ${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'headSha' IS DISTINCT FROM ${headSha}
+          OR coalesce(${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'attempts', '0')::int < ${MAX_REARM_ATTEMPTS_PER_HEAD}
+        )`,
+      ),
+    )
+    .returning({ id: issues.id });
+  return reserved.length > 0;
+}
+
+/**
+ * SUP-17274 finding-1 (stale-live-head-authorization-race): re-validate the
+ * live head at the arm boundary — immediately before the actuator — not just at
+ * candidate scan. The call site read the PR head a few operations earlier; a
+ * force-push that lands between that read and the enableAutoMerge call would
+ * queue a merge for a head that was never stamped (the paperclip/approved
+ * status is on the OLD commit, not the new one). Re-read the live PR head and
+ * require it is UNCHANGED and the PR still open. `requireStamped` additionally
+ * re-reads the head's combined status and requires paperclip/approved=success;
+ * it is false on the post-publish path, where the stamp was JUST written to
+ * headSha via the publish's expectedHeadSha CAS (a re-read need not see it yet).
+ * Any uncertainty — head moved, stamp gone, PR merged/closed, or a transient
+ * read failure — returns false (fail-closed, no slot consumed), so the tick
+ * re-evaluates on a fresh head next tick.
+ */
+async function verifyLiveHeadStillStamped(
+  db: Db,
+  row: CandidateRow,
+  headSha: string,
+  pr: LinkedPullRequest,
+  requireStamped: boolean,
+): Promise<boolean> {
+  const prRead = await ghReadJson(db, row.companyId, pr.owner, pr.repo, `/pulls/${pr.number}`);
+  if (!prRead.ok) return false;
+  const prBody = prRead.body as Record<string, unknown> | null;
+  if (prBody?.merged === true) return false;
+  if (typeof prBody?.state === "string" && prBody.state !== "open") return false;
+  const liveHead = ((prBody?.head as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
+  if (liveHead !== headSha) return false;
+  if (!requireStamped) return true;
+  const headStatus = await ghReadJson(
+    db,
+    row.companyId,
+    pr.owner,
+    pr.repo,
+    `/commits/${encodeURIComponent(headSha)}/status`,
+  );
+  if (!headStatus.ok) return false;
+  const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
+    ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
+    : [];
+  return statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success");
+}
+
+/**
+ * SUP-17274. The live head carries `paperclip/approved`=success, but the card's
+ * `approvalStatus` shows the decision-time arm never succeeded. Three shapes
+ * produce this:
+ *   1. the decision-time arm FAILED (`armOutcome` kind "failed" — e.g. a 5xx at
+ *      approval) and the stamp was later healed by this reconciler's re-publish;
+ *   2. the decision-time arm was never ATTEMPTED: the first publish was refused
+ *      with head_unresolvable, so no anchor/arm was persisted, and the stamp was
+ *      later healed by a SUP-14747 backfill + first publish;
+ *   3. no `armOutcome` is recorded at all (a card stamped by a reconciler tick
+ *      before arming existed, or a pre-arming card the routes never armed).
+ * In each shape the merge queue is still closed behind the required fail-closed
+ * check, so re-attempt the SAME actuator the decision door uses
+ * (armMergeOnApproval), persist the outcome, and post the same `[Merge-arming]`
+ * comment the decision door posts.
+ *
+ * Guards (all evaluated against LIVE state at call time, so a decision-time arm
+ * that lands between candidate scan and now is never clobbered):
+ *   - a recorded `armOutcome` kind "armed", or a terminal
+ *     `skipped:already-queued` outcome (the merge is already queued — a prior
+ *     arm SUCCEEDED operationally), suppresses;
+ *   - the company's `mergeArmingEnabled` gate (the same gate routes/issues.ts
+ *     checks before its decision-time arm attempt) suppresses;
+ *   - a per-head cap of MAX_REARM_ATTEMPTS_PER_HEAD, persisted in
+ *     `approvalStatus.armReattempt`, bounds retries: at most N attempts per head
+ *     SHA, reserved atomically (reserveRearmSlot) so the cap holds under
+ *     concurrent ticks. A moved live head starts a fresh counter.
+ *   - the live head is re-validated at the arm boundary
+ *     (verifyLiveHeadStillStamped) so a force-push that lands between the
+ *     candidate scan and the arm cannot queue a merge for an unstamped head.
+ *
+ * The armReattempt counter is written by reserveRearmSlot; the armOutcome is
+ * persisted via mergeApprovalStatus (an atomic jsonb merge into the
+ * approvalStatus subtree — never a full-row reconstruction, so a concurrent
+ * decision-time write to another subtree key survives). A `[Merge-arming]
+ * <message>` card comment is posted. All writes are fail-safe: a failed write is
+ * logged, never thrown (the tick must not fail because of a bookkeeping write).
+ *
+ * Returns a one-line "kind: message" detail when a re-attempt was made, or
+ * undefined when suppressed (armed/queued / arming disabled / head capped /
+ * live head no longer stamped).
+ */
+async function attemptRearmOnHealedStamp(
+  db: Db,
+  row: CandidateRow,
+  headSha: string,
+  certifiedPr: LinkedPullRequest | null,
+  opts: { requireStamped?: boolean } = {},
+): Promise<string | undefined> {
+  const liveRows = await db
+    .select({ executionState: issues.executionState })
+    .from(issues)
+    .where(eq(issues.id, row.id));
+  const liveState = (liveRows[0]?.executionState ?? row.executionState) as Record<string, unknown> | null;
+  const liveApprovalStatus = (liveState?.approvalStatus ?? null) as Record<string, unknown> | null;
+
+  const armOutcome = liveApprovalStatus?.armOutcome as
+    | { kind?: string; message?: string; at?: string }
+    | null
+    | undefined;
+  // SUP-17274 finding-3: `skipped:already-queued` means a prior arm already
+  // queued the merge (operational success) — treat it as terminal, like
+  // `armed`, or this path would re-arm and re-comment until the per-head cap.
+  if (armOutcome?.kind === "armed") {
+    return undefined;
+  }
+  if (
+    armOutcome?.kind === "skipped" &&
+    typeof armOutcome.message === "string" &&
+    armOutcome.message.startsWith("skipped:already-queued")
+  ) {
+    return undefined;
+  }
+
+  const companyRows = await db
+    .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
+    .from(companies)
+    .where(eq(companies.id, row.companyId));
+  if (companyRows[0]?.mergeArmingEnabled !== true) {
+    return undefined;
+  }
+
+  // Read-side cap pre-check (optimization; reserveRearmSlot below is the
+  // authority under concurrency). A counter already exhausted for THIS head is
+  // terminal — skip the live-head GitHub re-reads entirely.
+  const reattempt = liveApprovalStatus?.armReattempt as
+    | { headSha?: string; attempts?: number; at?: string }
+    | null
+    | undefined;
+  if (
+    reattempt &&
+    reattempt.headSha === headSha &&
+    (typeof reattempt.attempts === "number" ? reattempt.attempts : 0) >= MAX_REARM_ATTEMPTS_PER_HEAD
+  ) {
+    return undefined;
+  }
+
+  // SUP-17274 finding-1: re-validate the live head at the arm boundary. Fail
+  // closed when the head is no longer the stamped head; no slot is consumed.
+  if (!certifiedPr) {
+    return undefined;
+  }
+  if (!(await verifyLiveHeadStillStamped(db, row, headSha, certifiedPr, opts.requireStamped ?? true))) {
+    return undefined;
+  }
+
+  // SUP-17274 finding-2: atomically reserve the per-head slot; attempt only when
+  // the reservation succeeded (the cap holds under concurrent ticks).
+  if (!(await reserveRearmSlot(db, row, headSha))) {
+    return undefined;
+  }
+
+  const decision: MergeArmingDecision = {
+    stageId: "reconciler-rearm",
+    stageType: "approval",
+    outcome: "approved",
+    body: "Re-attempted by the approval-status reconciler: the live head carries the paperclip/approved success stamp, but the decision-time arm never succeeded.",
+  };
+
+  let outcome: ArmingOutcome;
+  try {
+    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr);
+  } catch (err) {
+    outcome = {
+      kind: "failed",
+      message: `failed:internal: re-arm actuator threw: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const at = new Date().toISOString();
+  // Persist ONLY armOutcome here: reserveRearmSlot already wrote the
+  // armReattempt counter. Re-writing it from an in-memory count would let a
+  // slower completion clobber a concurrent tick's newer count.
+  try {
+    await mergeApprovalStatus(
+      db,
+      row,
+      {
+        armOutcome: { kind: outcome.kind, message: outcome.message, at },
+      },
+      { source: "approval-status-reconciler.rearm" },
+    );
+  } catch (err) {
+    logger.warn(
+      { err, issueId: row.id, headSha },
+      "SUP-17274: re-arm outcome persist failed; the arm itself may still have succeeded",
+    );
+  }
+
+  try {
+    await issueService(db).addComment(row.id, `[Merge-arming] ${outcome.message}`, {}, { authorType: "system" });
+  } catch (err) {
+    logger.warn(
+      { err, issueId: row.id, headSha },
+      "SUP-17274: [Merge-arming] comment write failed; outcome still persisted",
+    );
+  }
+
+  return `${outcome.kind}: ${outcome.message}`;
+}
+
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
   const label = row.identifier ?? row.id;
 
@@ -2536,10 +2820,19 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
   if (statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success")) {
+    // SUP-17274: the stamp is on the live head, but the decision-time arm may
+    // have never succeeded (it failed, the first publish was refused before the
+    // arm and the stamp was later healed, or the card was stamped before arming
+    // existed). Re-attempt the arm now; the helper suppresses when the card
+    // already records an armed/queued armOutcome or the per-head cap is reached,
+    // and re-validates the live head + stamp at the arm boundary (the stamp was
+    // only confirmed at scan time, so a force-push can have since landed).
+    const rearm = await attemptRearmOnHealedStamp(db, row, headSha, target, { requireStamped: true });
     return {
       kind: "skipped",
       reason: "already-success",
       detail: `already-success: ${target.displayName} head ${headSha.slice(0, 7)} already carries ${PAPERCLIP_APPROVED_CONTEXT}=success`,
+      rearm,
     };
   }
 
@@ -2714,7 +3007,22 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
         },
       );
     }
-    return { kind: "republished", detail: `republished ${target.displayName}: ${outcome.message}`, backfilledDetail };
+    // SUP-17274: the stamp was just healed onto the live head. When the
+    // decision-time arm never succeeded (first publish refused, decision-time
+    // arm failed, or never ran), re-attempt it now — same actuator, same
+    // guards as the already-success path. The publish's certified PR is the
+    // authoritative arm subject (SUP-15394). requireStamped: false — the stamp
+    // was just written to headSha via the publish's expectedHeadSha CAS, so the
+    // arm-boundary guard re-checks only that the live head has not moved.
+    const rearm = await attemptRearmOnHealedStamp(db, row, headSha, outcome.certifiedPr ?? target, {
+      requireStamped: false,
+    });
+    return {
+      kind: "republished",
+      detail: `republished ${target.displayName}: ${outcome.message}`,
+      backfilledDetail,
+      rearm,
+    };
   }
   if (outcome.kind === "skipped") {
     const reason = outcome.message.startsWith("status:skipped:head_moved")
@@ -3197,6 +3505,8 @@ export async function runApprovalStatusReconcilerTick(
     stranded: 0,
     strandedDetails: [],
     strandedNew: 0,
+    rearmed: 0,
+    rearmDetails: [],
   };
 
   // SUP-16610 change 4: the `delivery-card-cancelled` class is per-PR, not per
@@ -3232,6 +3542,14 @@ export async function runApprovalStatusReconcilerTick(
         summary.backfilled += 1;
         if (summary.backfilledDetails.length < MAX_DETAIL_ENTRIES) {
           summary.backfilledDetails.push(`${label}: ${result.backfilledDetail}`);
+        }
+      }
+      // SUP-17274: a re-attempt of the decision-time arm was made on a healed
+      // stamp this tick (attempt count; the outcome kind is in the detail).
+      if (result.rearm !== undefined) {
+        summary.rearmed += 1;
+        if (summary.rearmDetails.length < MAX_DETAIL_ENTRIES) {
+          summary.rearmDetails.push(`${label}: ${result.rearm}`);
         }
       }
       if (result.kind !== "republished") {
@@ -3308,6 +3626,8 @@ export async function runApprovalStatusReconcilerTick(
       stranded: summary.stranded,
       strandedDetails: summary.strandedDetails,
       strandedNew: summary.strandedNew,
+      rearmed: summary.rearmed,
+      rearmDetails: summary.rearmDetails,
     },
     "approval status reconciler tick",
   );
