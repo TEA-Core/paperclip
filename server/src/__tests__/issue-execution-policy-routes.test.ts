@@ -139,11 +139,14 @@ function registerModuleMocks() {
     }),
     accessService: () => mockAccessService,
     agentService: () => ({
-      getById: vi.fn(async (agentId: string) => ({
-        id: agentId,
-        companyId: "company-1",
-        permissions: null,
-      })),
+      getById: vi.fn(async (agentId: string) => {
+        if (agentId === PHANTOM_AGENT_ID) return null;
+        return {
+          id: agentId,
+          companyId: agentId === OTHER_COMPANY_AGENT_ID ? "company-2" : "company-1",
+          permissions: null,
+        };
+      }),
       resolveByReference: vi.fn(async (_companyId: string, reference: string) => {
         const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reference);
         if (isUuid) {
@@ -305,6 +308,12 @@ const HANDOFF_AGENT_ROWS = [{
   contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
   permissions: null,
 }];
+
+// SUP-17410: ids that exercise the agent-reference guard. PHANTOM is the live
+// transcription slip from SUP-16903 (4893 vs the intended 4895); OTHER_COMPANY
+// exists but belongs to a different company.
+const PHANTOM_AGENT_ID = "e75502a7-952d-4893-93df-6a2b524a804b";
+const OTHER_COMPANY_AGENT_ID = "0f0f0f0f-1111-4222-8333-444444444444";
 
 function dbChainNode(rows: unknown[]): Record<string, unknown> {
   return {
@@ -3232,6 +3241,211 @@ describe("issue execution policy routes", () => {
       expect(nulled.status, JSON.stringify(nulled.body)).toBe(200);
       const nulledPatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
       expect(nulledPatch.executionPolicy ?? null).toBeNull();
+    });
+  });
+
+  // SUP-17410: a policy write must fail closed when it introduces a stage
+  // participant (or return assignee) whose agentId resolves to no agent in the
+  // issue's company. Such a reference arms on an undispatched principal, and a
+  // stage past index 0 has no re-arm path, so the card wedges unrecoverably.
+  describe("agent reference validation (SUP-17410)", () => {
+    const REVIEWER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+    const APPROVER_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+    const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
+    const ISSUE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    function issueFixture(overrides: Record<string, unknown> = {}) {
+      return {
+        id: ISSUE_ID,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-17410",
+        title: "Agent reference validation",
+        executionPolicy: null,
+        executionState: null,
+        ...overrides,
+      };
+    }
+
+    function programPatchTarget(issue: Record<string, unknown>) {
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => ({
+          ...issue,
+          ...patch,
+          updatedAt: new Date(),
+        }),
+      );
+    }
+
+    async function patchPolicy(executionPolicy: unknown) {
+      return request(await createApp())
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({ executionPolicy });
+    }
+
+    it("rejects a participant agentId that resolves to no agent, naming the stage and id", async () => {
+      programPatchTarget(issueFixture());
+
+      const res = await patchPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+          { type: "approval", participants: [{ type: "agent", agentId: PHANTOM_AGENT_ID }] },
+        ],
+      });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("stage 1");
+      expect(res.body.error).toContain(PHANTOM_AGENT_ID);
+      expect(res.body.details).toMatchObject({
+        stageIndex: 1,
+        stageType: "approval",
+        agentId: PHANTOM_AGENT_ID,
+        companyId: "company-1",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a returnAssigneeAgentId that resolves to no agent", async () => {
+      programPatchTarget(issueFixture());
+
+      const res = await patchPolicy({
+        returnAssigneeAgentId: PHANTOM_AGENT_ID,
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+        ],
+      });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("returnAssigneeAgentId");
+      expect(res.body.error).toContain(PHANTOM_AGENT_ID);
+      expect(res.body.details).toMatchObject({
+        field: "returnAssigneeAgentId",
+        agentId: PHANTOM_AGENT_ID,
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("accepts a policy where every participant and the return assignee resolve", async () => {
+      programPatchTarget(issueFixture());
+
+      const res = await patchPolicy({
+        returnAssigneeAgentId: ASSIGNEE_AGENT_ID,
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+          { type: "approval", participants: [{ type: "agent", agentId: APPROVER_AGENT_ID }] },
+        ],
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("rejects an agent id that exists but belongs to another company", async () => {
+      programPatchTarget(issueFixture());
+
+      const res = await patchPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: OTHER_COMPANY_AGENT_ID }] },
+        ],
+      });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain(OTHER_COMPANY_AGENT_ID);
+      expect(res.body.details).toMatchObject({
+        stageIndex: 0,
+        agentId: OTHER_COMPANY_AGENT_ID,
+        companyId: "company-1",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not re-validate stored stages when the PATCH omits the stages key", async () => {
+      // An issue already carrying a phantom participant (SUP-16903) must stay
+      // mutable: a partial write that preserves the stored ladder is not
+      // blocked, and the stored phantom is carried over untouched.
+      programPatchTarget(
+        issueFixture({
+          executionPolicy: {
+            mode: "normal",
+            stages: [
+              {
+                id: "c16093a9-9b47-40a9-8c2d-3e4bcd6c496e",
+                type: "review",
+                participants: [
+                  { id: "4a3f7748-7618-4f44-8d13-5877be64d311", type: "agent", agentId: PHANTOM_AGENT_ID },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({ executionPolicy: { mode: "normal" } });
+
+      expect(res.status).toBe(200);
+      const [, patch] = mockIssueService.update.mock.calls[0] as [string, Record<string, unknown>];
+      expect(patch.executionPolicy).toMatchObject({
+        stages: [
+          expect.objectContaining({
+            participants: [expect.objectContaining({ agentId: PHANTOM_AGENT_ID })],
+          }),
+        ],
+      });
+    });
+
+    it("does not re-validate an unchanged return assignee that is already stored", async () => {
+      programPatchTarget(
+        issueFixture({
+          executionPolicy: {
+            mode: "normal",
+            returnAssigneeAgentId: PHANTOM_AGENT_ID,
+            stages: [
+              {
+                id: "c16093a9-9b47-40a9-8c2d-3e4bcd6c496e",
+                type: "review",
+                participants: [
+                  { id: "4a3f7748-7618-4f44-8d13-5877be64d311", type: "agent", agentId: REVIEWER_AGENT_ID },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const res = await patchPolicy({
+        returnAssigneeAgentId: PHANTOM_AGENT_ID,
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+        ],
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("rejects a create whose participant agentId resolves to no agent", async () => {
+      const res = await request(await createApp())
+        .post("/api/companies/company-1/issues")
+        .send({
+          title: "Phantom participant on create",
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          executionPolicy: {
+            stages: [
+              { type: "review", participants: [{ type: "agent", agentId: PHANTOM_AGENT_ID }] },
+            ],
+          },
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain(PHANTOM_AGENT_ID);
+      expect(res.body.details).toMatchObject({ stageIndex: 0, agentId: PHANTOM_AGENT_ID });
+      expect(mockIssueService.create).not.toHaveBeenCalled();
     });
   });
 });
