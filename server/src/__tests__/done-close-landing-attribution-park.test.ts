@@ -326,6 +326,89 @@ describe("SUP-17092/B: deadlocked shared-carrier attribution parks instead of re
     expect(wakeup).not.toHaveBeenCalled();
   });
 
+  it("(a2) prior deadlocked attribution row whose park update FAILED → the next sweep re-parks the still-`done` card to `blocked` with a usable descriptor and does NOT duplicate the attribution row", async () => {
+    // Regression for deadlocked-attribution-row-skips-required-park. Phase 1 plays
+    // the sweep that logged the attribution row but whose park `svc.update` threw,
+    // so the card is left a false terminal `done`. Phase 2 is the retry: the
+    // attribution row now exists in the discovered rows and the update succeeds —
+    // the sweep MUST still park the card, not skip it because a row is present.
+    mockResolveCarrierOwner.mockResolvedValue({ ownerId: "cc", identifier: "SUP-15000" });
+    mockIssueInBlockerClosure.mockResolvedValue(true);
+    mockListNonTerminalRootCauseBlockers.mockResolvedValue([
+      { id: "rrrrrrrr-0000-4000-8000-000000000000", identifier: "SUP-15001", status: "in_progress" },
+    ]);
+    const linked455 = () =>
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 455, displayName: "paperclipai/paperclip#455", headRefName: "SUP-15098-branch" }),
+      ]);
+
+    // --- Phase 1: attribution row logged, park update throws, card stays `done`.
+    const wake1 = vi.fn().mockResolvedValue({ id: "wake" });
+    const phase1 = makeService(
+      { candidates: [sharedCarrierRefusalCandidateRow()], existingLandingRows: [], companyMergeArmingEnabled: true },
+      { wakeup: wake1 },
+    );
+    mockUpdate.mockClear();
+    mockUpdate.mockRejectedValue(new Error("db write failed: interrupted before the park applied"));
+    linked455();
+    mockResolver(async () => openSnapshot);
+    const r1 = await phase1.service.sweep();
+    expect(r1.escalated).toBe(0);
+    expect(r1.reenqueued).toBe(0);
+    // The attribution row was logged (deadlocked=true) BEFORE the park was applied…
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_attributed",
+      details: expect.objectContaining({ pr: "paperclipai/paperclip#455", deadlocked: true }),
+    }));
+    // …and the park update was attempted (and threw); the per-candidate catch let
+    // the sweep survive, so the card is still `done` at the end of this sweep.
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    // The post-park comment is NOT written (the update threw first).
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(wake1).not.toHaveBeenCalled();
+
+    // --- Phase 2 (retry): the logged row is now discovered; the update succeeds.
+    const priorAttributionRow = {
+      action: "issue.done_close_landing_attributed",
+      entityId: ISSUE,
+      details: { pr: "paperclipai/paperclip#455", deadlocked: true, carrierOwnerId: "cc" },
+      createdAt: new Date(IN_WINDOW),
+    };
+    mockUpdate.mockClear();
+    mockUpdate.mockResolvedValue({ id: "issue-row" });
+    mockLogActivity.mockClear();
+    mockAddComment.mockClear();
+    const wake2 = vi.fn().mockResolvedValue({ id: "wake" });
+    const phase2 = makeService(
+      { candidates: [sharedCarrierRefusalCandidateRow()], existingLandingRows: [priorAttributionRow], companyMergeArmingEnabled: true },
+      { wakeup: wake2 },
+    );
+    linked455();
+    const r2 = await phase2.service.sweep();
+
+    // AC#2/#5: the card is re-parked `blocked` even though its attribution row
+    // already existed — the row bounds re-LOGGING only, never the park itself.
+    expect(r2.escalated).toBe(0);
+    expect(r2.reenqueued).toBe(0);
+    expect(r2.confirmed).toBe(0);
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const [, parkPatch] = mockUpdate.mock.calls[0]!;
+    expect(parkPatch.status).toBe("blocked");
+    expect(parkPatch.unblockDescriptor).toMatchObject({ owner: "board" });
+    // The recovery/heal lane will NOT re-dispatch this re-parked card.
+    expect(hasUsableUnblockDescriptor(parkPatch.unblockDescriptor)).toBe(true);
+    // No duplicate attribution row: the prior deadlocked row already recorded the
+    // attribution, so this retry must not log a second one.
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    // The park comment is still written on the retry (the park is a live repair).
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    const [, retryComment] = mockAddComment.mock.calls[0]!;
+    expect(retryComment).toContain("SUP-15000");
+    expect(retryComment).not.toContain("left done");
+    expect(wake2).not.toHaveBeenCalled();
+  });
+
   it("(b) shared-carrier refusal + not deadlocked → still `done` + attribution row, no status change (preserved SUP-15381 path)", async () => {
     mockResolveCarrierOwner.mockResolvedValue({ ownerId: "cc", identifier: "SUP-15000" });
     mockIssueInBlockerClosure.mockResolvedValue(false);

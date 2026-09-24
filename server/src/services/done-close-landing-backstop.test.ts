@@ -2003,12 +2003,16 @@ describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
 
     const result = await service.sweep();
 
-    // Already attributed → no-op: no second audit row, no re-open/park.
+    // Already attributed → no second audit row, no re-open/park. SUP-17092/B
+    // round-1: the sweep still re-derives the LIVE deadlocked state (resolve the
+    // carrier owner + check the blocker closure) so a deadlocked card whose park
+    // update failed gets repaired; but because this card is not deadlocked (the
+    // closure check defaults to false) and its attribution already exists, nothing
+    // is re-logged, re-commented, or re-parked.
     expect(result.escalated).toBe(0);
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
     expect(mockUpdate).not.toHaveBeenCalled();
-    expect(mockResolveCarrierOwner).not.toHaveBeenCalled();
   });
 });
 
