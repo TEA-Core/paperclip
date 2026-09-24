@@ -23,6 +23,19 @@ vi.mock("../sentry.js", async () => {
 });
 
 import { reconcileAbandonedExecutionControl } from "./execution-control-reconciliation.js";
+import { waitForPendingRunFailureReports } from "./run-failure-report.js";
+
+/**
+ * Settle the reports the sweep started but did not await.
+ *
+ * `reconcileAbandonedExecutionControl` reports with `void reportRunFailure(...)`
+ * by design — the module's own contract is "do not await it, a Sentry read must
+ * not delay the caller's required lifecycle work" — and that report reads the
+ * database before it calls Sentry. So the sweep returning says nothing about
+ * whether the capture has been recorded. Drain the module's own pending set
+ * instead of guessing.
+ */
+const settleRunFailureReports = () => waitForPendingRunFailureReports();
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -94,6 +107,7 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     // Scope to this test's run. `mockCaptureRunFailure` is shared across the
     // file, so a positional slice alone also picks up a capture emitted by a
     // sibling test whose async work settled after captureCallsBefore was read.
+    await settleRunFailureReports();
     const newCaptures = capturesForRun(captureCallsBefore, runId);
     expect(newCaptures).toHaveLength(1);
     expect(newCaptures[0]?.[0]).toMatchObject({
@@ -106,6 +120,13 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
   it("reports zero events for a repeated sweep over the same already-failed run", async () => {
     const { runId } = await seedAbandonedRunFixture();
     await reconcileAbandonedExecutionControl(db);
+    // Settle the FIRST sweep's report before taking the baseline below. This is
+    // what made the assertion flaky, and scoping by runId could not fix it: the
+    // late capture is this run's OWN first-sweep report, so it matches the runId
+    // filter. On a loaded shard its database read finished after
+    // `captureCallsBefore` was read, and it was then counted as a second capture
+    // that never happened.
+    await settleRunFailureReports();
     // The first sweep already cleared executionControlDeadlineAt and moved the
     // run to "failed". Restore the deadline to simulate a second sweep still
     // observing the same run as a candidate.
@@ -120,9 +141,11 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     // The run is already terminal ("failed"), so the early terminal-status
     // guard applies and no second "failed" write happens.
     expect(result.surfaced).toBe(1);
-    // Scoped by runId for the same reason as above: PR #748's merge_group run
-    // saw a length of 1 here from a leaked sibling capture. A genuine second
-    // capture for THIS run still fails the assertion.
+    // Give a report the second sweep might have fired the same chance to land
+    // that the first one got. Asserting absence without this would pass merely
+    // because nothing had settled yet.
+    await settleRunFailureReports();
+    // Scoped by runId so a sibling test's capture cannot satisfy or break this.
     expect(capturesForRun(captureCallsBefore, runId)).toHaveLength(0);
   });
 });
