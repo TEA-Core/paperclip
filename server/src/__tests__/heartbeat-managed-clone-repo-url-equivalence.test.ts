@@ -120,6 +120,22 @@ describe("isSameManagedRepoUrl", () => {
     expect(isSameManagedRepoUrl(variant, base)).toBe(false);
   });
 
+  it("treats two hostless local paths that name the same checkout as the same repository", () => {
+    // The local-path case: neither side carries a host, so the path is all
+    // there is to compare, and a `.git` suffix must still not separate them.
+    expect(isSameManagedRepoUrl("/srv/repos/thing", "/srv/repos/thing.git")).toBe(true);
+    expect(isSameManagedRepoUrl("/srv/repos/thing", "/srv/repos/other")).toBe(false);
+  });
+
+  it("does not treat a hostless URL as matching a hosted one", () => {
+    // `normalizeRepoUrl` reduces a hosted URL to `owner/repo`, which a hostless
+    // value can equal by coincidence. Answering "same" there would hand back a
+    // checkout of a different repository, so a missing host on one side only is
+    // not agreement.
+    expect(isSameManagedRepoUrl("TEA-Core/Trading-Signal-Platform", base)).toBe(false);
+    expect(isSameManagedRepoUrl(base, "TEA-Core/Trading-Signal-Platform")).toBe(false);
+  });
+
   it("never claims a match when either side is missing", () => {
     expect(isSameManagedRepoUrl(null, base)).toBe(false);
     expect(isSameManagedRepoUrl(base, null)).toBe(false);

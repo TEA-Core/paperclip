@@ -2672,7 +2672,12 @@ export function isSameManagedRepoUrl(a: string | null | undefined, b: string | n
   // host in the comparison when both URLs carry one.
   const hostA = extractGitRemoteHost(a);
   const hostB = extractGitRemoteHost(b);
-  if (!hostA || !hostB) return true;
+  // Only treat a missing host as agreement when BOTH sides lack one, which is
+  // the local-path case where neither URL carries a host to compare. A hostless
+  // URL against a hosted one is not evidence of the same repository: the
+  // normalized path alone can collide, and answering "same" there would reuse a
+  // checkout of a different repository.
+  if (!hostA || !hostB) return !hostA && !hostB;
   return hostA === hostB;
 }
 
@@ -2711,8 +2716,12 @@ export async function ensureManagedProjectWorkspace(input: {
       logger.warn(
         {
           projectId: input.projectId,
-          defaultCwd,
-          divertedCwd: cwd,
+          // Basenames, not the absolute paths. The directory name is the whole
+          // diagnostic — `<repo>` against `<repo>-<hash>` is what names a
+          // divert — and the parent path adds nothing but the instance layout
+          // and the account the server runs under.
+          defaultCheckout: path.basename(defaultCwd),
+          divertedCheckout: path.basename(cwd),
           originRepo: normalizeRepoUrl(origin),
           requestedRepo: normalizeRepoUrl(input.repoUrl),
         },
