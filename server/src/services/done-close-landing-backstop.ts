@@ -819,17 +819,23 @@ export function createDoneCloseLandingBackstopService(
       // SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by
       // the prefix predicate can NEVER land through its own card — the head ref
       // belongs to the parent's shared branch and can never carry this card's
-      // identifier prefix (SUP-15098 / SUP-15126 / SUP-15203). Re-opening it into
-      // a board park that its own parent blocks on is a semantic deadlock with no
-      // reportable surface. Instead, attribute the landing obligation to the card
-      // that owns the carrier branch and leave this card done: no re-enqueue, no
-      // escalation, no status change. When the child sits inside that owner's own
-      // blocker closure (the observed deadlock) the report names it as such.
+      // identifier prefix (SUP-15098 / SUP-15126 / SUP-15203).
+      //
+      // Split on `deadlocked` (SUP-17092/B): when the child sits inside the carrier
+      // owner's OWN blocker closure, the attribution is provably a deadlock — no
+      // agent has a live path to land it, and resting the card `done` is a false
+      // terminal (it removes the board's only button and, pre-SUP-17098, discharged
+      // the card as a resolved dependency, waking dependents on a delivery that
+      // provably never landed). The deadlocked case therefore PARKS the card
+      // `blocked` with a first-class unblock descriptor. When the carrier owner
+      // still has a live actionable path (`deadlocked === false`), SUP-15381's
+      // rationale stands — attribute and leave done; SUP-17098's predicate keys on
+      // the attribution row below to withhold the dependent wake in that case.
       if (isSharedCarrierRefusal(refusalReason)) {
         if (alreadyAttributed.has(prKey)) {
-          // Already attributed this card+PR on a prior sweep. Leave it done and do
-          // NOTHING — do not fall through to the re-enqueue/escalate path, which
-          // is exactly the re-open-into-board-park behavior this fix removes.
+          // Already attributed this card+PR on a prior sweep. Do NOTHING — do not
+          // re-park, re-comment, or fall through to the re-enqueue/escalate path.
+          // Idempotent whether the prior sweep parked it or left it done.
           continue;
         }
         const carrier = await resolveCarrierOwner(db, issue.companyId, issue.id);
@@ -844,6 +850,7 @@ export function createDoneCloseLandingBackstopService(
             ? await listNonTerminalRootCauseBlockers(db, issue.companyId, carrier.ownerId)
             : [];
           const carrierName = carrier.identifier ?? carrier.ownerId;
+          const rootCauseNames = rootCauses.map((r) => r.identifier ?? r.id);
           await logActivity(db, {
             companyId: issue.companyId,
             actorType: "system",
@@ -865,21 +872,41 @@ export function createDoneCloseLandingBackstopService(
               carrierOwnerId: carrier.ownerId,
               carrierIdentifier: carrier.identifier,
               deadlocked,
-              rootCauseBlockers: rootCauses.map((r) => r.identifier ?? r.id),
+              rootCauseBlockers: rootCauseNames,
             },
           });
-          const deadlockLine = deadlocked
-            ? " This card sits inside the blocker closure of that owning card, so no agent has a concrete action here — the deadlock has been reported for board escalation."
-            : "";
-          const rootCauseList =
-            rootCauses.length > 0
-              ? ` Root-cause non-terminal blockers on ${carrierName}: ${rootCauses
-                  .map((r) => r.identifier ?? r.id)
-                  .join(", ")}.`
-              : "";
+          if (deadlocked) {
+            // SUP-17092/B: provable deadlock — park `blocked` with a first-class
+            // unblock descriptor naming the carrier owner and its root-cause
+            // non-terminal blockers, instead of leaving the card a false `done`.
+            const rootCauseSuffix =
+              rootCauseNames.length > 0
+                ? ` Root-cause non-terminal blockers: ${rootCauseNames.join(", ")}.`
+                : "";
+            await deps.svc.update(issue.id, {
+              status: "blocked",
+              unblockDescriptor: {
+                owner: "board",
+                action:
+                  `Park resolved by the board: land the shared-carrier branch ${prKey} owned by ${carrierName} ` +
+                  `(this card's delivery was refused at the ADR-091 D1 prefix predicate and sits inside ${carrierName}'s own blocker closure, so it is parked, not done). ` +
+                  `Unblock by resolving ${carrierName} so its shared head can carry ${issue.identifier ?? "this card"}'s identifier prefix and merge; this card is not a live dependency until it lands.${rootCauseSuffix}`,
+              },
+            });
+            await deps.svc.addComment(
+              issue.id,
+              `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is a shared-carrier deliverable refused at the ADR-091 D1 prefix predicate — its head belongs to the shared branch owned by ${carrierName}, so this card cannot land on its own. This card sits inside ${carrierName}'s own blocker closure, so the attribution is a provable deadlock: it is parked (status blocked) with a first-class unblock descriptor rather than left terminal, because a terminal done would remove the board's only button and, pre-SUP-17098, discharge it as a resolved dependency. A re-open/park IS recorded here: the attribution row plus this block.${rootCauseSuffix}`,
+              {},
+              { authorType: "system" },
+            );
+            continue;
+          }
+          // deadlocked === false: SUP-15381's disposition stands — attribute and
+          // leave done (no status change). SUP-17098's predicate keys on the
+          // attribution row above to stop the phantom dependency discharge.
           await deps.svc.addComment(
             issue.id,
-            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is a shared-carrier deliverable refused at the ADR-091 D1 prefix predicate — its head belongs to the shared branch owned by ${carrierName}, so this card cannot land on its own. The landing obligation is attributed to ${carrierName} and this card is left done. No re-open or park is recorded here.${deadlockLine}${rootCauseList}`,
+            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is a shared-carrier deliverable refused at the ADR-091 D1 prefix predicate — its head belongs to the shared branch owned by ${carrierName}, so this card cannot land on its own. The landing obligation is attributed to ${carrierName} and this card is left done. No re-open or park is recorded here.`,
             {},
             { authorType: "system" },
           );
