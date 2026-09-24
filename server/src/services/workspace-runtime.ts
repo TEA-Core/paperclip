@@ -951,7 +951,7 @@ async function executeProcess(input: {
   };
 }
 
-async function runGit(
+export async function runGit(
   args: string[],
   cwd: string,
   // `raw` returns stdout untrimmed. Required for `-z` output: a path name may
@@ -966,6 +966,25 @@ async function runGit(
   });
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+  }
+  // `executeProcess` caps stdout at DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES and keeps the
+  // LAST bytes, prefixed with `[output truncated …]`. For a machine-read result that is a
+  // silent catastrophe: the leading lines vanish and the diagnostic prefix fuses onto the
+  // first surviving line, so a truncated listing parses as a plausible-but-partial answer.
+  // A caller that cannot get the whole output must not act on part of it, so a truncated
+  // result is refused here — at the single point every `runGit` caller funnels through —
+  // instead of returning a partial stdout as if it were complete.
+  // `executeProcess` caps stdout at DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES and keeps the
+  // LAST bytes, prefixed with `[output truncated …]`. For a machine-read result that is a
+  // silent catastrophe: the leading lines vanish and the diagnostic prefix fuses onto the
+  // first surviving line, so a truncated listing parses as a plausible-but-partial answer.
+  // A caller that cannot get the whole output must not act on part of it, so a truncated
+  // result is refused here — at the single point every `runGit` caller funnels through —
+  // instead of returning a partial stdout as if it were complete.
+  if (proc.stdoutTruncated) {
+    throw new Error(
+      `git ${args.join(" ")} output was truncated to the last ${DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES} bytes of ${proc.stdoutBytes}; refusing to return a partial result`,
+    );
   }
   return opts?.raw ? proc.stdout : proc.stdout.trim();
 }
