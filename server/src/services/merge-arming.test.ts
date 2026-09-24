@@ -28,7 +28,12 @@ import {
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
+  fetchBranchHeadSha,
+  fetchGitHubNodeId,
+  fetchHeadApprovedStatusViaTokenCandidates,
+  fetchOpenPullRequests,
   isTransientHttpStatus,
+  isTransientReadStatus,
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
   publishApprovalStatus,
@@ -39,6 +44,7 @@ import {
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   writeCommitStatusWithRetry,
+  withTransientReadRetry,
   type NoPrBranchAnchor,
 } from "./merge-arming.js";
 // SUP-16140 (relocation of the SUP-16081 fix #2 route-level guard regression from
@@ -272,6 +278,200 @@ describe("isTransientHttpStatus", () => {
     expect(isTransientHttpStatus(301)).toBe(false);
     // The 5xx band has a hard upper bound.
     expect(isTransientHttpStatus(600)).toBe(false);
+  });
+});
+
+// SUP-17273: the READ-path transient class is narrower than the write-path one —
+// it retries a network error (0) and 5xx ONLY, and treats every 4xx (incl. 429)
+// as deterministic. AC2: deterministic statuses are NOT retried.
+describe("isTransientReadStatus", () => {
+  it("treats only no-response (0) and the gateway allowlist (500/502/503/504) as transient", () => {
+    expect(isTransientReadStatus(0)).toBe(true);
+    expect(isTransientReadStatus(500)).toBe(true);
+    expect(isTransientReadStatus(502)).toBe(true);
+    expect(isTransientReadStatus(503)).toBe(true);
+    expect(isTransientReadStatus(504)).toBe(true);
+  });
+
+  it("treats every 4xx (incl. 401/403/404/429), 2xx/3xx, and non-allowlisted 5xx as deterministic", () => {
+    expect(isTransientReadStatus(401)).toBe(false);
+    expect(isTransientReadStatus(403)).toBe(false);
+    expect(isTransientReadStatus(404)).toBe(false);
+    expect(isTransientReadStatus(429)).toBe(false);
+    expect(isTransientReadStatus(408)).toBe(false);
+    expect(isTransientReadStatus(400)).toBe(false);
+    expect(isTransientReadStatus(200)).toBe(false);
+    expect(isTransientReadStatus(301)).toBe(false);
+    // Non-allowlisted 5xx are deterministic: a short retry cannot clear them.
+    expect(isTransientReadStatus(501)).toBe(false);
+    expect(isTransientReadStatus(505)).toBe(false);
+    expect(isTransientReadStatus(599)).toBe(false);
+    expect(isTransientReadStatus(600)).toBe(false);
+  });
+});
+
+// SUP-17273: the bounded transient retry wrapper that the head/PR resolution
+// reads are wrapped in. Pure (no I/O) — `fetchOnce` and `delay` are injected.
+describe("withTransientReadRetry (SUP-17273)", () => {
+  it("AC1: transient-then-success — retries the transient read and returns the success", async () => {
+    let calls = 0;
+    const fetchOnce = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) return { ok: false, status: 500, message: "server exploded" };
+      return { ok: true, status: 200, message: null };
+    });
+
+    const result = await withTransientReadRetry(fetchOnce, { delay: async () => {} });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("AC1: a network error (status 0) is also retried to success", async () => {
+    let calls = 0;
+    const fetchOnce = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) return { ok: false, status: 0, message: "network_error" };
+      return { ok: true, status: 200, message: null };
+    });
+
+    const result = await withTransientReadRetry(fetchOnce, { delay: async () => {} });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("AC3: transient-exhausted — retries to the attempt bound, returns the last transient result", async () => {
+    let calls = 0;
+    const fetchOnce = vi.fn(async () => {
+      calls += 1;
+      return { ok: false, status: 503, message: "unavailable" };
+    });
+
+    const result = await withTransientReadRetry(fetchOnce, { attempts: 3, delay: async () => {} });
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(503);
+    expect(calls).toBe(3);
+  });
+
+  it("AC2: deterministic-4xx-not-retried — a 404 returns after the first attempt", async () => {
+    let calls = 0;
+    const fetchOnce = vi.fn(async () => {
+      calls += 1;
+      return { ok: false, status: 404, message: "Not Found" };
+    });
+
+    const result = await withTransientReadRetry(fetchOnce, { attempts: 3, delay: async () => {} });
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(404);
+    // Operator signal: exactly one attempt, never retried.
+    expect(calls).toBe(1);
+  });
+});
+
+// SUP-17273 findings approval-node-id-read-unretried /
+// approval-live-pr-discovery-unretried / approval-branch-head-read-unretried: the
+// remaining approval-time head/PR resolution reads are each wrapped in
+// withTransientReadRetry. These Postgres-free leaf tests prove the wrapper is
+// actually WIRED to each read — a transient 5xx is retried on the SAME token
+// (2 attempts for transient-then-success), while a deterministic 4xx returns
+// after exactly one attempt. (The wrapper's own AC logic is covered above; this
+// covers the leaf<->wrapper wiring the findings called out.)
+describe("approval-time read retry wiring (SUP-17273)", () => {
+  beforeEach(() => {
+    mockGhFetch.mockReset();
+  });
+
+  it("fetchGitHubNodeId: retries a transient 503 to success on the same token", async () => {
+    mockGhFetch
+      .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ node_id: "PR_node_id_abc" }),
+      } as unknown as Response);
+
+    const result = await fetchGitHubNodeId("tok", "owner", "repo", 42);
+
+    expect(result.ok).toBe(true);
+    expect(result.nodeId).toBe("PR_node_id_abc");
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fetchGitHubNodeId: does not retry a deterministic 404", async () => {
+    mockGhFetch.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ message: "Not Found" }),
+    } as unknown as Response);
+
+    const result = await fetchGitHubNodeId("tok", "owner", "repo", 42);
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(404);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetchOpenPullRequests: retries a transient 502 to success on the same token", async () => {
+    mockGhFetch
+      .mockResolvedValueOnce({ ok: false, status: 502, json: async () => ({}) } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [{ number: 42, draft: false, head: { ref: "b" }, title: "t", body: "b" }],
+      } as unknown as Response);
+
+    const result = await fetchOpenPullRequests("tok", "owner", "repo");
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.items).toHaveLength(1);
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fetchOpenPullRequests: does not retry a deterministic 404", async () => {
+    mockGhFetch.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ message: "Not Found" }),
+    } as unknown as Response);
+
+    const result = await fetchOpenPullRequests("tok", "owner", "repo");
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(404);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetchBranchHeadSha: retries a transient 503 to success on the same token", async () => {
+    mockGhFetch
+      .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ object: { sha: "abc123def" } }),
+      } as unknown as Response);
+
+    const result = await fetchBranchHeadSha("tok", "owner", "repo", "SUP-42/branch");
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.headSha).toBe("abc123def");
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fetchBranchHeadSha: does not retry a deterministic 404", async () => {
+    mockGhFetch.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ message: "Not Found" }),
+    } as unknown as Response);
+
+    const result = await fetchBranchHeadSha("tok", "owner", "repo", "SUP-42/branch");
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(404);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1067,6 +1267,109 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(outcome.kind).toBe("armed");
       expect(outcome.headSha).toBe(APPROVED_HEAD);
       expect(postStatusShas()).toEqual([APPROVED_HEAD, APPROVED_HEAD]);
+    });
+  });
+
+  // SUP-17273: the READ path (head / PR resolution) retries transient transport
+  // failures (5xx / network) with a bounded backoff, while deterministic 4xx stay
+  // single-attempt. Drives the real fetchHeadApprovedStatusViaTokenCandidates so
+  // the retry is proven to be wired into the actual leaf read, not just the
+  // pure wrapper.
+  describe("SUP-17273 read-path transient retry", () => {
+    const HEAD_STATUSES_URL = (sha: string) =>
+      `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${sha}?per_page=100`;
+
+    it("AC1: a transient 500 on the head-status read is retried and succeeds", async () => {
+      let statusesReads = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (String(url) === HEAD_STATUSES_URL(APPROVED_HEAD)) {
+          statusesReads += 1;
+          if (statusesReads === 1) {
+            return {
+              ok: false,
+              status: 500,
+              json: async () => ({ message: "server exploded" }),
+            } as unknown as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => [
+              { context: "paperclip/approved", state: "success" },
+            ],
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await fetchHeadApprovedStatusViaTokenCandidates(
+        db,
+        companyId,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+      );
+
+      expect(result).toEqual({ ok: true, approved: true });
+      expect(statusesReads).toBe(2);
+    });
+
+    it("AC3: transient-exhausted yields the terminal outcome with its prefix intact", async () => {
+      let statusesReads = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (String(url) === HEAD_STATUSES_URL(APPROVED_HEAD)) {
+          statusesReads += 1;
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({ message: "server exploded" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await fetchHeadApprovedStatusViaTokenCandidates(
+        db,
+        companyId,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+      );
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        // Prefix stays byte-compatible with the sweep classifier; detail is suffix-only.
+        expect(result.reason).toMatch(/^pr_error: HTTP 500 /);
+      }
+      // Default bounded budget: 3 attempts total.
+      expect(statusesReads).toBe(3);
+    });
+
+    it("AC2: a deterministic 404 on the head-status read is NOT retried", async () => {
+      let statusesReads = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (String(url) === HEAD_STATUSES_URL(APPROVED_HEAD)) {
+          statusesReads += 1;
+          return {
+            ok: false,
+            status: 404,
+            json: async () => ({ message: "Not Found" }),
+          } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+      });
+
+      const result = await fetchHeadApprovedStatusViaTokenCandidates(
+        db,
+        companyId,
+        OWNER,
+        REPO,
+        APPROVED_HEAD,
+      );
+
+      expect(result).toEqual({ ok: false, reason: "pr_not_found: HTTP 404" });
+      // Deterministic refusal: exactly one attempt, byte-identical to today.
+      expect(statusesReads).toBe(1);
     });
   });
 
