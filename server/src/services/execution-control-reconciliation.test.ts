@@ -23,6 +23,7 @@ vi.mock("../sentry.js", async () => {
 });
 
 import { reconcileAbandonedExecutionControl } from "./execution-control-reconciliation.js";
+import { waitForPendingRunFailureReports } from "./run-failure-report.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -86,6 +87,12 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
 
     const result = await reconcileAbandonedExecutionControl(db);
 
+    // Sweep's reportRunFailure is fire-and-forget (void, unawaited in
+    // reconcileAbandonedExecutionControl), so drain it before sampling captures:
+    // otherwise the capture may land after captureCallsBefore is read and the
+    // length-1 assertion below flakes to 0 under shard scheduling.
+    await waitForPendingRunFailureReports();
+
     expect(result.surfaced).toBe(1);
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(run?.status).toBe("failed");
@@ -106,6 +113,11 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
   it("reports zero events for a repeated sweep over the same already-failed run", async () => {
     const { runId } = await seedAbandonedRunFixture();
     await reconcileAbandonedExecutionControl(db);
+    // Drain sweep 1's fire-and-forget reportRunFailure BEFORE sampling
+    // captureCallsBefore. Left in flight, sweep 1's capture can settle after the
+    // sample point, land inside .slice(since) carrying this run's runId, and
+    // make the length-0 assertion below flake to 1 (the SUP-17415 mechanism).
+    await waitForPendingRunFailureReports();
     // The first sweep already cleared executionControlDeadlineAt and moved the
     // run to "failed". Restore the deadline to simulate a second sweep still
     // observing the same run as a candidate.
@@ -116,6 +128,9 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
 
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
     const result = await reconcileAbandonedExecutionControl(db);
+    // Sweep 2 emits no capture for this already-terminal run, but drain any
+    // in-flight report before asserting so the window is settled.
+    await waitForPendingRunFailureReports();
 
     // The run is already terminal ("failed"), so the early terminal-status
     // guard applies and no second "failed" write happens.
