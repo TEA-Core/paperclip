@@ -3309,6 +3309,7 @@ export type ManagedGitWorktreeBranchInspection = {
     | "missing_worktree"
     | "not_a_git_checkout"
     | "not_registered"
+    | "worktree_list_failed"
     | "wrong_repository_root"
     | "branch_mismatch"
     | null;
@@ -3514,8 +3515,23 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
-  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
-  if (!listedWorktrees?.has(worktreePath)) {
+  let listedWorktrees: Set<string>;
+  try {
+    listedWorktrees = await listLinkedGitWorktreePaths(repoRoot);
+  } catch (error) {
+    // A failed `git worktree list` (e.g. a `safe.directory` / dubious-ownership
+    // refusal, or repoRoot not being a usable git checkout) is a different defect
+    // from a path that is simply absent from a successful listing. Reporting it as
+    // `not_registered` asserts a fact we never established and misleads triage.
+    return {
+      ...base,
+      valid: false,
+      reason: `git worktree list failed: ${error instanceof Error ? error.message : String(error)}`,
+      reasonCode: "worktree_list_failed",
+      repoRoot,
+    };
+  }
+  if (!listedWorktrees.has(worktreePath)) {
     return {
       ...base,
       valid: false,
