@@ -811,4 +811,78 @@ describe("SUP-17092/A dependency wake attributed-landing withhold", () => {
       expect(await countBackstopWithheld(dependentId), "no second withhold row").toHaveLength(1);
     });
   });
+
+  // ---- AC#5b: the recovery HEAL lane (zero-blocker blocked_without_blockers)
+  // must NOT re-dispatch / reclassify a parked shared-carrier card. This is the
+  // "cannot reclassify the rejected close as dependency restoration" half of AC#5,
+  // proved at the real reconcileBlockedWithoutBlockers seam rather than by calling
+  // the hasUsableUnblockDescriptor predicate in isolation.
+  describe("recovery heal-lane exemption for a parked shared-carrier card (AC#5b)", () => {
+    const healCompanyId = randomUUID();
+    const healAgentId = randomUUID();
+
+    it("a blocked card carrying the shared-carrier park descriptor is exempted (no re-dispatch, no escalation, card stays blocked)", async () => {
+      // loadConfig-based deps resolve against a non-existent config so the bare
+      // embedded DB falls back to env-only defaults (same trick as the backstop
+      // describe above).
+      process.env.PAPERCLIP_CONFIG = path.join(
+        os.tmpdir(),
+        `paperclip-heal-exempt-test-noconfig-${randomUUID()}.json`,
+      );
+      process.env.PAPERCLIP_BIND = "loopback";
+      await db.insert(companies).values({
+        id: healCompanyId,
+        name: "Heal-exempt company",
+        issuePrefix: "HEAL",
+      });
+      await db.insert(agents).values([
+        { id: healAgentId, companyId: healCompanyId, name: "Heal agent", adapterType: "codex_local", status: "idle" },
+      ]);
+
+      const parkedId = randomUUID();
+      await db.insert(issues).values({
+        id: parkedId,
+        companyId: healCompanyId,
+        title: "parked shared-carrier card",
+        status: "blocked",
+        assigneeAgentId: healAgentId,
+        workMode: "standard",
+        // The EXACT descriptor shape the done-close-landing backstop parks a
+        // deadlocked shared-carrier card with: a non-empty board action naming the
+        // unblock path.
+        unblockDescriptor: {
+          owner: "board",
+          action:
+            "Park resolved by the board: land the shared-carrier branch corp/repo#42 owned by SUP-8888; this card is not a live dependency until it lands.",
+        },
+      });
+
+      const calls: Array<{ agentId: string }> = [];
+      const enqueueWakeup = (async (agentId: string) => {
+        calls.push({ agentId });
+        return { id: randomUUID() };
+      }) as unknown as Parameters<typeof recoveryService>[1]["enqueueWakeup"];
+      const service = recoveryService(db, { enqueueWakeup });
+
+      const result = await service.reconcileBlockedWithoutBlockers({
+        companyId: healCompanyId,
+        now: new Date("2026-09-23T00:00:00Z"),
+      });
+
+      // AC#5: the recovery lane leaves the parked card alone — counted as exempt,
+      // NOT healed back to `todo` and NOT escalated to the board.
+      expect(result.checked).toBe(1);
+      expect(result.unblockDescriptorExemptSkipped).toBe(1);
+      expect(result.healed).toBe(0);
+      expect(result.escalated).toBe(0);
+      // No assignee wakeup was enqueued for the parked card.
+      expect(calls).toHaveLength(0);
+      // The card is still `blocked` — not reclassified.
+      const [after] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, parkedId));
+      expect(after!.status).toBe("blocked");
+    });
+  });
 });

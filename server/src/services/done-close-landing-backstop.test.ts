@@ -9,6 +9,10 @@ import {
   type DoneCloseLandingSweepResult,
 } from "./done-close-landing-backstop.js";
 import type { ExternalObjectResolveResult } from "./external-objects.js";
+// SUP-17092/B (AC#5): the exact SUP-16951 exemption predicate the blocked_without_blockers
+// heal lane uses. Importing the real function proves the parked card's descriptor is
+// the one the heal lane will leave alone — no re-dispatch into a no-op.
+import { hasUsableUnblockDescriptor } from "./recovery/service.js";
 
 const mockResolveLinkedPullRequestsWithState = vi.hoisted(() => vi.fn());
 const mockResolveCardPullRequest = vi.hoisted(() => vi.fn());
@@ -1821,7 +1825,7 @@ describe("createDoneCloseLandingBackstopService", () => {
 describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
   const CARRIER = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
-  it("attributes a shared-carrier child whose PR is open past grace, reporting the deadlock — no re-open, no park (regression)", async () => {
+  it("parks a deadlocked shared-carrier child `blocked` with a first-class unblock descriptor (SUP-17092/B regression)", async () => {
     mockResolveCarrierOwner.mockResolvedValue({ ownerId: CARRIER, identifier: "SUP-15000" });
     mockIssueInBlockerClosure.mockResolvedValue(true);
     mockListNonTerminalRootCauseBlockers.mockResolvedValue([
@@ -1843,14 +1847,35 @@ describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
 
     const result = await service.sweep();
 
-    // AC1/AC2/AC5: the child is left done — no re-open, no board park, no re-enqueue.
+    // AC#1: the deadlocked child is PARKED `blocked`, not left a false done — no
+    // re-enqueue, no ordinary escalation.
     expect(result.escalated).toBe(0);
     expect(result.reenqueued).toBe(0);
-    expect(mockUpdate).not.toHaveBeenCalled();
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
     expect(wakeup).not.toHaveBeenCalled();
 
-    // The attribution ledger row + the deadlock report naming the owning card.
+    // The park: a first-class unblock descriptor whose action names the carrier
+    // owner AND the root-cause non-terminal blocker (AC#1) plus the PR key.
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    expect(mockUpdate).toHaveBeenCalledWith(
+      ISSUE,
+      expect.objectContaining({
+        status: "blocked",
+        unblockDescriptor: expect.objectContaining({ owner: "board" }),
+      }),
+    );
+    const [, parkPatch] = mockUpdate.mock.calls[0]!;
+    expect(parkPatch.unblockDescriptor.action).toContain("SUP-15000");
+    expect(parkPatch.unblockDescriptor.action).toContain("SUP-15001");
+    expect(parkPatch.unblockDescriptor.action).toContain("paperclipai/paperclip#455");
+
+    // AC#5: the parked card carries a descriptor the SUP-16951
+    // blocked_without_blockers heal lane leaves alone — it is NOT healed back to
+    // todo (which would re-dispatch the assignee into the same no-op), and the
+    // backstop records no assignee wakeup for it.
+    expect(hasUsableUnblockDescriptor(parkPatch.unblockDescriptor)).toBe(true);
+
+    // The attribution ledger row still records the (deadlocked) attribution.
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       actorType: "system",
@@ -1868,15 +1893,20 @@ describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
         rootCauseBlockers: ["SUP-15001"],
       }),
     }));
+
+    // AC#1: the park comment names the deadlock + root cause but no longer claims
+    // the card is "left done" / "no re-open or park is recorded here".
     expect(mockAddComment).toHaveBeenCalledTimes(1);
     const [commentIssueId, commentBody] = mockAddComment.mock.calls[0]!;
     expect(commentIssueId).toBe(ISSUE);
     expect(commentBody).toContain("owned by SUP-15000");
     expect(commentBody).toContain("blocker closure");
     expect(commentBody).toContain("SUP-15001");
+    expect(commentBody).not.toContain("left done");
+    expect(commentBody).not.toContain("No re-open or park is recorded here");
   });
 
-  it("attributes a non-deadlocked shared-carrier child without fetching root causes", async () => {
+  it("attributes a non-deadlocked shared-carrier child, leaves it done, and fetches no root causes (SUP-17092/B preserved path)", async () => {
     mockResolveCarrierOwner.mockResolvedValue({ ownerId: CARRIER, identifier: "SUP-15000" });
     mockIssueInBlockerClosure.mockResolvedValue(false);
     const { service } = makeService(
@@ -1889,6 +1919,8 @@ describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
 
     const result = await service.sweep();
 
+    // AC#2: not deadlocked → preserved SUP-15381 disposition: attribution row, no
+    // status change (card stays done), no park.
     expect(result.escalated).toBe(0);
     expect(mockUpdate).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -1902,6 +1934,11 @@ describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
     }));
     // Root-cause walk only runs when deadlocked.
     expect(mockListNonTerminalRootCauseBlockers).not.toHaveBeenCalled();
+    // Positive assertion on the preserved path: the report still says "left done".
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    const [, commentBody] = mockAddComment.mock.calls[0]!;
+    expect(commentBody).toContain("left done");
+    expect(commentBody).toContain("No re-open or park is recorded here");
   });
 
   it("falls back to escalation when a shared-carrier child's owner cannot be resolved (safe default)", async () => {
@@ -1966,12 +2003,16 @@ describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
 
     const result = await service.sweep();
 
-    // Already attributed → no-op: no second audit row, no re-open/park.
+    // Already attributed → no second audit row, no re-open/park. SUP-17092/B
+    // round-1: the sweep still re-derives the LIVE deadlocked state (resolve the
+    // carrier owner + check the blocker closure) so a deadlocked card whose park
+    // update failed gets repaired; but because this card is not deadlocked (the
+    // closure check defaults to false) and its attribution already exists, nothing
+    // is re-logged, re-commented, or re-parked.
     expect(result.escalated).toBe(0);
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
     expect(mockUpdate).not.toHaveBeenCalled();
-    expect(mockResolveCarrierOwner).not.toHaveBeenCalled();
   });
 });
 
