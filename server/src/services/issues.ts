@@ -1938,6 +1938,30 @@ type IssueWithLabels = IssueRow & IssueLabelEnrichment;
 type IssueWithLabelsAndRun = IssueWithLabels & {
   activeRun: IssueActiveRunRow | null;
 };
+/**
+ * SUP-17484 (ADR-103 M2 / SUP-17481 §2): `issues.parent_link_kind` is
+ * `NOT NULL DEFAULT 'decomposition'` and nothing ties it to `parent_id`, so an
+ * unparented row still reads as `parentLinkKind: "decomposition"` on a
+ * single-issue read. That is a false observation: a top-level card has no edge,
+ * and a reader classifying a decomposition edge by the field counts it as a
+ * child of the card it references (the live defect behind SUP-17432 and the
+ * `parent-close-ladder-missing` signature). This is the single-issue read
+ * boundary: normalize the field to `null` when the row has no parent, so "no
+ * edge" and "a decomposition edge" are never the same observation. The stored
+ * column, its `NOT NULL` default and `CHECK`, the list projection, the write
+ * path, and `countLadderedChildren` are all untouched — `null` and
+ * `'decomposition'` are read identically by every consumer that still sees a
+ * real edge.
+ */
+type IssueDetailParentLinkKind = Omit<IssueWithLabels, "parentLinkKind"> & {
+  parentLinkKind: string | null;
+};
+function normalizeIssueDetailParentLinkKind(
+  issue: IssueWithLabels,
+): IssueDetailParentLinkKind {
+  if (issue.parentId != null) return issue;
+  return { ...issue, parentLinkKind: null };
+}
 type IssueListRowWithLabels = IssueListRow & IssueLabelEnrichment;
 type IssueListRowWithLabelsAndRun = IssueListRowWithLabels & {
   activeRun: IssueActiveRunRow | null;
@@ -7106,7 +7130,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
-    return enriched;
+    return normalizeIssueDetailParentLinkKind(enriched);
   }
 
   async function getIssueByIdentifier(identifier: string) {
@@ -7117,7 +7141,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
-    return enriched;
+    return normalizeIssueDetailParentLinkKind(enriched);
   }
 
   async function projectHistoricalRunComments<
