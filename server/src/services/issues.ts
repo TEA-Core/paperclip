@@ -222,6 +222,7 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
+import { isTransactionHandle } from "./db-handle.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
@@ -11135,17 +11136,19 @@ export function issueService(db: Db) {
       };
       // Upstream (#13038) made `create` runnable inside a caller-owned
       // transaction (server/src/services/chat-channels.ts passes its own `tx`).
-      // Only the owning branch may drain here: on the caller-owned branch
-      // `persist` returning proves nothing has committed — the caller can still
-      // `throw`, roll back, and leave a published activity for an issue that
-      // never existed. A caller that wants those publications passes
-      // `postCommitActivityPublications` and drains it after its own commit,
-      // exactly as `update` requires.
+      // The discriminator is `isTransactionHandle(dbOrTx)`, not an identity
+      // check against the pool handle: it is true only when the caller handed us
+      // a transaction. Only the owning (pool) branch may drain here: on a
+      // caller-supplied transaction `persist` returning proves nothing has
+      // committed — the caller can still `throw`, roll back, and leave a
+      // published activity for an issue that never existed. A caller that wants
+      // those publications passes `postCommitActivityPublications` and drains it
+      // after its own commit, exactly as `update` requires.
       const created =
-        dbOrTx === db
+        !isTransactionHandle(dbOrTx)
           ? await db.transaction(persist)
           : await persist(dbOrTx as DbTransaction);
-      if (dbOrTx === db && !postCommitActivityPublications) {
+      if (!isTransactionHandle(dbOrTx) && !postCommitActivityPublications) {
         for (const publication of ownedCreateActivityPublications)
           publishActivity(publication);
       }
@@ -12374,14 +12377,14 @@ export function issueService(db: Db) {
         };
       };
 
-      const result = await (dbOrTx === db
+      const result = await (!isTransactionHandle(dbOrTx)
         ? db.transaction(runUpdate)
         : runUpdate(dbOrTx));
-      if (dbOrTx === db && !postCommitActivityPublications) {
+      if (!isTransactionHandle(dbOrTx) && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications)
           publishActivity(publication);
       }
-      if (dbOrTx === db && !postCommitActions) {
+      if (!isTransactionHandle(dbOrTx) && !postCommitActions) {
         await executeIssuePostCommitActions(db, ownedPostCommitActions);
       }
       return result;
@@ -13373,7 +13376,7 @@ export function issueService(db: Db) {
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
-      if (dbOrTx === db && (actor.runId || actor.userId)) {
+      if (!isTransactionHandle(dbOrTx) && (actor.runId || actor.userId)) {
         const append = () =>
           db.transaction(async (tx) => {
             // Serialize run-authored comments on the issue so a provider retry
@@ -13951,14 +13954,14 @@ export function issueService(db: Db) {
           comment,
           { agentId: actor.agentId, userId: actor.userId },
         );
-        // `addComment` runs either on the pool (`dbOrTx === db`) or inside a
-        // caller-supplied transaction (`dbOrTx !== db`; the recursive run-id
-        // branch and the explicit-`tx` callers). The expiry write above shares
-        // this handle, so its audit must share the same fate: inside a
-        // transaction a swallowed audit failure would let the expiry commit
-        // unaudited. On the pool the documented best-effort behaviour stands.
+      // `addComment` runs either on the pool or inside a caller-supplied
+      // transaction (`isTransactionHandle(dbOrTx)`; the recursive run-id
+      // branch and the explicit-`tx` callers). The expiry write above shares
+      // this handle, so its audit must share the same fate: inside a
+      // transaction a swallowed audit failure would let the expiry commit
+      // unaudited. On the pool the documented best-effort behaviour stands.
         const auditExpiredInteraction =
-          dbOrTx === db ? logActivity : logActivityInTransaction;
+          !isTransactionHandle(dbOrTx) ? logActivity : logActivityInTransaction;
         for (const interaction of expiredInteractions) {
           await auditExpiredInteraction(dbOrTx, {
             companyId: issue.companyId,
