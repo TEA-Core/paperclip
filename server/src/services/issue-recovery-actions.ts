@@ -794,11 +794,15 @@ export function issueRecoveryActionService(db: Db) {
       // ceiling must stop depending on run-id evidence. `staleRepark` remains
       // the run-keyed *fast path*; it is no longer a precondition.
       //
-      // The `prev.attemptCount >= effectiveMaxAttempts` guard distinguishes the
-      // production re-mint loop (predecessor pegged at the ceiling) from the
-      // bwob heal-ceiling (heal rows carry attemptCount 0; their cumulative
-      // depth is tracked via healAttemptCount, not the escalation ladder).
+      // A re-park whose predecessor is a *real, consumed budget* (a non-null
+      // `maxAttempts` at or past the ceiling — the terminal sentinel this
+      // ceiling itself mints, or a caller-supplied budget) is the deliberate
+      // board/budget reset, not a run-agnostic re-mint: it must mint a fresh
+      // attempt-1 active row, not another terminal. The production loop's
+      // predecessors always carry `maxAttempts: null` (buildInsertValues), so
+      // `predecessorBudgetExhausted` is false there and the ceiling still arms.
       const runAgnosticRepark =
+        !predecessorBudgetExhausted &&
         !staleRepark &&
         prev != null &&
         (prev.status === "resolved" || prev.status === "escalated") &&
@@ -808,10 +812,12 @@ export function issueRecoveryActionService(db: Db) {
       // not the high-water `max(attemptCount)`. A resolve -> re-park cycle
       // previously read a low per-row count (or the high-water of a reset
       // predecessor) and restarted the ladder, defeating the ceiling.
-      // SUP-17408: suppress the reset for run-agnostic re-mints at the ceiling;
-      // without this, the terminal predecessor's `attemptCount >= maxAttempts`
-      // triggers the reset and `carriedAttemptCount` drops to 1, so the gate
-      // below can never fire.
+      // SUP-17408: a run-agnostic re-mint at the ceiling must NOT fire the
+      // predecessor-budget reset; that carve-out is encoded in `runAgnosticRepark`
+      // (its `!predecessorBudgetExhausted` guard), so `carriedAttemptCount` stays
+      // at cumulative depth and the gate below can fire. A real budget reset
+      // (`predecessorBudgetExhausted` true) keeps `runAgnosticRepark` false and
+      // still wins — the SUP-13698 reset to attempt 1.
       const effectivePredecessorExhausted = predecessorBudgetExhausted && !runAgnosticRepark;
       const carriedAttemptCount = effectivePredecessorExhausted ? 1 : cumulativeDepth + 1;
       // SUP-14151: clamp the carried count to the effective ceiling. The

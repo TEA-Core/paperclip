@@ -242,4 +242,58 @@ describeEmbeddedPostgres("issueRecoveryActionService run-agnostic evidence ceili
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
     expect(rows).toHaveLength(DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS + 1);
   });
+
+  // SUP-17408 finding `run-agnostic-board-reset-suppressed`: a board resolution
+  // of a terminal run-agnostic lineage must reset to attempt 1, NOT re-mint
+  // another terminal row. The run-keyed board-reset tests re-park with
+  // `latestRunId`, so they miss this shape.
+  for (const shape of RUN_AGNOSTIC_CAUSES) {
+    it(`resets the ${shape.cause} lineage to attempt 1 on an explicit board resolution of the terminal row`, async () => {
+      const { companyId, sourceIssueId } = await seedCompanyAndIssue();
+      const input: UpsertIssueRecoveryActionInput = {
+        companyId,
+        sourceIssueId,
+        kind: shape.kind,
+        ownerType: "board",
+        cause: shape.cause,
+        fingerprint: shape.fingerprint,
+        evidence: shape.evidence,
+        nextAction: shape.nextAction,
+        wakePolicy: null,
+        monitorPolicy: null,
+        maxAttempts: null,
+      };
+
+      const svc = issueRecoveryActionService(db);
+      // Drive the run-agnostic lineage to its terminal ceiling sentinel.
+      const ticks = await driveLineage(input, DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS + 3);
+      const terminal = ticks[ticks.length - 1]!;
+      expect(terminal.status).toBe("escalated");
+      expect(terminal.outcome).toBe("exhausted");
+
+      // An explicit board resolution clears the terminal sentinel and grants a
+      // fresh attempt budget (the routes path resolves with boardResolution: true).
+      const cleared = await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        actionId: terminal.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "Board reviewed; fresh attempt budget granted.",
+        boardResolution: true,
+      });
+      expect(cleared?.status).toBe("resolved");
+      expect(cleared?.id).toBe(terminal.id);
+
+      // The next re-park mints a fresh attempt-1 active successor — NOT a
+      // re-minted terminal row. The predecessor now carries a real, consumed
+      // `maxAttempts` (stamped by the ceiling), so this is a board reset, not a
+      // run-agnostic re-mint at the ceiling.
+      const successor = await svc.upsertSourceScoped(input);
+      expect(successor.status).toBe("active");
+      expect(successor.attemptCount).toBe(1);
+      expect(successor.maxAttempts).toBeNull();
+      expect(successor.id).not.toBe(terminal.id);
+    });
+  }
 });
