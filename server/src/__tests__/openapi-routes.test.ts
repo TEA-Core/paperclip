@@ -408,6 +408,28 @@ describe("openapi routes", () => {
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["403"]).toBeDefined();
   });
 
+  it("publishes the live rearmExecutionPolicy field on PATCH /api/issues/{id}", () => {
+    // SUP-17539: `rearmExecutionPolicy` is a route-only extension of
+    // `updateIssueObjectSchema` (see `updateIssueRouteSchema` in ./issues.ts). The
+    // route parses it and enforces its seat check, but the documented body was a
+    // closed schema that omitted it, so a reader trusting the contract concluded
+    // the one sanctioned remedy for a wedged execution ladder did not exist.
+    const { spec } = loadSpecRoutes();
+    const schema =
+      spec.paths["/api/issues/{id}"].patch.requestBody.content["application/json"]
+        .schema;
+
+    // The documented body stays closed; the field is additive and optional.
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.required ?? []).not.toContain("rearmExecutionPolicy");
+
+    const field = schema.properties.rearmExecutionPolicy;
+    expect(field).toMatchObject({ type: "boolean" });
+    expect(field.description).toContain("assignee agent or a board user");
+    expect(field.description).toContain("execution_policy_rearm_conflicts_with_status");
+    expect(field.description).toContain("in_review");
+  });
+
   it("publishes the complete board contract for chat channels", () => {
     const { spec } = loadSpecRoutes();
     const boardSecurity = [{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }];

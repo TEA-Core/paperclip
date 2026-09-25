@@ -411,7 +411,23 @@ function applyNumberChecks(
   }
 }
 
+// Zod 4 keeps `.describe()` metadata in a global registry reached through the
+// schema's `description` getter, not on `_def` where the shape walker reads the
+// type. Without this wrapper a `.describe()` on a registered schema was
+// silently dropped from the published contract — e.g. `rearmExecutionPolicy`
+// (SUP-17539) needs its seat restriction and refusal code visible to readers.
 function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
+  const jsonSchema = zodToOpenApiSchemaShape(schema);
+  const description =
+    (schema as { description?: unknown }).description ??
+    (unwrapSchema(schema) as { description?: unknown }).description;
+  if (typeof description === "string" && description.length > 0) {
+    jsonSchema.description = description;
+  }
+  return jsonSchema;
+}
+
+function zodToOpenApiSchemaShape(schema: z.ZodTypeAny): JsonSchema {
   const unwrapped = unwrapSchema(schema);
   const def = zodDef(unwrapped);
   const typeName = def.type;
@@ -3877,10 +3893,19 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     // Documented shape omits the create-only attribution keys: they are accepted-and-ignored, not
     // updatable, so advertising them would imply a mutation the server will never perform.
+    //
+    // `rearmExecutionPolicy` is a route-only extension of `updateIssueObjectSchema` (see
+    // `updateIssueRouteSchema` in ./issues.ts), so it must be re-declared here or the published
+    // contract advertises a closed schema that omits the one sanctioned remedy for a wedged
+    // execution ladder (SUP-17539 / ADR-102 M2).
     body: jsonBody(updateIssueObjectSchema.omit({
       createdByUserId: true,
       responsibleUserId: true,
-    }).partial()),
+    }).partial().extend({
+      rearmExecutionPolicy: z.boolean().optional().describe(
+        "Re-arm the issue's execution-policy stage pointer from the replacement `executionPolicy` sent in the same PATCH body. Requires a co-sent `executionPolicy` (422 `execution_policy_rearm_requires_policy_write` otherwise); a co-sent `status` other than `in_review` is refused (422 `execution_policy_rearm_conflicts_with_status`). Only the assignee agent or a board user may re-arm (403 otherwise).",
+      ),
+    })),
   },
   responses: {
     200: r.ok(),
