@@ -64,7 +64,8 @@ import type {
 import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationDeniedDetails, authorizationService } from "./authorization.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
+import { isTransactionHandle } from "./db-handle.js";
 // Only a `local_encrypted` secret can hold a literal directory path, so only a
 // `local_encrypted` secret can ever name a Codex account-home directory. A
 // create or a rotate that writes a new `local_encrypted` value runs inside
@@ -969,6 +970,15 @@ function assertSelectableProviderConfig(config: {
 
 export function secretService(db: Db | DbTransaction) {
   const authorization = authorizationService(db);
+  // Secret-read audits must share the transaction's fate: when this service is
+  // built on a transaction handle, a failed `secret.value.read` audit write
+  // has to abort the transaction rather than let the surrounding mutation
+  // commit unaudited (SUP-16541). On the pool handle the audit stays
+  // best-effort: `logActivity` logs the failure and swallows it. The handle's
+  // kind is fixed at construction, so the predicate runs once here, not per
+  // call. (`dbOrTx === db` was an identity check against this constructor
+  // handle, not a transaction predicate — see SUP-16541.)
+  const auditActivity = isTransactionHandle(db) ? logActivityInTransaction : logActivity;
 
   type NormalizeEnvOptions = {
     strictMode?: boolean;
@@ -1704,7 +1714,7 @@ export function secretService(db: Db | DbTransaction) {
         accessContext,
       });
       await context.registerForRedaction(resolution.value);
-      await logActivity(db as Db, {
+      await auditActivity(db as Db, {
         companyId,
         actorType: "agent",
         actorId: context.agentId,
@@ -1726,7 +1736,16 @@ export function secretService(db: Db | DbTransaction) {
       };
     } catch (error) {
       const errorCode = secretResolutionErrorCode(error);
-      await logActivity(db as Db, {
+      // Deliberate: no trailing `.catch` on this audit write. On the pool
+      // path `logActivity` already swallows audit failures internally
+      // (activity-log.ts), so a `.catch` here was unreachable dead code. On a
+      // transaction path `logActivityInTransaction` must propagate: catching
+      // the error here would leave the Postgres transaction aborted while the
+      // caller only sees the original secret error, and every later statement
+      // in that transaction would then fail with "current transaction is
+      // aborted" instead of the real audit failure. Propagating makes the
+      // failure visible and lets drizzle roll the transaction back explicitly.
+      await auditActivity(db as Db, {
         companyId,
         actorType: "agent",
         actorId: context.agentId,
@@ -1741,7 +1760,7 @@ export function secretService(db: Db | DbTransaction) {
           outcome: "failure",
           errorCode,
         },
-      }).catch(() => undefined);
+      });
       if (errorCode === "binding_missing" || errorCode === "secret_scope_invalid") {
         throw forbidden("Secret access is not granted for this agent");
       }
