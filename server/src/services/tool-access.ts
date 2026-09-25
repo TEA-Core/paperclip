@@ -184,6 +184,7 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { isTransactionHandle } from "./db-handle.js";
 import {
   initializeMcpHttpSession,
   mcpHttpRequestHeaders,
@@ -648,6 +649,13 @@ type ToolAccessServiceOptions = {
   paperclipIdGmailConnector?: PaperclipCloudConnector | null;
   /** Test seam for Vercel Connect without live vendor traffic. */
   vercelConnectClient?: VercelConnectClient | null;
+  /**
+   * SUP-17464: a separate live pool/dedicated-connection handle to record the
+   * audit-write-failure counter on when `audit()` fails inside a transaction.
+   * The transaction handle that just aborted cannot be re-used for that write;
+   * the counter must land on a different, live connection.
+   */
+  auditDb?: Db;
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -3560,7 +3568,20 @@ export function toolAccessService(
         details: input.details ?? {},
       });
     } catch (error) {
-      await recordToolRuntimeAuditWriteFailure(db, input.companyId);
+      // SUP-17464: a failed audit insert aborts the transaction it ran in.
+      // Re-issuing the failure counter on that same handle right now would
+      // issue another statement on the aborted transaction, get "current
+      // transaction is aborted", and — because recordToolRuntimeAuditWriteFailure
+      // swallows that error — silently drop the counter signal. A later
+      // event-loop turn is neither ordered after the rollback nor safe to
+      // reuse the released sub-client, so instead record the counter on a
+      // different, live connection: options.auditDb when `db` is a transaction,
+      // `db` itself when it is already the pool. The original error still
+      // propagates to the caller.
+      const failureTarget = isTransactionHandle(db) ? options.auditDb : db;
+      if (failureTarget) {
+        await recordToolRuntimeAuditWriteFailure(failureTarget, input.companyId);
+      }
       throw error;
     }
   }
@@ -13391,11 +13412,10 @@ export function toolAccessService(
       // making catalog, defaults, and their audits one all-or-nothing step.
       const refresh: ToolCatalogRefreshResult = personalPublicSetupEstablished
         ? await db.transaction(async (tx): Promise<ToolCatalogRefreshResult> =>
-            toolAccessService(tx as unknown as Db, options).refreshCatalog(
-              catalogConnectionId,
-              actor,
-              refreshOptions,
-            ),
+            toolAccessService(tx as unknown as Db, {
+              ...options,
+              auditDb: db,
+            }).refreshCatalog(catalogConnectionId, actor, refreshOptions),
           )
         : await refreshCatalog(catalogConnectionId, actor, refreshOptions);
       const [application] = await db
