@@ -236,6 +236,7 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  findMissingAdr072CloseLadderStages,
   writeAuditLog,
   type DoneTransitionOverride,
 } from "../services/done-transition-guard.js";
@@ -15218,6 +15219,34 @@ export function issueRoutes(
       }
       await queueTaskWatchdogEvaluation(issue, actor.runId);
 
+      // SUP-17538: the company-scoped create door. When this create supplied a
+      // parent, evaluate the parent's ADR-072 close-ladder shape and emit the
+      // non-authoritative advisory — the same control the child-create and
+      // accepted-plan-decomposition doors run. `createParent` is only fetched
+      // for agent actors above, so a board-actor create reads the parent here.
+      // The advisory is best-effort (AC-7): the extra read is itself guarded so
+      // a parent-lookup failure can never turn a successful create into a 5xx.
+      if (issue.parentId) {
+        let advisoryParent =
+          createParent && createParent.id === issue.parentId ? createParent : null;
+        if (!advisoryParent) {
+          try {
+            advisoryParent = await svc.getById(issue.parentId);
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.parentId },
+              "failed to read parent for ADR-072 close-ladder advisory",
+            );
+          }
+        }
+        if (advisoryParent) {
+          await flagAdr072CloseLadderOnChildAcquisition(
+            advisoryParent,
+            "issue_create",
+          );
+        }
+      }
+
       res.status(201).json({
         ...issue,
         relatedWork: referenceSummary,
@@ -15321,6 +15350,229 @@ export function issueRoutes(
         tx,
       );
     });
+  }
+
+  // SUP-17538 (ADR-072 close ladder, child-create advisory; root SUP-17422,
+  // ruling SUP-17536): a card that acquires laddered children while its
+  // executionPolicy does not yet satisfy the ADR-072 close-ladder SHAPE is
+  // already refusable at close by Mechanism D — but by then the stage pointer has
+  // usually advanced past the point where the missing rungs can be inserted, and
+  // the only remedy left (rearmExecutionPolicy) is seat-restricted to the
+  // assignee agent or a board user. Six parents (SUP-15871, SUP-16018,
+  // SUP-16019, SUP-16739, SUP-17481, SUP-17536) each needed a hand repair because
+  // the fact surfaced only at close. Emit a NON-authoritative advisory at the
+  // moment the children are filed, so the ladder can be installed while the
+  // pointer is still in the free window.
+  //
+  // This does NOT reverse ADR-102's rejection of "evaluating parent
+  // classification atomically at child-create time". The shape is computed from
+  // live rows and EMITTED AND DISCARDED: nothing is persisted, cached, or
+  // denormalized onto the parent row, and the close remains the sole authority
+  // that recomputes lazily. The durable activity row written below is a dedup /
+  // audit marker for the comment, never a cached classification any close path
+  // reads.
+  const ADR072_CLOSE_LADDER_ADVISORY_ACTION =
+    "issue.adr072_close_ladder_incomplete";
+  const ADR072_CLOSE_LADDER_ADVISORY_MARKER =
+    "[ADR-072 close ladder incomplete]";
+
+  function buildAdr072CloseLadderAdvisory(input: {
+    identifier: string | null;
+    missingStageLabels: string[];
+    outOfOrderStageLabels: string[];
+    ladderedChildCount: number;
+    ladderedChildIdentifiers: string[];
+    pointerAdvanced: boolean;
+    currentStageIndex: number | null;
+  }): string {
+    const lines: string[] = [
+      ADR072_CLOSE_LADDER_ADVISORY_MARKER,
+      "",
+      `This card${input.identifier ? ` (${input.identifier})` : ""} is now a ` +
+        `decomposed parent over ${input.ladderedChildCount} ` +
+        `laddered child issue(s) (${input.ladderedChildIdentifiers.join(", ")}), ` +
+        "so its close is gated by the ADR-072 close-ladder shape (the " +
+        "done-transition guard's Mechanism D). Its executionPolicy does not yet " +
+        "carry the full ratified close ladder.",
+    ];
+    if (input.missingStageLabels.length > 0) {
+      lines.push(
+        "",
+        `Missing close-ladder stage(s), in ratified order: ` +
+          `${input.missingStageLabels.join(", ")}`,
+      );
+    }
+    if (input.outOfOrderStageLabels.length > 0) {
+      lines.push(
+        "",
+        `Out-of-order close-ladder stage(s): ` +
+          `${input.outOfOrderStageLabels.join(", ")} (each lands before an ` +
+          "earlier-required close-ladder stage).",
+      );
+    }
+    lines.push(
+      "",
+      `Current stage pointer: index ${
+        input.currentStageIndex === null ? "none" : input.currentStageIndex
+      } — the close-ladder pointer has ${
+        input.pointerAdvanced ? "already advanced" : "not yet advanced"
+      } past the insertion point.`,
+      "",
+    );
+    if (input.pointerAdvanced) {
+      // AC-2: an advisory that names a remedy the reader cannot execute is the
+      // defect this card exists to remove, so the seat restriction is named
+      // alongside the remedy.
+      lines.push(
+        "Remedy: because the pointer has already advanced, the missing " +
+          "stage(s) can no longer simply be appended — inserting an unresolved " +
+          "stage behind the live pointer is refused (ADR-102 M1 / " +
+          "INV-LADDER-1). Recover with `rearmExecutionPolicy`: send the " +
+          "replacement `executionPolicy` together with `rearmExecutionPolicy: " +
+          "true` in the same PATCH. Seat restriction: only the assignee agent " +
+          "or a board user may re-arm the execution-policy pointer; every other " +
+          "actor is refused (assertCanReArmExecutionPolicy).",
+      );
+    } else {
+      lines.push(
+        "Remedy: the pointer has not yet advanced, so this is the free window — " +
+          "add the missing stage(s) above to this card's executionPolicy now. " +
+          "Installing the close ladder is legal only while the pointer has not " +
+          "advanced past the first close-ladder rung (ADR-102 M1).",
+      );
+    }
+    lines.push(
+      "",
+      "Advisory only: nothing on this card was changed. The close remains the " +
+        "sole authority and recomputes the shape from live rows.",
+    );
+    return lines.join("\n");
+  }
+
+  async function flagAdr072CloseLadderOnChildAcquisition(
+    parent: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      executionPolicy: unknown;
+      executionState?: unknown;
+      createdByAgentId?: string | null;
+    },
+    source: "child_create" | "accepted_plan_decomposition" | "issue_create",
+  ): Promise<void> {
+    // AC-7 / non-authoritative: this advisory must NEVER fail the child create
+    // that triggered it. Every read and write below is contained; a failure is
+    // logged and swallowed so a successful acquisition is never turned into a
+    // 5xx by a best-effort advisory.
+    try {
+      // Shared predicate, no drift: the close guard counts only children whose
+      // ladder has RUN, but the advisory fires while those children are still
+      // open, so it relaxes ONLY the completion gate — the same relaxation the
+      // SUP-17158 acquisition flag uses. Origin/status/carve-out exclusions and
+      // the `>= 2` threshold are shared, so the two can never disagree.
+      const laddered = await countLadderedChildren(
+        db,
+        parent.companyId,
+        parent.id,
+        { requireCompletedLadder: false },
+      );
+      if (laddered.count < 2) return;
+      // Reuse the Mechanism D shape check verbatim — never a second copy. The
+      // close path is unchanged; this only reads the same helper.
+      const shape = await findMissingAdr072CloseLadderStages(
+        db,
+        parent.companyId,
+        parent.executionPolicy,
+        parent.executionState,
+        parent.createdByAgentId,
+      );
+      if (
+        shape.missingStageLabels.length === 0 &&
+        shape.outOfOrderStageLabels.length === 0
+      ) {
+        // AC-4: a parent whose ladder already satisfies ADR-072 gets no comment.
+        return;
+      }
+      // "Advanced" reuses ADR-103 M4's canonical predicate
+      // (parent-edge-close-ladder-gate.ts condition 2): the close-ladder pointer
+      // has advanced once any stage has completed or been skipped. A
+      // not-advanced parent can still lawfully add the missing rungs, so it gets
+      // the free-window remedy; an advanced one can only recover through the
+      // seat-restricted re-arm. Reusing M4's predicate keeps one definition of
+      // "advanced" across the two child-create controls.
+      const state = parseIssueExecutionState(parent.executionState);
+      const pointerAdvanced =
+        (state?.completedStageIds?.length ?? 0) > 0 ||
+        (state?.skippedStageIds?.length ?? 0) > 0;
+      const body = buildAdr072CloseLadderAdvisory({
+        identifier: parent.identifier ?? null,
+        missingStageLabels: shape.missingStageLabels,
+        outOfOrderStageLabels: shape.outOfOrderStageLabels,
+        ladderedChildCount: laddered.count,
+        ladderedChildIdentifiers: laddered.identifiers,
+        pointerAdvanced,
+        currentStageIndex: state?.currentStageIndex ?? null,
+      });
+      // AC-3 (idempotent) + race-safe, mirroring the SUP-17158 acquisition flag:
+      // the parent row is the transaction fence (concurrent acquisitions on the
+      // same parent serialize here), and the dedup is a history-independent read
+      // of the durable activity table — never a bounded comment scan — so a
+      // marker is never forgotten because newer comments pushed it out of a
+      // `limit`.
+      await db.transaction(async (tx) => {
+        await tx
+          .select({ id: issueRows.id })
+          .from(issueRows)
+          .where(eq(issueRows.id, parent.id))
+          .for("update");
+        const alreadyFlagged = await tx
+          .select({ id: activityLog.id })
+          .from(activityLog)
+          .where(
+            and(
+              eq(activityLog.companyId, parent.companyId),
+              eq(activityLog.action, ADR072_CLOSE_LADDER_ADVISORY_ACTION),
+              eq(activityLog.entityType, "issue"),
+              eq(activityLog.entityId, parent.id),
+            ),
+          );
+        if (alreadyFlagged.length > 0) return;
+        await logActivityInTransaction(tx as unknown as Db, {
+          companyId: parent.companyId,
+          actorType: "system",
+          actorId: "adr072-close-ladder-advisory",
+          action: ADR072_CLOSE_LADDER_ADVISORY_ACTION,
+          entityType: "issue",
+          entityId: parent.id,
+          issueId: parent.id,
+          details: {
+            identifier: parent.identifier ?? null,
+            ladderedChildCount: laddered.count,
+            ladderedChildIdentifiers: laddered.identifiers,
+            excludedChildIdentifiers: laddered.excludedChildIdentifiers,
+            missingStageLabels: shape.missingStageLabels,
+            outOfOrderStageLabels: shape.outOfOrderStageLabels,
+            pointerAdvanced,
+            currentStageIndex: state?.currentStageIndex ?? null,
+            source,
+          },
+        });
+        // AC-5: the comment is the ONLY write to the parent. No executionPolicy,
+        // status, assignee, or cached classification field is touched.
+        await svc.addComment(
+          parent.id,
+          body,
+          {},
+          { authorType: "system" },
+          tx,
+        );
+      });
+    } catch (err) {
+      logger.warn(
+        { err, issueId: parent.id, companyId: parent.companyId, source },
+        "failed to emit ADR-072 close-ladder child-create advisory",
+      );
+    }
   }
 
   router.post(
@@ -15623,6 +15875,7 @@ export function issueRoutes(
         );
       }
       await flagMissingApprovalStageOnChildAcquisition(parent, "child_create");
+      await flagAdr072CloseLadderOnChildAcquisition(parent, "child_create");
       res.status(201).json(issue);
     },
   );
@@ -15898,6 +16151,10 @@ export function issueRoutes(
       });
 
       await flagMissingApprovalStageOnChildAcquisition(
+        sourceIssue,
+        "accepted_plan_decomposition",
+      );
+      await flagAdr072CloseLadderOnChildAcquisition(
         sourceIssue,
         "accepted_plan_decomposition",
       );

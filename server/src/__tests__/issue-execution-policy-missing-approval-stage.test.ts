@@ -71,6 +71,13 @@ const carveOutIssueLabelRowsState = vi.hoisted(() => ({ rows: [] as unknown[] })
 // history-independent uniqueness check (never a bounded comment scan). Empty by
 // default so a fresh acquisition is not deduped.
 const activityFlagState = vi.hoisted(() => ({ rows: [] as unknown[] }));
+// SUP-17538: the ADR-072 close-ladder shape read (`findMissingAdr072CloseLadderStages`)
+// resolves participant agent urlKeys from the agents table via an `{id, name}`
+// projection. Empty by default — like the handoff-agent default, whose rows
+// carry no `name`, every rung resolves as unsatisfied, which is the
+// conservative shape the non-SUP-17538 tests in this file expect. Arm it only
+// to model a parent whose ladder already satisfies ADR-072.
+const agentNameRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
@@ -484,7 +491,7 @@ function gapActivityInputs() {
   // error-propagating, transactional logger). Asserting against that call is what
   // proves the signals are no longer fire-and-forget.
   return mockLogActivityInTransaction.mock.calls
-    .map((call) => call[1] as Record<string, unknown> | undefined)
+    .map((call) => (call as unknown[])[1] as Record<string, unknown> | undefined)
     .filter((input): input is Record<string, unknown> =>
       typeof input?.action === "string" && input.action.includes("missing_approval_stage"));
 }
@@ -506,6 +513,7 @@ describe("issue execution policy missing approval stage", () => {
     carveOutLabelRowsState.rows = [];
     carveOutIssueLabelRowsState.rows = [];
     activityFlagState.rows = [];
+    agentNameRowsState.rows = [];
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -556,6 +564,12 @@ describe("issue execution policy missing approval stage", () => {
           let filterLabelNames = false;
           if (childSignature) {
             rows = childRowsState.rows;
+          } else if (keys.length === 2 && keys.includes("id") && keys.includes("name")) {
+            // SUP-17538: the ADR-072 shape read resolves participant agent
+            // urlKeys from the agents table. Armed per-test; empty by default
+            // (conservative — every rung unsatisfied), exactly as the
+            // handoff-agent default behaves since its rows carry no `name`.
+            rows = agentNameRowsState.rows;
           } else if (drizzleTableName(table) === "activity_log") {
             // SUP-17158: the acquisition-flag dedup is a 1-key `id` projection on
             // the activity_log table, signature-colliding with the carve-out
@@ -1204,7 +1218,23 @@ describe("issue execution policy missing approval stage", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(acquisitionFlagInputs()).toEqual([]);
-      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      // SUP-17538: assert on the SUP-17158 flag's OWN marker rather than "no
+      // comment at all". This parent HAS an approval stage, so the
+      // missing-approval flag must stay silent — but its review/approval
+      // participants are not the ratified support-QAE/coder-LE/exec-CTO rungs,
+      // so its ADR-072 close-ladder shape is still incomplete and the distinct
+      // child-create advisory legitimately fires. A blanket "no comment" would
+      // conflate the two independent controls.
+      expect(
+        mockIssueService.addComment.mock.calls.some((call) =>
+          String(call[1] ?? "").includes("[Missing approval stage acquired]"),
+        ),
+      ).toBe(false);
+      expect(
+        mockIssueService.addComment.mock.calls.some((call) =>
+          String(call[1] ?? "").includes("[ADR-072 close ladder incomplete]"),
+        ),
+      ).toBe(true);
     });
 
     it("F2: dedups via the durable activity table — a prior flag on the same parent is a no-op", async () => {
@@ -1246,6 +1276,258 @@ describe("issue execution policy missing approval stage", () => {
 
       expect(res.status).toBeGreaterThanOrEqual(500);
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("SUP-17538 ADR-072 close-ladder child-create advisory", () => {
+    const QAE_AGENT_ID = "a1111111-1111-4111-8111-111111111111";
+    const LE_AGENT_ID = "b2222222-2222-4222-8222-222222222222";
+    const CTO_AGENT_ID = "c3333333-3333-4333-8333-333333333333";
+
+    function adr072AdvisoryInputs() {
+      return mockLogActivityInTransaction.mock.calls
+        .map((call) => (call as unknown[])[1] as Record<string, unknown> | undefined)
+        .filter((input): input is Record<string, unknown> =>
+          input?.action === "issue.adr072_close_ladder_incomplete");
+    }
+
+    function advisoryComments() {
+      return mockIssueService.addComment.mock.calls.filter((call) =>
+        String(call[1] ?? "").includes("[ADR-072 close ladder incomplete]"),
+      );
+    }
+
+    function createChildFixture() {
+      mockIssueService.createChild.mockResolvedValue({
+        issue: {
+          id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          companyId: "company-1",
+          identifier: "PAP-NEW",
+          title: "New child",
+          status: "todo",
+        },
+        parentBlockerAdded: false,
+      });
+    }
+
+    function twoOpenLadderedChildren() {
+      childRowsState.rows = [
+        openLadderedChildRow("child-a-id", "PAP-2"),
+        openLadderedChildRow("child-b-id", "PAP-3"),
+      ];
+    }
+
+    // The full ratified ADR-072 close ladder, with participants that resolve to
+    // the required agent urlKeys.
+    function satisfiedAdr072Policy() {
+      return normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: "11111111-1111-4111-8111-111111111111",
+            type: "review",
+            participants: [{ type: "agent", agentId: QAE_AGENT_ID }],
+          },
+          {
+            id: "22222222-2222-4222-8222-222222222222",
+            type: "review",
+            participants: [{ type: "agent", agentId: LE_AGENT_ID }],
+          },
+          {
+            id: "33333333-3333-4333-8333-333333333333",
+            type: "approval",
+            participants: [{ type: "agent", agentId: CTO_AGENT_ID }],
+          },
+        ],
+      })!;
+    }
+
+    function armSatisfiedAgents() {
+      agentNameRowsState.rows = [
+        { id: QAE_AGENT_ID, name: "support-QAE" },
+        { id: LE_AGENT_ID, name: "coder-LE" },
+        { id: CTO_AGENT_ID, name: "exec-CTO" },
+      ];
+    }
+
+    // All three rungs present and resolvable, but the exec-CTO approval lands
+    // BEFORE the two review rungs — the SUP-16532 ordering violation, which is
+    // reported as out-of-order (not missing) by the shared shape helper.
+    function outOfOrderAdr072Policy() {
+      return normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: "33333333-3333-4333-8333-333333333333",
+            type: "approval",
+            participants: [{ type: "agent", agentId: CTO_AGENT_ID }],
+          },
+          {
+            id: "11111111-1111-4111-8111-111111111111",
+            type: "review",
+            participants: [{ type: "agent", agentId: QAE_AGENT_ID }],
+          },
+          {
+            id: "22222222-2222-4222-8222-222222222222",
+            type: "review",
+            participants: [{ type: "agent", agentId: LE_AGENT_ID }],
+          },
+        ],
+      })!;
+    }
+
+    // A schema-valid execution state whose close-ladder pointer has advanced
+    // (one completed stage) — the ADR-103 M4 "advanced" shape.
+    function advancedParentState() {
+      return {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: null,
+        returnAssignee: null,
+        deliveryAuthor: null,
+        reviewRequest: null,
+        completedStageIds: ["22222222-2222-4222-8222-222222222222"],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+        changesRequestedCount: 0,
+      };
+    }
+
+    it("posts exactly one advisory naming the missing rungs in ratified order (pointer not advanced)", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const advisories = adr072AdvisoryInputs();
+      expect(advisories).toHaveLength(1);
+      expect(advisories[0]!.issueId).toBe(PARENT_ID);
+      const details = advisories[0]!.details as Record<string, unknown>;
+      // Ratified order, both review rungs before the approval rung.
+      expect(details.missingStageLabels).toEqual([
+        "review:support-QAE",
+        "review:coder-LE",
+        "approval:exec-CTO",
+      ]);
+      expect(details.outOfOrderStageLabels).toEqual([]);
+      expect(details.ladderedChildCount).toBe(2);
+      expect(details.ladderedChildIdentifiers).toEqual(["PAP-2", "PAP-3"]);
+      expect(details.pointerAdvanced).toBe(false);
+      const comments = advisoryComments();
+      expect(comments).toHaveLength(1);
+      const body = String(comments[0]![1]);
+      expect(body).toContain("review:support-QAE");
+      expect(body).toContain("review:coder-LE");
+      expect(body).toContain("approval:exec-CTO");
+      expect(body).toContain("free window");
+      expect(body).not.toContain("rearmExecutionPolicy");
+      // The advisory is the only write to the parent: no policy/status update.
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("names the seat-restricted rearm remedy when the pointer has already advanced", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue({
+        ...parentIssue(reviewOnlyPolicy()),
+        executionState: advancedParentState(),
+      });
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const advisories = adr072AdvisoryInputs();
+      expect(advisories).toHaveLength(1);
+      expect(
+        (advisories[0]!.details as Record<string, unknown>).pointerAdvanced,
+      ).toBe(true);
+      const comments = advisoryComments();
+      expect(comments).toHaveLength(1);
+      const body = String(comments[0]![1]);
+      // An advisory that names an inaccessible remedy is the defect this card
+      // removes, so the seat restriction is named alongside rearmExecutionPolicy.
+      expect(body).toContain("rearmExecutionPolicy");
+      expect(body).toContain("assignee agent");
+      expect(body).toContain("board user");
+      expect(body).not.toContain("free window");
+    });
+
+    it("is idempotent: a prior durable advisory row on the parent is a no-op", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+      activityFlagState.rows = [{ id: "99999999-9999-4999-8999-999999999999" }];
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(adr072AdvisoryInputs()).toEqual([]);
+      expect(advisoryComments()).toEqual([]);
+    });
+
+    it("does not advise a parent whose ladder already satisfies ADR-072", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(satisfiedAdr072Policy()));
+      armSatisfiedAgents();
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(adr072AdvisoryInputs()).toEqual([]);
+      expect(advisoryComments()).toEqual([]);
+    });
+
+    it("advises (and names) an out-of-order ladder even when no rung is missing", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(outOfOrderAdr072Policy()));
+      armSatisfiedAgents();
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const advisories = adr072AdvisoryInputs();
+      expect(advisories).toHaveLength(1);
+      const details = advisories[0]!.details as Record<string, unknown>;
+      expect(details.missingStageLabels).toEqual([]);
+      expect(details.outOfOrderStageLabels).toEqual(["approval:exec-CTO"]);
+      const comments = advisoryComments();
+      expect(comments).toHaveLength(1);
+      expect(String(comments[0]![1])).toContain("Out-of-order");
+    });
+
+    it("never fails the child create when the advisory itself fails (best-effort, AC-7)", async () => {
+      createChildFixture();
+      // A parent WITH an approval stage so the SUP-17158 flag does not fire and
+      // does not consume the injected transaction failure; its ladder is still
+      // shape-incomplete (participants are not the ratified rungs), so the
+      // ADR-072 advisory runs and its fenced transaction is the one that fails.
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewPlusApprovalPolicy()));
+      twoOpenLadderedChildren();
+      mockDb.transaction.mockRejectedValueOnce(new Error("advisory tx failed"));
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(adr072AdvisoryInputs()).toEqual([]);
+      expect(advisoryComments()).toEqual([]);
     });
   });
 });
