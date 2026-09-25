@@ -2074,6 +2074,10 @@ export function routineService(
             originFingerprint: dispatchFingerprint,
             billingCode: issueBillingCode,
             executionPolicy: input.routine.executionPolicy ?? null,
+            // SUP-17459: when the routine declares a policy, an explicitly-empty
+            // ladder (`stages: []`) must be honoured as "no ladder" on the card
+            // instead of collapsing to null and inheriting the project default.
+            trustExplicitExecutionPolicy: input.routine.executionPolicy != null,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,

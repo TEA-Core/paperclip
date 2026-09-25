@@ -427,7 +427,7 @@ export function normalizeIssueExecutionPolicy(
   // be able to read back — `hasPendingProviderQuotaRecoveryMonitor` compares the
   // persisted ref against the latest run id to avoid restamping a live monitor — so
   // they opt out of redaction.
-  options?: { preserveMonitorExternalRef?: boolean },
+  options?: { preserveMonitorExternalRef?: boolean; preserveEmptyPolicy?: boolean },
 ): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
@@ -494,6 +494,17 @@ export function normalizeIssueExecutionPolicy(
     !returnAssigneeAgentId &&
     !baseRef
   ) {
+    // SUP-17459: an explicitly-provided policy with no stages is "no ladder",
+    // distinct from a null policy (which inherits the project default at
+    // issue create). Trusted internal callers that must preserve that
+    // distinction (routine dispatch) opt in via `preserveEmptyPolicy`.
+    if (options?.preserveEmptyPolicy) {
+      return {
+        mode: parsed.data.mode ?? "normal",
+        commentRequired: true,
+        stages: [],
+      };
+    }
     return null;
   }
 

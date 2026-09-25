@@ -44,6 +44,26 @@ describe("normalizeIssueExecutionPolicy", () => {
     expect(normalizeIssueExecutionPolicy({ stages: [] })).toBeNull();
   });
 
+  it("preserves an explicit empty policy when preserveEmptyPolicy is set (SUP-17459)", () => {
+    const preserved = normalizeIssueExecutionPolicy({ stages: [] }, { preserveEmptyPolicy: true });
+    expect(preserved).not.toBeNull();
+    expect(preserved!.stages).toHaveLength(0);
+    expect(preserved!.mode).toBe("normal");
+    expect(preserved!.commentRequired).toBe(true);
+    expect(
+      normalizeIssueExecutionPolicy({ mode: "auto", stages: [] }, { preserveEmptyPolicy: true })!
+        .mode,
+    ).toBe("auto");
+    // The flag must not resurrect a null policy.
+    expect(
+      normalizeIssueExecutionPolicy(null, { preserveEmptyPolicy: true }),
+    ).toBeNull();
+    // Without the flag the collapse is unchanged.
+    expect(
+      normalizeIssueExecutionPolicy({ stages: [] }, { preserveEmptyPolicy: false }),
+    ).toBeNull();
+  });
+
   it("throws when all participants are invalid (missing agentId)", () => {
     expect(() =>
       normalizeIssueExecutionPolicy({
