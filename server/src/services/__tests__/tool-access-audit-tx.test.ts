@@ -1,26 +1,33 @@
 /**
- * SUP-17464: a tool-access audit write that fails INSIDE a transaction must not
- * re-enter the aborted transaction to record the failure.
+ * SUP-17464: a tool-access audit write that fails INSIDE a transaction must
+ * record the failure counter on a separate, live pool handle — never by
+ * re-entering the aborted transaction handle.
  *
- * `audit()` in `services/tool-access.ts` used to call
- * `recordToolRuntimeAuditWriteFailure(db, companyId)` unconditionally in its
- * catch block. When `db` is a transaction handle, the insert that just failed
- * has already aborted the Postgres transaction, so the counter write issued
- * another statement on that aborted transaction, failed with "current
- * transaction is aborted", and `recordToolRuntimeAuditWriteFailure` swallowed
- * the error — the audit-write-failure counter signal was silently dropped.
+ * `audit()` in `services/tool-access.ts` records the audit-write-failure
+ * counter in its catch. When `db` is a transaction handle, the insert that
+ * just failed has aborted the Postgres transaction: issuing the counter on
+ * that same handle would get "current transaction is aborted", and
+ * `recordToolRuntimeAuditWriteFailure` swallows that error — the counter
+ * signal is silently dropped. A `setImmediate` around that does not help: the
+ * awaited ROLLBACK only runs after the transaction callback rethrows, so
+ * event-loop ordering does not place the deferred write past the rollback, and
+ * the released transaction sub-client is unsafe to reuse on a later turn.
  *
- * These tests drive `refreshCatalog` — the SUP-17464 witness path
- * (`tool-access.ts:13394` constructs the service on a tx handle and calls it) —
- * against a hand-rolled handle that models abort semantics, and assert:
- *   - the pool handle keeps today's behaviour (counter recorded, original
- *     error rethrown);
- *   - the transaction handle defers the counter past the rollback, so the
- *     original error still propagates and the signal is still recorded.
+ * The fix routes the counter to `options.auditDb` — an explicitly supplied,
+ * separate live pool handle — when the service's handle is a transaction, and
+ * to `db` itself when it is already the pool. These tests drive
+ * `refreshCatalog` (the SUP-17464 witness path) against two hand-rolled
+ * handles and assert:
+ *   - pool handle: counter recorded on it, original error rethrown;
+ *   - transaction handle: the counter write lands on the separate pool handle
+ *     (never the aborted tx, which stays aborted), and the original error is
+ *     still the rejection.
  *
- * No database is involved: the branch under test is `isTransactionHandle(db)`,
- * so a fake handle that rejects the audit insert is the whole setup. Real
- * Postgres abort semantics are modelled explicitly rather than simulated.
+ * No database is involved: the branch under test is `isTransactionHandle(db)`
+ * plus the auditDb routing, so two fakes — one that aborts, one that records —
+ * are the whole setup. No event-loop timing is relied on: the counter is
+ * recorded synchronously (awaited) in the catch, before the error rethrows, so
+ * the assertions hold at the moment `refreshCatalog` rejects.
  */
 
 import { describe, expect, it } from "vitest";
@@ -50,17 +57,25 @@ const CONNECTION = {
   credentialSecretRefs: [],
 } as unknown as Record<string, unknown>;
 
-type FakeDbState = {
+type HandleState = {
   /** Mirrors Postgres: a failed statement leaves the transaction aborted. */
   aborted: boolean;
-  /** How many times the counter insert was actually invoked. */
+  /** How many times the counter insert was actually invoked on this handle. */
   counterValuesCalls: number;
-  /** Outcome of each counter write attempt, in order. */
+  /** Outcome of each counter write attempt on this handle, in order. */
   counterWrites: Array<{ ok: boolean }>;
 };
 
-function makeFailingAuditDb(options: { modelTransaction: boolean }) {
-  const state: FakeDbState = {
+/**
+ * A handle that always fails the audit insert. When `isTransaction`, that
+ * failure also aborts the handle (mirroring a real Postgres transaction); when
+ * it is the pool handle, the failure does not abort it. The counter write is
+ * recorded on whatever handle it is issued against, so these two fakes let us
+ * tell apart "counter re-entered the aborted tx" from "counter recorded on the
+ * separate pool".
+ */
+function makeHandle(options: { isTransaction: boolean }) {
+  const state: HandleState = {
     aborted: false,
     counterValuesCalls: 0,
     counterWrites: [],
@@ -84,14 +99,17 @@ function makeFailingAuditDb(options: { modelTransaction: boolean }) {
         if (table === toolAccessAuditEvents) {
           // The audit write is the statement that fails. On a real transaction
           // it is also the statement that aborts it; model that only for the
-          // transaction case so the pool case keeps a healthy counter path.
-          if (options.modelTransaction) state.aborted = true;
+          // transaction handle so the pool handle keeps a healthy counter path.
+          if (options.isTransaction) state.aborted = true;
           return Promise.reject(AUDIT_ERROR);
         }
         if (table === toolRuntimeMetricCounters) {
           state.counterValuesCalls += 1;
           return {
             onConflictDoUpdate: async () => {
+              // A counter write issued while this handle is aborted would be
+              // swallowed by recordToolRuntimeAuditWriteFailure — model that so
+              // a regression to re-entering the aborted tx is caught here.
               if (state.aborted) {
                 state.counterWrites.push({ ok: false });
                 throw new Error("current transaction is aborted");
@@ -109,34 +127,45 @@ function makeFailingAuditDb(options: { modelTransaction: boolean }) {
 }
 
 describe("tool-access audit() failure path (SUP-17464)", () => {
-  it("pool handle: records the failure counter and rethrows the original error", async () => {
-    const { db, state } = makeFailingAuditDb({ modelTransaction: false });
+  it("pool handle: records the failure counter on the pool and rethrows the original error", async () => {
+    const { db, state } = makeHandle({ isTransaction: false });
     const service = toolAccessService(db as unknown as Db, {});
 
     await expect(service.refreshCatalog("conn_test")).rejects.toBe(AUDIT_ERROR);
 
+    // The counter is recorded on the pool handle and the original error (not
+    // "current transaction is aborted") propagates.
+    expect(state.counterValuesCalls).toBe(1);
     expect(state.counterWrites).toEqual([{ ok: true }]);
   });
 
-  it("transaction handle: does not re-enter the aborted tx; defers the counter past the rollback", async () => {
-    const { db, state } = makeFailingAuditDb({ modelTransaction: true });
-    const txHandle = brandAsTransactionHandle(db);
-    const service = toolAccessService(txHandle as unknown as Db, {});
+  it("transaction handle: records the counter on the separate pool handle, never re-enters the aborted tx", async () => {
+    // The transaction handle aborts on the failed audit insert and STAYS
+    // aborted: the test never clears it and never yields to event-loop timing,
+    // so any counter that tried to re-enter this handle would be caught here.
+    const { db: txRaw, state: txState } = makeHandle({ isTransaction: true });
+    // The healthy, separate pool handle that the counter must land on.
+    const { db: poolRaw, state: poolState } = makeHandle({
+      isTransaction: false,
+    });
+    const txHandle = brandAsTransactionHandle(txRaw);
+    const service = toolAccessService(txHandle as unknown as Db, {
+      auditDb: poolRaw as unknown as Db,
+    });
 
     // The original insert error propagates — not "current transaction is
     // aborted".
     await expect(service.refreshCatalog("conn_test")).rejects.toBe(AUDIT_ERROR);
 
-    // The counter has not touched the aborted handle yet: the whole point of
-    // the fix is that it must not. (Without the deferral this is 1 and the
-    // write below is lost with `{ ok: false }`.)
-    expect(state.counterValuesCalls).toBe(0);
+    // The aborted transaction was never re-entered for the counter: it stayed
+    // aborted and the counter insert was never invoked on it.
+    expect(txState.aborted).toBe(true);
+    expect(txState.counterValuesCalls).toBe(0);
+    expect(txState.counterWrites).toEqual([]);
 
-    // Simulate the transaction settling: the rollback that clears the abort.
-    state.aborted = false;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-
-    // The deferred counter ran after the rollback and was actually recorded.
-    expect(state.counterWrites).toEqual([{ ok: true }]);
+    // Exactly one counter write happened — on the separate pool handle — and
+    // it succeeded.
+    expect(poolState.counterValuesCalls).toBe(1);
+    expect(poolState.counterWrites).toEqual([{ ok: true }]);
   });
 });

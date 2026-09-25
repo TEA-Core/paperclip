@@ -568,7 +568,7 @@ export function connectionIntentService(db: Db) {
         options.bypassCurrentMembershipCheck,
       );
       const txDb = tx as unknown as Db;
-      const txAccess = toolAccessService(txDb);
+      const txAccess = toolAccessService(txDb, { auditDb: db });
       const txInteractions = issueThreadInteractionService(txDb);
       await tx.select({ id: toolConnections.id }).from(toolConnections).where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, loaded.issue.companyId))).for("update");
       let selectedConnection = await txAccess.getConnection(connectionId, loaded.issue.companyId);
