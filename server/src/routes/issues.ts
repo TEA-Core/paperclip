@@ -3274,6 +3274,145 @@ function diffExecutionParticipants(
   };
 }
 
+type NewExecutionPolicyAgentReference = {
+  agentId: string;
+  /** Set for stage participants; absent for the return assignee. */
+  stageIndex?: number;
+  stageType?: NormalizedExecutionPolicy["stages"][number]["type"];
+  /** True when the reference names the return assignee rather than a participant. */
+  isReturnAssignee: boolean;
+};
+
+/**
+ * SUP-17410: collect the agent references a policy write *introduces*.
+ *
+ * Delta-only by design. A write that does not introduce a reference is not
+ * checked, so an issue already carrying a phantom participant (SUP-16903) is
+ * never made less mutable by this guard:
+ *
+ * - a PATCH that omits the `stages` key preserves the stored ladder untouched
+ *   (`stageReferencesWritten` is false, so nothing is returned);
+ * - a return assignee is only checked when it differs from the stored one;
+ * - a stage participant id that already appears in the stored ladder
+ *   (`storedExecutionPolicy`) is a legacy reference this write does not
+ *   introduce, so it is not re-validated. This is what keeps a card that
+ *   already holds a phantom participant repairable (round-1 finding
+ *   `legacy-phantom-stage-repair-blocked`): a full-`stages` PATCH that fixes
+ *   one stage and carries the phantom forward untouched in another is not
+ *   blocked. Only the ids that are genuinely new to the stored ladder are
+ *   returned.
+ */
+function collectNewExecutionPolicyAgentReferences(input: {
+  executionPolicy: NormalizedExecutionPolicy | null;
+  storedReturnAssigneeAgentId: string | null;
+  /** False when the write preserves the stored stages (PATCH omitting `stages`). */
+  stageReferencesWritten: boolean;
+  /**
+   * The previously-stored policy, when the write replaces the ladder rather
+   * than preserving it. Used to skip legacy participant ids this write does
+   * not introduce. Absent (or null) on create, where every reference is new.
+   */
+  storedExecutionPolicy?: NormalizedExecutionPolicy | null;
+}): NewExecutionPolicyAgentReference[] {
+  const references: NewExecutionPolicyAgentReference[] = [];
+  if (input.stageReferencesWritten && input.executionPolicy) {
+    const storedAgentIds = new Set<string>();
+    if (input.storedExecutionPolicy) {
+      for (const stage of input.storedExecutionPolicy.stages) {
+        for (const participant of stage.participants) {
+          if (participant.type === "agent" && participant.agentId) {
+            storedAgentIds.add(participant.agentId);
+          }
+        }
+      }
+    }
+    input.executionPolicy.stages.forEach((stage, stageIndex) => {
+      for (const participant of stage.participants) {
+        if (participant.type !== "agent" || !participant.agentId) continue;
+        // A participant id already stored on this issue is not introduced by
+        // this write; skip it so a pre-existing phantom stays repairable.
+        if (storedAgentIds.has(participant.agentId)) continue;
+        references.push({
+          agentId: participant.agentId,
+          stageIndex,
+          stageType: stage.type,
+          isReturnAssignee: false,
+        });
+      }
+    });
+  }
+  const returnAssigneeAgentId = input.executionPolicy?.returnAssigneeAgentId ?? null;
+  if (returnAssigneeAgentId && returnAssigneeAgentId !== input.storedReturnAssigneeAgentId) {
+    references.push({ agentId: returnAssigneeAgentId, isReturnAssignee: true });
+  }
+  return references;
+}
+
+/**
+ * SUP-17410: fail closed when an executionPolicy write would persist a stage
+ * participant (or return assignee) whose `agentId` resolves to no agent in the
+ * issue's company.
+ *
+ * Such a reference is accepted today, and when the stage pointer reaches that
+ * stage it arms on a participant that cannot be dispatched to. Stages at index
+ * > 0 have no re-arm path (`pending_review_rearm` rescues stage 0 only), so the
+ * issue can never close and can never be recovered — it wedges permanently.
+ * The only place the bad policy can still be stopped is the write, so this runs
+ * on the write paths only (issue create, child create, bulk-child create, issue
+ * PATCH), never on a read or a normalize of an already-stored policy.
+ *
+ * The reference is resolved the way the runtime resolves it (existence plus
+ * company membership), so any reference this guard admits is one the runtime can
+ * route to. See `collectNewExecutionPolicyAgentReferences` for the delta scope.
+ */
+async function assertNewExecutionPolicyAgentReferencesResolve(input: {
+  companyId: string;
+  references: NewExecutionPolicyAgentReference[];
+  resolvesInCompany: (agentId: string) => Promise<boolean>;
+}): Promise<void> {
+  if (input.references.length === 0) return;
+  const uniqueAgentIds = Array.from(
+    new Set(input.references.map((reference) => reference.agentId)),
+  );
+  const resolvedByAgentId = new Map<string, boolean>();
+  await Promise.all(
+    uniqueAgentIds.map(async (agentId) => {
+      resolvedByAgentId.set(agentId, await input.resolvesInCompany(agentId));
+    }),
+  );
+  const unresolved = input.references.find(
+    (reference) => !resolvedByAgentId.get(reference.agentId),
+  );
+  if (!unresolved) return;
+
+  if (unresolved.isReturnAssignee) {
+    throw unprocessable(
+      `executionPolicy.returnAssigneeAgentId ${unresolved.agentId} does not resolve to an agent `
+        + `in company ${input.companyId}; the runtime cannot hand the issue back to a non-existent `
+        + "agent. Send an existing agent id in this company, or clear the field.",
+      {
+        field: "returnAssigneeAgentId",
+        agentId: unresolved.agentId,
+        companyId: input.companyId,
+      },
+    );
+  }
+
+  const stageType = unresolved.stageType ?? null;
+  throw unprocessable(
+    `Execution policy stage ${unresolved.stageIndex} (${stageType}) participant agentId `
+      + `${unresolved.agentId} does not resolve to an agent in company ${input.companyId}; the stage `
+      + "would arm on an agent that cannot be dispatched to, and stages after the first have no "
+      + "re-arm path, so the issue could never close. Fix the participant id or remove the stage.",
+    {
+      stageIndex: unresolved.stageIndex ?? null,
+      stageType,
+      agentId: unresolved.agentId,
+      companyId: input.companyId,
+    },
+  );
+}
+
 function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
@@ -4884,6 +5023,29 @@ export function issueRoutes(
     opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
+  // SUP-17410: bind the agent resolver once so every executionPolicy write path
+  // validates the references it introduces against the issue's company. Existence
+  // plus company membership mirrors how the runtime resolves a stage principal.
+  const assertExecutionPolicyAgentReferencesResolve = (input: {
+    companyId: string;
+    executionPolicy: NormalizedExecutionPolicy | null;
+    storedReturnAssigneeAgentId?: string | null;
+    stageReferencesWritten?: boolean;
+    storedExecutionPolicy?: NormalizedExecutionPolicy | null;
+  }) =>
+    assertNewExecutionPolicyAgentReferencesResolve({
+      companyId: input.companyId,
+      references: collectNewExecutionPolicyAgentReferences({
+        executionPolicy: input.executionPolicy,
+        storedReturnAssigneeAgentId: input.storedReturnAssigneeAgentId ?? null,
+        stageReferencesWritten: input.stageReferencesWritten ?? true,
+        storedExecutionPolicy: input.storedExecutionPolicy ?? null,
+      }),
+      resolvesInCompany: async (agentId) => {
+        const agent = await agentsSvc.getById(agentId);
+        return Boolean(agent && agent.companyId === input.companyId);
+      },
+    });
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
@@ -14764,6 +14926,10 @@ export function issueRoutes(
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
       });
+      await assertExecutionPolicyAgentReferencesResolve({
+        companyId,
+        executionPolicy: normalizedExecutionPolicy,
+      });
       const executionPolicy = applyActorMonitorScheduledBy(
         normalizedExecutionPolicy,
         actor.actorType,
@@ -15292,6 +15458,10 @@ export function issueRoutes(
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
       });
+      await assertExecutionPolicyAgentReferencesResolve({
+        companyId: parent.companyId,
+        executionPolicy: normalizedExecutionPolicy,
+      });
       const executionPolicy = applyActorMonitorScheduledBy(
         normalizedExecutionPolicy,
         actor.actorType,
@@ -15533,6 +15703,10 @@ export function issueRoutes(
           executionPolicy: normalizedExecutionPolicy,
           assigneeAgentId:
             (child.assigneeAgentId as string | null | undefined) ?? null,
+        });
+        await assertExecutionPolicyAgentReferencesResolve({
+          companyId: sourceIssue.companyId,
+          executionPolicy: normalizedExecutionPolicy,
         });
         const executionPolicy = applyActorMonitorScheduledBy(
           normalizedExecutionPolicy,
@@ -16503,6 +16677,13 @@ export function issueRoutes(
         companyId: existing.companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: requestedAssigneeAgentId ?? null,
+      });
+      await assertExecutionPolicyAgentReferencesResolve({
+        companyId: existing.companyId,
+        executionPolicy: normalizedExecutionPolicy,
+        storedReturnAssigneeAgentId: previousExecutionPolicy?.returnAssigneeAgentId ?? null,
+        stageReferencesWritten: !stagesKeyAbsent,
+        storedExecutionPolicy: previousExecutionPolicy,
       });
       updateFields.executionPolicy = applyActorMonitorScheduledBy(
         normalizedExecutionPolicy,
