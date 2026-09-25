@@ -21,12 +21,18 @@
  * keeps it that way.
  *
  * The stub mirrors the drizzle read surface route code uses, plus a
- * `transaction` executor that hands the callback the same stub, and resolves
- * every read to zero rows. Modelled on the working inline `mockDb` in
+ * `transaction` executor that hands the callback a separate object branded as
+ * a transaction handle (via `services/db-handle.ts`) while mirroring the same
+ * read surface, and resolves every read to zero rows. Branding the tx (and
+ * leaving the pool stub unbranded) is what lets `isTransactionHandle` tell
+ * the pool apart from a transaction in suite-level fate-sharing tests.
+ * Modelled on the working inline `mockDb` in
  * `issue-assigned-backlog-contract-routes.test.ts`. Test scaffolding only: no
  * production import may reference this helper, and callers cast with
  * `as any` at the call site exactly as they do today.
  */
+
+import { brandAsTransactionHandle } from "../../services/db-handle.js";
 
 type Row = Record<string, unknown>;
 
@@ -71,7 +77,8 @@ export function makeRouteDbStub(): RouteDbStub {
     select: () => ({
       from: () => makeQuery(),
     }),
-    transaction: async (callback) => callback(stub),
+    transaction: async (callback) =>
+      callback(brandAsTransactionHandle({ ...stub })),
   };
   return stub;
 }
