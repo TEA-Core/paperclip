@@ -39,6 +39,7 @@ import {
 import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } from "./local-process-control.js";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
+import { deprioritizeForOom } from "../oom-priority.js";
 import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
 import {
   classifyWorkspaceRestoreFailure,
@@ -4690,7 +4691,24 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               args: [...args],
               env: options.env ?? {},
             });
-            return spawn(command, args, options);
+            const child = spawn(command, args, options);
+            // Agent runs share the Paperclip server's memory cgroup, so a runaway
+            // agent workload competes with the control plane for the kernel's OOM
+            // choice. `oom_score_adj` is inherited across fork and exec, so marking
+            // the provider child here covers its whole tree — the agent's shell and
+            // anything it launches, including a test fleet. Best-effort by design;
+            // see ../oom-priority.ts for why the server cannot instead lower its own.
+            //
+            // Applied SYNCHRONOUSLY, in the narrow window between `spawn()` and the
+            // child doing anything. Deferring it to a later tick loses the mark in
+            // two ways: descendants the child forks in the meantime keep the default
+            // priority (the value is inherited AT fork, not tracked afterwards), and
+            // once the uid-split shim calls setuid the proc entry changes owner, so
+            // a non-root server can no longer write it at all. One small, deferred
+            // /proc write is not worth either gap. The helper never throws, so this
+            // cannot fail the spawn.
+            deprioritizeForOom(child.pid);
+            return child;
           },
           onAgentStderr: prepared.childStderrLogPath
             ? (chunk) => routeChildStderr(childStderrState, chunk)

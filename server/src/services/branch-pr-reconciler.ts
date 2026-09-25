@@ -43,6 +43,32 @@ import { prDeliveryService, type PrDeliveryInput } from "./pr-delivery.js";
  * marker is stamped on every probe outcome — including failure — so a
  * persistently-unresolvable row stops occupying a `limit` slot.
  *
+ * The marker alone bounds only per-TICK work, never the steady-state query rate.
+ * Observed on a production instance, 2026-09-25: 653 candidates, `limit` 50, a sweep every 30s —
+ * so a full cycle took ~6.5 min against a flat 5 min cooldown. Every row was
+ * therefore always due again by the time its turn came round: `rateLimited` was 0
+ * on 120 consecutive sweeps and the reconciler sustained ~6,000 GitHub calls an
+ * hour, above GitHub's 5,000/hr authenticated ceiling, with nothing ever leaving
+ * the candidate set (a branch with no merged PR records nothing, so it stays a
+ * candidate forever).
+ *
+ * So the cooldown is per-row and EXPONENTIAL, keyed on
+ * `metadata.branchPrReconcileMissStreak`: the base window doubles with each
+ * consecutive unproductive outcome and is capped at 24h, and the streak resets to
+ * 0 the moment a product is recorded. Rows that will never resolve become
+ * geometrically cheaper to carry while a branch whose PR merges later is still
+ * picked up within a day.
+ *
+ * Backoff alone would create a second starvation problem. Ordering by the
+ * CHECKED-AT marker is only correct while every row shares one window, because
+ * then the oldest check is also the most due. With per-row windows it is not, and
+ * a rate-limited row is deliberately never re-stamped (that would restart its
+ * clock), so it keeps an old marker and sits at the FRONT of the cursor ahead of
+ * rows that are genuinely due. So each row also carries a PRECOMPUTED due time in
+ * `metadata.branchPrReconcileNextDueAt`, and the query both filters and orders by
+ * it. A sweep therefore reads only rows it may actually probe, and no width of
+ * read window is load-bearing.
+ *
  * Counters are reported as separate fields: `created` (recorded a new product),
  * `skipped` (branch checked, had no merged PR — nothing recorded), and
  * `rateLimited` (within the per-workspace cooldown window; GitHub not
@@ -51,11 +77,135 @@ import { prDeliveryService, type PrDeliveryInput } from "./pr-delivery.js";
  */
 
 const COOLDOWN_KEY = "branchPrReconcileCheckedAt";
+const MISS_STREAK_KEY = "branchPrReconcileMissStreak";
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 const DEFAULT_LIMIT = 50;
+/**
+ * Ceiling on the backed-off window. A row is never abandoned: however many times
+ * it has come back unproductive, it is re-probed at least once a day, so a branch
+ * whose PR is merged long after the fact is still picked up.
+ */
+const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+/** Guard against `2 ** streak` overflowing to Infinity on a corrupt/absurd counter. */
+const MAX_BACKOFF_EXPONENT = 32;
+/**
+ * Precomputed wall-clock time at which a row becomes due again.
+ *
+ * Ordering by the CHECKED-AT marker was correct only while every row shared one
+ * cooldown, because then the oldest check was also the most due. Per-row backoff
+ * breaks that: a row backed off for 24h can hold an older marker than a row
+ * checked ten minutes ago with a five minute window. A rate-limited row is also
+ * deliberately never re-stamped — that would restart its clock — so it keeps its
+ * old marker and stays at the FRONT of an `ASC NULLS FIRST` cursor, ahead of rows
+ * that are genuinely due. Reading a wider window only raises the number of cooled
+ * rows needed to starve a due row; it does not remove the starvation.
+ *
+ * Storing the due time instead makes the database filter and order by DUE-NESS,
+ * so a sweep reads only rows it may actually probe and the starvation cannot
+ * arise. The value is an ISO-8601 UTC string, which compares correctly as TEXT —
+ * no `::timestamptz` cast, so a single malformed row cannot throw for the whole
+ * sweep. Rows written before this key existed have no value; they sort first and
+ * are treated as due, so the backlog converges after one pass.
+ */
+const NEXT_DUE_KEY = "branchPrReconcileNextDueAt";
+
+/**
+ * Canonical `Date.prototype.toISOString()` output, the only form this sweep
+ * writes. MUST stay in step with the regex in the sweep's SQL predicate: the
+ * query selects everything that fails this shape so it can be repaired, and
+ * `isDue` treats the same values as due so the repair actually happens. If the
+ * two drift apart, a row can be selected forever and never re-stamped.
+ *
+ * The component ranges are constrained deliberately, not just the digit counts.
+ * A shape-only rule accepts "2026-09-25T25:00:00.000Z", which is not a real
+ * instant but as TEXT sorts BETWEEN the deadline and the ceiling — so it would
+ * pass every arm of the predicate and strand the row. Constraining month, day,
+ * hour, minute and second closes that, and the ceiling arm covers the rest.
+ *
+ * One narrow case remains by design: a date that is range-valid but not a real
+ * calendar day, such as "2026-02-30T...", is only caught when it happens to sort
+ * outside [deadline, ceiling]. Reaching it would require a value this sweep can
+ * never write landing inside a 24h window, and closing it would mean casting
+ * untrusted text — which can abort the whole sweep for one bad row.
+ */
+const CANONICAL_ISO_UTC = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$/;
+
+/** Consecutive unproductive outcomes recorded on a row, or 0 when absent/corrupt. */
+function readMissStreak(metadata: Record<string, unknown> | null): number {
+  const raw = metadata?.[MISS_STREAK_KEY];
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return 0;
+  return Math.floor(raw);
+}
+
+/**
+ * Is this row due, by the same rule the SQL predicate applies?
+ *
+ * Prefers the STORED due time, so this backstop and the query agree by
+ * construction. Re-deriving the window from the checked-at marker instead would
+ * let the two disagree whenever `cooldownMs` is reconfigured: rows stamped under
+ * the old base would be selected as due by SQL and then rejected here, consuming
+ * a probe slot every sweep without ever being re-stamped — reintroducing, in that
+ * window, exactly the starvation the stored due time exists to prevent.
+ *
+ * Falls back to deriving the window for rows written before the key existed, and
+ * for an unparseable value, which bounds the retry by the derived window rather
+ * than hammering the row. Self-healing depends on the query SELECTING such a row
+ * in the first place, which is why the predicate carries an explicit arm for
+ * non-canonical values; a plain text comparison sorts them after the deadline and
+ * would strand them forever.
+ */
+function isDue(
+  metadata: Record<string, unknown> | null,
+  missStreak: number,
+  nowMs: number,
+  baseCooldownMs: number,
+): boolean {
+  const storedDueAt = metadata?.[NEXT_DUE_KEY];
+  if (storedDueAt !== undefined) {
+    // A stored value is trusted ONLY if it is canonical, parseable, and within the
+    // ceiling this sweep could possibly have written. Anything else present —
+    // a JSON number or object, a non-canonical string, a shape-valid but
+    // calendar-invalid date like "2026-13-01T00:00:00.000Z", or a value further
+    // ahead than MAX_COOLDOWN_MS — is bogus and reads as due, so the row is
+    // probed once and re-stamped in canonical form.
+    //
+    // Every one of those must agree with the SQL predicate's repair arms.
+    // Honouring a value the query selects (or skipping one it never selects)
+    // deadlocks the row in one direction or strands it in the other: it either
+    // occupies a probe slot on every sweep forever, or is never looked at again.
+    if (typeof storedDueAt === "string" && CANONICAL_ISO_UTC.test(storedDueAt)) {
+      const parsed = Date.parse(storedDueAt);
+      if (Number.isFinite(parsed) && parsed <= nowMs + MAX_COOLDOWN_MS) {
+        return parsed <= nowMs;
+      }
+    }
+    return true;
+  }
+  const lastCheckedAt =
+    typeof metadata?.[COOLDOWN_KEY] === "string"
+      ? Date.parse(metadata[COOLDOWN_KEY] as string)
+      : Number.NaN;
+  if (!Number.isFinite(lastCheckedAt)) return true;
+  return nowMs - lastCheckedAt >= effectiveCooldownMs(baseCooldownMs, missStreak);
+}
+
+/**
+ * Effective cooldown for a row: the base window doubled once per consecutive
+ * unproductive outcome, capped at `MAX_COOLDOWN_MS`.
+ *
+ * A FLAT cooldown only bounds per-tick work, never the steady-state query rate:
+ * once the candidate backlog is large enough that a full cycle takes longer than
+ * the window, every row is always due again when its turn comes and the sweep
+ * probes at full rate forever. Backoff bounds the rate instead, because the rows
+ * that will never resolve become geometrically cheaper to carry.
+ */
+function effectiveCooldownMs(baseCooldownMs: number, missStreak: number): number {
+  const exponent = Math.min(missStreak, MAX_BACKOFF_EXPONENT);
+  return Math.min(baseCooldownMs * 2 ** exponent, MAX_COOLDOWN_MS);
+}
 
 export interface BranchPrReconcilerSweepResult {
-  /** Rows in the candidate set this tick (repo + branch + source, no existing pull_request product); equals rateLimited + created + skipped + failed. */
+  /** Rows EXAMINED this tick (repo + branch + source, no existing pull_request product); equals rateLimited + created + skipped + failed. Probes are bounded separately by `limit`. */
   candidates: number;
   /** New pull_request work products recorded from a merged PR on the workspace's own branch. */
   created: number;
@@ -70,7 +220,7 @@ export interface BranchPrReconcilerSweepResult {
 export interface BranchPrReconcilerSweepOptions {
   /** Milliseconds before a given workspace's branch is re-probed. Defaults to 5 min (matches the PR merge-state sweep). */
   cooldownMs?: number;
-  /** Max candidate workspaces inspected per tick. Defaults to 50. */
+  /** Max candidate workspaces probed per tick. Defaults to 50. */
   limit?: number;
   now?: () => Date;
   /** Probe a branch for a merged PR. Defaults to the widened done-transition-guard primitive. */
@@ -128,13 +278,31 @@ export function createBranchPrReconcilerSweepService(
       resolveGitHubTokenForRepo(db, args.companyId, args.owner, args.repo));
   const recordAtOpen = opts.recordAtOpen ?? prDeliveryService(db).recordAtOpen;
 
-  /** Stamps the per-workspace cooldown marker, preserving any existing metadata. Best-effort: a marker failure must not abort the sweep. */
-  async function stampCooldown(row: CandidateRow, nowMs: number): Promise<void> {
+  /**
+   * Stamps the per-workspace cooldown marker and the consecutive-miss counter that
+   * drives the backoff, preserving any existing metadata. Best-effort: a marker
+   * failure must not abort the sweep.
+   *
+   * `nextMissStreak` is 0 on a productive outcome (a product was recorded) and the
+   * incremented streak on every unproductive one (no merged PR, no token, probe or
+   * record error) — those are exactly the outcomes that must get cheaper to retry.
+   */
+  async function stampCooldown(row: CandidateRow, nowMs: number, nextMissStreak: number): Promise<void> {
     const metadata = (row.metadata as Record<string, unknown> | null) ?? {};
+    // Written alongside the marker so the NEXT sweep can select on due-ness in SQL
+    // rather than re-deriving each row's window in JS after reading it.
+    const nextDueAtMs = nowMs + effectiveCooldownMs(cooldownMs, nextMissStreak);
     try {
       await db
         .update(executionWorkspaces)
-        .set({ metadata: { ...metadata, [COOLDOWN_KEY]: new Date(nowMs).toISOString() } })
+        .set({
+          metadata: {
+            ...metadata,
+            [COOLDOWN_KEY]: new Date(nowMs).toISOString(),
+            [MISS_STREAK_KEY]: nextMissStreak,
+            [NEXT_DUE_KEY]: new Date(nextDueAtMs).toISOString(),
+          },
+        })
         .where(eq(executionWorkspaces.id, row.id));
     } catch (error) {
       logger.warn(
@@ -183,28 +351,67 @@ export function createBranchPrReconcilerSweepService(
             WHERE issue_work_products.issue_id = ${executionWorkspaces.sourceIssueId}
               AND issue_work_products.type = 'pull_request'
           )`,
+          // Due-ness, as a TEXT comparison on ISO-8601 UTC values, which sort in
+          // time order. A missing key (rows written before this key existed, or
+          // never checked) reads as due, so the existing backlog converges after
+          // one pass. No `::timestamptz` cast is used, so no value can throw for
+          // the whole sweep.
+          //
+          // The third arm selects any value that is NOT canonical
+          // `Date.toISOString()` output, so a malformed one is repaired rather
+          // than stranded. Without it a text comparison silently sorts garbage
+          // AFTER the deadline — verified against Postgres, where
+          // "not-a-timestamp" and a JSON object both read as not due — so the row
+          // would never be selected again, `isDue` would never run on it, and the
+          // workspace would stay `active` forever with the reaper gate blind,
+          // which is the exact failure this sweep exists to prevent. Selecting it
+          // instead hands it to `isDue`, whose fallback bounds the retry by the
+          // derived window and then re-stamps a well-formed value.
+          //
+          // The fourth arm catches what a SHAPE check cannot: a value that looks
+          // canonical but is not a real instant, such as "2026-13-01T00:00:00.000Z".
+          // Its shape passes, and as text it sorts after the deadline, so without
+          // this it would never be selected and the row would be stranded exactly
+          // as a malformed one was. This sweep can never legitimately write a due
+          // time further ahead than MAX_COOLDOWN_MS, so anything beyond that
+          // ceiling is bogus by construction — which covers invalid months, days
+          // and clock values without casting untrusted text.
+          sql`(
+            ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' IS NULL
+            OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' <= ${new Date(nowMs).toISOString()}
+            OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' !~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{3}Z$'
+            OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' > ${new Date(nowMs + MAX_COOLDOWN_MS).toISOString()}
+          )`,
         ),
       )
-      .orderBy(sql`${executionWorkspaces.metadata} ->> 'branchPrReconcileCheckedAt' ASC NULLS FIRST`)
+      .orderBy(sql`${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' ASC NULLS FIRST`)
       .limit(limit);
 
+    // Probes consumed this tick, bounding GitHub calls. The query already returns
+    // only due rows, so this is a backstop for a stale or unwritable due marker.
+    let probed = 0;
+
     for (const row of rows) {
+      if (probed >= limit) break;
       result.candidates += 1;
 
-      const parsed = parseRepoUrl(row.repoUrl);
-      if (!parsed || !row.branchName || !row.sourceIssueId) {
-        result.failed += 1;
-        await stampCooldown(row, nowMs);
+      // The cooldown gate runs FIRST, before the row is parsed or charged a probe.
+      // It used to sit after the parse check, which meant an unparseable `repoUrl`
+      // was charged a probe slot and re-stamped on EVERY sweep: its miss streak
+      // grew without ever reducing its cost, so the rows least able to make
+      // progress were the most expensive to carry. Backoff has to apply to every
+      // unproductive outcome, including the ones that never reach GitHub.
+      const missStreak = readMissStreak(row.metadata);
+      if (!isDue(row.metadata, missStreak, nowMs, cooldownMs)) {
+        result.rateLimited += 1;
         continue;
       }
 
-      // Per-workspace cooldown: within the window, do not re-query GitHub.
-      const lastCheckedAt =
-        typeof row.metadata?.[COOLDOWN_KEY] === "string"
-          ? Date.parse(row.metadata[COOLDOWN_KEY] as string)
-          : Number.NaN;
-      if (Number.isFinite(lastCheckedAt) && nowMs - lastCheckedAt < cooldownMs) {
-        result.rateLimited += 1;
+      const parsed = parseRepoUrl(row.repoUrl);
+      if (!parsed || !row.branchName || !row.sourceIssueId) {
+        probed += 1;
+        result.failed += 1;
+        await stampCooldown(row, nowMs, missStreak + 1);
         continue;
       }
 
@@ -218,12 +425,14 @@ export function createBranchPrReconcilerSweepService(
           { workspaceId: row.id, reason: tokenResult.reason },
           "branch-to-merged-PR reconciler: no GitHub token resolvable; will retry next sweep",
         );
-        await stampCooldown(row, nowMs);
+        probed += 1;
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.failed += 1;
         continue;
       }
 
       let probe: BranchMergedPrProbe;
+      probed += 1;
       try {
         probe = await probeBranchMergedPr({
           hostname: parsed.hostname,
@@ -237,14 +446,16 @@ export function createBranchPrReconcilerSweepService(
           { err: error, workspaceId: row.id, branch: row.branchName },
           "branch-to-merged-PR reconciler: merged-PR probe failed; will retry next sweep",
         );
-        await stampCooldown(row, nowMs);
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.failed += 1;
         continue;
       }
 
       if (!probe.hasMergedPr || probe.mergedPrNumber === null) {
-        // The branch has no merged PR: record nothing, cool the row down.
-        await stampCooldown(row, nowMs);
+        // The branch has no merged PR: record nothing, cool the row down and widen
+        // its window, since this is the outcome that repeats forever on a row whose
+        // branch will never carry a merged PR.
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.skipped += 1;
         continue;
       }
@@ -261,15 +472,21 @@ export function createBranchPrReconcilerSweepService(
           headSha: null,
           url: `https://${parsed.hostname}/${repository}/pull/${probe.mergedPrNumber}`,
         });
-        await stampCooldown(row, nowMs);
-        if (recorded.writtenIssueIds.length > 0) result.created += 1;
+        // Reset the streak only when a product was actually WRITTEN. An empty
+        // `writtenIssueIds` means nothing was recorded, so the row stays a
+        // candidate: resetting there would return it to the base cadence and let
+        // an endlessly unproductive record path probe every five minutes forever,
+        // which is the cost backoff exists to bound.
+        const wroteProduct = recorded.writtenIssueIds.length > 0;
+        await stampCooldown(row, nowMs, wroteProduct ? 0 : missStreak + 1);
+        if (wroteProduct) result.created += 1;
         else result.skipped += 1;
       } catch (error) {
         logger.warn(
           { err: error, workspaceId: row.id, branch: row.branchName },
           "branch-to-merged-PR reconciler: failed to record pull_request work product; will retry next sweep",
         );
-        await stampCooldown(row, nowMs);
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.failed += 1;
       }
     }
