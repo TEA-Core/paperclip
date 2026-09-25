@@ -491,7 +491,7 @@ function gapActivityInputs() {
   // error-propagating, transactional logger). Asserting against that call is what
   // proves the signals are no longer fire-and-forget.
   return mockLogActivityInTransaction.mock.calls
-    .map((call) => call[1] as Record<string, unknown> | undefined)
+    .map((call) => (call as unknown[])[1] as Record<string, unknown> | undefined)
     .filter((input): input is Record<string, unknown> =>
       typeof input?.action === "string" && input.action.includes("missing_approval_stage"));
 }
