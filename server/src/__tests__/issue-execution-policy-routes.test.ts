@@ -3429,6 +3429,97 @@ describe("issue execution policy routes", () => {
       expect(mockIssueService.update).toHaveBeenCalled();
     });
 
+    it("accepts a full-stages PATCH that repairs one stage while preserving a legacy phantom in another", async () => {
+      // Round-1 finding legacy-phantom-stage-repair-blocked: a card already
+      // wedged with a phantom participant (SUP-16903) must stay repairable. A
+      // PATCH that sends the full `stages` array, fixes one stage, and carries
+      // the phantom forward untouched in a stage the repair does not touch must
+      // not re-validate the preserved legacy id and 422 the repair.
+      programPatchTarget(
+        issueFixture({
+          executionPolicy: {
+            mode: "normal",
+            stages: [
+              {
+                id: "c16093a9-9b47-40a9-8c2d-3e4bcd6c496e",
+                type: "review",
+                participants: [
+                  { id: "4a3f7748-7618-4f44-8d13-5877be64d311", type: "agent", agentId: PHANTOM_AGENT_ID },
+                ],
+              },
+              {
+                id: "d26093a9-9b47-40a9-8c2d-3e4bcd6c496e",
+                type: "approval",
+                participants: [
+                  { id: "5b4f7748-7618-4f44-8d13-5877be64d311", type: "agent", agentId: APPROVER_AGENT_ID },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const res = await patchPolicy({
+        stages: [
+          // Unchanged: the legacy phantom is preserved in place.
+          { type: "review", participants: [{ type: "agent", agentId: PHANTOM_AGENT_ID }] },
+          // Repaired: a valid agent newly introduced for this stage.
+          { type: "approval", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+        ],
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("still rejects a newly introduced foreign-company agent id in a full-stages PATCH that preserves a legacy phantom", async () => {
+      // The delta is prospective: a *newly introduced* id that exists but lives
+      // in a different company is rejected even when the same write preserves a
+      // legacy phantom elsewhere in the ladder.
+      programPatchTarget(
+        issueFixture({
+          executionPolicy: {
+            mode: "normal",
+            stages: [
+              {
+                id: "c16093a9-9b47-40a9-8c2d-3e4bcd6c496e",
+                type: "review",
+                participants: [
+                  { id: "4a3f7748-7618-4f44-8d13-5877be64d311", type: "agent", agentId: PHANTOM_AGENT_ID },
+                ],
+              },
+              {
+                id: "d26093a9-9b47-40a9-8c2d-3e4bcd6c496e",
+                type: "approval",
+                participants: [
+                  { id: "5b4f7748-7618-4f44-8d13-5877be64d311", type: "agent", agentId: APPROVER_AGENT_ID },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const res = await patchPolicy({
+        stages: [
+          // Preserved legacy phantom: not re-validated.
+          { type: "review", participants: [{ type: "agent", agentId: PHANTOM_AGENT_ID }] },
+          // New foreign-company id: must be rejected.
+          { type: "approval", participants: [{ type: "agent", agentId: OTHER_COMPANY_AGENT_ID }] },
+        ],
+      });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain(OTHER_COMPANY_AGENT_ID);
+      expect(res.body.details).toMatchObject({
+        stageIndex: 1,
+        stageType: "approval",
+        agentId: OTHER_COMPANY_AGENT_ID,
+        companyId: "company-1",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("rejects a create whose participant agentId resolves to no agent", async () => {
       const res = await request(await createApp())
         .post("/api/companies/company-1/issues")

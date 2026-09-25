@@ -3288,22 +3288,50 @@ type NewExecutionPolicyAgentReference = {
  *
  * Delta-only by design. A write that does not introduce a reference is not
  * checked, so an issue already carrying a phantom participant (SUP-16903) is
- * never made less mutable by this guard: a PATCH that omits the `stages` key
- * preserves the stored ladder untouched, and an unchanged return assignee is
- * not re-validated. Only the references that would land as a result of this
- * write are returned.
+ * never made less mutable by this guard:
+ *
+ * - a PATCH that omits the `stages` key preserves the stored ladder untouched
+ *   (`stageReferencesWritten` is false, so nothing is returned);
+ * - a return assignee is only checked when it differs from the stored one;
+ * - a stage participant id that already appears in the stored ladder
+ *   (`storedExecutionPolicy`) is a legacy reference this write does not
+ *   introduce, so it is not re-validated. This is what keeps a card that
+ *   already holds a phantom participant repairable (round-1 finding
+ *   `legacy-phantom-stage-repair-blocked`): a full-`stages` PATCH that fixes
+ *   one stage and carries the phantom forward untouched in another is not
+ *   blocked. Only the ids that are genuinely new to the stored ladder are
+ *   returned.
  */
 function collectNewExecutionPolicyAgentReferences(input: {
   executionPolicy: NormalizedExecutionPolicy | null;
   storedReturnAssigneeAgentId: string | null;
   /** False when the write preserves the stored stages (PATCH omitting `stages`). */
   stageReferencesWritten: boolean;
+  /**
+   * The previously-stored policy, when the write replaces the ladder rather
+   * than preserving it. Used to skip legacy participant ids this write does
+   * not introduce. Absent (or null) on create, where every reference is new.
+   */
+  storedExecutionPolicy?: NormalizedExecutionPolicy | null;
 }): NewExecutionPolicyAgentReference[] {
   const references: NewExecutionPolicyAgentReference[] = [];
   if (input.stageReferencesWritten && input.executionPolicy) {
+    const storedAgentIds = new Set<string>();
+    if (input.storedExecutionPolicy) {
+      for (const stage of input.storedExecutionPolicy.stages) {
+        for (const participant of stage.participants) {
+          if (participant.type === "agent" && participant.agentId) {
+            storedAgentIds.add(participant.agentId);
+          }
+        }
+      }
+    }
     input.executionPolicy.stages.forEach((stage, stageIndex) => {
       for (const participant of stage.participants) {
         if (participant.type !== "agent" || !participant.agentId) continue;
+        // A participant id already stored on this issue is not introduced by
+        // this write; skip it so a pre-existing phantom stays repairable.
+        if (storedAgentIds.has(participant.agentId)) continue;
         references.push({
           agentId: participant.agentId,
           stageIndex,
@@ -5003,6 +5031,7 @@ export function issueRoutes(
     executionPolicy: NormalizedExecutionPolicy | null;
     storedReturnAssigneeAgentId?: string | null;
     stageReferencesWritten?: boolean;
+    storedExecutionPolicy?: NormalizedExecutionPolicy | null;
   }) =>
     assertNewExecutionPolicyAgentReferencesResolve({
       companyId: input.companyId,
@@ -5010,6 +5039,7 @@ export function issueRoutes(
         executionPolicy: input.executionPolicy,
         storedReturnAssigneeAgentId: input.storedReturnAssigneeAgentId ?? null,
         stageReferencesWritten: input.stageReferencesWritten ?? true,
+        storedExecutionPolicy: input.storedExecutionPolicy ?? null,
       }),
       resolvesInCompany: async (agentId) => {
         const agent = await agentsSvc.getById(agentId);
@@ -16653,6 +16683,7 @@ export function issueRoutes(
         executionPolicy: normalizedExecutionPolicy,
         storedReturnAssigneeAgentId: previousExecutionPolicy?.returnAssigneeAgentId ?? null,
         stageReferencesWritten: !stagesKeyAbsent,
+        storedExecutionPolicy: previousExecutionPolicy,
       });
       updateFields.executionPolicy = applyActorMonitorScheduledBy(
         normalizedExecutionPolicy,
