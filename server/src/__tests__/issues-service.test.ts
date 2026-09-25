@@ -8450,6 +8450,18 @@ describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance
       requireBoardApprovalForNewAgents: false,
     });
 
+    await db.insert(agents).values({
+      id: defaultPolicyAgentId,
+      companyId,
+      name: "Default policy reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
     await db.insert(projects).values({
       id: projectId,
       companyId,
@@ -8502,6 +8514,109 @@ describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance
     expect(issue.executionPolicy).toBeNull();
   });
 
+  it("rejects an unresolved participant in an inherited project default", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const invalidAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Invalid policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId: invalidAgentId, userId: null }],
+          },
+        ],
+      } as unknown as Record<string, unknown>,
+    });
+
+    await expect(
+      svc.create(companyId, {
+        projectId,
+        title: "Issue with unresolved inherited participant",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { stageIndex: 0, agentId: invalidAgentId },
+    });
+  });
+
+  it("rejects an inherited participant belonging to another company", async () => {
+    const companyId = randomUUID();
+    const foreignCompanyId = randomUUID();
+    const projectId = randomUUID();
+    const foreignAgentId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: foreignCompanyId,
+        name: "Other company",
+        issuePrefix: `T${foreignCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: foreignCompanyId,
+      name: "Foreign policy reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Foreign policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId: foreignAgentId, userId: null }],
+          },
+        ],
+      } as unknown as Record<string, unknown>,
+    });
+
+    await expect(
+      svc.create(companyId, {
+        projectId,
+        title: "Issue with foreign inherited participant",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { stageIndex: 0, agentId: foreignAgentId, companyId },
+    });
+  });
+
   it("does not override an explicitly provided executionPolicy with the project default", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -8516,6 +8631,18 @@ describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance
       requireBoardApprovalForNewAgents: false,
     });
 
+    await db.insert(agents).values({
+      id: explicitReviewerAgentId,
+      companyId,
+      name: "Explicit policy reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
     await db.insert(projects).values({
       id: projectId,
       companyId,
@@ -8527,7 +8654,7 @@ describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance
     const issue = await svc.create(companyId, {
       projectId,
       title: "Issue with explicit policy",
-      executionPolicy: explicitPolicy,
+      executionPolicy: explicitPolicy as unknown as Record<string, unknown>,
     });
 
     expect(issue.executionPolicy).toMatchObject({
@@ -8577,9 +8704,10 @@ describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inh
     commentRequired: true,
     stages: [
       {
+        id: randomUUID(),
         type: "review",
         approvalsNeeded: 1,
-        participants: [{ type: "agent", agentId: companyPolicyAgentId, userId: null }],
+        participants: [{ type: "agent", agentId: companyPolicyAgentId, userId: null, id: randomUUID() }],
       },
     ],
   };
@@ -8593,6 +8721,18 @@ describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inh
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultExecutionPolicy: companyPolicy as unknown as Record<string, unknown>,
+    });
+
+    await db.insert(agents).values({
+      id: companyPolicyAgentId,
+      companyId,
+      name: "Company policy reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
     });
 
     const issue = await svc.create(companyId, {
@@ -8610,6 +8750,39 @@ describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inh
           participants: [expect.objectContaining({ type: "agent", agentId: companyPolicyAgentId })],
         },
       ],
+    });
+  });
+
+  it("rejects an unresolved participant in an inherited company default", async () => {
+    const companyId = randomUUID();
+    const invalidAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId: invalidAgentId, userId: null }],
+          },
+        ],
+      } as unknown as Record<string, unknown>,
+    });
+
+    await expect(
+      svc.create(companyId, {
+        projectId: null,
+        title: "Issue with unresolved company participant",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { stageIndex: 0, agentId: invalidAgentId, companyId },
     });
   });
 
@@ -8641,9 +8814,10 @@ describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inh
       commentRequired: true,
       stages: [
         {
+          id: randomUUID(),
           type: "review",
           approvalsNeeded: 1,
-          participants: [{ type: "agent", agentId: projectPolicyAgentId, userId: null }],
+          participants: [{ type: "agent", agentId: projectPolicyAgentId, userId: null, id: randomUUID() }],
         },
       ],
     };
@@ -8663,6 +8837,31 @@ describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inh
       status: "in_progress",
       defaultExecutionPolicy: projectPolicy as unknown as Record<string, unknown>,
     });
+
+    await db.insert(agents).values([
+      {
+        id: companyPolicyAgentId,
+        companyId,
+        name: "Company policy reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: projectPolicyAgentId,
+        companyId,
+        name: "Project policy reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
 
     const issue = await svc.create(companyId, {
       projectId,

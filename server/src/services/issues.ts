@@ -7035,6 +7035,61 @@ export function guardBRefusalCommentLockKey(issueId: string): string {
   return `issue-comment:guard-b-arming-refusal:${issueId}`;
 }
 
+async function assertIssueExecutionPolicyAgentReferencesResolve(
+  db: Pick<Db, "select">,
+  companyId: string,
+  policy: ReturnType<typeof normalizeIssueExecutionPolicy>,
+): Promise<void> {
+  if (!policy) return;
+
+  const references = policy.stages.flatMap((stage, stageIndex) =>
+    stage.participants.flatMap((participant) =>
+      participant.type === "agent" && participant.agentId
+        ? [{ agentId: participant.agentId, stageIndex, stageType: stage.type }]
+        : [],
+    ),
+  );
+  if (policy.returnAssigneeAgentId) {
+    references.push({
+      agentId: policy.returnAssigneeAgentId,
+      stageIndex: -1,
+      stageType: "review",
+    });
+  }
+  if (references.length === 0) return;
+
+  const agentIds = [...new Set(references.map((reference) => reference.agentId))];
+  const resolvedAgentIds = new Set(
+    await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds)))
+      .then((rows) => rows.map((row) => row.id)),
+  );
+  const unresolved = references.find((reference) => !resolvedAgentIds.has(reference.agentId));
+  if (!unresolved) return;
+
+  if (unresolved.stageIndex === -1) {
+    throw unprocessable(
+      `executionPolicy.returnAssigneeAgentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
+      {
+        field: "returnAssigneeAgentId",
+        agentId: unresolved.agentId,
+        companyId,
+      },
+    );
+  }
+  throw unprocessable(
+    `Execution policy stage ${unresolved.stageIndex} (${unresolved.stageType}) participant agentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
+    {
+      stageIndex: unresolved.stageIndex,
+      stageType: unresolved.stageType,
+      agentId: unresolved.agentId,
+      companyId,
+    },
+  );
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -10721,6 +10776,11 @@ export function issueService(db: Db) {
             issueData.executionPolicy = normalized as unknown as Record<string, unknown>;
           }
         }
+        await assertIssueExecutionPolicyAgentReferencesResolve(
+          tx,
+          companyId,
+          normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null),
+        );
         // Cache the project policy lookup for this insert so the default
         // workspace-settings block does not re-query the project row.
         let projectPolicyCached: ReturnType<
