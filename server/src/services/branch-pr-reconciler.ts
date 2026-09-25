@@ -109,6 +109,15 @@ const MAX_BACKOFF_EXPONENT = 32;
  */
 const NEXT_DUE_KEY = "branchPrReconcileNextDueAt";
 
+/**
+ * Canonical `Date.prototype.toISOString()` output, the only form this sweep
+ * writes. MUST stay in step with the regex in the sweep's SQL predicate: the
+ * query selects everything that fails this shape so it can be repaired, and
+ * `isDue` treats the same values as due so the repair actually happens. If the
+ * two drift apart, a row can be selected forever and never re-stamped.
+ */
+const CANONICAL_ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
 /** Consecutive unproductive outcomes recorded on a row, or 0 when absent/corrupt. */
 function readMissStreak(metadata: Record<string, unknown> | null): number {
   const raw = metadata?.[MISS_STREAK_KEY];
@@ -127,8 +136,11 @@ function readMissStreak(metadata: Record<string, unknown> | null): number {
  * window, exactly the starvation the stored due time exists to prevent.
  *
  * Falls back to deriving the window for rows written before the key existed, and
- * treats a missing or unparseable value as due: the row is then probed once and
- * re-stamped with a well-formed value, so a corrupt row self-heals.
+ * for an unparseable value, which bounds the retry by the derived window rather
+ * than hammering the row. Self-healing depends on the query SELECTING such a row
+ * in the first place, which is why the predicate carries an explicit arm for
+ * non-canonical values; a plain text comparison sorts them after the deadline and
+ * would strand them forever.
  */
 function isDue(
   metadata: Record<string, unknown> | null,
@@ -137,10 +149,19 @@ function isDue(
   baseCooldownMs: number,
 ): boolean {
   const storedDueAt = metadata?.[NEXT_DUE_KEY];
-  if (typeof storedDueAt === "string") {
+  // Only a CANONICAL value is trusted as a due time. A non-canonical one is
+  // treated as due so it is repaired on the next pass, which is what keeps this
+  // in step with the SQL predicate's repair arm. Honouring a parseable but
+  // non-canonical value instead (for example a seconds-precision
+  // "2026-12-01T10:00:00Z") would deadlock the row: the query selects it because
+  // it is not canonical, this gate rejects it because it parses to a future time,
+  // and it is never re-stamped — so it occupies a probe slot on every sweep,
+  // forever.
+  if (typeof storedDueAt === "string" && CANONICAL_ISO_UTC.test(storedDueAt)) {
     const parsed = Date.parse(storedDueAt);
     if (Number.isFinite(parsed)) return parsed <= nowMs;
   }
+  if (typeof storedDueAt === "string") return true;
   const lastCheckedAt =
     typeof metadata?.[COOLDOWN_KEY] === "string"
       ? Date.parse(metadata[COOLDOWN_KEY] as string)
@@ -314,18 +335,23 @@ export function createBranchPrReconcilerSweepService(
           // Due-ness, as a TEXT comparison on ISO-8601 UTC values, which sort in
           // time order. A missing key (rows written before this key existed, or
           // never checked) reads as due, so the existing backlog converges after
-          // one pass.
+          // one pass. No `::timestamptz` cast is used, so no value can throw for
+          // the whole sweep.
           //
-          // No `::timestamptz` cast is used, so no value can throw for the whole
-          // sweep. Verified against Postgres on every shape this column could
-          // hold: a non-timestamp string and a JSON object both sort after the
-          // deadline and read as NOT due, while a bare number sorts before it and
-          // reads as due. Neither outcome is harmful — only this sweep writes the
-          // key, always as an ISO string, and a value read as due is simply probed
-          // once and re-stamped correctly, so a corrupt row self-heals.
+          // The third arm selects any value that is NOT canonical
+          // `Date.toISOString()` output, so a malformed one is repaired rather
+          // than stranded. Without it a text comparison silently sorts garbage
+          // AFTER the deadline — verified against Postgres, where
+          // "not-a-timestamp" and a JSON object both read as not due — so the row
+          // would never be selected again, `isDue` would never run on it, and the
+          // workspace would stay `active` forever with the reaper gate blind,
+          // which is the exact failure this sweep exists to prevent. Selecting it
+          // instead hands it to `isDue`, whose fallback bounds the retry by the
+          // derived window and then re-stamps a well-formed value.
           sql`(
             ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' IS NULL
             OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' <= ${new Date(nowMs).toISOString()}
+            OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$'
           )`,
         ),
       )

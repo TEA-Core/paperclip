@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 import { describe, expect, it, vi } from "vitest";
 import {
   createBranchPrReconcilerSweepService,
@@ -640,5 +642,136 @@ describe("createBranchPrReconcilerSweepService", () => {
     // Re-stamped with a well-formed ISO value.
     const metadata = updates[0].set.metadata as Record<string, unknown>;
     expect(Number.isFinite(Date.parse(metadata.branchPrReconcileNextDueAt as string))).toBe(true);
+  });
+
+  /**
+   * A parseable but NON-canonical due time (seconds precision, no milliseconds)
+   * must be treated as due, not honoured.
+   *
+   * The SQL predicate selects it, because it selects everything that is not
+   * canonical so malformed values get repaired rather than stranded. If this gate
+   * honoured it instead, the row would deadlock: selected by the query every
+   * sweep, rejected here as a future time, never re-stamped — occupying a probe
+   * slot forever. The two rules have to agree on what "canonical" means.
+   */
+  it("repairs a parseable but non-canonical due time instead of honouring it", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        // Valid to Date.parse, far in the future, but not toISOString() output.
+        metadata: { branchPrReconcileNextDueAt: "2026-12-01T10:00:00Z" },
+      }),
+    ]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.rateLimited).toBe(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+    // Rewritten in canonical form, so the next sweep can trust it.
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(metadata.branchPrReconcileNextDueAt).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+    );
+  });
+
+  it("still honours a canonical future due time", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: { branchPrReconcileNextDueAt: new Date(NOW + 30 * 60 * 1000).toISOString() },
+      }),
+    ]];
+    const { db } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    expect((await service.sweep()).rateLimited).toBe(1);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The canonical-form rule is written twice: once as a TypeScript regex for
+   * `isDue`, once as a POSIX regex inside the sweep's SQL predicate. They are a
+   * matched pair — the query selects everything the shape rejects so it can be
+   * repaired, and `isDue` treats the same values as due so the repair happens.
+   *
+   * If they drift apart the failure is silent and permanent in one direction
+   * (a value the query never selects is never repaired) and a per-sweep leak in
+   * the other (a value the query always selects but the gate always rejects
+   * occupies a probe slot forever). Neither shows up as a test failure anywhere
+   * else, so the agreement is asserted directly.
+   */
+  it("keeps the TypeScript and SQL canonical-form rules in agreement", async () => {
+    const source = await readFile(
+      new URL("./branch-pr-reconciler.ts", import.meta.url),
+      "utf8",
+    );
+
+    const tsMatch = source.match(/const CANONICAL_ISO_UTC = \/(.+?)\/;/);
+    expect(tsMatch, "CANONICAL_ISO_UTC literal not found").not.toBeNull();
+    const tsRe = new RegExp(tsMatch![1]);
+
+    const sqlMatch = source.match(/!~ '(\^.+?\$)'/);
+    expect(sqlMatch, "SQL canonical-form regex not found").not.toBeNull();
+    // POSIX bracket forms -> JS equivalents; the shapes are otherwise identical.
+    const sqlRe = new RegExp(sqlMatch![1].replace(/\[\.\]/g, "\\."));
+
+    // Chosen to DISCRIMINATE, not merely to pass: each near-miss differs from
+    // canonical in exactly one component, so a loosened quantifier or a dropped
+    // anchor on either side shows up as a disagreement.
+    const samples = [
+      new Date(NOW).toISOString(),
+      "2026-09-25T10:00:00.000Z",
+      "2026-12-01T10:00:00Z",
+      "2026-09-25T10:00:00.0Z",
+      "2026-09-25T10:00:00.00Z",
+      "2026-09-25T10:00:00.0000Z",
+      "2026-09-25T10:00:00.000z",
+      "2026-09-25T10:00:00.000",
+      " 2026-09-25T10:00:00.000Z",
+      "2026-09-25T10:00:00.000Z ",
+      "x2026-09-25T10:00:00.000Z",
+      "2026-09-25T10:00:00.000Zx",
+      "2026-09-25 10:00:00.000Z",
+      "20260925T100000.000Z",
+      "not-a-timestamp",
+      "",
+      "12345",
+      "2026-09-25T10:00:00.000+02:00",
+      "2026-9-25T10:00:00.000Z",
+    ];
+    for (const sample of samples) {
+      expect(sqlRe.test(sample), `disagreement on ${JSON.stringify(sample)}`).toBe(
+        tsRe.test(sample),
+      );
+    }
+    // Sanity: the pair actually discriminates rather than matching everything.
+    expect(tsRe.test(new Date(NOW).toISOString())).toBe(true);
+    expect(tsRe.test("2026-12-01T10:00:00Z")).toBe(false);
   });
 });
