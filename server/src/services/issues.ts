@@ -2034,6 +2034,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   actorRunId?: string | null;
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
+  trustExplicitExecutionPolicy?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
@@ -10360,6 +10361,7 @@ export function issueService(db: Db) {
         actorRunId,
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
+        trustExplicitExecutionPolicy,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
@@ -10393,7 +10395,13 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       if (Object.prototype.hasOwnProperty.call(issueData, "executionPolicy")) {
-        const normalizedPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null);
+        // SUP-17459: trusted internal callers (routine dispatch) mark an
+        // explicitly-empty policy so it stays a real "no ladder" policy
+        // instead of collapsing to null and re-inheriting the project default.
+        const normalizedPolicy = normalizeIssueExecutionPolicy(
+          issueData.executionPolicy ?? null,
+          { preserveEmptyPolicy: trustExplicitExecutionPolicy === true },
+        );
         issueData.executionPolicy = (normalizedPolicy as Record<string, unknown> | null) ?? null;
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });

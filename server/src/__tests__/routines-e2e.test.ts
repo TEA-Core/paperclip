@@ -551,6 +551,131 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     expect(issue?.executionPolicy ?? null).toBeNull();
   }, 15_000);
 
+  it("honors an explicit empty routine ladder as no ladder on the card (SUP-17459)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+
+    // The project carries a review ladder so "inherit the project default"
+    // and "no ladder" are observably different on the materialised card.
+    await db
+      .update(projects)
+      .set({
+        defaultExecutionPolicy: {
+          mode: "normal",
+          stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+        },
+      })
+      .where(eq(projects.id, projectId));
+
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "No-ladder sweep routine",
+        assigneeAgentId: agentId,
+        executionPolicy: { mode: "normal", stages: [] },
+      });
+    expect([200, 201]).toContain(createRes.status);
+    expect(createRes.body.executionPolicy.stages).toHaveLength(0);
+
+    const detailRes = await request(app).get(`/api/routines/${createRes.body.id}`);
+    expect(detailRes.status).toBe(200);
+    expect(detailRes.body.executionPolicy.stages).toHaveLength(0);
+
+    const runRes = await postRoutineRun(app, createRes.body.id, { source: "manual" });
+    expect(runRes.status).toBe(202);
+    expect(runRes.body.status).toBe("issue_created");
+
+    const [issue] = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+
+    type LadderStage = {
+      type: string;
+      participants?: Array<{ type: string; agentId?: string | null }>;
+    };
+    const cardPolicy = issue?.executionPolicy as { stages?: LadderStage[] } | null | undefined;
+    // The card carries a real, non-null empty policy: no review stage, so the
+    // assignee can close the card itself instead of the project default ladder.
+    expect(cardPolicy).not.toBeNull();
+    expect(cardPolicy!.stages).toEqual([]);
+  }, 15_000);
+
+  it("inherits the project default when a routine executionPolicy is PATCHed back to null (SUP-17459)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+
+    await db
+      .update(projects)
+      .set({
+        defaultExecutionPolicy: {
+          mode: "normal",
+          stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+        },
+      })
+      .where(eq(projects.id, projectId));
+
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Laddered routine",
+        assigneeAgentId: agentId,
+        executionPolicy: {
+          mode: "normal",
+          stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+        },
+      });
+    expect([200, 201]).toContain(createRes.status);
+    const routineId = createRes.body.id as string;
+
+    const clearRes = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ executionPolicy: null });
+    expect(clearRes.status).toBe(200);
+    expect(clearRes.body.executionPolicy ?? null).toBeNull();
+
+    const detailRes = await request(app).get(`/api/routines/${routineId}`);
+    expect(detailRes.body.executionPolicy ?? null).toBeNull();
+
+    const runRes = await postRoutineRun(app, routineId, { source: "manual" });
+    expect(runRes.status).toBe(202);
+    expect(runRes.body.status).toBe("issue_created");
+
+    const [issue] = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+
+    type LadderStage = {
+      type: string;
+      participants?: Array<{ type: string; agentId?: string | null }>;
+    };
+    const cardPolicy = issue?.executionPolicy as { stages?: LadderStage[] } | null | undefined;
+    // A null routine policy means "inherit the project default" — the card is
+    // born with the project's review ladder, exactly as before this feature.
+    expect(cardPolicy).not.toBeNull();
+    const stages = cardPolicy!.stages ?? [];
+    expect(stages).toHaveLength(1);
+    expect(stages[0]?.type).toBe("review");
+    expect(stages[0]?.participants?.[0]?.agentId ?? null).toBe(agentId);
+  }, 15_000);
+
   it("runs routines with variable inputs and interpolates the execution issue description", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
     const app = await createApp({
