@@ -39,6 +39,7 @@ import {
 import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } from "./local-process-control.js";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
+import { deprioritizeForOom } from "../oom-priority.js";
 import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
 import {
   classifyWorkspaceRestoreFailure,
@@ -4690,7 +4691,21 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               args: [...args],
               env: options.env ?? {},
             });
-            return spawn(command, args, options);
+            const child = spawn(command, args, options);
+            // Agent runs share the Paperclip server's memory cgroup, so a runaway
+            // agent workload competes with the control plane for the kernel's OOM
+            // choice. `oom_score_adj` is inherited across fork and exec, so marking
+            // the provider child here covers its whole tree — the agent's shell and
+            // anything it launches, including a test fleet. Best-effort by design;
+            // see ../oom-priority.ts for why the server cannot instead lower its own.
+            //
+            // Deferred to the next tick so this stays strictly off the spawn path:
+            // `spawnAgent` returns the child exactly as it did before, and the
+            // adjustment lands a tick later — still many orders of magnitude before
+            // any memory pressure the mark is meant to survive. If the child is
+            // already gone by then the write no-ops, which is the correct outcome.
+            setImmediate(() => deprioritizeForOom(child.pid));
+            return child;
           },
           onAgentStderr: prepared.childStderrLogPath
             ? (chunk) => routeChildStderr(childStderrState, chunk)
