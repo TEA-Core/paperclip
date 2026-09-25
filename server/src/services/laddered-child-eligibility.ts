@@ -41,9 +41,10 @@ import { labels, type Db } from "@paperclipai/db";
  *     immutable afterwards, so it is known on both write paths.
  *   - a procedural edge (ADR-103 M2, `parent_link_kind = 'process'`) — the kind
  *     is declared by the write itself.
- *   - a carve-out label (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177) — the
- *     labels are on the create payload (`labelIds`) and on the PATCH body, and
- *     the stored set is on the child row, so both write paths can resolve them.
+ *   - a carve-out label (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177 /
+ *     SUP-17553) — the labels are on the create payload (`labelIds`) and on the
+ *     PATCH body, and the stored set is on the child row, so both write paths
+ *     can resolve them.
  *     See {@link LADDERED_CHILD_CARVE_OUT_LABEL_NAMES} and
  *     {@link edgeCarriesLadderCarveOutLabel}. Round 1 of this fix mirrored only
  *     the first three and left this one out, which kept the original defect
@@ -121,8 +122,15 @@ import { labels, type Db } from "@paperclipai/db";
  * slice of the parent's deliverable. Two such children silently arm mechanism D
  * on an otherwise-normal work card and can make its final `paperclip/approved`
  * transition unreachable.
+ * SUP-17553 — `work-type:recovery`: a recovery card (the SUP-17489 / SUP-17485
+ * shape over SUP-17292) filed to restore an execution path, review write grant,
+ * or other platform state after a rough round. Like `work-type:process` it gates
+ * no slice of the parent's deliverable, so it must not arm the parent's close
+ * ladder. This company carries `work-type:recovery` as its procedural label (it
+ * has no `work-type:process` label at all), so adding the name here is what
+ * makes the label carve-out route reachable there.
  *
- * All four are matched by NAME and resolved company-scoped, because the label id
+ * All five are matched by NAME and resolved company-scoped, because the label id
  * is company-scoped and these predicates are not. The carve-out is label-gated,
  * not column-gated: a child whose edge is `process` but which carries no label
  * is excluded by the `parent_link_kind` arm instead, and a child carrying any of
@@ -134,6 +142,7 @@ export const LADDERED_CHILD_CARVE_OUT_LABEL_NAMES = [
   "work-type:delivery",
   "work-type:architecture-review",
   "work-type:process",
+  "work-type:recovery",
 ] as const;
 
 export type LadderArmingParentEdge = {
