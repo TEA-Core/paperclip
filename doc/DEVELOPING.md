@@ -380,6 +380,8 @@ The root config therefore bounds the pool itself. The default is 4 workers, clam
 
 Raise it only for a run that owns the machine. Do not raise it for a run inside the Paperclip server container: agent runs share the server's memory cgroup, so an oversized worker fleet can get the control plane OOM-killed.
 
+This limit bounds how many workers run, not how large each one grows. A per-worker JS heap ceiling cannot be set from the root config: the pool size is global, but worker spawn arguments (`execArgv`) resolve per project, so a value set at the root never reaches the workers. The memory budget therefore rests on the worker count. Four workers against the worst observed worker size stays under the container limit, but not by much, so the agent subprocess OOM priority below is the complementary guard rather than an optional extra.
+
 `pnpm test` runs through `scripts/run-vitest-stable.mjs`, which shards deliberately and keeps the server lane serial. That path is unaffected by this limit.
 
 ### Task search evaluation

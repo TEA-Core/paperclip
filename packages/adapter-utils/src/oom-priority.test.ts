@@ -30,6 +30,20 @@ describe("resolveAgentOomScoreAdj", () => {
       DEFAULT_AGENT_OOM_SCORE_ADJ,
     );
   });
+
+  /**
+   * `Number.parseInt` stops at the first non-numeric character, so a partial
+   * value would be read as a number the operator never wrote: "0.5" as 0 (which
+   * silently DISABLES the adjustment) and "500MB" as 500. Both must fall back to
+   * the documented default instead.
+   */
+  it("rejects a partially numeric value instead of parsing its prefix", () => {
+    for (const raw of ["0.5", "500MB", "1e3", "4 workers", "+500", "0x10"]) {
+      expect(resolveAgentOomScoreAdj({ PAPERCLIP_AGENT_OOM_SCORE_ADJ: raw })).toBe(
+        DEFAULT_AGENT_OOM_SCORE_ADJ,
+      );
+    }
+  });
 });
 
 describe("deprioritizeForOom", () => {

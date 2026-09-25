@@ -29,31 +29,59 @@ import { defineConfig } from "vitest/config";
  */
 const DEFAULT_MAX_WORKERS = 4;
 
+/**
+ * NOTE on what this cap does and does not do.
+ *
+ * It bounds how MANY workers run, not how large each one grows. A per-worker JS
+ * heap ceiling would be the complementary guard, but `execArgv` does not survive
+ * a `projects` run: the pool SIZE is global and honoured here, while worker spawn
+ * arguments are resolved per project, so a value set in this root config never
+ * reaches the workers. Verified by sampling every 0.3s across a full run — zero
+ * workers carried the flag, while `maxWorkers` was obeyed exactly. Applying a heap
+ * ceiling would mean editing all 20 project configs, which is out of scope here.
+ *
+ * So the memory budget rests on the worker count: 4 workers against the observed
+ * 8.5 GiB runaway is ~34 GiB, under the container's 40 GiB cgroup but not
+ * comfortably. That is deliberate — this cap makes the OOM far less likely, and
+ * the agent subprocess OOM priority (packages/adapter-utils/src/oom-priority.ts)
+ * separately ensures the control plane is not the victim when it does happen.
+ * Neither guard is sufficient alone.
+ */
+
+/**
+ * Parses a whole-number environment override.
+ *
+ * The string must be ALL digits. `Number.parseInt` stops at the first
+ * non-numeric character, so it would silently read "16GB" as 16 and "0.5" as 0 —
+ * turning an operator's typo into a quietly wrong limit rather than a fallback
+ * to the documented default.
+ */
+function envInteger(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const normalized = raw.trim();
+  if (!/^\d+$/.test(normalized)) return fallback;
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed) || parsed < min) return fallback;
+  return parsed;
+}
+
 function resolveMaxWorkers(): number {
-  const raw = process.env.PAPERCLIP_VITEST_MAX_WORKERS;
-  if (raw !== undefined && raw.trim() !== "") {
-    const parsed = Number.parseInt(raw, 10);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return Math.min(parsed, availableParallelism());
-    }
-  }
-  return Math.max(1, Math.min(DEFAULT_MAX_WORKERS, availableParallelism()));
+  const configured = envInteger("PAPERCLIP_VITEST_MAX_WORKERS", DEFAULT_MAX_WORKERS, 1);
+  return Math.max(1, Math.min(configured, availableParallelism()));
 }
 
 const maxWorkers = resolveMaxWorkers();
 
 export default defineConfig({
   test: {
-    // Bound BOTH ends: `minWorkers` stops the pool scaling back up past the cap,
-    // and the fork pool gets an explicit per-worker heap ceiling so a single
-    // runaway suite fails on its own JS heap instead of pushing the whole cgroup
-    // into the kernel OOM killer and taking its neighbours with it.
+    // `minWorkers` stops the pool scaling back up past the cap.
+    //
+    // These are TOP-LEVEL options. Vitest 4 removed `test.poolOptions`, and a
+    // config still using it gets a deprecation warning and no effect — the
+    // per-pool `maxForks`/`maxThreads` keys silently do nothing. Keep them here.
     maxWorkers,
     minWorkers: 1,
-    poolOptions: {
-      forks: { maxForks: maxWorkers, minForks: 1 },
-      threads: { maxThreads: maxWorkers, minThreads: 1 },
-    },
     projects: [
       "packages/shared",
       "packages/skills-catalog",
@@ -65,14 +93,17 @@ export default defineConfig({
       "packages/adapters/cursor-local",
       "packages/adapters/gemini-local",
       "packages/adapters/grok-local",
+      "packages/adapters/kimi-local",
       "packages/adapters/openclaw-gateway",
       "packages/adapters/opencode-local",
       "packages/adapters/pi-local",
       "packages/plugins/sdk",
       "packages/plugins/create-paperclip-plugin",
+      "packages/plugins/sandbox-providers/daytona",
       "server",
       "ui",
       "cli",
+      "scripts",
     ],
   },
 });

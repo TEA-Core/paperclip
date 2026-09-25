@@ -4699,12 +4699,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             // anything it launches, including a test fleet. Best-effort by design;
             // see ../oom-priority.ts for why the server cannot instead lower its own.
             //
-            // Deferred to the next tick so this stays strictly off the spawn path:
-            // `spawnAgent` returns the child exactly as it did before, and the
-            // adjustment lands a tick later — still many orders of magnitude before
-            // any memory pressure the mark is meant to survive. If the child is
-            // already gone by then the write no-ops, which is the correct outcome.
-            setImmediate(() => deprioritizeForOom(child.pid));
+            // Applied SYNCHRONOUSLY, in the narrow window between `spawn()` and the
+            // child doing anything. Deferring it to a later tick loses the mark in
+            // two ways: descendants the child forks in the meantime keep the default
+            // priority (the value is inherited AT fork, not tracked afterwards), and
+            // once the uid-split shim calls setuid the proc entry changes owner, so
+            // a non-root server can no longer write it at all. One small, deferred
+            // /proc write is not worth either gap. The helper never throws, so this
+            // cannot fail the spawn.
+            deprioritizeForOom(child.pid);
             return child;
           },
           onAgentStderr: prepared.childStderrLogPath

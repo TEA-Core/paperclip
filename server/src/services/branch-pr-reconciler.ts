@@ -57,9 +57,16 @@ import { prDeliveryService, type PrDeliveryInput } from "./pr-delivery.js";
  * consecutive unproductive outcome and is capped at 24h, and the streak resets to
  * 0 the moment a product is recorded. Rows that will never resolve become
  * geometrically cheaper to carry while a branch whose PR merges later is still
- * picked up within a day. Because the marker is stamped on every outcome, a
- * backed-off row also sorts to the BACK of the `ASC NULLS FIRST` cursor, so it
- * stops consuming a `limit` slot ahead of genuinely due rows.
+ * picked up within a day.
+ *
+ * Backoff alone would create a second starvation problem, so `limit` now bounds
+ * PROBES and the cursor reads `limit * SCAN_WINDOW_MULTIPLIER` rows. A row that is
+ * still cooling is deliberately not re-stamped — that would restart its clock — so
+ * it keeps an old marker and stays at the FRONT of the `ASC NULLS FIRST` order
+ * until its window elapses. With per-row windows the oldest marker is no longer
+ * the most due, so reading only `limit` rows would let a wall of long-backoff rows
+ * hide genuinely due rows behind it. Reading wider and spending the probe budget
+ * only on due rows keeps the GitHub call count unchanged.
  *
  * Counters are reported as separate fields: `created` (recorded a new product),
  * `skipped` (branch checked, had no merged PR — nothing recorded), and
@@ -80,6 +87,23 @@ const DEFAULT_LIMIT = 50;
 const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 /** Guard against `2 ** streak` overflowing to Infinity on a corrupt/absurd counter. */
 const MAX_BACKOFF_EXPONENT = 32;
+/**
+ * How many rows the cursor may READ per tick, as a multiple of `limit`.
+ *
+ * `limit` bounds GitHub probes; it must not also bound how far the cursor can
+ * see. A rate-limited row keeps its old marker (it is deliberately NOT re-stamped,
+ * or its backoff clock would restart), so it stays at the FRONT of the
+ * `ASC NULLS FIRST` order until its window elapses. With a flat window that was
+ * harmless — the oldest marker was also the most due. With per-row backoff it is
+ * not: a heavily backed-off row can hold an old marker for up to 24h while a
+ * row checked more recently, but with a short window, is genuinely due behind it.
+ * Reading only `limit` rows lets a wall of cooled rows starve those due rows.
+ *
+ * So the cursor reads `limit * SCAN_WINDOW_MULTIPLIER` rows and probes at most
+ * `limit` of them. The extra rows are a cheap indexed read; the bounded resource
+ * is the GitHub call, which is unchanged.
+ */
+const SCAN_WINDOW_MULTIPLIER = 10;
 
 /** Consecutive unproductive outcomes recorded on a row, or 0 when absent/corrupt. */
 function readMissStreak(metadata: Record<string, unknown> | null): number {
@@ -104,7 +128,7 @@ function effectiveCooldownMs(baseCooldownMs: number, missStreak: number): number
 }
 
 export interface BranchPrReconcilerSweepResult {
-  /** Rows in the candidate set this tick (repo + branch + source, no existing pull_request product); equals rateLimited + created + skipped + failed. */
+  /** Rows EXAMINED this tick (repo + branch + source, no existing pull_request product); equals rateLimited + created + skipped + failed. Probes are bounded separately by `limit`. */
   candidates: number;
   /** New pull_request work products recorded from a merged PR on the workspace's own branch. */
   created: number;
@@ -119,8 +143,10 @@ export interface BranchPrReconcilerSweepResult {
 export interface BranchPrReconcilerSweepOptions {
   /** Milliseconds before a given workspace's branch is re-probed. Defaults to 5 min (matches the PR merge-state sweep). */
   cooldownMs?: number;
-  /** Max candidate workspaces inspected per tick. Defaults to 50. */
+  /** Max candidate workspaces PROBED per tick. Defaults to 50. */
   limit?: number;
+  /** Max rows read per tick, as a multiple of `limit`. Defaults to 10. */
+  scanWindowMultiplier?: number;
   now?: () => Date;
   /** Probe a branch for a merged PR. Defaults to the widened done-transition-guard primitive. */
   probeBranchMergedPr?: (args: {
@@ -160,6 +186,8 @@ export function createBranchPrReconcilerSweepService(
 ) {
   const cooldownMs = opts.cooldownMs ?? DEFAULT_COOLDOWN_MS;
   const limit = opts.limit ?? DEFAULT_LIMIT;
+  const scanWindowMultiplier = Math.max(1, opts.scanWindowMultiplier ?? SCAN_WINDOW_MULTIPLIER);
+  const scanLimit = limit * scanWindowMultiplier;
   const now = opts.now ?? (() => new Date());
   const probeBranchMergedPr: (args: {
     hostname: string;
@@ -249,13 +277,20 @@ export function createBranchPrReconcilerSweepService(
         ),
       )
       .orderBy(sql`${executionWorkspaces.metadata} ->> 'branchPrReconcileCheckedAt' ASC NULLS FIRST`)
-      .limit(limit);
+      .limit(scanLimit);
+
+    // Probes consumed this tick. `limit` bounds GitHub calls; `scanLimit` bounds
+    // rows read. A rate-limited row costs a read but never a probe, so a wall of
+    // cooled rows no longer prevents a due row behind it from being reached.
+    let probed = 0;
 
     for (const row of rows) {
+      if (probed >= limit) break;
       result.candidates += 1;
 
       const parsed = parseRepoUrl(row.repoUrl);
       if (!parsed || !row.branchName || !row.sourceIssueId) {
+        probed += 1;
         result.failed += 1;
         await stampCooldown(row, nowMs, readMissStreak(row.metadata) + 1);
         continue;
@@ -285,12 +320,14 @@ export function createBranchPrReconcilerSweepService(
           { workspaceId: row.id, reason: tokenResult.reason },
           "branch-to-merged-PR reconciler: no GitHub token resolvable; will retry next sweep",
         );
+        probed += 1;
         await stampCooldown(row, nowMs, missStreak + 1);
         result.failed += 1;
         continue;
       }
 
       let probe: BranchMergedPrProbe;
+      probed += 1;
       try {
         probe = await probeBranchMergedPr({
           hostname: parsed.hostname,

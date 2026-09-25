@@ -58,13 +58,20 @@ export function resolveAgentOomScoreAdj(
   env: NodeJS.ProcessEnv = process.env,
 ): number {
   const raw = env.PAPERCLIP_AGENT_OOM_SCORE_ADJ;
-  if (raw !== undefined && raw.trim() !== "") {
-    const parsed = Number.parseInt(raw, 10);
-    if (Number.isFinite(parsed)) {
-      return Math.min(Math.max(parsed, OOM_SCORE_ADJ_MIN), OOM_SCORE_ADJ_MAX);
-    }
-  }
-  return DEFAULT_AGENT_OOM_SCORE_ADJ;
+  if (raw === undefined) return DEFAULT_AGENT_OOM_SCORE_ADJ;
+  const normalized = raw.trim();
+  // The whole string must be an integer. `Number.parseInt` stops at the first
+  // non-numeric character, so it reads "0.5" as 0 and "500MB" as 500 — silently
+  // turning an operator's typo into a limit they did not ask for. Anything that
+  // is not a clean integer falls back to the documented default instead.
+  if (!/^-?\d+$/.test(normalized)) return DEFAULT_AGENT_OOM_SCORE_ADJ;
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) return DEFAULT_AGENT_OOM_SCORE_ADJ;
+  // A negative value is clamped to 0 rather than rejected. It expresses a wish to
+  // protect the agent MORE than the default, which needs CAP_SYS_RESOURCE and
+  // cannot be honoured here; 0 (no adjustment) is the closest achievable
+  // behaviour. Falling back to the default would do the opposite of the intent.
+  return Math.min(Math.max(parsed, OOM_SCORE_ADJ_MIN), OOM_SCORE_ADJ_MAX);
 }
 
 /**
