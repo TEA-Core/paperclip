@@ -562,7 +562,18 @@ type ParsedExecutionState = NonNullable<
 type NormalizedExecutionPolicy = NonNullable<
   ReturnType<typeof normalizeIssueExecutionPolicy>
 >;
-type IssueRouteSnapshot = typeof issueRows.$inferSelect;
+/**
+ * SUP-17484 (ADR-103 M2 / SUP-17481 §2): the single-issue read boundary
+ * reports `parentLinkKind` as `null` when the row has no parent, even though
+ * the stored column is `NOT NULL DEFAULT 'decomposition'`. So the read-surface
+ * snapshot models the field as `string | null`, not the stored `string`. This
+ * propagates to `IssueRouteSnapshotExecutionOptional` below, which re-exposes
+ * it as `parentLinkKind?: string | null`.
+ */
+type IssueRouteSnapshot = Omit<
+  typeof issueRows.$inferSelect,
+  "parentLinkKind"
+> & { parentLinkKind: string | null };
 /**
  * SUP-16741: list reads (`issueListSelect`) omit the execution-ladder columns
  * for perf, so a row handed to recovery revalidation may legitimately be
