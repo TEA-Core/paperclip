@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -10,6 +10,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueCreateIdempotencyKeys,
   issues,
 } from "@paperclipai/db";
@@ -131,5 +132,77 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
     // No issue was created, so there is nothing to silently drop.
     const rows = await db.select().from(issues).where(eq(issues.parentId, parent.id));
     expect(rows).toHaveLength(0);
+  });
+
+  // SUP-17538: the company-scoped create door must run the same non-authoritative
+  // ADR-072 close-ladder advisory as the child-create and accepted-plan doors.
+  // This runs against the real store, so the shared shape helper, the durable
+  // dedup marker, and the system comment are all exercised end to end.
+  it("emits the ADR-072 close-ladder advisory on the parent when the create reaches two laddered children", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    // Two ladder-carrying open children make the parent a decomposed body; the
+    // parent's executionPolicy carries none of the ratified ADR-072 rungs, so
+    // its close ladder is shape-incomplete.
+    await db.insert(issues).values([
+      {
+        companyId,
+        parentId: parent.id,
+        title: "Laddered child A",
+        status: "todo",
+        priority: "medium",
+        executionPolicy: {
+          stages: [
+            { id: randomUUID(), type: "review", participants: [{ type: "agent", agentId: randomUUID() }] },
+          ],
+        },
+      },
+      {
+        companyId,
+        parentId: parent.id,
+        title: "Laddered child B",
+        status: "todo",
+        priority: "medium",
+        executionPolicy: {
+          stages: [
+            { id: randomUUID(), type: "review", participants: [{ type: "agent", agentId: randomUUID() }] },
+          ],
+        },
+      },
+    ]);
+
+    const app = createApp();
+    const created = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Third child" })
+      .expect(201);
+    expect(created.body.parentId).toBe(parent.id);
+
+    // The durable marker is written on the PARENT, not the new child, so the
+    // advisory is discoverable from the card that owes the ladder.
+    const advisoryRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.adr072_close_ladder_incomplete"),
+          eq(activityLog.entityId, parent.id),
+        ),
+      );
+    expect(advisoryRows).toHaveLength(1);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, parent.id));
+    const advisories = comments.filter((row) =>
+      (row.body ?? "").includes("[ADR-072 close ladder incomplete]"),
+    );
+    expect(advisories).toHaveLength(1);
+    // Ratified order, all three rungs named.
+    expect(advisories[0]!.body).toContain("review:support-QAE");
+    expect(advisories[0]!.body).toContain("review:coder-LE");
+    expect(advisories[0]!.body).toContain("approval:exec-CTO");
   });
 });
