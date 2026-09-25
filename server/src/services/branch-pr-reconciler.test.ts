@@ -937,4 +937,59 @@ describe("createBranchPrReconcilerSweepService", () => {
     expect((await service.sweep()).rateLimited).toBe(1);
     expect(probe).not.toHaveBeenCalled();
   });
+
+  /**
+   * Selection semantics of the SQL predicate, evaluated deterministically.
+   *
+   * The sweep tests above run against a mock that ignores `WHERE`, so nothing
+   * here executes the predicate — yet it is where the correctness of the whole
+   * backoff lives. This reconstructs it from the REAL regex in the source and
+   * applies the same four arms Postgres does, with string comparison standing in
+   * for Postgres TEXT comparison (both are byte-order on these ASCII values).
+   *
+   * It is written as a table because the failure it guards against is semantic,
+   * not structural: an earlier revision had a ceiling arm and a digit-count shape
+   * check and still stranded "2026-09-25T25:00:00.000Z", which is shape-valid and
+   * sorts BETWEEN the deadline and the ceiling. Only running the predicate over
+   * real values surfaced that. Every row below was confirmed against Postgres.
+   */
+  it("selects exactly the due and the bogus rows, and nothing else", async () => {
+    const source = await readFile(
+      new URL("./branch-pr-reconciler.ts", import.meta.url),
+      "utf8",
+    );
+    const sqlShape = source.match(/!~ '(\^.+?\$)'/);
+    expect(sqlShape, "SQL canonical-form regex not found").not.toBeNull();
+    const shapeRe = new RegExp(sqlShape![1].replace(/\[\.\]/g, "\\."));
+
+    const nowIso = new Date(NOW).toISOString();
+    const ceilingIso = new Date(NOW + 24 * 60 * 60 * 1000).toISOString();
+
+    // The predicate, arm for arm. `raw` is what Postgres `->>` yields, so a JSON
+    // number and object arrive as their text forms.
+    const selects = (raw: string | null) =>
+      raw === null || raw <= nowIso || !shapeRe.test(raw) || raw > ceilingIso;
+
+    const cases: Array<[string, string | null, boolean]> = [
+      ["missing key",            null,                          true],
+      ["due in the past",        "2026-09-03T10:00:00.000Z",    true],
+      ["future within window",   new Date(NOW + 3600_000).toISOString(),            false],
+      ["exactly at ceiling",     ceilingIso,                    false],
+      ["beyond the ceiling",     new Date(NOW + 30 * 86400_000).toISOString(),      true],
+      ["invalid month",          "2026-13-01T00:00:00.000Z",    true],
+      ["invalid day",            "2026-09-32T00:00:00.000Z",    true],
+      ["invalid hour",           "2026-09-04T25:00:00.000Z",    true],
+      ["invalid minute",         "2026-09-04T10:60:00.000Z",    true],
+      ["invalid second",         "2026-09-04T10:00:60.000Z",    true],
+      ["seconds precision",      "2026-12-01T10:00:00Z",        true],
+      ["json number as text",    "12345",                       true],
+      ["json object as text",    '{"a": 1}',                    true],
+      ["non-timestamp string",   "not-a-timestamp",             true],
+      ["empty string",           "",                            true],
+    ];
+
+    for (const [label, raw, expected] of cases) {
+      expect(selects(raw), `${label}: ${JSON.stringify(raw)}`).toBe(expected);
+    }
+  });
 });
