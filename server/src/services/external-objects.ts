@@ -17,6 +17,7 @@ import type { PluginExternalObjectRecordSnapshot, PluginExternalObjectResolveRes
 import { notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { isTransactionHandle } from "./db-handle.js";
 import { createGitHubExternalObjectProvider, type GitHubExternalObjectProviderOptions } from "./github-external-object-provider.js";
 import { publishLiveEvent } from "./live-events.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -557,7 +558,7 @@ export function externalObjectService(
         text: issue.description,
       }, tx);
     };
-    return dbOrTx === db ? db.transaction(runSync) : runSync(dbOrTx);
+    return isTransactionHandle(dbOrTx) ? runSync(dbOrTx) : db.transaction(runSync);
   }
 
   async function syncComment(commentId: string, dbOrTx: any = db) {
@@ -589,7 +590,7 @@ export function externalObjectService(
         text: comment.body,
       }, tx);
     };
-    return dbOrTx === db ? db.transaction(runSync) : runSync(dbOrTx);
+    return isTransactionHandle(dbOrTx) ? runSync(dbOrTx) : db.transaction(runSync);
   }
 
   async function syncDocument(documentId: string, dbOrTx: any = db) {
@@ -623,7 +624,7 @@ export function externalObjectService(
         text: document.body,
       }, tx);
     };
-    return dbOrTx === db ? db.transaction(runSync) : runSync(dbOrTx);
+    return isTransactionHandle(dbOrTx) ? runSync(dbOrTx) : db.transaction(runSync);
   }
 
   async function safeSync(label: string, fn: () => Promise<void>) {

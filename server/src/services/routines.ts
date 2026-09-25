@@ -80,6 +80,7 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./is
 import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
+import { isTransactionHandle } from "./db-handle.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -979,7 +980,7 @@ export function routineService(
     actor: Actor,
     options: { changeSummary?: string | null } = {},
   ): Promise<RoutineDescriptionDocument> {
-    if (executor === db) {
+    if (!isTransactionHandle(executor)) {
       return db.transaction(async (tx) => (
         upsertRoutineDescriptionDocument(tx as unknown as Db, routine, actor, options)
       ));
