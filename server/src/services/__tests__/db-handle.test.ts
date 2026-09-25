@@ -10,17 +10,15 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
-import { makeRouteDbStub } from "../__tests__/helpers/route-db-stub.js";
+import { makeRouteDbStub } from "../../__tests__/helpers/route-db-stub.js";
 import {
   brandAsTransactionHandle,
   isTransactionHandle,
-} from "./db-handle.js";
+} from "../db-handle.js";
 
-// ---------------------------------------------------------------------------
 // Pure predicate/brand behaviour. No database: these pin the ordering the whole
 // team relies on — a handle is "a transaction" if it is branded, and the brand
 // is consulted before the `instanceof PgTransaction` fallback.
-// ---------------------------------------------------------------------------
 
 describe("isTransactionHandle (pure, no database)", () => {
   it("returns false for null and undefined without throwing", () => {
