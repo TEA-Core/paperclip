@@ -184,6 +184,7 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { isTransactionHandle } from "./db-handle.js";
 import {
   initializeMcpHttpSession,
   mcpHttpRequestHeaders,
@@ -3560,7 +3561,21 @@ export function toolAccessService(
         details: input.details ?? {},
       });
     } catch (error) {
-      await recordToolRuntimeAuditWriteFailure(db, input.companyId);
+      if (isTransactionHandle(db)) {
+        // SUP-17464: the audit insert failed, which aborts the transaction it
+        // ran in. Re-issuing the failure counter on this same handle right now
+        // would issue another statement on the aborted transaction, get
+        // "current transaction is aborted", and — because
+        // recordToolRuntimeAuditWriteFailure swallows that error — silently drop
+        // the counter signal. Defer the counter past the rollback instead, so it
+        // runs on the handle after the transaction has settled. The error below
+        // still propagates so the caller sees the real failure.
+        setImmediate(() => {
+          void recordToolRuntimeAuditWriteFailure(db, input.companyId);
+        });
+      } else {
+        await recordToolRuntimeAuditWriteFailure(db, input.companyId);
+      }
       throw error;
     }
   }
