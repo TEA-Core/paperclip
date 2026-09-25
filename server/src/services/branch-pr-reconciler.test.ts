@@ -41,16 +41,24 @@ const iso = (msAgo: number) => new Date(NOW - msAgo).toISOString();
  */
 function makeDb(pages: Candidate[][]) {
   const updates: Array<{ set: Record<string, unknown> }> = [];
+  const requestedLimits: number[] = [];
   let selectCalls = 0;
   const db = {
     select: vi.fn(() => ({
       from: () => ({
         where: () => ({
           orderBy: () => ({
-            limit: () => {
+            // Honour the requested limit. Ignoring it would let a test pass while
+            // the sweep asked for the wrong number of rows, which is exactly the
+            // bound the probe budget depends on.
+            limit: (requestedLimit: number) => {
               const idx = Math.min(selectCalls, pages.length - 1);
               selectCalls += 1;
-              return Promise.resolve(pages[idx]);
+              const page = pages[idx];
+              requestedLimits.push(requestedLimit);
+              return Promise.resolve(
+                typeof requestedLimit === "number" ? page.slice(0, requestedLimit) : page,
+              );
             },
           }),
         }),
@@ -65,7 +73,7 @@ function makeDb(pages: Candidate[][]) {
       }),
     })),
   };
-  return { db, updates };
+  return { db, updates, requestedLimits };
 }
 
 function row(overrides: Partial<Candidate> & { id: string }): Candidate {
@@ -396,67 +404,110 @@ describe("createBranchPrReconcilerSweepService", () => {
   });
 
   /**
-   * Regression for probe-slot starvation. A rate-limited row is deliberately NOT
-   * re-stamped — re-stamping would restart its backoff clock — so it keeps an old
-   * marker and stays at the front of the `ASC NULLS FIRST` order. Under a flat
-   * cooldown that was harmless, because the oldest marker was also the most due.
-   * Under per-row backoff it is not: a heavily backed-off row can sit on an old
-   * marker for up to 24h while a row checked more recently, but with a short
-   * window, is genuinely due behind it. If the cursor only ever read `limit` rows,
-   * that wall of cooled rows would starve the due row indefinitely.
+   * Regression for probe-slot starvation, fixed at its root.
+   *
+   * Ordering by the CHECKED-AT marker is only correct while every row shares one
+   * cooldown. With per-row backoff a heavily backed-off row can hold an older
+   * marker than a row checked recently with a short window, and a rate-limited row
+   * is never re-stamped (that would restart its clock), so it stays at the FRONT
+   * of the cursor ahead of rows that are genuinely due.
+   *
+   * The fix is the precomputed `branchPrReconcileNextDueAt`, which the query both
+   * filters and orders by. This asserts the stamp carries a due time consistent
+   * with the row's backoff, which is what makes that SQL ordering correct.
    */
-  it("reaches a due row sitting behind a full page of cooled-down rows", async () => {
+  it("stamps a due time that reflects the row's backoff, so the cursor can order by due-ness", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    // Streak 3 -> this miss makes it 4 -> window is 5min * 2^4 = 80 min.
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: { branchPrReconcileMissStreak: 3 },
+      }),
+    ]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    await service.sweep();
+
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(metadata.branchPrReconcileMissStreak).toBe(4);
+    const dueAt = Date.parse(metadata.branchPrReconcileNextDueAt as string);
+    expect(dueAt).toBe(NOW + 80 * 60 * 1000);
+    // Written as ISO-8601 UTC, because the query compares it as TEXT rather than
+    // casting to timestamptz — a malformed row must not throw for the whole sweep.
+    expect(metadata.branchPrReconcileNextDueAt).toBe(new Date(NOW + 80 * 60 * 1000).toISOString());
+  });
+
+  it("clears the due time back to the base window when a merged PR is recorded", async () => {
     const probe = makeProbe(async () => ({
       hasMergedPr: true,
       mergedPrNumber: 42,
       mergedPrRepository: "o/r",
     }));
-    const recordAtOpen = vi.fn(async () => ({ writtenIssueIds: ["src-due"] }));
-
-    // Two rows fill the entire probe budget (limit: 2) and are all heavily backed
-    // off: streak 10 gives a window far longer than their 1h-old markers, and
-    // their OLD markers sort them ahead of the due row.
-    const cooledWall = [0, 1].map((n) =>
-      row({
-        id: `w-cooled-${n}`,
-        sourceIssueId: `src-cooled-${n}`,
-        branchName: `cooled-${n}`,
-        metadata: {
-          branchPrReconcileCheckedAt: iso(60 * 60 * 1000),
-          branchPrReconcileMissStreak: 10,
-        },
-      }),
-    );
-    // Checked more recently, but streak 0 means a 5 min window, so it IS due.
-    const dueRow = row({
-      id: "w-due",
-      sourceIssueId: "src-due",
-      branchName: "due-branch",
-      metadata: {
-        branchPrReconcileCheckedAt: iso(10 * 60 * 1000),
-        branchPrReconcileMissStreak: 0,
-      },
-    });
-
-    const { db } = makeDb([[...cooledWall, dueRow]]);
+    const pages = [[row({ id: "w-a", sourceIssueId: "src-a", branchName: "a-branch", metadata: { branchPrReconcileMissStreak: 9 } })]];
+    const { db, updates } = makeDb(pages);
     const service = createBranchPrReconcilerSweepService(db as never, {
-      limit: 2,
       probeBranchMergedPr: probe,
       resolveToken: vi.fn(async () => tokenOk()),
-      recordAtOpen,
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: ["src-a"] })),
+      now: nowFn,
+    });
+
+    await service.sweep();
+
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(metadata.branchPrReconcileMissStreak).toBe(0);
+    expect(Date.parse(metadata.branchPrReconcileNextDueAt as string)).toBe(NOW + 5 * 60 * 1000);
+  });
+
+  /**
+   * An unparseable `repoUrl` used to be charged a probe slot and re-stamped on
+   * EVERY sweep, because the cooldown gate sat after the parse check. Its miss
+   * streak grew without ever reducing its cost, so the rows least able to make
+   * progress were the most expensive to carry.
+   */
+  it("applies the cooldown to a malformed repo URL instead of re-charging it every sweep", async () => {
+    const probe = makeProbe(async () => ({ hasMergedPr: false, mergedPrNumber: null, mergedPrRepository: null }));
+    const pages = [[
+      row({
+        id: "w-bad",
+        sourceIssueId: "src-bad",
+        branchName: "b",
+        repoUrl: "not a url",
+        metadata: {
+          branchPrReconcileCheckedAt: iso(60 * 1000),
+          branchPrReconcileMissStreak: 5,
+        },
+      }),
+    ]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
       now: nowFn,
     });
 
     const result = await service.sweep();
 
-    // The cooled rows cost a read each but no probe, so the due row is still reached.
-    expect(result.rateLimited).toBe(2);
-    expect(result.created).toBe(1);
-    expect(probe).toHaveBeenCalledTimes(1);
-    expect((probe.mock.calls[0][0] as ProbeArgs).branch).toBe("due-branch");
+    // Cooled: counted as rate-limited, NOT failed, and not re-stamped.
+    expect(result).toEqual({ candidates: 1, created: 0, skipped: 0, rateLimited: 1, failed: 0 });
+    expect(updates).toHaveLength(0);
   });
 
-  it("never issues more probes than `limit`, however wide the scan window", async () => {
+  it("asks the cursor for no more rows than the probe budget", async () => {
     const probe = makeProbe(async () => ({
       hasMergedPr: false,
       mergedPrNumber: null,
@@ -466,7 +517,7 @@ describe("createBranchPrReconcilerSweepService", () => {
     const allDue = Array.from({ length: 30 }, (_unused, n) =>
       row({ id: `w-${n}`, sourceIssueId: `src-${n}`, branchName: `b-${n}` }),
     );
-    const { db } = makeDb([allDue]);
+    const { db, requestedLimits } = makeDb([allDue]);
     const service = createBranchPrReconcilerSweepService(db as never, {
       limit: 3,
       probeBranchMergedPr: probe,
@@ -477,6 +528,9 @@ describe("createBranchPrReconcilerSweepService", () => {
 
     const result = await service.sweep();
 
+    // The query is bounded by `limit`: the sweep must not read rows it could never
+    // probe, now that the due-ness filter lives in SQL.
+    expect(requestedLimits).toEqual([3]);
     expect(probe).toHaveBeenCalledTimes(3);
     expect(result.candidates).toBe(3);
     expect(result.skipped).toBe(3);
