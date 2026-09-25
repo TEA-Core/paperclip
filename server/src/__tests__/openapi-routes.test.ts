@@ -408,6 +408,22 @@ describe("openapi routes", () => {
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["403"]).toBeDefined();
   });
 
+  it("publishes the live rearmExecutionPolicy field on PATCH /api/issues/{id}", () => {
+    const { spec } = loadSpecRoutes();
+    const schema =
+      spec.paths["/api/issues/{id}"].patch.requestBody.content["application/json"]
+        .schema;
+
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.required ?? []).not.toContain("rearmExecutionPolicy");
+
+    const field = schema.properties.rearmExecutionPolicy;
+    expect(field).toMatchObject({ type: "boolean" });
+    expect(field.description).toContain("assignee agent or a board user");
+    expect(field.description).toContain("execution_policy_rearm_conflicts_with_status");
+    expect(field.description).toContain("in_review");
+  });
+
   it("publishes the complete board contract for chat channels", () => {
     const { spec } = loadSpecRoutes();
     const boardSecurity = [{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }];

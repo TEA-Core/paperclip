@@ -412,6 +412,17 @@ function applyNumberChecks(
 }
 
 function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
+  const jsonSchema = zodToOpenApiSchemaShape(schema);
+  const description =
+    (schema as { description?: unknown }).description ??
+    (unwrapSchema(schema) as { description?: unknown }).description;
+  if (typeof description === "string" && description.length > 0) {
+    jsonSchema.description = description;
+  }
+  return jsonSchema;
+}
+
+function zodToOpenApiSchemaShape(schema: z.ZodTypeAny): JsonSchema {
   const unwrapped = unwrapSchema(schema);
   const def = zodDef(unwrapped);
   const typeName = def.type;
@@ -3880,7 +3891,11 @@ registry.registerPath({
     body: jsonBody(updateIssueObjectSchema.omit({
       createdByUserId: true,
       responsibleUserId: true,
-    }).partial()),
+    }).partial().extend({
+      rearmExecutionPolicy: z.boolean().optional().describe(
+        "Re-arm the issue's execution-policy stage pointer from the replacement `executionPolicy` sent in the same PATCH body. Requires a co-sent `executionPolicy` (422 `execution_policy_rearm_requires_policy_write` otherwise); a co-sent `status` other than `in_review` is refused (422 `execution_policy_rearm_conflicts_with_status`). Only the assignee agent or a board user may re-arm (403 otherwise).",
+      ),
+    })),
   },
   responses: {
     200: r.ok(),
