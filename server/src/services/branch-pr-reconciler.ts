@@ -115,8 +115,20 @@ const NEXT_DUE_KEY = "branchPrReconcileNextDueAt";
  * query selects everything that fails this shape so it can be repaired, and
  * `isDue` treats the same values as due so the repair actually happens. If the
  * two drift apart, a row can be selected forever and never re-stamped.
+ *
+ * The component ranges are constrained deliberately, not just the digit counts.
+ * A shape-only rule accepts "2026-09-25T25:00:00.000Z", which is not a real
+ * instant but as TEXT sorts BETWEEN the deadline and the ceiling — so it would
+ * pass every arm of the predicate and strand the row. Constraining month, day,
+ * hour, minute and second closes that, and the ceiling arm covers the rest.
+ *
+ * One narrow case remains by design: a date that is range-valid but not a real
+ * calendar day, such as "2026-02-30T...", is only caught when it happens to sort
+ * outside [deadline, ceiling]. Reaching it would require a value this sweep can
+ * never write landing inside a 24h window, and closing it would mean casting
+ * untrusted text — which can abort the whole sweep for one bad row.
  */
-const CANONICAL_ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const CANONICAL_ISO_UTC = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$/;
 
 /** Consecutive unproductive outcomes recorded on a row, or 0 when absent/corrupt. */
 function readMissStreak(metadata: Record<string, unknown> | null): number {
@@ -149,19 +161,26 @@ function isDue(
   baseCooldownMs: number,
 ): boolean {
   const storedDueAt = metadata?.[NEXT_DUE_KEY];
-  // Only a CANONICAL value is trusted as a due time. A non-canonical one is
-  // treated as due so it is repaired on the next pass, which is what keeps this
-  // in step with the SQL predicate's repair arm. Honouring a parseable but
-  // non-canonical value instead (for example a seconds-precision
-  // "2026-12-01T10:00:00Z") would deadlock the row: the query selects it because
-  // it is not canonical, this gate rejects it because it parses to a future time,
-  // and it is never re-stamped — so it occupies a probe slot on every sweep,
-  // forever.
-  if (typeof storedDueAt === "string" && CANONICAL_ISO_UTC.test(storedDueAt)) {
-    const parsed = Date.parse(storedDueAt);
-    if (Number.isFinite(parsed)) return parsed <= nowMs;
+  if (storedDueAt !== undefined) {
+    // A stored value is trusted ONLY if it is canonical, parseable, and within the
+    // ceiling this sweep could possibly have written. Anything else present —
+    // a JSON number or object, a non-canonical string, a shape-valid but
+    // calendar-invalid date like "2026-13-01T00:00:00.000Z", or a value further
+    // ahead than MAX_COOLDOWN_MS — is bogus and reads as due, so the row is
+    // probed once and re-stamped in canonical form.
+    //
+    // Every one of those must agree with the SQL predicate's repair arms.
+    // Honouring a value the query selects (or skipping one it never selects)
+    // deadlocks the row in one direction or strands it in the other: it either
+    // occupies a probe slot on every sweep forever, or is never looked at again.
+    if (typeof storedDueAt === "string" && CANONICAL_ISO_UTC.test(storedDueAt)) {
+      const parsed = Date.parse(storedDueAt);
+      if (Number.isFinite(parsed) && parsed <= nowMs + MAX_COOLDOWN_MS) {
+        return parsed <= nowMs;
+      }
+    }
+    return true;
   }
-  if (typeof storedDueAt === "string") return true;
   const lastCheckedAt =
     typeof metadata?.[COOLDOWN_KEY] === "string"
       ? Date.parse(metadata[COOLDOWN_KEY] as string)
@@ -348,10 +367,20 @@ export function createBranchPrReconcilerSweepService(
           // which is the exact failure this sweep exists to prevent. Selecting it
           // instead hands it to `isDue`, whose fallback bounds the retry by the
           // derived window and then re-stamps a well-formed value.
+          //
+          // The fourth arm catches what a SHAPE check cannot: a value that looks
+          // canonical but is not a real instant, such as "2026-13-01T00:00:00.000Z".
+          // Its shape passes, and as text it sorts after the deadline, so without
+          // this it would never be selected and the row would be stranded exactly
+          // as a malformed one was. This sweep can never legitimately write a due
+          // time further ahead than MAX_COOLDOWN_MS, so anything beyond that
+          // ceiling is bogus by construction — which covers invalid months, days
+          // and clock values without casting untrusted text.
           sql`(
             ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' IS NULL
             OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' <= ${new Date(nowMs).toISOString()}
-            OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$'
+            OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' !~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{3}Z$'
+            OR ${executionWorkspaces.metadata} ->> 'branchPrReconcileNextDueAt' > ${new Date(nowMs + MAX_COOLDOWN_MS).toISOString()}
           )`,
         ),
       )
@@ -443,9 +472,14 @@ export function createBranchPrReconcilerSweepService(
           headSha: null,
           url: `https://${parsed.hostname}/${repository}/pull/${probe.mergedPrNumber}`,
         });
-        // Productive outcome: clear the streak so a healed row returns to the base cadence.
-        await stampCooldown(row, nowMs, 0);
-        if (recorded.writtenIssueIds.length > 0) result.created += 1;
+        // Reset the streak only when a product was actually WRITTEN. An empty
+        // `writtenIssueIds` means nothing was recorded, so the row stays a
+        // candidate: resetting there would return it to the base cadence and let
+        // an endlessly unproductive record path probe every five minutes forever,
+        // which is the cost backoff exists to bound.
+        const wroteProduct = recorded.writtenIssueIds.length > 0;
+        await stampCooldown(row, nowMs, wroteProduct ? 0 : missStreak + 1);
+        if (wroteProduct) result.created += 1;
         else result.skipped += 1;
       } catch (error) {
         logger.warn(

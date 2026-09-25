@@ -752,6 +752,14 @@ describe("createBranchPrReconcilerSweepService", () => {
       "2026-09-25T10:00:00.00Z",
       "2026-09-25T10:00:00.0000Z",
       "2026-09-25T10:00:00.000z",
+      "2026-13-01T00:00:00.000Z",
+      "2026-00-01T00:00:00.000Z",
+      "2026-09-32T00:00:00.000Z",
+      "2026-09-00T00:00:00.000Z",
+      "2026-09-25T25:00:00.000Z",
+      "2026-09-25T24:00:00.000Z",
+      "2026-09-25T10:60:00.000Z",
+      "2026-09-25T10:00:60.000Z",
       "2026-09-25T10:00:00.000",
       " 2026-09-25T10:00:00.000Z",
       "2026-09-25T10:00:00.000Z ",
@@ -773,5 +781,160 @@ describe("createBranchPrReconcilerSweepService", () => {
     // Sanity: the pair actually discriminates rather than matching everything.
     expect(tsRe.test(new Date(NOW).toISOString())).toBe(true);
     expect(tsRe.test("2026-12-01T10:00:00Z")).toBe(false);
+  });
+
+  it("keeps backing off when the record path writes nothing", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: true,
+      mergedPrNumber: 42,
+      mergedPrRepository: "o/r",
+    }));
+    // A merged PR is found, but nothing is written. The row stays a candidate, so
+    // resetting its streak here would return it to the base cadence forever.
+    const pages = [[row({ id: "w-a", sourceIssueId: "src-a", branchName: "a-branch", metadata: { branchPrReconcileMissStreak: 4 } })]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(metadata.branchPrReconcileMissStreak).toBe(5);
+  });
+
+  it("repairs a non-string stored due time instead of rate-limiting it", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    // A JSON number sorts BEFORE any ISO timestamp, so it occupies the front of the
+    // page. Falling back to the checked-at window would rate-limit it without ever
+    // re-stamping, and it would hold that slot until the derived window expired.
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: {
+          branchPrReconcileNextDueAt: 12345,
+          branchPrReconcileCheckedAt: iso(1000),
+          branchPrReconcileMissStreak: 2,
+        },
+      }),
+    ]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.rateLimited).toBe(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(metadata.branchPrReconcileNextDueAt).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+    );
+  });
+
+  /**
+   * A shape check cannot validate a calendar. "2026-13-01T00:00:00.000Z" passes the
+   * canonical regex, is not a real instant, and as text sorts after the deadline —
+   * so a shape-only rule would never select it and the row would be stranded.
+   */
+  it("repairs a shape-valid but calendar-invalid due time", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: { branchPrReconcileNextDueAt: "2026-13-01T00:00:00.000Z" },
+      }),
+    ]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    expect((await service.sweep()).rateLimited).toBe(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(Date.parse(metadata.branchPrReconcileNextDueAt as string)).toBeGreaterThan(NOW);
+  });
+
+  it("repairs a due time further ahead than this sweep could ever have written", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    // Canonical and parseable, but 30 days out. The cap is 24h, so this cannot
+    // have come from stampCooldown and must not be honoured.
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: {
+          branchPrReconcileNextDueAt: new Date(NOW + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        },
+      }),
+    ]];
+    const { db } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    expect((await service.sweep()).rateLimited).toBe(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it("still honours a due time exactly at the ceiling", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: {
+          branchPrReconcileNextDueAt: new Date(NOW + 24 * 60 * 60 * 1000).toISOString(),
+        },
+      }),
+    ]];
+    const { db } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    expect((await service.sweep()).rateLimited).toBe(1);
+    expect(probe).not.toHaveBeenCalled();
   });
 });
