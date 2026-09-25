@@ -1267,6 +1267,30 @@ export function isReviewChangesRequestedTransition(input: {
   return activeStage?.type === "review";
 }
 
+/**
+ * SUP-17552: whether approving the issue's current pending stage would complete
+ * every stage in its policy. This is the engine's final-stage approval branch
+ * (`applyIssueExecutionStageTransition`: `requestedStatus === "done"` with
+ * `nextPendingStageAfter(...) === null`), which deliberately leaves `patch.status`
+ * untouched so the caller must render the `done` close. Exported so a non-PATCH
+ * approval door (the review round-cap escalation-accept) can pre-flight the
+ * shared done-transition guard on exactly the branch the reviewer-approval path
+ * takes, instead of forcing the return-assignee hand-back.
+ *
+ * Returns false when there is no resolvable policy/state, the workflow is not
+ * pending, or a later pending stage would remain.
+ */
+export function approvingCurrentStageCompletesLadder(input: {
+  policy: IssueExecutionPolicy | null;
+  executionState: IssueExecutionState | null;
+}): boolean {
+  const { policy, executionState } = input;
+  if (!policy || !executionState || executionState.status !== PENDING_STATUS) return false;
+  const activeStage = findStageById(policy, executionState.currentStageId);
+  if (!activeStage) return false;
+  return nextPendingStageAfter(policy, activeStage, buildCompletedState(executionState, activeStage)) === null;
+}
+
 function applyIssueExecutionStageTransition(input: TransitionInput): TransitionResult {
   const patch: Record<string, unknown> = {};
   const existingState = parseIssueExecutionState(input.issue.executionState);

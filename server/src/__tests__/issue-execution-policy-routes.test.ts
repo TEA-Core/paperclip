@@ -103,6 +103,11 @@ const mockDb = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+// SUP-17552: the accept door pre-flights the shared done-transition guard before
+// it accepts a final-stage review escalation. Default delegates to the real
+// guard (set in registerModuleMocks) so every other close path is unaffected;
+// the refusal test overrides one call to prove the refusal is surfaced.
+const mockEvaluateDoneTransitionGuard = vi.hoisted(() => vi.fn());
 // The summary-generation forced-return resolver (SUP-15768). issues.ts imports
 // this directly from ../services/summary-slots.js, so it is not covered by the
 // ../services/index.js module mock. Default resolves null (a non-summary issue
@@ -127,6 +132,15 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  // SUP-17552: wrap the real done-transition guard so the accept door's
+  // pre-flight refusal can be forced in one test while every other close path
+  // keeps the genuine guard (and the module's other exports) verbatim.
+  vi.doMock("../services/done-transition-guard.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../services/done-transition-guard.js")>();
+    mockEvaluateDoneTransitionGuard.mockImplementation(actual.evaluateDoneTransitionGuard);
+    return { ...actual, evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard };
+  });
+
   vi.doMock("../services/runner-goals.js", () => ({
     runnerGoalService: () => mockRunnerGoalService,
     RunnerGoalActionError: class RunnerGoalActionError extends Error {},
@@ -2871,15 +2885,15 @@ describe("issue execution policy routes", () => {
       return () => insertedDecision;
     }
 
-    it("accepting the escalation records an approved decision, completes the stage, and wakes the return assignee", async () => {
+    it("accepting the escalation on the final stage records an approved decision, completes the stage, and closes the card done", async () => {
       const issue = escalatedRoundCapIssue();
       const pending = pendingEscalationInteraction();
       mockIssueService.getById.mockResolvedValue(issue);
       mockIssueService.update.mockResolvedValue({
         ...issue,
-        status: "in_progress",
-        assigneeAgentId: returnAssigneeAgentId,
-        assigneeUserId: null,
+        status: "done",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
       } as any);
       mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
       mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
@@ -2927,12 +2941,14 @@ describe("issue execution policy routes", () => {
       expect(mockIssueService.update).toHaveBeenCalledTimes(1);
       const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
       expect(updatePatch).toMatchObject({
-        status: "in_progress",
-        assigneeAgentId: returnAssigneeAgentId,
-        assigneeUserId: null,
+        status: "done",
         actorAgentId: null,
         actorUserId: "board-user",
       });
+      // SUP-17552: the final-stage close must not hand the card back — no
+      // return-assignee rewrite rides along with the `done` status.
+      expect(updatePatch.assigneeAgentId).toBeUndefined();
+      expect(updatePatch.assigneeUserId).toBeUndefined();
       const executionState = updatePatch.executionState as Record<string, unknown>;
       expect(executionState).toMatchObject({
         status: "completed",
@@ -2960,26 +2976,18 @@ describe("issue execution policy routes", () => {
       });
       expect(insertedDecision?.id).toBe(decisionId);
 
-      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-        returnAssigneeAgentId,
-        expect.objectContaining({
-          payload: expect.objectContaining({
-            issueId,
-            interactionId,
-            interactionKind: "request_confirmation",
-            interactionStatus: "accepted",
-          }),
-        }),
-      );
+      // A closed card has no continuation wake target: the accept door must not
+      // wake the return assignee back into a done card (SUP-17552).
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
 
-    it("SUP-15768: approving a summary-generation escalation hands the card back to the Summarizer, not returnAssigneeAgentId", async () => {
+    it("SUP-17552: approving a summary-generation escalation closes the final stage done instead of handing back to the Summarizer", async () => {
       const summarizerAgentId = "66666666-6666-4666-8666-666666666666";
       const issue = escalatedRoundCapIssue();
       const pending = pendingEscalationInteraction();
-      // The card is a summary-generation task: the forced-return resolver
-      // yields the Summarizer even though the policy's stored return assignee is
-      // a plain (non-Summarizer) agent.
+      // Even when the card is a summary-generation task whose forced-return
+      // resolver would yield the Summarizer, the final-stage close supersedes the
+      // hand-back: the card is done, so there is no return target to resolve.
       mockResolveSummaryGenerationReturnAssignee.mockResolvedValue({
         type: "agent",
         agentId: summarizerAgentId,
@@ -2988,9 +2996,9 @@ describe("issue execution policy routes", () => {
       mockIssueService.getById.mockResolvedValue(issue);
       mockIssueService.update.mockResolvedValue({
         ...issue,
-        status: "in_progress",
-        assigneeAgentId: summarizerAgentId,
-        assigneeUserId: null,
+        status: "done",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
       } as any);
       mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
       mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
@@ -3033,19 +3041,149 @@ describe("issue execution policy routes", () => {
         .send({});
 
       expect(res.status).toBe(200);
-      expect(mockResolveSummaryGenerationReturnAssignee).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({ id: issueId, companyId: "company-1" }),
-      );
+      // The final-stage close is rendered instead of the summary hand-back, so the
+      // forced-return resolver is never consulted on this door.
+      expect(mockResolveSummaryGenerationReturnAssignee).not.toHaveBeenCalled();
       expect(mockIssueService.update).toHaveBeenCalledTimes(1);
       const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
-      // The card routes to the Summarizer, not the policy return assignee.
-      expect(updatePatch).toMatchObject({
-        status: "in_progress",
-        assigneeAgentId: summarizerAgentId,
-        assigneeUserId: null,
+      expect(updatePatch).toMatchObject({ status: "done" });
+      expect(updatePatch.assigneeAgentId).toBeUndefined();
+      expect(updatePatch.assigneeUserId).toBeUndefined();
+    });
+
+    it("SUP-17552: accepting an escalation on a non-final stage only advances the pointer (no done close)", async () => {
+      const nextStageId = "22222222-2222-4222-8222-222222222222";
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: stageId,
+            type: "review",
+            participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+          },
+          {
+            id: nextStageId,
+            type: "review",
+            participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+          },
+        ],
+      })!;
+      const issue = roundCapReviewIssue(
+        { assigneeAgentId: null, assigneeUserId: "board-user", executionPolicy: policy },
+        { changesRequestedCount: 3, currentParticipant: { type: "user", userId: "board-user" } },
+      );
+      const pending = pendingEscalationInteraction();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }),
+      );
+      mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
+      mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
+        interaction: {
+          ...pending,
+          status: "accepted",
+          result: { version: 1, outcome: "accepted" },
+        },
+        createdIssues: [],
+        continuationIssue: null,
       });
-      expect(updatePatch.assigneeAgentId).not.toBe(returnAssigneeAgentId);
+      captureDecisionInsert();
+      mockDbSelectWhere.mockImplementation(() => {
+        const resolveDefault = (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([{
+            id: "55555555-5555-4555-8555-555555555555",
+            companyId: "company-1",
+            agentId: "33333333-3333-4333-8333-333333333333",
+            contextSnapshot: { issueId },
+            permissions: null,
+          }]).then(onFulfilled, onRejected);
+        const chain: Record<string, unknown> = {
+          for: () => ({ then: resolveDefault }),
+          orderBy: () => chain,
+          limit: () => chain,
+          then: resolveDefault,
+        };
+        return chain as never;
+      });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      });
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+        .send({});
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      // The escalated stage is stage 1 of 2: the approval advances the pointer to
+      // the next pending stage, it does not close the card.
+      expect(updatePatch.status).toBe("in_review");
+      expect(updatePatch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: nextStageId,
+        currentStageIndex: 1,
+        currentStageType: "review",
+      });
+    });
+
+    it("SUP-17552: a final-stage escalation close surfaces the done-transition guard refusal instead of swallowing it", async () => {
+      const issue = escalatedRoundCapIssue();
+      const pending = pendingEscalationInteraction();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
+      mockDbSelectWhere.mockImplementation(() => {
+        const resolveDefault = (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([{
+            id: "55555555-5555-4555-8555-555555555555",
+            companyId: "company-1",
+            agentId: "33333333-3333-4333-8333-333333333333",
+            contextSnapshot: { issueId },
+            permissions: null,
+          }]).then(onFulfilled, onRejected);
+        const chain: Record<string, unknown> = {
+          for: () => ({ then: resolveDefault }),
+          orderBy: () => chain,
+          limit: () => chain,
+          then: resolveDefault,
+        };
+        return chain as never;
+      });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      });
+      // The final-stage close runs the shared guard; force its delivery refusal.
+      mockEvaluateDoneTransitionGuard.mockResolvedValueOnce({
+        allowed: false,
+        reason: "test refusal: no delivered head",
+        aheadBy: null,
+        branch: "SUP-17552-branch",
+        defaultRef: null,
+        owner: "acme",
+        repo: "paperclip",
+        skipped: false,
+        skipReason: null,
+        mechanism: "delivery",
+        remedy: "Run deliver.sh before closing.",
+      } as never);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+        .send({});
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe("done_transition_missing_delivery");
+      // The refusal is surfaced before the interaction is consumed or the card is
+      // written: the pending escalation stays resolvable and no decision lands.
+      expect(mockIssueThreadInteractionService.acceptInteraction).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("rejecting the escalation records a changes_requested decision, resets rounds, and returns the card to the return assignee", async () => {
