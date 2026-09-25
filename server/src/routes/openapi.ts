@@ -411,11 +411,6 @@ function applyNumberChecks(
   }
 }
 
-// Zod 4 keeps `.describe()` metadata in a global registry reached through the
-// schema's `description` getter, not on `_def` where the shape walker reads the
-// type. Without this wrapper a `.describe()` on a registered schema was
-// silently dropped from the published contract — e.g. `rearmExecutionPolicy`
-// (SUP-17539) needs its seat restriction and refusal code visible to readers.
 function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
   const jsonSchema = zodToOpenApiSchemaShape(schema);
   const description =
@@ -3893,11 +3888,6 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     // Documented shape omits the create-only attribution keys: they are accepted-and-ignored, not
     // updatable, so advertising them would imply a mutation the server will never perform.
-    //
-    // `rearmExecutionPolicy` is a route-only extension of `updateIssueObjectSchema` (see
-    // `updateIssueRouteSchema` in ./issues.ts), so it must be re-declared here or the published
-    // contract advertises a closed schema that omits the one sanctioned remedy for a wedged
-    // execution ladder (SUP-17539 / ADR-102 M2).
     body: jsonBody(updateIssueObjectSchema.omit({
       createdByUserId: true,
       responsibleUserId: true,

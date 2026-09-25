@@ -409,17 +409,11 @@ describe("openapi routes", () => {
   });
 
   it("publishes the live rearmExecutionPolicy field on PATCH /api/issues/{id}", () => {
-    // SUP-17539: `rearmExecutionPolicy` is a route-only extension of
-    // `updateIssueObjectSchema` (see `updateIssueRouteSchema` in ./issues.ts). The
-    // route parses it and enforces its seat check, but the documented body was a
-    // closed schema that omitted it, so a reader trusting the contract concluded
-    // the one sanctioned remedy for a wedged execution ladder did not exist.
     const { spec } = loadSpecRoutes();
     const schema =
       spec.paths["/api/issues/{id}"].patch.requestBody.content["application/json"]
         .schema;
 
-    // The documented body stays closed; the field is additive and optional.
     expect(schema.additionalProperties).toBe(false);
     expect(schema.required ?? []).not.toContain("rearmExecutionPolicy");
 
