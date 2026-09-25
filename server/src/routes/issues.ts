@@ -357,6 +357,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   applyBoardStageDecision,
+  approvingCurrentStageCompletesLadder,
   assertNoStageInsertedBehindPointer,
   assertPatchableExecutionPolicyWrite,
   BoardStageNoUndecidedStageError,
@@ -20221,6 +20222,36 @@ export function issueRoutes(
         throw unprocessable(
           "Remembered permission is only supported for tool reviews",
         );
+      // SUP-17552: accepting a review round-cap escalation on a card whose
+      // escalated stage is the final stage must render the same final-stage
+      // `done` close the reviewer-approval path renders, not the return-assignee
+      // in_progress hand-back that stranded SUP-17292. Pre-flight the shared
+      // done-transition guard here — before the interaction is accepted — so a
+      // card that cannot lawfully close is refused with the guard's own typed
+      // status/body, surfaced rather than swallowed, and the pending interaction
+      // is left resolvable.
+      const reviewEscalationAccept =
+        current.kind === "request_confirmation" && isReviewEscalationInteraction(current);
+      const reviewEscalationCompletesLadder =
+        reviewEscalationAccept &&
+        approvingCurrentStageCompletesLadder({
+          policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+          executionState: parseIssueExecutionState(issue.executionState),
+        });
+      if (reviewEscalationCompletesLadder) {
+        const closeOutcome = await evaluateDoneTransitionGuards({
+          issue,
+          override: null,
+          commentBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
+          runId: actor.runId ?? null,
+          decisionCarried: true,
+          boardActor: req.actor.type === "board",
+        });
+        if (!closeOutcome.ok) {
+          res.status(closeOutcome.status).json(closeOutcome.body);
+          return;
+        }
+      }
       const { interaction, createdIssues, continuationIssue } =
         await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
           agentId: actor.agentId,
@@ -20251,6 +20282,10 @@ export function issueRoutes(
             userId: actor.actorType === "user" ? actor.actorId : null,
             runId: actor.runId,
           },
+          // SUP-17552: a final-stage escalation approval closes the card (the
+          // guard above already allowed it); a non-final stage still only advances
+          // the pointer via the engine's `in_review` patch.
+          finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
         });
         if (escalationResolution) {
           resolvedContinuationIssue = escalationResolution;
@@ -20260,9 +20295,8 @@ export function issueRoutes(
           // post-approval merge-arming hook here, post-commit, so the approved
           // head is stamped + armed exactly like the other doors. It is non-fatal:
           // a hook failure never rejects the escalation (ADR-073 D3).
-          // closingTransition is false: the escalation acceptance hands the card
-          // back to its return assignee (status `in_progress`), it does not close
-          // the card — matching the stage-decision door's hand-back semantic.
+          // closingTransition mirrors the other doors: true when the escalation
+          // closed the card (final stage), false on the non-final hand-back.
           await runApprovalMergeArming({
             issue: escalationResolution.issue,
             decision: {
@@ -20271,7 +20305,7 @@ export function issueRoutes(
               outcome: escalationResolution.outcome,
               body: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
             },
-            closingTransition: false,
+            closingTransition: reviewEscalationCompletesLadder,
           });
         }
       }

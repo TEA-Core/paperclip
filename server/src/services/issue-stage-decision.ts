@@ -9,6 +9,8 @@ import {
 } from "./issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "./summary-slots.js";
 import { issueService } from "./index.js";
+import { publishActivity, type ActivityPublication } from "./activity-log.js";
+import { executeIssuePostCommitActions, type IssuePostCommitAction } from "./issues.js";
 
 export type ReviewEscalationDecisionIssue = {
   id: string;
@@ -49,9 +51,13 @@ export type ReviewEscalationDecisionIssue = {
  * For a final-stage approval the engine completes every stage without touching
  * the issue status, so the card is routed back to its return assignee in_progress
  * — matching what a changes-requested hand-back produces and what the issue's
- * continuation wake expects. Returns `null` when the issue carries no
- * resolvable execution policy/state, or when the transition records no decision
- * for this shape (in which case the caller keeps its own fallback).
+ * continuation wake expects. The escalation-accept door overrides that with
+ * `finalStageDisposition: "done"` (SUP-17552): the reviewer-approval path closes
+ * the card on its final stage, and this door must render the same `done` close
+ * instead of stranding the card in_progress with a completed execution state.
+ * Returns `null` when the issue carries no resolvable execution policy/state, or
+ * when the transition records no decision for this shape (in which case the
+ * caller keeps its own fallback).
  */
 export async function applyReviewEscalationDecision(args: {
   db: Db;
@@ -59,6 +65,12 @@ export async function applyReviewEscalationDecision(args: {
   requestedStatus: "done" | "in_progress";
   decisionBody: string;
   actor: { agentId: string | null; userId: string | null; runId: string | null };
+  // SUP-17552: how a final-stage approval (the ladder completed) lands the card.
+  // "handback" (default) keeps the return-assignee in_progress hand-back; "done"
+  // renders the final-stage `done` close. The caller is responsible for running
+  // the done-transition guard before choosing "done" — this helper only writes
+  // the status, so a refused close must never reach it.
+  finalStageDisposition?: "handback" | "done";
 }): Promise<{
   id: string;
   status: string;
@@ -71,6 +83,7 @@ export async function applyReviewEscalationDecision(args: {
   issue: typeof issues.$inferSelect;
 } | null> {
   const { db, issue, requestedStatus, decisionBody, actor } = args;
+  const finalStageDisposition = args.finalStageDisposition ?? "handback";
   const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
   const existingState = parseIssueExecutionState(issue.executionState);
   if (!policy || !existingState) return null;
@@ -111,28 +124,40 @@ export async function applyReviewEscalationDecision(args: {
     },
   };
   // A final-stage approval completes every execution stage; the engine leaves the
-  // issue status untouched, so route the card back to its return assignee to close.
+  // issue status untouched. SUP-17552: the escalation-accept door renders the
+  // reviewer-approval path's `done` close here (the caller already ran the shared
+  // done-transition guard); every other door keeps the return-assignee hand-back.
   if (requestedStatus === "done" && updateFields.status === undefined) {
-    // A summary-generation card's approval hand-back must land on the Summarizer
-    // (the only writer of its slot), never on a policy `returnAssigneeAgentId`
-    // (SUP-15768). Ordinary issues resolve to null here, so they keep routing to
-    // their stored return assignee.
-    const returnAssignee =
-      (await resolveSummaryGenerationReturnAssignee(db, issue)) ??
-      existingState.returnAssignee ??
-      null;
-    updateFields.status = "in_progress";
-    if (returnAssignee?.type === "agent") {
-      updateFields.assigneeAgentId = returnAssignee.agentId ?? null;
-      updateFields.assigneeUserId = null;
-    } else if (returnAssignee?.type === "user") {
-      updateFields.assigneeAgentId = null;
-      updateFields.assigneeUserId = returnAssignee.userId ?? null;
+    if (finalStageDisposition === "done") {
+      updateFields.status = "done";
+    } else {
+      // A summary-generation card's approval hand-back must land on the Summarizer
+      // (the only writer of its slot), never on a policy `returnAssigneeAgentId`
+      // (SUP-15768). Ordinary issues resolve to null here, so they keep routing to
+      // their stored return assignee.
+      const returnAssignee =
+        (await resolveSummaryGenerationReturnAssignee(db, issue)) ??
+        existingState.returnAssignee ??
+        null;
+      updateFields.status = "in_progress";
+      if (returnAssignee?.type === "agent") {
+        updateFields.assigneeAgentId = returnAssignee.agentId ?? null;
+        updateFields.assigneeUserId = null;
+      } else if (returnAssignee?.type === "user") {
+        updateFields.assigneeAgentId = null;
+        updateFields.assigneeUserId = returnAssignee.userId ?? null;
+      }
     }
   }
   updateFields.actorAgentId = actor.agentId ?? null;
   updateFields.actorUserId = actor.userId ?? null;
 
+  // The `done` close writes into the same transaction as the decision row, so the
+  // update needs a post-commit queue: issue-service refuses a human completion in
+  // an external transaction without one (issues.ts). Drain both queues only after
+  // the transaction commits.
+  const activityPublications: ActivityPublication[] = [];
+  const postCommitActions: IssuePostCommitAction[] = [];
   const updatedIssue = await db.transaction(async (tx) => {
     await tx.insert(issueExecutionDecisions).values({
       id: decisionId,
@@ -146,8 +171,16 @@ export async function applyReviewEscalationDecision(args: {
       body: decision.body,
       createdByRunId: actor.runId ?? null,
     });
-    return issueService(db).update(issue.id, updateFields, tx);
+    return issueService(db).update(
+      issue.id,
+      updateFields,
+      tx,
+      activityPublications,
+      postCommitActions,
+    );
   });
+  for (const publication of activityPublications) publishActivity(publication);
+  await executeIssuePostCommitActions(db, postCommitActions);
   if (!updatedIssue) {
     throw new Error("Failed to update issue after review escalation decision");
   }
