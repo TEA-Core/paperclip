@@ -12096,7 +12096,7 @@ export function issueService(db: Db) {
                 const nativeQuestion =
                   nativeQuestionCancellationIdentity(interaction);
                 if (nativeQuestion) {
-                  if (dbOrTx !== db && !postCommitActions) {
+                  if (isTransactionHandle(dbOrTx) && !postCommitActions) {
                     throw new Error(
                       "Terminal native question updates in an external transaction require a post-commit action queue",
                     );
@@ -12329,7 +12329,7 @@ export function issueService(db: Db) {
             );
         }
         if (actorUserId && receiptExisting.status !== "done" && updated.status === "done") {
-          if (dbOrTx !== db && !postCommitActivityPublications) {
+          if (isTransactionHandle(dbOrTx) && !postCommitActivityPublications) {
             throw new Error(
               "Human completion in an external transaction requires a post-commit activity queue",
             );

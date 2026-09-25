@@ -17,6 +17,7 @@ import type {
 } from "@paperclipai/shared";
 import { extractIssueReferenceMatches } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
+import { isTransactionHandle } from "./db-handle.js";
 
 const SOURCE_KIND_ORDER: Record<IssueReferenceSourceKind, number> = {
   title: 0,
@@ -211,7 +212,7 @@ export function issueReferenceService(db: Db) {
       }, tx);
     };
 
-    return dbOrTx === db ? db.transaction(runSync) : runSync(dbOrTx);
+    return isTransactionHandle(dbOrTx) ? runSync(dbOrTx) : db.transaction(runSync);
   }
 
   async function syncComment(commentId: string, dbOrTx: any = db) {

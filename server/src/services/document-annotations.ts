@@ -23,6 +23,7 @@ import {
   UpdateDocumentAnnotationThread,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { isTransactionHandle } from "./db-handle.js";
 
 type ActorInput = {
   actorType: "agent" | "user";
@@ -845,7 +846,7 @@ export function documentAnnotationService(db: Db) {
         return { deletedCommentIds, resolvedThreadIds: [] };
       };
 
-      return dbOrTx === db ? db.transaction(runCleanup) : runCleanup(dbOrTx);
+      return isTransactionHandle(dbOrTx) ? runCleanup(dbOrTx) : db.transaction(runCleanup);
     },
 
     updateThread: async (
