@@ -65,15 +65,16 @@ const ADR072_CLOSE_LADDER: {
    { stageType: "approval", agentUrlKey: "exec-cto", label: "approval:exec-CTO" },
 ];
 
-// SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177: the four non-decomposition
-// label names (`work-type:redo`, `work-type:delivery`,
-// `work-type:architecture-review`, `work-type:process`) used to live here as
-// four private consts. They now live in laddered-child-eligibility.ts beside
-// the edge-time predicate, as the SINGLE copy, because the ADR-103 M4
+// SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177 / SUP-17553: the five
+// non-decomposition label names (`work-type:redo`, `work-type:delivery`,
+// `work-type:architecture-review`, `work-type:process`, `work-type:recovery`)
+// used to live here as private consts. They now live in
+// laddered-child-eligibility.ts beside the edge-time predicate, as the SINGLE
+// copy, because the ADR-103 M4
 // create/re-parent gate has to resolve exactly the same names against an
 // INCOMING edge: a second copy is how that gate came to 409 children this
 // counter demonstrably excludes. The per-label reasoning travels with the
-// constant — see LADDERED_CHILD_CARVE_OUT_LABEL_NAMES. All four are still
+// constant — see LADDERED_CHILD_CARVE_OUT_LABEL_NAMES. All five are still
 // matched by NAME and resolved company-scoped in one read below, because the
 // label id is company-scoped and this guard is not.
 
@@ -1154,16 +1155,18 @@ export async function countLadderedChildren(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
 
-  // SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177: a `work-type:redo`,
-  // `work-type:delivery`, `work-type:architecture-review`, or `work-type:process`
-  // child is not a decomposition child. The first two re-deliver the same
+  // SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177 / SUP-17553: a
+  // `work-type:redo`, `work-type:delivery`, `work-type:architecture-review`,
+  // `work-type:process`, or `work-type:recovery` child is not a decomposition
+  // child. The first two re-deliver the same
   // deliverable this parent already gated; the third is a card filed to
   // adjudicate this parent's close gate (a chain terminator that must never arm
-  // the gate it exists to correct); the fourth is a procedural courier /
-  // review-routing / unblock card that gates no slice of the parent's deliverable.
-  // Resolve ALL FOUR carve-out label names in a single company-scoped labels read
+  // the gate it exists to correct); the fourth and fifth are procedural courier /
+  // review-routing / unblock / recovery cards that gate no slice of the parent's
+  // deliverable.
+  // Resolve ALL FIVE carve-out label names in a single company-scoped labels read
   // — the label id is company-scoped and this guard is not, and one read covers
-  // all four names (a second query would only add a round trip for a name the
+  // all five names (a second query would only add a round trip for a name the
   // first already resolves). A company with none of the labels present cannot
   // have such a child, so the issue_labels read is skipped entirely.
   let carveOutChildIds: Set<string> | null = null;
@@ -1246,12 +1249,14 @@ export async function countLadderedChildren(
       const policyStages = (row.executionPolicy as { stages?: unknown }).stages;
       if (!Array.isArray(policyStages) || policyStages.length === 0) continue;
     }
-    // SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177: a `work-type:redo`,
-    // `work-type:delivery`, `work-type:architecture-review`, or `work-type:process`
-    // child is not "which child gated this work?" — the first two re-deliver the
+    // SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177 / SUP-17553: a
+    // `work-type:redo`, `work-type:delivery`, `work-type:architecture-review`,
+    // `work-type:process`, or `work-type:recovery` child is not "which child
+    // gated this work?" — the first two re-deliver the
     // same deliverable this parent already gated, the third is a chain terminator
-    // filed to adjudicate this parent's gate, and the fourth is a procedural
-    // courier / review-routing / unblock card that gates no slice of it. Record it
+    // filed to adjudicate this parent's gate, and the fourth and fifth are
+    // procedural courier / review-routing / unblock / recovery cards that gate no
+    // slice of it. Record it
     // so the carve-out is visible in the mechanism A / D audit trail (a
     // mislabelled genuine child is detectable there), and do not count it toward
     // the decomposition.
@@ -1259,7 +1264,7 @@ export async function countLadderedChildren(
     // signal either — it is declared procedural at the edge and gates no slice of
     // this parent's deliverable. Exclude it (and record it in the audit trail)
     // identically to a carve-out-labelled child. Back-compat keeps the label
-    // check, so a child carrying any of the four carve-out labels is treated as
+    // check, so a child carrying any of the five carve-out labels is treated as
     // `process` regardless of the column value (no relabelling campaign needed).
     if (row.parentLinkKind === "process" || carveOutChildIds?.has(row.id)) {
       excludedChildIdentifiers.push(row.identifier ?? "<unnamed>");

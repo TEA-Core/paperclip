@@ -12,8 +12,10 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueLabels,
   issueRelations,
   issues,
+  labels,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import {
@@ -22,6 +24,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { countLadderedChildren } from "../services/done-transition-guard.js";
+import {
+  MISSING_APPROVAL_STAGE_ERROR_CODE,
+  diagnoseMissingApprovalStage,
+} from "../services/issue-execution-policy.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -52,6 +59,7 @@ describeEmbeddedPostgres("parent_link_kind write paths", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(issueLabels);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -61,6 +69,7 @@ describeEmbeddedPostgres("parent_link_kind write paths", () => {
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    await db.delete(labels);
     await db.delete(companies);
   });
 
@@ -148,6 +157,59 @@ describeEmbeddedPostgres("parent_link_kind write paths", () => {
       .from(issues)
       .where(eq(issues.id, issueId));
     return rows[0] ?? null;
+  }
+
+  async function createChild(
+    companyId: string,
+    parentId: string,
+    body: Record<string, unknown>,
+  ): Promise<string> {
+    // A unique title keeps the create route's recent-title dedup from folding the
+    // second child into the first (which would return 200 with the same id).
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: `Child ${randomUUID()}`, parentId, ...body });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    return res.body.id as string;
+  }
+
+  // Give a child a ran review ladder so `countLadderedChildren` sees it as a
+  // genuine decomposition child (policy present + a completed stage).
+  async function makeChildLaddered(childId: string) {
+    const stageId = randomUUID();
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] },
+        executionState: {
+          status: "completed",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          completedStageIds: [stageId],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, childId));
+  }
+
+  // The route's done-transition probe (routes/issues.ts) makes exactly these two
+  // calls: countLadderedChildren then diagnoseMissingApprovalStage. A null gap is
+  // what lets the close proceed without the typed
+  // done_transition_missing_approval_stage 409; a non-null gap is that refusal.
+  async function closeGapFor(companyId: string, parentId: string) {
+    const census = await countLadderedChildren(db, companyId, parentId);
+    const gap = diagnoseMissingApprovalStage({
+      policy: null,
+      ladderedChildCount: census.count,
+      ladderedChildIdentifiers: census.identifiers,
+      excludedChildIdentifiers: census.excludedChildIdentifiers,
+    });
+    return { census, gap };
   }
 
   it("writes parent_link_kind beside parent_id at create time", async () => {
@@ -284,5 +346,85 @@ describeEmbeddedPostgres("parent_link_kind write paths", () => {
           and(eq(issues.companyId, companyId), eq(issues.title, "Bad child kind")),
         ),
     ).toHaveLength(0);
+  });
+
+  // SUP-17553: the close-guard decision must follow the `parent_link_kind` (or
+  // carve-out label) written at CREATE — not a later PATCH. These seed children
+  // through the real POST route, then exercise the exact predicate the
+  // done-transition probe runs, so a regression that reads the wrong column (or
+  // drops a carve-out name) fails here against a real database.
+  describe("close-guard decision follows the create-time edge (SUP-17553)", () => {
+    it("excludes two process children created via POST — no close ladder owed (AC2/AC5)", async () => {
+      const { companyId, parentA } = await seedCompanyWithParents();
+      const child1 = await createChild(companyId, parentA, { parentLinkKind: "process" });
+      const child2 = await createChild(companyId, parentA, { parentLinkKind: "process" });
+      await makeChildLaddered(child1);
+      await makeChildLaddered(child2);
+
+      const { census, gap } = await closeGapFor(companyId, parentA);
+      expect(census.count).toBe(0);
+      expect(census.excludedChildIdentifiers).toHaveLength(2);
+      expect(gap).toBeNull();
+
+      // And on the real route: the approval-stage refusal is absent. (The close
+      // may still be held by an unrelated guard, so assert only the code.)
+      const done = await request(createApp(companyId))
+        .patch(`/api/issues/${parentA}`)
+        .send({ status: "done" });
+      expect(
+        done.body?.details?.code ?? done.body?.code,
+        JSON.stringify(done.body),
+      ).not.toBe(MISSING_APPROVAL_STAGE_ERROR_CODE);
+    });
+
+    it("still refuses for two decomposition children created via POST (AC5)", async () => {
+      const { companyId, parentA } = await seedCompanyWithParents();
+      const child1 = await createChild(companyId, parentA, { parentLinkKind: "decomposition" });
+      const child2 = await createChild(companyId, parentA, { parentLinkKind: "decomposition" });
+      await makeChildLaddered(child1);
+      await makeChildLaddered(child2);
+
+      const { census, gap } = await closeGapFor(companyId, parentA);
+      expect(census.count).toBe(2);
+      expect(census.identifiers).toHaveLength(2);
+      expect(gap).not.toBeNull();
+      expect(gap?.ladderedChildCount).toBe(2);
+      // The gap is the route's typed refusal code.
+      expect(MISSING_APPROVAL_STAGE_ERROR_CODE).toBe("done_transition_missing_approval_stage");
+
+      // And on the real route: the done transition is refused with that code.
+      const done = await request(createApp(companyId))
+        .patch(`/api/issues/${parentA}`)
+        .send({ status: "done" });
+      expect(done.status, JSON.stringify(done.body)).toBe(409);
+      expect(
+        done.body?.details?.code ?? done.body?.code,
+        JSON.stringify(done.body),
+      ).toBe(MISSING_APPROVAL_STAGE_ERROR_CODE);
+    });
+
+    it("carves out work-type:recovery children attached at the create edge (AC3)", async () => {
+      // This company's procedural label is `work-type:recovery` (it has no
+      // `work-type:process` label), so AC3's reachable label route is the
+      // recovery name. Two such children must not arm the parent's close ladder.
+      const { companyId, parentA } = await seedCompanyWithParents();
+      const labelId = randomUUID();
+      await db.insert(labels).values({
+        id: labelId,
+        companyId,
+        name: "work-type:recovery",
+        color: "#000000",
+      });
+
+      const child1 = await createChild(companyId, parentA, { labelIds: [labelId] });
+      const child2 = await createChild(companyId, parentA, { labelIds: [labelId] });
+      await makeChildLaddered(child1);
+      await makeChildLaddered(child2);
+
+      const { census, gap } = await closeGapFor(companyId, parentA);
+      expect(census.count).toBe(0);
+      expect(census.excludedChildIdentifiers).toHaveLength(2);
+      expect(gap).toBeNull();
+    });
   });
 });

@@ -75,9 +75,9 @@ describe("isLadderArmingParentEdge", () => {
     ).toBe(false);
   });
 
-  it("does not count a carve-out-labelled child (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177)", () => {
+  it("does not count a carve-out-labelled child (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177 / SUP-17553)", () => {
     // The arm round 1 of this fix left out. `countLadderedChildren` excludes a
-    // child carrying any of the four carve-out labels, so the gate must not
+    // child carrying any of the five carve-out labels, so the gate must not
     // refuse one for a count that side would never have produced. A redo child
     // is the common case: it is manual, not cancelled, and an ordinary
     // `decomposition` edge — every other arm passes it through.
@@ -106,7 +106,7 @@ describe("isLadderArmingParentEdge", () => {
     ).toBe(true);
   });
 
-  it("pins the four carve-out label names as one shared list", () => {
+  it("pins the five carve-out label names as one shared list", () => {
     // These names are matched by string against company-scoped label rows in
     // two places (the close-time counter and the edge-time resolver). A second
     // copy of the list is exactly the drift that produced the M4 defect, so the
@@ -116,6 +116,7 @@ describe("isLadderArmingParentEdge", () => {
       "work-type:delivery",
       "work-type:architecture-review",
       "work-type:process",
+      "work-type:recovery",
     ]);
   });
 

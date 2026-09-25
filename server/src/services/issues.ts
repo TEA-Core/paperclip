@@ -11005,8 +11005,9 @@ export function issueService(db: Db) {
         //
         // The carve-out labels travel with the edge for the same reason. The
         // close guard excludes any child carrying `work-type:redo`,
-        // `work-type:delivery`, `work-type:architecture-review` or
-        // `work-type:process` (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177),
+        // `work-type:delivery`, `work-type:architecture-review`,
+        // `work-type:process` or `work-type:recovery`
+        // (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177 / SUP-17553),
         // and those names are resolvable HERE because `labelIds` is on the
         // create payload — the same `inputLabelIds` that `syncIssueLabels`
         // attaches a few dozen lines below, so the gate judges the child by the
