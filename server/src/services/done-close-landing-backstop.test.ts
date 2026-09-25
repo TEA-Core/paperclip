@@ -2722,7 +2722,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       ],
     };
 
-    it("refuses a cross-repo head: names the ADR-091 D5 remedy, arms nothing, spends no quota", async () => {
+    it("reports a cross-repo head report-only: names the D5 cause, arms nothing, parks nothing, wakes no one, spends no quota", async () => {
       const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
       const { service } = makeService(
         {
@@ -2771,7 +2771,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 1,
+        escalated: 0,
         draftStranded: 0,
       });
 
@@ -2782,40 +2782,43 @@ describe("SUP-16689: draft-stranded done cards", () => {
       expect(mockFetchLastMergeQueueEjectionViaTokenCandidates).not.toHaveBeenCalled();
       expect(mockFetchHeadViaTokenCandidates).not.toHaveBeenCalled();
 
-      // The reported reason is the structural cross-repo cause + the D5 remedy,
-      // NOT the old "no resolvable GitHub token or API error" misreport.
-      const escalated = mockLogActivity.mock.calls.find(
-        (call) => (call[1] as { action?: string })?.action === "issue.done_close_landing_escalated",
+      // SUP-17514: the cross-repo head is REPORT-ONLY. A durable audit row names
+      // the PR, the head repo, the delivery repo and the ADR-091 D5 reason — and
+      // nothing else. The old escalated row with the unsatisfiable board remedy is
+      // gone.
+      const reported = mockLogActivity.mock.calls.find(
+        (call) =>
+          (call[1] as { action?: string })?.action === "issue.done_close_landing_cross_repo_reported",
       );
-      const reason = (escalated?.[1] as { details?: { reason?: string } })?.details?.reason ?? "";
+      expect(reported).toBeDefined();
+      const reportedDetails = (reported?.[1] as { details?: Record<string, unknown> })?.details ?? {};
+      expect(reportedDetails.pr).toBe("tea-core/tsp-obsidian-vault#493");
+      expect(reportedDetails.headRepo).toBe("tea-core/tsp-obsidian-vault");
+      expect(reportedDetails.deliveryRepo).toBe("TEA-Core/Trading-Signal-Platform");
+      const reason = String(reportedDetails.reason ?? "");
       expect(reason).toContain("tea-core/tsp-obsidian-vault");
       expect(reason).toContain("is not this card's delivery repo");
       expect(reason).toContain("TEA-Core/Trading-Signal-Platform");
       expect(reason).toContain("must be filed under a project bound to that repo (ADR-091 D5)");
       expect(reason).not.toContain("re-enqueue attempt failed");
 
-      // No re-enqueue row → no MAX_REENQUEUE_ATTEMPTS slot consumed.
+      // No escalated row and no re-enqueue row → no MAX_REENQUEUE_ATTEMPTS slot.
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_close_landing_escalated" }),
+      );
       expect(mockLogActivity).not.toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ action: "issue.done_close_landing_reenqueued" }),
       );
 
-      expect(mockUpdate).toHaveBeenCalledWith(
-        ISSUE,
-        expect.objectContaining({
-          status: "blocked",
-          unblockDescriptor: expect.objectContaining({
-            owner: "board",
-            action: expect.stringContaining(
-              "File the deliverable under a project bound to tea-core/tsp-obsidian-vault (ADR-091 D5)",
-            ),
-          }),
-        }),
-      );
-      expect(wakeup).toHaveBeenCalledTimes(1);
+      // SUP-17514: no board park, no unblockDescriptor, no assignee wake — the
+      // card stays done.
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
     });
 
-    it("replaces the observed SUP-17047 token/API escalation with the D5 cause (no token resolvable)", async () => {
+    it("reports the observed SUP-17047 cross-repo head report-only (no token resolvable, no park, no wake)", async () => {
       const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
       const { service } = makeService(
         {
@@ -2851,30 +2854,37 @@ describe("SUP-16689: draft-stranded done cards", () => {
         failed: 0,
         deferred: 0,
         reenqueued: 0,
-        escalated: 1,
+        escalated: 0,
         draftStranded: 0,
       });
 
       // Pre-fix this exact setup escalated with "re-enqueue attempt failed (no
-      // resolvable GitHub token or API error)"; now it names the structural cause.
-      const escalated = mockLogActivity.mock.calls.find(
-        (call) => (call[1] as { action?: string })?.action === "issue.done_close_landing_escalated",
+      // resolvable GitHub token or API error)" + a board park + an assignee wake.
+      // SUP-17514: it now names the structural cross-repo cause as a report-only
+      // row and parks nothing, wakes no one.
+      const reported = mockLogActivity.mock.calls.find(
+        (call) =>
+          (call[1] as { action?: string })?.action === "issue.done_close_landing_cross_repo_reported",
       );
-      const reason = (escalated?.[1] as { details?: { reason?: string } })?.details?.reason ?? "";
+      expect(reported).toBeDefined();
+      const reason =
+        (reported?.[1] as { details?: { reason?: string } })?.details?.reason ?? "";
       expect(reason).toContain("is not this card's delivery repo");
       expect(reason).not.toContain("re-enqueue attempt failed");
       // The guard short-circuits before the token read.
       expect(mockResolveGitHubTokenForRepo).not.toHaveBeenCalled();
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
-      expect(wakeup).toHaveBeenCalledTimes(1);
+      // Report-only: no board park, no assignee wake.
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
     });
 
-    it("bounds the cross-repo disposition to one escalated row per PR key", async () => {
+    it("bounds the cross-repo disposition to one report-only row per card", async () => {
       const { service } = makeService({
         candidates: [candidateRow()],
         existingLandingRows: [
           {
-            action: "issue.done_close_landing_escalated",
+            action: "issue.done_close_landing_cross_repo_reported",
             entityId: ISSUE,
             details: { pr: "tea-core/tsp-obsidian-vault#493" },
           },
@@ -2903,6 +2913,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
         escalated: 0,
         draftStranded: 0,
       });
+      // Already reported for this card → idempotent: no second row, no park, no wake.
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockUpdate).not.toHaveBeenCalled();
     });

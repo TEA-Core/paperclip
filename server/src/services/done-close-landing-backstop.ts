@@ -98,6 +98,18 @@ export const DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION = "issue.done_close_landin
 // done. This row is the only record for that disposition (mirrors the
 // superseded-carrier ledger: an audit row, no status change).
 export const DONE_CLOSE_LANDING_ATTRIBUTED_ACTION = "issue.done_close_landing_attributed";
+// SUP-17514 (ADR-091 D5 cross-repo disposition): a decision-carried `done` card
+// whose linked PR's head repo is NOT the card's delivery repo. The SUP-17133
+// delivery-repo guard refuses to arm it (correct — the card has no deliverable
+// in that repo), but its disposition used to be "escalate + park the card
+// `blocked`", converting a fully-landed card into a permanently-parked one with
+// an unsatisfiable board remedy (SUP-17092: the card's own delivery confirmed
+// 8ms earlier, then a body-cited foreign-repo PR escalated and re-opened it).
+// The cross-repo reading is therefore report-only: a durable audit row naming
+// the PR, head repo, delivery repo and the D5 reason. No status change, no
+// unblockDescriptor, no assignee wake. This row is the only record for that
+// disposition (mirrors draft_stranded: an audit row, no status change).
+export const DONE_CLOSE_LANDING_CROSS_REPO_REPORTED_ACTION = "issue.done_close_landing_cross_repo_reported";
 const DECISION_CARRIED_SKIP_REASON_PREFIX = "open_linked_prs_decision_carried:";
 const SKIPPED_ACTION = "issue.done_transition_guard_skipped";
 
@@ -500,6 +512,7 @@ export function createDoneCloseLandingBackstopService(
               DONE_CLOSE_LANDING_ATTRIBUTED_ACTION,
               DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION,
               DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
+              DONE_CLOSE_LANDING_CROSS_REPO_REPORTED_ACTION,
             ],
           ),
           // This card's own rows (per-card ledger) OR any company row that
@@ -554,6 +567,20 @@ export function createDoneCloseLandingBackstopService(
         .filter(
           (r) =>
             r.action === DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION && r.entityId === issue.id,
+        )
+        .map((r) => readString(readRecord(r.details)?.pr))
+        .filter((value): value is string => value !== null),
+    );
+    // SUP-17514: per-card cross-repo report-only ledger. A cross-repo PR is a
+    // structural attribution (like the D1 `attributed` row, grace-independent),
+    // so it is reported once per card; the per-card scope (entityId = issue.id)
+    // bounds the report like confirmed/failed/draft_stranded. No status change,
+    // so the bound lives entirely in this ledger.
+    const alreadyCrossRepoReported = new Set(
+      existing
+        .filter(
+          (r) =>
+            r.action === DONE_CLOSE_LANDING_CROSS_REPO_REPORTED_ACTION && r.entityId === issue.id,
         )
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
@@ -986,6 +1013,63 @@ export function createDoneCloseLandingBackstopService(
           headRepo: `${pr.owner}/${pr.repo}`,
           deliveryRepo: `${delivery.deliveryRepo.owner}/${delivery.deliveryRepo.repo}`,
         };
+      }
+
+      // SUP-17514 (ADR-091 D5 cross-repo disposition): a linked PR whose head repo
+      // is NOT this card's delivery repo is structurally not part of this card's
+      // landing obligation — the card has no deliverable in that repo and never
+      // did. SUP-17133's guard refuses to arm it (correct), but the disposition it
+      // chose was "escalate + park the card `blocked`" with an unsatisfiable board
+      // remedy ("file the deliverable under a project bound to that repo"), which
+      // converted a fully-landed card into a permanently-parked one (SUP-17092:
+      // the card's own delivery confirmed 8ms earlier, then a body-cited
+      // foreign-repo PR escalated and re-opened it). The cross-repo reading is
+      // therefore REPORT-ONLY: a durable audit row naming the PR, the head repo,
+      // the delivery repo and the D5 reason. No `svc.update(status: "blocked")`,
+      // no `unblockDescriptor`, no assignee wake. This is a structural attribution
+      // (like the D1 `attributed` row), so it is reported grace-independently and
+      // idempotently. The genuinely-unlanded SAME-repo `not-delivered` PR (head
+      // repo matches the delivery repo) falls through to the escalate+park path
+      // below, and `identity-unresolved` keeps SUP-17133's re-enqueue behaviour —
+      // the guard is keyed on `not-delivered`, never widened to a second outcome.
+      const headRepoIsDeliveryRepo =
+        delivery.outcome === "not-delivered" &&
+        pr.owner.toLowerCase() === delivery.deliveryRepo.owner.toLowerCase() &&
+        pr.repo.toLowerCase() === delivery.deliveryRepo.repo.toLowerCase();
+      if (delivery.outcome === "not-delivered" && !headRepoIsDeliveryRepo) {
+        if (!alreadyCrossRepoReported.has(prKey)) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: DONE_CLOSE_LANDING_CROSS_REPO_REPORTED_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              pr: prKey,
+              prState: "open",
+              disposition: "cross_repo_report_only",
+              headRepo: `${pr.owner}/${pr.repo}`,
+              deliveryRepo: `${delivery.deliveryRepo.owner}/${delivery.deliveryRepo.repo}`,
+              reason: notDeliveredReasonForPr(
+                pr,
+                delivery.deliveryRepo,
+                delivery.deliveryBranch,
+                delivery.requiredIdentifier,
+              ),
+              skipReason: skipReason ?? null,
+              refusal: isArmingRefusal,
+            },
+          });
+        }
+        // Drop this PR from the card's landing set: no re-enqueue, no escalation,
+        // no board park, no assignee wake.
+        continue;
       }
 
       // SUP-15315: head-authorization gate. Set when the live head is positively
