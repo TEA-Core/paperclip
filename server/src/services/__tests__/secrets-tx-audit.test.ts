@@ -290,7 +290,8 @@ describeEmbeddedPostgres("secretService secret-read audit — transaction fate",
         "latest",
         context,
       );
-      expect(result.value).toBe(FIXTURE_VALUE);
+      // Redaction-safe: a boolean assertion keeps the fixture value out of Vitest failure output.
+      expect(result.value === FIXTURE_VALUE).toBe(true);
       expect(result.version).toBe(1);
     } finally {
       await db.transaction(async (tx) => {
@@ -310,6 +311,7 @@ describeEmbeddedPostgres("secretService secret-read audit — transaction fate",
       .from(activityLog)
       .where(eq(activityLog.entityId, secret.id));
     expect(auditRows).toHaveLength(0);
-    expect(JSON.stringify(auditRows)).not.toContain(FIXTURE_VALUE);
+    // Redaction-safe: a boolean assertion keeps any audit-row value out of failure output.
+    expect(JSON.stringify(auditRows).includes(FIXTURE_VALUE)).toBe(false);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 });
