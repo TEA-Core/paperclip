@@ -535,4 +535,110 @@ describe("createBranchPrReconcilerSweepService", () => {
     expect(result.candidates).toBe(3);
     expect(result.skipped).toBe(3);
   });
+
+  /**
+   * The SQL predicate selects on the STORED `branchPrReconcileNextDueAt`, so the
+   * in-process backstop must read the same value rather than re-deriving a window
+   * from the checked-at marker. If it re-derived, a change to the configured base
+   * cooldown would make the two disagree: rows stamped under the old base would be
+   * selected as due by the query and then rejected here, burning a probe slot every
+   * sweep without ever being re-stamped — the exact starvation the stored due time
+   * exists to prevent.
+   */
+  it("honours the stored due time over a reconfigured base cooldown", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    // Stored due time has passed, so the row IS due. A re-derived window would
+    // disagree: checked 10 min ago, streak 3, against a raised 1h base cooldown.
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: {
+          branchPrReconcileCheckedAt: iso(10 * 60 * 1000),
+          branchPrReconcileMissStreak: 3,
+          branchPrReconcileNextDueAt: iso(60 * 1000),
+        },
+      }),
+    ]];
+    const { db } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      cooldownMs: 60 * 60 * 1000,
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.rateLimited).toBe(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it("still rate-limits a row whose stored due time is in the future", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: {
+          branchPrReconcileCheckedAt: iso(10 * 60 * 60 * 1000),
+          branchPrReconcileMissStreak: 0,
+          branchPrReconcileNextDueAt: new Date(NOW + 30 * 60 * 1000).toISOString(),
+        },
+      }),
+    ]];
+    const { db } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.rateLimited).toBe(1);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("treats an unparseable stored due time as due, so a corrupt row self-heals", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    const pages = [[
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: { branchPrReconcileNextDueAt: "not-a-timestamp" },
+      }),
+    ]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.skipped).toBe(1);
+    // Re-stamped with a well-formed ISO value.
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(Number.isFinite(Date.parse(metadata.branchPrReconcileNextDueAt as string))).toBe(true);
+  });
 });

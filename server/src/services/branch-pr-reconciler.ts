@@ -117,6 +117,39 @@ function readMissStreak(metadata: Record<string, unknown> | null): number {
 }
 
 /**
+ * Is this row due, by the same rule the SQL predicate applies?
+ *
+ * Prefers the STORED due time, so this backstop and the query agree by
+ * construction. Re-deriving the window from the checked-at marker instead would
+ * let the two disagree whenever `cooldownMs` is reconfigured: rows stamped under
+ * the old base would be selected as due by SQL and then rejected here, consuming
+ * a probe slot every sweep without ever being re-stamped — reintroducing, in that
+ * window, exactly the starvation the stored due time exists to prevent.
+ *
+ * Falls back to deriving the window for rows written before the key existed, and
+ * treats a missing or unparseable value as due: the row is then probed once and
+ * re-stamped with a well-formed value, so a corrupt row self-heals.
+ */
+function isDue(
+  metadata: Record<string, unknown> | null,
+  missStreak: number,
+  nowMs: number,
+  baseCooldownMs: number,
+): boolean {
+  const storedDueAt = metadata?.[NEXT_DUE_KEY];
+  if (typeof storedDueAt === "string") {
+    const parsed = Date.parse(storedDueAt);
+    if (Number.isFinite(parsed)) return parsed <= nowMs;
+  }
+  const lastCheckedAt =
+    typeof metadata?.[COOLDOWN_KEY] === "string"
+      ? Date.parse(metadata[COOLDOWN_KEY] as string)
+      : Number.NaN;
+  if (!Number.isFinite(lastCheckedAt)) return true;
+  return nowMs - lastCheckedAt >= effectiveCooldownMs(baseCooldownMs, missStreak);
+}
+
+/**
  * Effective cooldown for a row: the base window doubled once per consecutive
  * unproductive outcome, capped at `MAX_COOLDOWN_MS`.
  *
@@ -314,12 +347,7 @@ export function createBranchPrReconcilerSweepService(
       // progress were the most expensive to carry. Backoff has to apply to every
       // unproductive outcome, including the ones that never reach GitHub.
       const missStreak = readMissStreak(row.metadata);
-      const rowCooldownMs = effectiveCooldownMs(cooldownMs, missStreak);
-      const lastCheckedAt =
-        typeof row.metadata?.[COOLDOWN_KEY] === "string"
-          ? Date.parse(row.metadata[COOLDOWN_KEY] as string)
-          : Number.NaN;
-      if (Number.isFinite(lastCheckedAt) && nowMs - lastCheckedAt < rowCooldownMs) {
+      if (!isDue(row.metadata, missStreak, nowMs, cooldownMs)) {
         result.rateLimited += 1;
         continue;
       }
