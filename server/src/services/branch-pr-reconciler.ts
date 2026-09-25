@@ -43,6 +43,24 @@ import { prDeliveryService, type PrDeliveryInput } from "./pr-delivery.js";
  * marker is stamped on every probe outcome — including failure — so a
  * persistently-unresolvable row stops occupying a `limit` slot.
  *
+ * The marker alone bounds only per-TICK work, never the steady-state query rate.
+ * Observed on a production instance, 2026-09-25: 653 candidates, `limit` 50, a sweep every 30s —
+ * so a full cycle took ~6.5 min against a flat 5 min cooldown. Every row was
+ * therefore always due again by the time its turn came round: `rateLimited` was 0
+ * on 120 consecutive sweeps and the reconciler sustained ~6,000 GitHub calls an
+ * hour, above GitHub's 5,000/hr authenticated ceiling, with nothing ever leaving
+ * the candidate set (a branch with no merged PR records nothing, so it stays a
+ * candidate forever).
+ *
+ * So the cooldown is per-row and EXPONENTIAL, keyed on
+ * `metadata.branchPrReconcileMissStreak`: the base window doubles with each
+ * consecutive unproductive outcome and is capped at 24h, and the streak resets to
+ * 0 the moment a product is recorded. Rows that will never resolve become
+ * geometrically cheaper to carry while a branch whose PR merges later is still
+ * picked up within a day. Because the marker is stamped on every outcome, a
+ * backed-off row also sorts to the BACK of the `ASC NULLS FIRST` cursor, so it
+ * stops consuming a `limit` slot ahead of genuinely due rows.
+ *
  * Counters are reported as separate fields: `created` (recorded a new product),
  * `skipped` (branch checked, had no merged PR — nothing recorded), and
  * `rateLimited` (within the per-workspace cooldown window; GitHub not
@@ -51,8 +69,39 @@ import { prDeliveryService, type PrDeliveryInput } from "./pr-delivery.js";
  */
 
 const COOLDOWN_KEY = "branchPrReconcileCheckedAt";
+const MISS_STREAK_KEY = "branchPrReconcileMissStreak";
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 const DEFAULT_LIMIT = 50;
+/**
+ * Ceiling on the backed-off window. A row is never abandoned: however many times
+ * it has come back unproductive, it is re-probed at least once a day, so a branch
+ * whose PR is merged long after the fact is still picked up.
+ */
+const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+/** Guard against `2 ** streak` overflowing to Infinity on a corrupt/absurd counter. */
+const MAX_BACKOFF_EXPONENT = 32;
+
+/** Consecutive unproductive outcomes recorded on a row, or 0 when absent/corrupt. */
+function readMissStreak(metadata: Record<string, unknown> | null): number {
+  const raw = metadata?.[MISS_STREAK_KEY];
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return 0;
+  return Math.floor(raw);
+}
+
+/**
+ * Effective cooldown for a row: the base window doubled once per consecutive
+ * unproductive outcome, capped at `MAX_COOLDOWN_MS`.
+ *
+ * A FLAT cooldown only bounds per-tick work, never the steady-state query rate:
+ * once the candidate backlog is large enough that a full cycle takes longer than
+ * the window, every row is always due again when its turn comes and the sweep
+ * probes at full rate forever. Backoff bounds the rate instead, because the rows
+ * that will never resolve become geometrically cheaper to carry.
+ */
+function effectiveCooldownMs(baseCooldownMs: number, missStreak: number): number {
+  const exponent = Math.min(missStreak, MAX_BACKOFF_EXPONENT);
+  return Math.min(baseCooldownMs * 2 ** exponent, MAX_COOLDOWN_MS);
+}
 
 export interface BranchPrReconcilerSweepResult {
   /** Rows in the candidate set this tick (repo + branch + source, no existing pull_request product); equals rateLimited + created + skipped + failed. */
@@ -128,13 +177,27 @@ export function createBranchPrReconcilerSweepService(
       resolveGitHubTokenForRepo(db, args.companyId, args.owner, args.repo));
   const recordAtOpen = opts.recordAtOpen ?? prDeliveryService(db).recordAtOpen;
 
-  /** Stamps the per-workspace cooldown marker, preserving any existing metadata. Best-effort: a marker failure must not abort the sweep. */
-  async function stampCooldown(row: CandidateRow, nowMs: number): Promise<void> {
+  /**
+   * Stamps the per-workspace cooldown marker and the consecutive-miss counter that
+   * drives the backoff, preserving any existing metadata. Best-effort: a marker
+   * failure must not abort the sweep.
+   *
+   * `nextMissStreak` is 0 on a productive outcome (a product was recorded) and the
+   * incremented streak on every unproductive one (no merged PR, no token, probe or
+   * record error) — those are exactly the outcomes that must get cheaper to retry.
+   */
+  async function stampCooldown(row: CandidateRow, nowMs: number, nextMissStreak: number): Promise<void> {
     const metadata = (row.metadata as Record<string, unknown> | null) ?? {};
     try {
       await db
         .update(executionWorkspaces)
-        .set({ metadata: { ...metadata, [COOLDOWN_KEY]: new Date(nowMs).toISOString() } })
+        .set({
+          metadata: {
+            ...metadata,
+            [COOLDOWN_KEY]: new Date(nowMs).toISOString(),
+            [MISS_STREAK_KEY]: nextMissStreak,
+          },
+        })
         .where(eq(executionWorkspaces.id, row.id));
     } catch (error) {
       logger.warn(
@@ -194,16 +257,20 @@ export function createBranchPrReconcilerSweepService(
       const parsed = parseRepoUrl(row.repoUrl);
       if (!parsed || !row.branchName || !row.sourceIssueId) {
         result.failed += 1;
-        await stampCooldown(row, nowMs);
+        await stampCooldown(row, nowMs, readMissStreak(row.metadata) + 1);
         continue;
       }
 
-      // Per-workspace cooldown: within the window, do not re-query GitHub.
+      // Per-workspace cooldown: within the window, do not re-query GitHub. The
+      // window widens with the row's consecutive-miss streak, so a backlog of
+      // permanently unresolvable rows cannot pin the sweep at full query rate.
+      const missStreak = readMissStreak(row.metadata);
+      const rowCooldownMs = effectiveCooldownMs(cooldownMs, missStreak);
       const lastCheckedAt =
         typeof row.metadata?.[COOLDOWN_KEY] === "string"
           ? Date.parse(row.metadata[COOLDOWN_KEY] as string)
           : Number.NaN;
-      if (Number.isFinite(lastCheckedAt) && nowMs - lastCheckedAt < cooldownMs) {
+      if (Number.isFinite(lastCheckedAt) && nowMs - lastCheckedAt < rowCooldownMs) {
         result.rateLimited += 1;
         continue;
       }
@@ -218,7 +285,7 @@ export function createBranchPrReconcilerSweepService(
           { workspaceId: row.id, reason: tokenResult.reason },
           "branch-to-merged-PR reconciler: no GitHub token resolvable; will retry next sweep",
         );
-        await stampCooldown(row, nowMs);
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.failed += 1;
         continue;
       }
@@ -237,14 +304,16 @@ export function createBranchPrReconcilerSweepService(
           { err: error, workspaceId: row.id, branch: row.branchName },
           "branch-to-merged-PR reconciler: merged-PR probe failed; will retry next sweep",
         );
-        await stampCooldown(row, nowMs);
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.failed += 1;
         continue;
       }
 
       if (!probe.hasMergedPr || probe.mergedPrNumber === null) {
-        // The branch has no merged PR: record nothing, cool the row down.
-        await stampCooldown(row, nowMs);
+        // The branch has no merged PR: record nothing, cool the row down and widen
+        // its window, since this is the outcome that repeats forever on a row whose
+        // branch will never carry a merged PR.
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.skipped += 1;
         continue;
       }
@@ -261,7 +330,8 @@ export function createBranchPrReconcilerSweepService(
           headSha: null,
           url: `https://${parsed.hostname}/${repository}/pull/${probe.mergedPrNumber}`,
         });
-        await stampCooldown(row, nowMs);
+        // Productive outcome: clear the streak so a healed row returns to the base cadence.
+        await stampCooldown(row, nowMs, 0);
         if (recorded.writtenIssueIds.length > 0) result.created += 1;
         else result.skipped += 1;
       } catch (error) {
@@ -269,7 +339,7 @@ export function createBranchPrReconcilerSweepService(
           { err: error, workspaceId: row.id, branch: row.branchName },
           "branch-to-merged-PR reconciler: failed to record pull_request work product; will retry next sweep",
         );
-        await stampCooldown(row, nowMs);
+        await stampCooldown(row, nowMs, missStreak + 1);
         result.failed += 1;
       }
     }

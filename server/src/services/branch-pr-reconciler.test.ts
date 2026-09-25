@@ -279,4 +279,119 @@ describe("createBranchPrReconcilerSweepService", () => {
     expect(second).toEqual({ candidates: 0, created: 0, skipped: 0, rateLimited: 0, failed: 0 });
     expect(recordAtOpen).toHaveBeenCalledTimes(1);
   });
+
+  /**
+   * Production defect (2026-09-25): the candidate set held 653 rows and the
+   * sweep fired every 30s with limit 50, so a full cycle took ~6.5 min — LONGER than
+   * the flat 5 min cooldown. Every row was therefore always out of cooldown when it
+   * came round again: `rateLimited` was 0 on 120/120 sweeps and the reconciler issued
+   * a steady 6,000 GitHub calls/hour, above GitHub's 5,000/hr authenticated ceiling.
+   * A flat cooldown cannot bound the steady-state rate when the backlog outgrows it;
+   * only a per-row backoff can, because it makes an unproductive row cheaper over time.
+   */
+  it("backs a persistently unproductive row off exponentially so a large backlog cannot outrun the cooldown", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    // Marker is 6 minutes old: outside the 5 min BASE cooldown, but the row has already
+    // come back "no merged PR" four times, so its effective window is 5 * 2^4 = 80 min.
+    const backedOff = [
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: { branchPrReconcileCheckedAt: iso(6 * 60 * 1000), branchPrReconcileMissStreak: 4 },
+      }),
+    ];
+    const { db } = makeDb([backedOff]);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result).toEqual({ candidates: 1, created: 0, skipped: 0, rateLimited: 1, failed: 0 });
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("increments the miss streak when a probed branch has no merged PR", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    const pages = [[row({ id: "w-a", sourceIssueId: "src-a", branchName: "a-branch", metadata: { branchPrReconcileMissStreak: 2 } })]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.skipped).toBe(1);
+    expect(updates).toHaveLength(1);
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(metadata.branchPrReconcileMissStreak).toBe(3);
+  });
+
+  it("resets the miss streak once a merged PR is recorded, so a healed row returns to the base cadence", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: true,
+      mergedPrNumber: 42,
+      mergedPrRepository: "o/r",
+    }));
+    const pages = [[row({ id: "w-a", sourceIssueId: "src-a", branchName: "a-branch", metadata: { branchPrReconcileMissStreak: 7 } })]];
+    const { db, updates } = makeDb(pages);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: ["src-a"] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    expect(result.created).toBe(1);
+    const metadata = updates[0].set.metadata as Record<string, unknown>;
+    expect(metadata.branchPrReconcileMissStreak).toBe(0);
+  });
+
+  it("caps the backoff so a row is still re-probed eventually rather than being abandoned", async () => {
+    const probe = makeProbe(async () => ({
+      hasMergedPr: false,
+      mergedPrNumber: null,
+      mergedPrRepository: null,
+    }));
+    // A huge streak must not produce an unbounded (effectively infinite) window: the
+    // cap is 24h, so a marker older than that is probed again.
+    const ancient = [
+      row({
+        id: "w-a",
+        sourceIssueId: "src-a",
+        branchName: "a-branch",
+        metadata: { branchPrReconcileCheckedAt: iso(25 * 60 * 60 * 1000), branchPrReconcileMissStreak: 999 },
+      }),
+    ];
+    const { db } = makeDb([ancient]);
+    const service = createBranchPrReconcilerSweepService(db as never, {
+      probeBranchMergedPr: probe,
+      resolveToken: vi.fn(async () => tokenOk()),
+      recordAtOpen: vi.fn(async () => ({ writtenIssueIds: [] })),
+      now: nowFn,
+    });
+
+    const result = await service.sweep();
+
+    // Probed (not rate-limited), and the branch still has no merged PR → skipped.
+    expect(result).toEqual({ candidates: 1, created: 0, skipped: 1, rateLimited: 0, failed: 0 });
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
 });
