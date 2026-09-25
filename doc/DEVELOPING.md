@@ -370,6 +370,18 @@ These browser suites are intended for targeted local verification and CI, not th
 
 For normal issue work, start with the smallest targeted check that proves the change. Reserve repo-wide typecheck/build/test runs for PR-ready handoff or changes broad enough that narrow checks do not cover the risk.
 
+### Test Worker Limits
+
+Vitest uses one worker pool for the whole run. A per-project `maxWorkers` does not bound that pool, so a bare `vitest` or `pnpm test:watch` at the repo root runs every project through one shared pool. This matters because each concurrent `@paperclipai/server` suite boots its own embedded PostgreSQL in `beforeAll`; `server/vitest.config.ts` pins `maxWorkers` to 1, and that pin only applies when the server project is the entire run.
+
+The root config therefore bounds the pool itself. The default is 4 workers, clamped to the machine's available parallelism.
+
+- `PAPERCLIP_VITEST_MAX_WORKERS` (default `4`, clamped to `availableParallelism()`)
+
+Raise it only for a run that owns the machine. Do not raise it for a run inside the Paperclip server container: agent runs share the server's memory cgroup, so an oversized worker fleet can get the control plane OOM-killed.
+
+`pnpm test` runs through `scripts/run-vitest-stable.mjs`, which shards deliberately and keeps the server lane serial. That path is unaffected by this limit.
+
 ### Task search evaluation
 
 The task search relevance rubric and regression corpus are documented in
@@ -644,6 +656,16 @@ Environment overrides:
 - `PAPERCLIP_WORKSPACE_GIT_SCAN_QUEUE_CAPACITY` (default `32`, range `0`–`1024`)
 - `PAPERCLIP_WORKSPACE_GIT_SCAN_TIMEOUT_MS` (default `8000`, range `100`–`120000`)
 - `PAPERCLIP_WORKSPACE_GIT_SCAN_CACHE_TTL_MS` (default `10000`, range `0`–`60000`)
+
+## Agent Subprocess OOM Priority
+
+Agent runs execute inside the Paperclip server container and share its memory cgroup. When that cgroup fills, the kernel chooses a victim across everything in it, so a runaway agent workload competes with the control plane. If the server loses, the container still reports `Up`, because the init process survives, and the reverse proxy has nothing to reach.
+
+The server cannot lower its own `oom_score_adj`; that needs `CAP_SYS_RESOURCE`, which the container does not hold. Raising a value is always permitted and `oom_score_adj` is inherited across fork and exec. Paperclip therefore raises the value on the agent child at its spawn seam, which covers the whole process tree beneath it.
+
+- `PAPERCLIP_AGENT_OOM_SCORE_ADJ` (default `500`, range `0`–`1000`)
+
+Set `0` to disable. The adjustment is best-effort: a dead pid, a non-Linux host or a denied write is a no-op and never fails a run.
 
 Structured `workspace_git_scan` logs expose the operation name, a non-reversible workspace-path hash, queue and execution durations, active/queued counts, cache and single-flight use, and terminal outcome. Saturation and timeout warnings are rate-limited so an overload does not create a second logging storm.
 
