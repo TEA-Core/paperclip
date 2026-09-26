@@ -406,6 +406,8 @@ describe("runChildProcess OOM deprioritization (SUP-17610)", () => {
         ],
         {
           cwd: process.cwd(),
+          // This case intentionally covers only the gate-unset server path; production
+          // PAPERCLIP_AGENT_UID setuid-shim coverage is in docker/agent-spawn-shim/test-spawn-shim.sh.
           env: {},
           timeoutSec: 5,
           graceSec: 1,
