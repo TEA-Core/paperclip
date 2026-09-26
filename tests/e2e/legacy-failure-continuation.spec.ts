@@ -13,7 +13,10 @@ async function json(response: APIResponse) {
 
 for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "queued_interrupt", "automatic_message"] as const) {
   test(`legacy startup hold: ${action} reaches a new agent response`, async ({ page, request }) => {
-    test.setTimeout(120_000);
+    // SUP-17651: envelope for loaded-runner setup plus the signal-driven waits below
+    // (90s pipeline poll + two 45s render checks). The internal waits terminate early
+    // when the server state settles; the cap is the pathological ceiling, not a budget.
+    test.setTimeout(240_000);
     const root = await mkdtemp(path.join(os.tmpdir(), "legacy-recovery-browser-"));
     const config = JSON.parse(await readFile(process.env.PAPERCLIP_E2E_SERVER_CONFIG!, "utf8"));
     // Use the running test server's actual port, including fallback allocation.
@@ -114,6 +117,18 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       // Tier 1 comment mid-turn, so until the run settles the reply also renders as the live
       // transcript interstitial and an unscoped getByText hits a strict-mode violation. Both
       // reply checks assert on the posted agent reply bubble, which is the response under test.
+      // SUP-17651: wait on the real completion signal -- exactly one recovered run (not the
+      // seeded sourceRunId) reaching terminal success in the server's state -- instead of a
+      // fixed 45s wall-clock budget. On loaded CI shards the pipeline (wakeup dispatch, ACP
+      // process spawn, run finalization) and browser rendering can each lag; the old fixed
+      // window turned that lag into a hard "reply never appeared" timeout at the test cap.
+      // The poll bounds the pipeline wait and terminates early the moment the server state
+      // settles; the UI assertions below then verify rendering against settled state.
+      await expect.poll(async () => {
+        const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, company.id), eq(heartbeatRuns.agentId, agent.id)));
+        const recovered = runs.filter(run => run.id !== sourceRunId);
+        return recovered.length === 1 && recovered[0].status === "succeeded";
+      }, { timeout: 90_000, intervals: [500] });
       await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
       await expect(page.getByRole("status", { name: "Task recovery" })).toHaveCount(0);
       const completed = await json(await request.get(`/api/issues/${issue.id}`));
@@ -128,11 +143,23 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       }
       if (action === "message") expect(prompts).toContain("Please continue the pending follow-up.");
       await page.reload();
-      await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible();
+      // SUP-17651: the reload lands on a cold task page that must re-fetch the issue,
+      // comments, and runs; on loaded runners the default 5s expect window is the
+      // narrowest gate in this spec, so the reply re-assertion gets the same explicit
+      // render window as the live check above.
+      await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
     } finally {
-      await request.patch(`/api/companies/${company.id}`, { data: { status: "archived" } });
-      await closeRegisteredClients(url);
-      await rm(root, { recursive: true, force: true });
+      // SUP-17651: teardown must never mask the primary failure. When the test times
+      // out Playwright has already torn down the page/context, and the archive PATCH
+      // then rejects ("Target page, context or browser has been closed"), replacing
+      // the real assertion error in the report. Swallow teardown errors only.
+      try {
+        await request.patch(`/api/companies/${company.id}`, { data: { status: "archived" } });
+      } catch {
+        // ignore: teardown only
+      }
+      await closeRegisteredClients(url).catch(() => {});
+      await rm(root, { recursive: true, force: true }).catch(() => {});
     }
   });
 }
