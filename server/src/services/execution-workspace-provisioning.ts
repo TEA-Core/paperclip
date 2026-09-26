@@ -42,7 +42,7 @@ import {
 import { environmentRuntimeService, type EnvironmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import {
-  detachIssuesFromClosedSharedExecutionWorkspace,
+  detachIssuesFromClosedExecutionWorkspace,
   executionWorkspaceService,
 } from "./execution-workspaces.js";
 import {
@@ -332,7 +332,7 @@ export async function provisionIssueExecutionWorkspace(
   });
 
   if (workspaceReuseRequest.bindingUnrestorable && requestedExecutionWorkspaceId) {
-    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+    await detachIssuesFromClosedExecutionWorkspace(db, {
       companyId: agent.companyId,
       executionWorkspaceId: requestedExecutionWorkspaceId,
     });

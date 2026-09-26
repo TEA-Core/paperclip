@@ -22,7 +22,7 @@ import {
 import { resolvePaperclipConfigPath } from "../paths.js";
 import { validate } from "../middleware/validate.js";
 import {
-  detachIssuesFromClosedSharedExecutionWorkspace,
+  detachIssuesFromClosedExecutionWorkspace,
 } from "../services/execution-workspaces.js";
 import {
   accessService,
@@ -1315,7 +1315,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       await runtimeLeases.release({ executionWorkspaceId: existing.id, force: true });
 
       if (existing.mode === "shared_workspace") {
-        await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+        await detachIssuesFromClosedExecutionWorkspace(db, {
           companyId: existing.companyId,
           executionWorkspaceId: existing.id,
         });

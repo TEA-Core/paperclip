@@ -1052,7 +1052,7 @@ export function readExecutionWorkspaceConfig(metadata: Record<string, unknown> |
 }
 
 /**
- * Detach every issue pointing at a closed shared execution workspace.
+ * Detach every issue pointing at a closed execution workspace.
  *
  * Clearing the id alone would strand `executionWorkspacePreference:
  * "reuse_existing"` with a null id — the unrealizable pair that
@@ -1062,8 +1062,16 @@ export function readExecutionWorkspaceConfig(metadata: Record<string, unknown> |
  * fields would 422 on state the close wrote. Other preferences are left alone:
  * they are mode intents that stay meaningful without an id, and nulling them
  * would silently move where the next run lands.
+ *
+ * The scope is deliberately mode-agnostic. An isolated workspace is not
+ * necessarily owned by a single card: a child can inherit its parent's vehicle
+ * under `reuse_existing`, so one workspace row can be pointed at by a whole
+ * subtree. Archiving it therefore has to detach every issue that points at it,
+ * not only the card whose PATCH triggered the close — otherwise the untouched
+ * siblings keep a dangling pointer at a closed row and dispatch throws
+ * `inherited_workspace_reuse_unavailable` (SUP-17621).
  */
-export async function detachIssuesFromClosedSharedExecutionWorkspace(
+export async function detachIssuesFromClosedExecutionWorkspace(
   db: Db,
   input: { companyId: string; executionWorkspaceId: string },
 ) {
@@ -3245,6 +3253,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     // outcome). Passing `tx` folds the write into the caller's transaction so the
     // pointer clear and the close commit or roll back together; omitting `tx`
     // wraps it in its own transaction.
+    //
+    // SUP-17621: closing the vehicle must also detach EVERY issue bound to it,
+    // not just the card whose PATCH triggered the close. A workspace row can be
+    // pointed at by an entire subtree (a child inherits its parent's vehicle
+    // under `reuse_existing`), so clearing only the triggering card's pointer
+    // left the siblings pinned to an archived row with `reuse_existing` — the
+    // exact half-state that throws `inherited_workspace_reuse_unavailable` on
+    // dispatch. The detach runs in this same transaction (and under the same
+    // lifecycle lock) so the archive and the detach commit or roll back
+    // together.
     closePinnedWorkspaceForReprovision: async (
       workspaceId: string,
       scope: { companyId: string },
@@ -3265,6 +3283,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           .then((rows) => rows[0] ?? null);
         if (!fresh) return { outcome: "missing" as const, workspace: null };
         if (isClosedExecutionWorkspaceStatus(fresh.status)) {
+          // Already terminal: the vehicle is gone. Still detach every card bound
+          // to it so a dangling pointer (and its unrealizable reuse_existing
+          // preference) cannot survive the close (SUP-17621).
+          await detachIssuesFromClosedExecutionWorkspace(dbOrTx as unknown as Db, {
+            companyId: scope.companyId,
+            executionWorkspaceId: workspaceId,
+          });
           return { outcome: "already_closed" as const, workspace: toExecutionWorkspace(fresh) };
         }
         if (metadataHasReopenPendingConsumption(fresh.metadata as Record<string, unknown> | null)) {
@@ -3302,11 +3327,32 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .from(executionWorkspaces)
             .where(eq(executionWorkspaces.id, workspaceId))
             .then((rows) => rows[0] ?? null);
+          if (isClosedExecutionWorkspaceStatus(reread?.status)) {
+            // A concurrent close won and left the row terminal; detach the cards
+            // bound to it exactly as the winning close would have (SUP-17621).
+            await detachIssuesFromClosedExecutionWorkspace(dbOrTx as unknown as Db, {
+              companyId: scope.companyId,
+              executionWorkspaceId: workspaceId,
+            });
+            return {
+              outcome: "already_closed" as const,
+              workspace: reread ? toExecutionWorkspace(reread) : null,
+            };
+          }
           return {
-            outcome: isClosedExecutionWorkspaceStatus(reread?.status) ? ("already_closed" as const) : ("not_live" as const),
+            outcome: "not_live" as const,
             workspace: reread ? toExecutionWorkspace(reread) : null,
           };
         }
+        // The vehicle is now terminal. Detach every card still pointing at it —
+        // the triggering card's pointer was cleared by the caller, but siblings
+        // that inherited this vehicle under `reuse_existing` were not, and a
+        // pointer at an archived row is the half-state dispatch refuses
+        // (SUP-17621).
+        await detachIssuesFromClosedExecutionWorkspace(dbOrTx as unknown as Db, {
+          companyId: scope.companyId,
+          executionWorkspaceId: workspaceId,
+        });
         return { outcome: "archived" as const, workspace: toExecutionWorkspace(row) };
       };
       if (tx) return apply(tx as unknown as DbTransaction);
