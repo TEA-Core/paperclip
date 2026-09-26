@@ -650,6 +650,7 @@ export async function provisionIssueExecutionWorkspace(
     reusedExecutionWorkspace,
     policy: resolvedWorkspaceReusePolicy,
     reprovisionedAfterUnavailableReuse,
+    reprovisionAfterUnavailableReuseCause,
   } =
     await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
       requestedShouldReuseExisting,
@@ -742,6 +743,7 @@ export async function provisionIssueExecutionWorkspace(
         issueId,
         issueIdentifier: issueRef?.identifier ?? null,
         unavailableExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+        restoreFailureCause: reprovisionAfterUnavailableReuseCause,
         executionWorkspaceCwd: executionWorkspace.cwd,
       },
       "inherited execution workspace could not be restored; re-provisioned a fresh workspace instead of failing the dispatch",
