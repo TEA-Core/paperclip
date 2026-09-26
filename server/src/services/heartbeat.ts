@@ -6867,14 +6867,24 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
-    // SUP-17622: a requested inherited workspace that cannot be restored (row
-    // gone, worktree unrecoverable, base checkout missing, or a restore error)
-    // is an unrestorable artifact, not a misconfiguration. Record the cause so
-    // the fallback stays attributable, then fall back to a fresh provision.
-    // `reuse_existing` is an optimisation, not a correctness requirement; a
-    // fresh provision preserves intent. The 422 for a reuse with no named or
-    // inheritable workspace is raised upstream (execution-workspace-policy),
-    // not here, so this path only ever sees a genuinely-unrestorable named one.
+    // A genuine workspace validation refusal (branch contention, worktree
+    // incoherence, or a reuse misconfiguration) is raised by the restore as a
+    // WorkspaceValidationFailure. That is not an unrestorable artifact:
+    // re-provisioning over another workspace's live branch, or masking a real
+    // refusal, would be wrong. Propagate it so the dispatch fails closed with
+    // the concrete cause and its recovery path is preserved.
+    if (isWorkspaceValidationFailure(error)) {
+      throw error;
+    }
+    // SUP-17622: a requested inherited workspace that cannot be restored for a
+    // plain reason (row gone, worktree unrecoverable, operator-owned branch
+    // deleted, base checkout missing) is an unrestorable artifact, not a
+    // misconfiguration. Record the cause so the fallback stays attributable,
+    // then fall back to a fresh provision. `reuse_existing` is an optimisation,
+    // not a correctness requirement; a fresh provision preserves intent. The 422
+    // for a reuse with no named or inheritable workspace is raised upstream
+    // (execution-workspace-policy), not here, so this path only ever sees a
+    // genuinely-unrestorable named one.
     reuseFallbackCause = error;
   }
 
