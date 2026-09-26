@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -22,8 +22,9 @@ vi.mock("../sentry.js", async () => {
   };
 });
 
-import { reconcileAbandonedExecutionControl } from "./execution-control-reconciliation.js";
+import { reconcileAbandonedExecutionControl, reapStaleExecutionOwnerLeases } from "./execution-control-reconciliation.js";
 import { waitForPendingRunFailureReports } from "./run-failure-report.js";
+import { getConversationOwnershipBlocker } from "./conversation-continuation.js";
 
 /**
  * Settle the reports the sweep started but did not await.
@@ -155,5 +156,169 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     await settleRunFailureReports();
     // Scoped by runId so a sibling test's capture cannot satisfy or break this.
     expect(capturesForRun(captureCallsBefore, runId)).toHaveLength(0);
+  });
+});
+
+describeEmbeddedPostgres("reapStaleExecutionOwnerLeases clears dead-holder leases and keeps live ones", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("stale-execution-lease-reaper-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  // A legacy conversation run (the only shape that can raise an
+  // execution_owner_active gate) plus the active, never-released lease it held.
+  async function seedConversationLeaseRun(status: "failed" | "running" | "queued") {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const leaseId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Stale Lease Reap",
+      issuePrefix: `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Lease holder",
+      adapterType: "claude_local",
+      status: "running",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status,
+      runtimeMode: "legacy",
+      contextSnapshot: { issueId },
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Lease gate",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      heartbeatRunId: runId,
+      issueId,
+      status: "active",
+      leasePolicy: "ephemeral",
+    });
+
+    return { companyId, issueId, leaseId };
+  }
+
+  const getLease = (leaseId: string) =>
+    db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leaseId))
+      .limit(1)
+      .then((rows) => rows[0]);
+
+  it("releases the lease and clears the gate for a dead holder run", async () => {
+    const dead = await seedConversationLeaseRun("failed");
+
+    // Before reaping, the dead conversation run's held lease is the gate.
+    expect((await getConversationOwnershipBlocker(db, dead.companyId, dead.issueId))?.cause).toBe("execution_owner_active");
+
+    const result = await reapStaleExecutionOwnerLeases(db);
+    expect(result.reaped).toBe(1);
+
+    const lease = await getLease(dead.leaseId);
+    expect(lease?.releasedAt).not.toBeNull();
+    expect(lease?.status).toBe("released");
+    expect(lease?.cleanupStatus).toBe("success");
+
+    // With the lease gone and no live process, the gate no longer reports.
+    expect(await getConversationOwnershipBlocker(db, dead.companyId, dead.issueId)).toBeNull();
+  });
+
+  it("never releases the lease of a holder run that is still live", async () => {
+    const live = await seedConversationLeaseRun("running");
+    const queued = await seedConversationLeaseRun("queued");
+
+    const result = await reapStaleExecutionOwnerLeases(db);
+
+    // Neither the running nor the queued holder is terminal, so nothing is
+    // reaped for them even though both hold an unreleased lease.
+    expect(result.reaped).toBe(0);
+
+    const liveLease = await getLease(live.leaseId);
+    expect(liveLease?.releasedAt).toBeNull();
+    expect(liveLease?.status).toBe("active");
+    const queuedLease = await getLease(queued.leaseId);
+    expect(queuedLease?.releasedAt).toBeNull();
+  });
+
+  it("never releases the lease of a legacy non-conversation (provider-backed) terminal run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const leaseId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Provider-Backed Lease",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Provider sandbox",
+      adapterType: "paperclip_runner",
+      status: "running",
+    });
+    // A legacy terminal run whose adapter is provider-backed, NOT a
+    // conversation adapter. Its lease is owned by the provider teardown
+    // path, not the in-plane bookkeeping the reaper targets.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "failed",
+      runtimeMode: "legacy",
+      contextSnapshot: { issueId },
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Provider sandbox gate",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      heartbeatRunId: runId,
+      issueId,
+      status: "active",
+      leasePolicy: "ephemeral",
+    });
+
+    const result = await reapStaleExecutionOwnerLeases(db);
+
+    // The reaper must NOT release this lease: the holder run is terminal but
+    // NOT a conversation run, so the blocker reader would never gate on it
+    // and its cleanup belongs to the pending-cleanup sweep.
+    expect(result.reaped).toBe(0);
+    const lease = await getLease(leaseId);
+    expect(lease?.releasedAt).toBeNull();
+    expect(lease?.status).toBe("active");
   });
 });

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "../middleware/logger.js";
-import { and, eq, isNotNull, lte, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import {
   agents,
+  environmentLeases,
   heartbeatRuns,
   issues,
   nativeRunFinalizations,
@@ -11,12 +12,146 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { reportRunFailure } from "./run-failure-report.js";
+import { conversationRunPredicate } from "./conversation-continuation.js";
+
+/**
+ * Terminal run states — a run in any of these is not live and cannot be
+ * holding a dispatch lease. Mirrors the candidate set in
+ * `getConversationOwnershipBlocker`, so a run the reaper clears is exactly one
+ * that could be producing a `execution_owner_active` gate.
+ */
+const DEAD_RUN_STATUSES: readonly string[] = ["failed", "timed_out", "interrupted", "cancelled"];
+
+/**
+ * A lease still reads as held by `getConversationOwnershipBlocker` when any of
+ * these is true. This is the exact condition that keeps the
+ * `execution_owner_active` dispatch gate closed.
+ */
+function staleOwnerLeasePredicate() {
+  return or(
+    isNull(environmentLeases.releasedAt),
+    eq(environmentLeases.status, "pending_cleanup"),
+    eq(environmentLeases.cleanupStatus, "failed"),
+  );
+}
+
+/**
+ * Release environment leases that a dead holder run left wedging the
+ * `execution_owner_active` dispatch gate.
+ *
+ * The holder run is dead (terminal) but its lease was never released, so the
+ * gate's reader keeps reporting "wait for cleanup" for a cleanup that can never
+ * run — the only actors who may release are the (gated) assignee and the
+ * creator. This reaper clears that strand.
+ *
+ * The clear is **liveness-based, not age-based**: a lease whose holder run is
+ * still `queued`/`running` is never released, and the liveness is re-verified
+ * under the run lock before the write, so a candidate that goes live between
+ * the scan and the update is left untouched.
+ *
+ * The candidate query requires `conversationRunPredicate()` — the same
+ * predicate `getConversationOwnershipBlocker` uses to decide that a lease
+ * holds the `execution_owner_active` gate. This ensures the reaper only
+ * releases leases that are actually blocking dispatch through that gate and
+ * never touches a provider-backed or non-conversation lease whose teardown
+ * belongs to the pending-cleanup sweep.
+ */
+export async function reapStaleExecutionOwnerLeases(
+  db: Db,
+  now = new Date(),
+): Promise<{ scanned: number; reaped: number }> {
+  const candidates = await db
+    .select({
+      leaseId: environmentLeases.id,
+      companyId: environmentLeases.companyId,
+      runId: heartbeatRuns.id,
+    })
+    .from(environmentLeases)
+    .innerJoin(
+      heartbeatRuns,
+      and(
+        eq(environmentLeases.heartbeatRunId, heartbeatRuns.id),
+        eq(environmentLeases.companyId, heartbeatRuns.companyId),
+      ),
+    )
+    .where(
+      and(
+        isNotNull(environmentLeases.heartbeatRunId),
+        eq(heartbeatRuns.runtimeMode, "legacy"),
+        inArray(heartbeatRuns.status, [...DEAD_RUN_STATUSES]),
+        conversationRunPredicate(),
+        staleOwnerLeasePredicate(),
+      ),
+    )
+    .limit(50);
+
+  let reaped = 0;
+  let nextCandidate = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(5, candidates.length) }, async () => {
+      while (nextCandidate < candidates.length) {
+        const candidate = candidates[nextCandidate++]!;
+        try {
+          const cleared = await db.transaction(async (tx) => {
+            await tx.execute(
+              sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+            );
+            const [run] = await tx
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.id, candidate.runId),
+                  eq(heartbeatRuns.companyId, candidate.companyId),
+                ),
+              )
+              .for("update");
+            // Re-check liveness under the lock: a run that is no longer terminal
+            // (or is gone) must not have its lease released.
+            if (!run || !DEAD_RUN_STATUSES.includes(run.status)) return false;
+            const [updated] = await tx
+              .update(environmentLeases)
+              .set({
+                status: "released",
+                releasedAt: now,
+                cleanupStatus: "success",
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(environmentLeases.id, candidate.leaseId),
+                  // Re-check the wedge under lock so a concurrent release, or a
+                  // lease a live holder re-armed, is left untouched.
+                  staleOwnerLeasePredicate(),
+                ),
+              )
+              .returning({ id: environmentLeases.id });
+            return updated?.id != null;
+          });
+          if (cleared) reaped += 1;
+        } catch {
+          // A lock/statement timeout leaves this lease for the next tick; the
+          // sweep is periodic, so a skipped candidate is retried.
+          logger.warn(
+            { runId: candidate.runId },
+            "Stale execution-owner lease reaping remains pending; continuing with other leases",
+          );
+        }
+      }
+    }),
+  );
+  return { scanned: candidates.length, reaped };
+}
 
 /** Only newly recorded control deadlines are eligible. Upgrades never replay ambiguous historical runs. */
 export async function reconcileAbandonedExecutionControl(
   db: Db,
   now = new Date(),
 ) {
+  // Clear dead-holder leases first, so a terminal run cannot keep the
+  // execution_owner_active gate wedged. Runs in the same periodic sweep — no
+  // second, competing sweep — and is strictly liveness-based.
+  const leaseReaping = await reapStaleExecutionOwnerLeases(db, now);
   const nativeDue = await db
     .select({
       runId: nativeRunFinalizations.runId,
@@ -251,5 +386,5 @@ export async function reconcileAbandonedExecutionControl(
       }
     }
   }));
-  return { scanned: due.length, surfaced };
+  return { scanned: due.length, surfaced, reaped: leaseReaping.reaped };
 }

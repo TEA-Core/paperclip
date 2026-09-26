@@ -25,7 +25,7 @@ export function claimedAdapterType(run: Pick<typeof heartbeatRuns.$inferSelect, 
   return typeof dispatch?.adapterType === "string" ? dispatch.adapterType : null;
 }
 
-function conversationRunPredicate() {
+export function conversationRunPredicate() {
   return or(
     inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES]),
     sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
