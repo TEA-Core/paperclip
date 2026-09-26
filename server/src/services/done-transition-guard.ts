@@ -1372,20 +1372,23 @@ export async function countLadderedChildren(
   * changes WHO satisfies a rung; the order rule above is applied per
   * requirement on top of that same predicate.
   *
-  * SUP-17647 (SUP-17403): the predicate above matches a rung by PARTICIPATION,
-  * so a co-participant of the required agent could discharge the rung even when
-  * it never acted — a stage carrying two reviewers with `approvalsNeeded: 1`
-  * let the wrong agent's recorded decision satisfy the other's rung. This is
-  * now corrected for a stage that HAS run: when a stage has a recorded
-  * `issue_execution_decisions` row, the rung is satisfied only when the required
-  * agent urlKey is the ACTOR on that stage's recorded decision row
-  * (the most recent decision; see {@link listLatestDecisionActorByStageId}),
-  * never by a mere co-participant. A stage with no decision row has not run and
-  * keeps the participation-based shape check above verbatim, so the advisory for
-  * an unarmed / not-yet-run ladder is unchanged. The re-seat above is preserved
-  * for the actor form: a rung whose required agent is the gated principal is
-  * satisfied only when the recorded actor is an independent (non-principal)
-  * agent.
+   * SUP-17647 (SUP-17403): the predicate above matches a rung by PARTICIPATION,
+   * so a co-participant of the required agent could discharge the rung even when
+   * it never acted — a stage carrying two reviewers with `approvalsNeeded: 1`
+   * let the wrong agent's recorded decision satisfy the other's rung. This is
+   * now corrected for a COMPLETED stage: when the stage is in
+   * `executionState.completedStageIds` and has a recorded
+   * `issue_execution_decisions` row, the rung is satisfied only when the required
+   * agent urlKey is the ACTOR on that stage's recorded decision row
+   * (the most recent decision; see {@link listLatestDecisionActorByStageId}),
+   * never by a mere co-participant. A PENDING stage — including one bounced to
+   * `changes_requested`, which carries a decision row but has not completed —
+   * keeps the participation-based shape check above verbatim, as does a stage
+   * with no decision row at all, so the advisory for an unarmed / not-yet-run
+   * ladder is unchanged. The re-seat above is preserved
+   * for the actor form: a rung whose required agent is the gated principal is
+   * satisfied only when the recorded actor is an independent (non-principal)
+   * agent.
   *
   * Returns `{ missingStageLabels, outOfOrderStageLabels }`. Requirements
   * unmatched by the end of the scan are missing (unchanged shape); a
@@ -1441,10 +1444,23 @@ export async function findMissingAdr072CloseLadderStages(
   // rung below stays verbatim — the conservative behaviour.
   const gated = resolveGatedPrincipal(policy, state, createdByAgentId);
 
-  // SUP-17647: the recorded decision actor per stage that has run. A stage with
-  // a row in this map is judged by the agent that recorded its decision; a
-  // stage without one keeps the participation shape check. Read scoped to the
-  // issue so a decision on another card can never discharge a rung here.
+  // SUP-17647: the stage ids that have actually COMPLETED. Only a completed
+  // stage with a recorded decision is judged by its decision actor; a PENDING
+  // stage keeps the participation shape check even when a decision row exists
+  // (a stage bounced to `changes_requested` carries a row but has not run).
+  const completedStageIds = new Set<string>(
+    Array.isArray(state.completedStageIds)
+      ? (state.completedStageIds as unknown[]).filter(
+          (id): id is string => typeof id === "string",
+        )
+      : [],
+  );
+
+  // SUP-17647: the recorded decision actor per stage. A completed stage with a
+  // row in this map is judged by the agent that recorded its decision; a
+  // stage without a row — or a pending stage that carries one — keeps the
+  // participation shape check. Read scoped to the issue so a decision on
+  // another card can never discharge a rung here.
   const stageDecisionActor = await listLatestDecisionActorByStageId(
     db,
     companyId,
@@ -1495,9 +1511,11 @@ export async function findMissingAdr072CloseLadderStages(
 
   const requirementCount = ADR072_CLOSE_LADDER.length;
 
-  // Per-requirement satisfaction predicate. A RUN stage is judged by the agent
-  // that recorded its decision (SUP-17647); a NOT-YET-RUN stage keeps the
-  // participation shape check. Both forms PRESERVE the SUP-15650 re-seat: a
+  // Per-requirement satisfaction predicate. A COMPLETED stage with a recorded
+  // decision is judged by the agent that recorded it (SUP-17647); every other
+  // stage — pending (including `changes_requested`-bounced), or with no
+  // decision row — keeps the participation shape check. Both forms PRESERVE the
+  // SUP-15650 re-seat: a
   // rung whose required agent urlKey is the gated principal's is satisfied
   // only by an INDEPENDENT (non-principal) agent — a self-held rung is not a
   // rung.
@@ -1509,10 +1527,17 @@ export async function findMissingAdr072CloseLadderStages(
     if (stage.type !== requirement.stageType) return false;
     const principalHoldsRung = principalUrlKeys.has(requirement.agentUrlKey);
 
-    // SUP-17647: a stage with a recorded decision has run, and its recorded
-    // ACTOR — not a co-participant who never acted — is what discharges the
-    // rung. A co-participant of the required agent does NOT satisfy it.
-    if (stage.id !== null && stageDecisionActor.has(stage.id)) {
+    // SUP-17647: a COMPLETED stage with a recorded decision is judged by the
+    // ACTOR that recorded it — not by a co-participant who never acted. A
+    // co-participant of the required agent does NOT satisfy it. A PENDING
+    // stage (not in completedStageIds) falls through to the participation
+    // check below even when it carries a decision row: a stage bounced to
+    // `changes_requested` has a row but has not run.
+    if (
+      stage.id !== null &&
+      completedStageIds.has(stage.id) &&
+      stageDecisionActor.has(stage.id)
+    ) {
       const actorAgentId = stageDecisionActor.get(stage.id);
       if (typeof actorAgentId !== "string") return false;
       if (principalHoldsRung) {

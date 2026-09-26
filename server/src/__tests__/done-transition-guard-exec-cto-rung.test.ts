@@ -7,7 +7,10 @@ import {
   issues as issuesTable,
   labels as labelsTable,
 } from "@paperclipai/db";
-import { evaluateDoneTransitionGuard } from "../services/done-transition-guard.js";
+import {
+  evaluateDoneTransitionGuard,
+  findMissingAdr072CloseLadderStages,
+} from "../services/done-transition-guard.js";
 import { evaluateStageIntegrity } from "../services/approval-status-reconciler.js";
 import { logActivity } from "../services/activity-log.js";
 import {
@@ -1013,5 +1016,46 @@ describe("SUP-17647 ADR-072 close-ladder shape: a completed rung is discharged b
         }),
       }),
     );
+  });
+
+  it("a PENDING stage bounced to changes_requested keeps the participant-based shape check even though it carries a decision row (AC1b)", async () => {
+    // The pointer sits on stage 1 after support-CR bounced it: stage 1 is NOT
+    // in completedStageIds, yet it carries a decision row whose latest outcome
+    // is changes_requested and whose recorded actor is the co-participant
+    // support-CR, not the required support-QAE. The actor-identity branch must
+    // not fire for a pending stage: support-QAE's participation still satisfies
+    // the review:support-QAE rung, so the close-ladder shape stays complete —
+    // a new parent edge on this parent must not be refused on this shape.
+    const bouncedState = {
+      status: "pending",
+      currentStageId: stage1,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: supportCrId },
+      returnAssignee: null,
+      deliveryAuthor: null,
+      completedStageIds: [stage2, stage3],
+      skippedStageIds: [],
+      lastDecisionId: "dec-1",
+      lastDecisionOutcome: "changes_requested",
+    };
+    setupDbMock({
+      agents: allAgents,
+      issueExecutionDecisions: [
+        { id: "dec-1", stageId: stage1, outcome: "changes_requested", actorAgentId: supportCrId, actorUserId: null, createdAt: new Date("2026-09-26T15:24:20Z") },
+        { id: "dec-2", stageId: stage2, outcome: "approved", actorAgentId: coderLeId, actorUserId: null, createdAt: new Date("2026-09-26T15:25:00Z") },
+        { id: "dec-3", stageId: stage3, outcome: "approved", actorAgentId: execCtoId, actorUserId: null, createdAt: new Date("2026-09-26T15:26:00Z") },
+      ],
+    });
+    const verdict = await findMissingAdr072CloseLadderStages(
+      mockDb,
+      "company-1",
+      "issue-1",
+      shape,
+      bouncedState,
+      null,
+    );
+    expect(verdict.missingStageLabels).toEqual([]);
+    expect(verdict.outOfOrderStageLabels).toEqual([]);
   });
 });
