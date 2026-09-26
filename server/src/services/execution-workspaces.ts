@@ -3530,6 +3530,29 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // block. No-op in production.
         await input.rebuildBarrier?.();
 
+        // SUP-17623: a failed rebuild must not leave the card pinned to a closed
+        // workspace. Clear the triggering issue's pointer in this same
+        // transaction — under the lifecycle lock already held here — so the
+        // pointer clear and the reopen-failure marker commit or roll back
+        // together. The id is cleared together with the `reuse_existing`
+        // preference, the pair that assertReusableExecutionWorkspaceBound 422s
+        // at write time; other preferences are kept, since they are mode intents
+        // that stay meaningful without an id. The workspace row itself stays
+        // closed and retryable; only the dangling pointer is released.
+        const detachIssueFromFailedReopen = async () => {
+          await tx
+            .update(issues)
+            .set({
+              executionWorkspaceId: null,
+              executionWorkspacePreference: sql`case when ${issues.executionWorkspacePreference} = 'reuse_existing' then null else ${issues.executionWorkspacePreference} end`,
+              updatedAt: new Date(),
+            })
+            .where(and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, issue.companyId),
+            ));
+        };
+
         let rebuildError: string | null = null;
         try {
           const realized = await ensurePersistedExecutionWorkspaceAvailable({
@@ -3624,6 +3647,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               generation: nextGeneration,
             },
           });
+          // Release the card's claim on the closed vehicle so the failed reopen
+          // cannot strand it (SUP-17623).
+          await detachIssueFromFailedReopen();
           return { ok: false, code: "rebuild_failed", message: "Failed to rebuild the execution workspace" };
         }
 
@@ -3649,6 +3675,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!activeRow) {
+          // The publish write found no row: the vehicle is gone (hard-deleted
+          // between the rebuild and the publication). The card must not be left
+          // pointing at a row that is no longer active (SUP-17623).
+          await detachIssueFromFailedReopen();
           return { ok: false, code: "rebuild_failed", message: "Failed to rebuild the execution workspace" };
         }
         logger.info(

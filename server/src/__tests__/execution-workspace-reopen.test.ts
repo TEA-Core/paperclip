@@ -226,6 +226,7 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
     projectId: string;
     workspaceId: string;
     issueNumber: number;
+    executionWorkspacePreference?: string | null;
   }) {
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -238,6 +239,10 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
       status: "todo",
       priority: "medium",
       executionWorkspaceId: input.workspaceId,
+      executionWorkspacePreference:
+        input.executionWorkspacePreference === undefined
+          ? null
+          : input.executionWorkspacePreference,
     });
     return issueId;
   }
@@ -337,6 +342,88 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
     expect(row?.cleanupReason).toBe(EXECUTION_WORKSPACE_REOPEN_FAILED_REASON);
     expect(row?.cleanupEligibleAt).toBeNull();
     expect(readExecutionWorkspaceLifecycleGeneration(row?.metadata as Record<string, unknown> | null)).toBe(3);
+
+    // SUP-17623: the failed rebuild must not leave the non-terminal card pinned to
+    // the closed workspace. The pointer is cleared in the same transaction as the
+    // reopen-failure marker.
+    const issueRow = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issueRow?.executionWorkspaceId).toBeNull();
+  });
+
+  it("clears the reuse_existing preference together with the pointer when the rebuild fails (no 422 half-state)", async () => {
+    const { companyId, projectId, projectWorkspaceId } = await seedCompanyProject();
+    // A directory that does not exist. The project_primary rebuild returns null.
+    const missingDir = join(tmpdir(), `paperclip-reopen-missing-${randomUUID()}`);
+    const workspaceId = await seedClosedWorkspace({
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      cwd: missingDir,
+    });
+    // The stranded half-state SUP-17618 describes: a non-terminal card bound to a
+    // closed workspace while still carrying reuse_existing.
+    const issueId = await seedIssue({
+      companyId,
+      projectId,
+      workspaceId,
+      issueNumber: 4105,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    const svc = executionWorkspaceService(db);
+    const result = await svc.reopenClosedIsolatedExecutionWorkspaceForIssue({
+      workspaceId,
+      issue: { id: issueId, companyId, projectId },
+      actor: { agentId: null, actorType: "user" },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe("rebuild_failed");
+
+    // The id and the unrealizable preference are cleared together, in one write:
+    // reuse_existing with a null id is the pair that would 422 the next PATCH.
+    const issueRow = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issueRow?.executionWorkspaceId).toBeNull();
+    expect(issueRow?.executionWorkspacePreference).toBeNull();
+    // The card itself is untouched: still non-terminal, still the same row.
+    expect(issueRow?.status).toBe("todo");
+  });
+
+  it("keeps a non-reuse preference when the rebuild clears the pointer", async () => {
+    const { companyId, projectId, projectWorkspaceId } = await seedCompanyProject();
+    const missingDir = join(tmpdir(), `paperclip-reopen-missing-${randomUUID()}`);
+    const workspaceId = await seedClosedWorkspace({
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      cwd: missingDir,
+    });
+    const issueId = await seedIssue({
+      companyId,
+      projectId,
+      workspaceId,
+      issueNumber: 4106,
+      executionWorkspacePreference: "isolated_workspace",
+    });
+
+    const svc = executionWorkspaceService(db);
+    const result = await svc.reopenClosedIsolatedExecutionWorkspaceForIssue({
+      workspaceId,
+      issue: { id: issueId, companyId, projectId },
+      actor: { agentId: null, actorType: "user" },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe("rebuild_failed");
+
+    // The dangling id is released, but the mode intent survives: isolated_workspace
+    // stays meaningful without an id, and nulling it would move where the next run
+    // lands.
+    const issueRow = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issueRow?.executionWorkspaceId).toBeNull();
+    expect(issueRow?.executionWorkspacePreference).toBe("isolated_workspace");
   });
 
   it("resolves the managed base checkout for a git_worktree row when the project workspace cwd is null", async () => {
