@@ -78,6 +78,14 @@ const activityFlagState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 // conservative shape the non-SUP-17538 tests in this file expect. Arm it only
 // to model a parent whose ladder already satisfies ADR-072.
 const agentNameRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
+// SUP-17647: the ADR-072 close-ladder shape read
+// (`findMissingAdr072CloseLadderStages`) now also reads the recorded decision
+// ACTOR per completed stage from `issue_execution_decisions`. Empty by default
+// — these advisory parents have no recorded decisions, so every stage keeps the
+// unchanged participation-based shape check. Route by drizzle table name, which
+// is reliable across module instances where the 4-key projection signature is
+// not (it is not otherwise distinguishable from the handoff-agent default).
+const decisionRowsState = vi.hoisted(() => ({ rows: [] as unknown[] }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
@@ -514,6 +522,7 @@ describe("issue execution policy missing approval stage", () => {
     carveOutIssueLabelRowsState.rows = [];
     activityFlagState.rows = [];
     agentNameRowsState.rows = [];
+    decisionRowsState.rows = [];
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -576,6 +585,13 @@ describe("issue execution policy missing approval stage", () => {
             // label read. It is routed by drizzle table name, which is reliable
             // across module instances even when object identity is not.
             rows = activityFlagState.rows;
+          } else if (drizzleTableName(table) === "issue_execution_decisions") {
+            // SUP-17647: the close-ladder shape read's per-stage recorded
+            // decision-actor projection ({stageId, actorAgentId, createdAt, id}).
+            // 4-key signature is not distinctive from the handoff default, so
+            // route by table name. Empty by default => no stage has run, so the
+            // shape check keeps its participation-based form (unchanged).
+            rows = decisionRowsState.rows;
           } else if (keys.length === 1 && keys[0] === "id") {
             // The carve-out labels read is the only single-key `id` projection on
             // this route path (the child decomposition is a 6-key projection and

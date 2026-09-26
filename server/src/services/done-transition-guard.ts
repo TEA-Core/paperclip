@@ -936,6 +936,65 @@ async function listDecisionSatisfiedStageIds(
 }
 
 /**
+ * SUP-17647: the recorded decision ACTOR per stage — the agent that recorded the
+ * LATEST `issue_execution_decisions` row on that stage. A completed close-ladder
+ * rung is discharged by its recorded actor, not by a co-participant who never
+ * acted (SUP-17403). Stages with no decision row are absent from the map, so the
+ * caller keeps its participation-based shape check for them (a stage that has
+ * not run yet has no actor to judge). The most recent row is resolved in JS
+ * (createdAt, id tie-break), mirroring {@link listDecisionSatisfiedStageIdS}; no
+ * try/catch, so a DB error propagates and fails the close closed.
+ */
+async function listLatestDecisionActorByStageId(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<Map<string, string | null>> {
+  const rows = await db
+    .select({
+      stageId: issueExecutionDecisions.stageId,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      createdAt: issueExecutionDecisions.createdAt,
+      id: issueExecutionDecisions.id,
+    })
+    .from(issueExecutionDecisions)
+    .where(
+      and(
+        eq(issueExecutionDecisions.issueId, issueId),
+        eq(issueExecutionDecisions.companyId, companyId),
+      ),
+    );
+  // Keep only the most recent decision per stage (createdAt, id tie-break), so
+  // the actor we judge a rung by is the one that actually recorded it, not a
+  // superseded earlier decision. Computing the max in JS makes this independent
+  // of DB row ordering.
+  const latestByStage = new Map<
+    string,
+    { createdAtMs: number; id: string; actorAgentId: string | null }
+  >();
+  for (const row of rows) {
+    const cur = {
+      createdAtMs: row.createdAt.getTime(),
+      id: row.id,
+      actorAgentId: row.actorAgentId,
+    };
+    const prev = latestByStage.get(row.stageId);
+    if (
+      prev === undefined ||
+      cur.createdAtMs > prev.createdAtMs ||
+      (cur.createdAtMs === prev.createdAtMs && cur.id > prev.id)
+    ) {
+      latestByStage.set(row.stageId, cur);
+    }
+  }
+  const actorByStage = new Map<string, string | null>();
+  for (const [stageId, latest] of latestByStage) {
+    actorByStage.set(stageId, latest.actorAgentId);
+  }
+  return actorByStage;
+}
+
+/**
  * SUP-14446 mechanism C: a close to `done` must account for the issue's own
  * review ladder. An issue carrying a populated `executionPolicy.stages` can
  * otherwise reach `done` with zero stage decisions recorded (SUP-8098: parked
@@ -1309,12 +1368,27 @@ export async function countLadderedChildren(
  * right type whose ONLY agent participant is the principal does NOT satisfy
  * the requirement (a self-held rung is not a rung), so a ladder with fewer
  * independent gates than ADR-072 requires still refuses. Every rung the
- * principal does not hold keeps its verbatim agent requirement. The re-seat
- * changes WHO satisfies a rung; the order rule above is applied per
- * requirement on top of that same predicate.
- *
- * Returns `{ missingStageLabels, outOfOrderStageLabels }`. Requirements
- * unmatched by the end of the scan are missing (unchanged shape); a
+  * principal does not hold keeps its verbatim agent requirement. The re-seat
+  * changes WHO satisfies a rung; the order rule above is applied per
+  * requirement on top of that same predicate.
+  *
+  * SUP-17647 (SUP-17403): the predicate above matches a rung by PARTICIPATION,
+  * so a co-participant of the required agent could discharge the rung even when
+  * it never acted — a stage carrying two reviewers with `approvalsNeeded: 1`
+  * let the wrong agent's recorded decision satisfy the other's rung. This is
+  * now corrected for a stage that HAS run: when a stage has a recorded
+  * `issue_execution_decisions` row, the rung is satisfied only when the required
+  * agent urlKey is the ACTOR on that stage's recorded decision row
+  * (the most recent decision; see {@link listLatestDecisionActorByStageId}),
+  * never by a mere co-participant. A stage with no decision row has not run and
+  * keeps the participation-based shape check above verbatim, so the advisory for
+  * an unarmed / not-yet-run ladder is unchanged. The re-seat above is preserved
+  * for the actor form: a rung whose required agent is the gated principal is
+  * satisfied only when the recorded actor is an independent (non-principal)
+  * agent.
+  *
+  * Returns `{ missingStageLabels, outOfOrderStageLabels }`. Requirements
+  * unmatched by the end of the scan are missing (unchanged shape); a
  * missing/stages-less policy reports every requirement as missing. Both lists
  * empty means the ladder carries the full close-ladder shape in the ratified
  * order.
@@ -1329,6 +1403,7 @@ interface Adr072CloseLadderShape {
 export async function findMissingAdr072CloseLadderStages(
   db: Db,
   companyId: string,
+  issueId: string,
   executionPolicy: unknown,
   executionState: unknown,
   createdByAgentId: string | null | undefined,
@@ -1352,10 +1427,11 @@ export async function findMissingAdr072CloseLadderStages(
 
   const stages = rawStages
     .filter(
-      (stage): stage is { type?: unknown; participants?: unknown } =>
+      (stage): stage is { id?: unknown; type?: unknown; participants?: unknown } =>
         stage != null && typeof stage === "object",
     )
     .map((stage) => ({
+      id: typeof stage.id === "string" ? stage.id : null,
       type: typeof stage.type === "string" ? stage.type : null,
       participants: Array.isArray(stage.participants) ? stage.participants : [],
     }));
@@ -1364,6 +1440,16 @@ export async function findMissingAdr072CloseLadderStages(
   // D3 order Guard B uses. When it is unresolvable the set is empty and every
   // rung below stays verbatim — the conservative behaviour.
   const gated = resolveGatedPrincipal(policy, state, createdByAgentId);
+
+  // SUP-17647: the recorded decision actor per stage that has run. A stage with
+  // a row in this map is judged by the agent that recorded its decision; a
+  // stage without one keeps the participation shape check. Read scoped to the
+  // issue so a decision on another card can never discharge a rung here.
+  const stageDecisionActor = await listLatestDecisionActorByStageId(
+    db,
+    companyId,
+    issueId,
+  );
 
   const agentIds = new Set<string>();
   for (const stage of stages) {
@@ -1381,6 +1467,12 @@ export async function findMissingAdr072CloseLadderStages(
   // Include the principal's agent ids so the read below can resolve their
   // urlKeys too (needed to tell a principal-held rung from an ordinary one).
   for (const agentId of gated.agentIds) agentIds.add(agentId);
+  // Include the recorded decision actors so the read below can resolve THEIR
+  // urlKeys too — a completed rung is judged by its actor, not its participants
+  // (SUP-17647).
+  for (const actorAgentId of stageDecisionActor.values()) {
+    if (actorAgentId !== null) agentIds.add(actorAgentId);
+  }
 
   const agentIdToUrlKey = new Map<string, string | null>();
   if (agentIds.size > 0) {
@@ -1403,38 +1495,57 @@ export async function findMissingAdr072CloseLadderStages(
 
   const requirementCount = ADR072_CLOSE_LADDER.length;
 
-  // Per-requirement satisfaction predicate. PRESERVES the SUP-15650 re-seat:
-  // a rung whose required agent urlKey is the gated principal's is satisfied
-  // only by a same-type stage carrying an INDEPENDENT (non-principal) agent
-  // participant — a self-held rung is not a rung.
+  // Per-requirement satisfaction predicate. A RUN stage is judged by the agent
+  // that recorded its decision (SUP-17647); a NOT-YET-RUN stage keeps the
+  // participation shape check. Both forms PRESERVE the SUP-15650 re-seat: a
+  // rung whose required agent urlKey is the gated principal's is satisfied
+  // only by an INDEPENDENT (non-principal) agent — a self-held rung is not a
+  // rung.
   const stageSatisfiesRequirement = (
-    stage: { type: string | null; participants: unknown[] },
+    stage: { id: string | null; type: string | null; participants: unknown[] },
     requirementIndex: number,
   ): boolean => {
     const requirement = ADR072_CLOSE_LADDER[requirementIndex];
+    if (stage.type !== requirement.stageType) return false;
     const principalHoldsRung = principalUrlKeys.has(requirement.agentUrlKey);
-    return (
-      stage.type === requirement.stageType &&
-      stage.participants.some((participant) => {
-        if (
-          participant == null ||
-          typeof participant !== "object" ||
-          (participant as { type?: unknown }).type !== "agent" ||
-          typeof (participant as { agentId?: unknown }).agentId !== "string"
-        ) {
-          return false;
-        }
-        const agentId = (participant as { agentId: string }).agentId;
-        if (principalHoldsRung) {
-          // Re-seated rung: satisfied only by an INDEPENDENT (non-principal)
-          // agent participant. A rung held only by the principal is not a
-          // rung — the gate must move to another agent, never drop.
-          return !gated.agentIds.has(agentId);
-        }
-        // Ordinary rung: the participant must resolve to the required agent.
-        return agentIdToUrlKey.get(agentId) === requirement.agentUrlKey;
-      })
-    );
+
+    // SUP-17647: a stage with a recorded decision has run, and its recorded
+    // ACTOR — not a co-participant who never acted — is what discharges the
+    // rung. A co-participant of the required agent does NOT satisfy it.
+    if (stage.id !== null && stageDecisionActor.has(stage.id)) {
+      const actorAgentId = stageDecisionActor.get(stage.id);
+      if (typeof actorAgentId !== "string") return false;
+      if (principalHoldsRung) {
+        // Re-seated rung: satisfied only by an INDEPENDENT (non-principal)
+        // recorded actor. A rung the principal recorded itself is not a rung —
+        // the gate must move to another agent, never drop.
+        return !gated.agentIds.has(actorAgentId);
+      }
+      // Ordinary rung: the recorded actor must resolve to the required agent.
+      return agentIdToUrlKey.get(actorAgentId) === requirement.agentUrlKey;
+    }
+
+    // Pending / not-yet-run stage (no recorded decision): the unchanged
+    // participation shape check. A co-participant of the required agent counts.
+    return stage.participants.some((participant) => {
+      if (
+        participant == null ||
+        typeof participant !== "object" ||
+        (participant as { type?: unknown }).type !== "agent" ||
+        typeof (participant as { agentId?: unknown }).agentId !== "string"
+      ) {
+        return false;
+      }
+      const agentId = (participant as { agentId: string }).agentId;
+      if (principalHoldsRung) {
+        // Re-seated rung: satisfied only by an INDEPENDENT (non-principal)
+        // agent participant. A rung held only by the principal is not a
+        // rung — the gate must move to another agent, never drop.
+        return !gated.agentIds.has(agentId);
+      }
+      // Ordinary rung: the participant must resolve to the required agent.
+      return agentIdToUrlKey.get(agentId) === requirement.agentUrlKey;
+    });
   };
 
   // Ordered forward scan (SUP-16532 / ADR-102 M3): a single pass keeps a
@@ -1600,6 +1711,7 @@ async function evaluateDoneTransitionGuardCore(
         await findMissingAdr072CloseLadderStages(
           db,
           issue.companyId,
+          issue.id,
           issue.executionPolicy,
           issue.executionState,
           issue.createdByAgentId,

@@ -207,6 +207,7 @@ function mockGitProbe(aheadCount: string, attributableCount: string, statusOutpu
 const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
 const coderLeId = "bbbbbbb2-0000-4000-8000-000000000002";
 const execCtoId = "ccccccc3-0000-4000-8000-000000000003";
+const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
 const stage1 = "10000000-0000-4000-8000-000000000001";
 const stage2 = "20000000-0000-4000-8000-000000000002";
 const stage3 = "30000000-0000-4000-8000-000000000003";
@@ -825,6 +826,192 @@ describe("SUP-16525 §4/§5 close path after re-arm: only a durable decision row
     expect(logActivity).not.toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+    );
+  });
+});
+
+describe("SUP-17647 ADR-072 close-ladder shape: a completed rung is discharged by the recorded decision actor, not a co-participant (SUP-17403)", () => {
+  beforeEach(() => {
+    ghFetchMock.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+    mockFetchOpenPullRequests.mockReset();
+    mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: [] });
+    mockResolveGitHubToken.mockReset();
+    mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    vi.mocked(logActivity).mockClear();
+    mockExecFile.mockReset();
+    mockGitProbe("0", "0");
+    setupDbMock({});
+  });
+
+  // The SUP-17403 shape: the first review rung carries BOTH support-CR and
+  // support-QAE as participants (approvalsNeeded: 1), so the required
+  // support-QAE is a co-participant. What discharges the ratified
+  // review:support-QAE rung is the ACTOR who recorded that stage's decision.
+  const shape = {
+    stages: [
+      {
+        id: stage1,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [
+          { type: "agent", agentId: supportCrId },
+          { type: "agent", agentId: supportQaeId },
+        ],
+      },
+      { id: stage2, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: coderLeId }] },
+      { id: stage3, type: "approval", approvalsNeeded: 1, participants: [{ type: "agent", agentId: execCtoId }] },
+    ],
+  };
+  const allAgents = [...agents, { id: supportCrId, name: "support-CR", role: "support" }];
+
+  it("refuses a completed rung whose co-participant includes the required agent but whose recorded actor is a different agent (AC1)", async () => {
+    // support-CR — a co-participant, NOT the required support-QAE — recorded
+    // stage 1's only decision. Under the old participation check support-QAE's
+    // mere membership satisfied the rung and the close sailed through. After the
+    // fix, the rung is judged by the recorded actor, so it is NOT satisfied and
+    // mechanism D refuses, naming review:support-QAE.
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents: allAgents,
+      issueExecutionDecisions: [
+        { id: "dec-1", stageId: stage1, outcome: "approved", actorAgentId: supportCrId, actorUserId: null, createdAt: new Date("2026-09-26T15:24:20Z") },
+        { id: "dec-2", stageId: stage2, outcome: "approved", actorAgentId: coderLeId, actorUserId: null, createdAt: new Date("2026-09-26T15:25:00Z") },
+        { id: "dec-3", stageId: stage3, outcome: "approved", actorAgentId: execCtoId, actorUserId: null, createdAt: new Date("2026-09-26T15:26:00Z") },
+      ],
+    });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      { ...issue, parentId: null, executionPolicy: shape, executionState: satisfiedState([stage1, stage2, stage3]) },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.skipped).toBe(false);
+    expect(result.reason).toContain("Mechanism D");
+    expect(result.reason).toContain("review:support-QAE");
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          reason: "adr072_close_ladder_shape_incomplete",
+          missingStageLabels: expect.arrayContaining(["review:support-QAE"]),
+        }),
+      }),
+    );
+    expect(ghFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("discharges the same rung when the REQUIRED agent recorded the decision, even alongside a co-participant (AC2)", async () => {
+    // Identical participants [support-CR, support-QAE], but support-QAE itself
+    // recorded the decision. The recorded actor now matches the required agent,
+    // so the rung is discharged and the close is allowed — the fix does not
+    // over-refuse a rung the required agent actually acted on.
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents: allAgents,
+      issueExecutionDecisions: [
+        { id: "dec-1", stageId: stage1, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-09-26T15:24:20Z") },
+        { id: "dec-2", stageId: stage2, outcome: "approved", actorAgentId: coderLeId, actorUserId: null, createdAt: new Date("2026-09-26T15:25:00Z") },
+        { id: "dec-3", stageId: stage3, outcome: "approved", actorAgentId: execCtoId, actorUserId: null, createdAt: new Date("2026-09-26T15:26:00Z") },
+      ],
+    });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      { ...issue, parentId: null, executionPolicy: shape, executionState: satisfiedState([stage1, stage2, stage3]) },
+      null,
+    );
+    expect(result.allowed).toBe(true);
+    expect(logActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+    );
+  });
+
+  it("a not-yet-run stage with no decision row keeps the participant-based shape check (AC3)", async () => {
+    // Same two-reviewer participants [support-CR, support-QAE], but no decision
+    // row has been recorded yet: the rung is not completed, so the unchanged
+    // participation shape check still counts support-QAE's membership and the
+    // close-ladder shape is complete. This is the unarmed-ladder advisory path —
+    // untouched by SUP-17647.
+    setupDbMock({ issues: twoLadderedChildren, agents: allAgents });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      { ...issue, parentId: null, executionPolicy: shape, executionState: satisfiedState([stage1, stage2, stage3]) },
+      null,
+    );
+    expect(result.allowed).toBe(true);
+    expect(logActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+    );
+  });
+
+  it("preserves the SUP-15650 re-seat on a completed stage: a principal-held rung is satisfied only by an independent recorded actor (AC4)", async () => {
+    // exec-CTO is the gated principal, so the terminal approval rung re-seats to
+    // an independent agent. The approval stage carries BOTH the principal and an
+    // independent co-participant (support-QAE).
+    const reseatPolicy = {
+      stages: [
+        { id: stage1, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: coderLeId }] },
+        {
+          id: stage3,
+          type: "approval",
+          approvalsNeeded: 1,
+          participants: [
+            { type: "agent", agentId: supportQaeId },
+            { type: "agent", agentId: execCtoId },
+          ],
+        },
+      ],
+    };
+
+    // An INDEPENDENT agent recorded the decision: the re-seated rung is
+    // discharged and the close is allowed.
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents,
+      issueExecutionDecisions: [
+        { id: "dec-1", stageId: stage1, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-09-26T15:24:20Z") },
+        { id: "dec-2", stageId: stage2, outcome: "approved", actorAgentId: coderLeId, actorUserId: null, createdAt: new Date("2026-09-26T15:25:00Z") },
+        { id: "dec-3", stageId: stage3, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-09-26T15:26:00Z") },
+      ],
+    });
+    const allowed = await evaluateDoneTransitionGuard(
+      mockDb,
+      { ...issue, parentId: null, executionPolicy: reseatPolicy, executionState: principalState([stage1, stage2, stage3], execCtoId) },
+      null,
+    );
+    expect(allowed.allowed).toBe(true);
+
+    // The PRINCIPAL itself recorded the decision: a self-held rung is not a
+    // rung, so mechanism D refuses, naming approval:exec-CTO.
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents,
+      issueExecutionDecisions: [
+        { id: "dec-1", stageId: stage1, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-09-26T15:24:20Z") },
+        { id: "dec-2", stageId: stage2, outcome: "approved", actorAgentId: coderLeId, actorUserId: null, createdAt: new Date("2026-09-26T15:25:00Z") },
+        { id: "dec-3", stageId: stage3, outcome: "approved", actorAgentId: execCtoId, actorUserId: null, createdAt: new Date("2026-09-26T15:26:00Z") },
+      ],
+    });
+    const refused = await evaluateDoneTransitionGuard(
+      mockDb,
+      { ...issue, parentId: null, executionPolicy: reseatPolicy, executionState: principalState([stage1, stage2, stage3], execCtoId) },
+      null,
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.reason).toContain("approval:exec-CTO");
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          missingStageLabels: expect.arrayContaining(["approval:exec-CTO"]),
+        }),
+      }),
     );
   });
 });
