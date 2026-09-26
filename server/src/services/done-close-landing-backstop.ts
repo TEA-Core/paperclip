@@ -1054,10 +1054,11 @@ export function createDoneCloseLandingBackstopService(
       }
 
       // SUP-15953: a candidate inside the widened re-enqueue window but outside
-      // the landing-verdict window gets NO verdict yet — including escalation.
-      // Only the re-enqueue leg above runs for it; everything else waits for the
-      // unchanged 24h graceCutoff.
-      if (!verdictEligible) {
+      // the landing-verdict window gets NO verdict yet — including escalation —
+      // UNLESS the re-enqueue cap is exhausted (SUP-17656: #825). An exhausted
+      // PR must escalate now; waiting the full 24h grace would leave the card
+      // silently stuck with no re-enqueue attempts remaining.
+      if (!verdictEligible && !reenqueueExhausted) {
         counts.deferred += 1;
         continue;
       }
