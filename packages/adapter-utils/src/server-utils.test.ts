@@ -66,6 +66,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+import { DEFAULT_AGENT_OOM_SCORE_ADJ } from "./oom-priority.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -382,6 +383,45 @@ describe("runChildProcess launch-size guard (FORK-DIVERGENCE e2big-wake-env)", (
     expect(spawnSpy).not.toHaveBeenCalled();
     expect(await listSshKeyDirs()).toEqual(before);
   });
+});
+
+describe("runChildProcess OOM deprioritization (SUP-17610)", () => {
+  // The mark is applied synchronously in runChildProcess right after spawn(),
+  // so a live child's /proc/<pid>/oom_score_adj already carries it by the time
+  // onSpawn fires. /proc is Linux-only, so the whole block is skipped elsewhere.
+  it.skipIf(process.platform !== "linux")(
+    "marks the spawned run child as a preferred OOM victim so its whole process tree inherits it",
+    async () => {
+      let observedAdj: number | null = null;
+
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "process.stdout.write(String(process.pid));",
+            "setTimeout(() => {}, 1500);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+          onSpawn: async (meta) => {
+            const raw = await fs.readFile(`/proc/${meta.pid}/oom_score_adj`, "utf8");
+            observedAdj = Number.parseInt(raw.trim(), 10);
+          },
+        },
+      );
+
+      // The run still completes cleanly — the mark must not break the spawn.
+      expect(result.exitCode).toBe(0);
+      expect(observedAdj).toBe(DEFAULT_AGENT_OOM_SCORE_ADJ);
+    },
+  );
 });
 
 describe("runtime connection tool delivery", () => {
