@@ -386,11 +386,28 @@ describe("runChildProcess launch-size guard (FORK-DIVERGENCE e2big-wake-env)", (
 });
 
 describe("runChildProcess OOM deprioritization (SUP-17610)", () => {
-  // The mark is applied synchronously in runChildProcess right after spawn(),
-  // so a live child's /proc/<pid>/oom_score_adj already carries it by the time
-  // onSpawn fires. /proc is Linux-only, so the whole block is skipped elsewhere.
-  it.skipIf(process.platform !== "linux")(
-    "marks the spawned run child as a preferred OOM victim so its whole process tree inherits it",
+  // SCOPE, and why this case is NOT the coverage that matters (SUP-17664).
+  //
+  // This exercises the UNARMED path only — dev boxes, CI and upstream, where no
+  // setuid binary is in the spawn path and the server can write the child's
+  // /proc entry. It passed while production was 100% broken, because
+  // `agentUidGateArmed()` reads `process.env` and not the `env` passed below, so
+  // CI's own unset PAPERCLIP_AGENT_UID is what made it green. A check that
+  // returns the same answer when the feature is absent is not evidence, so do
+  // not read a pass here as "OOM deprioritization works".
+  //
+  // The armed path cannot be covered from vitest at all: it needs a real
+  // setuid-root binary. It is covered by
+  // docker/agent-spawn-shim/test-spawn-shim.sh, which compiles and chmods one
+  // inside a container and asserts the shim marks itself, honours the env
+  // override, and that an unmarked child reads 0 so the assertion cannot pass
+  // vacuously.
+  //
+  // Skipped rather than run when the gate IS armed, so a developer with the var
+  // set locally gets a skip instead of a failure whose cause is this note.
+  const uidGateArmed = (process.env.PAPERCLIP_AGENT_UID ?? "") !== "";
+  it.skipIf(process.platform !== "linux" || uidGateArmed)(
+    "marks the spawned run child as a preferred OOM victim on the unarmed path (see note: the armed path is covered by test-spawn-shim.sh)",
     async () => {
       let observedAdj: number | null = null;
 

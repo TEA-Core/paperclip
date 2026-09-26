@@ -74,6 +74,34 @@ EOF
 gcc -o /tmp/climb /tmp/climb.c 2>/dev/null
 echo "T_CLIMB<<:"; as_node "$SHIM" /tmp/climb 2>&1; echo ":>>"
 
+# --- SUP-17664: the shim marks its own oom_score_adj before dropping, so the
+#     whole agent tree inherits it. Five assertions that reinforce each other,
+#     because a single "it reads 500" would green on an ambient default:
+#       BASE      without the shim the value is 0, so 500 is never ambient
+#       OOM       through the shim it is the default 500
+#       BUILDARG  a build with -DAGENT_OOM_SCORE_ADJ=750 reads 750, so the value
+#                 is configurable and not hardcoded
+#       OFF       a build with 0 disables the mark, and 0 != the 500 default
+#       TREE      a grandchild inherits it, which is the point of doing it here
+#
+#     BUILDARG and OFF each need their OWN binary, which is why they compile
+#     again rather than reuse $SHIM: the value is fixed at compile time
+#     deliberately (the shim reads no environment), so a build arg is the only
+#     thing there is to vary.
+echo "T_OOM_BASE<<:"; as_node                sh -c 'cat /proc/self/oom_score_adj' 2>&1; echo ":>>"
+echo "T_OOM<<:";      as_node "$SHIM"        sh -c 'cat /proc/self/oom_score_adj' 2>&1; echo ":>>"
+echo "T_OOM_TREE<<:"; as_node "$SHIM" sh -c 'sh -c "cat /proc/self/oom_score_adj"' 2>&1; echo ":>>"
+
+SHIM750=/usr/local/sbin/paperclip-spawn-agent-750
+gcc -O2 -Wall -Wextra -Werror -DAGENT_OOM_SCORE_ADJ=750 -o "$SHIM750" /tmp/spawn-agent.c \
+  && chown root:root "$SHIM750" && chmod 4755 "$SHIM750"
+echo "T_OOM_BUILDARG<<:"; as_node "$SHIM750" sh -c 'cat /proc/self/oom_score_adj' 2>&1; echo ":>>"
+
+SHIM0=/usr/local/sbin/paperclip-spawn-agent-0
+gcc -O2 -Wall -Wextra -Werror -DAGENT_OOM_SCORE_ADJ=0 -o "$SHIM0" /tmp/spawn-agent.c \
+  && chown root:root "$SHIM0" && chmod 4755 "$SHIM0"
+echo "T_OOM_OFF<<:"; as_node "$SHIM0" sh -c 'cat /proc/self/oom_score_adj' 2>&1; echo ":>>"
+
 # --- THE acceptance test for the whole chain: cross-uid /proc read is denied.
 #     Run a long-lived process as uid 1000 and read its environ as uid 1001.
 # The victim must genuinely BE uid 1000. Backgrounding the helper function is
@@ -152,6 +180,24 @@ esac
                                   || no "control failed, same-uid read denied: $(sec SAMEUID)"
 [ "$(sec CROSSUID)" = "DENIED"  ] && ok "DECISIVE: cross-uid /proc/<pid>/environ is DENIED from uid 1001" \
                                   || no "cross-uid read was NOT denied: $(sec CROSSUID)"
+
+# SUP-17664. BASE is the fail-control: if the bare uid-1000 child already read
+# 500, every assertion below would pass with the shim doing nothing at all.
+[ "$(sec OOM_BASE)" = "0" ] \
+  && ok "control: an unmarked uid-1000 child reads oom_score_adj 0" \
+  || no "control void — unmarked child is not 0, so a 500 below proves nothing: $(sec OOM_BASE)"
+[ "$(sec OOM)" = "500" ] \
+  && ok "shim marks itself oom_score_adj 500 before dropping" \
+  || no "shim did not mark itself: $(sec OOM)"
+[ "$(sec OOM_BUILDARG)" = "750" ] \
+  && ok "-DAGENT_OOM_SCORE_ADJ=750 is honoured (750, so the value is not hardcoded)" \
+  || no "build-arg override ignored: $(sec OOM_BUILDARG)"
+[ "$(sec OOM_OFF)" = "0" ] \
+  && ok "-DAGENT_OOM_SCORE_ADJ=0 disables the mark (0 != the 500 default)" \
+  || no "build-arg 0 did not disable the mark: $(sec OOM_OFF)"
+[ "$(sec OOM_TREE)" = "500" ] \
+  && ok "the mark is inherited by a grandchild — the whole agent tree is covered" \
+  || no "grandchild did not inherit the mark: $(sec OOM_TREE)"
 
 case "$(sec NOSETUID)" in
   *"not running with euid 0"*) ok "a stripped setuid bit fails loudly, no silent uid-1000 fallback" ;;
