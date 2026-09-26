@@ -12,6 +12,7 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import { deprioritizeForOom } from "./oom-priority.js";
 import {
   evaluateRunProcessSpawn,
   getRunProcessGroupCounter,
@@ -5453,6 +5454,20 @@ export async function runChildProcess(
           shell: false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
+        // Agent runs share the Paperclip server's memory cgroup, so a runaway
+        // agent workload competes with the control plane for the kernel's OOM
+        // choice. `oom_score_adj` is inherited across fork and exec, so marking
+        // this run's top-level child here covers its whole process tree — the
+        // provider CLI, the agent's shell, and anything it launches. This is
+        // the single seam where run children are created, so no process-adapter
+        // path (opencode, the claude CLI lane, pi, hermes, the generic process
+        // adapter, ...) can bypass it: the ACPX engine already marks its own
+        // spawn seam, but every CLI-lane spawn flows through here and previously
+        // kept the inherited 0. Best-effort by design; see ./oom-priority.ts for
+        // why the server cannot instead lower its own. Applied synchronously in
+        // the narrow window between `spawn()` and the child doing anything; the
+        // helper never throws, so this cannot fail the spawn.
+        deprioritizeForOom(child.pid);
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
