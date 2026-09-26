@@ -2486,6 +2486,18 @@ export function readPaperclipIssueWorkModeFromContext(
   return wake?.issue?.workMode ?? null;
 }
 
+// The issue IDENTIFIER (e.g. "SUP-15102"), not the id. Same two sources and the same
+// precedence as the work mode above: the run context's own issue ref first, the wake
+// payload as the fallback. For the router's X-Paperclip-Issue header.
+export function readPaperclipIssueIdentifierFromContext(value: unknown): string | null {
+  const context = parseObject(value);
+  const issue = parseObject(context.paperclipIssue);
+  const direct = asString(issue.identifier, "").trim();
+  if (direct) return direct;
+  const wake = normalizePaperclipWakePayload(context.paperclipWake);
+  return wake?.issue?.identifier ?? null;
+}
+
 // Wake reasons that (re)start work on an issue, where the session may not have
 // seen the task brief yet even though the adapter session itself is resuming.
 const ASSIGNMENT_SHAPED_PAPERCLIP_WAKE_REASONS = new Set([

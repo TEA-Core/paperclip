@@ -67,6 +67,7 @@ import {
   parseObject,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
+  readPaperclipIssueIdentifierFromContext,
   readPaperclipIssueWorkModeFromContext,
   renderPaperclipWakePrompt,
   renderTemplate,
@@ -2150,8 +2151,12 @@ async function buildRuntime(input: {
     : [];
   const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
+  const issueIdentifier = readPaperclipIssueIdentifierFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
+  // Unset rather than empty when there is no issue: the router drops an empty header,
+  // and an absent issue must read as absent rather than as a blank key.
+  if (issueIdentifier) env.PAPERCLIP_ISSUE_IDENTIFIER = issueIdentifier;
   if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
   if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
