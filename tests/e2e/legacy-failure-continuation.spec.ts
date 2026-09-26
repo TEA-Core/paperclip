@@ -13,10 +13,13 @@ async function json(response: APIResponse) {
 
 for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "queued_interrupt", "automatic_message"] as const) {
   test(`legacy startup hold: ${action} reaches a new agent response`, async ({ page, request }) => {
-    // SUP-17651: envelope for loaded-runner setup plus the signal-driven waits below
+    // SUP-17651: envelope for loaded-runner setup plus the signal-driven waits below:
+    // the retry-button appearance gate (240s) and the post-click completion signal
     // (90s pipeline poll + two 45s render checks). The internal waits terminate early
     // when the server state settles; the cap is the pathological ceiling, not a budget.
-    test.setTimeout(240_000);
+    // 450s = setup + 240s button gate + worst-case post-click (90s + 45s + 45s); normal
+    // cases finish in ~12s, so the extra ceiling costs nothing but the pathological tail.
+    test.setTimeout(450_000);
     const root = await mkdtemp(path.join(os.tmpdir(), "legacy-recovery-browser-"));
     const config = JSON.parse(await readFile(process.env.PAPERCLIP_E2E_SERVER_CONFIG!, "utf8"));
     // Use the running test server's actual port, including fallback allocation.
@@ -109,7 +112,18 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         await page.getByRole("textbox", { name: "editable markdown" }).fill("Please continue the pending follow-up.");
         await page.getByRole("button", { name: "Send", exact: true }).click();
       } else {
-        await page.getByRole("button", { name: action === "thread_retry" ? "Try again" : "Retry", exact: true }).click();
+        // SUP-17651: the recovery retry button ("Try again" on a blocked task thread,
+        // "Retry" on the execution-blocker notice / inbox) renders only after the page's
+        // recovery data has fetched and rendered. On the heaviest-load merge-queue preview
+        // that fetch lagged >200s, so a blind .click() ate the whole cap with "element(s)
+        // not found" -- the same class the queued_interrupt Interrupt-button hardening
+        // (slice 2d) widened from 5s -> 45s. Wait on the button explicitly, bounded, so it
+        // can never starve the post-click completion waits. The recovery state is seeded
+        // synchronously, so this is a pure frontend fetch/render latency gate, not a
+        // server-state wait.
+        const retryButton = page.getByRole("button", { name: action === "thread_retry" ? "Try again" : "Retry", exact: true });
+        await expect(retryButton).toBeVisible({ timeout: 240_000 });
+        await retryButton.click();
         if (action === "inbox_retry") await page.goto(taskUrl);
       }
       // Fork divergence (SUP-12693 done-tier close comment, slice 2c): upstream 9031516a7 posts
