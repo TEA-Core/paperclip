@@ -12,6 +12,7 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { reportRunFailure } from "./run-failure-report.js";
+import { conversationRunPredicate } from "./conversation-continuation.js";
 
 /**
  * Terminal run states — a run in any of these is not live and cannot be
@@ -46,10 +47,14 @@ function staleOwnerLeasePredicate() {
  * The clear is **liveness-based, not age-based**: a lease whose holder run is
  * still `queued`/`running` is never released, and the liveness is re-verified
  * under the run lock before the write, so a candidate that goes live between
- * the scan and the update is left untouched. Restricting to `legacy` runtime
- * keeps the reaper on the in-plane conversation runs whose leases are pure
- * bookkeeping — it never touches a remote-sandbox lease whose teardown the
- * pending-cleanup sweep owns.
+ * the scan and the update is left untouched.
+ *
+ * The candidate query requires `conversationRunPredicate()` — the same
+ * predicate `getConversationOwnershipBlocker` uses to decide that a lease
+ * holds the `execution_owner_active` gate. This ensures the reaper only
+ * releases leases that are actually blocking dispatch through that gate and
+ * never touches a provider-backed or non-conversation lease whose teardown
+ * belongs to the pending-cleanup sweep.
  */
 export async function reapStaleExecutionOwnerLeases(
   db: Db,
@@ -74,6 +79,7 @@ export async function reapStaleExecutionOwnerLeases(
         isNotNull(environmentLeases.heartbeatRunId),
         eq(heartbeatRuns.runtimeMode, "legacy"),
         inArray(heartbeatRuns.status, [...DEAD_RUN_STATUSES]),
+        conversationRunPredicate(),
         staleOwnerLeasePredicate(),
       ),
     )

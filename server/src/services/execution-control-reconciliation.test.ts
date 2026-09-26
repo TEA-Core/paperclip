@@ -263,4 +263,62 @@ describeEmbeddedPostgres("reapStaleExecutionOwnerLeases clears dead-holder lease
     const queuedLease = await getLease(queued.leaseId);
     expect(queuedLease?.releasedAt).toBeNull();
   });
+
+  it("never releases the lease of a legacy non-conversation (provider-backed) terminal run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const leaseId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Provider-Backed Lease",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Provider sandbox",
+      adapterType: "paperclip_runner",
+      status: "running",
+    });
+    // A legacy terminal run whose adapter is provider-backed, NOT a
+    // conversation adapter. Its lease is owned by the provider teardown
+    // path, not the in-plane bookkeeping the reaper targets.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "failed",
+      runtimeMode: "legacy",
+      contextSnapshot: { issueId },
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Provider sandbox gate",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      heartbeatRunId: runId,
+      issueId,
+      status: "active",
+      leasePolicy: "ephemeral",
+    });
+
+    const result = await reapStaleExecutionOwnerLeases(db);
+
+    // The reaper must NOT release this lease: the holder run is terminal but
+    // NOT a conversation run, so the blocker reader would never gate on it
+    // and its cleanup belongs to the pending-cleanup sweep.
+    expect(result.reaped).toBe(0);
+    const lease = await getLease(leaseId);
+    expect(lease?.releasedAt).toBeNull();
+    expect(lease?.status).toBe("active");
+  });
 });
