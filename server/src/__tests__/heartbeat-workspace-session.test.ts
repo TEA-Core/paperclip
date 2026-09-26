@@ -1872,7 +1872,7 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
-  it("fails loudly when explicit reuse restore errors", async () => {
+  it("re-provisions a fresh workspace when an explicit reuse restore throws", async () => {
     const base = buildWorkspaceConfigMetadata();
     const next = buildWorkspaceConfigMetadata({
       repoRef: "origin/release",
@@ -1890,7 +1890,10 @@ describe("effective run execution workspace config freshness", () => {
     });
     const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] }));
 
-    await expect(provisionExecutionWorkspaceForFreshnessDecision({
+    // SUP-17622: a requested inherited workspace that cannot be restored is an
+    // unrestorable artifact, not a misconfiguration — re-provision and proceed
+    // instead of failing the dispatch, and surface the cause for attribution.
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceId: "workspace-old",
       issueRef: { id: "issue-1", identifier: "PAP-42" },
@@ -1900,14 +1903,19 @@ describe("effective run execution workspace config freshness", () => {
         throw new Error("restore command failed");
       },
       realizeWorkspace,
-    })).rejects.toThrow(/restore command failed/);
-    expect(realizeWorkspace).not.toHaveBeenCalled();
+    });
+
+    expect(result.executionWorkspace).toEqual({ id: "fallback-workspace", warnings: [] });
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.reprovisionedAfterUnavailableReuse).toBe(true);
+    expect(result.reprovisionAfterUnavailableReuseCause).toEqual("restore command failed");
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it.each([
     { name: "missing", status: null },
     { name: "archived", status: "archived" },
-  ])("fails loudly when the inherited workspace row is $name", async ({ status }) => {
+  ])("re-provisions a fresh workspace when the inherited workspace row is $name", async ({ status }) => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-old",
       issueExecutionWorkspacePreference: "reuse_existing",
@@ -1918,8 +1926,6 @@ describe("effective run execution workspace config freshness", () => {
       requestedExecutionWorkspaceId: "workspace-old",
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceAvailable: false,
-      // Repairable: a missing row or an archived one whose directory still
-      // exists can be restored by hand, so this must keep failing loudly.
       bindingUnrestorable: false,
     });
 
@@ -1932,7 +1938,10 @@ describe("effective run execution workspace config freshness", () => {
     });
     const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] }));
 
-    await expect(provisionExecutionWorkspaceForFreshnessDecision({
+    // SUP-17622: a named-but-unrestorable workspace (row missing or archived)
+    // used to fail the dispatch with `inherited_workspace_reuse_unavailable`.
+    // The run now provisions a fresh workspace and proceeds instead.
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
       requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
       existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
       issueRef: { id: "issue-1", identifier: "PAP-42" },
@@ -1942,8 +1951,12 @@ describe("effective run execution workspace config freshness", () => {
         ? async () => ({ id: "workspace-old", warnings: [] })
         : null,
       realizeWorkspace,
-    })).rejects.toThrow(/could not be restored/);
-    expect(realizeWorkspace).not.toHaveBeenCalled();
+    });
+
+    expect(result.executionWorkspace).toEqual({ id: "fallback-workspace", warnings: [] });
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.reprovisionedAfterUnavailableReuse).toBe(true);
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
   });
 
   // SUP-9810: the worktree reaper archives the workspace row when it deletes a
@@ -2141,7 +2154,7 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
-  it("fails loudly when explicit reuse restore returns no workspace", async () => {
+  it("re-provisions a fresh workspace when explicit reuse restore returns no workspace", async () => {
     const metadata = buildWorkspaceConfigMetadata();
     const decision = resolveExecutionWorkspaceConfigFreshness({
       hasExistingWorkspace: true,
@@ -2150,7 +2163,10 @@ describe("effective run execution workspace config freshness", () => {
     });
     const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] }));
 
-    await expect(provisionExecutionWorkspaceForFreshnessDecision({
+    // SUP-17622: the restore produced nothing — the named workspace is gone.
+    // The dispatch falls back to a fresh provision instead of failing with
+    // `inherited_workspace_reuse_unavailable`.
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceId: "workspace-old",
       issueRef: { id: "issue-1", identifier: "PAP-42" },
@@ -2158,14 +2174,15 @@ describe("effective run execution workspace config freshness", () => {
       workspaceConfigFreshness: decision,
       restoreExistingWorkspace: async () => null,
       realizeWorkspace,
-    })).rejects.toThrow(/could not be restored/);
-    expect(realizeWorkspace).not.toHaveBeenCalled();
+    });
+
+    expect(result.executionWorkspace).toEqual({ id: "fallback-workspace", warnings: [] });
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.reprovisionedAfterUnavailableReuse).toBe(true);
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    { name: "restore throws", restoreOutcome: "throws" as const },
-    { name: "restore returns no workspace", restoreOutcome: "empty" as const },
-  ])("classifies reuse restore failure as a workspace validation failure when $name", async ({ restoreOutcome }) => {
+  it("re-provisions instead of failing when a throwing reuse restore cannot be restored", async () => {
     const metadata = buildWorkspaceConfigMetadata();
     const decision = resolveExecutionWorkspaceConfigFreshness({
       hasExistingWorkspace: true,
@@ -2174,35 +2191,34 @@ describe("effective run execution workspace config freshness", () => {
     });
     const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] as string[] }));
 
-    const error = await provisionExecutionWorkspaceForFreshnessDecision({
+    // SUP-17622: even a throwing restore (not just a null return) falls back to a
+    // fresh provision so a stranded reuse_existing binding recovers instead of
+    // permanently trapping the dispatch.
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceId: "workspace-old",
       issueRef: { id: "issue-1", identifier: "PAP-42" },
       runId: "run-1",
       workspaceConfigFreshness: decision,
       restoreExistingWorkspace: async () => {
-        if (restoreOutcome === "throws") throw new Error("restore command failed");
-        return null;
+        throw new Error("restore command failed");
       },
       realizeWorkspace,
-    }).then(
-      () => null,
-      (err: unknown) => err,
-    );
+    });
 
-    // A per-issue workspace restore failure must stay workspace-scoped so the
-    // heartbeat keeps the agent idle instead of flipping the whole agent to error.
-    expect(error).toBeInstanceOf(WorkspaceValidationFailure);
-    expect((error as WorkspaceValidationFailure).code).toBe("workspace_validation_failed");
-    expect(realizeWorkspace).not.toHaveBeenCalled();
+    expect(result.executionWorkspace).toEqual({ id: "fallback-workspace", warnings: [] as string[] });
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.reprovisionedAfterUnavailableReuse).toBe(true);
+    expect(result.reprovisionAfterUnavailableReuseCause).toEqual("restore command failed");
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
   });
 
-  // SUP-13090: the concrete reuse failure reason must be readable from the run's
-  // resultJson, not swallowed into an empty payload. Recovery reads
-  // `resultJson.workspaceValidation` to build `evidence`; an empty object left
-  // agents with only the "withheld" placeholder and no way to diagnose the cause
-  // (e.g. ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) from the API alone.
-  it("surfaces the reuse failure reason in the workspace validation resultJson", async () => {
+  // SUP-13090 follow-through: the concrete reuse failure reason must stay
+  // readable. It no longer rides a thrown `workspace_validation_failed` failure
+  // (the dispatch now succeeds via a fresh provision), so it surfaces on the
+  // re-provision result instead — letting recovery attribute why the reuse fell
+  // back instead of being left with the "withheld" placeholder.
+  it("surfaces the reuse failure cause in the re-provision result", async () => {
     const metadata = buildWorkspaceConfigMetadata();
     const decision = resolveExecutionWorkspaceConfigFreshness({
       hasExistingWorkspace: true,
@@ -2211,7 +2227,7 @@ describe("effective run execution workspace config freshness", () => {
     });
     const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] as string[] }));
 
-    const error = await provisionExecutionWorkspaceForFreshnessDecision({
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceId: "workspace-old",
       issueRef: { id: "issue-1", identifier: "PAP-42" },
@@ -2221,48 +2237,14 @@ describe("effective run execution workspace config freshness", () => {
         throw new Error("Execution workspace provision command failed: ERR_PNPM_LOCKFILE_CONFIG_MISMATCH");
       },
       realizeWorkspace,
-    }).then(
-      () => null,
-      (err: unknown) => err,
+    });
+
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.reprovisionedAfterUnavailableReuse).toBe(true);
+    expect(result.reprovisionAfterUnavailableReuseCause).toEqual(
+      "Execution workspace provision command failed: ERR_PNPM_LOCKFILE_CONFIG_MISMATCH",
     );
-
-    expect(error).toBeInstanceOf(WorkspaceValidationFailure);
-    const resultJson = (error as WorkspaceValidationFailure).resultJson;
-    expect(resultJson.workspaceValidation).toEqual({
-      reason: "inherited_workspace_reuse_failed",
-      executionWorkspaceId: "workspace-old",
-      cause: "Execution workspace provision command failed: ERR_PNPM_LOCKFILE_CONFIG_MISMATCH",
-    });
-  });
-
-  it("surfaces an unavailable-reuse reason when restore returns no workspace", async () => {
-    const metadata = buildWorkspaceConfigMetadata();
-    const decision = resolveExecutionWorkspaceConfigFreshness({
-      hasExistingWorkspace: true,
-      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
-      nextMetadata: metadata,
-    });
-    const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] as string[] }));
-
-    const error = await provisionExecutionWorkspaceForFreshnessDecision({
-      requestedShouldReuseExisting: true,
-      existingExecutionWorkspaceId: "workspace-old",
-      issueRef: { id: "issue-1", identifier: "PAP-42" },
-      runId: "run-1",
-      workspaceConfigFreshness: decision,
-      restoreExistingWorkspace: async () => null,
-      realizeWorkspace,
-    }).then(
-      () => null,
-      (err: unknown) => err,
-    );
-
-    expect(error).toBeInstanceOf(WorkspaceValidationFailure);
-    expect((error as WorkspaceValidationFailure).resultJson.workspaceValidation).toEqual({
-      reason: "inherited_workspace_reuse_unavailable",
-      executionWorkspaceId: "workspace-old",
-      cause: null,
-    });
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it("formats a safe workspace operation payload for config drift decisions", () => {
