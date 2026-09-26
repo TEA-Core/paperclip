@@ -3551,6 +3551,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               eq(issues.id, issue.id),
               eq(issues.companyId, issue.companyId),
             ));
+          logger.info(
+            {
+              event: "execution_workspace.reopen",
+              outcome: "issue_pointer_detached_on_rebuild_failure",
+              executionWorkspaceId: row.id,
+              issueId: issue.id,
+              companyId: issue.companyId,
+            },
+            "execution workspace reopen: detached issue pointer after failed rebuild",
+          );
         };
 
         let rebuildError: string | null = null;
