@@ -976,13 +976,11 @@ export function summarySlotService(db: Db) {
           .returning();
       }
 
-      // A successful write does NOT release the generation link: the task may
-      // still be in review and get a changes_requested bounce, so the slot must
-      // stay armed for a second write against the same generationIssueId. The
-      // link is released exactly once, at the issue's terminal transition, by
-      // finalizeSummarySlotsForTerminalIssue (SUP-15773). We therefore keep
-      // `status` at "generating" and leave `generatingIssueId` untouched here
-      // (the WHERE clause below pins it to the active generation task).
+      // The slot update keeps the generation link intact for the duration of
+      // this transaction: the write's WHERE clause pins it to the active
+      // generation task so a concurrent supersede makes the update match 0
+      // rows and fail closed. Releasing the link and recording the task's
+      // terminal disposition happens AFTER this transaction commits (below).
       const slotPatch = {
         documentId: documentRow.id,
         status: "generating" as const,
@@ -1010,8 +1008,44 @@ export function summarySlotService(db: Db) {
       return { slot: nextSlot, document: documentRow, revision: revisionRow };
     });
 
+    // SUP-17609 (board ruling on SUP-17160): a successful matching write IS the
+    // generation task's deliverable, so record the task's terminal disposition
+    // here instead of leaving termination to the agent's own close-out — the
+    // dominant stall shape is a card that wrote its revision, narrated the
+    // success, and sat in_progress forever while the refresh sweep re-wake'd it
+    // (SUP-17499).
+    //
+    // Routed through the standard issue-update funnel (not a raw UPDATE inside
+    // the write transaction) so every terminal side effect runs exactly once:
+    // finalizeSummarySlotsForTerminalIssue releases the slot binding in the same
+    // transaction as the status flip — to `idle`, because this generation just
+    // wrote the surviving revision — and activity logging, interaction expiry,
+    // and post-commit actions follow the normal close-out. Post-commit
+    // placement also keeps the write's slot row lock out of the issue
+    // transition's lock scope: the terminal path locks issue -> slot, so
+    // nesting it under the write's slot lock would invert that order and risk
+    // a deadlock. If the task was already terminalized in the gap, the update
+    // is a no-op status-wise and the release already happened; a vanished task
+    // fails closed so the write never reports success over an unrecorded
+    // disposition.
+    const terminalized = await issuesSvc.update(input.generationIssueId!, {
+      status: "done",
+      actorAgentId: actor.agentId ?? null,
+    });
+    if (!terminalized) {
+      throw conflict("Summary generation task vanished before its terminal disposition was recorded", {
+        code: "summary_generation_terminalization_missing",
+        generationIssueId: input.generationIssueId,
+      });
+    }
+
+    // The terminal transition released the slot binding in its own
+    // transaction; return the slot's settled state rather than the
+    // pre-release snapshot from the write transaction.
+    const settledSlot = await findSlotRow(sel);
+
     return {
-      slot: mapSlot(result.slot),
+      slot: mapSlot(settledSlot ?? result.slot),
       document: mapDocument(result.document),
       revision: mapRevision(result.revision),
     };

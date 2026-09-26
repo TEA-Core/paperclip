@@ -980,7 +980,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       return { svc, generationIssueId: generated.generatingIssue.id, runId };
     }
 
-    it("writes a board-readable revision, preserves the previous revision, and keeps the slot armed for the live generation task", async () => {
+    it("writes a board-readable revision, completes the generation task, and releases the slot at write time (SUP-17609)", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
       const summarizerAgentId = await seedSummarizer(companyId);
@@ -997,9 +997,26 @@ describeEmbeddedPostgres("summary slot service", () => {
         { agentId: summarizerAgentId, runId },
       );
 
+      // A successful matching write records the generation task's terminal
+      // disposition itself: the task is done WITHOUT the agent writing a
+      // terminal status, and the slot released to idle (this generation wrote
+      // the surviving revision).
+      const firstTaskAfterWrite = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generationIssueId))
+        .then((rows) => rows[0]!);
+      expect(firstTaskAfterWrite.status).toBe("done");
+      expect(initial.slot.status).toBe("idle");
+      expect(initial.slot.generatingIssueId).toBeNull();
+      expect(initial.slot.documentId).toBe(initial.document.id);
+      expect(initial.slot.lastGeneratedByAgentId).toBe(summarizerAgentId);
+      expect(initial.slot.lastModel).toBe("cheap-model");
+
       const nextGeneration = await svc.generate(projectSelector(companyId, projectId), {
         userId: "board-user",
       });
+      expect(nextGeneration.generatingIssue.id).not.toBe(generationIssueId);
       const nextRunId = await seedRun(companyId, summarizerAgentId, nextGeneration.generatingIssue.id);
       await db
         .update(issues)
@@ -1020,8 +1037,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(written.revision.revisionNumber).toBe(2);
       expect(written.document.body).toMatch(/^\*\*Decide:\*\*[\s\S]*\*\*I suggest:\*\*/m);
       expect(written.document.body).not.toMatch(/^Issues: /m);
-      expect(written.slot.status).toBe("generating");
-      expect(written.slot.generatingIssueId).toBe(generationIssueId);
+      expect(written.slot.status).toBe("idle");
+      expect(written.slot.generatingIssueId).toBeNull();
       expect(written.slot.documentId).toBe(written.document.id);
       expect(written.slot.lastGeneratedByAgentId).toBe(summarizerAgentId);
       expect(written.slot.lastModel).toBe("cheap-model");
@@ -1041,8 +1058,7 @@ describeEmbeddedPostgres("summary slot service", () => {
 
       // Pre-seed a document at revision 1 and point the still-generating slot at it so
       // both concurrent writers read the same latestRevisionNumber and both compute the
-      // same next revision (the document_revisions_document_revision_uq shape). Because
-      // the slot stays armed after a write (SUP-15773), both writes target this document.
+      // same next revision if they race (the document_revisions_document_revision_uq shape).
       const seedDocumentId = randomUUID();
       await db.insert(documents).values({
         id: seedDocumentId,
@@ -1086,39 +1102,70 @@ describeEmbeddedPostgres("summary slot service", () => {
         (r): r is PromiseRejectedResult => r.status === "rejected",
       );
 
-      // The slot row lock serializes the two writers: both land, each computing its
-      // next revision from the latest document state — never the same revision number.
-      // No raw unique-index error is exposed.
-      expect(rejected).toHaveLength(0);
-      expect(fulfilled).toHaveLength(2);
+      // The slot row lock serializes the two writers. Because a successful write
+      // now terminalizes its generation task and releases the slot link
+      // (SUP-17609), the second writer lands either as the next sequential
+      // revision (serialized before the release commits) or with the structured
+      // 409 "superseded" conflict (after the release commits). It is never a raw
+      // revision unique-index violation: every write computes its next revision
+      // from the latest document state under the slot lock.
+      expect(fulfilled.length).toBeGreaterThanOrEqual(1);
+      expect(fulfilled.length + rejected.length).toBe(2);
+
+      for (const r of rejected) {
+        expect(r.reason).toMatchObject({ status: 409 });
+        expect(String((r.reason as { message?: unknown })?.message ?? "")).not.toMatch(
+          /document_revisions_document_revision_uq/i,
+        );
+      }
 
       const revisionNumbers = fulfilled.map((r) => r.value.revision.revisionNumber).sort((a, b) => a - b);
-      expect(revisionNumbers).toEqual([2, 3]);
+      expect(revisionNumbers).toEqual(Array.from({ length: fulfilled.length }, (_, i) => i + 2));
 
-      // Both revisions land on the same (seeded) document.
+      // Every landed revision lands on the same (seeded) document.
       expect(new Set(fulfilled.map((r) => r.value.document.id)).size).toBe(1);
       expect(fulfilled[0]!.value.document.id).toBe(seedDocumentId);
 
       const revisions = await svc.listRevisions(projectSelector(companyId, projectId));
-      expect(revisions.revisions).toHaveLength(3);
-      expect(revisions.revisions[0]!.revisionNumber).toBe(3);
-      expect(revisions.revisions[2]!.revisionNumber).toBe(1);
+      expect(revisions.revisions).toHaveLength(1 + fulfilled.length);
+      expect(revisions.revisions[0]!.revisionNumber).toBe(1 + fulfilled.length);
+      expect(revisions.revisions.at(-1)!.revisionNumber).toBe(1);
+
+      // Whichever serialization point the second writer hit, the slot settles
+      // released: the generation task is terminal and the link is off the slot.
+      const taskAfter = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generationIssueId))
+        .then((rows) => rows[0]!);
+      expect(taskAfter.status).toBe("done");
+      const slotAfter = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(slotAfter.slot.status).toBe("idle");
+      expect(slotAfter.slot.generatingIssueId).toBeNull();
     });
 
-    it("allows a second write for the same generation task after a changes_requested bounce, then releases the link only at terminal", async () => {
+    it("completes the generation task at write time; a changes_requested bounce still lands on the Summarizer, but the released slot is no longer armed to it (SUP-17609)", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
       const summarizerAgentId = await seedSummarizer(companyId);
       const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
 
-      // First revision lands; the slot must stay armed for the still-active task.
+      // First revision lands; the write itself records the task's terminal
+      // disposition and releases the slot link — the task no longer needs its
+      // own close-out to end the card.
       const first = await svc.write(
         { ...projectSelector(companyId, projectId), markdown: "# Summary v1", generationIssueId },
         { agentId: summarizerAgentId, runId },
       );
       expect(first.revision.revisionNumber).toBe(1);
-      expect(first.slot.status).toBe("generating");
-      expect(first.slot.generatingIssueId).toBe(generationIssueId);
+      expect(first.slot.status).toBe("idle");
+      expect(first.slot.generatingIssueId).toBeNull();
+      const taskAfterWrite = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generationIssueId))
+        .then((rows) => rows[0]!);
+      expect(taskAfterWrite.status).toBe("done");
 
       // The summarizer submits the summary for review. Arm a single review stage
       // whose participant is a board reviewer and whose return assignee is the
@@ -1157,9 +1204,8 @@ describeEmbeddedPostgres("summary slot service", () => {
       // Drive the ACTUAL review-bounce through the execution engine: the reviewer
       // requests changes and the engine bounces the SAME generation task back to
       // the summarizer (executionState.status = "changes_requested", issue back
-      // in_progress). This is the transition a real changes_requested verdict
-      // performs — not a comment, so the regression cannot be faked by a stale
-      // slot link.
+      // in_progress). Bounce routing to the slot owner (SUP-15768) is unaffected
+      // by the write-time terminal disposition.
       const armedIssue = await db
         .select()
         .from(issues)
@@ -1201,37 +1247,57 @@ describeEmbeddedPostgres("summary slot service", () => {
         .set({ checkoutRunId: resubmitRunId })
         .where(eq(issues.id, generationIssueId));
 
-      // After the real bounce the SAME generation task writes a corrected revision
-      // with no board re-arm in between (SUP-15773).
+      // The released slot is no longer armed to this task: the bounced write is
+      // refused by the active-link guard (the slot released at write time is not
+      // re-armed by a bounce), not by the terminal-status guard. A fresh
+      // generation is required to re-arm.
+      await expect(
+        svc.write(
+          {
+            ...projectSelector(companyId, projectId),
+            markdown: "# Stale re-arm",
+            baseRevisionId: first.revision.id,
+            generationIssueId,
+          },
+          { agentId: summarizerAgentId, runId: resubmitRunId },
+        ),
+      ).rejects.toMatchObject({
+        status: 403,
+        message: "Summary write does not match the active generation task",
+      });
+
+      // The fresh generation re-arms the slot and writes the corrected revision.
+      const regenerated = await svc.generate(projectSelector(companyId, projectId), {
+        userId: "board-user",
+      });
+      expect(regenerated.generatingIssue.id).not.toBe(generationIssueId);
+      const regenRunId = await seedRun(companyId, summarizerAgentId, regenerated.generatingIssue.id);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: regenRunId })
+        .where(eq(issues.id, regenerated.generatingIssue.id));
       const second = await svc.write(
         {
           ...projectSelector(companyId, projectId),
           markdown: "# Summary v2 (corrected)",
           baseRevisionId: first.revision.id,
-          generationIssueId,
+          generationIssueId: regenerated.generatingIssue.id,
         },
-        { agentId: summarizerAgentId, runId: resubmitRunId },
+        { agentId: summarizerAgentId, runId: regenRunId },
       );
       expect(second.revision.revisionNumber).toBe(2);
-      expect(second.slot.status).toBe("generating");
-      expect(second.slot.generatingIssueId).toBe(generationIssueId);
-
-      // The link is cleared exactly once, at the terminal transition.
-      await issueService(db).update(generationIssueId, { status: "done" });
-      const afterTerminal = await svc.getSlot(projectSelector(companyId, projectId));
-      expect(afterTerminal.slot).toMatchObject({ status: "idle", generatingIssueId: null });
-      expect(afterTerminal.generatingIssue).toBeNull();
+      expect(second.slot.status).toBe("idle");
+      expect(second.slot.generatingIssueId).toBeNull();
 
       // A terminal generation task that still holds the slot link (a write request
       // that captured the link just before the terminal transition) must be refused
       // by the terminal-status guard — NOT the earlier active-link guard. Re-arm the
-      // link to the now-terminal task to model that in-flight race: the guard order
-      // is active-link (5) then terminal-status (6), so only a present link lets the
-      // request reach the terminal-status refusal. Use the resubmission run, the run
-      // that owns the task after the bounce.
+      // link to the now-terminal second task to model that in-flight race: the guard
+      // order is active-link then terminal-status, so only a present link lets the
+      // request reach the terminal-status refusal.
       await db
         .update(summarySlots)
-        .set({ generatingIssueId: generationIssueId })
+        .set({ status: "generating", generatingIssueId: regenerated.generatingIssue.id })
         .where(
           and(
             eq(summarySlots.companyId, companyId),
@@ -1240,15 +1306,19 @@ describeEmbeddedPostgres("summary slot service", () => {
             eq(summarySlots.scopeId, projectId),
           ),
         );
+      await db
+        .update(issues)
+        .set({ checkoutRunId: regenRunId })
+        .where(eq(issues.id, regenerated.generatingIssue.id));
       await expect(
         svc.write(
           {
             ...projectSelector(companyId, projectId),
             markdown: "# Too late",
             baseRevisionId: second.revision.id,
-            generationIssueId,
+            generationIssueId: regenerated.generatingIssue.id,
           },
-          { agentId: summarizerAgentId, runId: resubmitRunId },
+          { agentId: summarizerAgentId, runId: regenRunId },
         ),
       ).rejects.toMatchObject({
         status: 403,
