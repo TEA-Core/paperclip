@@ -5467,7 +5467,10 @@ export async function runChildProcess(
         // why the server cannot instead lower its own. Applied synchronously in
         // the narrow window between `spawn()` and the child doing anything; the
         // helper never throws, so this cannot fail the spawn.
-        deprioritizeForOom(child.pid);
+        deprioritizeForOom(child.pid, undefined, {
+          onError: (error) =>
+            onLogError(error, runId, "failed to apply agent OOM priority"),
+        });
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 

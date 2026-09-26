@@ -4707,7 +4707,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             // a non-root server can no longer write it at all. One small, deferred
             // /proc write is not worth either gap. The helper never throws, so this
             // cannot fail the spawn.
-            deprioritizeForOom(child.pid);
+            deprioritizeForOom(child.pid, undefined, {
+              onError: (error) => {
+                void ctx.onLog(
+                  "stderr",
+                  `[paperclip] failed to apply agent OOM priority: ${
+                    error instanceof Error ? error.message : String(error)
+                  }\n`,
+                );
+              },
+            });
             return child;
           },
           onAgentStderr: prepared.childStderrLogPath
