@@ -3530,17 +3530,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // block. No-op in production.
         await input.rebuildBarrier?.();
 
-        // SUP-17623: a failed rebuild must not leave the card pinned to a closed
-        // workspace. Clear the triggering issue's pointer in this same
-        // transaction — under the lifecycle lock already held here — so the
-        // pointer clear and the reopen-failure marker commit or roll back
-        // together. The id is cleared together with the `reuse_existing`
-        // preference, the pair that assertReusableExecutionWorkspaceBound 422s
-        // at write time; other preferences are kept, since they are mode intents
-        // that stay meaningful without an id. The workspace row itself stays
-        // closed and retryable; only the dangling pointer is released.
-        const detachIssueFromFailedReopen = async () => {
-          await tx
+        // SUP-17623: a failed rebuild must not leave any card pinned to a closed
+        // workspace. Release every non-terminal binding on this vehicle in this
+        // same transaction — under the lifecycle lock already held here — so the
+        // pointer clears and the reopen-failure marker commit or roll back
+        // together. `executionWorkspaceId = row.id` is the rebind guard: a card
+        // that was re-bound to a different workspace while the rebuild ran no
+        // longer points at this vehicle and is left alone. The id is cleared
+        // together with the `reuse_existing` preference, the pair that
+        // assertReusableExecutionWorkspaceBound 422s at write time; other
+        // preferences are kept, since they are mode intents that stay meaningful
+        // without an id. Terminal cards keep their pointer: they never dispatch,
+        // and the closed vehicle must stay retryable for the next resume. The
+        // workspace row itself stays closed and retryable.
+        const detachIssueBindingsFromFailedReopen = async () => {
+          const detached = await tx
             .update(issues)
             .set({
               executionWorkspaceId: null,
@@ -3548,19 +3552,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               updatedAt: new Date(),
             })
             .where(and(
-              eq(issues.id, issue.id),
-              eq(issues.companyId, issue.companyId),
-            ));
+              eq(issues.companyId, row.companyId),
+              eq(issues.executionWorkspaceId, row.id),
+              ne(issues.status, "done"),
+              ne(issues.status, "cancelled"),
+            ))
+            .returning({ id: issues.id });
           logger.info(
             {
               event: "execution_workspace.reopen",
-              outcome: "issue_pointer_detached_on_rebuild_failure",
+              outcome: "issue_pointers_detached_on_rebuild_failure",
               executionWorkspaceId: row.id,
               issueId: issue.id,
-              companyId: issue.companyId,
+              detachedIssueIds: detached.map((entry) => entry.id),
+              companyId: row.companyId,
             },
-            "execution workspace reopen: detached issue pointer after failed rebuild",
+            "execution workspace reopen: detached issue pointers after failed rebuild",
           );
+          return detached.map((entry) => entry.id);
         };
 
         let rebuildError: string | null = null;
@@ -3643,6 +3652,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             },
             "execution workspace reopen rebuild failed",
           );
+          // Release the cards' claims on the closed vehicle so the failed reopen
+          // cannot strand them (SUP-17623).
+          const detachedIssueIds = await detachIssueBindingsFromFailedReopen();
           await logActivityInTransaction(tx as unknown as Db, {
             companyId: row.companyId,
             actorType: actor.actorType === "user" ? "user" : "agent",
@@ -3655,11 +3667,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               issueId: issue.id,
               outcome: "rebuild_failed",
               generation: nextGeneration,
+              detachedIssueIds,
             },
           });
-          // Release the card's claim on the closed vehicle so the failed reopen
-          // cannot strand it (SUP-17623).
-          await detachIssueFromFailedReopen();
           return { ok: false, code: "rebuild_failed", message: "Failed to rebuild the execution workspace" };
         }
 
@@ -3686,9 +3696,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           .then((rows) => rows[0] ?? null);
         if (!activeRow) {
           // The publish write found no row: the vehicle is gone (hard-deleted
-          // between the rebuild and the publication). The card must not be left
+          // between the rebuild and the publication). The cards must not be left
           // pointing at a row that is no longer active (SUP-17623).
-          await detachIssueFromFailedReopen();
+          await detachIssueBindingsFromFailedReopen();
           return { ok: false, code: "rebuild_failed", message: "Failed to rebuild the execution workspace" };
         }
         logger.info(

@@ -42,12 +42,17 @@ if (!embeddedPostgresSupport.supported) {
 
 describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
   let db!: ReturnType<typeof createDb>;
+  let db2!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const tempDirs: string[] = [];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-reopen-");
     db = createDb(tempDb.connectionString);
+    // A second, independent pool. A rebind driven on db2 runs on a different
+    // physical connection than the reopen (which runs on db), so the two contend
+    // the way two server processes would.
+    db2 = createDb(tempDb.connectionString);
   }, 20_000);
 
   afterEach(async () => {
@@ -61,6 +66,7 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
   });
 
   afterAll(async () => {
+    await db2.$client.end();
     await tempDb?.cleanup();
   });
 
@@ -424,6 +430,136 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
     const issueRow = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issueRow?.executionWorkspaceId).toBeNull();
     expect(issueRow?.executionWorkspacePreference).toBe("isolated_workspace");
+  });
+
+  it("does not clear a pointer that was re-bound to another workspace while the rebuild ran", async () => {
+    const { companyId, projectId, projectWorkspaceId } = await seedCompanyProject();
+    // A directory that does not exist. The project_primary rebuild returns null.
+    const missingDir = join(tmpdir(), `paperclip-reopen-missing-${randomUUID()}`);
+    const workspaceId = await seedClosedWorkspace({
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      cwd: missingDir,
+    });
+    const issueId = await seedIssue({
+      companyId,
+      projectId,
+      workspaceId,
+      issueNumber: 4110,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    const svc = executionWorkspaceService(db);
+    const result = await svc.reopenClosedIsolatedExecutionWorkspaceForIssue({
+      workspaceId,
+      issue: { id: issueId, companyId, projectId },
+      actor: { agentId: null, actorType: "user" },
+      // While the failed reopen is open at the rebuild boundary, the card is
+      // re-bound to a different live workspace. Driven on the independent pool,
+      // the way a different server process would rebind the card mid-rebuild.
+      rebuildBarrier: async () => {
+        const reboundWorkspaceId = await seedClosedWorkspace({
+          companyId,
+          projectId,
+          projectWorkspaceId,
+          cwd: await makeExistingDir(),
+          status: "active",
+        });
+        await db2
+          .update(issues)
+          .set({
+            executionWorkspaceId: reboundWorkspaceId,
+            executionWorkspacePreference: "reuse_existing",
+            updatedAt: new Date(),
+          })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe("rebuild_failed");
+
+    // The rebind survives the failed reopen: the detach must not clobber a pointer
+    // that no longer points at the failed vehicle.
+    const issueRow = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issueRow?.executionWorkspaceId).not.toBeNull();
+    expect(issueRow?.executionWorkspaceId).not.toBe(workspaceId);
+    expect(issueRow?.executionWorkspacePreference).toBe("reuse_existing");
+
+    // The failed vehicle stays closed and retryable.
+    const row = await readWorkspace(workspaceId);
+    expect(row?.status).toBe("archived");
+    expect(row?.cleanupReason).toBe(EXECUTION_WORKSPACE_REOPEN_FAILED_REASON);
+  });
+
+  it("detaches every non-terminal binding on the vehicle when the rebuild fails", async () => {
+    const { companyId, projectId, projectWorkspaceId } = await seedCompanyProject();
+    // A directory that does not exist. The project_primary rebuild returns null.
+    const missingDir = join(tmpdir(), `paperclip-reopen-missing-${randomUUID()}`);
+    const workspaceId = await seedClosedWorkspace({
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      cwd: missingDir,
+      generation: 2,
+    });
+    // Two non-terminal cards share the isolated vehicle with the stranded
+    // half-state SUP-17618 describes, plus one terminal card on the same vehicle.
+    const firstIssueId = await seedIssue({
+      companyId,
+      projectId,
+      workspaceId,
+      issueNumber: 4111,
+      executionWorkspacePreference: "reuse_existing",
+    });
+    const secondIssueId = await seedIssue({
+      companyId,
+      projectId,
+      workspaceId,
+      issueNumber: 4112,
+      executionWorkspacePreference: "reuse_existing",
+    });
+    const terminalIssueId = await seedIssue({
+      companyId,
+      projectId,
+      workspaceId,
+      issueNumber: 4113,
+      executionWorkspacePreference: "reuse_existing",
+    });
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issues.id, terminalIssueId));
+
+    const svc = executionWorkspaceService(db);
+    const result = await svc.reopenClosedIsolatedExecutionWorkspaceForIssue({
+      workspaceId,
+      issue: { id: firstIssueId, companyId, projectId },
+      actor: { agentId: null, actorType: "user" },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe("rebuild_failed");
+
+    // Every non-terminal binding is released in the same transaction: no dangling
+    // pointer and no unrealizable reuse_existing on any of the live cards.
+    const rows = await db.select().from(issues);
+    const byId = new Map(rows.map((entry) => [entry.id, entry]));
+    for (const id of [firstIssueId, secondIssueId]) {
+      expect(byId.get(id)?.executionWorkspaceId, id).toBeNull();
+      expect(byId.get(id)?.executionWorkspacePreference, id).toBeNull();
+    }
+    // The terminal card keeps its claim on the retryable vehicle, so the next
+    // resume can reopen the same workspace.
+    expect(byId.get(terminalIssueId)?.executionWorkspaceId).toBe(workspaceId);
+    expect(byId.get(terminalIssueId)?.executionWorkspacePreference).toBe("reuse_existing");
+
+    const row = await readWorkspace(workspaceId);
+    expect(row?.status).toBe("archived");
+    expect(row?.cleanupReason).toBe(EXECUTION_WORKSPACE_REOPEN_FAILED_REASON);
   });
 
   it("resolves the managed base checkout for a git_worktree row when the project workspace cwd is null", async () => {
