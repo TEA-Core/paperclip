@@ -4269,7 +4269,7 @@ export function recoveryService(
         sourceIssueId: input.issue.id,
         actionId: active.id,
         status: "cancelled",
-        outcome: "cancelled",
+        outcome: "condition_cleared",
         resolutionNote: "source_state_changed",
       });
       await logActivity(db, {
