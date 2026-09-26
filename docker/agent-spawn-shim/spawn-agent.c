@@ -47,9 +47,11 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -128,6 +130,21 @@ int main(int argc, char **argv) {
    * the right answer today, but it is right by accident: the moment anyone adds
    * a supplementary group to the server user, that group silently rides through
    * into the agent principal and nothing fails visibly. Pin the set. */
+#ifndef PAPERCLIP_DISABLE_OOM_SCORE_ADJ
+  {
+    const char *raw = getenv("PAPERCLIP_AGENT_OOM_SCORE_ADJ");
+    const char *value = "500";
+    if (raw && *raw && strspn(raw, " \t\r\n") != strlen(raw)) {
+      value = raw;
+    }
+    int fd = open("/proc/self/oom_score_adj", O_WRONLY);
+    if (fd >= 0) {
+      (void)!write(fd, value, strlen(value));
+      close(fd);
+    }
+  }
+#endif
+
   const gid_t groups[] = {AGENTS_GID};
   if (setgroups(sizeof(groups) / sizeof(groups[0]), groups) != 0) {
     fail("setgroups failed");

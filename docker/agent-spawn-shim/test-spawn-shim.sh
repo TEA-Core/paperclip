@@ -51,6 +51,20 @@ gcc -O2 -Wall -Wextra -Werror -o "$SHIM" /tmp/spawn-agent.c || { echo "COMPILE_F
 chown root:root "$SHIM" && chmod 4755 "$SHIM"
 echo "COMPILED_CLEAN"
 
+# --- the OOM adjustment is written before the uid drop and survives exec
+as_node env -u PAPERCLIP_AGENT_OOM_SCORE_ADJ "$SHIM" sh -c 'cat /proc/self/oom_score_adj' > /tmp/oom-default
+as_node env PAPERCLIP_AGENT_OOM_SCORE_ADJ=750 "$SHIM" sh -c 'cat /proc/self/oom_score_adj' > /tmp/oom-override
+as_node env PAPERCLIP_AGENT_OOM_SCORE_ADJ=0 "$SHIM" sh -c 'cat /proc/self/oom_score_adj' > /tmp/oom-disabled
+echo "T_OOM_DEFAULT<<:"; cat /tmp/oom-default; echo ":>>"
+echo "T_OOM_OVERRIDE<<:"; cat /tmp/oom-override; echo ":>>"
+echo "T_OOM_DISABLED<<:"; cat /tmp/oom-disabled; echo ":>>"
+
+gcc -O2 -Wall -Wextra -Werror -DPAPERCLIP_DISABLE_OOM_SCORE_ADJ \
+  -o /tmp/paperclip-spawn-agent-unpatched /tmp/spawn-agent.c || { echo "UNPATCHED_COMPILE_FAILED"; exit 1; }
+chown root:root /tmp/paperclip-spawn-agent-unpatched && chmod 4755 /tmp/paperclip-spawn-agent-unpatched
+echo "T_OOM_UNPATCHED<<:"; as_node env -u PAPERCLIP_AGENT_OOM_SCORE_ADJ \
+  /tmp/paperclip-spawn-agent-unpatched sh -c 'cat /proc/self/oom_score_adj'; echo ":>>"
+
 # --- the property M1 exists for: the child lands on 1001, not the server's uid
 echo "T_UID<<:"; as_node "$SHIM" id -u 2>&1; echo ":>>"
 echo "T_GID<<:"; as_node "$SHIM" id -g 2>&1; echo ":>>"
@@ -116,6 +130,15 @@ sec() { printf '%s' "$OUT" | sed -n "/^T_$1<<:$/,/^:>>$/p" | sed '1d;$d'; }
 printf '%s' "$OUT" | grep -q COMPILED_CLEAN \
   && ok "compiles clean under -Wall -Wextra -Werror" \
   || { no "compile failed"; printf '%s\n' "$OUT" | head -30; }
+
+[ "$(sec OOM_DEFAULT)" = "500" ] && ok "default OOM adjustment survives the shim and exec" \
+                                      || no "default OOM adjustment: got '$(sec OOM_DEFAULT)'"
+[ "$(sec OOM_OVERRIDE)" = "750" ] && ok "configured OOM adjustment is honoured" \
+                                       || no "configured OOM adjustment: got '$(sec OOM_OVERRIDE)'"
+[ "$(sec OOM_DISABLED)" = "0" ] && ok "zero OOM adjustment disables the hint" \
+                                      || no "zero OOM adjustment: got '$(sec OOM_DISABLED)'"
+[ "$(sec OOM_UNPATCHED)" = "0" ] && ok "unpatched shim reproduces the production gap" \
+                                       || no "unpatched OOM adjustment: got '$(sec OOM_UNPATCHED)'"
 
 [ "$(sec UID)" = "1001" ]  && ok "child lands on uid 1001"        || no "uid: got '$(sec UID)'"
 [ "$(sec GID)" = "1001" ]  && ok "child lands on gid 1001"        || no "gid: got '$(sec GID)'"
