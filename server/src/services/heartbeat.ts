@@ -6862,6 +6862,12 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
   executionWorkspace: T;
   reusedExecutionWorkspace: T | null;
   policy: ExecutionWorkspaceReuseProvisioningPolicy;
+  /**
+   * SUP-17622: true when an existing workspace restore was requested but the
+   * workspace could not be restored, and the dispatch fell back to a fresh
+   * provision instead of failing with `inherited_workspace_reuse_unavailable`.
+   */
+  reprovisionedAfterUnavailableReuse: boolean;
 }> {
   const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
     requestedShouldReuseExisting: input.requestedShouldReuseExisting,
@@ -6874,12 +6880,12 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
       executionWorkspace,
       reusedExecutionWorkspace: null,
       policy,
+      reprovisionedAfterUnavailableReuse: false,
     };
   }
 
   let restored: T | null = null;
   let reuseFailure: string | null = null;
-  let reuseFailureReason: "inherited_workspace_reuse_failed" | "inherited_workspace_reuse_unavailable" | null = null;
   let reuseFailureCause: unknown = null;
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
@@ -6888,7 +6894,6 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
       throw error;
     }
     reuseFailureCause = error;
-    reuseFailureReason = "inherited_workspace_reuse_failed";
     reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
       reason: "inherited_workspace_reuse_failed",
       issueRef: input.issueRef,
@@ -6899,17 +6904,21 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
     });
   }
 
-  if (!restored) {
-    if (!reuseFailure) {
-      reuseFailureReason = "inherited_workspace_reuse_unavailable";
-      reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
-        reason: "inherited_workspace_reuse_unavailable",
-        issueRef: input.issueRef,
-        runId: input.runId,
-        executionWorkspaceId: input.existingExecutionWorkspaceId,
-        workspaceConfigFreshness: input.workspaceConfigFreshness,
-      });
-    }
+  // SUP-17622: the named workspace could not be restored (its row is missing or
+  // archived, or the restore produced nothing). That used to fail the whole
+  // dispatch with `inherited_workspace_reuse_unavailable`, but a workspace is
+  // a rebuildable artifact and `reuse_existing` is an optimisation, not a
+  // correctness requirement — so provision a fresh one and proceed instead.
+  // A restore that actively FAILED (threw a non-validation error) still fails
+  // loudly: that is a live error to surface, not a missing artifact.
+  if (!restored && !reuseFailure) {
+    const executionWorkspace = await input.realizeWorkspace();
+    return {
+      executionWorkspace,
+      reusedExecutionWorkspace: null,
+      policy,
+      reprovisionedAfterUnavailableReuse: true,
+    };
   }
 
   if (reuseFailure) {
@@ -6919,7 +6928,7 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
     // agent could read the actual cause (e.g. ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) from the API.
     throw new WorkspaceValidationFailure(reuseFailure, {
       workspaceValidation: {
-        reason: reuseFailureReason,
+        reason: "inherited_workspace_reuse_failed",
         executionWorkspaceId: input.existingExecutionWorkspaceId ?? null,
         cause: reuseFailureCause instanceof Error
           ? reuseFailureCause.message
@@ -6932,7 +6941,7 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
   if (!restored) {
     throw new WorkspaceValidationFailure("Expected restored execution workspace after reuse fallback handling", {
       workspaceValidation: {
-        reason: "inherited_workspace_reuse_unavailable",
+        reason: "inherited_workspace_reuse_failed",
         executionWorkspaceId: input.existingExecutionWorkspaceId ?? null,
       },
     });
@@ -6942,6 +6951,7 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
     executionWorkspace: restored,
     reusedExecutionWorkspace: restored,
     policy,
+    reprovisionedAfterUnavailableReuse: false,
   };
 }
 
