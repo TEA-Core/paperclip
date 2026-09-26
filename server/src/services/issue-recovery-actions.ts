@@ -780,12 +780,46 @@ export function issueRecoveryActionService(db: Db) {
       // reset, so it must keep winning over the cumulative depth.
       const predecessorBudgetExhausted =
         prev != null && prev.maxAttempts != null && prev.attemptCount >= prev.maxAttempts;
+      const effectiveMaxAttempts = input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
+      // SUP-15847: a re-park whose evidence has not advanced past the row that
+      // was just resolved is a stale re-park -- it is driven by an unchanged
+      // `latestRunId`, not a new failure.
+      const staleRepark = isStaleReparkEvidence(prev, input);
+      // SUP-17408: the run-agnostic mirror of the stale-repark ceiling. The
+      // detectors for these causes emit evidence with no `latestRunId` on either
+      // side of the lineage, so `staleRepark` is always false for them and the
+      // exhausted-mint below (gated on `staleRepark`) could never arm: the
+      // successor re-mints at the clamped ceiling every sweep tick forever. For
+      // a run-agnostic cause the cumulative depth is the only signal, so the
+      // ceiling must stop depending on run-id evidence. `staleRepark` remains
+      // the run-keyed *fast path*; it is no longer a precondition.
+      //
+      // A re-park whose predecessor is a *real, consumed budget* (a non-null
+      // `maxAttempts` at or past the ceiling — the terminal sentinel this
+      // ceiling itself mints, or a caller-supplied budget) is the deliberate
+      // board/budget reset, not a run-agnostic re-mint: it must mint a fresh
+      // attempt-1 active row, not another terminal. The production loop's
+      // predecessors always carry `maxAttempts: null` (buildInsertValues), so
+      // `predecessorBudgetExhausted` is false there and the ceiling still arms.
+      const runAgnosticRepark =
+        !predecessorBudgetExhausted &&
+        !staleRepark &&
+        prev != null &&
+        (prev.status === "resolved" || prev.status === "escalated") &&
+        prev.attemptCount >= effectiveMaxAttempts &&
+        readEvidenceRunId(input.evidence) == null;
       // SUP-15847: carry the fingerprint's durable cumulative depth forward,
       // not the high-water `max(attemptCount)`. A resolve -> re-park cycle
       // previously read a low per-row count (or the high-water of a reset
       // predecessor) and restarted the ladder, defeating the ceiling.
-      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : cumulativeDepth + 1;
-      const effectiveMaxAttempts = input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
+      // SUP-17408: a run-agnostic re-mint at the ceiling must NOT fire the
+      // predecessor-budget reset; that carve-out is encoded in `runAgnosticRepark`
+      // (its `!predecessorBudgetExhausted` guard), so `carriedAttemptCount` stays
+      // at cumulative depth and the gate below can fire. A real budget reset
+      // (`predecessorBudgetExhausted` true) keeps `runAgnosticRepark` false and
+      // still wins — the SUP-13698 reset to attempt 1.
+      const effectivePredecessorExhausted = predecessorBudgetExhausted && !runAgnosticRepark;
+      const carriedAttemptCount = effectivePredecessorExhausted ? 1 : cumulativeDepth + 1;
       // SUP-14151: clamp the carried count to the effective ceiling. The
       // predecessor-budget reset above only fires when the predecessor carries
       // a non-null maxAttempts; where it was null the count carried forward
@@ -797,11 +831,7 @@ export function issueRecoveryActionService(db: Db) {
       // legacy park history). Every carry-forward caller above passes none, so
       // the SUP-13698/SUP-14151 clamp still governs each of them.
       const nextAttemptCount = input.attemptCount ??
-        (predecessorBudgetExhausted ? 1 : Math.min(carriedAttemptCount, effectiveMaxAttempts));
-      // SUP-15847: a re-park whose evidence has not advanced past the row that
-      // was just resolved is a stale re-park -- it is driven by an unchanged
-      // `latestRunId`, not a new failure.
-      const staleRepark = isStaleReparkEvidence(prev, input);
+        (effectivePredecessorExhausted ? 1 : Math.min(carriedAttemptCount, effectiveMaxAttempts));
       const staleReparkEvidence = staleRepark
         ? { staleRepark: { detected: true, latestRunId: readEvidenceRunId(input.evidence) } }
         : undefined;
@@ -811,7 +841,7 @@ export function issueRecoveryActionService(db: Db) {
       // stop counting the closed lineage it just replaced. Only the reset path
       // itself stamps it — a caller that supplies an explicit `attemptCount` is
       // setting the authoritative count and is not starting a fresh lineage.
-      const resetRemint = predecessorBudgetExhausted && input.attemptCount === undefined;
+      const resetRemint = effectivePredecessorExhausted && input.attemptCount === undefined;
       const insertEvidenceExtra: Record<string, unknown> = {
         ...(staleReparkEvidence ?? {}),
         ...(resetRemint
@@ -823,15 +853,62 @@ export function issueRecoveryActionService(db: Db) {
       // active row the sweep would only re-escalate on the next pass.
       if (
         input.attemptCount === undefined &&
-        !predecessorBudgetExhausted &&
+        !effectivePredecessorExhausted &&
         carriedAttemptCount > effectiveMaxAttempts &&
-        staleRepark
+        (staleRepark || runAgnosticRepark)
       ) {
-        const staleRunId = readEvidenceRunId(prev!.evidence)!;
-        const latestIssueRunId = await getLatestIssueRunId(input.companyId, input.sourceIssueId);
-        // Only suppress when the cited run really is the issue's latest run, so
-        // a genuinely newer failure still gets a normal active action.
-        if (latestIssueRunId != null && latestIssueRunId === staleRunId) {
+        if (staleRepark) {
+          // Run-keyed fast path (SUP-15847): only suppress when the cited run
+          // really is the issue's latest run, so a genuinely newer failure still
+          // gets a normal active action.
+          const staleRunId = readEvidenceRunId(prev!.evidence)!;
+          const latestIssueRunId = await getLatestIssueRunId(input.companyId, input.sourceIssueId);
+          // Only suppress when the cited run really is the issue's latest run.
+          if (latestIssueRunId != null && latestIssueRunId === staleRunId) {
+            const [escalated] = await db
+              .insert(issueRecoveryActions)
+              .values({
+                ...buildInsertValues(input, "board", now, effectiveMaxAttempts),
+                status: "escalated" as const,
+                ownerType: "board" as const,
+                ownerAgentId: null,
+                ownerUserId: null,
+                previousOwnerAgentId: prev!.ownerAgentId ?? input.previousOwnerAgentId ?? null,
+                returnOwnerAgentId: prev!.ownerAgentId ?? input.returnOwnerAgentId ?? null,
+                evidence: {
+                  ...(input.evidence ?? {}),
+                  recoveryBudget: {
+                    state: "exhausted",
+                    attemptsUsed: effectiveMaxAttempts,
+                    maxAttempts: effectiveMaxAttempts,
+                    exhaustedAt: now.toISOString(),
+                    cause: input.cause,
+                    fingerprint: input.fingerprint,
+                    suppressedStaleRepark: true,
+                  },
+                },
+                nextAction:
+                  `Automatic recovery exhausted after ${effectiveMaxAttempts}/${effectiveMaxAttempts} attempts on an unchanged run ` +
+                  `(${staleRunId}). Dispatch a new run or choose a replacement configuration; the same stale evidence will not re-park.`,
+                wakePolicy: null,
+                monitorPolicy: null,
+                attemptCount: effectiveMaxAttempts,
+                maxAttempts: effectiveMaxAttempts,
+                // DB-level terminal sentinel (`escalated` + `outcome: "exhausted"`),
+                // matching the sweep. Ordinary callers cannot clear it without a
+                // board resolution, so the stale loop cannot restart.
+                outcome: "exhausted",
+                resolutionNote: null,
+                resolvedAt: null,
+              })
+              .returning();
+            return toReadModel(escalated!);
+          }
+        } else {
+          // Run-agnostic ceiling (SUP-17408): there is no run id to cross-check
+          // against the issue's latest run, so the cumulative depth alone is the
+          // signal. Mint the same terminal board-facing shape, just without the
+          // stale-run citation.
           const [escalated] = await db
             .insert(issueRecoveryActions)
             .values({
@@ -851,19 +928,20 @@ export function issueRecoveryActionService(db: Db) {
                   exhaustedAt: now.toISOString(),
                   cause: input.cause,
                   fingerprint: input.fingerprint,
-                  suppressedStaleRepark: true,
+                  runAgnosticCeiling: true,
                 },
               },
               nextAction:
-                `Automatic recovery exhausted after ${effectiveMaxAttempts}/${effectiveMaxAttempts} attempts on an unchanged run ` +
-                `(${staleRunId}). Dispatch a new run or choose a replacement configuration; the same stale evidence will not re-park.`,
+                `Automatic recovery exhausted after ${effectiveMaxAttempts}/${effectiveMaxAttempts} attempts. ` +
+                "This cause reports no run identity, so the ceiling is enforced on cumulative depth. " +
+                "Dispatch a new run or choose a replacement configuration; the same evidence will not re-park.",
               wakePolicy: null,
               monitorPolicy: null,
               attemptCount: effectiveMaxAttempts,
               maxAttempts: effectiveMaxAttempts,
               // DB-level terminal sentinel (`escalated` + `outcome: "exhausted"`),
               // matching the sweep. Ordinary callers cannot clear it without a
-              // board resolution, so the stale loop cannot restart.
+              // board resolution, so the loop cannot restart.
               outcome: "exhausted",
               resolutionNote: null,
               resolvedAt: null,

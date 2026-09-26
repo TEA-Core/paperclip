@@ -4878,7 +4878,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(issueRow?.status).toBe("todo");
   });
 
-  it("preserves attemptCount across resolve-then-re-mint cycles so the sweep ceiling is reachable", async () => {
+  it("preserves attemptCount across resolve-then-re-mint cycles so the run-agnostic ceiling arms at upsert", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
     const fingerprint = "stranded:fingerprint";
@@ -4913,39 +4913,43 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(resolved).toBeNull();
     }
 
-    const active = await svc.upsertSourceScoped(baseInput);
-    expect(active.status).toBe("active");
-    // SUP-14151: the carried count (prev.attemptCount 5 + 1) is clamped to the
-    // default ceiling, so the 6th re-mint lands exactly on it instead of past it.
-    expect(active.attemptCount).toBe(5);
+    // SUP-17408: the 6th re-mint mints terminal at the ceiling instead of
+    // landing clamped-and-active for the stale-wake sweep to catch later — for
+    // a run-agnostic cause the cumulative depth alone arms the ceiling at
+    // upsert time.
+    const terminal = await svc.upsertSourceScoped(baseInput);
+    expect(terminal.status).toBe("escalated");
+    expect(terminal.outcome).toBe("exhausted");
+    expect(terminal.attemptCount).toBe(5);
+    expect(terminal.maxAttempts).toBe(5);
 
     const all = await svc.listAllForIssue(companyId, sourceIssueId);
     expect(all).toHaveLength(6);
-    expect(all[0].id).toBe(active.id);
-    expect(all[0].status).toBe("active");
+    expect(all[0].id).toBe(terminal.id);
+    expect(all[0].status).toBe("escalated");
     expect(all[0].attemptCount).toBe(5);
     expect(all[5].attemptCount).toBe(1);
     expect(all[5].status).toBe("resolved");
 
-    // Backdate so the stale-wake sweep selects the action, then prove the sweep
-    // ceiling turns the 6th re-mint into an escalated/exhausted action.
+    // The terminal sentinel is stable under the sweep: backdating the row must
+    // not re-fire it, and the sweep has nothing left to escalate.
     const staleAt = new Date(Date.now() - 10 * 60_000);
     await db
       .update(issueRecoveryActions)
       .set({ lastAttemptAt: staleAt })
-      .where(eq(issueRecoveryActions.id, active.id));
+      .where(eq(issueRecoveryActions.id, terminal.id));
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
     const sweepResult = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 0 });
-    expect(sweepResult.maxAttemptsReached).toBe(1);
+    expect(sweepResult.maxAttemptsReached).toBe(0);
 
-    const [escalated] = await db
+    const [afterSweep] = await db
       .select()
       .from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.id, active.id));
-    expect(escalated?.status).toBe("escalated");
-    expect(escalated?.outcome).toBe("exhausted");
-    expect(escalated?.attemptCount).toBe(5);
-    expect(escalated?.maxAttempts).toBe(5);
+      .where(eq(issueRecoveryActions.id, terminal.id));
+    expect(afterSweep?.status).toBe("escalated");
+    expect(afterSweep?.outcome).toBe("exhausted");
+    expect(afterSweep?.attemptCount).toBe(5);
+    expect(afterSweep?.maxAttempts).toBe(5);
   });
 
   it("does not reset an exhausted escalated action to active on re-mint", async () => {
@@ -4990,7 +4994,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(active).toMatchObject({ id: action.id, status: "escalated", outcome: "exhausted" });
   });
 
-  it("clamps a re-minted successor to the default ceiling when the predecessor's maxAttempts is null", async () => {
+  it("mints a re-minted successor terminal at the default ceiling when the predecessor's maxAttempts is null", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
     const fingerprint = "stranded:null-ceiling:fingerprint";
@@ -5024,16 +5028,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       resolutionNote: "Cycle resolved.",
     });
 
-    // SUP-14151: pre-fix this minted attemptCount 6 (prev.attemptCount + 1) even
-    // though nothing stamps a ceiling — the successor lands past the budget the
-    // sweep will hold it to the moment it acquires one.
+    // SUP-17408: with the predecessor pegged at the default ceiling on a
+    // run-agnostic cause, the successor mints terminal at that ceiling instead
+    // of landing clamped-and-active for the sweep to catch.
     const successor = await svc.upsertSourceScoped(baseInput);
-    expect(successor.status).toBe("active");
+    expect(successor.status).toBe("escalated");
+    expect(successor.outcome).toBe("exhausted");
     expect(successor.attemptCount).toBe(5);
-    expect(successor.attemptCount).toBeLessThanOrEqual(successor.maxAttempts ?? 5);
+    expect(successor.maxAttempts).toBe(5);
   });
 
-  it("clamps a re-minted successor to an explicit successor ceiling", async () => {
+  it("mints a re-minted successor terminal at an explicit successor ceiling", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
     const fingerprint = "stranded:explicit-ceiling:fingerprint";
@@ -5064,10 +5069,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       resolutionNote: "Cycle resolved.",
     });
 
+    // SUP-17408: the run-agnostic successor past the explicit ceiling mints
+    // terminal at that ceiling instead of landing clamped-and-active.
     const successor = await svc.upsertSourceScoped({ ...baseInput, maxAttempts: 3 });
-    expect(successor.status).toBe("active");
+    expect(successor.status).toBe("escalated");
+    expect(successor.outcome).toBe("exhausted");
     expect(successor.attemptCount).toBe(3);
-    expect(successor.attemptCount).toBeLessThanOrEqual(successor.maxAttempts ?? 5);
+    expect(successor.maxAttempts).toBe(3);
   });
 
   it("never bumps an active action past its ceiling on a same-issue re-upsert", async () => {
