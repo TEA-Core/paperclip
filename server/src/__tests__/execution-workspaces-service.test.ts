@@ -29,7 +29,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
-  detachIssuesFromClosedSharedExecutionWorkspace,
+  detachIssuesFromClosedExecutionWorkspace,
   decideReprovisionProceed,
   EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
@@ -5369,7 +5369,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 });
 
-describeEmbeddedPostgres("detachIssuesFromClosedSharedExecutionWorkspace", () => {
+describeEmbeddedPostgres("detachIssuesFromClosedExecutionWorkspace", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -5477,7 +5477,7 @@ describeEmbeddedPostgres("detachIssuesFromClosedSharedExecutionWorkspace", () =>
       executionWorkspacePreference: "reuse_existing",
     });
 
-    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+    await detachIssuesFromClosedExecutionWorkspace(db, {
       companyId: seeded.companyId,
       executionWorkspaceId: seeded.sharedWorkspaceId,
     });
@@ -5496,7 +5496,7 @@ describeEmbeddedPostgres("detachIssuesFromClosedSharedExecutionWorkspace", () =>
       executionWorkspacePreference: "isolated_workspace",
     });
 
-    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+    await detachIssuesFromClosedExecutionWorkspace(db, {
       companyId: seeded.companyId,
       executionWorkspaceId: seeded.sharedWorkspaceId,
     });
@@ -5515,13 +5515,224 @@ describeEmbeddedPostgres("detachIssuesFromClosedSharedExecutionWorkspace", () =>
       executionWorkspacePreference: "reuse_existing",
     });
 
-    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+    await detachIssuesFromClosedExecutionWorkspace(db, {
       companyId: seeded.companyId,
       executionWorkspaceId: seeded.sharedWorkspaceId,
     });
 
     expect(await readIssue(issueId)).toEqual({
       executionWorkspaceId: seeded.otherWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+  });
+});
+
+// SUP-17621: a PATCH-driven re-provision closes the card's pinned vehicle, but
+// the card is not necessarily its only user — a child can inherit the parent's
+// workspace under `reuse_existing`, so one row can be pointed at by a whole
+// subtree. Closing must detach every card bound to the vehicle, not only the one
+// whose PATCH triggered the close, or the siblings keep a pointer at an archived
+// row paired with an unrealizable `reuse_existing` — the half-state dispatch
+// refuses with `inherited_workspace_reuse_unavailable`.
+describeEmbeddedPostgres("closePinnedWorkspaceForReprovision detaches bound issues (SUP-17621)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-reprovision-detach-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seed(input: { workspaceStatus?: string } = {}) {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const workspaceId = randomUUID();
+    const otherWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Reprovision project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+    });
+    for (const [id, name, status] of [
+      [workspaceId, "Card vehicle", input.workspaceStatus ?? "active"],
+      [otherWorkspaceId, "Unrelated vehicle", "active"],
+    ] as const) {
+      await db.insert(executionWorkspaces).values({
+        id,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name,
+        status,
+        providerType: "git_worktree",
+      });
+    }
+
+    return { companyId, projectId, projectWorkspaceId, workspaceId, otherWorkspaceId };
+  }
+
+  async function seedIssue(
+    seeded: Awaited<ReturnType<typeof seed>>,
+    input: {
+      issueNumber: number;
+      executionWorkspaceId: string;
+      executionWorkspacePreference: string | null;
+    },
+  ) {
+    const id = randomUUID();
+    await db.insert(issues).values({
+      id,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      projectWorkspaceId: seeded.projectWorkspaceId,
+      title: `Issue ${input.issueNumber}`,
+      status: "todo",
+      priority: "medium",
+      issueNumber: input.issueNumber,
+      identifier: `T-${input.issueNumber}`,
+      executionWorkspaceId: input.executionWorkspaceId,
+      executionWorkspacePreference: input.executionWorkspacePreference,
+    });
+    return id;
+  }
+
+  async function readIssue(id: string) {
+    const [row] = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(eq(issues.id, id));
+    return row;
+  }
+
+  async function readWorkspace(id: string) {
+    const [row] = await db
+      .select({
+        status: executionWorkspaces.status,
+        cleanupReason: executionWorkspaces.cleanupReason,
+        closedAt: executionWorkspaces.closedAt,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, id));
+    return row;
+  }
+
+  it("archives the vehicle and detaches every issue bound to it, not only the triggering card", async () => {
+    const seeded = await seed();
+    const triggeringIssueId = await seedIssue(seeded, {
+      issueNumber: 1,
+      executionWorkspaceId: seeded.workspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+    const inheritedSiblingId = await seedIssue(seeded, {
+      issueNumber: 2,
+      executionWorkspaceId: seeded.workspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+    const unrelatedIssueId = await seedIssue(seeded, {
+      issueNumber: 3,
+      executionWorkspaceId: seeded.otherWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    const svc = executionWorkspaceService(db);
+    const result = await svc.closePinnedWorkspaceForReprovision(seeded.workspaceId, {
+      companyId: seeded.companyId,
+    });
+
+    expect(result.outcome).toBe("archived");
+    expect(await readWorkspace(seeded.workspaceId)).toMatchObject({
+      status: "archived",
+      cleanupReason: "re-provisioned_by_patch",
+    });
+    // Before the fix only `triggeringIssueId` was detached by the route; the
+    // inherited sibling kept `{ id: <archived>, preference: "reuse_existing" }`.
+    expect(await readIssue(triggeringIssueId)).toEqual({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    });
+    expect(await readIssue(inheritedSiblingId)).toEqual({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    });
+    expect(await readIssue(unrelatedIssueId)).toEqual({
+      executionWorkspaceId: seeded.otherWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+  });
+
+  it("detaches bound issues when the vehicle was already terminal", async () => {
+    const seeded = await seed({ workspaceStatus: "archived" });
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 1,
+      executionWorkspaceId: seeded.workspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    const svc = executionWorkspaceService(db);
+    const result = await svc.closePinnedWorkspaceForReprovision(seeded.workspaceId, {
+      companyId: seeded.companyId,
+    });
+
+    expect(result.outcome).toBe("already_closed");
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    });
+  });
+
+  it("folds the detach into the caller's transaction so it rolls back with the archive", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 1,
+      executionWorkspaceId: seeded.workspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    const svc = executionWorkspaceService(db);
+    await expect(
+      db.transaction(async (tx) => {
+        await svc.closePinnedWorkspaceForReprovision(seeded.workspaceId, { companyId: seeded.companyId }, tx);
+        throw new Error("abort");
+      }),
+    ).rejects.toThrow("abort");
+
+    // Neither the archive nor the detach may survive the rolled-back transaction.
+    expect(await readWorkspace(seeded.workspaceId)).toMatchObject({ status: "active", closedAt: null });
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: seeded.workspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
   });
