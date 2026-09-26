@@ -84,18 +84,26 @@ async function invokeHeartbeat(
   // Each iteration then costs at least three HTTP round trips (the issue, the
   // agent's recent runs, then one fetch per candidate run) plus a 50ms sleep,
   // and under CI load the server frequently queues a stale-run handoff before
-  // the issue binding appears. The original 3s budget was measured expiring on
-  // ~0.7% of CI e2e shard executions (6 of 815, 2026-09-15..22, across
-  // unrelated branches) -- one failing instance needed 3.8s where a passing one
-  // took 2.1s -- so the budget is sized well clear of that tail. At most three
-  // invokes run per test, so even three exhausted budgets stay inside the 60s
-  // per-test timeout and surface the diagnostic below instead of a timeout.
-  //
-  // This does not slow the suite's negative-authorization paths: those invoke
-  // a non-participant, so the assignee check below returns on the very first
-  // iteration (measured at 18ms) and never reaches the deadline.
-  const startedAt = Date.now();
-  const deadline = startedAt + 12_000;
+   // the issue binding appears. The original 3s budget was measured expiring on
+   // ~0.7% of CI e2e shard executions (6 of 815, 2026-09-15..22, across
+   // unrelated branches) -- one failing instance needed 3.8s where a passing one
+   // took 2.1s -- so the budget was sized well clear of that tail. It was later
+   // widened to 12s, but the merge-queue preview tail (heaviest-load runner pool;
+   // pr-827 shard 2/3, 2026-09-26) has since exceeded it: `changes requested`
+   // (the 3-invoke test below) failed at 12.5s with a single early invoke
+   // outliving 12s, which aborts the whole test before the remaining invokes run.
+   // Widening to 18s clears that observed tail. This is still the largest value
+   // that keeps three exhausted budgets inside the 60s per-test timeout (3 x 18s
+   // = 54s), so it is the ceiling the cap allows. If the merge-queue tail keeps
+   // growing past 18s, the follow-up is to raise this suite's per-test cap (as
+   // legacy-failure-continuation did at 240s) so a larger budget fits, not to
+   // push this number past the cap.
+   //
+   // This does not slow the suite's negative-authorization paths: those invoke
+   // a non-participant, so the assignee check below returns on the very first
+   // iteration (measured at 18ms) and never reaches the deadline.
+   const startedAt = Date.now();
+   const deadline = startedAt + 18_000;
   const inspectedCandidates = new Set<string>();
   let lastRunLock: IssueRunLockState | null = null;
   do {
