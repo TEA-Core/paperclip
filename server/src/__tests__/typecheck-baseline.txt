@@ -1421,7 +1421,7 @@ server/src/__tests__/status-cards.test.ts(309,9): TS2741
 server/src/__tests__/status-cards.test.ts(316,18): TS2352
 server/src/__tests__/status-cards.test.ts(400,7): TS2322
 server/src/__tests__/status-cards.test.ts(590,9): TS2741
-server/src/__tests__/summary-slots.test.ts(1461,11): TS2353
+server/src/__tests__/summary-slots.test.ts(1530,11): TS2353
 server/src/__tests__/summary-slots.test.ts(702,29): TS18047
 server/src/__tests__/summary-slots.test.ts(706,50): TS2339
 server/src/__tests__/summary-slots.test.ts(717,28): TS2339
