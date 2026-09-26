@@ -1140,8 +1140,7 @@ describeEmbeddedPostgres("summary slot service", () => {
         .then((rows) => rows[0]!);
       expect(taskAfter.status).toBe("done");
       const slotAfter = await svc.getSlot(projectSelector(companyId, projectId));
-      expect(slotAfter.slot.status).toBe("idle");
-      expect(slotAfter.slot.generatingIssueId).toBeNull();
+      expect(slotAfter.slot).toMatchObject({ status: "idle", generatingIssueId: null });
     });
 
     it("completes the generation task at write time; a changes_requested bounce still lands on the Summarizer, but the released slot is no longer armed to it (SUP-17609)", async () => {
