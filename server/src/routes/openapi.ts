@@ -3895,6 +3895,35 @@ registry.registerPath({
       rearmExecutionPolicy: z.boolean().optional().describe(
         "Re-arm the issue's execution-policy stage pointer from the replacement `executionPolicy` sent in the same PATCH body. Requires a co-sent `executionPolicy` (422 `execution_policy_rearm_requires_policy_write` otherwise); a co-sent `status` other than `in_review` is refused (422 `execution_policy_rearm_conflicts_with_status`). Only the assignee agent or a board user may re-arm (403 otherwise).",
       ),
+      force: z.boolean().optional().describe(
+        "Override for the 409 `pending_interaction_assignment_pin` refusal: send `force:true` to strip the user-assigned board assignee onto an agent while a pending `wake_assignee` or `wake_assignee_on_accept` interaction is live (a deliberate handoff). Answer or cancel the pending interaction instead. No effect on any other check.",
+      ),
+      doneTransitionOverride: z
+        .object({
+          disposition: z.string().trim().min(1),
+          reason: z.string().trim().min(1).max(2000).optional(),
+        })
+        .optional()
+        .nullable()
+        .describe(
+          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, or `merged-elsewhere` (any other value is refused, 409 `done_transition_missing_delivery`). A no-deliverable-head override does not clear a review-ladder refusal.",
+        ),
+      deliveryIdentity: z
+        .object({
+          repo: z
+            .object({
+              owner: z.string().trim().min(1),
+              repo: z.string().trim().min(1),
+            })
+            .strict(),
+          branch: z.string().trim().min(1),
+          headSha: z.string().trim().min(1),
+        })
+        .strict()
+        .optional()
+        .describe(
+          "Record this card's delivery identity (ADR-091 D1) on a transition into `in_review`. Writable only by the agent run holding the issue's lease (422 `delivery_identity_write_rejected` otherwise). `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
+        ),
     })),
   },
   responses: {
