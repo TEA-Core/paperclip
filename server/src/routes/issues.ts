@@ -322,7 +322,10 @@ import {
   buildDependencyWakeWithheldActivity,
   readAttributedLandingDischarge,
 } from "../services/blocker-closure.js";
-import { isBlockedWithoutBlockers } from "../services/recovery/service.js";
+import {
+  clearRecoveryReplayHold,
+  isBlockedWithoutBlockers,
+} from "../services/recovery/service.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS } from "../services/execution-workspaces.js";
 import { decisionTrainingService } from "../services/decision-training.js";
@@ -3547,24 +3550,10 @@ function buildExecutionStageWakeup(input: {
  * = "blocked"`) is a durable hold that `getExecutionBlocker` keeps reading even
  * after the action is resolved, so a restored-stage wake would be dropped as
  * "Automatic recovery stopped". A board restore that arms a fresh execution stage
- * is new evidence, so clear the hold when we land one.
+ * is new evidence, so clear the hold when we land one. The transform lives in
+ * `services/recovery/service.ts` so the periodic sweep (SUP-16698) reuses the
+ * exact same code path.
  */
-function clearRecoveryReplayHold(
-  evidence: Record<string, unknown>,
-): Record<string, unknown> {
-  const automaticRecovery = evidence.automaticRecovery;
-  if (
-    !automaticRecovery ||
-    typeof automaticRecovery !== "object" ||
-    Array.isArray(automaticRecovery)
-  ) {
-    return evidence;
-  }
-  const automatic = automaticRecovery as Record<string, unknown>;
-  if (automatic.replay !== "blocked") return evidence;
-  return { ...evidence, automaticRecovery: { ...automatic, replay: "restored" } };
-}
-
 class AutoApprovalIssueMissingError extends Error {
   constructor() {
     super("Issue not found during auto-approval transaction");
