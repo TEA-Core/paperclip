@@ -13,6 +13,21 @@ async function json(response: APIResponse) {
 
 for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "queued_interrupt", "automatic_message"] as const) {
   test(`legacy startup hold: ${action} reaches a new agent response`, async ({ page, request }) => {
+    // SUP-17651 board decision 302d393f / exec-CTO ruling 75dd7e23 + correction b4441ea3:
+    // the two affordance-dependent variants are quarantined, not deleted. The retry
+    // button waited for below is a pre-projection control whose render condition is a
+    // three-predicate server-state wait (TaskChatThread.tsx:2823-2831), and every
+    // predicate is one-way-falsified by the state this spec deliberately seeds: the
+    // reconciliation-causing recovery action, the recovery_needed projection, and any
+    // automation retry off `blocked` each withdraw the affordance by design
+    // (IssueRecoveryActionCard.tsx:1080/1129). Longer caps cannot pass -- measured
+    // 5/5 local green at ~13s (click wins the race) vs 2/2 CI red at exactly the
+    // 240s cap (projection wins). Re-enable via SUP-17740 (projection-deterministic
+    // seeding redesign). The other four variants stay live.
+    test.fixme(
+      action === "thread_retry" || action === "inbox_retry",
+      "SUP-17651: retry affordance is withdrawn by the execution-reconciliation projection; re-enable via SUP-17740.",
+    );
     // SUP-17651: envelope for loaded-runner setup plus the signal-driven waits below:
     // the retry-button appearance gate (240s) and the post-click completion signal
     // (90s pipeline poll + two 45s render checks). The internal waits terminate early
@@ -118,9 +133,7 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         // that fetch lagged >200s, so a blind .click() ate the whole cap with "element(s)
         // not found" -- the same class the queued_interrupt Interrupt-button hardening
         // (slice 2d) widened from 5s -> 45s. Wait on the button explicitly, bounded, so it
-        // can never starve the post-click completion waits. The recovery state is seeded
-        // synchronously, so this is a pure frontend fetch/render latency gate, not a
-        // server-state wait.
+        // can never starve the post-click completion waits.
         const retryButton = page.getByRole("button", { name: action === "thread_retry" ? "Try again" : "Retry", exact: true });
         await expect(retryButton).toBeVisible({ timeout: 240_000 });
         await retryButton.click();
