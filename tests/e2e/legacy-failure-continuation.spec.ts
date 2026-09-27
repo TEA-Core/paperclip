@@ -138,11 +138,39 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       // window turned that lag into a hard "reply never appeared" timeout at the test cap.
       // The poll bounds the pipeline wait and terminates early the moment the server state
       // settles; the UI assertions below then verify rendering against settled state.
-      await expect.poll(async () => {
-        const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, company.id), eq(heartbeatRuns.agentId, agent.id)));
-        const recovered = runs.filter(run => run.id !== sourceRunId);
-        return recovered.length === 1 && recovered[0].status === "succeeded";
-      }, { timeout: 90_000, intervals: [500] });
+      // SUP-17651 (exec-CTO 2026-09-26T22:48Z): a poll timeout must name the
+      // stall class -- no recovered run at all (never dispatched) vs a run in a
+      // non-terminal status (spawned and hung) vs a finalized non-succeeded
+      // run -- instead of failing an opaque boolean predicate.
+      //
+      // Root cause of the CI-only failures: a bare `await expect.poll(fn, opts)`
+      // (no chained matcher) is a NO-OP in Playwright 1.62.x -- it returns the
+      // matcher container object, which is not thenable, so the callback is
+      // never invoked and the await resolves instantly. Verified against the
+      // stock @playwright/test@1.62.1 npm build. Chaining `.toBe(true)` is
+      // what actually drives the polling loop (invokePollMatcher), matches
+      // every other expect.poll call in this repo, and makes the timeout
+      // below real: it now terminates early when the predicate first holds,
+      // and throws after 90s with the last observed server state attached.
+      let recoveredAtTimeout = "";
+      try {
+        await expect.poll(async () => {
+          const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, company.id), eq(heartbeatRuns.agentId, agent.id)));
+          const recovered = runs.filter(run => run.id !== sourceRunId);
+          recoveredAtTimeout = recovered.length === 0
+            ? "no recovered run was ever created (the wakeup was never dispatched)"
+            : recovered.map(run => JSON.stringify({
+              id: run.id, status: run.status, errorCode: run.errorCode, error: run.error,
+              processPid: run.processPid, startedAt: run.startedAt, finishedAt: run.finishedAt,
+              resultJson: JSON.stringify(run.resultJson ?? null).slice(0, 1000),
+            })).join(" | ");
+          return recovered.length === 1 && recovered[0].status === "succeeded";
+        }, { timeout: 90_000, intervals: [500] }).toBe(true);
+      } catch (error) {
+        const timedOut = error as Error;
+        timedOut.message = `recovered run never reached "succeeded" within 90s -- last observed: ${recoveredAtTimeout}`;
+        throw timedOut;
+      }
       await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
       await expect(page.getByRole("status", { name: "Task recovery" })).toHaveCount(0);
       const completed = await json(await request.get(`/api/issues/${issue.id}`));
