@@ -645,7 +645,13 @@ export async function provisionIssueExecutionWorkspace(
     agentId: agent.id,
     environmentDriver: input.selectedEnvironmentForConfig?.driver ?? null,
   });
-  const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
+  const {
+    executionWorkspace,
+    reusedExecutionWorkspace,
+    policy: resolvedWorkspaceReusePolicy,
+    reprovisionedAfterUnavailableReuse,
+    reprovisionAfterUnavailableReuseCause,
+  } =
     await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
       requestedShouldReuseExisting,
       existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
@@ -730,6 +736,20 @@ export async function provisionIssueExecutionWorkspace(
     }),
     });
 
+  if (reprovisionedAfterUnavailableReuse) {
+    logger.warn(
+      {
+        runId: run.id,
+        issueId,
+        issueIdentifier: issueRef?.identifier ?? null,
+        unavailableExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+        restoreFailureCause: reprovisionAfterUnavailableReuseCause,
+        executionWorkspaceCwd: executionWorkspace.cwd,
+      },
+      "inherited execution workspace could not be restored; re-provisioned a fresh workspace instead of failing the dispatch",
+    );
+  }
+
   const resolvedProjectId =
     executionWorkspace.projectId ?? issueRef?.projectId ?? input.executionProjectId ?? null;
   const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
@@ -742,7 +762,12 @@ export async function provisionIssueExecutionWorkspace(
     createdByRuntime: executionWorkspace.created,
     strategyType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "project_primary",
     configSnapshot: input.configSnapshot,
-    shouldReuseExisting: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace,
+    // SUP-17622: after an unavailable-reuse fallback the persisted workspace is a
+    // fresh provision, so it must carry the latest config snapshot like any
+    // fresh provision rather than keeping the reuse-merge semantics.
+    shouldReuseExisting:
+      resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
+      !reprovisionedAfterUnavailableReuse,
     shouldRefreshConfigSnapshot: resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,
     workspaceConfigMetadata: resolvedWorkspaceReusePolicy.shouldPersistLatestWorkspaceConfigMetadata
       ? latestWorkspaceConfigMetadata
@@ -752,6 +777,7 @@ export async function provisionIssueExecutionWorkspace(
   });
   let persistedWorktreeInstanceRoot =
     resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
+    && !reprovisionedAfterUnavailableReuse
     && typeof reusableExistingExecutionWorkspace?.metadata?.[WORKTREE_INSTANCE_ROOT_METADATA_KEY] === "string"
       ? reusableExistingExecutionWorkspace.metadata[WORKTREE_INSTANCE_ROOT_METADATA_KEY]
       : null;
@@ -780,6 +806,18 @@ export async function provisionIssueExecutionWorkspace(
     ...baseExecutionWorkspaceMetadata,
     ...(persistedWorktreeInstanceRoot
       ? { [WORKTREE_INSTANCE_ROOT_METADATA_KEY]: persistedWorktreeInstanceRoot }
+      : {}),
+    // SUP-17622: keep the re-provision attributable on the row itself — this
+    // workspace was created because the reuse_existing binding named a
+    // workspace that could not be restored, not because reuse succeeded.
+    ...(reprovisionedAfterUnavailableReuse
+      ? {
+          inheritedReuseUnavailable: {
+            requestedWorkspaceId:
+              workspaceReuseRequest.requestedExecutionWorkspaceId ?? null,
+            at: new Date().toISOString(),
+          },
+        }
       : {}),
   };
   const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;

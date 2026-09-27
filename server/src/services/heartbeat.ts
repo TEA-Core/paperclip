@@ -6818,36 +6818,6 @@ export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
   };
 }
 
-function formatInheritedExecutionWorkspaceReuseFailure(input: {
-  reason:
-    | "inherited_workspace_reuse_failed"
-    | "inherited_workspace_reuse_unavailable";
-  issueRef: WorkspaceReuseIssueRef;
-  runId: string;
-  executionWorkspaceId: string | null | undefined;
-  workspaceConfigFreshness: ExecutionWorkspaceConfigFreshnessDecision;
-  cause?: unknown;
-}) {
-  const issueLabel =
-    input.issueRef?.identifier ?? input.issueRef?.id ?? input.runId;
-  const workspaceLabel = input.executionWorkspaceId ?? "unknown workspace";
-  const causeMessage =
-    input.cause instanceof Error
-      ? input.cause.message
-      : input.cause != null
-        ? String(input.cause)
-        : null;
-  const remediation =
-    input.reason === "inherited_workspace_reuse_failed"
-      ? "Inspect the referenced execution workspace restore/provision logs, repair or unarchive the workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying."
-      : "Repair or unarchive the referenced execution workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying.";
-  const message = causeMessage
-    ? `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored because ${causeMessage}.`
-    : `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored.`;
-
-  return `${message} ${remediation}`;
-}
-
 export async function provisionExecutionWorkspaceForFreshnessDecision<
   T extends { warnings?: string[] },
 >(input: {
@@ -6862,6 +6832,19 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
   executionWorkspace: T;
   reusedExecutionWorkspace: T | null;
   policy: ExecutionWorkspaceReuseProvisioningPolicy;
+  /**
+   * SUP-17622: true when an existing workspace restore was requested but the
+   * workspace could not be restored, and the dispatch fell back to a fresh
+   * provision instead of failing with `inherited_workspace_reuse_unavailable`.
+   */
+  reprovisionedAfterUnavailableReuse: boolean;
+  /**
+   * SUP-17622: human-readable cause of why the requested inherited workspace
+   * could not be restored, captured so the re-provision stays attributable and
+   * does not look like the reuse succeeded. Null when no fallback occurred or
+   * the restore simply produced nothing.
+   */
+  reprovisionAfterUnavailableReuseCause: string | null;
 }> {
   const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
     requestedShouldReuseExisting: input.requestedShouldReuseExisting,
@@ -6874,74 +6857,62 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
       executionWorkspace,
       reusedExecutionWorkspace: null,
       policy,
+      reprovisionedAfterUnavailableReuse: false,
+      reprovisionAfterUnavailableReuseCause: null,
     };
   }
 
   let restored: T | null = null;
-  let reuseFailure: string | null = null;
-  let reuseFailureReason: "inherited_workspace_reuse_failed" | "inherited_workspace_reuse_unavailable" | null = null;
-  let reuseFailureCause: unknown = null;
+  let reuseFallbackCause: unknown = null;
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
+    // A genuine workspace validation refusal (branch contention, worktree
+    // incoherence, or a reuse misconfiguration) is raised by the restore as a
+    // WorkspaceValidationFailure. That is not an unrestorable artifact:
+    // re-provisioning over another workspace's live branch, or masking a real
+    // refusal, would be wrong. Propagate it so the dispatch fails closed with
+    // the concrete cause and its recovery path is preserved.
     if (isWorkspaceValidationFailure(error)) {
       throw error;
     }
-    reuseFailureCause = error;
-    reuseFailureReason = "inherited_workspace_reuse_failed";
-    reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
-      reason: "inherited_workspace_reuse_failed",
-      issueRef: input.issueRef,
-      runId: input.runId,
-      executionWorkspaceId: input.existingExecutionWorkspaceId,
-      workspaceConfigFreshness: input.workspaceConfigFreshness,
-      cause: error,
-    });
+    // SUP-17622: a requested inherited workspace that cannot be restored for a
+    // plain reason (row gone, worktree unrecoverable, operator-owned branch
+    // deleted, base checkout missing) is an unrestorable artifact, not a
+    // misconfiguration. Record the cause so the fallback stays attributable,
+    // then fall back to a fresh provision. `reuse_existing` is an optimisation,
+    // not a correctness requirement; a fresh provision preserves intent. The 422
+    // for a reuse with no named or inheritable workspace is raised upstream
+    // (execution-workspace-policy), not here, so this path only ever sees a
+    // genuinely-unrestorable named one.
+    reuseFallbackCause = error;
   }
 
-  if (!restored) {
-    if (!reuseFailure) {
-      reuseFailureReason = "inherited_workspace_reuse_unavailable";
-      reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
-        reason: "inherited_workspace_reuse_unavailable",
-        issueRef: input.issueRef,
-        runId: input.runId,
-        executionWorkspaceId: input.existingExecutionWorkspaceId,
-        workspaceConfigFreshness: input.workspaceConfigFreshness,
-      });
-    }
+  if (restored) {
+    return {
+      executionWorkspace: restored,
+      reusedExecutionWorkspace: restored,
+      policy,
+      reprovisionedAfterUnavailableReuse: false,
+      reprovisionAfterUnavailableReuseCause: null,
+    };
   }
 
-  if (reuseFailure) {
-    // SUP-13090: the concrete reuse failure must land in `resultJson`, not only in the
-    // message string. The prior empty `{}` payload meant `resultJson.workspaceValidation`
-    // was absent, so recovery assembled `evidence` with the "withheld" placeholder and no
-    // agent could read the actual cause (e.g. ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) from the API.
-    throw new WorkspaceValidationFailure(reuseFailure, {
-      workspaceValidation: {
-        reason: reuseFailureReason,
-        executionWorkspaceId: input.existingExecutionWorkspaceId ?? null,
-        cause: reuseFailureCause instanceof Error
-          ? reuseFailureCause.message
-          : reuseFailureCause != null
-            ? String(reuseFailureCause)
-            : null,
-      },
-    });
-  }
-  if (!restored) {
-    throw new WorkspaceValidationFailure("Expected restored execution workspace after reuse fallback handling", {
-      workspaceValidation: {
-        reason: "inherited_workspace_reuse_unavailable",
-        executionWorkspaceId: input.existingExecutionWorkspaceId ?? null,
-      },
-    });
-  }
-
+  // The named workspace could not be restored (restore returned nothing or
+  // threw). Provision a fresh one instead of failing the dispatch, and surface
+  // the cause so the re-provision is not mistaken for a successful reuse.
+  const executionWorkspace = await input.realizeWorkspace();
   return {
-    executionWorkspace: restored,
-    reusedExecutionWorkspace: restored,
+    executionWorkspace,
+    reusedExecutionWorkspace: null,
     policy,
+    reprovisionedAfterUnavailableReuse: true,
+    reprovisionAfterUnavailableReuseCause:
+      reuseFallbackCause instanceof Error
+        ? reuseFallbackCause.message
+        : reuseFallbackCause != null
+          ? String(reuseFallbackCause)
+          : null,
   };
 }
 
