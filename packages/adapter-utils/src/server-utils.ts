@@ -272,12 +272,26 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
   return key.startsWith("PAPERCLIP_");
 }
 
-// PAPERCLIP_API_KEY is never accepted from adapter/user config env: the
-// harness-minted run token is the only source of Paperclip API identity.
-// Other PAPERCLIP_*-named config keys are allowed as long as Paperclip has
-// not assigned the same key for the run (runtime vars always win).
+// Never accepted from adapter/user config env, whether or not Paperclip has
+// assigned the key for this run. Other PAPERCLIP_*-named config keys are
+// allowed as long as Paperclip has not assigned the same key (runtime vars
+// always win); these two cannot be left to that rule.
+//
+// PAPERCLIP_API_KEY: the harness-minted run token is the only source of
+// Paperclip API identity.
+//
+// PAPERCLIP_ISSUE_IDENTIFIER: the ordinary rule is exactly backwards here.
+// Paperclip leaves this unset precisely when the run has NO issue, so
+// "config applies when Paperclip has not set it" would let a stale configured
+// value through on exactly the runs that must not carry one — an idle
+// heartbeat poll would go out labelled with somebody else's issue. It reaches
+// the router as X-Paperclip-Issue, which is recorded verbatim into
+// decisions.issue_key and inferred from nothing, so a wrong key is worse than
+// an absent one: absent reads as unattributed, wrong reads as attributed. The
+// issue is a property of the run and known only to the control plane, so there
+// is no legitimate configured value being refused.
 export function isForbiddenConfigEnvKey(key: string): boolean {
-  return key === "PAPERCLIP_API_KEY";
+  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_ISSUE_IDENTIFIER";
 }
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -2484,6 +2498,18 @@ export function readPaperclipIssueWorkModeFromContext(
   if (direct) return direct;
   const wake = normalizePaperclipWakePayload(context.paperclipWake);
   return wake?.issue?.workMode ?? null;
+}
+
+// The issue IDENTIFIER (e.g. "SUP-15102"), not the id. Same two sources and the same
+// precedence as the work mode above: the run context's own issue ref first, the wake
+// payload as the fallback. For the router's X-Paperclip-Issue header.
+export function readPaperclipIssueIdentifierFromContext(value: unknown): string | null {
+  const context = parseObject(value);
+  const issue = parseObject(context.paperclipIssue);
+  const direct = asString(issue.identifier, "").trim();
+  if (direct) return direct;
+  const wake = normalizePaperclipWakePayload(context.paperclipWake);
+  return wake?.issue?.identifier ?? null;
 }
 
 // Wake reasons that (re)start work on an issue, where the session may not have

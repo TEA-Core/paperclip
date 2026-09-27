@@ -43,6 +43,7 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  readPaperclipIssueIdentifierFromContext,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -4744,6 +4745,44 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     // a configured value is dropped even when Paperclip has not set one.
     expect(env.PAPERCLIP_API_KEY).toBeUndefined();
   });
+
+  it("never accepts PAPERCLIP_ISSUE_IDENTIFIER from config env", () => {
+    const env: Record<string, string> = {};
+
+    refreshPaperclipWorkspaceEnvForExecution({
+      env,
+      envConfig: {
+        PAPERCLIP_ISSUE_IDENTIFIER: "SUP-0000",
+      },
+      workspaceCwd: null,
+    });
+
+    // The ordinary PAPERCLIP_* rule — "config applies only when Paperclip has
+    // not set it" — is exactly wrong for this one. Paperclip leaves it unset
+    // precisely when the run has NO issue, which is when a stale configured
+    // value would sail through and label an issueless turn (an idle heartbeat
+    // poll) with somebody else's issue key. The router records the header
+    // verbatim and infers nothing, so a wrong key there is worse than an
+    // absent one: absent reads as unattributed, wrong reads as attributed.
+    //
+    // The issue is a property of the RUN and is known only to the control
+    // plane, so there is no legitimate configured value to preserve.
+    expect(env.PAPERCLIP_ISSUE_IDENTIFIER).toBeUndefined();
+  });
+
+  it("still lets Paperclip's own issue identifier through", () => {
+    const env: Record<string, string> = { PAPERCLIP_ISSUE_IDENTIFIER: "SUP-15102" };
+
+    refreshPaperclipWorkspaceEnvForExecution({
+      env,
+      envConfig: { PAPERCLIP_ISSUE_IDENTIFIER: "SUP-0000" },
+      workspaceCwd: null,
+    });
+
+    // Forbidding the CONFIG key must not disturb the runtime one the adapter
+    // just assigned from context.paperclipIssue.
+    expect(env.PAPERCLIP_ISSUE_IDENTIFIER).toBe("SUP-15102");
+  });
 });
 
 describe("sanitizeInheritedPaperclipEnv", () => {
@@ -5493,5 +5532,53 @@ describe("runtime skill assignment boundaries", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("readPaperclipIssueIdentifierFromContext", () => {
+  it("reads the identifier off the run context's own issue ref", () => {
+    expect(
+      readPaperclipIssueIdentifierFromContext({
+        paperclipIssue: { id: "uuid", identifier: "SUP-15102", title: "t" },
+      }),
+    ).toBe("SUP-15102");
+  });
+
+  it("falls back to the wake payload when the context carries no issue ref", () => {
+    expect(
+      readPaperclipIssueIdentifierFromContext({
+        paperclipWake: { issue: { id: "uuid", identifier: "SUP-99" } },
+      }),
+    ).toBe("SUP-99");
+  });
+
+  it("prefers the context's own issue ref over the wake payload", () => {
+    expect(
+      readPaperclipIssueIdentifierFromContext({
+        paperclipIssue: { identifier: "SUP-1" },
+        paperclipWake: { issue: { identifier: "SUP-2" } },
+      }),
+    ).toBe("SUP-1");
+  });
+
+  it("returns null when there is no issue anywhere", () => {
+    // The idle heartbeat-poll shape: a wake payload with no issue at all.
+    expect(readPaperclipIssueIdentifierFromContext({ paperclipWake: {} })).toBeNull();
+    expect(readPaperclipIssueIdentifierFromContext({})).toBeNull();
+    expect(readPaperclipIssueIdentifierFromContext(null)).toBeNull();
+  });
+
+  it("treats a blank or whitespace identifier as absent, never as a blank key", () => {
+    expect(readPaperclipIssueIdentifierFromContext({ paperclipIssue: { identifier: "   " } })).toBeNull();
+    expect(readPaperclipIssueIdentifierFromContext({ paperclipIssue: { identifier: "" } })).toBeNull();
+  });
+
+  it("falls through to the wake payload when the context issue ref has a blank identifier", () => {
+    expect(
+      readPaperclipIssueIdentifierFromContext({
+        paperclipIssue: { identifier: "  " },
+        paperclipWake: { issue: { identifier: "SUP-7" } },
+      }),
+    ).toBe("SUP-7");
   });
 });
