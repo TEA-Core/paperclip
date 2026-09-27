@@ -30,11 +30,12 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
     );
     // SUP-17651: envelope for loaded-runner setup plus the signal-driven waits below:
     // the retry-button appearance gate (240s) and the post-click completion signal
-    // (90s pipeline poll + two 45s render checks). The internal waits terminate early
-    // when the server state settles; the cap is the pathological ceiling, not a budget.
-    // 450s = setup + 240s button gate + worst-case post-click (90s + 45s + 45s); normal
-    // cases finish in ~12s, so the extra ceiling costs nothing but the pathological tail.
-    test.setTimeout(450_000);
+    // (90s pipeline poll + 90s done-close poll + two 45s render checks). The internal
+    // waits terminate early when the server state settles; the cap is the
+    // pathological ceiling, not a budget. 600s = setup + 240s button gate +
+    // worst-case post-click (90s + 90s + 45s + 45s); normal cases finish in ~12s,
+    // so the extra ceiling costs nothing but the pathological tail.
+    test.setTimeout(600_000);
     const root = await mkdtemp(path.join(os.tmpdir(), "legacy-recovery-browser-"));
     const config = JSON.parse(await readFile(process.env.PAPERCLIP_E2E_SERVER_CONFIG!, "utf8"));
     // Use the running test server's actual port, including fallback allocation.
@@ -194,6 +195,39 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       }
       await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
       await expect(page.getByRole("status", { name: "Task recovery" })).toHaveCount(0);
+      // SUP-17651 (round-3): the fixture closes the task with a mid-turn,
+      // reply-bearing Tier-1 done PATCH issued by the run itself
+      // (acp-stop-agent.mjs), so the done close settles as part of the run's
+      // finalization pipeline. On a loaded CI shard that pipeline -- the
+      // dispatch in_progress promotion and the done close both landing around
+      // run finalization -- can settle just after the recovered run's
+      // "succeeded" status is written and the reply has rendered, so the old
+      // immediate GET raced the close and intermittently read `in_progress`
+      // (CI-only red at this line while the pipeline poll above and both reply
+      // checks passed). Wait on the real signal -- the issue itself reaching
+      // its terminal done close -- instead of asserting on a single snapshot
+      // read. Bounded at 90s like the pipeline poll above and terminating early
+      // the moment the close lands, so the pathological ceiling costs nothing on
+      // the normal ~12s path. A non-ok GET is treated as "not landed yet" and
+      // retried rather than thrown, so a transient API blip cannot hard-fail
+      // the wait.
+      let doneCloseAtTimeout = "";
+      try {
+        await expect.poll(async () => {
+          const response = await request.get(`/api/issues/${issue.id}`);
+          if (!response.ok()) {
+            doneCloseAtTimeout = `GET /api/issues returned ${response.status()}`;
+            return false;
+          }
+          const current = await response.json();
+          doneCloseAtTimeout = JSON.stringify({ status: current.status, executionBlocker: current.executionBlocker });
+          return current.status === "done" && current.executionBlocker === null;
+        }, { timeout: 90_000, intervals: [500] }).toBe(true);
+      } catch (error) {
+        const timedOut = error as Error;
+        timedOut.message = `issue never reached the done close within 90s -- last observed: ${doneCloseAtTimeout}`;
+        throw timedOut;
+      }
       const completed = await json(await request.get(`/api/issues/${issue.id}`));
       expect(completed).toMatchObject({ status: "done", executionBlocker: null });
       const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, company.id), eq(heartbeatRuns.agentId, agent.id)));
