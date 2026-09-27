@@ -4728,6 +4728,44 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     // a configured value is dropped even when Paperclip has not set one.
     expect(env.PAPERCLIP_API_KEY).toBeUndefined();
   });
+
+  it("never accepts PAPERCLIP_ISSUE_IDENTIFIER from config env", () => {
+    const env: Record<string, string> = {};
+
+    refreshPaperclipWorkspaceEnvForExecution({
+      env,
+      envConfig: {
+        PAPERCLIP_ISSUE_IDENTIFIER: "SUP-0000",
+      },
+      workspaceCwd: null,
+    });
+
+    // The ordinary PAPERCLIP_* rule — "config applies only when Paperclip has
+    // not set it" — is exactly wrong for this one. Paperclip leaves it unset
+    // precisely when the run has NO issue, which is when a stale configured
+    // value would sail through and label an issueless turn (an idle heartbeat
+    // poll) with somebody else's issue key. The router records the header
+    // verbatim and infers nothing, so a wrong key there is worse than an
+    // absent one: absent reads as unattributed, wrong reads as attributed.
+    //
+    // The issue is a property of the RUN and is known only to the control
+    // plane, so there is no legitimate configured value to preserve.
+    expect(env.PAPERCLIP_ISSUE_IDENTIFIER).toBeUndefined();
+  });
+
+  it("still lets Paperclip's own issue identifier through", () => {
+    const env: Record<string, string> = { PAPERCLIP_ISSUE_IDENTIFIER: "SUP-15102" };
+
+    refreshPaperclipWorkspaceEnvForExecution({
+      env,
+      envConfig: { PAPERCLIP_ISSUE_IDENTIFIER: "SUP-0000" },
+      workspaceCwd: null,
+    });
+
+    // Forbidding the CONFIG key must not disturb the runtime one the adapter
+    // just assigned from context.paperclipIssue.
+    expect(env.PAPERCLIP_ISSUE_IDENTIFIER).toBe("SUP-15102");
+  });
 });
 
 describe("sanitizeInheritedPaperclipEnv", () => {
