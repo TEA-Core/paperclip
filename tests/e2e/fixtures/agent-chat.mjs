@@ -48,9 +48,22 @@ if (!task.conversationAgentId) {
   process.exit(0);
 }
 const comments = await api(`/issues/${task.id}/comments?order=asc`);
+// FORK DIVERGENCE (D9/SUP-16581, slice 2d): the fork still runs the in-file
+// releaseIssueExecutionAndPromote (server/src/services/heartbeat.ts), which
+// re-promotes a stopped turn's deferred wake. A wake with no wakeCommentId is
+// an assignment/continuation that owns no chat message; falling back to the
+// latest user comment let it re-run that comment's turn, racing the
+// Stop-then-/new reset in tests/e2e/agent-chat.spec.ts:287. Only a comment the
+// wake names, or an interaction continuation, may consume a message here.
 const current =
   comments.find((c) => c.id === ctx.wakeCommentId) ??
-  comments.filter((c) => c.authorUserId).at(-1);
+  (ctx.interactionKind
+    ? comments.filter((c) => c.authorUserId).at(-1)
+    : undefined);
+if (!current) {
+  console.log("Wake carried no comment and no interaction; exiting.");
+  process.exit(0);
+}
 let command;
 try {
   command = JSON.parse(

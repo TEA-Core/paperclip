@@ -39,7 +39,7 @@ import {
 import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } from "./local-process-control.js";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
-import { deprioritizeForOom } from "../oom-priority.js";
+import { deprioritizeForOom, reportOomMarkFailureOnce } from "../oom-priority.js";
 import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
 import {
   classifyWorkspaceRestoreFailure,
@@ -4704,15 +4704,28 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             // anything it launches, including a test fleet. Best-effort by design;
             // see ../oom-priority.ts for why the server cannot instead lower its own.
             //
-            // Applied SYNCHRONOUSLY, in the narrow window between `spawn()` and the
-            // child doing anything. Deferring it to a later tick loses the mark in
-            // two ways: descendants the child forks in the meantime keep the default
-            // priority (the value is inherited AT fork, not tracked afterwards), and
-            // once the uid-split shim calls setuid the proc entry changes owner, so
-            // a non-root server can no longer write it at all. One small, deferred
-            // /proc write is not worth either gap. The helper never throws, so this
-            // cannot fail the spawn.
-            deprioritizeForOom(child.pid);
+            // Applied SYNCHRONOUSLY, because the value is inherited AT fork and not
+            // tracked afterwards: descendants the child forks in the meantime would
+            // keep the default priority. The helper never throws, so this cannot
+            // fail the spawn.
+            //
+            // CORRECTION (SUP-17664). This comment used to say that deferring would
+            // lose the mark because "once the uid-split shim calls setuid the proc
+            // entry changes owner". The mechanism is real but the ordering was
+            // wrong, and the conclusion drawn from it was too optimistic: the proc
+            // entry is re-owned by the setuid-root execve ITSELF, which completes
+            // before `spawn()` returns, so when this lane's uid split is armed
+            // (`resolveAcpAgentSpawnTarget` returns the same shim binary) the write
+            // below has ALREADY failed EACCES — there was never a window to be
+            // synchronous within. Measured 20/20. The shim performs the write on
+            // itself instead (docker/agent-spawn-shim/spawn-agent.c); this call
+            // still covers the unarmed lane, where acpx spawns the agent command
+            // directly as the server's uid.
+            deprioritizeForOom(child.pid, undefined, {
+              onError: reportOomMarkFailureOnce((message, err) =>
+                console.warn({ err, command }, message),
+              ),
+            });
             return child;
           },
           onAgentStderr: prepared.childStderrLogPath
