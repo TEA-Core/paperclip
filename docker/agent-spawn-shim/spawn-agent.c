@@ -47,6 +47,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
 #include <stdio.h>
@@ -73,6 +74,38 @@
 #error "AGENT_UID/AGENT_GID must not be 0 — the shim must never land on root"
 #endif
 
+/* Mirrors DEFAULT_AGENT_OOM_SCORE_ADJ in
+ * packages/adapter-utils/src/oom-priority.ts. A string because the only thing
+ * done with it is a write() to /proc.
+ *
+ * COMPILE-TIME, like every other tunable in this file, and deliberately NOT read
+ * from the environment. An earlier revision of this change read
+ * PAPERCLIP_AGENT_OOM_SCORE_ADJ out of the environment and was correctly rejected
+ * by scripts/__tests__/agent-spawn-shim.test.mjs, which pins "the shim must not
+ * read the environment for any decision". That guard is broader than the uid property
+ * it is written next to, and that breadth is the point: this is the only
+ * setuid-root binary shipped, its caller is not always trusted, and "reads no
+ * environment at all" is an invariant that can be audited in one grep, whereas
+ * "reads only harmless variables" cannot. The Dockerfile stays the single source
+ * of truth, exactly as it is for AGENT_UID/AGENT_GID/AGENTS_GID. */
+#ifndef AGENT_OOM_SCORE_ADJ
+#define AGENT_OOM_SCORE_ADJ 500
+#endif
+
+/* Stringify the build arg so it can be passed as a bare number, exactly like
+ * -DAGENT_UID=${AGENT_UID}. Two levels are required: the inner macro must see the
+ * expanded value, not the parameter name. */
+#define OOM_SCORE_ADJ_STR_(x) #x
+#define OOM_SCORE_ADJ_STR(x) OOM_SCORE_ADJ_STR_(x)
+
+/* The kernel accepts -1000..1000 and rejects anything else with EINVAL. Since the
+ * write below is best-effort, an out-of-range build arg would otherwise produce an
+ * image that builds, passes its probes, and silently carries no OOM mark at all.
+ * Fail the build instead, exactly as an AGENT_UID of 0 does. */
+#if AGENT_OOM_SCORE_ADJ > 1000 || AGENT_OOM_SCORE_ADJ < -1000
+#error "AGENT_OOM_SCORE_ADJ must be within the kernel range -1000..1000"
+#endif
+
 #define EXIT_USAGE 64
 #define EXIT_PRECONDITION 70
 #define EXIT_EXEC 127
@@ -86,6 +119,18 @@ static void fail_msg(const char *what) {
   fprintf(stderr, "paperclip-spawn-agent: %s\n", what);
   _exit(EXIT_PRECONDITION);
 }
+
+#if AGENT_OOM_SCORE_ADJ != 0
+/* Report and CONTINUE. The OOM mark is best-effort, so a failure must never stop
+ * the privilege drop or the exec — but it must not be invisible either. Silence is
+ * exactly how the server-side version of this write went unnoticed for a day while
+ * failing on every spawn. */
+static void oom_warn(const char *what) {
+  fprintf(stderr, "paperclip-spawn-agent: %s: %s (continuing; the agent tree keeps "
+                  "its inherited OOM priority)\n",
+          what, strerror(errno));
+}
+#endif
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -120,6 +165,78 @@ int main(int argc, char **argv) {
             (int)geteuid());
     _exit(EXIT_PRECONDITION);
   }
+
+  /* Make this process — and therefore the whole agent tree that inherits from
+   * it — the kernel's preferred OOM victim, so a runaway agent workload cannot
+   * take the control plane down with it. See
+   * packages/adapter-utils/src/oom-priority.ts for the incident this defends.
+   *
+   * WHY IT HAS TO HAPPEN HERE, and not in the server (SUP-17664). The server
+   * calls deprioritizeForOom(child.pid) right after spawn(), which works only
+   * while no setuid binary is in the spawn path. Once this shim is the spawn
+   * target the server can never write that file, at any instant:
+   *
+   *   - A setuid-root execve is a secure-exec, so the kernel re-owns
+   *     the child's /proc entries to root:root (mode 644) BEFORE this shim
+   *     runs a single instruction. Measured: at the moment spawn() returns,
+   *     the child reads `Uid: 1000 0 0 0` — real uid still the server's,
+   *     euid 0, this shim not yet dropped — and the server's write already
+   *     fails EACCES, 20/20.
+   *   - After the drop below, the same file belongs to AGENT_UID. Still not the
+   *     server's uid.
+   *
+   * So there is no window to hurry into or defer to; the write simply cannot be
+   * done from outside. It can be done from HERE, because we still hold euid 0
+   * and the file is ours, and oom_score_adj survives both the credential change
+   * and the execve at the end of this function — which is precisely what makes
+   * one write here cover the provider CLI, the agent's shell and anything they
+   * launch. Both spawn lanes (the CLI lane via resolveSpawnTarget and the ACPX
+   * lane via resolveAcpAgentSpawnTarget) exec THIS binary, so this single site
+   * covers both.
+   *
+   * Strictly best-effort, exactly like the helper it replaces: a failure here
+   * must never fail the exec, because the worst case is the status quo ante.
+   *
+   * The value is a build arg, not an env var — see AGENT_OOM_SCORE_ADJ above for
+   * why. Under the uid split there is therefore no runtime kill switch: changing
+   * it means rebuilding with --build-arg AGENT_OOM_SCORE_ADJ=<n>.
+   *
+   * A build arg of 0 compiles this block out ENTIRELY rather than writing "0".
+   * Writing 0 is not the same as not writing: the shim holds euid 0 here, so it
+   * could LOWER a nonzero inherited adjustment and quietly make the agent tree a
+   * less likely victim than the deployment asked for. "Disabled" has to mean
+   * "leave whatever was inherited alone", which is also what
+   * resolveAgentOomScoreAdj()'s `clamped === 0` early return already does on the
+   * server side.
+   *
+   * PAPERCLIP_AGENT_OOM_SCORE_ADJ still governs the server-side call in
+   * deployments that do NOT arm the split, where that call is the one that does
+   * the work.
+   */
+#if AGENT_OOM_SCORE_ADJ != 0
+  {
+    static const char value[] = OOM_SCORE_ADJ_STR(AGENT_OOM_SCORE_ADJ);
+    const size_t len = sizeof(value) - 1;
+    int fd = open("/proc/self/oom_score_adj", O_WRONLY);
+    if (fd < 0) {
+      oom_warn("cannot open /proc/self/oom_score_adj");
+    } else {
+      ssize_t written = write(fd, value, len);
+      if (written < 0) {
+        oom_warn("cannot write /proc/self/oom_score_adj");
+      } else if ((size_t)written != len) {
+        fprintf(stderr,
+                "paperclip-spawn-agent: short write to /proc/self/oom_score_adj "
+                "(%zd of %zu bytes); the agent tree keeps its inherited OOM "
+                "priority\n",
+                written, len);
+      }
+      if (close(fd) != 0) {
+        oom_warn("cannot close /proc/self/oom_score_adj");
+      }
+    }
+  }
+#endif
 
   /* Drop, in the only order that is safe: supplementary groups, then gid, then
    * uid. setuid() last, because it is the step that makes the rest impossible.

@@ -27,6 +27,18 @@ import { writeFileSync } from "node:fs";
  * process tree beneath it — the provider CLI, the agent's shell, and any test
  * fleet it launches — while leaving the server at its default.
  *
+ * WHAT "PERMITTED" DOES NOT COVER (SUP-17664). Raising the value needs no
+ * privilege, but the writer still has to own the `/proc` entry, and with the
+ * agent-uid split armed the server never does. `resolveSpawnTarget` makes the
+ * spawned child the setuid-root shim, and a setuid execve is a secure-exec, so
+ * the kernel re-owns that child's `/proc` entries to root:root before the shim
+ * runs; after the shim drops, they belong to the agent uid. Measured: EACCES on
+ * 20 of 20 spawns through the shim, and OK on 20 of 20 without it. So the call
+ * below is effective exactly when no setuid binary is in the spawn path — dev
+ * boxes, CI, and upstream — and is a no-op under the split, where
+ * `docker/agent-spawn-shim/spawn-agent.c` performs the same write on itself
+ * instead. Keep both: they cover disjoint deployments.
+ *
  * Strictly best-effort. A failure here must never fail a run: the worst case is
  * the status quo ante.
  */
@@ -105,4 +117,40 @@ export function deprioritizeForOom(
     options.onError?.(error);
     return null;
   }
+}
+
+let oomMarkFailureReported = false;
+
+/**
+ * Wrap a reporter so the first failed mark per process is logged and the rest
+ * are dropped.
+ *
+ * A failed write used to be completely silent — `onError` existed and no call
+ * site passed it — so a mark that failed on every single spawn produced no
+ * signal at all and the regression was found by hand-probing production
+ * (SUP-17664). Reporting it per spawn is the opposite failure: under the
+ * agent-uid split the server's write ALWAYS fails, by construction, so a
+ * per-spawn warning would be unbounded noise describing intended behaviour.
+ * Once per process is enough to notice, and cheap enough to keep forever.
+ *
+ * Exported for the tests, which need to clear the latch between cases.
+ */
+export function reportOomMarkFailureOnce(
+  report: (message: string, error: unknown) => void,
+): (error: unknown) => void {
+  return (error: unknown) => {
+    if (oomMarkFailureReported) return;
+    oomMarkFailureReported = true;
+    report(
+      "could not mark the run child as a preferred OOM victim; when PAPERCLIP_AGENT_UID " +
+        "is armed this is expected (the setuid spawn shim marks the agent tree itself) " +
+        "and this message is emitted once per process",
+      error,
+    );
+  };
+}
+
+/** Test seam: clear the once-per-process latch. */
+export function resetOomMarkFailureReportedForTests(): void {
+  oomMarkFailureReported = false;
 }

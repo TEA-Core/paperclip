@@ -1,8 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_AGENT_OOM_SCORE_ADJ,
   deprioritizeForOom,
+  reportOomMarkFailureOnce,
+  resetOomMarkFailureReportedForTests,
   resolveAgentOomScoreAdj,
 } from "./oom-priority.js";
 
@@ -95,5 +97,43 @@ describe("deprioritizeForOom", () => {
     expect(() => deprioritizeForOom(4242, 500, { write, platform: "linux", onError })).not.toThrow();
     expect(deprioritizeForOom(4242, 500, { write, platform: "linux", onError })).toBeNull();
     expect(onError).toHaveBeenCalled();
+  });
+});
+
+describe("reportOomMarkFailureOnce (SUP-17664)", () => {
+  beforeEach(() => {
+    resetOomMarkFailureReportedForTests();
+  });
+
+  it("reports the first failure and stays silent afterwards", () => {
+    const seen: Array<{ message: string; error: unknown }> = [];
+    const report = (message: string, error: unknown) => {
+      seen.push({ message, error });
+    };
+    const boom = new Error("EACCES");
+
+    reportOomMarkFailureOnce(report)(boom);
+    reportOomMarkFailureOnce(report)(boom);
+    reportOomMarkFailureOnce(report)(new Error("another"));
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.error).toBe(boom);
+    // The message has to name the expected cause, or the one line a reader gets
+    // sends them hunting a bug that is intended behaviour under the uid split.
+    expect(seen[0]?.message).toContain("PAPERCLIP_AGENT_UID");
+  });
+
+  it("is wired into a real failed write, so the silence that hid SUP-17664 cannot return", () => {
+    const seen: string[] = [];
+    const failed = deprioritizeForOom(4242, undefined, {
+      platform: "linux",
+      write: () => {
+        throw new Error("EACCES: permission denied");
+      },
+      onError: reportOomMarkFailureOnce((message) => seen.push(message)),
+    });
+
+    expect(failed).toBeNull();
+    expect(seen).toHaveLength(1);
   });
 });

@@ -356,6 +356,10 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ARG AGENT_UID=1001
 ARG AGENT_GID=1001
 ARG AGENTS_GID=1002
+# oom_score_adj the shim applies to itself before dropping, so the whole agent
+# tree inherits it. A build arg rather than an env var because the shim reads no
+# environment at all; see docker/agent-spawn-shim/spawn-agent.c. 0 disables it.
+ARG AGENT_OOM_SCORE_ADJ=500
 # buildx injects these automatically. They let the exec probes below run only on
 # a native build: under binfmt/qemu emulation (BUILDPLATFORM != TARGETPLATFORM)
 # the kernel never honours the setuid bit, so the probes can never pass there.
@@ -377,6 +381,7 @@ RUN if getent passwd "${AGENT_UID}" >/dev/null \
   && usermod -aG agents node \
   && gcc -O2 -Wall -Wextra -Werror \
        -DAGENT_UID=${AGENT_UID} -DAGENT_GID=${AGENT_GID} -DAGENTS_GID=${AGENTS_GID} \
+       -DAGENT_OOM_SCORE_ADJ=${AGENT_OOM_SCORE_ADJ} \
        -o /usr/local/sbin/paperclip-spawn-agent /tmp/spawn-agent.c \
   && rm -f /tmp/spawn-agent.c \
   && chown root:root /usr/local/sbin/paperclip-spawn-agent \

@@ -12,7 +12,7 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
-import { deprioritizeForOom } from "./oom-priority.js";
+import { deprioritizeForOom, reportOomMarkFailureOnce } from "./oom-priority.js";
 import {
   evaluateRunProcessSpawn,
   getRunProcessGroupCounter,
@@ -5461,13 +5461,24 @@ export async function runChildProcess(
         // provider CLI, the agent's shell, and anything it launches. This is
         // the single seam where run children are created, so no process-adapter
         // path (opencode, the claude CLI lane, pi, hermes, the generic process
-        // adapter, ...) can bypass it: the ACPX engine already marks its own
-        // spawn seam, but every CLI-lane spawn flows through here and previously
-        // kept the inherited 0. Best-effort by design; see ./oom-priority.ts for
-        // why the server cannot instead lower its own. Applied synchronously in
-        // the narrow window between `spawn()` and the child doing anything; the
-        // helper never throws, so this cannot fail the spawn.
-        deprioritizeForOom(child.pid);
+        // adapter, ...) can bypass it. Best-effort by design; see
+        // ./oom-priority.ts for why the server cannot instead lower its own.
+        //
+        // EFFECTIVE ONLY WHEN THE UID SPLIT IS OFF (SUP-17664). With
+        // PAPERCLIP_AGENT_UID armed, `resolveSpawnTarget` above has replaced the
+        // target with the setuid-root shim, and the server can never write that
+        // child's `/proc` entry — a setuid execve is a secure-exec, so the kernel
+        // re-owns it to root before the shim runs, and after the shim drops it
+        // belongs to the agent uid. There is no instant in between, so there is
+        // no ordering here to fix: the shim marks itself instead
+        // (docker/agent-spawn-shim/spawn-agent.c). This call still carries dev
+        // boxes, CI and upstream, where no setuid binary is in the path.
+        //
+        // The failure is reported once per process rather than per spawn, since
+        // under the split it is both constant and intended.
+        deprioritizeForOom(child.pid, undefined, {
+          onError: reportOomMarkFailureOnce((message, err) => onLogError(err, runId, message)),
+        });
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
