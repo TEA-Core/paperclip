@@ -690,18 +690,18 @@ describe("startServer feedback export wiring", () => {
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
     }));
-    let intervalCallback: (() => void) | null = null;
+    const heartbeatInterval: { callback: (() => void) | null } = { callback: null };
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, delayMs?: number) => {
       // Capture only the heartbeat scheduler interval so unrelated startup
       // timers registered later cannot shadow it.
-      if (delayMs === HEARTBEAT_SCHEDULER_INTERVAL_MS) intervalCallback = callback;
+      if (delayMs === HEARTBEAT_SCHEDULER_INTERVAL_MS) heartbeatInterval.callback = callback;
       return 1 as unknown as ReturnType<typeof setInterval>;
     }) as typeof setInterval);
     try {
       await startServer();
       expect(heartbeatServiceMock.detectStaleIssueMonitors).toHaveBeenCalledTimes(1);
-      expect(intervalCallback).not.toBeNull();
-      intervalCallback?.();
+      expect(heartbeatInterval.callback).not.toBeNull();
+      heartbeatInterval.callback?.();
       // The fork's periodic recovery chain runs many sweeps in sequence; wait
       // for the step that follows the stale-monitor detector before asserting.
       await vi.waitFor(() => {
