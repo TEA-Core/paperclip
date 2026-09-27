@@ -58467,24 +58467,31 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           return builder;
         });
         restoreMocks.push(() => insertSpy.mockRestore());
+        // Order-stable comparison: these selects have no natural order, and a
+        // recovery write settling between the baseline read and this final
+        // read can move a row's heap position without changing the id set.
         const unchangedRows = async () =>
           Promise.all([
             db
               .select({ id: issueComments.id })
               .from(issueComments)
-              .where(eq(issueComments.companyId, fixture.companyId)),
+              .where(eq(issueComments.companyId, fixture.companyId))
+              .orderBy(asc(issueComments.id)),
             db
               .select({ id: issues.id })
               .from(issues)
-              .where(eq(issues.companyId, fixture.companyId)),
+              .where(eq(issues.companyId, fixture.companyId))
+              .orderBy(asc(issues.id)),
             db
               .select({ id: heartbeatRuns.id })
               .from(heartbeatRuns)
-              .where(eq(heartbeatRuns.companyId, fixture.companyId)),
+              .where(eq(heartbeatRuns.companyId, fixture.companyId))
+              .orderBy(asc(heartbeatRuns.id)),
             db
               .select({ id: chatPublications.id })
               .from(chatPublications)
-              .where(eq(chatPublications.endpointId, endpoint.id)),
+              .where(eq(chatPublications.endpointId, endpoint.id))
+              .orderBy(asc(chatPublications.id)),
           ]);
         const baseline = await unchangedRows();
         const wakeupCount = wakeup.mock.calls.length;
