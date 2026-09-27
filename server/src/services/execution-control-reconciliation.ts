@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import {
   agents,
   environmentLeases,
   heartbeatRuns,
+  issueRecoveryActions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -13,6 +14,12 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { reportRunFailure } from "./run-failure-report.js";
 import { conversationRunPredicate } from "./conversation-continuation.js";
+import { publishActivity, type ActivityPublication } from "./activity-log.js";
+import {
+  executeIssuePostCommitActions,
+  issueService,
+  type IssuePostCommitAction,
+} from "./issues.js";
 
 /**
  * Terminal run states — a run in any of these is not live and cannot be
@@ -143,6 +150,131 @@ export async function reapStaleExecutionOwnerLeases(
   return { scanned: candidates.length, reaped };
 }
 
+/**
+ * Terminalize summary-generation tasks stranded in `changes_requested` limbo
+ * by the pre-SUP-17609 forward path (SUP-17698 backfill; the six stranded
+ * cards are the known instances). The review stage bounced the card, the run
+ * that carried the bounce is gone, and no slot write will ever happen for a
+ * bounced card — so SUP-17609's terminalize-on-write can never fire, and the
+ * card is invisible to every other sweep: `in_progress`/`blocked` with no run
+ * is swept by nothing, and the read-path dead-binding reclaim (SUP-16945)
+ * clears the slot binding without terminalizing the issue.
+ *
+ * The selector is the generation token minted into the issue description, not
+ * the slot binding: SUP-16945's reclaim releases `generating_issue_id` while
+ * the card still needs its terminal disposition, so a slot join would miss
+ * already-released cards. The token string occurs only in minted
+ * generation-task descriptions.
+ *
+ * Terminalization reuses the standard issue-update funnel — the same path
+ * SUP-17609's write route runs post-commit — so the status flip, the slot
+ * release via `finalizeSummarySlotsForTerminalIssue`, interaction expiry, and
+ * activity logging all land in one transaction with normal close-out
+ * semantics. Every stranded predicate is re-verified under the issue row
+ * lock, so a card that gained a live run, a recovery action, or a terminal
+ * status between scan and write is left to its own owner; a re-run over
+ * already-terminal rows matches nothing and is a no-op.
+ */
+export async function reapStrandedSummaryGenerationIssues(
+  db: Db,
+): Promise<{ scanned: number; terminalized: number }> {
+  const candidates = await db
+    .select({
+      issueId: issues.id,
+      companyId: issues.companyId,
+    })
+    .from(issues)
+    .where(
+      and(
+        notInArray(issues.status, ["done", "cancelled"]),
+        sql`${issues.executionState} ->> 'status' = 'changes_requested'`,
+        isNull(issues.executionRunId),
+        isNull(issues.checkoutRunId),
+        sql`${issues.description} like '%generationIssueId%'`,
+        sql`not exists (
+          select 1
+          from ${issueRecoveryActions}
+          where ${issueRecoveryActions.companyId} = ${issues.companyId}
+            and ${issueRecoveryActions.sourceIssueId} = ${issues.id}
+            and ${issueRecoveryActions.status} in ('active', 'escalated')
+        )`,
+      ),
+    )
+    .limit(50);
+
+  let terminalized = 0;
+  let nextCandidate = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(5, candidates.length) }, async () => {
+      while (nextCandidate < candidates.length) {
+        const candidate = candidates[nextCandidate++]!;
+        try {
+          const postCommitActivityPublications: ActivityPublication[] = [];
+          const postCommitIssueActions: IssuePostCommitAction[] = [];
+          const settled = await db.transaction(async (tx) => {
+            await tx.execute(
+              sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+            );
+            const [issue] = await tx
+              .select()
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.id, candidate.issueId),
+                  eq(issues.companyId, candidate.companyId),
+                ),
+              )
+              .for("update");
+            // Re-check the stranded shape under the row lock: a card that went
+            // terminal, went live, or entered recovery since the scan belongs
+            // to its own owner.
+            if (!issue) return false;
+            if (issue.status === "done" || issue.status === "cancelled") return false;
+            if (issue.executionRunId || issue.checkoutRunId) return false;
+            // Match the scan's raw `execution_state ->> 'status'` predicate, not
+            // the strict `issueExecutionStateSchema` parse: a legacy/orphan row
+            // can carry the review limbo with a state the strict schema rejects,
+            // and it is exactly the row a backfill exists to drain.
+            if ((issue.executionState as { status?: unknown } | null)?.status !== "changes_requested") return false;
+            if (typeof issue.description !== "string" || !issue.description.includes("generationIssueId")) return false;
+            const activeRecovery = await issueRecoveryActionService(
+              tx as unknown as Db,
+            ).getActiveForIssue(issue.companyId, issue.id, tx as unknown as Db);
+            if (activeRecovery) return false;
+            // The funnel re-locks this same row (a no-op inside this
+            // transaction), flips the status, and runs the terminal side
+            // effects in place. Post-commit work is deferred to the queues
+            // below because this write is part of an external transaction.
+            const updated = await issueService(db).update(
+              issue.id,
+              { status: "done", companyGuard: issue.companyId },
+              tx,
+              postCommitActivityPublications,
+              postCommitIssueActions,
+            );
+            return updated?.status === "done";
+          });
+          if (settled) {
+            terminalized += 1;
+            for (const publication of postCommitActivityPublications) publishActivity(publication);
+            if (postCommitIssueActions.length > 0) {
+              await executeIssuePostCommitActions(db, postCommitIssueActions);
+            }
+          }
+        } catch {
+          // A lock/statement timeout leaves this card for the next tick; the
+          // sweep is periodic, so a skipped candidate is retried.
+          logger.warn(
+            { issueId: candidate.issueId },
+            "Stranded summary-generation terminalization remains pending; continuing with other issues",
+          );
+        }
+      }
+    }),
+  );
+  return { scanned: candidates.length, terminalized };
+}
+
 /** Only newly recorded control deadlines are eligible. Upgrades never replay ambiguous historical runs. */
 export async function reconcileAbandonedExecutionControl(
   db: Db,
@@ -152,6 +284,10 @@ export async function reconcileAbandonedExecutionControl(
   // execution_owner_active gate wedged. Runs in the same periodic sweep — no
   // second, competing sweep — and is strictly liveness-based.
   const leaseReaping = await reapStaleExecutionOwnerLeases(db, now);
+  // Terminalize summary-generation cards stranded in changes-requested limbo
+  // by the pre-SUP-17609 forward path (SUP-17698). Same periodic sweep, same
+  // single-flight guarantee, strictly liveness-based.
+  const summaryReaping = await reapStrandedSummaryGenerationIssues(db);
   const nativeDue = await db
     .select({
       runId: nativeRunFinalizations.runId,
@@ -386,5 +522,10 @@ export async function reconcileAbandonedExecutionControl(
       }
     }
   }));
-  return { scanned: due.length, surfaced, reaped: leaseReaping.reaped };
+  return {
+    scanned: due.length,
+    surfaced,
+    reaped: leaseReaping.reaped,
+    summaryTerminalized: summaryReaping.terminalized,
+  };
 }

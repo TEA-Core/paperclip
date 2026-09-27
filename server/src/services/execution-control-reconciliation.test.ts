@@ -1,7 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environmentLeases, heartbeatRuns, issues } from "@paperclipai/db";
+import {
+  agents,
+  companies,
+  createDb,
+  environmentLeases,
+  heartbeatRuns,
+  issueRecoveryActions,
+  issues,
+  summarySlots,
+} from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -22,7 +31,11 @@ vi.mock("../sentry.js", async () => {
   };
 });
 
-import { reconcileAbandonedExecutionControl, reapStaleExecutionOwnerLeases } from "./execution-control-reconciliation.js";
+import {
+  reapStrandedSummaryGenerationIssues,
+  reapStaleExecutionOwnerLeases,
+  reconcileAbandonedExecutionControl,
+} from "./execution-control-reconciliation.js";
 import { waitForPendingRunFailureReports } from "./run-failure-report.js";
 import { getConversationOwnershipBlocker } from "./conversation-continuation.js";
 
@@ -322,3 +335,217 @@ describeEmbeddedPostgres("reapStaleExecutionOwnerLeases clears dead-holder lease
     expect(lease?.status).toBe("active");
   });
 });
+
+describeEmbeddedPostgres(
+  "reapStrandedSummaryGenerationIssues terminalizes pre-existing stranded summary tasks",
+  () => {
+    let db!: ReturnType<typeof createDb>;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("stranded-summary-generation-reaper-");
+      db = createDb(tempDb.connectionString);
+    }, 30_000);
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    /**
+     * The mint-only token block `generationIssueDescription()` writes into every
+     * generation task's description. The reaper selects on this marker rather
+     * than the slot binding because SUP-16945's read-path reclaim clears
+     * `summary_slots.generating_issue_id` without terminalizing the issue, so a
+     * stranded card's slot may already be released by the time it is reaped.
+     */
+    function generationDescription(generationIssueId: string) {
+      return [
+        "Generate the project summary for `86aa3f31-ce0d-42f8-98e9-02154f9be6a9`.",
+        "",
+        "```json",
+        JSON.stringify(
+          {
+            scopeKind: "project",
+            scopeId: "86aa3f31-ce0d-42f8-98e9-02154f9be6a9",
+            slotKey: "header",
+            generationIssueId,
+          },
+          null,
+          2,
+        ),
+        "```",
+      ].join("\n");
+    }
+
+    async function seedCompanyAndSummarizer() {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Stranded Summary Generation",
+        issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      });
+      await db.insert(agents).values([
+        { id: agentId, companyId, name: "Summarizer", adapterType: "claude_local", status: "idle" },
+        { id: reviewerAgentId, companyId, name: "Reviewer", adapterType: "claude_local", status: "idle" },
+      ]);
+      return { companyId, agentId, reviewerAgentId };
+    }
+
+    /**
+     * A generation task in the pre-existing stranded shape: the review stage
+     * bounced it to changes_requested, the bounce run is gone, and no recovery
+     * action is in flight.
+     */
+    async function seedStrandedGenerationTask(opts: {
+      companyId: string;
+      agentId: string;
+      reviewerAgentId: string;
+      status?: "in_progress" | "blocked";
+      description?: string;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: opts.companyId,
+        title: "Summarize project",
+        status: opts.status ?? "in_progress",
+        assigneeAgentId: opts.agentId,
+        executionState: {
+          status: "changes_requested",
+          currentStageId: randomUUID(),
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: opts.reviewerAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: opts.agentId, userId: null },
+          lastDecisionId: randomUUID(),
+          lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: 1,
+          pendingSince: new Date(Date.now() - 60_000).toISOString(),
+        },
+        description: opts.description ?? generationDescription(issueId),
+      });
+      return issueId;
+    }
+
+    const getIssue = (issueId: string) =>
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .limit(1)
+        .then((rows) => rows[0]);
+
+    it("terminalizes a pre-existing summary task stranded in changes_requested with no live run", async () => {
+      const { companyId, agentId, reviewerAgentId } = await seedCompanyAndSummarizer();
+      const issueId = await seedStrandedGenerationTask({ companyId, agentId, reviewerAgentId });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      const issue = await getIssue(issueId);
+      expect(issue?.status).toBe("done");
+      expect(issue?.executionRunId).toBeNull();
+      expect(issue?.checkoutRunId).toBeNull();
+    });
+
+    it("terminalizes a blocked summary task and releases a still-armed slot binding", async () => {
+      const { companyId, agentId, reviewerAgentId } = await seedCompanyAndSummarizer();
+      const issueId = await seedStrandedGenerationTask({ companyId, agentId, reviewerAgentId, status: "blocked" });
+      const slotId = randomUUID();
+      await db.insert(summarySlots).values({
+        id: slotId,
+        companyId,
+        scopeKind: "project",
+        scopeId: "86aa3f31-ce0d-42f8-98e9-02154f9be6a9",
+        slotKey: "header",
+        status: "generating",
+        generatingIssueId: issueId,
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      expect((await getIssue(issueId))?.status).toBe("done");
+      // The terminal transition runs the same slot finalizer SUP-17609 relies on:
+      // the binding is cleared. This generation wrote no surviving revision, so
+      // the slot fails closed to "failed" for the refresh sweep to regenerate.
+      const [slot] = await db
+        .select()
+        .from(summarySlots)
+        .where(eq(summarySlots.id, slotId))
+        .limit(1);
+      expect(slot?.generatingIssueId).toBeNull();
+      expect(slot?.status).toBe("failed");
+    });
+
+    it("is idempotent: a second pass over already-terminal rows is a no-op", async () => {
+      const { companyId, agentId, reviewerAgentId } = await seedCompanyAndSummarizer();
+      const issueId = await seedStrandedGenerationTask({ companyId, agentId, reviewerAgentId });
+
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 1 });
+
+      const rerun = await reapStrandedSummaryGenerationIssues(db);
+      expect(rerun).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("done");
+    });
+
+    it("leaves a stranded summary task that still has a live run untouched", async () => {
+      const { companyId, agentId, reviewerAgentId } = await seedCompanyAndSummarizer();
+      const issueId = await seedStrandedGenerationTask({ companyId, agentId, reviewerAgentId });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: runId, checkoutRunId: runId })
+        .where(eq(issues.id, issueId));
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+    });
+
+    it("leaves a stranded summary task with an in-flight recovery action untouched", async () => {
+      const { companyId, agentId, reviewerAgentId } = await seedCompanyAndSummarizer();
+      const issueId = await seedStrandedGenerationTask({ companyId, agentId, reviewerAgentId });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "active_run_watchdog",
+        status: "active",
+        ownerType: "board",
+        cause: "execution_finalization_deadline_exceeded",
+        fingerprint: `test:${issueId}`,
+        nextAction: "Inspect the failed run.",
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+    });
+
+    it("leaves a changes_requested card that is not a summary generation task untouched", async () => {
+      const { companyId, agentId, reviewerAgentId } = await seedCompanyAndSummarizer();
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        agentId,
+        reviewerAgentId,
+        description: "An ordinary task that happens to be waiting on review.",
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+    });
+  },
+);
