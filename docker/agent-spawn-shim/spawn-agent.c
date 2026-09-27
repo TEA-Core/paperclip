@@ -98,6 +98,14 @@
 #define OOM_SCORE_ADJ_STR_(x) #x
 #define OOM_SCORE_ADJ_STR(x) OOM_SCORE_ADJ_STR_(x)
 
+/* The kernel accepts -1000..1000 and rejects anything else with EINVAL. Since the
+ * write below is best-effort, an out-of-range build arg would otherwise produce an
+ * image that builds, passes its probes, and silently carries no OOM mark at all.
+ * Fail the build instead, exactly as an AGENT_UID of 0 does. */
+#if AGENT_OOM_SCORE_ADJ > 1000 || AGENT_OOM_SCORE_ADJ < -1000
+#error "AGENT_OOM_SCORE_ADJ must be within the kernel range -1000..1000"
+#endif
+
 #define EXIT_USAGE 64
 #define EXIT_PRECONDITION 70
 #define EXIT_EXEC 127
@@ -111,6 +119,18 @@ static void fail_msg(const char *what) {
   fprintf(stderr, "paperclip-spawn-agent: %s\n", what);
   _exit(EXIT_PRECONDITION);
 }
+
+#if AGENT_OOM_SCORE_ADJ != 0
+/* Report and CONTINUE. The OOM mark is best-effort, so a failure must never stop
+ * the privilege drop or the exec — but it must not be invisible either. Silence is
+ * exactly how the server-side version of this write went unnoticed for a day while
+ * failing on every spawn. */
+static void oom_warn(const char *what) {
+  fprintf(stderr, "paperclip-spawn-agent: %s: %s (continuing; the agent tree keeps "
+                  "its inherited OOM priority)\n",
+          what, strerror(errno));
+}
+#endif
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -179,20 +199,44 @@ int main(int argc, char **argv) {
    *
    * The value is a build arg, not an env var — see AGENT_OOM_SCORE_ADJ above for
    * why. Under the uid split there is therefore no runtime kill switch: changing
-   * it means rebuilding with --build-arg AGENT_OOM_SCORE_ADJ=<n>, and "0" is how
-   * you turn it off. PAPERCLIP_AGENT_OOM_SCORE_ADJ still governs the server-side
-   * call in deployments that do NOT arm the split, where that call is the one
-   * that does the work.
+   * it means rebuilding with --build-arg AGENT_OOM_SCORE_ADJ=<n>.
+   *
+   * A build arg of 0 compiles this block out ENTIRELY rather than writing "0".
+   * Writing 0 is not the same as not writing: the shim holds euid 0 here, so it
+   * could LOWER a nonzero inherited adjustment and quietly make the agent tree a
+   * less likely victim than the deployment asked for. "Disabled" has to mean
+   * "leave whatever was inherited alone", which is also what
+   * resolveAgentOomScoreAdj()'s `clamped === 0` early return already does on the
+   * server side.
+   *
+   * PAPERCLIP_AGENT_OOM_SCORE_ADJ still governs the server-side call in
+   * deployments that do NOT arm the split, where that call is the one that does
+   * the work.
    */
+#if AGENT_OOM_SCORE_ADJ != 0
   {
     static const char value[] = OOM_SCORE_ADJ_STR(AGENT_OOM_SCORE_ADJ);
+    const size_t len = sizeof(value) - 1;
     int fd = open("/proc/self/oom_score_adj", O_WRONLY);
-    if (fd >= 0) {
-      /* Return value deliberately discarded: see best-effort note above. */
-      (void)!write(fd, value, sizeof(value) - 1);
-      (void)close(fd);
+    if (fd < 0) {
+      oom_warn("cannot open /proc/self/oom_score_adj");
+    } else {
+      ssize_t written = write(fd, value, len);
+      if (written < 0) {
+        oom_warn("cannot write /proc/self/oom_score_adj");
+      } else if ((size_t)written != len) {
+        fprintf(stderr,
+                "paperclip-spawn-agent: short write to /proc/self/oom_score_adj "
+                "(%zd of %zu bytes); the agent tree keeps its inherited OOM "
+                "priority\n",
+                written, len);
+      }
+      if (close(fd) != 0) {
+        oom_warn("cannot close /proc/self/oom_score_adj");
+      }
     }
   }
+#endif
 
   /* Drop, in the only order that is safe: supplementary groups, then gid, then
    * uid. setuid() last, because it is the step that makes the rest impossible.

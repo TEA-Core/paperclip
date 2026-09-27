@@ -102,6 +102,19 @@ gcc -O2 -Wall -Wextra -Werror -DAGENT_OOM_SCORE_ADJ=0 -o "$SHIM0" /tmp/spawn-age
   && chown root:root "$SHIM0" && chmod 4755 "$SHIM0"
 echo "T_OOM_OFF<<:"; as_node "$SHIM0" sh -c 'cat /proc/self/oom_score_adj' 2>&1; echo ":>>"
 
+# A build arg of 0 must leave an INHERITED adjustment alone, not overwrite it with
+# 0. The shim still holds euid 0 at that point, so writing 0 would LOWER a nonzero
+# inherited value and make the agent tree a less likely victim than the deployment
+# asked for. Raising one's own adjustment needs no privilege, so the caller can set
+# 300 and exec the shim to observe what survives.
+echo "T_OOM_INHERIT_OFF<<:"
+as_node sh -c 'echo 300 > /proc/self/oom_score_adj && exec '"$SHIM0"' sh -c "cat /proc/self/oom_score_adj"' 2>&1
+echo ":>>"
+# ...while an enabled build must still override that inherited value.
+echo "T_OOM_INHERIT_ON<<:"
+as_node sh -c 'echo 300 > /proc/self/oom_score_adj && exec '"$SHIM"' sh -c "cat /proc/self/oom_score_adj"' 2>&1
+echo ":>>"
+
 # --- THE acceptance test for the whole chain: cross-uid /proc read is denied.
 #     Run a long-lived process as uid 1000 and read its environ as uid 1001.
 # The victim must genuinely BE uid 1000. Backgrounding the helper function is
@@ -195,6 +208,12 @@ esac
 [ "$(sec OOM_OFF)" = "0" ] \
   && ok "-DAGENT_OOM_SCORE_ADJ=0 disables the mark (0 != the 500 default)" \
   || no "build-arg 0 did not disable the mark: $(sec OOM_OFF)"
+[ "$(sec OOM_INHERIT_OFF)" = "300" ] \
+  && ok "a disabled build leaves an inherited 300 untouched, rather than writing 0 over it" \
+  || no "disabled build clobbered the inherited adjustment: $(sec OOM_INHERIT_OFF)"
+[ "$(sec OOM_INHERIT_ON)" = "500" ] \
+  && ok "an enabled build still overrides an inherited 300" \
+  || no "enabled build did not override the inherited adjustment: $(sec OOM_INHERIT_ON)"
 [ "$(sec OOM_TREE)" = "500" ] \
   && ok "the mark is inherited by a grandchild — the whole agent tree is covered" \
   || no "grandchild did not inherit the mark: $(sec OOM_TREE)"
