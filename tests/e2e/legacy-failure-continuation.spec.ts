@@ -193,7 +193,25 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         timedOut.message = `recovered run never reached "succeeded" within 90s -- last observed: ${recoveredAtTimeout}`;
         throw timedOut;
       }
-      await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
+      // SUP-17651 (round-4): the old unscoped getByText("Answered the pending
+      // follow-up once.") matched every bubble carrying the streamed reply text
+      // -- the live transcript interstitial AND every posted Tier-1 done-close
+      // bubble -- so it strict-mode-violated the moment two of them were
+      // present. A loaded CI shard produced exactly that legitimately: the
+      // issue-graph liveness backstop healed a dependency wake on the seeded
+      // blocked issue and dispatched a first recovered run whose fixture posted
+      // the Tier-1 done-close, and the user's "Please continue" comment then
+      // woke a second run that posted an identical one (CI evidence: two
+      // fixture spawns, two 200 done-close PATCHes, two posted bubbles in the
+      // post-reload DOM; 2 recovered heartbeat_runs, 3 issue_comments). The
+      // persistence signal is "the posted reply rendered"; scope to the posted
+      // done-close body -- which the interstitial never carries -- and assert
+      // at least one, so strict-mode ambiguity can no longer mask that signal.
+      // The duplicate dispatch/post is tracked in SUP-17780; this spec
+      // deliberately does not gate on toHaveCount(1), for the same
+      // cause-not-count reason as the pipeline poll above.
+      const postedReplyBubble = page.getByTestId("task-chat-agent-bubble").filter({ hasText: "Closed at Tier 1" });
+      await expect(postedReplyBubble).not.toHaveCount(0, { timeout: 45_000 });
       await expect(page.getByRole("status", { name: "Task recovery" })).toHaveCount(0);
       // SUP-17651 (round-3): the fixture closes the task with a mid-turn,
       // reply-bearing Tier-1 done PATCH issued by the run itself
@@ -278,7 +296,27 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       // comments, and runs; on loaded runners the default 5s expect window is the
       // narrowest gate in this spec, so the reply re-assertion gets the same explicit
       // render window as the live check above.
-      await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
+      // SUP-17651 (round-4): same scoping as the live check. Two posted done-close
+      // bubbles (liveness-backstop wake + user-comment wake, SUP-17780) are
+      // legitimate post-reload state on a loaded shard, so the unscoped getByText
+      // strict-violated on the pair; assert at least one scoped bubble instead.
+      // On failure, attach the server-side counts (recovered heartbeat_runs and
+      // issue_comments) so the next flake names the duplicate class without a
+      // second log archaeology pass.
+      try {
+        await expect(postedReplyBubble).not.toHaveCount(0, { timeout: 45_000 });
+      } catch (error) {
+        const failed = error as Error;
+        try {
+          const allRuns = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, company.id), eq(heartbeatRuns.agentId, agent.id)));
+          const allComments = await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
+          const recoveredNow = allRuns.filter(run => run.id !== sourceRunId);
+          failed.message += ` [diagnostic: ${recoveredNow.length} recovered heartbeat_runs (${recoveredNow.map(run => run.status).join(",") || "none"}), ${allComments.length} issue_comments (${allComments.map(comment => `${comment.authorType}:${String(comment.body).slice(0, 48).replace(/\s+/g, " ")}`).join(" | ") || "none"})]`;
+        } catch {
+          failed.message += " [diagnostic: unavailable]";
+        }
+        throw failed;
+      }
     } finally {
       // SUP-17651: teardown must never mask the primary failure. When the test times
       // out Playwright has already torn down the page/context, and the archive PATCH
