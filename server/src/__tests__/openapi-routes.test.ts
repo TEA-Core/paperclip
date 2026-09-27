@@ -424,6 +424,49 @@ describe("openapi routes", () => {
     expect(field.description).toContain("in_review");
   });
 
+  it("publishes the live force, doneTransitionOverride, and deliveryIdentity fields on PATCH /api/issues/{id}", () => {
+    const { spec } = loadSpecRoutes();
+    const schema =
+      spec.paths["/api/issues/{id}"].patch.requestBody.content["application/json"]
+        .schema;
+
+    expect(schema.additionalProperties).toBe(false);
+    for (const name of ["force", "doneTransitionOverride", "deliveryIdentity"]) {
+      expect(schema.properties[name]).toBeDefined();
+      expect(schema.required ?? []).not.toContain(name);
+    }
+
+    const force = schema.properties.force;
+    expect(force).toMatchObject({ type: "boolean" });
+    expect(force.description).toContain("pending_interaction_assignment_pin");
+    expect(force.description).toContain("force:true");
+
+    const override = schema.properties.doneTransitionOverride;
+    expect(override).toMatchObject({ type: "object", nullable: true });
+    expect(override.properties.disposition).toMatchObject({ type: "string" });
+    expect(override.properties.reason).toMatchObject({ type: "string" });
+    expect(override.required).toEqual(["disposition"]);
+    expect(override.description).toContain(
+      "upstream-equivalent-fix-no-deliverable-head",
+    );
+    expect(override.description).toContain("child-delivery-parent-close");
+    expect(override.description).toContain("merged-elsewhere");
+    expect(override.description).toContain("done_transition_missing_delivery");
+
+    const identity = schema.properties.deliveryIdentity;
+    expect(identity).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+    });
+    expect(identity.properties.repo).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+    });
+    expect(identity.required).toEqual(["repo", "branch", "headSha"]);
+    expect(identity.description).toContain("delivery_identity_write_rejected");
+    expect(identity.description).toContain("in_review");
+  });
+
   it("publishes the complete board contract for chat channels", () => {
     const { spec } = loadSpecRoutes();
     const boardSecurity = [{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }];
