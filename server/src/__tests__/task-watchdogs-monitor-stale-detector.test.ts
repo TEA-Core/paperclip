@@ -270,4 +270,34 @@ describeEmbeddedPostgres("detectStaleIssueMonitors", () => {
     expect(result.detected).toBe(0);
     expect(result.reported).toBe(0);
   });
+
+  it("skips issues created before the worktree execution cutoff", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const oldIssueId = await seedIssue(companyId, {
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      monitorLastTriggeredAt: FIRED_AT,
+      monitorAttemptCount: 1,
+      createdAt: new Date("2026-09-20T00:00:00.000Z"),
+    });
+    await seedIssue(companyId, {
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      monitorLastTriggeredAt: FIRED_AT,
+      monitorAttemptCount: 1,
+      createdAt: new Date("2026-09-26T00:00:00.000Z"),
+    });
+
+    const service = taskWatchdogService(db);
+    const result = await service.detectStaleIssueMonitors({
+      companyId,
+      issueCreatedAtGte: new Date("2026-09-25T00:00:00.000Z"),
+    });
+
+    expect(result.checked).toBe(1);
+    expect(result.detected).toBe(1);
+    expect(result.reported).toBe(1);
+    expect(result.detections[0].issueId).not.toBe(oldIssueId);
+  });
 });

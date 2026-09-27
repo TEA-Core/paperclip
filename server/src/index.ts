@@ -1876,6 +1876,14 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        const staleIssueMonitors = await heartbeat.detectStaleIssueMonitors();
+        if (staleIssueMonitors.reported > 0) {
+          logger.warn(
+            { ...staleIssueMonitors },
+            "startup fired-never-rearmed monitor detector reported issues",
+          );
+        }
+
         const scanned = await heartbeat.scanSilentActiveRuns();
         if (scanned.created > 0 || scanned.escalated > 0) {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
@@ -2199,6 +2207,12 @@ async function startServerWithDatabaseTeardown(
               const reconciled = await heartbeat.reconcileTaskWatchdogs();
               if (reconciled.triggered > 0) {
                 logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
+              }
+            })
+            .then(async () => {
+              const staleIssueMonitors = await heartbeat.detectStaleIssueMonitors();
+              if (staleIssueMonitors.reported > 0) {
+                logger.warn({ ...staleIssueMonitors }, "periodic fired-never-rearmed monitor detector reported issues");
               }
             })
             .then(async () => {

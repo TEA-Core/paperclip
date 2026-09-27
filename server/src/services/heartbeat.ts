@@ -22153,6 +22153,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  async function detectStaleIssueMonitors(opts?: {
+    companyId?: string | null;
+    runId?: string | null;
+  }) {
+    return taskWatchdogs.detectStaleIssueMonitors({
+      ...opts,
+      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+    });
+  }
+
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
@@ -33618,6 +33628,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     scanTerminableSilentActiveRuns,
 
     reconcileTaskWatchdogs,
+
+    detectStaleIssueMonitors,
 
     buildRunOutputSilence,
 

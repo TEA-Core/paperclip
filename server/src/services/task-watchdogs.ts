@@ -2098,6 +2098,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     detectStaleIssueMonitors: async (opts: {
       companyId?: string | null;
       runId?: string | null;
+      issueCreatedAtGte?: Date | null;
     } = {}) => {
       const rows = await db
         .select({
@@ -2120,6 +2121,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           sql`${issues.assigneeAgentId} is not null`,
           isNull(issues.assigneeUserId),
           inArray(issues.status, [...TASK_WATCHDOG_MONITOR_STALE_STATUSES]),
+          ...(opts.issueCreatedAtGte ? [gte(issues.createdAt, opts.issueCreatedAtGte)] : []),
         ));
       const result: TaskWatchdogMonitorStaleScanResult = {
         checked: 0,
