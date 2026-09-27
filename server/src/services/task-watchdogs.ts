@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
   agents,
+  activityLog,
   approvals,
   heartbeatRuns,
   issueComments,
@@ -30,6 +31,16 @@ const TASK_WATCHDOG_LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"]
 const TASK_WATCHDOG_WAKE_REQUEST_STATUSES = ["queued", "deferred_issue_execution"] as const;
 const TASK_WATCHDOG_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
 const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+// SUP-17672: fingerprint prefix and activity action for fired-never-rearmed
+// monitor reports (SUP-16546 detector 1 of 3).
+const TASK_WATCHDOG_MONITOR_STALE_FINGERPRINT_PREFIX = "task_watchdog_monitor_stale:";
+const TASK_WATCHDOG_MONITOR_STALE_ACTION = "issue.task_watchdog_monitor_stale_detected";
+// Monitor-armed issue states, mirroring `issueAllowsMonitor`
+// (issue-execution-policy) and the heartbeat monitor tick: a monitor that
+// fired and was left unrearmed in one of these states is the anomaly this
+// detector reports. In every other state the monitor is intentionally absent,
+// so its flat next-check time must not be treated as a missed re-arm.
+const TASK_WATCHDOG_MONITOR_STALE_STATUSES = ["in_progress", "in_review", "blocked"] as const;
 // Grace window after an issue is created/assigned during which its first
 // assignment run/wake may have been enqueued but is not yet visible to a
 // watchdog evaluation (the eval can race the issue's own assignment run).
@@ -141,6 +152,43 @@ export type TaskWatchdogStopSnapshot = {
   fingerprint: string;
   materialLeaves: TaskWatchdogMaterialLeaf[];
   waitsByIssueId: TaskWatchdogWaitsByIssueId;
+};
+
+// SUP-17672 (SUP-16546 detector 1 of 3): input for the fired-never-rearmed
+// monitor detector. `monitorLastTriggeredAt` is the flat firing evidence
+// written by `buildIssueMonitorTriggeredPatch`; `monitorNextCheckAt` is null
+// immediately after a firing until the monitor is re-armed.
+export type TaskWatchdogMonitorStaleIssue = Pick<
+  IssueRow,
+  | "id"
+  | "companyId"
+  | "identifier"
+  | "title"
+  | "status"
+  | "assigneeAgentId"
+  | "assigneeUserId"
+  | "monitorLastTriggeredAt"
+  | "monitorNextCheckAt"
+  | "monitorAttemptCount"
+>;
+
+export type TaskWatchdogMonitorStaleDetection = {
+  issueId: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  assigneeAgentId: string | null;
+  monitorLastTriggeredAt: string;
+  monitorLastTriggeredAtMs: number;
+  monitorAttemptCount: number;
+  fingerprint: string;
+};
+
+export type TaskWatchdogMonitorStaleScanResult = {
+  checked: number;
+  detected: number;
+  reported: number;
+  detections: TaskWatchdogMonitorStaleDetection[];
 };
 
 type TaskWatchdogPendingInteractionsByIssueId = Record<string, Array<{
@@ -315,6 +363,89 @@ function stableStopFingerprint(input: {
     waitsByIssueId: input.waitsByIssueId,
   });
   return `task_watchdog_stop:${createHash("sha256").update(payload).digest("hex")}`;
+}
+
+// SUP-17672 (SUP-16546 detector 1 of 3): stable fingerprint for a
+// fired-never-rearmed monitor report. It keys on the firing evidence (the
+// `monitorLastTriggeredAt` the monitor wrote when it dispatched, plus the
+// attempt count) so re-evaluating the same stale monitor yields the same
+// fingerprint (repeat reports dedupe), while a new firing event moves it and
+// reports again.
+function stableMonitorStaleFingerprint(input: {
+  companyId: string;
+  issueId: string;
+  monitorLastTriggeredAtMs: number;
+  monitorAttemptCount: number;
+}) {
+  const payload = JSON.stringify({
+    version: 1,
+    companyId: input.companyId,
+    issueId: input.issueId,
+    monitorLastTriggeredAtMs: input.monitorLastTriggeredAtMs,
+    monitorAttemptCount: input.monitorAttemptCount,
+  });
+  return `${TASK_WATCHDOG_MONITOR_STALE_FINGERPRINT_PREFIX}${createHash("sha256").update(payload).digest("hex")}`;
+}
+
+// SUP-17672 (SUP-16546 detector 1 of 3): detect issue monitors that fired and
+// were never re-armed. A due monitor dispatch clears `monitorNextCheckAt` and
+// sets `monitorLastTriggeredAt` in the same write; the next check time only
+// becomes non-null again when the monitor is re-armed. A non-null
+// `monitorLastTriggeredAt` together with a null `monitorNextCheckAt` on an
+// agent-assigned issue in a monitor-armed state is therefore the
+// fired-never-rearmed anomaly. Detection only: this reports the owning issue;
+// it does not re-arm, park, or escalate anything.
+export function detectFiredNeverRearmedMonitor(
+  issue: TaskWatchdogMonitorStaleIssue,
+): TaskWatchdogMonitorStaleDetection | null {
+  const monitorLastTriggeredAtMs = toEpochMs(issue.monitorLastTriggeredAt);
+  if (monitorLastTriggeredAtMs == null) return null;
+  if (issue.monitorNextCheckAt != null) return null;
+  if (!TASK_WATCHDOG_MONITOR_STALE_STATUSES.includes(issue.status as (typeof TASK_WATCHDOG_MONITOR_STALE_STATUSES)[number])) {
+    return null;
+  }
+  if (!issue.assigneeAgentId || issue.assigneeUserId) return null;
+  const monitorAttemptCount =
+    typeof issue.monitorAttemptCount === "number" && Number.isFinite(issue.monitorAttemptCount)
+      ? issue.monitorAttemptCount
+      : 0;
+  return {
+    issueId: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    status: issue.status,
+    assigneeAgentId: issue.assigneeAgentId,
+    monitorLastTriggeredAt: new Date(monitorLastTriggeredAtMs).toISOString(),
+    monitorLastTriggeredAtMs,
+    monitorAttemptCount,
+    fingerprint: stableMonitorStaleFingerprint({
+      companyId: issue.companyId,
+      issueId: issue.id,
+      monitorLastTriggeredAtMs,
+      monitorAttemptCount,
+    }),
+  };
+}
+
+// SUP-17672: dedupe guard for fired-never-rearmed monitor reports. The report
+// activity entry stores the stable fingerprint in `details->fingerprint`, so a
+// repeat scan of the same stale monitor finds the existing entry and does not
+// accumulate another.
+async function hasReportedMonitorStaleFingerprint(
+  db: Db,
+  detection: TaskWatchdogMonitorStaleDetection,
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, detection.issueId),
+      eq(activityLog.action, TASK_WATCHDOG_MONITOR_STALE_ACTION),
+      sql`${activityLog.details}->>'fingerprint' = ${detection.fingerprint}`,
+    ))
+    .limit(1);
+  return row !== undefined;
 }
 
 function materialLeaf(leaf: TaskWatchdogStoppedLeaf): TaskWatchdogMaterialLeaf {
@@ -1960,6 +2091,69 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         } else {
           result.skipped += 1;
         }
+      }
+      return result;
+    },
+
+    detectStaleIssueMonitors: async (opts: {
+      companyId?: string | null;
+      runId?: string | null;
+    } = {}) => {
+      const rows = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          monitorAttemptCount: issues.monitorAttemptCount,
+        })
+        .from(issues)
+        .where(and(
+          ...(opts.companyId ? [eq(issues.companyId, opts.companyId)] : []),
+          sql`${issues.monitorLastTriggeredAt} is not null`,
+          isNull(issues.monitorNextCheckAt),
+          sql`${issues.assigneeAgentId} is not null`,
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, [...TASK_WATCHDOG_MONITOR_STALE_STATUSES]),
+        ));
+      const result: TaskWatchdogMonitorStaleScanResult = {
+        checked: 0,
+        detected: 0,
+        reported: 0,
+        detections: [],
+      };
+      for (const row of rows) {
+        result.checked += 1;
+        const detection = detectFiredNeverRearmedMonitor(row);
+        if (!detection) continue;
+        result.detected += 1;
+        result.detections.push(detection);
+        if (await hasReportedMonitorStaleFingerprint(db, detection)) continue;
+        await logActivity(db, {
+          companyId: row.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: detection.assigneeAgentId,
+          runId: opts.runId ?? null,
+          action: TASK_WATCHDOG_MONITOR_STALE_ACTION,
+          entityType: "issue",
+          entityId: detection.issueId,
+          details: {
+            source: "task_watchdogs.detect_stale_issue_monitors",
+            issueIdentifier: detection.identifier,
+            status: detection.status,
+            assigneeAgentId: detection.assigneeAgentId,
+            monitorLastTriggeredAtMs: detection.monitorLastTriggeredAtMs,
+            monitorAttemptCount: detection.monitorAttemptCount,
+            fingerprint: detection.fingerprint,
+          },
+        });
+        result.reported += 1;
       }
       return result;
     },
