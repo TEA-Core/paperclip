@@ -14,26 +14,23 @@ async function json(response: APIResponse) {
 for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "queued_interrupt", "automatic_message"] as const) {
   test(`legacy startup hold: ${action} reaches a new agent response`, async ({ page, request }) => {
     // SUP-17651 board decision 302d393f / exec-CTO ruling 75dd7e23 + correction b4441ea3:
-    // the two affordance-dependent variants are quarantined, not deleted. The retry
-    // button waited for below is a pre-projection control whose render condition is a
-    // three-predicate server-state wait (TaskChatThread.tsx:2823-2831), and every
-    // predicate is one-way-falsified by the state this spec deliberately seeds: the
-    // reconciliation-causing recovery action, the recovery_needed projection, and any
-    // automation retry off `blocked` each withdraw the affordance by design
-    // (IssueRecoveryActionCard.tsx:1080/1129). Longer caps cannot pass -- measured
-    // 5/5 local green at ~13s (click wins the race) vs 2/2 CI red at exactly the
-    // 240s cap (projection wins). Re-enable via SUP-17740 (projection-deterministic
-    // seeding redesign). The other four variants stay live.
-    test.fixme(
-      action === "thread_retry" || action === "inbox_retry",
-      "SUP-17651: retry affordance is withdrawn by the execution-reconciliation projection; re-enable via SUP-17740.",
-    );
+    // the two retry variants (thread_retry, inbox_retry) were quarantined because the
+    // "Try again" / "Retry" affordance is a pre-projection control whose render is a
+    // three-predicate server-state wait (TaskChatThread.tsx:2822-2831) one-way-falsified
+    // by the state this spec deliberately seeds (TaskChatThread.tsx:546-577,
+    // IssueRecoveryActionCard.tsx:1080/1129): the reconciliation-causing recovery action,
+    // the recovery_needed projection, and any retry off `blocked` each withdraw the
+    // button, and none of those predicates ever flip back, so a longer visibility cap
+    // cannot pass (measured 5/5 local green at ~13s click-wins vs 2/2 CI red at the
+    // 240s cap, projection-wins). SUP-17740 re-enables them by dropping the UI click and
+    // driving the continuation through the server path the affordance would have
+    // triggered (the board retry_failed_run manual wakeup, see the else branch below),
+    // which is deterministic in this seeded state and cannot race the projection.
     // SUP-17651: envelope for loaded-runner setup plus the signal-driven waits below:
-    // the retry-button appearance gate (240s) and the post-click completion signal
-    // (90s pipeline poll + 90s done-close poll + two 45s render checks). The internal
-    // waits terminate early when the server state settles; the cap is the
-    // pathological ceiling, not a budget. 600s = setup + 240s button gate +
-    // worst-case post-click (90s + 90s + 45s + 45s); normal cases finish in ~12s,
+    // the post-dispatch completion signal (90s pipeline poll + 90s done-close poll +
+    // two 45s render checks). The internal waits terminate early when the server state
+    // settles; the cap is the pathological ceiling, not a budget. 600s = setup +
+    // worst-case post-dispatch (90s + 90s + 45s + 45s); normal cases finish in ~12s,
     // so the extra ceiling costs nothing but the pathological tail.
     test.setTimeout(600_000);
     const root = await mkdtemp(path.join(os.tmpdir(), "legacy-recovery-browser-"));
@@ -128,16 +125,27 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         await page.getByRole("textbox", { name: "editable markdown" }).fill("Please continue the pending follow-up.");
         await page.getByRole("button", { name: "Send", exact: true }).click();
       } else {
-        // SUP-17651: the recovery retry button ("Try again" on a blocked task thread,
-        // "Retry" on the execution-blocker notice / inbox) renders only after the page's
-        // recovery data has fetched and rendered. On the heaviest-load merge-queue preview
-        // that fetch lagged >200s, so a blind .click() ate the whole cap with "element(s)
-        // not found" -- the same class the queued_interrupt Interrupt-button hardening
-        // (slice 2d) widened from 5s -> 45s. Wait on the button explicitly, bounded, so it
-        // can never starve the post-click completion waits.
-        const retryButton = page.getByRole("button", { name: action === "thread_retry" ? "Try again" : "Retry", exact: true });
-        await expect(retryButton).toBeVisible({ timeout: 240_000 });
-        await retryButton.click();
+        // SUP-17740 (server-path drive, exec-CTO b4441ea3 §2): instead of waiting for and
+        // clicking the UI affordance -- which the seeded state deliberately withholds, the
+        // retry button is a pre-projection control one-way-falsified by the reconciliation
+        // projection, so a longer cap cannot pass -- drive the continuation through the
+        // exact server path the affordance would have triggered: the board `retry_failed_run`
+        // manual wakeup (agentsApi.retryFailedRun, ui/src/api/agents.ts:249 -> POST
+        // /api/agents/:id/wakeup). This deterministically retries the seeded legacy run in
+        // this state (the retry_failed_run admission path continues a legacy
+        // reconciliation run; see server/src/services/explicit-native-continuation.ts) and
+        // cannot race the projection. Both variants share the identical seeded state, so
+        // both drive the same server path; only the surface they started from differs.
+        // json() asserts the wakeup dispatches (200), so a skipped/withheld admission
+        // fails here instead of starving the post-dispatch completion waits.
+        await json(await request.post(`/api/agents/${agent.id}/wakeup`, {
+          data: {
+            source: "on_demand",
+            triggerDetail: "manual",
+            reason: "retry_failed_run",
+            failedRunId: sourceRunId,
+          },
+        }));
         if (action === "inbox_retry") await page.goto(taskUrl);
       }
       // Fork divergence (SUP-12693 done-tier close comment, slice 2c): upstream 9031516a7 posts
