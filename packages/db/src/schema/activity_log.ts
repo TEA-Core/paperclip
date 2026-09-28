@@ -2,6 +2,7 @@ import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-cor
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
+import { boardApiKeys } from "./board_api_keys.js";
 
 export const activityLog = pgTable(
   "activity_log",
@@ -15,6 +16,7 @@ export const activityLog = pgTable(
     entityId: text("entity_id").notNull(),
     agentId: uuid("agent_id").references(() => agents.id),
     runId: uuid("run_id").references(() => heartbeatRuns.id),
+    boardApiKeyId: uuid("board_api_key_id").references(() => boardApiKeys.id, { onDelete: "set null" }),
     responsibleUserId: text("responsible_user_id"),
     details: jsonb("details").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -24,6 +26,11 @@ export const activityLog = pgTable(
     companyAgentCreatedIdx: index("activity_log_company_agent_created_idx").on(
       table.companyId,
       table.agentId,
+      table.createdAt,
+    ),
+    companyBoardApiKeyCreatedIdx: index("activity_log_company_board_api_key_created_idx").on(
+      table.companyId,
+      table.boardApiKeyId,
       table.createdAt,
     ),
     companyResponsibleUserCreatedIdx: index("activity_log_company_responsible_user_created_idx").on(

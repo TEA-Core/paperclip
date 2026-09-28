@@ -201,6 +201,7 @@ export function getActorInfo(req: Request): (
     agentId: string | null;
     runId: string | null;
     agentApiKeyId: string | null;
+    boardApiKeyId: null;
     actorSource: "agent_key" | "agent_jwt";
   }
   | {
@@ -210,6 +211,7 @@ export function getActorInfo(req: Request): (
     agentId: null;
     runId: string | null;
     agentApiKeyId: null;
+    boardApiKeyId: string | null;
     actorSource: "local_implicit" | "session" | "board_key" | "cloud_tenant";
   }
 ) {
@@ -222,6 +224,7 @@ export function getActorInfo(req: Request): (
       agentId: req.actor.agentId ?? null,
       runId: req.actor.runId ?? null,
       agentApiKeyId: req.actor.keyId ?? null,
+      boardApiKeyId: null,
       actorSource,
     };
   }
@@ -240,6 +243,7 @@ export function getActorInfo(req: Request): (
     agentId: null,
     runId: req.actor.runId ?? null,
     agentApiKeyId: null,
+    boardApiKeyId: req.actor.source === "board_key" ? req.actor.keyId ?? null : null,
     actorSource,
   };
 }

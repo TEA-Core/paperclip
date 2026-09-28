@@ -208,6 +208,7 @@ describeEmbeddedPostgres("activity service", () => {
         "entityId",
         "agentId",
         "runId",
+        "boardApiKeyId",
         "responsibleUserId",
         "details",
         "createdAt",

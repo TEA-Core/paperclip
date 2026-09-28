@@ -202,6 +202,7 @@ export function projectRoutes(db: Db) {
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: project.companyId, actorType: actor.actorType, actorId: actor.actorId,
+      boardApiKeyId: actor.boardApiKeyId,
       action: "project.repositories_updated", entityType: "project", entityId: project.id,
       details: { repositoryIds: repositories.map((repo) => repo.id) },
     });
@@ -298,6 +299,7 @@ export function projectRoutes(db: Db) {
       const hydrated = await service.getById(project.id);
       const activity = await persistActivity(tx as unknown as Db, {
         companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId,
+        boardApiKeyId: actor.boardApiKeyId,
         runId: actor.runId, issueId: runContext?.issue.id,
         action: "project.created", entityType: "project", entityId: project.id,
         details: {
@@ -364,6 +366,7 @@ export function projectRoutes(db: Db) {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
+      boardApiKeyId: actor.boardApiKeyId,
       action: "project.updated",
       entityType: "project",
       entityId: project.id,
@@ -408,6 +411,7 @@ export function projectRoutes(db: Db) {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
+      boardApiKeyId: actor.boardApiKeyId,
       action: "project.workspace_created",
       entityType: "project",
       entityId: id,
@@ -452,6 +456,7 @@ export function projectRoutes(db: Db) {
         actorType: actor.actorType,
         actorId: actor.actorId,
         agentId: actor.agentId,
+        boardApiKeyId: actor.boardApiKeyId,
         action: "project.workspace_updated",
         entityType: "project",
         entityId: id,
@@ -511,6 +516,7 @@ export function projectRoutes(db: Db) {
         agentId: actor.agentId,
         runId: actor.runId,
         agentApiKeyId: actor.agentApiKeyId,
+        boardApiKeyId: actor.boardApiKeyId,
         action: "project.base_repo_rescue_reset",
         entityType: "project_workspace",
         entityId: workspace.id,
@@ -535,6 +541,7 @@ export function projectRoutes(db: Db) {
       agentId: actor.agentId,
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
+      boardApiKeyId: actor.boardApiKeyId,
       action: "project.base_repo_rescue_reset",
       entityType: "project_workspace",
       entityId: workspace.id,
@@ -816,6 +823,7 @@ export function projectRoutes(db: Db) {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
+      boardApiKeyId: actor.boardApiKeyId,
       action: `project.workspace_runtime_${action}`,
       entityType: "project",
       entityId: project.id,
@@ -856,6 +864,7 @@ export function projectRoutes(db: Db) {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
+      boardApiKeyId: actor.boardApiKeyId,
       action: "project.workspace_deleted",
       entityType: "project",
       entityId: id,
@@ -884,6 +893,7 @@ export function projectRoutes(db: Db) {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
+      boardApiKeyId: actor.boardApiKeyId,
       action: "project.deleted",
       entityType: "project",
       entityId: project.id,
