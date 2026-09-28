@@ -95,6 +95,7 @@ const {
     // dependency-wake backstop plus the fork sweeps that share its timer.
     reconcileIssueGraphLiveness: vi.fn(async () => ({ dependencyWakesHealed: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
+    detectStaleIssueMonitors: vi.fn(async () => ({ checked: 0, detected: 0, reported: 0, detections: [] })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     reconcileBlockedWithoutBlockers: vi.fn(async () => ({ escalated: 0, healed: 0 })),
     reconcilePendingReviewRearm: vi.fn(async () => ({ reArmed: 0, checked: 0 })),
@@ -680,6 +681,34 @@ describe("startServer feedback export wiring", () => {
       expect(retiredDetector).not.toHaveBeenCalled();
     } finally {
       delete (runtime as Partial<typeof runtime>).reconcileProductivityReviews;
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("detects stale issue monitors at startup and on the periodic heartbeat sweep", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
+    }));
+    const heartbeatInterval: { callback: (() => void) | null } = { callback: null };
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, delayMs?: number) => {
+      // Capture only the heartbeat scheduler interval so unrelated startup
+      // timers registered later cannot shadow it.
+      if (delayMs === HEARTBEAT_SCHEDULER_INTERVAL_MS) heartbeatInterval.callback = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      await startServer();
+      expect(heartbeatServiceMock.detectStaleIssueMonitors).toHaveBeenCalledTimes(1);
+      expect(heartbeatInterval.callback).not.toBeNull();
+      heartbeatInterval.callback?.();
+      // The fork's periodic recovery chain runs many sweeps in sequence; wait
+      // for the step that follows the stale-monitor detector before asserting.
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.scanSilentActiveRuns).toHaveBeenCalledTimes(2);
+      });
+      expect(heartbeatServiceMock.detectStaleIssueMonitors).toHaveBeenCalledTimes(2);
+    } finally {
       setIntervalSpy.mockRestore();
     }
   });

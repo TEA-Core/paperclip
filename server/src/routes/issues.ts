@@ -714,6 +714,12 @@ function noopTaskWatchdogService(): TaskWatchdogService {
       },
     }),
     advanceWatchdogRunStopFingerprint: async () => null,
+    detectStaleIssueMonitors: async () => ({
+      checked: 0,
+      detected: 0,
+      reported: 0,
+      detections: [],
+    }),
   };
 }
 
