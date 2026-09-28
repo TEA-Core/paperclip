@@ -126,6 +126,7 @@ export async function evaluateUndischargeableLadderEdge(
   const shape = await findMissingAdr072CloseLadderStages(
     db,
     companyId,
+    newParentId,
     parent.executionPolicy,
     parent.executionState,
     parent.createdByAgentId,

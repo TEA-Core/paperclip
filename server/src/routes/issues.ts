@@ -15471,6 +15471,7 @@ export function issueRoutes(
       const shape = await findMissingAdr072CloseLadderStages(
         db,
         parent.companyId,
+        parent.id,
         parent.executionPolicy,
         parent.executionState,
         parent.createdByAgentId,
