@@ -664,6 +664,7 @@ describe("environment customImage setup routes", () => {
         agentId: null,
         runId: null,
         agentApiKeyId: null,
+        boardApiKeyId: null,
       },
       companyId: "company-1",
     });

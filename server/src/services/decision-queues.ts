@@ -40,7 +40,7 @@ export type DecisionMutationActor = {
   userId: string | null;
   runId: string | null;
   agentApiKeyId: string | null;
-  boardApiKeyId: string | null;
+  boardApiKeyId?: string | null;
   responsibleUserId: string | null;
 };
 

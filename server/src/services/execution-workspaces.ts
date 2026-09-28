@@ -3368,7 +3368,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     reopenClosedIsolatedExecutionWorkspaceForIssue: async (input: {
       workspaceId: string;
       issue: { id: string; companyId: string; projectId: string | null };
-      actor: { agentId: string | null; actorType: string; boardApiKeyId: string | null };
+      actor: { agentId: string | null; actorType: string; boardApiKeyId?: string | null };
       // When true, the reopen is conditional on the issue still being live at the
       // reopen boundary: the persisted issue status is re-read inside this same
       // advisory-locked transaction, and a terminal card refuses the rebuild
@@ -3766,7 +3766,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     clearReopenPendingConsumptionForUnconsumedReopen: async (input: {
       workspaceId: string;
       issue: { id: string; companyId: string };
-      actor: { agentId: string | null; actorType: string; boardApiKeyId: string | null };
+      actor: { agentId: string | null; actorType: string; boardApiKeyId?: string | null };
       // The generation the reopen published the active row at. It owns the flag.
       // The clear runs only while the current generation still matches, so it never
       // clears a newer reopen's fence.
