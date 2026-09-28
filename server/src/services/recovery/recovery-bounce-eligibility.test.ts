@@ -192,3 +192,69 @@ describe("SUP-17884: recovery bounce eligibility (pure helpers)", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// SUP-17808 shape, end-to-end through the C1/C2/C3 pipeline the sweep uses.
+//
+// `resolveStrandedIssueRecoveryOwnerAgentId` filters candidates through C2 and
+// orders the survivors through C3; `resolveRecoveryReassignedAssignee` applies
+// the C1 refusal when the chosen owner is not live. These three pure helpers are
+// the entire selection decision, so composing them reproduces the incident
+// without a full database: the only candidate is a company root (exec-CEO) in
+// `error` failing every dispatch. The card must not move onto it.
+// ---------------------------------------------------------------------------
+
+describe("SUP-17808 shape: ladder collapsing to a dead root agent", () => {
+  it("reassigns nothing when the sole candidate is a root failing every dispatch", () => {
+    // exec-CEO: company root (reportsTo: null, entered the ladder by ROLE),
+    // status `error` (invokable — it is set on a failed run, cleared on the next
+    // success), last K wake requests all `failed`.
+    const root = { status: "error", wakes: ["failed", "failed", "failed"] };
+    const cardOwner = "agent-1"; // who actually owed the card
+
+    // C2 filters the candidate out of the ladder even though status is invokable.
+    expect(isRecoveryBounceTargetLive(root.status, root.wakes)).toBe(false);
+
+    // With no live candidate the ladder would propose the dead root as the
+    // recovery owner. The shared refusal refuses that write and keeps the card
+    // where it already sits — the assignee is UNCHANGED.
+    const decision = decideRecoveryReassignment({
+      currentAssigneeAgentId: cardOwner,
+      recoveryOwnerAgentId: "exec-ceo",
+      reviewStageSelfSatisfies: false,
+      recoveryOwnerLive: false,
+    });
+    expect(decision.assigneeAgentId).toBe(cardOwner);
+    expect(decision.refused).toBe(true);
+    expect(decision.refusalReason).toBe("reassignment_target_not_live");
+    expect(decision.refusedAssigneeAgentId).toBe("exec-ceo");
+    expect(decision.keptAssigneeAgentId).toBe(cardOwner);
+  });
+
+  it("prefers a live idle candidate over a live-but-error one (C3 ordering)", () => {
+    const idle = { status: "idle", wakes: ["succeeded"] };
+    const errored = { status: "error", wakes: ["failed"] }; // one transient failure, still live
+
+    // Both are live (one failed wake < K=3). C3 ranks idle ahead of error.
+    expect(isRecoveryBounceTargetLive(idle.status, idle.wakes)).toBe(true);
+    expect(isRecoveryBounceTargetLive(errored.status, errored.wakes)).toBe(true);
+    expect(recoveryBounceStatusRank(idle.status)).toBeLessThan(recoveryBounceStatusRank(errored.status));
+  });
+
+  it("still selects an `error`-status agent with a clean wake history (the §0 guard)", () => {
+    // A regression to C2 that treats `error` as dead would make any agent whose
+    // last run failed permanently undispatchable. This pins the opposite: `error`
+    // alone (no failed-wake streak) remains a selectable recovery target.
+    const agent = { status: "error", wakes: null }; // never failed a dispatch, or never dispatched
+    expect(isRecoveryBounceTargetLive(agent.status, agent.wakes)).toBe(true);
+
+    const decision = decideRecoveryReassignment({
+      currentAssigneeAgentId: "agent-1",
+      recoveryOwnerAgentId: "exec-ceo",
+      reviewStageSelfSatisfies: false,
+      recoveryOwnerLive: true,
+    });
+    expect(decision.assigneeAgentId).toBe("exec-ceo");
+    expect(decision.refused).toBe(false);
+  });
+});
