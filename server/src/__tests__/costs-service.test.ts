@@ -389,6 +389,7 @@ describe("cost routes", () => {
         windowKind: "calendar_month_utc",
       },
       "board-user",
+      null,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),

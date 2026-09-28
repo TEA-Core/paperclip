@@ -15,6 +15,8 @@ export type QueuedCommentActor = {
   agentId: string | null;
   runId: string | null;
   agentApiKeyId: string | null;
+  /** The board API key id when the write was authenticated with a board key; null otherwise. */
+  boardApiKeyId?: string | null;
 };
 
 /** The fields a mutation needs to log its own activity row; entity type is always "issue". */
@@ -24,6 +26,7 @@ export type QueuedCommentActivityLogInput = {
   agentId: string | null;
   runId: string | null;
   agentApiKeyId: string | null;
+  boardApiKeyId: string | null;
   action: string;
   entityId: string;
   details: Record<string, unknown>;

@@ -569,6 +569,7 @@ export function caseRoutes(db: Db, storage: StorageService) {
       await logActivity(db, {
         companyId: input.caseRow.companyId,
         actorType: input.actor.actorType,
+        boardApiKeyId: input.actor.boardApiKeyId,
         actorId: input.actor.actorId,
         agentId: input.actor.agentId,
         runId: input.actor.runId,
@@ -783,6 +784,7 @@ export function caseRoutes(db: Db, storage: StorageService) {
       await logActivity(db, {
         companyId: caseRow.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -822,6 +824,7 @@ export function caseRoutes(db: Db, storage: StorageService) {
       await logActivity(db, {
         companyId: caseRow.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -859,6 +862,7 @@ export function caseRoutes(db: Db, storage: StorageService) {
       await logActivity(db, {
         companyId: caseRow.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,

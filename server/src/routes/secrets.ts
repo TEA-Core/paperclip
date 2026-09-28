@@ -16,7 +16,7 @@ import {
   updateUserSecretValueSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource } from "./authz.js";
+import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -96,10 +96,11 @@ function boardActorUser(req: Parameters<typeof assertBoard>[0]) {
 
 function userSecretDefinitionActivityActor(req: Parameters<typeof assertBoard>[0]) {
   assertBoard(req);
+  const boardApiKeyId = getActorInfo(req).boardApiKeyId;
   if (req.actor.userId) {
-    return { actorType: "user" as const, actorId: req.actor.userId };
+    return { actorType: "user" as const, actorId: req.actor.userId, boardApiKeyId };
   }
-  return { actorType: "system" as const, actorId: req.actor.source ?? "board" };
+  return { actorType: "system" as const, actorId: req.actor.source ?? "board", boardApiKeyId };
 }
 
 function isCompanyScopedSecret(secret: { scope?: string | null }) {
@@ -400,6 +401,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "secret_provider_config.discovery_previewed",
         entityType: "secret_provider_config_discovery",
         entityId: companyId,
@@ -436,6 +438,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret_provider_config.created",
       entityType: "secret_provider_config",
       entityId: created.id,
@@ -478,6 +481,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId: updated.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret_provider_config.updated",
       entityType: "secret_provider_config",
       entityId: updated.id,
@@ -508,6 +512,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId: removed.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret_provider_config.removed",
       entityType: "secret_provider_config",
       entityId: removed.id,
@@ -537,6 +542,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId: updated.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret_provider_config.default_set",
       entityType: "secret_provider_config",
       entityId: updated.id,
@@ -566,6 +572,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId: existing.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret_provider_config.health_checked",
       entityType: "secret_provider_config",
       entityId: existing.id,
@@ -632,6 +639,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       await logActivity(db, {
         companyId,
         actorType: activityActor.actorType,
+        boardApiKeyId: activityActor.boardApiKeyId,
         actorId: activityActor.actorId,
         action: "user_secret_definition.created",
         entityType: "user_secret_definition",
@@ -677,6 +685,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       await logActivity(db, {
         companyId,
         actorType: activityActor.actorType,
+        boardApiKeyId: activityActor.boardApiKeyId,
         actorId: activityActor.actorId,
         action: activityAction,
         entityType: "user_secret_definition",
@@ -707,6 +716,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     await logActivity(db, {
       companyId,
       actorType: activityActor.actorType,
+      boardApiKeyId: activityActor.boardApiKeyId,
       actorId: activityActor.actorId,
       action: "user_secret_definition.deleted",
       entityType: "user_secret_definition",
@@ -909,6 +919,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret.created",
       entityType: "secret",
       entityId: created.id,
@@ -937,6 +948,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "secret.remote_import.previewed",
         entityType: "secret_provider_config",
         entityId: preview.providerConfigId,
@@ -974,6 +986,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "secret.remote_import.completed",
         entityType: "secret_provider_config",
         entityId: result.providerConfigId,
@@ -1020,6 +1033,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId: rotated.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret.rotated",
       entityType: "secret",
       entityId: rotated.id,
@@ -1064,6 +1078,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId: updated.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret.updated",
       entityType: "secret",
       entityId: updated.id,
@@ -1125,6 +1140,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       companyId: removed.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "secret.deleted",
       entityType: "secret",
       entityId: removed.id,

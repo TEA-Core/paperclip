@@ -339,6 +339,7 @@ export function approvalRoutes(
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "approval.created",
@@ -382,6 +383,7 @@ export function approvalRoutes(
         companyId: approval.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "approval.approved",
         entityType: "approval",
         entityId: approval.id,
@@ -439,6 +441,7 @@ export function approvalRoutes(
         companyId: approval.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "approval.rejected",
         entityType: "approval",
         entityId: approval.id,
@@ -491,6 +494,7 @@ export function approvalRoutes(
         companyId: approval.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "approval.revision_requested",
         entityType: "approval",
         entityId: approval.id,
@@ -539,6 +543,7 @@ export function approvalRoutes(
     await logActivity(db, {
       companyId: approval.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "approval.resubmitted",
@@ -571,6 +576,7 @@ export function approvalRoutes(
     await logActivity(db, {
       companyId: approval.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "approval.comment_added",

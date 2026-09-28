@@ -98,7 +98,7 @@ import {
   collapseDuplicatePendingHumanJoinRequests,
   findReusableHumanJoinRequest,
 } from "../lib/join-request-dedupe.js";
-import { assertAuthenticated, assertCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
   claimBoardOwnership,
   inspectBoardClaimChallenge
@@ -3338,6 +3338,7 @@ export function accessRoutes(
           req.actor.type === "agent"
             ? req.actor.agentId ?? "unknown-agent"
             : req.actor.userId ?? "board",
+            boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "invite.created",
         entityType: "invite",
         entityId: created.id,
@@ -3394,6 +3395,7 @@ export function accessRoutes(
           req.actor.type === "agent"
             ? req.actor.agentId ?? "unknown-agent"
             : req.actor.userId ?? "board",
+            boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "invite.openclaw_prompt_created",
         entityType: "invite",
         entityId: created.id,
@@ -4001,6 +4003,7 @@ export function accessRoutes(
             req.actor.type === "agent"
               ? req.actor.agentId ?? "invite-agent"
               : req.actor.userId ?? "board",
+              boardApiKeyId: getActorInfo(req).boardApiKeyId,
           action: "agent.updated_from_join_replay",
           entityType: "agent",
           entityId: updatedAgent.id,
@@ -4078,6 +4081,8 @@ export function accessRoutes(
             ? req.actor.agentId ?? "invite-agent"
             : req.actor.userId ??
               (requestType === "agent" ? "invite-anon" : "board"),
+        boardApiKeyId:
+          req.actor.type === "agent" ? null : getActorInfo(req).boardApiKeyId,
         action: inviteAlreadyAccepted
           ? "join.request_replayed"
           : "join.requested",
@@ -4163,6 +4168,7 @@ export function accessRoutes(
           req.actor.type === "agent"
             ? req.actor.agentId ?? "unknown-agent"
             : req.actor.userId ?? "board",
+            boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "invite.revoked",
         entityType: "invite",
         entityId: id
@@ -4324,6 +4330,7 @@ export function accessRoutes(
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "join.approved",
         entityType: "join_request",
         entityId: requestId,
@@ -4382,6 +4389,7 @@ export function accessRoutes(
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "join.rejected",
         entityType: "join_request",
         entityId: requestId,
@@ -4514,6 +4522,7 @@ export function accessRoutes(
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "company_member.updated",
         entityType: "company_membership",
         entityId: memberId,
@@ -4558,6 +4567,7 @@ export function accessRoutes(
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "company_member.access_updated",
         entityType: "company_membership",
         entityId: memberId,
@@ -4596,6 +4606,7 @@ export function accessRoutes(
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "company_member.archived",
         entityType: "company_membership",
         entityId: memberId,
@@ -4638,6 +4649,7 @@ export function accessRoutes(
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "company_member.permissions_updated",
         entityType: "company_membership",
         entityId: memberId,

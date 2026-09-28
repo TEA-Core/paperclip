@@ -5878,6 +5878,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     companyId: string,
     input: CreateChatEndpointInput,
     actorUserId?: string | null,
+    boardApiKeyId?: string | null,
   ) {
     if ((input.provider as string) === "agentmail") throw badRequest("Use the email inbox setup API for AgentMail");
     const agent = await db
@@ -5998,6 +5999,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       companyId,
       actorType: "user",
       actorId: actorUserId ?? "board",
+      boardApiKeyId: boardApiKeyId ?? null,
       action: "chat_endpoint.created",
       entityType: "tool_connection",
       entityId: connectionId,
@@ -6014,6 +6016,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     endpointId: string,
     input: UpdateChatEndpointInput,
     actorUserId?: string | null,
+    boardApiKeyId?: string | null,
   ) {
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
@@ -6048,6 +6051,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: existing.endpoint.companyId,
             actorType: "user",
             actorId: actorUserId ?? "board",
+            boardApiKeyId: boardApiKeyId ?? null,
             action: "chat_endpoint.updated",
             entityType: "tool_connection",
             entityId: existing.endpoint.connectionId,
@@ -6848,6 +6852,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function generateSetupSecret(
     endpointId: string,
     actorUserId?: string | null,
+    boardApiKeyId?: string | null,
   ) {
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
@@ -6921,6 +6926,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: endpoint.companyId,
             actorType: "user",
             actorId: actorUserId ?? "board",
+            boardApiKeyId: boardApiKeyId ?? null,
             action: "chat_endpoint.setup_secret_rotation_started",
             entityType: "tool_connection",
             entityId: endpoint.connectionId,
@@ -7040,6 +7046,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: endpoint.companyId,
             actorType: "user",
             actorId: actorUserId ?? "board",
+            boardApiKeyId: boardApiKeyId ?? null,
             action: "chat_endpoint.setup_secret_rotation_failed",
             entityType: "tool_connection",
             entityId: endpoint.connectionId,
@@ -7063,6 +7070,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: endpoint.companyId,
               actorType: "user",
               actorId: actorUserId ?? "board",
+              boardApiKeyId: boardApiKeyId ?? null,
               action: "chat_endpoint.setup_secret_generated",
               entityType: "tool_connection",
               entityId: endpoint.connectionId,
@@ -9023,6 +9031,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     endpointId: string,
     input: ConfigureChatEndpointInput,
     actorUserId?: string | null,
+    boardApiKeyId?: string | null,
   ) {
     const record = await endpointRecord(endpointId);
     if (!record) throw notFound("Chat endpoint not found");
@@ -9058,6 +9067,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         input,
         credentialLease,
         actorUserId,
+        boardApiKeyId,
       ),
     );
   }
@@ -9067,6 +9077,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     input: ConfigureChatEndpointInput,
     credentialLease: CredentialMutationLeaseGuard,
     actorUserId?: string | null,
+    boardApiKeyId?: string | null,
   ) {
     const record = await endpointRecord(endpointId);
     if (!record) throw notFound("Chat endpoint not found");
@@ -9129,6 +9140,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         companyId: endpoint.companyId,
         actorType: "user",
         actorId: actorUserId ?? "board",
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "chat_endpoint.paused",
         entityType: "tool_connection",
         entityId: endpoint.connectionId,
@@ -9321,6 +9333,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         companyId: endpoint.companyId,
         actorType: "user",
         actorId: actorUserId ?? "board",
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "chat_endpoint.resumed",
         entityType: "tool_connection",
         entityId: endpoint.connectionId,
@@ -9739,6 +9752,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: endpoint.companyId,
               actorType: "user",
               actorId: actorUserId ?? "board",
+              boardApiKeyId: boardApiKeyId ?? null,
               action,
               entityType: "tool_connection",
               entityId: endpoint.connectionId,
@@ -9878,6 +9892,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         companyId: endpoint.companyId,
         actorType: "user",
         actorId: actorUserId ?? "board",
+        boardApiKeyId: boardApiKeyId ?? null,
         action:
           input.action === "reconnect"
             ? "chat_endpoint.reconnected"
@@ -27597,6 +27612,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     endpointId: string,
     updates: Array<{ id: string; enabled: boolean }>,
     actorUserId?: string | null,
+    boardApiKeyId?: string | null,
   ) {
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
@@ -27689,6 +27705,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 companyId: endpoint.companyId,
                 actorType: "user",
                 actorId: actorUserId ?? "board",
+                boardApiKeyId: boardApiKeyId ?? null,
                 action: "chat_endpoint.resources_updated",
                 entityType: "tool_connection",
                 entityId: endpoint.connectionId,
@@ -28765,6 +28782,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       phase: import("@paperclipai/shared").ChatFileTransferPhase;
       version: number;
     },
+    boardApiKeyId?: string | null,
   ) {
     const initialRecord = await endpointRecord(endpointId);
     if (!initialRecord) throw notFound("Chat endpoint not found");
@@ -28853,6 +28871,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: publication.companyId,
               actorType: "user",
               actorId: userId,
+              boardApiKeyId: boardApiKeyId ?? null,
               action: `chat.publication_${action}`,
               entityType: "chat_publication",
               entityId: publication.id,
@@ -29078,6 +29097,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: publication.companyId,
             actorType: "user",
             actorId: userId,
+            boardApiKeyId: boardApiKeyId ?? null,
             action: `chat.publication_${action}`,
             entityType: "chat_publication",
             entityId: publication.id,
@@ -29106,6 +29126,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     actionId: string,
     resolution: "mark_delivered" | "retry_anyway" | "cancel",
     userId: string,
+    boardApiKeyId?: string | null,
   ) {
     const initialRecord = await endpointRecord(endpointId);
     if (!initialRecord) throw notFound("Chat endpoint not found");
@@ -29223,6 +29244,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: action.companyId,
               actorType: "user",
               actorId: userId,
+              boardApiKeyId: boardApiKeyId ?? null,
               action: "chat.provider_effect_retry_anyway",
               entityType: "chat_action",
               entityId: action.id,
@@ -29383,6 +29405,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: action.companyId,
             actorType: "user",
             actorId: userId,
+            boardApiKeyId: boardApiKeyId ?? null,
             action: `chat.provider_effect_${resolution}`,
             entityType: "chat_action",
             entityId: action.id,
@@ -29406,6 +29429,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     actionId: string,
     resolution: "mark_delivered" | "retry_anyway" | "cancel",
     userId: string,
+    boardApiKeyId?: string | null,
   ) {
     const initialRecord = await endpointRecord(endpointId);
     if (!initialRecord) throw notFound("Chat endpoint not found");
@@ -29421,7 +29445,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .then((rows) => rows[0] ?? null);
     if (!initialAction) throw notFound("Provider action not found");
     if (initialAction.kind === "provider_effect") {
-      await resolveProviderEffect(endpointId, actionId, resolution, userId);
+      await resolveProviderEffect(
+        endpointId,
+        actionId,
+        resolution,
+        userId,
+        boardApiKeyId,
+      );
       return;
     }
     if (initialRecord.endpoint.provider !== "slack") {
@@ -29514,6 +29544,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: action.companyId,
               actorType: "user",
               actorId: userId,
+              boardApiKeyId: boardApiKeyId ?? null,
               action: "chat.slack_command_cancel",
               entityType: "chat_action",
               entityId: action.id,
@@ -29809,6 +29840,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: current.companyId,
             actorType: "user",
             actorId: userId,
+            boardApiKeyId: boardApiKeyId ?? null,
             action: "chat.slack_command_retry_anyway",
             entityType: "chat_action",
             entityId: current.id,
@@ -30036,6 +30068,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     clientIdempotencyKey: string,
     userId: string,
     attachmentIds: string[] = [],
+    boardApiKeyId?: string | null,
   ) {
     const emailBoundary = await endpointRecord(endpointId);
     if (emailBoundary?.endpoint.publicationMode === "explicit")
@@ -30308,6 +30341,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         companyId: conversation.companyId,
         actorType: "user",
         actorId: userId,
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "chat.publication_requested",
         entityType: "chat_publication",
         entityId: created.id,

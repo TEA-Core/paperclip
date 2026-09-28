@@ -34,6 +34,7 @@ async function logMembershipChange(
   await logActivity(db, {
     companyId: input.companyId,
     actorType: actor.actorType,
+    boardApiKeyId: actor.boardApiKeyId,
     actorId: actor.actorId,
     agentId: actor.agentId,
     runId: actor.runId,

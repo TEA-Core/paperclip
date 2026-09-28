@@ -129,6 +129,7 @@ export function builtInAgentRoutes(db: Db) {
     await logActivity(db, {
       companyId: input.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       action: input.action,
       entityType: input.action === "approval.created" ? "approval" : "agent",

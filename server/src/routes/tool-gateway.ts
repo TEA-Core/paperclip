@@ -618,6 +618,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         actor: {
           agentId: actor.agentId,
           userId: req.actor.type === "board" ? req.actor.userId : null,
+          boardApiKeyId: actor.boardApiKeyId,
         },
       });
       res.json(actionRequest);
@@ -645,6 +646,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         actor: {
           agentId: actor.agentId,
           userId: req.actor.type === "board" ? req.actor.userId : null,
+          boardApiKeyId: actor.boardApiKeyId,
         },
       });
       res.json(actionRequest);

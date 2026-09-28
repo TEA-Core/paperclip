@@ -509,6 +509,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       companyId: string,
       input: BudgetPolicyUpsertInput,
       actorUserId: string | null,
+      boardApiKeyId?: string | null,
     ): Promise<BudgetPolicySummary> => {
       const scope = await resolveScopeRecord(db, input.scopeType, input.scopeId);
       if (scope.companyId !== companyId) {
@@ -613,6 +614,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         companyId,
         actorType: "user",
         actorId: actorUserId ?? "board",
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "budget.policy_upserted",
         entityType: "budget_policy",
         entityId: row.id,

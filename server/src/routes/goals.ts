@@ -33,6 +33,7 @@ export function goalRoutes(db: Db) {
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "goal.created",
@@ -61,6 +62,7 @@ export function goalRoutes(db: Db) {
     await logActivity(db, {
       companyId: goal.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "goal.updated",
@@ -86,6 +88,7 @@ export function goalRoutes(db: Db) {
     await logActivity(db, {
       companyId: goal.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "goal.deleted",

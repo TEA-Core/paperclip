@@ -867,7 +867,7 @@ export function externalObjectService(
 
   type RefreshObjectInput = {
     companyId: string;
-    actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId">;
+    actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId" | "boardApiKeyId">;
     force?: boolean;
     now?: Date;
   };
@@ -1014,6 +1014,7 @@ export function externalObjectService(
       await logActivity(db, {
         companyId: object.companyId,
         actorType: input.actor.actorType,
+        boardApiKeyId: input.actor.boardApiKeyId,
         actorId: input.actor.actorId,
         agentId: input.actor.agentId,
         runId: input.actor.runId,
@@ -1148,7 +1149,7 @@ export function externalObjectService(
   async function refreshIssueObjects(issueId: string, input: {
     companyId: string;
     objectIds?: string[];
-    actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId">;
+    actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId" | "boardApiKeyId">;
   }) {
     if (!(await isEnabled())) return [];
     const groups = await listForIssue(issueId);

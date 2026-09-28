@@ -32,7 +32,7 @@ export async function commitToolActionReview(
     decision: "approved" | "rejected";
     rememberAction?: boolean;
     reason?: string;
-    actor: { agentId?: string | null; userId?: string | null };
+    actor: { agentId?: string | null; userId?: string | null; boardApiKeyId?: string | null };
   },
 ) {
   if (input.actor.agentId)
@@ -226,6 +226,7 @@ export async function commitToolActionReview(
           companyId: input.companyId,
           actorType: "user",
           actorId: input.actor.userId ?? "board",
+          boardApiKeyId: input.actor.boardApiKeyId ?? null,
           action:
             input.decision === "approved"
               ? "issue.thread_interaction_accepted"

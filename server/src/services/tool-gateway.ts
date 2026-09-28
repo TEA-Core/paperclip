@@ -9340,7 +9340,7 @@ export function createToolGatewayService(
       issueId?: string;
       interactionId?: string;
       actionRequestId: string;
-      actor: { agentId?: string | null; userId?: string | null };
+      actor: { agentId?: string | null; userId?: string | null; boardApiKeyId?: string | null };
     }) {
       if (input.actor.agentId)
         throw new ToolGatewayHttpError(
@@ -9613,7 +9613,7 @@ export function createToolGatewayService(
       interactionId?: string;
       actionRequestId: string;
       reason?: string;
-      actor: { agentId?: string | null; userId?: string | null };
+      actor: { agentId?: string | null; userId?: string | null; boardApiKeyId?: string | null };
     }) {
       const updated = await commitToolActionReview(db, {
         ...input,

@@ -1145,6 +1145,7 @@ export function environmentCustomImageService(
         agentId?: string | null;
         runId?: string | null;
         agentApiKeyId?: string | null;
+        boardApiKeyId?: string | null;
       };
       companyId: string;
       now?: Date;
@@ -1244,6 +1245,7 @@ export function environmentCustomImageService(
           agentId: input.actor.agentId ?? null,
           runId: input.actor.runId ?? null,
           agentApiKeyId: input.actor.agentApiKeyId ?? null,
+          boardApiKeyId: input.actor.boardApiKeyId ?? null,
           action: "environment.custom_image_template.relinked",
           entityType: "environment",
           entityId: input.environmentId,

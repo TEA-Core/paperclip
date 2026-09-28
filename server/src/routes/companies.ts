@@ -1172,6 +1172,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     await logActivity(db, {
       companyId: result.company.id,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       entityType: "company",
       entityId: result.company.id,
@@ -1219,6 +1220,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       companyId: company.id,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "company.created",
       entityType: "company",
       entityId: company.id,
@@ -1234,6 +1236,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
           windowKind: "calendar_month_utc",
         },
         req.actor.userId ?? "board",
+        getActorInfo(req).boardApiKeyId,
       );
     }
     res.status(201).json(company);
@@ -1303,6 +1306,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -1329,6 +1333,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -1417,6 +1422,7 @@ interface ImportedCompanyActivityContext {
   actorId: string;
   agentId: string | null;
   runId: string | null;
+  boardApiKeyId: string | null;
   include: unknown;
 }
 
@@ -1515,6 +1521,7 @@ function importedCompanyActivityContext(
     actorId: actor.actorId,
     agentId: actor.agentId,
     runId: actor.runId,
+    boardApiKeyId: actor.boardApiKeyId,
     include,
   };
 }
@@ -1527,6 +1534,7 @@ async function logImportedCompanyActivity(
   await logActivity(db, {
     companyId: result.company.id,
     actorType: activity.actorType,
+    boardApiKeyId: activity.boardApiKeyId,
     actorId: activity.actorId,
     action: "company.imported",
     entityType: "company",

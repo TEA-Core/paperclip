@@ -70,6 +70,7 @@ export type EmailActor = {
   agentId?: string;
   runId?: string;
   localImplicit?: boolean;
+  boardApiKeyId?: string | null;
 };
 type Endpoint = typeof chatEndpoints.$inferSelect;
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -270,6 +271,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       companyId: endpoint.companyId,
       actorType: actor.agentId ? "agent" : actor.userId ? "user" : "system",
       actorId: actor.agentId ?? actor.userId ?? "agentmail",
+      boardApiKeyId: actor.boardApiKeyId ?? null,
       action,
       entityType: "tool_connection",
       entityId: endpoint.connectionId,

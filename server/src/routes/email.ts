@@ -22,6 +22,8 @@ function actor(req: Request): EmailActor {
     : {
         userId: req.actor.userId ?? "board",
         localImplicit: req.actor.source === "local_implicit",
+        boardApiKeyId:
+          req.actor.source === "board_key" ? req.actor.keyId ?? null : null,
       };
 }
 export function emailRoutes(db: Db, service: EmailChannelService) {

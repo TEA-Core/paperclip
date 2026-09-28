@@ -56,6 +56,7 @@ export interface CompanyActivityActor {
   actorId: string;
   agentId?: string | null;
   runId?: string | null;
+  boardApiKeyId?: string | null;
 }
 
 const SYSTEM_COMPANY_ACTOR: CompanyActivityActor = {
@@ -125,6 +126,7 @@ export function companyService(db: Db) {
     await logActivity(db, {
       companyId: id,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId ?? null,
       runId: actor.runId ?? null,
@@ -451,6 +453,7 @@ export function companyService(db: Db) {
         await logActivity(db, {
           companyId: id,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId ?? null,
           runId: actor.runId ?? null,
@@ -468,6 +471,7 @@ export function companyService(db: Db) {
         await logActivity(db, {
           companyId: id,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId ?? null,
           runId: actor.runId ?? null,

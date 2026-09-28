@@ -284,6 +284,7 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
             agentId: missingAgentId,
             runId: null,
             agentApiKeyId: null,
+            boardApiKeyId: null,
             action: "issue.queued_comment_edited",
             entityId: issueId,
             details: {},

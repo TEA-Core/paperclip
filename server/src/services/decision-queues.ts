@@ -40,6 +40,7 @@ export type DecisionMutationActor = {
   userId: string | null;
   runId: string | null;
   agentApiKeyId: string | null;
+  boardApiKeyId: string | null;
   responsibleUserId: string | null;
 };
 
@@ -90,6 +91,7 @@ const SYSTEM_ACTOR: DecisionMutationActor = {
   userId: null,
   runId: null,
   agentApiKeyId: null,
+  boardApiKeyId: null,
   responsibleUserId: null,
 };
 
@@ -344,6 +346,7 @@ async function recordActivity(
     agentId: actor.agentId,
     runId: actor.runId,
     agentApiKeyId: actor.agentApiKeyId,
+    boardApiKeyId: actor.boardApiKeyId,
     responsibleUserIdOverride: actor.responsibleUserId,
     action: input.action,
     entityType: input.entityType,

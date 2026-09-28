@@ -125,6 +125,7 @@ export function createEditQueuedComment(deps: { issueLock: QueuedCommentIssueLoc
 
         const activityPublication = await tx.logActivity({
           actorType: input.actor.actorType,
+          boardApiKeyId: input.actor.boardApiKeyId ?? null,
           actorId: input.actor.actorId,
           agentId: input.actor.agentId,
           runId: input.actor.runId,
@@ -197,6 +198,7 @@ export function createReorderQueuedComments(deps: { issueLock: QueuedCommentIssu
 
         const activityPublication = await tx.logActivity({
           actorType: input.actor.actorType,
+          boardApiKeyId: input.actor.boardApiKeyId ?? null,
           actorId: input.actor.actorId,
           agentId: input.actor.agentId,
           runId: input.actor.runId,
@@ -335,6 +337,7 @@ export function createDiscardQueuedComment(deps: { issueLock: QueuedCommentIssue
         const activityPublication = input.logActivity
           ? await tx.logActivity({
               actorType: input.actor.actorType,
+              boardApiKeyId: input.actor.boardApiKeyId ?? null,
               actorId: input.actor.actorId,
               agentId: input.actor.agentId,
               runId: input.actor.runId,

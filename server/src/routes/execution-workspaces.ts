@@ -1018,6 +1018,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -1073,6 +1074,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -1440,6 +1442,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,

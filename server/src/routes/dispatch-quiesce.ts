@@ -25,6 +25,7 @@ import {
 // The request schema lives in its own module so `openapi.ts` can import it
 // without importing this route handler (and with it `services/heartbeat.ts`).
 import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce-schemas.js";
+import { getActorInfo } from "./authz.js";
 
 /**
  * SUP-9857. Deploy-time dispatch quiesce.
@@ -72,6 +73,7 @@ export function dispatchQuiesceRoutes(db: Db) {
           companyId,
           actorType: "user",
           actorId: req.actor.userId ?? "board",
+          boardApiKeyId: getActorInfo(req).boardApiKeyId,
           action,
           entityType: "instance_dispatch_quiesce",
           entityId: "dispatch_quiesce",
