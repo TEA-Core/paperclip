@@ -30,6 +30,7 @@ import {
   gt,
   inArray,
   isNull,
+  not,
   notInArray,
   sql,
 } from "drizzle-orm";
@@ -190,6 +191,7 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
+import { redactIssueCommentBody } from "../services/issues.js";
 import {
   armMergeOnApproval,
   parseRepoUrl,
@@ -2699,6 +2701,52 @@ function isClosedIssueStatus(
   status: string | null | undefined,
 ): status is "done" | "cancelled" {
   return status === "done" || status === "cancelled";
+}
+
+/**
+ * SUP-17808: a done-close `PATCH /issues/:id` against an already-terminal issue used to
+ * append a second, byte-identical close comment — the status transition and the
+ * `issue_execution_decisions` row were already idempotent, only the inline comment was not.
+ * Two identical Tier-1 close literals in one thread make "which run closed this, against
+ * which evidence window" unanswerable from the thread, which is what close audits read.
+ *
+ * Returns the pre-existing agent comment the incoming body is byte-identical to when BOTH
+ * hold, else null (the caller then appends, unchanged):
+ *   1. the issue is already terminal (done/cancelled) at PATCH time, AND
+ *   2. the incoming body — after the same redaction `addComment` applies before insert —
+ *      is byte-identical to the most recent agent-authored comment on the thread.
+ *
+ * A non-terminal issue, or a byte-different body, returns null so a genuine second opinion,
+ * a re-close after reopen, or a disagreeing twin stays visible. Only the most-recent agent
+ * comment is read; the status transition and execution-decision idempotency are untouched.
+ *
+ * The redaction is deterministic and process-scoped (the OS user, not the caller), so
+ * recomputing it here reproduces the stored bytes and the comparison stays consistent with
+ * the persisted form.
+ */
+async function findSuppressibleDuplicateCloseComment(
+  db: Db,
+  issueId: string,
+  commentBody: string,
+): Promise<{ id: string } | null> {
+  const { censorUsernameInLogs } = await instanceSettingsService(db).getGeneral();
+  const normalizedIncoming = redactIssueCommentBody(commentBody, {
+    enabled: censorUsernameInLogs,
+  });
+  const [latestAgentComment] = await db
+    .select({ id: issueComments.id, body: issueComments.body })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, issueId),
+        not(isNull(issueComments.authorAgentId)),
+        isNull(issueComments.deletedAt),
+      ),
+    )
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+    .limit(1);
+  if (!latestAgentComment) return null;
+  return latestAgentComment.body === normalizedIncoming ? { id: latestAgentComment.id } : null;
 }
 
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
@@ -17870,6 +17918,10 @@ export function issueRoutes(
     const decision = transition.decision && decisionId ? transition.decision : null;
     let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
       null;
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+    let commentDeduplicated = false;
+    let deduplicatedFromCommentId: string | null = null;
+    let commentHandledInTransaction = false;
     const attachmentCommentSourceTrust = commentAttachmentIds?.length
       ? await sourceTrustForActorWrite(existing, actor)
       : undefined;
@@ -17880,7 +17932,8 @@ export function issueRoutes(
     // clause (which today happens to be true for every `done` PATCH, but is not
     // semantically about the approval-stage gap).
     const shouldUseTransactionalIssueUpdate =
-      Boolean(commentAttachmentIds?.length)
+      Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
+      || Boolean(commentAttachmentIds?.length)
       || Boolean(decision)
       || shouldRelayStop
       || persistReviewActivityTransactionally
@@ -18078,6 +18131,40 @@ export function issueRoutes(
               },
               tx,
             );
+          } else if (commentBody) {
+            // SUP-17808: key the dedup on the PRE-PATCH terminal state (`isClosed`),
+            // matching the fallback path and the ruled "already terminal at PATCH
+            // time" — NOT `updated.status`, which would wrongly suppress a first
+            // close whose comment happens to match a prior agent comment. The
+            // reopen/resume/move-to-todo guards keep implicit and explicit reopens
+            // appending, exactly as the fallback path does.
+            const duplicate =
+              isClosed &&
+              !effectiveMoveToTodoRequested &&
+              !reopenRequested &&
+              resumeRequested !== true &&
+              await findSuppressibleDuplicateCloseComment(
+                tx as unknown as Db,
+                updated.id,
+                commentBody,
+              );
+            if (duplicate) {
+              commentDeduplicated = true;
+              deduplicatedFromCommentId = duplicate.id;
+              commentHandledInTransaction = true;
+            } else {
+              comment = await svc.addComment(id, commentBody, {
+                agentId: actor.agentId ?? undefined,
+                userId: actor.actorType === "user" ? actor.actorId : undefined,
+                runId: actor.runId,
+                onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+              }, {
+                authorizationReason: issueMutationAuthorizationReason,
+                clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                sourceTrust: await sourceTrustForActorWrite(existing, actor),
+              }, tx);
+              commentHandledInTransaction = true;
+            }
           }
           if (decision && decisionId) {
             await tx.insert(issueExecutionDecisions).values({
@@ -18762,11 +18849,38 @@ export function issueRoutes(
       }
     }
 
-    let comment: Awaited<ReturnType<typeof svc.addComment>> | null =
-      attachmentComment;
+    comment ??= attachmentComment;
     let goalCommentSteered = false;
     let lostReviewPathRef: string | null = null;
-    if (commentBody) {
+    const suppressibleDuplicateComment =
+      !commentHandledInTransaction &&
+      isClosed &&
+      !effectiveMoveToTodoRequested &&
+      !reopenRequested &&
+      resumeRequested !== true &&
+      commentBody &&
+      !attachmentComment
+        ? await findSuppressibleDuplicateCloseComment(db, issue.id, commentBody)
+        : null;
+    if (commentBody && commentHandledInTransaction && comment) {
+      // The created comment is assigned inside the `db.transaction` callback
+      // above, which TS control-flow analysis does not track, so `comment`
+      // narrows to `never` here; the runtime value is the in-transaction
+      // created comment (the dedup path leaves it null, guarded out above).
+      const createdComment = comment as Awaited<ReturnType<typeof svc.addComment>>;
+      await issueReferencesSvc.syncComment(createdComment.id);
+      await externalObjectsSvc.syncCommentSafely(createdComment.id);
+    } else if (commentBody && commentHandledInTransaction) {
+      comment = null;
+    } else if (commentBody && suppressibleDuplicateComment) {
+      // SUP-17808: an already-terminal issue whose most recent agent comment is
+      // byte-identical to the incoming close comment. The status transition and the
+      // execution decision already succeeded / are already idempotent, so skip the
+      // duplicate row and every comment side-effect (`comment` stays null); the caller
+      // tells the difference from an append via `commentDeduplicated`.
+      commentDeduplicated = true;
+      deduplicatedFromCommentId = suppressibleDuplicateComment.id;
+    } else if (commentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       comment ??= await svc.addComment(id, commentBody, {
@@ -19402,6 +19516,15 @@ export function issueRoutes(
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     const changes = issueResponse.changes ?? {};
+    // SUP-17808: the dedup receipt is only meaningful when this PATCH actually
+    // carried a comment — an append (`comment != null`) or a suppression
+    // (`commentDeduplicated`). Emitting it on every PATCH would add keys to
+    // unrelated response shapes and break additive-receipt contracts; when no
+    // comment was involved the response shape is byte-for-byte unchanged.
+    const commentReceipt =
+      comment != null || commentDeduplicated
+        ? { commentDeduplicated, deduplicatedFromCommentId }
+        : {};
     if (prefersMinimalIssueUpdateResponse(req)) {
       res.setHeader("Preference-Applied", "return=minimal");
       res.json({
@@ -19410,10 +19533,11 @@ export function issueRoutes(
         updatedAt: issueResponse.updatedAt,
         changes,
         comment,
+        ...commentReceipt,
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment });
+    res.json({ ...issueResponse, changes, comment, ...commentReceipt });
   });
 
   router.delete("/issues/:id", async (req, res) => {

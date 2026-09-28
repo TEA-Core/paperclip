@@ -47,6 +47,7 @@ const mockTxInsert = vi.hoisted(() =>
 );
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
+  select: () => mockDbSelect(),
 }));
 // SUP-17098: readAttributedLandingDischarge() in blocker-closure.ts runs
 // `.where(...).orderBy(...).limit(1).then(...)` (clause 1) and
@@ -110,6 +111,7 @@ const mockFeedbackService = vi.hoisted(() => ({
   })),
 }));
 const mockInstanceSettingsService = vi.hoisted(() => ({
+  getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
   getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
   get: vi.fn(async () => ({
     id: "instance-settings-1",
@@ -188,6 +190,7 @@ vi.mock("../services/instance-settings.js", () => ({
 }));
 
 vi.mock("../services/issues.js", () => ({
+  redactIssueCommentBody: (body: string) => body,
   issueService: () => mockIssueService,
 }));
 
