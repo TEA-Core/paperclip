@@ -67,6 +67,7 @@ export interface LogActivityInput {
   agentId?: string | null;
   runId?: string | null;
   agentApiKeyId?: string | null;
+  boardApiKeyId?: string | null;
   issueId?: string | null;
   details?: Record<string, unknown> | null;
   responsibleUserIdOverride?: string | null;
@@ -203,6 +204,9 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
       "activity log references an unknown run; recording the entry without a run id",
     );
   }
+  // Only stamp board_api_key_id when it is a real key id; a dangling reference would trip the
+  // `activity_log_board_api_key_id_board_api_keys_id_fk` foreign key and cost us the whole audit row.
+  const boardApiKeyId = isUuidLike(input.boardApiKeyId ?? "") ? input.boardApiKeyId : null;
   const [activity] = await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
@@ -212,6 +216,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     entityId: input.entityId,
     agentId: input.agentId ?? null,
     runId,
+    boardApiKeyId,
     responsibleUserId,
     details: redactedDetails,
   }).returning({ id: activityLog.id });
@@ -224,6 +229,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     entityId: input.entityId,
     agentId: input.agentId ?? null,
     runId,
+    boardApiKeyId,
     responsibleUserId,
     details: redactedDetails,
   };
