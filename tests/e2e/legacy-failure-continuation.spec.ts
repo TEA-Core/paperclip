@@ -299,7 +299,20 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         await expect(page.getByRole("button", { name: "Interrupt", exact: true })).toHaveCount(0);
       }
       if (action === "message") expect(prompts).toContain("Please continue the pending follow-up.");
-      await page.reload();
+      // SUP-17766: the reload proves PERSISTENCE only -- after a full reload the posted reply
+      // bubble must still render, i.e. the done-close landed server-side. That is gated by the
+      // 45s postedReplyBubble assertion below, which is the real wait. The reload itself must
+      // not block on the `load` event: the default `waitUntil: "load"` waits for every
+      // subresource to settle, and on a loaded merge-group runner a late asset held `load`
+      // past the test budget, yielding an opaque "Test timeout ... exceeded" + "Target page,
+      // context or browser has been closed" artefact that never named the stall -- the exact
+      // signature this card filed against. `domcontentloaded` resolves once the SPA shell has
+      // parsed and its module scripts have run; the app's data re-fetch and render happen after,
+      // independently of `load`, so this removes the irrelevant subresource dependency without
+      // hiding the persistence race -- the 45s assertion still waits for the real settled app
+      // state. The explicit timeout bounds the navigation so the reload can no longer consume
+      // the whole 600s test budget and names itself (`page.reload`) if it ever times out.
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
       // SUP-17651: the reload lands on a cold task page that must re-fetch the issue,
       // comments, and runs; on loaded runners the default 5s expect window is the
       // narrowest gate in this spec, so the reply re-assertion gets the same explicit
