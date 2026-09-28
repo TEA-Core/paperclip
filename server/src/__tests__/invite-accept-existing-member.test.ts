@@ -39,6 +39,9 @@ function createQuery(rows: unknown[], hooks: QueryHooks = {}) {
     from: vi.fn(() => query),
     where: vi.fn(() => query),
     orderBy: vi.fn(() => query),
+    leftJoin: vi.fn(() => query),
+    innerJoin: vi.fn(() => query),
+    limit: vi.fn(() => query),
     set: vi.fn((value: unknown) => {
       hooks.onSet?.(value);
       return query;
