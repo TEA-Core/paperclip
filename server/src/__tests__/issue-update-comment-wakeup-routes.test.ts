@@ -90,6 +90,7 @@ vi.mock("../services/index.js", () => ({
   goalService: () => ({}),
   heartbeatService: () => mockHeartbeatService,
   instanceSettingsService: () => ({
+    getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
     getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
     get: vi.fn(async () => ({
       id: "instance-settings-1",
@@ -162,6 +163,7 @@ function registerModuleMocks() {
     goalService: () => ({}),
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => ({
+      getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
       getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
       get: vi.fn(async () => ({
         id: "instance-settings-1",

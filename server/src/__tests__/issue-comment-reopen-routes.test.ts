@@ -47,7 +47,7 @@ const mockTxInsert = vi.hoisted(() =>
 );
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
-  select: (...args: unknown[]) => mockDbSelect(...args),
+  select: () => mockDbSelect(),
 }));
 // SUP-17098: readAttributedLandingDischarge() in blocker-closure.ts runs
 // `.where(...).orderBy(...).limit(1).then(...)` (clause 1) and
