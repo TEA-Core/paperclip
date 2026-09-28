@@ -1,7 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environmentLeases, heartbeatRuns, issues } from "@paperclipai/db";
+import {
+  agents,
+  companies,
+  createDb,
+  environmentLeases,
+  heartbeatRuns,
+  issueRecoveryActions,
+  issueThreadInteractions,
+  issueWatchdogs,
+  issues,
+  summarySlots,
+} from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -22,7 +33,12 @@ vi.mock("../sentry.js", async () => {
   };
 });
 
-import { reconcileAbandonedExecutionControl, reapStaleExecutionOwnerLeases } from "./execution-control-reconciliation.js";
+import {
+  reapStrandedSummaryGenerationIssues,
+  reapStaleExecutionOwnerLeases,
+  reconcileAbandonedExecutionControl,
+  SUMMARIZER_AGENT_ID,
+} from "./execution-control-reconciliation.js";
 import { waitForPendingRunFailureReports } from "./run-failure-report.js";
 import { getConversationOwnershipBlocker } from "./conversation-continuation.js";
 
@@ -322,3 +338,392 @@ describeEmbeddedPostgres("reapStaleExecutionOwnerLeases clears dead-holder lease
     expect(lease?.status).toBe("active");
   });
 });
+
+describeEmbeddedPostgres(
+  "reapStrandedSummaryGenerationIssues terminalizes Summarizer cards with no live continuation path (SUP-17698 amended contract)",
+  () => {
+    let db!: ReturnType<typeof createDb>;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+    let companyId!: string;
+    let reviewerAgentId!: string;
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("stranded-summary-generation-reaper-");
+      db = createDb(tempDb.connectionString);
+      // The Summarizer row carries the fixed UUID the amended contract pins,
+      // and agents.id is a global primary key — so it can exist only once per
+      // database. Seed the company and both agents once for the whole block;
+      // every test isolates itself with fresh issue rows instead.
+      companyId = randomUUID();
+      reviewerAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Stranded Summary Generation",
+        issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      });
+      await db.insert(agents).values([
+        {
+          id: SUMMARIZER_AGENT_ID,
+          companyId,
+          name: "Summarizer",
+          adapterType: "claude_local",
+          status: "idle",
+        },
+        { id: reviewerAgentId, companyId, name: "Reviewer", adapterType: "claude_local", status: "idle" },
+      ]);
+    }, 30_000);
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    /**
+     * The mint-only token block `generationIssueDescription()` writes into every
+     * generation task's description. Kept in the fixture for fidelity to the
+     * production strands — the amended selector does NOT read the description.
+     */
+    function generationDescription(generationIssueId: string) {
+      return [
+        "Generate the project summary for `86aa3f31-ce0d-42f8-98e9-02154f9be6a9`.",
+        "",
+        "```json",
+        JSON.stringify(
+          {
+            scopeKind: "project",
+            scopeId: "86aa3f31-ce0d-42f8-98e9-02154f9be6a9",
+            slotKey: "header",
+            generationIssueId,
+          },
+          null,
+          2,
+        ),
+        "```",
+      ].join("\n");
+    }
+
+    /**
+     * A card in the stranded population: assigned to the Summarizer,
+     * non-terminal, and (by default) free of every continuation path.
+     * `executionState` is deliberately variable — the amended selector does
+     * not read it. `updatedAt` is backdated by default so the card sits
+     * outside the §2a settle window, like the production strands that have
+     * been abandoned for days.
+     */
+    async function seedStrandedGenerationTask(opts: {
+      companyId: string;
+      reviewerAgentId: string;
+      status?: "todo" | "in_progress" | "blocked";
+      executionState?: Record<string, unknown> | null;
+      description?: string;
+      recentActivity?: boolean;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: opts.companyId,
+        title: "Summarize project",
+        status: opts.status ?? "in_progress",
+        assigneeAgentId: SUMMARIZER_AGENT_ID,
+        executionState:
+          opts.executionState === undefined
+            ? {
+                status: "changes_requested",
+                currentStageId: randomUUID(),
+                currentStageIndex: 0,
+                currentStageType: "review",
+                currentParticipant: { type: "agent", agentId: opts.reviewerAgentId, userId: null },
+                returnAssignee: { type: "agent", agentId: SUMMARIZER_AGENT_ID, userId: null },
+                lastDecisionId: randomUUID(),
+                lastDecisionOutcome: "changes_requested",
+                changesRequestedCount: 1,
+                pendingSince: new Date(Date.now() - 60_000).toISOString(),
+              }
+            : opts.executionState,
+        description: opts.description ?? generationDescription(issueId),
+        updatedAt: opts.recentActivity ? new Date() : new Date(Date.now() - 10 * 60_000),
+      });
+      return issueId;
+    }
+
+    const getIssue = (issueId: string) =>
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .limit(1)
+        .then((rows) => rows[0]);
+
+    it("terminalizes a summary task stranded in changes_requested with no live run", async () => {
+
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      const issue = await getIssue(issueId);
+      expect(issue?.status).toBe("done");
+      expect(issue?.executionRunId).toBeNull();
+      expect(issue?.checkoutRunId).toBeNull();
+    });
+
+    it("terminalizes a summary task with a null execution state and no live run", async () => {
+
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        reviewerAgentId,
+        executionState: null,
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      expect((await getIssue(issueId))?.status).toBe("done");
+    });
+
+    it("terminalizes a blocked summary task and releases a still-armed slot binding", async () => {
+
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId, status: "blocked" });
+      const slotId = randomUUID();
+      await db.insert(summarySlots).values({
+        id: slotId,
+        companyId,
+        scopeKind: "project",
+        scopeId: "86aa3f31-ce0d-42f8-98e9-02154f9be6a9",
+        slotKey: "header",
+        status: "generating",
+        generatingIssueId: issueId,
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      expect((await getIssue(issueId))?.status).toBe("done");
+      // The terminal transition runs the same slot finalizer SUP-17609 relies on:
+      // the binding is cleared. This generation wrote no surviving revision, so
+      // the slot fails closed to "failed" for the refresh sweep to regenerate.
+      const [slot] = await db
+        .select()
+        .from(summarySlots)
+        .where(eq(summarySlots.id, slotId))
+        .limit(1);
+      expect(slot?.generatingIssueId).toBeNull();
+      expect(slot?.status).toBe("failed");
+    });
+
+    it("terminalizes a todo summary task with a null execution state", async () => {
+
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        reviewerAgentId,
+        status: "todo",
+        executionState: null,
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      expect((await getIssue(issueId))?.status).toBe("done");
+    });
+
+    it("terminalizes a card whose stamped run is dead but whose status never settled", async () => {
+
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        reviewerAgentId,
+        executionState: null,
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: SUMMARIZER_AGENT_ID,
+        status: "failed",
+        contextSnapshot: { issueId },
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: runId, checkoutRunId: runId })
+        .where(eq(issues.id, issueId));
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      // A terminal stamped run is not a live run: the amended contract
+      // selects on the absence of a LIVE run, and the funnel clears the
+      // dead binding as part of the terminal transition.
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      const issue = await getIssue(issueId);
+      expect(issue?.status).toBe("done");
+      expect(issue?.executionRunId).toBeNull();
+    });
+
+    it("is idempotent: a second pass over already-terminal rows is a no-op", async () => {
+
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 1 });
+
+      const rerun = await reapStrandedSummaryGenerationIssues(db);
+      expect(rerun).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("done");
+    });
+
+    it("leaves a stranded summary task that still has a live run untouched", async () => {
+
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: SUMMARIZER_AGENT_ID,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: runId, checkoutRunId: runId })
+        .where(eq(issues.id, issueId));
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+
+      // Leave the database as found: this card stays coarse-scan-visible to
+      // sibling tests, so delete the fixture.
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.delete(issues).where(eq(issues.id, issueId));
+    });
+
+    it("leaves a stranded summary task with a pending thread interaction untouched", async () => {
+
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        reviewerAgentId,
+        executionState: null,
+      });
+      await db.insert(issueThreadInteractions).values({
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { version: 1, prompt: "Review native evidence" },
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      // A question awaiting a human answer is a continuation path: the card
+      // is not a scan candidate at all.
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+    });
+
+    it("leaves a stranded summary task with an armed monitor untouched", async () => {
+
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        reviewerAgentId,
+        executionState: null,
+      });
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: new Date(Date.now() + 3_600_000) })
+        .where(eq(issues.id, issueId));
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+    });
+
+    it("leaves a stranded summary task with an active task watchdog untouched", async () => {
+
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        reviewerAgentId,
+        executionState: null,
+      });
+      await db.insert(issueWatchdogs).values({
+        companyId,
+        issueId,
+        watchdogAgentId: reviewerAgentId,
+        status: "active",
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      // The watchdog is a §2a live-continuation disjunct the coarse scan does
+      // not filter on, so the card is scanned and then left to its watchdog.
+      expect(result).toEqual({ scanned: 1, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+
+      // Leave the database as found: this card stays coarse-scan-visible to
+      // sibling tests, so delete the fixture.
+      await db.delete(issueWatchdogs).where(eq(issueWatchdogs.issueId, issueId));
+      await db.delete(issues).where(eq(issues.id, issueId));
+    });
+
+    it("leaves a stranded summary task with an in-flight recovery action untouched", async () => {
+
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "active_run_watchdog",
+        status: "active",
+        ownerType: "board",
+        cause: "execution_finalization_deadline_exceeded",
+        fingerprint: `test:${issueId}`,
+        nextAction: "Inspect the failed run.",
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+    });
+
+    it("leaves a card whose last activity is inside the settle window untouched", async () => {
+
+      const issueId = await seedStrandedGenerationTask({
+        companyId,
+        reviewerAgentId,
+        executionState: null,
+        recentActivity: true,
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      // §2a settle window: run stamping and status commit are not
+      // simultaneous, so a card touched within the last five minutes is not
+      // a ghost yet.
+      expect(result).toEqual({ scanned: 1, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+
+      // Leave the database as found: this card stays coarse-scan-visible to
+      // sibling tests, so delete the fixture.
+      await db.delete(issues).where(eq(issues.id, issueId));
+    });
+
+    it("leaves a non-terminal card assigned to a different agent untouched", async () => {
+
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Summarize project",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        executionState: null,
+        description: generationDescription(issueId),
+        updatedAt: new Date(Date.now() - 10 * 60_000),
+      });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      // The amended population is pinned by assignee: an identically-shaped
+      // card owned by another agent is not this reaper's.
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+    });
+  },
+);
