@@ -85,6 +85,13 @@ Core fields:
 - command (string, optional): defaults to "opencode"
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
+- skillIsolation (string, optional): "shared" (default) or "desired-only". "shared"
+  symlinks the agent's desiredSkills into the shared skills home, so the run
+  sees the union of every agent's skills there. "desired-only" (local runs
+  only) gives the run a per-run HOME whose .claude/skills holds exactly the
+  agent's desiredSkills, so its available-skills listing is scoped to that
+  set while all other HOME-dependent state (git config, opencode's per-agent
+  session DB, caches) carries over unchanged. Remote targets ignore this key.
 
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds

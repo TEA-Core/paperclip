@@ -91,7 +91,11 @@ import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-share
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
-import { resolveOpenCodeSkillsHome } from "./skills.js";
+import {
+  prepareOpenCodeIsolatedSkillsHome,
+  resolveOpenCodeSkillIsolation,
+  resolveOpenCodeSkillsHome,
+} from "./skills.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -699,12 +703,63 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredOpenCodeSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, openCodeSkillEntries);
+  let localSkillsDir: string | null = null;
+  let isolatedSkillsHome: string | null = null;
   if (!executionTargetIsRemote) {
-    await ensureOpenCodeSkillsInjected(
-      onLog,
-      openCodeSkillEntries,
-      desiredOpenCodeSkillNames,
-      resolveOpenCodeSkillsHome(config),
+    if (resolveOpenCodeSkillIsolation(config) === "desired-only") {
+      // Desired-only local run: build the filtered per-run skills dir (the same
+      // builder remote staging already uses) plus a per-run HOME whose
+      // .claude/skills points at it, instead of injecting into the shared
+      // skills home. The shared home is never read or written on this path.
+      localSkillsDir = await buildOpenCodeSkillsDir(config);
+      let isolated: { home: string; warnings: string[] };
+      try {
+        isolated = await prepareOpenCodeIsolatedSkillsHome({ config, skillsDir: localSkillsDir });
+      } catch (err) {
+        await fs
+          .rm(path.dirname(localSkillsDir), { recursive: true, force: true })
+          .catch(() => undefined);
+        localSkillsDir = null;
+        throw err;
+      }
+      isolatedSkillsHome = isolated.home;
+      for (const warning of isolated.warnings) {
+        await onLog("stdout", `[paperclip] ${warning}\n`);
+      }
+    } else {
+      await ensureOpenCodeSkillsInjected(
+        onLog,
+        openCodeSkillEntries,
+        desiredOpenCodeSkillNames,
+        resolveOpenCodeSkillsHome(config),
+      );
+    }
+  }
+  // One line per run naming the skill mode and how many skills it exposes
+  // (SUP-17881), so the union-vs-desired-only cost of every run is greppable.
+  if (!executionTargetIsRemote) {
+    if (isolatedSkillsHome && localSkillsDir) {
+      const exposedCount = (
+        await fs.readdir(localSkillsDir, { withFileTypes: true }).catch(() => [])
+      ).length;
+      await onLog(
+        "stdout",
+        `[paperclip] skillIsolation=desired-only: run exposes ${exposedCount} skill(s) via per-run HOME ${isolatedSkillsHome}\n`,
+      );
+    } else {
+      const skillsHome = resolveOpenCodeSkillsHome(config);
+      const sharedCount = (
+        await fs.readdir(skillsHome, { withFileTypes: true }).catch(() => [])
+      ).length;
+      await onLog(
+        "stdout",
+        `[paperclip] skillIsolation=shared: run exposes ${sharedCount} skill(s) via shared skills home ${skillsHome}\n`,
+      );
+    }
+  } else if (resolveOpenCodeSkillIsolation(config) === "desired-only") {
+    await onLog(
+      "stdout",
+      `[paperclip] skillIsolation=desired-only is a no-op on remote targets; remote skill staging already exposes only the desired set.\n`,
     );
   }
 
@@ -811,6 +866,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
   const localRuntimeConfigHome = preparedRuntimeConfig.runtimeConfigHome;
+  if (isolatedSkillsHome) {
+    // desired-only: repoint the child's HOME at the per-run home so opencode's
+    // external skill scans ($HOME/.claude/skills, $HOME/.agents/skills) find
+    // only the filtered set. Everything else the run reads from HOME (git
+    // config/credentials, opencode's data dir and per-agent session DB,
+    // package caches) is carried over by symlink inside that home — see
+    // prepareOpenCodeIsolatedSkillsHome. This deliberately overrides a
+    // configured config.env.HOME: isolation cannot be satisfied by pointing
+    // the child at a shared home.
+    preparedRuntimeConfig.env.HOME = isolatedSkillsHome;
+    const configuredHome = asString(parseObject(config.env).HOME, "");
+    if (configuredHome) {
+      preparedRuntimeConfig.notes.push(
+        `skillIsolation=desired-only overrides the configured env HOME ${configuredHome} with the per-run HOME ${isolatedSkillsHome}; the run's skill listing is scoped to its desiredSkills.`,
+      );
+    }
+  }
   try {
     const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...preparedRuntimeConfig.env })).filter(
@@ -864,7 +936,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return asStringArray(config.args);
     })();
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
-    let localSkillsDir: string | null = null;
     let remoteRuntimeRootDir: string | null = null;
     let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
@@ -1565,6 +1636,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         paperclipBridge?.stop(),
         restoreRemoteWorkspace?.(),
         localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+        isolatedSkillsHome ? fs.rm(isolatedSkillsHome, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
     }
   } finally {
