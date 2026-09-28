@@ -324,6 +324,68 @@ function createAcceptedHumanInviteReplayDbStub() {
   return { db, updateValues };
 }
 
+function createAnonymousAgentInviteDbStub() {
+  const invite = {
+    id: "invite-1",
+    companyId: "company-1",
+    inviteType: "company_join",
+    allowedJoinTypes: "agent",
+    tokenHash: "hash",
+    defaultsPayload: null,
+    expiresAt: new Date("2027-03-10T00:00:00.000Z"),
+    invitedByUserId: "inviter-user",
+    revokedAt: null,
+    acceptedAt: null,
+    createdAt: new Date("2026-03-07T00:00:00.000Z"),
+    updatedAt: new Date("2026-03-07T00:00:00.000Z"),
+  };
+  const createdJoinRequest = {
+    id: "join-1",
+    inviteId: "invite-1",
+    companyId: "company-1",
+    requestType: "agent",
+    status: "pending_approval",
+    requestIp: "::ffff:127.0.0.1",
+    requestingUserId: null,
+    requestEmailSnapshot: null,
+    agentName: "Anon Agent",
+    adapterType: "claude_code",
+    capabilities: null,
+    agentDefaultsPayload: null,
+    claimSecretHash: "hash",
+    claimSecretExpiresAt: new Date("2027-03-10T00:00:00.000Z"),
+    claimSecretConsumedAt: null,
+    createdAgentId: null,
+    approvedByUserId: null,
+    approvedAt: null,
+    rejectedByUserId: null,
+    rejectedAt: null,
+    createdAt: new Date("2026-03-07T00:01:00.000Z"),
+    updatedAt: new Date("2026-03-07T00:01:00.000Z"),
+  };
+  let selectCalls = 0;
+  const db = {
+    select() {
+      selectCalls += 1;
+      // First lookup resolves the invite by token hash; everything after is
+      // "no existing row", which is the fresh-enrollment shape.
+      return createQuery(selectCalls === 1 ? [invite] : []);
+    },
+    // The accept transaction sets `acceptedAt` under `isNull(acceptedAt)`; a
+    // returned row means the invite was consumed by THIS request.
+    update() {
+      return createQuery([{ ...invite, acceptedAt: new Date() }]);
+    },
+    insert() {
+      return createQuery([createdJoinRequest]);
+    },
+    transaction(callback: (tx: unknown) => unknown) {
+      return callback(db);
+    },
+  };
+  return { db };
+}
+
 describe("POST /invites/:token/accept", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -482,5 +544,55 @@ describe("POST /invites/:token/accept", () => {
         details: expect.objectContaining({ source: "human_invite_accept" }),
       }),
     );
+  });
+
+  // SUP-17804 regression -- the AGENT lane only.
+  //
+  // `POST /invites/:token/accept` is public: the rate limiter at
+  // `router.use("/invites/:token", ...)` exists because of that. The HUMAN lane is
+  // closed earlier (`requestType === "human" && req.actor.type !== "board"` throws
+  // before the transaction), but there is deliberately NO such guard on the agent
+  // lane -- which is why the handler's own actorId fallback reads
+  // `req.actor.userId ?? (requestType === "agent" ? "invite-anon" : "board")`, and
+  // why production holds real `invite-anon` / `join.requested` rows.
+  //
+  // `getActorInfo()` opens with `assertAuthenticated()`, which THROWS on
+  // `req.actor.type === "none"`. Both attribution sites in this handler run AFTER
+  // the transaction has set `invites.acceptedAt` and after the claim secret is
+  // minted, and the claim secret is returned nowhere else -- so an unguarded call
+  // consumes the invite and then 401s, making enrollment unrecoverable rather than
+  // merely failed.
+  //
+  // Every other test in this file injects `{ type: "board" }`, which is why this
+  // regression reached production with CI green. `{ type: "none", source: "none" }`
+  // is the shape `actorMiddleware` really emits for an unauthenticated request.
+  it("attributes an anonymous agent invite accept without throwing 401", async () => {
+    const { db } = createAnonymousAgentInviteDbStub();
+    const app = createAppWithActor(db, {
+      type: "none",
+      source: "none",
+      companyIds: [],
+      memberships: [],
+    });
+
+    const res = await request(app)
+      .post("/api/invites/pcp_invite_test/accept")
+      .send({
+        requestType: "agent",
+        agentName: "Anon Agent",
+        adapterType: "claude_code",
+      });
+
+    expect(res.status).not.toBe(401);
+
+    // Anonymous means there is no board key, so the column must be null -- not
+    // absent, and certainly not another principal's id.
+    const joinWrites = logActivityMock.mock.calls.filter(
+      (call) => typeof call[1]?.action === "string" && call[1].action.startsWith("join."),
+    );
+    expect(joinWrites.length).toBeGreaterThan(0);
+    for (const call of joinWrites) {
+      expect(call[1].boardApiKeyId ?? null).toBeNull();
+    }
   });
 });
