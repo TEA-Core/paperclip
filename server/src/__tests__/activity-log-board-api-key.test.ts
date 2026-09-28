@@ -1,270 +1,252 @@
-import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
-import type { Request } from "express";
+import { createHash, randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { eq, sql } from "drizzle-orm";
+import { beforeAll, expect, it } from "vitest";
 import {
   activityLog,
+  agentApiKeys,
+  agents,
   authUsers,
   boardApiKeys,
-  companies,
   createDb,
-  type Db,
+  inboxDismissals,
+  projects,
 } from "@paperclipai/db";
 import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./helpers/embedded-postgres.js";
-import { logActivity, type LogActivityInput } from "../services/activity-log.js";
-import { getActorInfo } from "../routes/authz.js";
+  describeEmbeddedPostgres,
+  seedCompanyWithBoardAccess,
+  useEmbeddedPostgres,
+} from "./helpers/route-test-harness.js";
+import { errorHandler } from "../middleware/index.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import { inboxDismissalRoutes } from "../routes/inbox-dismissals.js";
+import { projectRoutes } from "../routes/projects.js";
+import { activityRoutes } from "../routes/activity.js";
+import { logActivity } from "../services/activity-log.js";
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-
-if (!embeddedPostgresSupport.supported) {
-  console.warn(
-    `Skipping embedded Postgres board API key activity tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
-  );
+function hashBearerToken(token: string) {
+  return createHash("sha256").update(token).digest("hex");
 }
 
-/**
- * Build a request whose `actor` is shaped exactly the way `middleware/auth.ts` sets it after
- * resolving a board API key (type "board", source "board_key", keyId = the key row id). This
- * is the input the board-key call sites hand to `getActorInfo`, so it exercises the real seam
- * without standing up the full auth middleware stack.
- */
-function boardKeyRequest(input: { userId: string; keyId: string; source?: "board_key" | "session" }) {
-  return {
-    actor: {
-      type: "board" as const,
-      userId: input.userId,
-      keyId: input.keyId,
-      boardKeyScope: "all_access",
-      source: input.source ?? "board_key",
-    },
-  } as unknown as Request;
-}
-
-async function seedCompany(db: Db, companyId: string) {
-  await db.insert(companies).values({
-    id: companyId,
-    name: "Board Key Co",
-    issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-    requireBoardApprovalForNewAgents: false,
-  });
-}
-
-async function seedAuthUser(db: Db, userId: string) {
+async function seedAuthUser(db: Parameters<typeof seedCompanyWithBoardAccess>[0], userId: string, label: string) {
   await db.insert(authUsers).values({
     id: userId,
-    name: "Board User",
-    email: `board-${userId}@example.com`,
+    name: `Board User ${label}`,
+    email: `${label}-${userId.slice(0, 8)}@example.com`,
     createdAt: new Date(),
     updatedAt: new Date(),
   });
 }
 
-async function seedBoardKey(db: Db, input: { id: string; userId: string }) {
+async function seedBoardKey(
+  db: Parameters<typeof seedCompanyWithBoardAccess>[0],
+  input: { id: string; userId: string; name: string; token: string },
+) {
   await db.insert(boardApiKeys).values({
     id: input.id,
     userId: input.userId,
-    name: "Test Board Key",
-    keyHash: `hash-${input.id}`,
+    name: input.name,
+    keyHash: hashBearerToken(input.token),
+    scope: "all_access",
   });
 }
 
 describeEmbeddedPostgres("activity_log board API key attribution", () => {
+  const pg = useEmbeddedPostgres("paperclip-board-api-key-activity-", {
+    resetEach: async (db) => {
+      await db.delete(activityLog);
+      await db.delete(inboxDismissals);
+      await db.delete(projects);
+    },
+  });
+
   let db!: ReturnType<typeof createDb>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId = "";
+  let userId = "";
+  let keyA = "";
+  let keyB = "";
+  let keyC = "";
+  let agentId = "";
+  let agentKeyId = "";
+  let app: express.Express;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-activity-board-key-");
-    db = createDb(tempDb.connectionString);
+    db = pg.db;
+    const seeded = await seedCompanyWithBoardAccess(db, "Board Key Attribution");
+    companyId = seeded.companyId;
+    userId = seeded.userId;
+    await seedAuthUser(db, userId, "attribution");
+
+    keyA = randomUUID();
+    keyB = randomUUID();
+    keyC = randomUUID();
+    await seedBoardKey(db, { id: keyA, userId, name: "board-key-a", token: "board-key-a-token" });
+    await seedBoardKey(db, { id: keyB, userId, name: "board-key-b", token: "board-key-b-token" });
+    await seedBoardKey(db, { id: keyC, userId, name: "board-key-c", token: "board-key-c-token" });
+
+    agentId = randomUUID();
+    agentKeyId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Attribution Agent",
+      status: "idle",
+    });
+    await db.insert(agentApiKeys).values({
+      id: agentKeyId,
+      agentId,
+      companyId,
+      name: "attribution-agent-key",
+      keyHash: hashBearerToken("agent-key-token"),
+      responsibleUserId: userId,
+    });
+
+    app = express();
+    app.use(express.json());
+    app.use(
+      actorMiddleware(db, {
+        deploymentMode: "authenticated",
+        resolveSession: async (req) =>
+          req.header("x-test-session")
+            ? {
+                session: { id: "test-session", userId },
+                user: { id: userId, name: "Session User", email: "session@example.com" },
+              }
+            : null,
+      }),
+    );
+    app.use(inboxDismissalRoutes(db));
+    app.use(projectRoutes(db));
+    app.use(activityRoutes(db));
+    app.use(errorHandler);
   }, 60_000);
 
-  afterEach(async () => {
-    await db.delete(activityLog);
-    await db.delete(boardApiKeys);
-    await db.delete(authUsers);
-    await db.delete(companies);
-  });
+  it("stores the board key id on a real board-key write and reads it back unredacted", async () => {
+    const itemKey = `approval:${randomUUID()}`;
+    const res = await request(app)
+      .post(`/companies/${companyId}/inbox-dismissals`)
+      .set("Authorization", "Bearer board-key-a-token")
+      .send({ itemKey });
+    expect(res.status).toBe(201);
 
-  afterAll(async () => {
-    await tempDb?.cleanup();
-  });
-
-  it("persists board_api_key_id for a board-key write and reads it back unredacted", async () => {
-    const companyId = randomUUID();
-    const userId = `board-user-${randomUUID()}`;
-    const boardKeyId = randomUUID();
-    await seedCompany(db, companyId);
-    await seedAuthUser(db, userId);
-    await seedBoardKey(db, { id: boardKeyId, userId });
-
-    const actor = getActorInfo(boardKeyRequest({ userId, keyId: boardKeyId }));
-    expect(actor.actorType).toBe("user");
-    expect(actor.actorSource).toBe("board_key");
-    expect(actor.boardApiKeyId).toBe(boardKeyId);
-    expect(actor.agentApiKeyId).toBeNull();
-
-    const publications: unknown[] = [];
-    const input: LogActivityInput = {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      action: "board.key_write",
-      entityType: "company",
-      entityId: companyId,
-      agentApiKeyId: actor.agentApiKeyId,
-      boardApiKeyId: actor.boardApiKeyId,
-      responsibleUserIdOverride: userId,
-    };
-    const activity = await logActivity(db, input, publications as never);
-
-    expect(activity?.id).toBeTruthy();
     const [row] = await db
       .select()
       .from(activityLog)
-      .where(eq(activityLog.id, activity!.id));
-    expect(row.boardApiKeyId).toBe(boardKeyId);
-    expect(row.boardApiKeyId).not.toContain("REDACTED");
-    expect((publications[0] as { payload: Record<string, unknown> }).payload.boardApiKeyId).toBe(boardKeyId);
-  });
+      .where(eq(activityLog.action, "inbox.dismissed"));
+    expect(row).toBeTruthy();
+    expect(row!.actorType).toBe("user");
+    expect(row!.boardApiKeyId).toBe(keyA);
 
-  it("leaves board_api_key_id null for a session (non board-key) request", async () => {
-    const companyId = randomUUID();
-    const userId = `session-user-${randomUUID()}`;
-    const someKeyId = randomUUID();
-    await seedCompany(db, companyId);
-    await seedAuthUser(db, userId);
-
-    // A session actor carries a key id on the request but source "session", so
-    // getActorInfo must NOT attribute it to a board key.
-    const actor = getActorInfo(boardKeyRequest({ userId, keyId: someKeyId, source: "session" }));
-    expect(actor.actorType).toBe("user");
-    expect(actor.boardApiKeyId).toBeNull();
-
-    const publications: unknown[] = [];
-    const activity = await logActivity(
-      db,
-      {
-        companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        action: "session.worked",
-        entityType: "company",
-        entityId: companyId,
-        boardApiKeyId: actor.boardApiKeyId,
-        responsibleUserIdOverride: userId,
-      },
-      publications as never,
+    const read = await request(app)
+      .get(`/companies/${companyId}/activity?action=inbox.dismissed&entityType=company`)
+      .set("Authorization", "Bearer board-key-a-token");
+    expect(read.status).toBe(200);
+    const readRow = (read.body as Array<Record<string, unknown>>).find(
+      (item) => item.action === "inbox.dismissed",
     );
-    expect(activity?.id).toBeTruthy();
+    expect(readRow).toBeTruthy();
+    expect(readRow!.boardApiKeyId).toBe(keyA);
+    expect(String(readRow!.boardApiKeyId)).not.toContain("REDACTED");
+  });
+
+  it("produces distinguishable rows for two different board keys", async () => {
+    const dismissRes = await request(app)
+      .post(`/companies/${companyId}/inbox-dismissals`)
+      .set("Authorization", "Bearer board-key-a-token")
+      .send({ itemKey: `run:${randomUUID()}` });
+    expect(dismissRes.status).toBe(201);
+
+    const createRes = await request(app)
+      .post(`/companies/${companyId}/projects`)
+      .set("Authorization", "Bearer board-key-b-token")
+      .send({ name: "Board Key Project" });
+    expect(createRes.status).toBe(201);
+
+    const [byA] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "inbox.dismissed"));
+    const [byB] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "project.created"));
+    expect(byA).toBeTruthy();
+    expect(byB).toBeTruthy();
+    expect(byA!.boardApiKeyId).toBe(keyA);
+    expect(byB!.boardApiKeyId).toBe(keyB);
+    expect(byA!.boardApiKeyId).not.toBe(byB!.boardApiKeyId);
+  });
+
+  it("leaves board_api_key_id null for an agent-key write", async () => {
+    const res = await request(app)
+      .post(`/companies/${companyId}/projects`)
+      .set("Authorization", "Bearer agent-key-token")
+      .send({ name: "Agent Key Project" });
+    expect(res.status).toBe(201);
 
     const [row] = await db
       .select()
       .from(activityLog)
-      .where(eq(activityLog.id, activity!.id));
-    expect(row.boardApiKeyId).toBeNull();
+      .where(eq(activityLog.action, "project.created"));
+    expect(row).toBeTruthy();
+    expect(row!.actorType).toBe("agent");
+    expect(row!.boardApiKeyId).toBeNull();
   });
 
-  it("distinguishes two different board keys", async () => {
-    const companyId = randomUUID();
-    const userId = `two-key-user-${randomUUID()}`;
-    const keyA = randomUUID();
-    const keyB = randomUUID();
-    await seedCompany(db, companyId);
-    await seedAuthUser(db, userId);
-    await seedBoardKey(db, { id: keyA, userId });
-    await seedBoardKey(db, { id: keyB, userId });
+  it("leaves board_api_key_id null for a session write", async () => {
+    const res = await request(app)
+      .post(`/companies/${companyId}/inbox-dismissals`)
+      .set("x-test-session", "yes")
+      .send({ itemKey: `attention:${randomUUID()}` });
+    expect(res.status).toBe(201);
 
-    const publications: unknown[] = [];
-    const write = (keyId: string) =>
-      logActivity(
-        db,
-        {
-          companyId,
-          actorType: "user",
-          actorId: userId,
-          action: "board.wrote",
-          entityType: "company",
-          entityId: companyId,
-          boardApiKeyId: keyId,
-          responsibleUserIdOverride: userId,
-        },
-        publications as never,
-      );
-    const a = await write(keyA);
-    const b = await write(keyB);
-
-    const byA = await db
+    const [row] = await db
       .select()
       .from(activityLog)
-      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.boardApiKeyId, keyA)));
-    const byB = await db
-      .select()
-      .from(activityLog)
-      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.boardApiKeyId, keyB)));
-    expect(byA.map((r) => r.id)).toEqual([a!.id]);
-    expect(byB.map((r) => r.id)).toEqual([b!.id]);
-    expect(a!.id).not.toBe(b!.id);
+      .where(eq(activityLog.action, "inbox.dismissed"));
+    expect(row).toBeTruthy();
+    expect(row!.actorType).toBe("user");
+    expect(row!.actorId).toBe(userId);
+    expect(row!.boardApiKeyId).toBeNull();
   });
 
   it("nulls board_api_key_id when the key is deleted (ON DELETE SET NULL)", async () => {
-    const companyId = randomUUID();
-    const userId = `deleted-key-user-${randomUUID()}`;
-    const boardKeyId = randomUUID();
-    await seedCompany(db, companyId);
-    await seedAuthUser(db, userId);
-    await seedBoardKey(db, { id: boardKeyId, userId });
-
-    const publications: unknown[] = [];
-    const activity = await logActivity(
-      db,
-      {
-        companyId,
-        actorType: "user",
-        actorId: userId,
-        action: "board.key_write",
-        entityType: "company",
-        entityId: companyId,
-        boardApiKeyId: boardKeyId,
-        responsibleUserIdOverride: userId,
-      },
-      publications as never,
-    );
-    expect(activity?.id).toBeTruthy();
-
-    await db.delete(boardApiKeys).where(eq(boardApiKeys.id, boardKeyId));
+    const res = await request(app)
+      .post(`/companies/${companyId}/inbox-dismissals`)
+      .set("Authorization", "Bearer board-key-c-token")
+      .send({ itemKey: `join:${randomUUID()}` });
+    expect(res.status).toBe(201);
 
     const [row] = await db
       .select()
       .from(activityLog)
-      .where(eq(activityLog.id, activity!.id));
-    expect(row.boardApiKeyId).toBeNull();
+      .where(eq(activityLog.action, "inbox.dismissed"));
+    expect(row!.boardApiKeyId).toBe(keyC);
+
+    await db.delete(boardApiKeys).where(eq(boardApiKeys.id, keyC));
+
+    const [after] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.id, row!.id));
+    expect(after).toBeTruthy();
+    expect(after!.boardApiKeyId).toBeNull();
+    expect(after!.companyId).toBe(companyId);
   });
 
   it("ignores a malformed board_api_key_id instead of tripping the foreign key", async () => {
-    const companyId = randomUUID();
-    const userId = `malformed-key-user-${randomUUID()}`;
-    await seedCompany(db, companyId);
-    await seedAuthUser(db, userId);
-
-    const publications: unknown[] = [];
-    const activity = await logActivity(
-      db,
-      {
-        companyId,
-        actorType: "user",
-        actorId: userId,
-        action: "board.key_write",
-        entityType: "company",
-        entityId: companyId,
-        boardApiKeyId: "not-a-real-key",
-        responsibleUserIdOverride: userId,
-      },
-      publications as never,
-    );
+    const activity = await logActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: userId,
+      action: "board.key_write",
+      entityType: "company",
+      entityId: companyId,
+      boardApiKeyId: "not-a-real-key",
+    });
     expect(activity?.id).toBeTruthy();
+
     const [row] = await db
       .select()
       .from(activityLog)
