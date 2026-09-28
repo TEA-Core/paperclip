@@ -463,16 +463,16 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       return new Response(JSON.stringify({}), { status: 404 });
     });
 
-    mockAddComment.mockImplementation(async (
-      _issueId: string,
-      _body: string,
-      _actor: object,
-      options?: { authorType?: string | null },
-    ) => {
+    mockAddComment.mockImplementation((...args: any[]) => {
+      const options = args[3] as { authorType?: string | null } | undefined;
       if (options?.authorType === "system") {
         throw new Error("boom");
       }
-      return realAddCommentRef.current!(_issueId, _body, _actor, options);
+      // Forward every arg (incl. the transaction handle at args[4]) to the real
+      // service. Dropping the tx made the real addComment re-enter the pool and
+      // `SELECT ... FOR UPDATE` the same issue row the route's open transaction
+      // already holds, deadlocking the single-connection embedded PG pool.
+      return realAddCommentRef.current!(...args);
     });
 
     const res = await request(app)

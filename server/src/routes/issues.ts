@@ -17866,6 +17866,10 @@ export function issueRoutes(
     const decision = transition.decision && decisionId ? transition.decision : null;
     let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
       null;
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+    let commentDeduplicated = false;
+    let deduplicatedFromCommentId: string | null = null;
+    let commentHandledInTransaction = false;
     const attachmentCommentSourceTrust = commentAttachmentIds?.length
       ? await sourceTrustForActorWrite(existing, actor)
       : undefined;
@@ -17876,7 +17880,8 @@ export function issueRoutes(
     // clause (which today happens to be true for every `done` PATCH, but is not
     // semantically about the approval-stage gap).
     const shouldUseTransactionalIssueUpdate =
-      Boolean(commentAttachmentIds?.length)
+      Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
+      || Boolean(commentAttachmentIds?.length)
       || Boolean(decision)
       || shouldRelayStop
       || persistReviewActivityTransactionally
@@ -18074,6 +18079,40 @@ export function issueRoutes(
               },
               tx,
             );
+          } else if (commentBody) {
+            // SUP-17808: key the dedup on the PRE-PATCH terminal state (`isClosed`),
+            // matching the fallback path and the ruled "already terminal at PATCH
+            // time" — NOT `updated.status`, which would wrongly suppress a first
+            // close whose comment happens to match a prior agent comment. The
+            // reopen/resume/move-to-todo guards keep implicit and explicit reopens
+            // appending, exactly as the fallback path does.
+            const duplicate =
+              isClosed &&
+              !effectiveMoveToTodoRequested &&
+              !reopenRequested &&
+              resumeRequested !== true &&
+              await findSuppressibleDuplicateCloseComment(
+                tx as unknown as Db,
+                updated.id,
+                commentBody,
+              );
+            if (duplicate) {
+              commentDeduplicated = true;
+              deduplicatedFromCommentId = duplicate.id;
+              commentHandledInTransaction = true;
+            } else {
+              comment = await svc.addComment(id, commentBody, {
+                agentId: actor.agentId ?? undefined,
+                userId: actor.actorType === "user" ? actor.actorId : undefined,
+                runId: actor.runId,
+                onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+              }, {
+                authorizationReason: issueMutationAuthorizationReason,
+                clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                sourceTrust: await sourceTrustForActorWrite(existing, actor),
+              }, tx);
+              commentHandledInTransaction = true;
+            }
           }
           if (decision && decisionId) {
             await tx.insert(issueExecutionDecisions).values({
@@ -18745,17 +18784,30 @@ export function issueRoutes(
       }
     }
 
-    let comment: Awaited<ReturnType<typeof svc.addComment>> | null =
-      attachmentComment;
+    comment ??= attachmentComment;
     let goalCommentSteered = false;
     let lostReviewPathRef: string | null = null;
-    let commentDeduplicated = false;
-    let deduplicatedFromCommentId: string | null = null;
     const suppressibleDuplicateComment =
-      isClosed && commentBody && !attachmentComment
+      !commentHandledInTransaction &&
+      isClosed &&
+      !effectiveMoveToTodoRequested &&
+      !reopenRequested &&
+      resumeRequested !== true &&
+      commentBody &&
+      !attachmentComment
         ? await findSuppressibleDuplicateCloseComment(db, issue.id, commentBody)
         : null;
-    if (commentBody && suppressibleDuplicateComment) {
+    if (commentBody && commentHandledInTransaction && comment) {
+      // The created comment is assigned inside the `db.transaction` callback
+      // above, which TS control-flow analysis does not track, so `comment`
+      // narrows to `never` here; the runtime value is the in-transaction
+      // created comment (the dedup path leaves it null, guarded out above).
+      const createdComment = comment as Awaited<ReturnType<typeof svc.addComment>>;
+      await issueReferencesSvc.syncComment(createdComment.id);
+      await externalObjectsSvc.syncCommentSafely(createdComment.id);
+    } else if (commentBody && commentHandledInTransaction) {
+      comment = null;
+    } else if (commentBody && suppressibleDuplicateComment) {
       // SUP-17808: an already-terminal issue whose most recent agent comment is
       // byte-identical to the incoming close comment. The status transition and the
       // execution decision already succeeded / are already idempotent, so skip the
@@ -19398,6 +19450,15 @@ export function issueRoutes(
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     const changes = issueResponse.changes ?? {};
+    // SUP-17808: the dedup receipt is only meaningful when this PATCH actually
+    // carried a comment — an append (`comment != null`) or a suppression
+    // (`commentDeduplicated`). Emitting it on every PATCH would add keys to
+    // unrelated response shapes and break additive-receipt contracts; when no
+    // comment was involved the response shape is byte-for-byte unchanged.
+    const commentReceipt =
+      comment != null || commentDeduplicated
+        ? { commentDeduplicated, deduplicatedFromCommentId }
+        : {};
     if (prefersMinimalIssueUpdateResponse(req)) {
       res.setHeader("Preference-Applied", "return=minimal");
       res.json({
@@ -19406,12 +19467,11 @@ export function issueRoutes(
         updatedAt: issueResponse.updatedAt,
         changes,
         comment,
-        commentDeduplicated,
-        deduplicatedFromCommentId,
+        ...commentReceipt,
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment, commentDeduplicated, deduplicatedFromCommentId });
+    res.json({ ...issueResponse, changes, comment, ...commentReceipt });
   });
 
   router.delete("/issues/:id", async (req, res) => {

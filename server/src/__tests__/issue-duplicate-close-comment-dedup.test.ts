@@ -288,6 +288,29 @@ describeEmbeddedPostgres("duplicate close-comment dedup on terminal issues (SUP-
     expect(rows).toHaveLength(2);
   });
 
+  it("implicit reopen + byte-identical body => comment appends instead of deduping", async () => {
+    const { companyId, issueId, agentId, identifier } = await seedIssue(
+      "SUP17808G",
+      "done",
+    );
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: agentId })
+      .where(eq(issues.id, issueId));
+    await seedAgentCloseComment(companyId, issueId, agentId, "FOLLOW-UP-LITERAL");
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ comment: "FOLLOW-UP-LITERAL" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("todo");
+    expect(res.body.commentDeduplicated).toBe(false);
+    expect(res.body.comment).not.toBeNull();
+    expect(await commentRowsFor(issueId)).toHaveLength(2);
+  });
+
   it("cancelled terminal issue + byte-identical body => deduped too (terminal includes cancelled)", async () => {
     const { companyId, issueId, agentId, identifier } = await seedIssue(
       "SUP17808D",
