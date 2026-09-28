@@ -39,6 +39,7 @@ import {
   type IssueCommentPresentation,
   type IssueRecoveryAction,
   type IssueUnblockDescriptor,
+  isAgentStatusInvokable,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -1119,6 +1120,142 @@ export function hasUsableUnblockDescriptor(descriptor: IssueUnblockDescriptor | 
   return typeof descriptor.action === "string" && descriptor.action.trim().length > 0;
 }
 
+// ---------------------------------------------------------------------------
+// SUP-17884 — the orphan / stranded sweep may only hand a card to an agent that
+// can actually START a run. Configuration-invokability (`isAgentInvokable`)
+// answers "may this agent legally be invoked"; it does not observe whether a
+// dispatch launches. On SUP-17808 the sweep bounced a card onto exec-CEO while
+// that agent was failing every dispatch (status `error`, wake requests all
+// `failed`) — a state no agent could undo. `error` is deliberately still
+// invokable and must stay so: it is set when a run fails and cleared by the
+// next success, so stripping it from the invokable set would make any agent
+// whose last run failed permanently undispatchable. The fix instead observes
+// the wake-request outcomes: an agent whose last K consecutive wake requests
+// all terminated `failed` is observably dead regardless of `status`, and the
+// sweep must refuse to bounce a card onto it, keeping the card where it already
+// sits (or leaving it unassigned) so the recovery ladder can escalate from
+// there. `K` is chosen >= 3 so a single transient failure (provider blip,
+// one-off OOM) does not mark an agent dead, while a failing-every-dispatch
+// agent is caught quickly. No lookback time window: "consecutive" is about the
+// outcome sequence, not age; a stale streak with no success since is still
+// evidence the agent cannot start, and the check self-clears on the next
+// successful wake.
+// ---------------------------------------------------------------------------
+
+export const RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES = 3;
+
+/**
+ * SUP-17884 C2 (liveness read, pure). `wakeStatuses` is the agent's
+ * most-recent-first list of wake-request statuses (the last K rows). Returns
+ * true iff the most recent `consecutiveFailures` wake requests all terminated
+ * `failed`. Fewer than K wake requests means the streak cannot be established,
+ * so false (no evidence of death).
+ */
+export function hasConsecutiveWakeFailures(
+  wakeStatuses: readonly string[] | null | undefined,
+  consecutiveFailures: number,
+): boolean {
+  if (!wakeStatuses || wakeStatuses.length < consecutiveFailures) return false;
+  for (let i = 0; i < consecutiveFailures; i += 1) {
+    if (wakeStatuses[i] !== "failed") return false;
+  }
+  return true;
+}
+
+/**
+ * SUP-17884 C3 (ordering). Among live candidates prefer the states most
+ * clearly able to start a run. `error` is a demotion, never an exclusion: it
+ * sorts after active/idle/running but ahead of anything unknown. Lower wins.
+ */
+export function recoveryBounceStatusRank(status: string | null | undefined): number {
+  if (status === "active" || status === "idle" || status === "running") return 0;
+  if (status === "error") return 1;
+  return 2;
+}
+
+/**
+ * SUP-17884 C2, status-only form: is this status invokable AND does the recent
+ * wake history not show an observably-dead streak? The org-chain term of
+ * invokability is applied separately via `isAgentInvokable` at the call sites;
+ * this is the liveness term to AND into the selection predicate.
+ */
+export function isRecoveryBounceTargetLive(
+  status: string | null | undefined,
+  wakeStatuses: readonly string[] | null | undefined,
+  consecutiveFailures: number = RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES,
+): boolean {
+  if (!isAgentStatusInvokable(status ?? "")) return false;
+  return !hasConsecutiveWakeFailures(wakeStatuses, consecutiveFailures);
+}
+
+export type RecoveryReassignmentRefusalReason =
+  | "review_stage_self_satisfy"
+  | "reassignment_target_not_live";
+
+export interface RecoveryReassignmentDecision {
+  assigneeAgentId: string | null;
+  refused: boolean;
+  refusalReason: RecoveryReassignmentRefusalReason | null;
+  refusedAssigneeAgentId: string | null;
+  keptAssigneeAgentId: string | null;
+}
+
+/**
+ * SUP-17884 C1 (refusal) — the single refusal path every recovery
+ * reassignment routes through. `recoveryOwnerAgentId` is the agent the
+ * recovery wants to write; when it differs from the current assignee, two
+ * predicates can refuse the write and keep the card where it already sits:
+ *   - `reviewStageSelfSatisfies`: the write would make an incomplete review
+ *     stage self-satisfiable (the pre-existing SUP-13526 gate);
+ *   - `!recoveryOwnerLive`: the target cannot actually start a run (C2), so
+ *     writing it would reduce the set of actors able to act on the card.
+ * Keeping the current assignee is the only recovery that does not strand the
+ * card. Both refusals carry the same evidence shape.
+ */
+export function decideRecoveryReassignment(input: {
+  currentAssigneeAgentId: string | null;
+  recoveryOwnerAgentId: string | null;
+  reviewStageSelfSatisfies: boolean;
+  recoveryOwnerLive: boolean;
+}): RecoveryReassignmentDecision {
+  const effectiveCurrent = input.currentAssigneeAgentId;
+  const candidate = input.recoveryOwnerAgentId ?? effectiveCurrent;
+  if (!candidate || candidate === effectiveCurrent) {
+    return {
+      assigneeAgentId: candidate,
+      refused: false,
+      refusalReason: null,
+      refusedAssigneeAgentId: null,
+      keptAssigneeAgentId: effectiveCurrent,
+    };
+  }
+  if (input.reviewStageSelfSatisfies) {
+    return {
+      assigneeAgentId: effectiveCurrent,
+      refused: true,
+      refusalReason: "review_stage_self_satisfy",
+      refusedAssigneeAgentId: candidate,
+      keptAssigneeAgentId: effectiveCurrent,
+    };
+  }
+  if (!input.recoveryOwnerLive) {
+    return {
+      assigneeAgentId: effectiveCurrent,
+      refused: true,
+      refusalReason: "reassignment_target_not_live",
+      refusedAssigneeAgentId: candidate,
+      keptAssigneeAgentId: effectiveCurrent,
+    };
+  }
+  return {
+    assigneeAgentId: candidate,
+    refused: false,
+    refusalReason: null,
+    refusedAssigneeAgentId: null,
+    keptAssigneeAgentId: null,
+  };
+}
+
 async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: string) {
   return db
     .select({ id: issueRelations.issueId, identifier: issues.identifier })
@@ -1333,6 +1470,24 @@ export function recoveryService(
 
   async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
     return (await getAgentInvokability(agent)).invokable;
+  }
+
+  // SUP-17884 C2 liveness read: the agent's K most recent wake-request outcomes,
+  // most-recent-first. Ordered by when the dispatch was requested so the tail
+  // reflects the agent's most recent attempts. The pure `hasConsecutiveWakeFailures`
+  // decides from the returned statuses.
+  async function hasConsecutiveWakeFailuresForAgent(
+    agentId: string,
+    consecutiveFailures: number,
+  ): Promise<boolean> {
+    const statuses = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.id))
+      .limit(consecutiveFailures)
+      .then((rows) => rows.map((row) => row.status));
+    return hasConsecutiveWakeFailures(statuses, consecutiveFailures);
   }
 
   async function getLatestIssueRun(
@@ -2667,14 +2822,27 @@ export function recoveryService(
       const returnAssigneeAgentId = readReturnAssigneeAgentId(candidate.executionState);
       if (returnAssigneeAgentId) {
         const returnAgent = await getAgent(returnAssigneeAgentId);
-        if (returnAgent && returnAgent.companyId === candidate.companyId && (await isAgentInvokable(returnAgent))) {
+        if (
+          returnAgent &&
+          returnAgent.companyId === candidate.companyId &&
+          (await isAgentInvokable(returnAgent)) &&
+          // SUP-17884 C2: an observably-dead return assignee is not a recovery
+          // target; fall through to the creator instead of stranding the card.
+          !(await hasConsecutiveWakeFailuresForAgent(returnAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
+        ) {
           nextAgent = returnAgent;
           reassignSource = "return_assignee";
         }
       }
       if (!nextAgent) {
         const creatorAgent = await getAgent(creatorAgentId);
-        if (!creatorAgent || creatorAgent.companyId !== candidate.companyId || !(await isAgentInvokable(creatorAgent))) {
+        if (
+          !creatorAgent ||
+          creatorAgent.companyId !== candidate.companyId ||
+          !(await isAgentInvokable(creatorAgent)) ||
+          // SUP-17884 C2: an observably-dead creator is not a recovery target.
+          (await hasConsecutiveWakeFailuresForAgent(creatorAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
+        ) {
           skipped += 1;
           continue;
         }
@@ -2686,7 +2854,7 @@ export function recoveryService(
       // SUP-13526: route this recovery reassignment through the same gate as
       // the PATCH handler and the other recovery paths. A refusal keeps the
       // blocker unassigned instead of making its review stage self-satisfiable.
-      const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(candidate, nextAgent.id);
+      const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(candidate, nextAgent.id);
       if (!nextAssigneeAgentId) {
         skipped += 1;
         continue;
@@ -3274,6 +3442,8 @@ export function recoveryService(
     const parsedProjectPolicy = parseProjectExecutionWorkspacePolicy(projectPolicy);
 
     const seen = new Set<string>();
+    const eligible: Array<{ agentId: string; status: string; order: number }> = [];
+    let order = 0;
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
@@ -3294,17 +3464,29 @@ export function recoveryService(
         projectPolicy: parsedProjectPolicy,
         agentConfig: candidate.adapterConfig,
       })) continue;
+      if (!(await isAgentInvokable(candidate)) || budgetBlock) continue;
+      // SUP-17884 C2: an observably-dead agent (K consecutive failed wakes) is
+      // not a recovery target even though its `status` may still be invokable.
+      if (await hasConsecutiveWakeFailuresForAgent(candidate.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES)) continue;
       if (
-        (await isAgentInvokable(candidate)) &&
-        !budgetBlock &&
-        (await candidateCanWriteSourceIssue(issue, candidate.id, {
+        !(await candidateCanWriteSourceIssue(issue, candidate.id, {
           evaluateAsAssignee: candidate.id === preferredOwnerAgentId,
         }))
       )
-        return candidate.id;
+        continue;
+      eligible.push({ agentId: candidate.id, status: candidate.status, order: order += 1 });
     }
 
-    return null;
+    if (eligible.length === 0) return null;
+    // SUP-17884 C3: among live candidates, prefer idle/active/running ahead of
+    // error (error is a demotion, never an exclusion); stable candidate order
+    // otherwise.
+    eligible.sort(
+      (a, b) =>
+        recoveryBounceStatusRank(a.status) - recoveryBounceStatusRank(b.status) ||
+        a.order - b.order,
+    );
+    return eligible[0].agentId;
   }
 
   async function resolveInvokableRecoveryAgentId(
@@ -4156,26 +4338,39 @@ export function recoveryService(
   }
 
   /**
-   * SUP-13526: recovery reassignment writes `assigneeAgentId` straight through
-   * the issue service, bypassing the PATCH handler's gate. When the recovery
-   * owner is a participant of an incomplete review stage that cannot be cleared
-   * without their own approval, refuse the reassignment: keep the current
-   * assignee (or leave the issue unassigned) and still block it.
+   * SUP-13526 / SUP-17884: recovery reassignment writes `assigneeAgentId`
+   * straight through the issue service, bypassing the PATCH handler's gate.
+   * The reassignment is refused — keeping the current assignee (or leaving the
+   * issue unassigned) and still blocking it — when either predicate holds:
+   *   - SUP-13526: the recovery owner is a participant of an incomplete review
+   *     stage that cannot be cleared without their own approval;
+   *   - SUP-17884: the recovery owner cannot actually start a run (its `status`
+   *     is still invokable but its last K consecutive wake requests all
+   *     terminated `failed`). Writing it would reduce the set of actors able
+   *     to act on the card and strand it in a state no agent can undo, so the
+   *     card is kept where it already sits and the recovery ladder escalates
+   *     from there.
+   * Both refusals share one outcome (keep current) and one evidence shape
+   * (`refusedAssigneeAgentId` / `keptAssigneeAgentId`).
    */
-  function resolveRecoveryReassignedAssignee(
+  async function resolveRecoveryReassignedAssignee(
     issue: {
       id: string;
       identifier?: string | null;
+      companyId: string;
       assigneeAgentId: string | null;
       executionPolicy: unknown;
       executionState: unknown;
     },
     recoveryOwnerAgentId: string | null,
     currentAssigneeAgentId?: string | null,
-  ): string | null {
+  ): Promise<string | null> {
     const candidate = recoveryOwnerAgentId ?? issue.assigneeAgentId;
     const effectiveCurrent = currentAssigneeAgentId ?? issue.assigneeAgentId;
     if (!candidate || candidate === effectiveCurrent) return candidate;
+
+    let reviewStageSelfSatisfies = false;
+    let reviewStageError: string | null = null;
     try {
       assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
         executionPolicy: issue.executionPolicy,
@@ -4183,19 +4378,50 @@ export function recoveryService(
         incomingAssigneeAgentId: candidate,
       });
     } catch (error) {
+      reviewStageSelfSatisfies = true;
+      reviewStageError = error instanceof Error ? error.message : String(error);
+    }
+
+    // SUP-17884 C2: the target must actually be able to start a run. Re-read
+    // it fresh so a live agent that started failing between selection and
+    // write is still refused here (this is also the backstop for the
+    // original-agent routing path, which does not run the C2 filter).
+    const targetAgent = await getAgent(candidate);
+    const recoveryOwnerLive =
+      targetAgent != null &&
+      targetAgent.companyId === issue.companyId &&
+      (await isAgentInvokable(targetAgent)) &&
+      !(await hasConsecutiveWakeFailuresForAgent(candidate, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES));
+
+    const decision = decideRecoveryReassignment({
+      currentAssigneeAgentId: effectiveCurrent,
+      recoveryOwnerAgentId,
+      reviewStageSelfSatisfies,
+      recoveryOwnerLive,
+    });
+    if (decision.refused && decision.refusalReason === "review_stage_self_satisfy") {
       logger.warn(
         {
           issueId: issue.id,
           identifier: issue.identifier,
-          refusedAssigneeAgentId: candidate,
-          keptAssigneeAgentId: effectiveCurrent,
-          error: error instanceof Error ? error.message : String(error),
+          refusedAssigneeAgentId: decision.refusedAssigneeAgentId,
+          keptAssigneeAgentId: decision.keptAssigneeAgentId,
+          error: reviewStageError,
         },
         "recovery reassignment refused: assignee write would make an incomplete review stage self-satisfiable",
       );
-      return effectiveCurrent;
+    } else if (decision.refused && decision.refusalReason === "reassignment_target_not_live") {
+      logger.warn(
+        {
+          issueId: issue.id,
+          identifier: issue.identifier,
+          refusedAssigneeAgentId: decision.refusedAssigneeAgentId,
+          keptAssigneeAgentId: decision.keptAssigneeAgentId,
+        },
+        "recovery reassignment refused: target agent cannot start a run; keeping current assignee",
+      );
     }
-    return candidate;
+    return decision.assigneeAgentId;
   }
 
   function readDispositionRepairAttempt(latestRun: LatestIssueRun) {
@@ -5045,7 +5271,7 @@ export function recoveryService(
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
-    const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(input.issue, recoveryAction.ownerAgentId);
+    const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(input.issue, recoveryAction.ownerAgentId);
     const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
       source: escalationSource,
       previousStatus: input.previousStatus,
@@ -5272,7 +5498,7 @@ export function recoveryService(
           source: escalationSource,
           previousStatus: input.previousStatus,
           extraUpdate: {
-            assigneeAgentId: resolveRecoveryReassignedAssignee(
+            assigneeAgentId: await resolveRecoveryReassignedAssignee(
               input.issue,
               recoveryAction.ownerAgentId,
               currentIssue.assigneeAgentId,
