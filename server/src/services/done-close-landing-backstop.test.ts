@@ -3015,4 +3015,99 @@ describe("SUP-16689: draft-stranded done cards", () => {
   });
 });
 
+describe("SUP-17656: exhausted PR escalates inside the 24h verdict grace", () => {
+  const NOW_MS = Date.parse(NOW);
+  const RECENT_ROW = new Date(NOW_MS - 90 * 60 * 1000).toISOString();
+
+  it("escalates an exhausted open PR that is NOT yet verdict-eligible (the #825 shape)", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const priorRows = Array.from({ length: MAX_REENQUEUE_ATTEMPTS }, () => ({
+      action: "issue.done_close_landing_reenqueued",
+      details: { pr: "paperclipai/paperclip#514" },
+    }));
+    const { service } = makeService(
+      {
+        candidates: [candidateRow({ createdAt: RECENT_ROW })],
+        existingLandingRows: priorRows,
+        companyMergeArmingEnabled: true,
+      },
+      { wakeup },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    const result = await service.sweep();
+
+    // Exhausted + not verdict-eligible: the SUP-17656 fix lets this PR through
+    // to the escalation write instead of deferring silently.
+    expect(result).toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 1, draftStranded: 0,
+    });
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_escalated",
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#514",
+        prState: "open",
+        reason: expect.stringContaining("re-enqueued"),
+      }),
+    }));
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+      status: "blocked",
+      unblockDescriptor: expect.objectContaining({
+        owner: "board",
+        action: expect.stringContaining("re-enqueued"),
+      }),
+    }));
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    expect(mockAddComment).toHaveBeenCalledWith(ISSUE, expect.stringContaining("[Done-close landing]"), expect.anything(), expect.objectContaining({
+      authorType: "system",
+    }));
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("idempotency: second sweep does NOT re-escalate the same PR", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const priorRows = Array.from({ length: MAX_REENQUEUE_ATTEMPTS }, () => ({
+      action: "issue.done_close_landing_reenqueued",
+      details: { pr: "paperclipai/paperclip#514" },
+    }));
+    const state: DbState = {
+      candidates: [candidateRow({ createdAt: RECENT_ROW })],
+      existingLandingRows: priorRows,
+      companyMergeArmingEnabled: true,
+    };
+    const { service } = makeService(state, { wakeup });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    const first = await service.sweep();
+    expect(first.escalated).toBe(1);
+
+    // Simulate the next sweep seeing the escalation row written by the first.
+    state.existingLandingRows.push({
+      action: "issue.done_close_landing_escalated",
+      details: { pr: "paperclipai/paperclip#514" },
+    });
+    const second = await service.sweep();
+    expect(second.escalated).toBe(0);
+    expect(second.deferred).toBe(0);
+    // No duplicate comment or update.
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+});
+
 
