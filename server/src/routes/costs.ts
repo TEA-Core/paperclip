@@ -129,6 +129,7 @@ export function costRoutes(
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "cost.reported",
@@ -154,6 +155,7 @@ export function costRoutes(
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "finance_event.reported",
@@ -300,7 +302,7 @@ export function costRoutes(
       assertBoard(req);
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
-      const summary = await budgets.upsertPolicy(companyId, req.body, req.actor.userId ?? "board");
+      const summary = await budgets.upsertPolicy(companyId, req.body, req.actor.userId ?? "board", getActorInfo(req).boardApiKeyId);
       res.json(summary);
     },
   );
@@ -341,6 +343,7 @@ export function costRoutes(
       companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "company.budget_updated",
       entityType: "company",
       entityId: companyId,
@@ -356,6 +359,7 @@ export function costRoutes(
         windowKind: "calendar_month_utc",
       },
       req.actor.userId ?? "board",
+      getActorInfo(req).boardApiKeyId,
     );
 
     res.json(company);
@@ -378,6 +382,7 @@ export function costRoutes(
     await logActivity(db, {
       companyId: updated.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "agent.budget_updated",
@@ -395,6 +400,7 @@ export function costRoutes(
         windowKind: "calendar_month_utc",
       },
       req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      req.actor.type === "board" ? getActorInfo(req).boardApiKeyId : null,
     );
 
     res.json(updated);

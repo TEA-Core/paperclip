@@ -3940,6 +3940,7 @@ export function agentRoutes(
       await logActivity(db, {
         companyId: updated.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         action: "agent.skills_synced",
         entityType: "agent",
@@ -4343,6 +4344,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: updated.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -4400,6 +4402,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.runtime_session_reset",
       entityType: "agent",
       entityId: id,
@@ -4654,6 +4657,7 @@ export function agentRoutes(
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -4686,6 +4690,7 @@ export function agentRoutes(
         await logActivity(db, {
           companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -4835,6 +4840,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -4870,6 +4876,7 @@ export function agentRoutes(
           windowKind: "calendar_month_utc",
         },
         actor.actorType === "user" ? actor.actorId : null,
+        actor.actorType === "user" ? actor.boardApiKeyId : null,
       );
     }
 
@@ -4917,6 +4924,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -4995,6 +5003,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -5056,6 +5065,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -5121,6 +5131,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -5156,6 +5167,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -5368,6 +5380,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -5399,6 +5412,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
@@ -5430,6 +5444,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -5466,6 +5481,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.error_cleared",
       entityType: "agent",
       entityId: agent.id,
@@ -5519,6 +5535,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.approved",
       entityType: "agent",
       entityId: agent.id,
@@ -5578,6 +5595,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.terminated",
       entityType: "agent",
       entityId: agent.id,
@@ -5614,6 +5632,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.deleted",
       entityType: "agent",
       entityId: agent.id,
@@ -5648,6 +5667,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.key_created",
       entityType: "agent",
       entityId: agent.id,
@@ -5687,6 +5707,7 @@ export function agentRoutes(
       companyId: agent.companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "agent.key_revoked",
       entityType: "agent",
       entityId: agent.id,
@@ -5888,6 +5909,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: run.id,
@@ -5900,6 +5922,7 @@ export function agentRoutes(
       await logActivity(db, {
         companyId: agent.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: run.id,
@@ -6013,6 +6036,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: run.id,
@@ -6025,6 +6049,7 @@ export function agentRoutes(
       await logActivity(db, {
         companyId: agent.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: run.id,
@@ -6589,6 +6614,7 @@ export function agentRoutes(
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "provider_trace.metadata_listed",
@@ -6732,6 +6758,7 @@ export function agentRoutes(
         companyId: run.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,
@@ -6920,6 +6947,7 @@ export function agentRoutes(
           companyId: existing.companyId,
           actorType: "user",
           actorId: req.actor.userId ?? "board",
+          boardApiKeyId: getActorInfo(req).boardApiKeyId,
           action: "heartbeat.runtime_request_resolution_queued",
           entityType: "heartbeat_run",
           entityId: existing.id,
@@ -6993,11 +7021,12 @@ export function agentRoutes(
     );
     if (!run) return;
     const inspection = await providerTraces.inspect(run.id, run.companyId);
-    await logActivity(db, {
-      companyId: run.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "local-admin",
-      action: "provider_trace.redacted_viewed",
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "local-admin",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
+        action: "provider_trace.redacted_viewed",
       entityType: "heartbeat_run",
       entityId: run.id,
       details: {
@@ -7054,6 +7083,7 @@ export function agentRoutes(
         companyId: run.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "local-board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "provider_trace.workspace_diffs_reprojected",
         entityType: "heartbeat_run",
         entityId: run.id,
@@ -7094,6 +7124,7 @@ export function agentRoutes(
         companyId: run.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "local-admin",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "provider_trace.frame_revealed",
         entityType: "heartbeat_run",
         entityId: run.id,
@@ -7126,6 +7157,7 @@ export function agentRoutes(
         companyId: run.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "local-admin",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "provider_trace.downloaded",
         entityType: "heartbeat_run",
         entityId: run.id,
@@ -7157,11 +7189,12 @@ export function agentRoutes(
     if (!run) return;
     const removed = await providerTraces.remove(run.id, run.companyId);
     if (!removed) throw notFound("Provider trace not found");
-    await logActivity(db, {
-      companyId: run.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "local-admin",
-      action: "provider_trace.deleted",
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "local-admin",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
+        action: "provider_trace.deleted",
       entityType: "heartbeat_run",
       entityId: run.id,
       details: { traceId: removed.id, recoverable: false },

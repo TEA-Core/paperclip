@@ -196,6 +196,7 @@ function buildTransaction(tx: Db, companyId: string, deps: QueuedCommentQueuePos
           agentId: input.agentId,
           runId: input.runId,
           agentApiKeyId: input.agentApiKeyId,
+          boardApiKeyId: input.boardApiKeyId,
           action: input.action,
           entityType: "issue",
           entityId: input.entityId,

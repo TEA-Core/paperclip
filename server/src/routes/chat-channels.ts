@@ -64,6 +64,10 @@ function actorUserId(req: ExpressRequest): string | null {
   return actor.actorType === "user" ? actor.actorId : null;
 }
 
+function actorBoardApiKeyId(req: ExpressRequest): string | null {
+  return getActorInfo(req).boardApiKeyId;
+}
+
 async function assertEndpointAccess(
   req: ExpressRequest,
   res: ExpressResponse,
@@ -134,7 +138,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
       await assertConnectionManager(req, companyId);
       res
         .status(201)
-        .json(await service.create(companyId, req.body, actorUserId(req)));
+        .json(await service.create(companyId, req.body, actorUserId(req), actorBoardApiKeyId(req)));
     },
   );
 
@@ -149,7 +153,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     async (req, res) => {
       if (!(await assertEndpointManagementAccess(req, res))) return;
       res.json(
-        await service.update(endpointId(req), req.body, actorUserId(req)),
+        await service.update(endpointId(req), req.body, actorUserId(req), actorBoardApiKeyId(req)),
       );
     },
   );
@@ -166,7 +170,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     async (req, res) => {
       if (!(await assertEndpointManagementAccess(req, res))) return;
       res.json(
-        await service.configure(endpointId(req), req.body, actorUserId(req)),
+        await service.configure(endpointId(req), req.body, actorUserId(req), actorBoardApiKeyId(req)),
       );
     },
   );
@@ -177,7 +181,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     res
       .status(201)
       .json(
-        await service.generateSetupSecret(endpointId(req), actorUserId(req)),
+        await service.generateSetupSecret(endpointId(req), actorUserId(req), actorBoardApiKeyId(req)),
       );
   });
 
@@ -201,6 +205,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
           endpointId(req),
           req.body.resources,
           actorUserId(req),
+          actorBoardApiKeyId(req),
         ),
       );
     },
@@ -318,6 +323,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
         req.body.action,
         userId,
         req.body.fileTransfer,
+        actorBoardApiKeyId(req),
       );
       res.status(204).end();
     },
@@ -335,6 +341,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
         req.params.actionId as string,
         req.body.action,
         userId,
+        actorBoardApiKeyId(req),
       );
       res.status(204).end();
     },
@@ -369,6 +376,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
             req.body.idempotencyKey,
             userId,
             req.body.attachmentIds,
+            actorBoardApiKeyId(req),
           ),
         );
     },

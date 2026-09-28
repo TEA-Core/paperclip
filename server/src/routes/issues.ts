@@ -1035,6 +1035,7 @@ async function auditAgentIssueCreateAttributionSpoof(input: {
   await logActivity(input.db, {
     companyId: input.companyId,
     actorType: actor.actorType,
+    boardApiKeyId: actor.boardApiKeyId,
     actorId: actor.actorId,
     agentId: actor.agentId,
     runId: actor.runId,
@@ -1065,6 +1066,7 @@ async function auditAgentIssueCommentAttributionSpoof(input: {
   await logActivity(input.db, {
     companyId: input.issue.companyId,
     actorType: actor.actorType,
+    boardApiKeyId: actor.boardApiKeyId,
     actorId: actor.actorId,
     agentId: actor.agentId,
     runId: actor.runId,
@@ -4991,6 +4993,7 @@ export function issueRoutes(
     logActivity(db, {
       companyId: input.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
       runId: input.actor.runId,
@@ -5285,6 +5288,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: parent.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -5788,6 +5792,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: input.issue.companyId,
         actorType: input.actor.actorType,
+        boardApiKeyId: input.actor.boardApiKeyId,
         actorId: input.actor.actorId,
         agentId: input.actor.agentId,
         runId: input.actor.runId,
@@ -6457,6 +6462,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: input.issue.companyId,
         actorType: input.actor.actorType,
+        boardApiKeyId: input.actor.boardApiKeyId,
         actorId: input.actor.actorId,
         agentId: input.actor.agentId,
         runId: input.actor.runId,
@@ -7232,6 +7238,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -8013,6 +8020,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: watchdogParent.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
       runId: input.actor.runId,
@@ -9455,7 +9463,7 @@ export function issueRoutes(
             companyId: issue.companyId,
             projectId: issue.projectId ?? null,
           },
-          actor: { agentId: actor.agentId, actorType: actor.actorType },
+          actor: { agentId: actor.agentId, actorType: actor.actorType, boardApiKeyId: actor.boardApiKeyId },
           requireLiveIssue: options.requireLiveIssue,
         },
       );
@@ -9582,7 +9590,7 @@ export function issueRoutes(
       void clearReopenPendingConsumptionWithRetry({
         workspaceId: workspace.id,
         issue: { id: issue.id, companyId: issue.companyId },
-        actor: { agentId: actor.agentId, actorType: actor.actorType },
+        actor: { agentId: actor.agentId, actorType: actor.actorType, boardApiKeyId: actor.boardApiKeyId },
         expectedGeneration: generation,
       });
     };
@@ -9600,7 +9608,7 @@ export function issueRoutes(
   async function clearReopenPendingConsumptionWithRetry(input: {
     workspaceId: string;
     issue: { id: string; companyId: string };
-    actor: { agentId: string | null; actorType: string };
+    actor: { agentId: string | null; actorType: string; boardApiKeyId: string | null };
     expectedGeneration: number;
   }): Promise<void> {
     const maxAttempts = 5;
@@ -10526,6 +10534,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -10557,6 +10566,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: removed.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -10778,6 +10788,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       action: "issue.merge_arming_republish",
       entityType: "issue",
@@ -11134,6 +11145,7 @@ export function issueRoutes(
           {
             companyId: updated.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: boardUserId,
             action: "issue.board_stage_override",
             entityType: "issue",
@@ -11751,6 +11763,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -11803,6 +11816,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -12429,6 +12443,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: result.issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -12451,6 +12466,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: result.issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -12725,6 +12741,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -12893,6 +12910,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13010,6 +13028,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13077,6 +13096,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13175,6 +13195,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13209,6 +13230,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -13307,6 +13329,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13362,6 +13385,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13471,6 +13495,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13504,6 +13529,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -13609,6 +13635,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -13805,6 +13832,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -13852,6 +13880,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -13875,6 +13904,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -14106,6 +14136,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -14197,6 +14228,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: existing.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -14259,6 +14291,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -14304,6 +14337,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -14342,6 +14376,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -14446,6 +14481,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -14486,6 +14522,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -14577,6 +14614,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -14614,6 +14652,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -15014,6 +15053,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -15070,6 +15110,7 @@ export function issueRoutes(
         void logActivity(db, {
           companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -15096,6 +15137,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -15120,6 +15162,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -15766,6 +15809,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: parent.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -15796,6 +15840,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: parent.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -15821,6 +15866,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: parent.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -16034,6 +16080,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: sourceIssue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -16068,6 +16115,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: sourceIssue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -16098,6 +16146,7 @@ export function issueRoutes(
           await logActivity(db, {
             companyId: sourceIssue.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -16210,6 +16259,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       action: "issue.scheduled_retry_retry_now",
       entityType: "issue",
@@ -16798,6 +16848,7 @@ export function issueRoutes(
           await logActivity(db, {
             companyId: cancelled.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -17757,6 +17808,7 @@ export function issueRoutes(
       await logActivityInTransaction(tx as unknown as Db, {
         companyId: updated.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -18062,6 +18114,7 @@ export function issueRoutes(
             await logActivityInTransaction(tx as unknown as Db, {
               companyId: existing.companyId,
               actorType: actor.actorType,
+              boardApiKeyId: actor.boardApiKeyId,
               actorId: actor.actorId,
               agentId: actor.agentId,
               runId: actor.runId,
@@ -18144,6 +18197,7 @@ export function issueRoutes(
           await logActivityInTransaction(tx as unknown as Db, {
             companyId: existing.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -18268,6 +18322,7 @@ export function issueRoutes(
           await logActivity(db, {
             companyId: cancelled.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -18284,6 +18339,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: existing.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -18357,6 +18413,7 @@ export function issueRoutes(
           await logActivity(db, {
             companyId: issue.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -18453,6 +18510,7 @@ export function issueRoutes(
     if (!persistReviewActivityTransactionally) await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -18504,6 +18562,7 @@ export function issueRoutes(
           await logActivity(db, {
             companyId: issue.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -18535,6 +18594,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -18564,6 +18624,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -18585,6 +18646,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -18609,6 +18671,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -18632,6 +18695,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -18680,6 +18744,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -18774,6 +18839,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -19383,6 +19449,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -19558,6 +19625,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -19626,6 +19694,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: released.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -19667,6 +19736,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: result.issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -19900,6 +19970,7 @@ export function issueRoutes(
       await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, req.body.queueId, { retryCleanup: true });
       await logActivity(db, {
         companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
+        boardApiKeyId: actor.boardApiKeyId,
         agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
         action: "issue.queued_comments_interrupted", entityType: "issue", entityId: issue.id,
         details: { queueId: req.body.queueId, targetRunId: req.body.targetRunId },
@@ -20152,6 +20223,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -20316,6 +20388,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -20708,6 +20781,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -20744,6 +20818,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -20909,6 +20984,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -20999,6 +21075,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -21098,6 +21175,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -21226,6 +21304,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -21301,6 +21380,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -21377,6 +21457,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -21558,6 +21639,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -21653,6 +21735,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -21802,6 +21885,7 @@ export function issueRoutes(
         conversationState: "waiting", status: "in_review", createdByUserId: req.actor.userId,
       });
       await logActivity(db, { companyId, actorType: "user", actorId: req.actor.userId,
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "issue.conversation_opened", entityType: "issue", entityId: issue.id,
         details: { agentId: agent.id } });
       res.json(issue);
@@ -21835,6 +21919,7 @@ export function issueRoutes(
         }, tx);
         if (!existing) await logActivityInTransaction(tx as unknown as Db, {
           companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
+          boardApiKeyId: actor.boardApiKeyId,
           action: "issue.comment_added", entityType: "issue", entityId: issue.id,
           details: { commentId: saved.id, identifier: issue.identifier },
         }, publications);
@@ -22087,6 +22172,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: currentIssue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -22130,6 +22216,7 @@ export function issueRoutes(
           await logActivity(db, {
             companyId: cancelled.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -22306,6 +22393,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: currentIssue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -22445,6 +22533,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: currentIssue.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -22908,6 +22997,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -22929,6 +23019,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -22951,6 +23042,7 @@ export function issueRoutes(
             logActivity(db, {
               companyId,
               actorType: actor.actorType,
+              boardApiKeyId: actor.boardApiKeyId,
               actorId: actor.actorId,
               agentId: actor.agentId,
               runId: actor.runId,
@@ -23119,6 +23211,7 @@ export function issueRoutes(
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -23138,6 +23231,7 @@ export function issueRoutes(
         await logActivity(db, {
           companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -23293,6 +23387,7 @@ export function issueRoutes(
     await logActivity(db, {
       companyId: removed.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,

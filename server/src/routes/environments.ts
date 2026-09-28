@@ -436,6 +436,7 @@ export function environmentRoutes(
         logActivity(db, {
           companyId,
           actorType: input.actor.actorType,
+          boardApiKeyId: input.actor.boardApiKeyId,
           actorId: input.actor.actorId,
           agentId: input.actor.agentId,
           runId: input.actor.runId,
@@ -458,6 +459,7 @@ export function environmentRoutes(
     await logActivity(db, {
       companyId: input.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
       runId: input.actor.runId,
@@ -986,6 +988,7 @@ export function environmentRoutes(
           agentId: actor.agentId,
           runId: actor.runId,
           agentApiKeyId: actor.agentApiKeyId,
+          boardApiKeyId: actor.boardApiKeyId,
         },
         companyId,
       });

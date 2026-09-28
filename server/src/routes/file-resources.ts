@@ -373,6 +373,7 @@ export function fileResourceRoutes(db: Db, opts: {
     await logActivity(db, {
       companyId: input.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       action: input.outcome === "success"
         ? "issue.file_resource_availability"
@@ -406,6 +407,7 @@ export function fileResourceRoutes(db: Db, opts: {
     await logActivity(db, {
       companyId: input.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       action: input.action ?? "issue.file_resource_content_denied",
       entityType: "issue",
@@ -433,6 +435,7 @@ export function fileResourceRoutes(db: Db, opts: {
     await logActivity(db, {
       companyId: input.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       action: "issue.file_resource_list_denied",
       entityType: "issue",
@@ -609,6 +612,7 @@ export function fileResourceRoutes(db: Db, opts: {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         action: "issue.file_resource_list",
         entityType: "issue",
@@ -734,6 +738,7 @@ export function fileResourceRoutes(db: Db, opts: {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         action: "issue.file_resource_resolve",
         entityType: "issue",
@@ -860,6 +865,7 @@ export function fileResourceRoutes(db: Db, opts: {
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           action: "issue.file_resource_download",
           entityType: "issue",
@@ -910,6 +916,7 @@ export function fileResourceRoutes(db: Db, opts: {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         action: "issue.file_resource_content_read",
         entityType: "issue",

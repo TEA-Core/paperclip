@@ -163,6 +163,7 @@ export function instanceSettingsRoutes(db: Db) {
           logActivity(db, {
             companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -225,6 +226,7 @@ export function instanceSettingsRoutes(db: Db) {
           logActivity(db, {
             companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -273,6 +275,7 @@ export function instanceSettingsRoutes(db: Db) {
           logActivity(db, {
             companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -325,6 +328,7 @@ export function instanceSettingsRoutes(db: Db) {
               logActivityInTransaction(tx as unknown as Db, {
                 companyId,
                 actorType: actor.actorType,
+                boardApiKeyId: actor.boardApiKeyId,
                 actorId: actor.actorId,
                 agentId: actor.agentId,
                 runId: actor.runId,
@@ -378,6 +382,7 @@ export function instanceSettingsRoutes(db: Db) {
             logActivityInTransaction(tx as unknown as Db, {
               companyId,
               actorType: actor.actorType,
+              boardApiKeyId: actor.boardApiKeyId,
               actorId: actor.actorId,
               agentId: actor.agentId,
               runId: actor.runId,

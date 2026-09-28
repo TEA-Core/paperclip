@@ -332,6 +332,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
         companyId,
         actorType: "user",
         actorId: userId,
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "ai_connection.default_changed",
         entityType: "connection_grant",
         entityId: req.body.grantId,

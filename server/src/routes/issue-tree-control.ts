@@ -65,6 +65,7 @@ export function issueTreeControlRoutes(db: Db) {
     await logActivity(db, {
       companyId: root.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -102,6 +103,7 @@ export function issueTreeControlRoutes(db: Db) {
     await logActivity(db, {
       companyId: root.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
@@ -140,6 +142,7 @@ export function issueTreeControlRoutes(db: Db) {
             await logActivity(db, {
               companyId: root.companyId,
               actorType: actor.actorType,
+              boardApiKeyId: actor.boardApiKeyId,
               actorId: actor.actorId,
               agentId: actor.agentId,
               runId: actor.runId,
@@ -157,6 +160,7 @@ export function issueTreeControlRoutes(db: Db) {
             await Promise.resolve(logActivity(db, {
               companyId: root.companyId,
               actorType: actor.actorType,
+              boardApiKeyId: actor.boardApiKeyId,
               actorId: actor.actorId,
               agentId: actor.agentId,
               runId: actor.runId,
@@ -187,6 +191,7 @@ export function issueTreeControlRoutes(db: Db) {
         await logActivity(db, {
           companyId: root.companyId,
           actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
@@ -209,6 +214,7 @@ export function issueTreeControlRoutes(db: Db) {
       await logActivity(db, {
         companyId: root.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -251,6 +257,7 @@ export function issueTreeControlRoutes(db: Db) {
       await logActivity(db, {
         companyId: root.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -298,6 +305,7 @@ export function issueTreeControlRoutes(db: Db) {
           await logActivity(db, {
             companyId: root.companyId,
             actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
@@ -428,6 +436,7 @@ export function issueTreeControlRoutes(db: Db) {
       await logActivity(db, {
         companyId: root.companyId,
         actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
@@ -483,6 +492,7 @@ export function issueTreeControlRoutes(db: Db) {
               logActivity(db, {
                 companyId: root.companyId,
                 actorType: actor.actorType,
+                boardApiKeyId: actor.boardApiKeyId,
                 actorId: actor.actorId,
                 agentId: actor.agentId,
                 runId: actor.runId,

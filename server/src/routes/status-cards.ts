@@ -71,6 +71,7 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       action,
       entityType: "status_card",

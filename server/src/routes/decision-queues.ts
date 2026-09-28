@@ -33,6 +33,7 @@ function mutationActor(req: Parameters<typeof getActorInfo>[0]): DecisionMutatio
     userId: actor.actorType === "user" ? actor.actorId : null,
     runId: actor.runId,
     agentApiKeyId: actor.agentApiKeyId,
+    boardApiKeyId: actor.boardApiKeyId,
     responsibleUserId: req.actor.onBehalfOfUserId ?? (actor.actorType === "user" ? actor.actorId : null),
   };
 }

@@ -206,6 +206,7 @@ export function decisionRetentionService(
     await logActivity(db, {
       companyId: input.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
       runId: input.actor.runId,
@@ -261,6 +262,7 @@ export function decisionRetentionService(
     await logActivity(db, {
       companyId: input.companyId,
       actorType: input.actor.actorType,
+      boardApiKeyId: input.actor.boardApiKeyId,
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
       runId: input.actor.runId,

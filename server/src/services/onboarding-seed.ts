@@ -98,6 +98,7 @@ export type OnboardingSeedAuditActor = {
   agentId?: string | null;
   runId?: string | null;
   agentApiKeyId?: string | null;
+  boardApiKeyId?: string | null;
 };
 
 export function onboardingSeedService(db: Db) {
@@ -416,6 +417,7 @@ export function onboardingSeedService(db: Db) {
             agentId: audit.agentId,
             runId: audit.runId,
             agentApiKeyId: audit.agentApiKeyId,
+            boardApiKeyId: audit.boardApiKeyId,
             action: "company.onboarding_seed_applied",
             entityType: "company",
             entityId: companyId,

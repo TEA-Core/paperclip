@@ -49,6 +49,7 @@ export interface CatalogTeamActorContext {
   agentId?: string | null;
   runId?: string | null;
   userId?: string | null;
+  boardApiKeyId?: string | null;
 }
 
 export interface CatalogTeamImportOptions {
@@ -825,6 +826,7 @@ export function teamsCatalogService(db: Db) {
       actorId: actor.actorId,
       agentId: actor.agentId ?? null,
       runId: actor.runId ?? null,
+      boardApiKeyId: actor.boardApiKeyId ?? null,
       action,
       entityType: "company",
       entityId: companyId,

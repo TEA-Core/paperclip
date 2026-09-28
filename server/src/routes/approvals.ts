@@ -81,6 +81,7 @@ export function approvalRoutes(
     lostIssueIds: Set<string>;
     alreadyWoken?: { agentId: string; issueId: string } | null;
     requestedByUserId: string;
+    boardApiKeyId: string | null;
   }) {
     for (const issue of input.linkedIssues) {
       if (!input.lostIssueIds.has(issue.id) || !issue.assigneeAgentId) continue;
@@ -119,6 +120,7 @@ export function approvalRoutes(
           companyId: input.companyId,
           actorType: "user",
           actorId: input.requestedByUserId,
+          boardApiKeyId: input.boardApiKeyId,
           action: "approval.review_path_wakeup_queued",
           entityType: "approval",
           entityId: input.approvalId,
@@ -138,6 +140,7 @@ export function approvalRoutes(
           companyId: input.companyId,
           actorType: "user",
           actorId: input.requestedByUserId,
+          boardApiKeyId: input.boardApiKeyId,
           action: "approval.review_path_wakeup_failed",
           entityType: "approval",
           entityId: input.approvalId,
@@ -179,6 +182,7 @@ export function approvalRoutes(
     reason: string;
     source: string;
     actorUserId: string;
+    boardApiKeyId: string | null;
     extraContext?: Record<string, unknown> | null;
   }) {
     if (!args.approval.requestedByAgentId) return null;
@@ -212,6 +216,7 @@ export function approvalRoutes(
         companyId: args.approval.companyId,
         actorType: "user",
         actorId: args.actorUserId,
+        boardApiKeyId: args.boardApiKeyId,
         action: "approval.requester_wakeup_queued",
         entityType: "approval",
         entityId: args.approval.id,
@@ -235,6 +240,7 @@ export function approvalRoutes(
         companyId: args.approval.companyId,
         actorType: "user",
         actorId: args.actorUserId,
+        boardApiKeyId: args.boardApiKeyId,
         action: "approval.requester_wakeup_failed",
         entityType: "approval",
         entityId: args.approval.id,
@@ -339,6 +345,7 @@ export function approvalRoutes(
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "approval.created",
@@ -382,6 +389,7 @@ export function approvalRoutes(
         companyId: approval.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "approval.approved",
         entityType: "approval",
         entityId: approval.id,
@@ -399,6 +407,7 @@ export function approvalRoutes(
         reason: "approval_approved",
         source: "approval.approved",
         actorUserId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         extraContext: primaryReviewPathContext ?? null,
       });
       const primaryReviewPathWakeCovered = Boolean(primaryReviewPathWakeRun && primaryReviewPathContext);
@@ -413,6 +422,7 @@ export function approvalRoutes(
           ? { agentId: approval.requestedByAgentId, issueId: primaryIssueId }
           : null,
         requestedByUserId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
       });
     }
 
@@ -439,6 +449,7 @@ export function approvalRoutes(
         companyId: approval.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "approval.rejected",
         entityType: "approval",
         entityId: approval.id,
@@ -456,6 +467,7 @@ export function approvalRoutes(
         reason: "approval_rejected",
         source: "approval.rejected",
         actorUserId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
       });
       await queueAdditionalApprovalReviewPathWakes({
         approvalId: approval.id,
@@ -464,6 +476,7 @@ export function approvalRoutes(
         linkedIssues,
         lostIssueIds: lostReviewIssueIds,
         requestedByUserId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
       });
     }
 
@@ -491,6 +504,7 @@ export function approvalRoutes(
         companyId: approval.companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
         action: "approval.revision_requested",
         entityType: "approval",
         entityId: approval.id,
@@ -508,6 +522,7 @@ export function approvalRoutes(
         reason: "approval_revision_requested",
         source: "approval.revision_requested",
         actorUserId: req.actor.userId ?? "board",
+        boardApiKeyId: getActorInfo(req).boardApiKeyId,
       });
 
       res.json(redactApprovalPayload(approval));
@@ -539,6 +554,7 @@ export function approvalRoutes(
     await logActivity(db, {
       companyId: approval.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "approval.resubmitted",
@@ -571,6 +587,7 @@ export function approvalRoutes(
     await logActivity(db, {
       companyId: approval.companyId,
       actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "approval.comment_added",

@@ -10,6 +10,7 @@ import {
   authUsers,
   boardApiKeys,
   createDb,
+  folders,
   inboxDismissals,
   projects,
 } from "@paperclipai/db";
@@ -22,6 +23,7 @@ import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { inboxDismissalRoutes } from "../routes/inbox-dismissals.js";
 import { projectRoutes } from "../routes/projects.js";
+import { folderRoutes } from "../routes/folders.js";
 import { activityRoutes } from "../routes/activity.js";
 import { logActivity } from "../services/activity-log.js";
 
@@ -57,6 +59,7 @@ describeEmbeddedPostgres("activity_log board API key attribution", () => {
     resetEach: async (db) => {
       await db.delete(activityLog);
       await db.delete(inboxDismissals);
+      await db.delete(folders);
       await db.delete(projects);
     },
   });
@@ -118,6 +121,7 @@ describeEmbeddedPostgres("activity_log board API key attribution", () => {
     );
     app.use(inboxDismissalRoutes(db));
     app.use(projectRoutes(db));
+    app.use(folderRoutes(db));
     app.use(activityRoutes(db));
     app.use(errorHandler);
   }, 60_000);
@@ -148,6 +152,22 @@ describeEmbeddedPostgres("activity_log board API key attribution", () => {
     expect(readRow).toBeTruthy();
     expect(readRow!.boardApiKeyId).toBe(keyA);
     expect(String(readRow!.boardApiKeyId)).not.toContain("REDACTED");
+  });
+
+  it("threads board_api_key_id through a representative board endpoint (folder.created)", async () => {
+    const res = await request(app)
+      .post(`/companies/${companyId}/folders`)
+      .set("Authorization", "Bearer board-key-b-token")
+      .send({ kind: "routine", name: "Board Key Folder" });
+    expect(res.status).toBe(201);
+
+    const [row] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "folder.created"));
+    expect(row).toBeTruthy();
+    expect(row!.actorType).toBe("user");
+    expect(row!.boardApiKeyId).toBe(keyB);
   });
 
   it("produces distinguishable rows for two different board keys", async () => {
