@@ -15,7 +15,7 @@ import { connectionIntentService } from "../services/connection-intents.js";
 import { logActivity } from "../services/activity-log.js";
 import { accessService } from "../services/access.js";
 import type { heartbeatService } from "../services/heartbeat.js";
-import { assertBoard, assertCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 
 function bearer(req: Request) {
@@ -209,6 +209,7 @@ export function connectionIntentBoardRoutes(db: Db, heartbeat: Heartbeat) {
       companyId: loaded.issue.companyId,
       actorType: "user",
       actorId: userId,
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "issue.connection_intent_connected",
       entityType: "issue",
       entityId: loaded.issue.id,
@@ -232,6 +233,7 @@ export function connectionIntentBoardRoutes(db: Db, heartbeat: Heartbeat) {
       companyId: loaded.issue.companyId,
       actorType: "user",
       actorId: userId,
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       action: "issue.connection_intent_declined",
       entityType: "issue",
       entityId: loaded.issue.id,

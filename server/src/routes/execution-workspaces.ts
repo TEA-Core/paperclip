@@ -242,6 +242,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       entityId: workspace.id,
       actorType: "user",
       actorId: result.issuance.userId,
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       details: {
         nonce: result.issuance.nonce,
         instanceId: result.issuance.instanceId,
