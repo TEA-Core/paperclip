@@ -332,12 +332,12 @@ function createAnonymousAgentInviteDbStub() {
     allowedJoinTypes: "agent",
     tokenHash: "hash",
     defaultsPayload: null,
-    expiresAt: new Date("2027-03-10T00:00:00.000Z"),
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
     invitedByUserId: "inviter-user",
     revokedAt: null,
     acceptedAt: null,
-    createdAt: new Date("2026-03-07T00:00:00.000Z"),
-    updatedAt: new Date("2026-03-07T00:00:00.000Z"),
+    createdAt: new Date(),
+    updatedAt: new Date(),
   };
   const createdJoinRequest = {
     id: "join-1",
@@ -353,15 +353,15 @@ function createAnonymousAgentInviteDbStub() {
     capabilities: null,
     agentDefaultsPayload: null,
     claimSecretHash: "hash",
-    claimSecretExpiresAt: new Date("2027-03-10T00:00:00.000Z"),
+    claimSecretExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
     claimSecretConsumedAt: null,
     createdAgentId: null,
     approvedByUserId: null,
     approvedAt: null,
     rejectedByUserId: null,
     rejectedAt: null,
-    createdAt: new Date("2026-03-07T00:01:00.000Z"),
-    updatedAt: new Date("2026-03-07T00:01:00.000Z"),
+    createdAt: new Date(),
+    updatedAt: new Date(),
   };
   let selectCalls = 0;
   const db = {
@@ -583,7 +583,9 @@ describe("POST /invites/:token/accept", () => {
         adapterType: "claude_code",
       });
 
-    expect(res.status).not.toBe(401);
+    expect(res.status).toBe(202);
+    expect(res.body.claimSecret).toEqual(expect.any(String));
+    expect(res.body.claimSecret.length).toBeGreaterThan(0);
 
     // Anonymous means there is no board key, so the column must be null -- not
     // absent, and certainly not another principal's id.
@@ -592,7 +594,7 @@ describe("POST /invites/:token/accept", () => {
     );
     expect(joinWrites.length).toBeGreaterThan(0);
     for (const call of joinWrites) {
-      expect(call[1].boardApiKeyId ?? null).toBeNull();
+      expect(call[1].boardApiKeyId).toBeNull();
     }
   });
 });
