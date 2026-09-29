@@ -4003,7 +4003,8 @@ export function accessRoutes(
             req.actor.type === "agent"
               ? req.actor.agentId ?? "invite-agent"
               : req.actor.userId ?? "board",
-              boardApiKeyId: getActorInfo(req).boardApiKeyId,
+          boardApiKeyId:
+            req.actor.type === "board" ? getActorInfo(req).boardApiKeyId : null,
           action: "agent.updated_from_join_replay",
           entityType: "agent",
           entityId: updatedAgent.id,
@@ -4082,7 +4083,7 @@ export function accessRoutes(
             : req.actor.userId ??
               (requestType === "agent" ? "invite-anon" : "board"),
         boardApiKeyId:
-          req.actor.type === "agent" ? null : getActorInfo(req).boardApiKeyId,
+          req.actor.type === "board" ? getActorInfo(req).boardApiKeyId : null,
         action: inviteAlreadyAccepted
           ? "join.request_replayed"
           : "join.requested",
