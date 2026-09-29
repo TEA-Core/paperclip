@@ -17,8 +17,13 @@
  *    spread that may resolve to a user, or a missing actorType) is treated as
  *    potentially user and must carry a top-level `boardApiKeyId`.
  *
- * Exception mechanism is keyed by route file + action string (stable across
- * line shifts), never by line number.
+ * Exception mechanism is keyed by route file + action string, and — where a
+ * file/action pair is shared by multiple calls — by the exempted call's exact
+ * `actorType` expression, so an entry covers a single occurrence, not a
+ * file/action class. Markers are stable across line shifts and never pin a
+ * line number; if the matched call is reformatted, renamed, or gains the key,
+ * the marker stops matching and the guard falls back to requiring a top-level
+ * boardApiKeyId.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -29,26 +34,51 @@ const ROUTES_DIR = join(__dirname, "..", "routes");
 /**
  * Explicit route/action exceptions for board-authenticable sites that are
  * genuinely request-less (or owned by a sibling fence, not this residual
- * guard's scope). Keyed by file + action, not line number.
+ * guard's scope). Keyed by file + action, and where a file/action pair is
+ * shared by multiple calls, by the exact `actorType` expression of the
+ * exempted call (occurrence-specific, stable across line shifts — never a
+ * line number). An entry with no `actorType` marker exempts every call with
+ * that file + action; an entry with a marker exempts only the call whose
+ * trimmed `actorType` value matches the marker exactly.
  */
-const ALLOWLIST: Array<{ file: string; action: string; reason: string }> = [
+interface AllowlistEntry {
+  file: string;
+  action: string;
+  /** Exact trimmed source text of the exempted call's actorType property value. */
+  actorType?: string;
+  reason: string;
+}
+
+const ALLOWLIST: AllowlistEntry[] = [
   // agent actor: a board key can never be an agent
   { file: "secrets.ts", action: "secret.access.listed", reason: "agent actor" },
   // system actor: background/system join-claim event
   { file: "access.ts", action: "agent_api_key.claimed", reason: "system actor" },
-  // actorType is `actor?.actorType ?? "system"`; the board-key thread for
-  // issues.ts belongs to the issues.ts fence (SUP-17867), not this residual
-  // tail guard. The sibling `issue.recovery_action_resolved` site that IS in
-  // scope carries `boardApiKeyId: actor.boardApiKeyId` and is not exempted.
+  // Occurrence-specific carve-out for the `revalidateActiveSourceRecovery`
+  // follow-up in issues.ts, which logs with
+  // `actorType: actor?.actorType ?? "system"` and no top-level boardApiKeyId.
+  // The guard classifies that expression as board-authenticable (the read
+  // path can pass a request actor) and keeps reporting it; this entry is the
+  // narrow, documented, occurrence-keyed exception for that one site, fenced
+  // to the issues.ts board-key thread (SUP-17867). If the call is reformatted,
+  // renamed, or gains the key, the marker stops matching and the guard
+  // requires boardApiKeyId here.
   {
     file: "issues.ts",
     action: "issue.recovery_action_resolved",
-    reason: "issues.ts fence (SUP-17867) owns this system-fallback site",
+    actorType: 'actor?.actorType ?? "system"',
+    reason:
+      "issues.ts fence (SUP-17867) owns this request-less revalidation site; the exact-actorType marker exempts only that occurrence",
   },
 ];
 
-function isAllowlisted(file: string, action: string): boolean {
-  return ALLOWLIST.some((entry) => entry.file === file && entry.action === action);
+function isAllowlisted(allowlist: AllowlistEntry[], file: string, action: string, actorTypeExpr: string | undefined): boolean {
+  return allowlist.some(
+    (entry) =>
+      entry.file === file &&
+      entry.action === action &&
+      (entry.actorType === undefined || entry.actorType === (actorTypeExpr ?? "")),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +265,7 @@ const CALL_RE = /(?<![\w$.])(logActivity|persistActivity)\s*\(/g;
  * `server/src/routes/` is a `system`-actor event (the helpers return
  * `actorType: "system"`), so this is not masking a board-authenticable gap.
  */
-function scanSource(content: string, fileName: string): Violation[] {
+function scanSource(content: string, fileName: string, allowlist: AllowlistEntry[] = ALLOWLIST): Violation[] {
   const code = toCodeOnly(content);
   const violations: Violation[] = [];
   const n = code.length;
@@ -281,7 +311,7 @@ function scanSource(content: string, fileName: string): Violation[] {
 
     const actionProp = parsed.props.find((pr) => pr.key === "action");
     const action = actionProp ? actionProp.value.replace(/^["']|["']$/g, "") : "(unknown)";
-    if (isAllowlisted(fileName, action)) continue;
+    if (isAllowlisted(allowlist, fileName, action, actorProp?.value)) continue;
 
     const line = content.slice(0, callStart).split("\n").length;
     violations.push({
@@ -309,14 +339,14 @@ describe("board-api-key activity log guard", () => {
       const summary = allViolations.map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`).join("\n");
       throw new Error(
         `boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s):\n${summary}\n\n` +
-          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" to each call, or add the site to the ALLOWLIST if the actor cannot be a board key.`,
+          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.`,
       );
     }
 
     expect(allViolations).toHaveLength(0);
   });
 
-  it("allowlist entries reference valid files and actions", () => {
+  it("allowlist entries reference valid files, actions, and actorType markers", () => {
     for (const entry of ALLOWLIST) {
       const content = readFileSync(join(ROUTES_DIR, entry.file), "utf-8");
       const actionPattern = new RegExp(`action\\s*:\\s*["']${entry.action}["']`);
@@ -324,7 +354,78 @@ describe("board-api-key activity log guard", () => {
         actionPattern.test(content),
         `Allowlist entry ${entry.file} (${entry.action}): action string not found in file`,
       ).toBe(true);
+      if (entry.actorType !== undefined) {
+        expect(
+          content.includes(`actorType: ${entry.actorType}`),
+          `Allowlist entry ${entry.file} (${entry.action}) marker: exact actorType expression no longer present in file — the occurrence-specific exception is stale, re-evaluate it deliberately`,
+        ).toBe(true);
+      }
     }
+  });
+
+  // --- Occurrence-specific exception: prove both sides of the narrowing. ---
+
+  it("still reports the issues.ts revalidation occurrence when the exception is not applied", () => {
+    // The scanner must not have learned to classify
+    // `actor?.actorType ?? "system"` as safe: with the allowlist disabled the
+    // request-less revalidation follow-up is a board-authenticable omission
+    // and must surface. It is only suppressed by the documented,
+    // occurrence-keyed entry in ALLOWLIST.
+    const content = readFileSync(join(ROUTES_DIR, "issues.ts"), "utf-8");
+    const violations = scanSource(content, "issues.ts", []);
+    const recovery = violations.filter((v) => v.action === "issue.recovery_action_resolved");
+    expect(recovery).toHaveLength(1);
+    expect(recovery[0].detail).toContain('actorType=actor?.actorType ?? "system"');
+  });
+
+  it("exempts exactly the documented occurrence: real issues.ts scans clean with the allowlist", () => {
+    const content = readFileSync(join(ROUTES_DIR, "issues.ts"), "utf-8");
+    const violations = scanSource(content, "issues.ts");
+    expect(violations.filter((v) => v.action === "issue.recovery_action_resolved")).toHaveLength(0);
+  });
+
+  it("reports a same-file, same-action board-authenticable omission the exception must not cover", () => {
+    // Same route file, same action string, board-authenticable actor
+    // expression, top-level boardApiKeyId omitted: the broad {file, action}
+    // key used to hide this; the occurrence-specific entry must not.
+    const snippet = [
+      'import { logActivity } from "../services/activity-log";',
+      "export function handler(actor: any, db: any) {",
+      "  return logActivity(db, {",
+      "    companyId: actor.companyId,",
+      "    actorType: actor.actorType,",
+      "    actorId: actor.actorId,",
+      '    action: "issue.recovery_action_resolved",',
+      '    entityType: "issue",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "issues.ts");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].action).toBe("issue.recovery_action_resolved");
+  });
+
+  it("does not extend the occurrence-specific exception to another file", () => {
+    // The exact same actorType expression in a different route file must
+    // still be flagged: the entry is an occurrence carve-out, not a
+    // file/action-class exemption.
+    const snippet = [
+      'import { logActivity } from "../services/activity-log";',
+      "export function handler(actor: any, db: any) {",
+      "  return logActivity(db, {",
+      "    companyId: actor.companyId,",
+      '    actorType: actor?.actorType ?? "system",',
+      "    actorId: actor?.actorId,",
+      '    action: "issue.recovery_action_resolved",',
+      '    entityType: "issue",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "other-routes.ts");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].action).toBe("issue.recovery_action_resolved");
   });
 
   // --- Distinguishing tests: prove the guard actually detects the gap. ---
