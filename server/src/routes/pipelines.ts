@@ -85,7 +85,7 @@ import {
 import { accessService } from "../services/access.js";
 import { authorizationService } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
-import { assertCompanyAccess } from "./authz.js";
+import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
   computePipelineHealth,
   deriveCaseType,
@@ -1643,6 +1643,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     await logActivity(db, {
       companyId,
       ...activityActorForPipelineRoute(actor),
+      boardApiKeyId: actor.type === "user" ? getActorInfo(req).boardApiKeyId : null,
       action: result.created ? "pipeline.case_document_created" : "pipeline.case_document_updated",
       entityType: "pipeline_case",
       entityId: caseId,
@@ -1756,6 +1757,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     await logActivity(db, {
       companyId,
       ...activityActorForPipelineRoute(actor),
+      boardApiKeyId: actor.type === "user" ? getActorInfo(req).boardApiKeyId : null,
       action: "pipeline.case_document_restored",
       entityType: "pipeline_case",
       entityId: caseId,
