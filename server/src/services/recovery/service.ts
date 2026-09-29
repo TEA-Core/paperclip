@@ -9664,6 +9664,7 @@ export function recoveryService(
       livePathSkipped: 0,
       thresholdSkipped: 0,
       alreadyActionedSkipped: 0,
+      alreadyParkedDischargedSkipped: 0,
       candidateLimitSkipped: 0,
       issueIds: [] as string[],
     };
@@ -9764,6 +9765,28 @@ export function recoveryService(
       assigneeRows.map((row) => [row.id, row.name] as const),
     );
 
+    // SUP-17927: a card may be parked at most once per seat. If the same
+    // (issue, assigneeAgentId) seat already has a todo_stranded park row, the
+    // card is "already parked" — the BWOB auto-heal will return it to todo and
+    // this sweep would otherwise re-park it every threshold window, oscillating
+    // todo<->blocked and re-emitting an identical notice forever. Discharge it.
+    const priorParkRows = await db
+      .select({
+        entityId: activityLog.entityId,
+        agentId: activityLog.agentId,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.action, TODO_STRANDED_ACTION),
+          inArray(activityLog.entityId, candidateIdList),
+        ),
+      );
+    const alreadyParkedSeats = new Set(
+      priorParkRows.map((row) => `${row.entityId}:${row.agentId ?? ""}`),
+    );
+
     for (const candidate of issueRows) {
       const leased = Boolean(leasesByCompany.get(candidate.companyId)?.has(candidate.id));
       const monitorFuture = hasFutureMonitorCheck(candidate.monitorNextCheckAt);
@@ -9820,6 +9843,11 @@ export function recoveryService(
       if (!verdict.stranded) {
         if (activePath || monitorFuture || liveWake) result.livePathSkipped += 1;
         else result.thresholdSkipped += 1;
+        continue;
+      }
+
+      if (alreadyParkedSeats.has(`${candidate.id}:${candidate.assigneeAgentId ?? ""}`)) {
+        result.alreadyParkedDischargedSkipped += 1;
         continue;
       }
 
