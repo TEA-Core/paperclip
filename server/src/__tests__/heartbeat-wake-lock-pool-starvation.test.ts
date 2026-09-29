@@ -200,10 +200,9 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
           payload: { issueId, convoyIndex: index },
           contextSnapshot: { issueId, taskId: issueId },
         })
-        .then(
-          () => performance.now() - startedAt,
-          () => performance.now() - startedAt,
-        ),
+        // A rejected admission fails the test; only the timing of a
+        // successful one is measured.
+        .then(() => performance.now() - startedAt),
     );
     const settled = await Promise.race([
       Promise.all(wakes),
@@ -306,5 +305,6 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
     });
 
     expect(result).toMatchObject({ settled: true });
+    expect(result).not.toHaveProperty("error");
   }, 30_000);
 });
