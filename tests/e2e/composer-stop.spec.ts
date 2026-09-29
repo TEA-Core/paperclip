@@ -25,10 +25,80 @@ async function task(
     }),
   );
 }
+type ResumeEvidence = Record<string, unknown> & {
+  label: string;
+  capturedAt: string;
+};
+function evidenceField(value: unknown, key: string) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  return (value as Record<string, unknown>)[key];
+}
+async function resumeEvidence(
+  request: APIRequestContext,
+  issueId: string,
+  label: string,
+): Promise<ResumeEvidence> {
+  const [issue, liveRuns, recovery, tree] = await Promise.all([
+    json(await request.get(`/api/issues/${issueId}`)),
+    json(await request.get(`/api/issues/${issueId}/live-runs`)),
+    json(await request.get(`/api/issues/${issueId}/recovery-actions`)),
+    json(await request.get(`/api/issues/${issueId}/tree-control/state`)),
+  ]);
+  return {
+    label,
+    capturedAt: new Date().toISOString(),
+    issue: {
+      status: issue.status,
+      executionRunId: issue.executionRunId,
+      checkoutRunId: issue.checkoutRunId,
+      assigneeAgentId: issue.assigneeAgentId,
+    },
+    liveRuns: liveRuns.map((run: Record<string, unknown>) => ({
+      id: run.id,
+      status: run.status,
+      runtimeMode: run.runtimeMode,
+      invocationSource: run.invocationSource,
+      triggerDetail: run.triggerDetail,
+      continuationAttempt: run.continuationAttempt,
+    })),
+    recovery: {
+      active: recovery.active
+        ? {
+            id: recovery.active.id,
+            status: recovery.active.status,
+            cause: recovery.active.cause,
+            runId: evidenceField(recovery.active.evidence, "runId"),
+            continuationDelivery: evidenceField(
+              recovery.active.evidence,
+              "continuationDelivery",
+            ),
+          }
+        : null,
+      actions: recovery.actions.map((action: Record<string, unknown>) => ({
+        id: action.id,
+        status: action.status,
+        cause: action.cause,
+        runId: evidenceField(action.evidence, "runId"),
+        continuationDelivery: evidenceField(
+          action.evidence,
+          "continuationDelivery",
+        ),
+      })),
+    },
+    tree: {
+      activePauseHold: tree.activePauseHold
+        ? { id: tree.activePauseHold.id }
+        : null,
+    },
+  };
+}
 async function running(
   request: APIRequestContext,
   issueId: string,
   adapter: "process" | "paperclip_runner",
+  evidence?: ResumeEvidence[],
 ) {
   let run:
     | { id: string; status: string; runtimeMode?: string; processPid?: number }
@@ -42,6 +112,9 @@ async function running(
         run = runs.find(
           (candidate: { status: string }) => candidate.status === "running",
         );
+        if (!run && evidence) {
+          evidence.push(await resumeEvidence(request, issueId, "running-poll"));
+        }
         return !!run;
       },
       { timeout: 30_000 },
@@ -170,6 +243,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       await request.get("/api/instance/settings/experimental"),
     );
     const statusMetadata: Record<string, string | null>[] = [];
+    const resumeEvidenceLog: ResumeEvidence[] = [];
     page.on("websocket", (socket) => {
       socket.on("framereceived", ({ payload: frame }) => {
         try {
@@ -434,12 +508,28 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
         expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
         await reconcileDemoExecution(request, parent.id, parentRun.id);
+        resumeEvidenceLog.push(
+          await resumeEvidence(request, parent.id, "after-parent-resolve"),
+        );
         await reconcileDemoExecution(request, child.id, childRun.id);
+        resumeEvidenceLog.push(
+          await resumeEvidence(request, child.id, "after-child-resolve"),
+        );
       }
       // A verified stopped native runner can honor the explicitly selected
       // Wake agents option without another manual reconciliation step.
-      const resumedParentRun = await running(request, parent.id, adapter);
-      const resumedChildRun = await running(request, child.id, adapter);
+      const resumedParentRun = await running(
+        request,
+        parent.id,
+        adapter,
+        resumeEvidenceLog,
+      );
+      const resumedChildRun = await running(
+        request,
+        child.id,
+        adapter,
+        resumeEvidenceLog,
+      );
       expect(resumedParentRun.id).not.toBe(parentRun.id);
       expect(resumedChildRun.id).not.toBe(childRun.id);
       if (adapter === "paperclip_runner") {
@@ -530,6 +620,12 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         body: statusEvidence,
         contentType: "application/json",
       });
+      if (resumeEvidenceLog.length > 0) {
+        await testInfo.attach("resume-evidence", {
+          body: JSON.stringify(resumeEvidenceLog, null, 2),
+          contentType: "application/json",
+        });
+      }
     }
   });
 }
