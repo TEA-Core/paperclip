@@ -2,13 +2,23 @@
  * Regression guard: every board-authenticable `logActivity`/`persistActivity`
  * call site in `server/src/routes/` must pass `boardApiKeyId` in the same call.
  *
- * This is a source-pinning check — it reads the route source as text and
- * verifies the pattern is present. Omitting the property produces no type
- * error and no runtime error, just a NULL column, so only a source scan can
- * catch it.
+ * This is a source check — omitting the property produces no type error and no
+ * runtime error, just a NULL column, so only a source scan can catch it.
  *
- * Allowlisted sites (actorType "system" or "agent") cannot have a board key
- * as their actor, so boardApiKeyId is correctly null/absent.
+ * The guard parses the COMPLETE second argument of each call (a comment- and
+ * string-aware, balanced-brace parse — not a fixed line window) and requires a
+ * TOP-LEVEL `boardApiKeyId`. A `boardApiKeyId` nested inside `details` does not
+ * satisfy the requirement.
+ *
+ * Actor classification drives which calls are board-authenticable:
+ *  - a literal `actorType` of "agent" / "system" / "plugin" can never carry a
+ *    board key, so those sites are exempt by classification;
+ *  - a literal "user", or an expression (`actor.actorType`, a ternary, a
+ *    spread that may resolve to a user, or a missing actorType) is treated as
+ *    potentially user and must carry a top-level `boardApiKeyId`.
+ *
+ * Exception mechanism is keyed by route file + action string (stable across
+ * line shifts), never by line number.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -17,94 +27,269 @@ import { describe, expect, it } from "vitest";
 const ROUTES_DIR = join(__dirname, "..", "routes");
 
 /**
- * Sites that are NOT board-key-authenticable:
- * - actorType is "system" (background/system actions)
- * - actorType is "agent" (agent-originated writes)
- *
- * Each entry is keyed by file + action string (not line number) so that
- * other PRs shifting lines do not break the allowlist.
+ * Explicit route/action exceptions for board-authenticable sites that are
+ * genuinely request-less (or owned by a sibling fence, not this residual
+ * guard's scope). Keyed by file + action, not line number.
  */
 const ALLOWLIST: Array<{ file: string; action: string; reason: string }> = [
-  // agent actor: board key can never be an agent
+  // agent actor: a board key can never be an agent
   { file: "secrets.ts", action: "secret.access.listed", reason: "agent actor" },
-  // system actor: background/system action
+  // system actor: background/system join-claim event
   { file: "access.ts", action: "agent_api_key.claimed", reason: "system actor" },
+  // actorType is `actor?.actorType ?? "system"`; the board-key thread for
+  // issues.ts belongs to the issues.ts fence (SUP-17867), not this residual
+  // tail guard. The sibling `issue.recovery_action_resolved` site that IS in
+  // scope carries `boardApiKeyId: actor.boardApiKeyId` and is not exempted.
+  {
+    file: "issues.ts",
+    action: "issue.recovery_action_resolved",
+    reason: "issues.ts fence (SUP-17867) owns this system-fallback site",
+  },
 ];
 
 function isAllowlisted(file: string, action: string): boolean {
   return ALLOWLIST.some((entry) => entry.file === file && entry.action === action);
 }
 
-/**
- * For a given source file, find all logActivity/persistActivity calls and
- * check whether they pass boardApiKeyId.
- *
- * Strategy: scan for `logActivity(db, {` or `persistActivity(db, {` patterns.
- * Then look at the next 30 lines for:
- *   - a potentially-user actorType (literal "user", a variable expression,
- *     or a spread that resolves to user)
- *   - boardApiKeyId as a top-level property (not nested inside details)
- *
- * If the actor is potentially user and boardApiKeyId is absent, it's a
- * violation unless allowlisted.
- */
-function findViolations(content: string, fileName: string): Array<{ line: number; action: string }> {
-  const lines = content.split("\n");
-  const violations: Array<{ line: number; action: string }> = [];
+// ---------------------------------------------------------------------------
+// Structural scanning. `toCodeOnly` blanks comments and string interiors
+// (keeping the same length so index arithmetic stays valid), leaving braces,
+// commas, colons, and identifiers intact. All structural work runs on that
+// code-only view; values are read back from the original text at the same
+// indices so string literals (actorType/action values) are preserved.
+// ---------------------------------------------------------------------------
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const callMatch = line.match(/\b(logActivity|persistActivity)\s*\(/);
-    if (!callMatch) continue;
-
-    // Skip import lines and type-only references
-    if (line.trim().startsWith("import") || line.trim().startsWith("type ")) continue;
-
-    // Look at the next 20 lines for the call block
-    const block = lines.slice(i, Math.min(i + 25, lines.length)).join("\n");
-
-    // Detect potentially-user actor types:
-    //  - literal "user"
-    //  - variable expressions (actor.actorType, req.actor.type, etc.)
-    //    that are NOT literal "agent" or "system"
-    //  - spread patterns that may resolve to user
-    const hasUserActor = /actorType\s*:\s*["']user["']/.test(block);
-    const hasVariableActorType =
-      /actorType\s*:\s*(?!["'])/.test(block) &&
-      !/actorType\s*:\s*["'](?:agent|system)["']/.test(block);
-    const hasSpreadUserActor = /\.\.\.\w+Log\b/.test(block) || /activityActorForPipelineRoute/.test(block);
-
-    if (!hasUserActor && !hasVariableActorType && !hasSpreadUserActor) continue;
-
-    // Check for boardApiKeyId at the top level of the call arguments,
-    // i.e. before the `details:` key. A boardApiKeyId nested inside
-    // `details: { ... }` does not satisfy the requirement.
-    const detailsIdx = block.search(/\bdetails\s*:/);
-    const topLevel = detailsIdx >= 0 ? block.slice(0, detailsIdx) : block;
-    let hasBoardApiKeyId = /boardApiKeyId\s*:/.test(topLevel);
-
-    // Handle spread variables: if the call spreads a local variable (e.g. ...baseLog),
-    // check whether that variable's definition (within 40 lines above the call) includes boardApiKeyId.
-    if (!hasBoardApiKeyId) {
-      const spreadMatch = block.match(/\.\.\.(\w+)/);
-      if (spreadMatch) {
-        const varName = spreadMatch[1];
-        // Search up to 60 lines above for the variable definition
-        const above = lines.slice(Math.max(0, i - 60), i).join("\n");
-        const defRegex = new RegExp(`(?:const|let|var)\\s+${varName}\\s*=\\s*\\{`);
-        if (defRegex.test(above)) {
-          hasBoardApiKeyId = /boardApiKeyId\s*:/.test(above);
+function toCodeOnly(text: string): string {
+  const out = text.split("");
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === "/" && text[i + 1] === "/") {
+      let j = i;
+      while (j < n && text[j] !== "\n") {
+        out[j] = " ";
+        j++;
+      }
+      i = j;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      let j = i;
+      while (j < n && !(text[j] === "*" && text[j + 1] === "/")) {
+        out[j] = " ";
+        j++;
+      }
+      if (j < n) {
+        out[j] = " ";
+        out[j + 1] = " ";
+        j += 2;
+      }
+      i = j;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      const q = c;
+      out[i] = " ";
+      i++;
+      while (i < n) {
+        if (text[i] === "\\") {
+          out[i] = " ";
+          i++;
+          if (i < n) {
+            out[i] = " ";
+            i++;
+          }
+          continue;
         }
+        if (text[i] === q) {
+          out[i] = " ";
+          i++;
+          break;
+        }
+        out[i] = " ";
+        i++;
       }
+      continue;
     }
+    i++;
+  }
+  return out.join("");
+}
 
-    if (!hasBoardApiKeyId) {
-      const actionMatch = block.match(/action\s*:\s*["']([^"']+)["']/);
-      const action = actionMatch?.[1] ?? "(unknown)";
-      if (!isAllowlisted(fileName, action)) {
-        violations.push({ line: i + 1, action });
+function matchBrace(code: string, openIdx: number): number {
+  let depth = 0;
+  for (let i = openIdx; i < code.length; i++) {
+    if (code[i] === "{") depth++;
+    else if (code[i] === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+interface TopLevelProp {
+  key: string;
+  value: string;
+}
+
+interface ParsedObject {
+  props: TopLevelProp[];
+  spreadVars: string[];
+}
+
+/** Parse the top-level properties of the object literal whose `{` is at openIdx. */
+function topLevelProps(code: string, text: string, openIdx: number): ParsedObject | null {
+  const close = matchBrace(code, openIdx);
+  if (close < 0) return null;
+  const innerStart = openIdx + 1;
+  const innerEnd = close;
+  let depth = 0;
+  let segStart = innerStart;
+  const spans: Array<[number, number]> = [];
+  for (let i = innerStart; i < innerEnd; i++) {
+    const c = code[i];
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    else if (c === "," && depth === 0) {
+      spans.push([segStart, i]);
+      segStart = i + 1;
+    }
+  }
+  spans.push([segStart, innerEnd]);
+
+  const props: TopLevelProp[] = [];
+  const spreadVars: string[] = [];
+  for (const [s, e] of spans) {
+    let d = 0;
+    let colon = -1;
+    for (let i = s; i < e; i++) {
+      const c = code[i];
+      if (c === "{") d++;
+      else if (c === "}") d--;
+      else if (c === ":" && d === 0) {
+        colon = i;
+        break;
       }
     }
+    const segCode = code.slice(s, e).trim();
+    if (segCode.startsWith("...")) {
+      const sm = segCode.match(/\.\.\.\s*([A-Za-z_$][\w$]*)/);
+      if (sm) spreadVars.push(sm[1]);
+      continue;
+    }
+    if (colon < 0) continue;
+    const keyTok = code.slice(s, colon).trim();
+    const keyMatch = keyTok.match(/^["']?([A-Za-z_$][\w$]*)["']?$/);
+    if (!keyMatch) continue;
+    const value = text.slice(colon + 1, e).trim();
+    props.push({ key: keyMatch[1], value });
+  }
+  return { props, spreadVars };
+}
+
+/**
+ * Resolve a spread variable to its in-file object-literal initializer and check
+ * whether THAT object carries a top-level boardApiKeyId. Handles the
+ * `logActivity(db, { ...baseLog, details: {...} })` pattern where the board key
+ * lives on the spread source, not on the call literal.
+ */
+function spreadHasBoard(code: string, text: string, varName: string): boolean {
+  const re = new RegExp(`(?:const|let|var)\\s+${varName}\\b\\s*=[^;{]*\\{`);
+  const m = re.exec(code);
+  if (!m) return false;
+  const openIdx = m.index + m[0].length - 1;
+  const parsed = topLevelProps(code, text, openIdx);
+  return !!parsed && parsed.props.some((p) => p.key === "boardApiKeyId");
+}
+
+type ActorClass = "USER" | "AGENT" | "SYSTEM" | "PLUGIN" | "EXPR";
+
+function classifyActor(value: string | null): ActorClass {
+  if (!value) return "EXPR";
+  const v = value.trim();
+  if (/^["']user["']/.test(v)) return "USER";
+  if (/^["']agent["']/.test(v)) return "AGENT";
+  if (/^["']system["']/.test(v)) return "SYSTEM";
+  if (/^["']plugin["']/.test(v)) return "PLUGIN";
+  return "EXPR";
+}
+
+interface Violation {
+  file: string;
+  line: number;
+  action: string;
+  detail: string;
+}
+
+const CALL_RE = /(?<![\w$.])(logActivity|persistActivity)\s*\(/g;
+
+/**
+ * Scan one source file and return board-api-key violations.
+ *
+ * Scope limit (documented, matching the transaction guard): a call whose second
+ * argument is not an inline object literal (i.e. a helper-built object such as
+ * `logActivity(db, buildDependencyWakeWithheldActivity({...}))`) is not
+ * statically verifiable and is skipped. Every current site of that shape in
+ * `server/src/routes/` is a `system`-actor event (the helpers return
+ * `actorType: "system"`), so this is not masking a board-authenticable gap.
+ */
+function scanSource(content: string, fileName: string): Violation[] {
+  const code = toCodeOnly(content);
+  const violations: Violation[] = [];
+  const n = code.length;
+
+  CALL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = CALL_RE.exec(code)) !== null) {
+    const callStart = m.index;
+    // Locate the second argument: the top-level comma after the opening `(`.
+    let p = callStart + m[0].length;
+    let depth = 1;
+    let commaIdx = -1;
+    while (p < n) {
+      const c = code[p];
+      if (c === "(") depth++;
+      else if (c === ")") {
+        depth--;
+        if (depth === 0) break;
+      } else if (c === "," && depth === 1) {
+        commaIdx = p;
+        break;
+      }
+      p++;
+    }
+    if (commaIdx < 0) continue; // no second argument
+
+    let argStart = commaIdx + 1;
+    while (argStart < n && (code[argStart] === "\n" || /[ \t]/.test(code[argStart]))) argStart++;
+    if (code[argStart] !== "{") continue; // helper-built object: out of static reach
+
+    const parsed = topLevelProps(code, content, argStart);
+    if (!parsed) continue;
+
+    const actorProp = parsed.props.find((pr) => pr.key === "actorType");
+    const cls = classifyActor(actorProp ? actorProp.value : null);
+    // agent/system/plugin actors can never carry a board key.
+    if (cls === "AGENT" || cls === "SYSTEM" || cls === "PLUGIN") continue;
+
+    const hasBoard =
+      parsed.props.some((pr) => pr.key === "boardApiKeyId") ||
+      parsed.spreadVars.some((v) => spreadHasBoard(code, content, v));
+    if (hasBoard) continue;
+
+    const actionProp = parsed.props.find((pr) => pr.key === "action");
+    const action = actionProp ? actionProp.value.replace(/^["']|["']$/g, "") : "(unknown)";
+    if (isAllowlisted(fileName, action)) continue;
+
+    const line = content.slice(0, callStart).split("\n").length;
+    violations.push({
+      file: fileName,
+      line,
+      action,
+      detail: `actorType=${actorProp?.value ?? "(none)"} — missing top-level boardApiKeyId`,
+    });
   }
 
   return violations;
@@ -113,24 +298,18 @@ function findViolations(content: string, fileName: string): Array<{ line: number
 describe("board-api-key activity log guard", () => {
   it("all board-authenticable logActivity/persistActivity calls in routes/ pass boardApiKeyId", () => {
     const files = readdirSync(ROUTES_DIR).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
-    const allViolations: Array<{ file: string; line: number; action: string }> = [];
+    const allViolations: Violation[] = [];
 
     for (const file of files) {
-      const filePath = join(ROUTES_DIR, file);
-      const content = readFileSync(filePath, "utf-8");
-      const violations = findViolations(content, file);
-      for (const v of violations) {
-        allViolations.push({ file, ...v });
-      }
+      const content = readFileSync(join(ROUTES_DIR, file), "utf-8");
+      allViolations.push(...scanSource(content, file));
     }
 
     if (allViolations.length > 0) {
-      const summary = allViolations
-        .map((v) => `  ${v.file}:${v.line} — ${v.action}`)
-        .join("\n");
+      const summary = allViolations.map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`).join("\n");
       throw new Error(
         `boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s):\n${summary}\n\n` +
-        `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" to each call, or add the site to the ALLOWLIST if the actor cannot be a board key.`,
+          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" to each call, or add the site to the ALLOWLIST if the actor cannot be a board key.`,
       );
     }
 
@@ -139,14 +318,90 @@ describe("board-api-key activity log guard", () => {
 
   it("allowlist entries reference valid files and actions", () => {
     for (const entry of ALLOWLIST) {
-      const filePath = join(ROUTES_DIR, entry.file);
-      const content = readFileSync(filePath, "utf-8");
-      // The allowlisted file must contain a logActivity call with the specified action
+      const content = readFileSync(join(ROUTES_DIR, entry.file), "utf-8");
       const actionPattern = new RegExp(`action\\s*:\\s*["']${entry.action}["']`);
       expect(
         actionPattern.test(content),
         `Allowlist entry ${entry.file} (${entry.action}): action string not found in file`,
       ).toBe(true);
     }
+  });
+
+  // --- Distinguishing tests: prove the guard actually detects the gap. ---
+
+  it("flags a call that drops the top-level boardApiKeyId while keeping details.boardApiKeyId", () => {
+    const snippet = [
+      'import { logActivity } from "../services/activity-log";',
+      "export function handler(req: any, db: any) {",
+      "  return logActivity(db, {",
+      "    companyId: req.companyId,",
+      '    actorType: "user",',
+      "    actorId: req.actor.userId,",
+      '    action: "synthetic.missing_board",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "    details: {",
+      '      boardApiKeyId: "nested-must-not-count",',
+      "    },",
+      "  });",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "synthetic.ts");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].action).toBe("synthetic.missing_board");
+  });
+
+  it("passes an actorType: actor.actorType call that carries a top-level boardApiKeyId", () => {
+    const snippet = [
+      'import { logActivity } from "../services/activity-log";',
+      "export function handler(actor: any, db: any) {",
+      "  return logActivity(db, {",
+      "    companyId: actor.companyId,",
+      "    actorType: actor.actorType,",
+      "    boardApiKeyId: actor.boardApiKeyId,",
+      "    actorId: actor.actorId,",
+      '    action: "synthetic.expr_ok",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    expect(scanSource(snippet, "synthetic.ts")).toHaveLength(0);
+  });
+
+  it("flags an actorType: actor.actorType call that omits the top-level boardApiKeyId", () => {
+    const snippet = [
+      'import { logActivity } from "../services/activity-log";',
+      "export function handler(actor: any, db: any) {",
+      "  return logActivity(db, {",
+      "    companyId: actor.companyId,",
+      "    actorType: actor.actorType,",
+      "    actorId: actor.actorId,",
+      '    action: "synthetic.expr_missing",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "synthetic.ts");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].action).toBe("synthetic.expr_missing");
+  });
+
+  it("exempts a literal system-actor call without boardApiKeyId", () => {
+    const snippet = [
+      'import { logActivity } from "../services/activity-log";',
+      "export function handler(db: any) {",
+      "  return logActivity(db, {",
+      '    companyId: "c1",',
+      '    actorType: "system",',
+      '    actorId: "background",',
+      '    action: "synthetic.system_ok",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    expect(scanSource(snippet, "synthetic.ts")).toHaveLength(0);
   });
 });
