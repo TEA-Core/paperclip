@@ -1,5 +1,9 @@
 /**
- * Adapter types shipped with Paperclip. External plugins must not replace these.
+ * Adapter types that ship with Paperclip. An external adapter package MAY
+ * declare one of these types to override the built-in implementation: the
+ * registry keeps the built-in registered as a fallback and only returns it from
+ * `findActiveServerAdapter` while the override is paused or unregistered
+ * (see server/src/adapters/registry.ts and docs/adapters/external-adapters.md).
  */
 export const BUILTIN_ADAPTER_TYPES = new Set([
   "acpx_local",

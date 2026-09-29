@@ -2,6 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
+import { apiUrl, normalizeBaseUrl, redactUrlCredentials } from "./base-url.js";
 
 function makeCtx(config: Record<string, unknown>): AdapterExecutionContext {
   return {
@@ -578,6 +579,124 @@ describe("execute", () => {
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("hermes_gateway_timeout");
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/stop"))).toBe(true);
+  });
+
+  it("keeps apiBaseUrl userinfo out of logs and metadata while still authenticating the request", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(
+          sseStream(
+            [
+              "event: run.completed",
+              "data: {\"status\":\"completed\",\"output\":\"done\"}",
+              "",
+            ].join("\n"),
+          ),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const ctx = makeCtx({
+      apiBaseUrl: "http://user:sekrit@127.0.0.1:8642/",
+      apiKey: "secret-key",
+      timeoutSec: 5,
+    });
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+
+    // The credential still reaches the network so the request authenticates.
+    const fetchedUrls = fetchMock.mock.calls.map(([input]) => String(input));
+    expect(fetchedUrls).toContain("http://user:sekrit@127.0.0.1:8642/v1/runs");
+
+    // ...but the persisted stdout line and run-metadata commandArgs never leak it.
+    const logText = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map(([, line]) => String(line)).join("\n");
+    expect(logText).toContain("creating run at http://REDACTED@127.0.0.1:8642/v1/runs");
+    expect(logText).not.toContain("sekrit");
+
+    const commandArgs = (ctx.onMeta as ReturnType<typeof vi.fn>).mock.calls
+      .map(([meta]) => ((meta as { commandArgs?: unknown[] } | undefined)?.commandArgs ?? []))
+      .flat()
+      .map(String);
+    expect(commandArgs).toContain("http://REDACTED@127.0.0.1:8642/v1/runs");
+    expect(commandArgs.join("\n")).not.toContain("sekrit");
+  });
+});
+
+describe("shared gateway base URL (run + probe)", () => {
+  it("strips query and fragment so probe and run target the same origin+path", () => {
+    const base = normalizeBaseUrl("http://10.10.1.5:8642/risk/?x=1#frag");
+    expect(base).not.toBeNull();
+    const health = apiUrl(base!, "/health");
+    const run = apiUrl(base!, "/v1/runs");
+    expect(health).toBe("http://10.10.1.5:8642/risk/health");
+    expect(run).toBe("http://10.10.1.5:8642/risk/v1/runs");
+    // Same origin+path; only the endpoint differs.
+    const originPath = (u: string) => u.replace(/\/(health|v1\/runs)$/, "");
+    expect(originPath(health)).toBe(originPath(run));
+  });
+
+  it("still maps the bare 9119 dashboard root to /api and drops the query", () => {
+    const base = normalizeBaseUrl("http://127.0.0.1:9119/?probe=1");
+    expect(base).not.toBeNull();
+    expect(apiUrl(base!, "/v1/runs")).toBe("http://127.0.0.1:9119/api/v1/runs");
+  });
+
+  it("redactUrlCredentials masks userinfo on a copy without touching the original", () => {
+    const original = new URL("http://user:sekrit@127.0.0.1:8642/");
+    const redacted = redactUrlCredentials(original);
+    expect(redacted.toString()).toBe("http://REDACTED@127.0.0.1:8642/");
+    // Original is preserved so the live credential can still be used for fetch.
+    expect(original.toString()).toBe("http://user:sekrit@127.0.0.1:8642/");
+  });
+
+  it("composes the same origin+path in the run executor and the Test-Connection probe", async () => {
+    const apiBaseUrl = "http://127.0.0.1:8642/risk/?x=1#frag";
+
+    const fetchRun = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-1", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(
+          sseStream(
+            [
+              "event: run.completed",
+              "data: {\"status\":\"completed\",\"output\":\"done\"}",
+              "",
+            ].join("\n"),
+          ),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    const fetchProbe = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response("{}", { status: 200 }));
+
+    vi.stubGlobal("fetch", fetchRun);
+    await execute(makeCtx({ apiBaseUrl, apiKey: "secret-key", timeoutSec: 5 }));
+    const runUrl = fetchRun.mock.calls.find(([input]) => String(input).endsWith("/v1/runs"))?.[0];
+
+    vi.stubGlobal("fetch", fetchProbe);
+    await testEnvironment({
+      companyId: "company-1",
+      adapterType: "hermes_gateway",
+      config: { apiBaseUrl, apiKey: "secret-key" },
+    });
+    const probeUrl = fetchProbe.mock.calls[0]?.[0];
+
+    expect(String(runUrl)).toBe("http://127.0.0.1:8642/risk/v1/runs");
+    expect(String(probeUrl)).toBe("http://127.0.0.1:8642/risk/health");
+    const originPath = (u: string) => u.replace(/\/(v1\/runs|health)$/, "");
+    expect(originPath(String(runUrl))).toBe(originPath(String(probeUrl)));
   });
 });
 

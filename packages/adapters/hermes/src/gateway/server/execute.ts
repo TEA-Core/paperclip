@@ -25,6 +25,7 @@ import {
   isRemotePlainHttp,
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
+import { apiUrl, normalizeBaseUrl, redactUrlCredentials } from "./base-url.js";
 
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
@@ -86,8 +87,6 @@ const TERMINAL_STATUSES = new Set([
 
 const FAILURE_STATUSES = new Set(["failed", "error"]);
 const CANCELLED_STATUSES = new Set(["cancelled", "canceled", "stopped", "interrupted"]);
-const DEFAULT_HERMES_DASHBOARD_PORT = "9119";
-const HERMES_DASHBOARD_API_PATHS = new Set(["", "/", "/chat"]);
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -116,32 +115,6 @@ function normalizeSessionKeyStrategy(value: unknown): SessionKeyStrategy {
   const raw = asString(value, "issue").trim().toLowerCase();
   if (raw === "agent" || raw === "run" || raw === "none") return raw;
   return "issue";
-}
-
-function normalizeBaseUrl(value: string): URL | null {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-    const normalizedPath = url.pathname.replace(/\/+$/, "") || "/";
-    if (
-      url.port === DEFAULT_HERMES_DASHBOARD_PORT &&
-      HERMES_DASHBOARD_API_PATHS.has(normalizedPath)
-    ) {
-      url.pathname = "/api";
-    } else {
-      url.pathname = url.pathname.replace(/\/+$/, "");
-    }
-    url.search = "";
-    url.hash = "";
-    return url;
-  } catch {
-    return null;
-  }
-}
-
-function apiUrl(baseUrl: URL, path: string): string {
-  const base = baseUrl.toString().replace(/\/+$/, "");
-  return `${base}${path}`;
 }
 
 function issueIdFromContext(ctx: AdapterExecutionContext): string | null {
@@ -858,11 +831,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   ]);
   const body = buildRunBody(ctx, sessionKey);
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
+  // apiBaseUrl may carry userinfo (user:pass@host). Keep the credential on the
+  // URL that reaches fetch; only the display sinks see the masked copy.
+  const redactedCreateRunUrl = apiUrl(redactUrlCredentials(baseUrl), "/v1/runs");
 
   await ctx.onMeta?.({
     adapterType: ADAPTER_TYPE,
     command: "POST /v1/runs",
-    commandArgs: [createRunUrl],
+    commandArgs: [redactedCreateRunUrl],
     context: {
       runId: ctx.runId,
       timeoutSec,
@@ -871,7 +847,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       hasSessionKey: Boolean(sessionKey),
     },
   });
-  await ctx.onLog("stdout", `[hermes-gateway] creating run at ${createRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
+  await ctx.onLog("stdout", `[hermes-gateway] creating run at ${redactedCreateRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
 
   let runId: string | null = null;
