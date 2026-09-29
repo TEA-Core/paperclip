@@ -9664,6 +9664,7 @@ export function recoveryService(
       livePathSkipped: 0,
       thresholdSkipped: 0,
       alreadyActionedSkipped: 0,
+      alreadyParkedDischargedSkipped: 0,
       candidateLimitSkipped: 0,
       issueIds: [] as string[],
     };
@@ -9764,6 +9765,72 @@ export function recoveryService(
       assigneeRows.map((row) => [row.id, row.name] as const),
     );
 
+    // SUP-17927: a card may be parked at most once per seat. If the same
+    // (issue, assigneeAgentId) seat already has a todo_stranded park row, the
+    // card is "already parked" — the BWOB auto-heal will return it to todo and
+    // this sweep would otherwise re-park it every threshold window, oscillating
+    // todo<->blocked and re-emitting an identical notice forever. Discharge it.
+    const priorParkRows = await db
+      .select({
+        entityId: activityLog.entityId,
+        agentId: activityLog.agentId,
+        createdAt: activityLog.createdAt,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.action, TODO_STRANDED_ACTION),
+          inArray(activityLog.entityId, candidateIdList),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt));
+    const latestParkedAtBySeat = new Map<string, Date>();
+    for (const row of priorParkRows) {
+      const key = `${row.entityId}:${row.agentId ?? ""}`;
+      if (!latestParkedAtBySeat.has(key)) latestParkedAtBySeat.set(key, new Date(row.createdAt));
+    }
+
+    const boardCommentRows = await db
+      .select({
+        issueId: issueComments.issueId,
+        latestCommentAt: sql<Date | null>`MAX(${issueComments.createdAt})`,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          inArray(issueComments.issueId, candidateIdList),
+          or(
+            eq(issueComments.authorType, "user"),
+            and(isNull(issueComments.authorType), isNotNull(issueComments.authorUserId)),
+          ),
+          isNull(issueComments.deletedAt),
+        ),
+      )
+      .groupBy(issueComments.issueId);
+    const latestBoardCommentAtById = new Map(
+      boardCommentRows.map((row) => [row.issueId, row.latestCommentAt] as const),
+    );
+
+    const resolutionRows = await db
+      .select({
+        issueId: issueRecoveryActions.sourceIssueId,
+        latestResolvedAt: sql<Date | null>`MAX(${issueRecoveryActions.resolvedAt})`,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.sourceIssueId, candidateIdList),
+          eq(issueRecoveryActions.ownerType, "board"),
+          eq(issueRecoveryActions.status, "resolved"),
+          isNotNull(issueRecoveryActions.resolvedAt),
+        ),
+      )
+      .groupBy(issueRecoveryActions.sourceIssueId);
+    const latestBoardResolutionAtById = new Map(
+      resolutionRows.map((row) => [row.issueId, row.latestResolvedAt] as const),
+    );
+
     for (const candidate of issueRows) {
       const leased = Boolean(leasesByCompany.get(candidate.companyId)?.has(candidate.id));
       const monitorFuture = hasFutureMonitorCheck(candidate.monitorNextCheckAt);
@@ -9820,6 +9887,22 @@ export function recoveryService(
       if (!verdict.stranded) {
         if (activePath || monitorFuture || liveWake) result.livePathSkipped += 1;
         else result.thresholdSkipped += 1;
+        continue;
+      }
+
+      const seatKey = `${candidate.id}:${candidate.assigneeAgentId ?? ""}`;
+      const latestParkedAt = latestParkedAtBySeat.get(seatKey);
+      const latestBoardCommentAt = latestBoardCommentAtById.get(candidate.id) ?? null;
+      const latestBoardResolutionAt = latestBoardResolutionAtById.get(candidate.id) ?? null;
+      const latestDischargeAt = [latestBoardCommentAt, latestBoardResolutionAt]
+        .map((value) => (value ? new Date(value) : null))
+        .filter((value): value is Date => Boolean(value && !Number.isNaN(value.getTime())))
+        .reduce<Date | null>(
+          (latest, value) => (latest === null || value.getTime() > latest.getTime() ? value : latest),
+          null,
+        );
+      if (latestParkedAt && (!latestDischargeAt || latestDischargeAt.getTime() <= latestParkedAt.getTime())) {
+        result.alreadyParkedDischargedSkipped += 1;
         continue;
       }
 

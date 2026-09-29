@@ -507,4 +507,156 @@ describeEmbeddedPostgres("recovery reconcileTodoStrandedCards", () => {
     expect((await readIssue(issueId))?.status).toBe("blocked");
     expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(1);
   });
+
+  // SUP-17927: the D2 `todo`-arm park was re-firing forever on a card whose
+  // assignee seat is non-dispatchable. The BWOB auto-heal (SUP-17865 shape)
+  // returns the card to `todo` and bumps `updatedAt`; without a discharge rule
+  // D2 would re-park it every threshold window, oscillating todo<->blocked and
+  // re-emitting an identical notice every ~2.25h sweep. The card may now be
+  // parked at most once per seat — a prior park row for the same
+  // (issue, assigneeAgentId) discharges it.
+  it("parks at most once per seat: a re-stranded healed card is discharged, not re-parked (SUP-17927)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // Stale `updatedAt` (3h ago by default) so the first sweep parks it.
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const now0 = new Date();
+    const first = await svc.reconcileTodoStrandedCards({ now: now0 });
+    expect(first.parked).toBe(1);
+    expect(first.alreadyParkedDischargedSkipped).toBe(0);
+    expect((await readIssue(issueId))?.status).toBe("blocked");
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(1);
+    expect(await countNotices(issueId)).toBe(1);
+
+    // Simulate the BWOB auto-heal: status back to `todo`, `updatedAt` bumped to
+    // the heal time, same non-dispatchable seat still the assignee.
+    await db
+      .update(issues)
+      .set({ status: "todo", updatedAt: now0 })
+      .where(eq(issues.id, issueId));
+
+    // Pass 2, three hours later: stale again, but this seat was already parked.
+    const now1 = new Date(now0.getTime() + 3 * 60 * 60 * 1000);
+    const second = await svc.reconcileTodoStrandedCards({ now: now1 });
+    expect(second.parked).toBe(0);
+    expect(second.alreadyParkedDischargedSkipped).toBe(1);
+    expect((await readIssue(issueId))?.status).toBe("todo");
+    // No second activity row, no second notice — the oscillation is broken.
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(1);
+    expect(await countNotices(issueId)).toBe(1);
+  });
+
+  it("re-arms the same seat after a newer board comment", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const now0 = new Date();
+    const first = await svc.reconcileTodoStrandedCards({ now: now0 });
+    expect(first.parked).toBe(1);
+
+    await db
+      .update(issues)
+      .set({ status: "todo", updatedAt: now0 })
+      .where(eq(issues.id, issueId));
+    const boardCommentAt = new Date(now0.getTime() + 60 * 60 * 1000);
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorType: "user",
+      authorUserId: "board-user",
+      body: "Board resolved the prior park; recheck this card.",
+      createdAt: boardCommentAt,
+      updatedAt: boardCommentAt,
+    });
+
+    const second = await svc.reconcileTodoStrandedCards({
+      now: new Date(now0.getTime() + 3 * 60 * 60 * 1000),
+    });
+    expect(second.parked).toBe(1);
+    expect(second.alreadyParkedDischargedSkipped).toBe(0);
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(2);
+    expect(await countNotices(issueId)).toBe(2);
+  });
+
+  it("re-arms the same seat after a newer resolved board action", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const now0 = new Date();
+    const first = await svc.reconcileTodoStrandedCards({ now: now0 });
+    expect(first.parked).toBe(1);
+
+    await db
+      .update(issues)
+      .set({ status: "todo", updatedAt: now0 })
+      .where(eq(issues.id, issueId));
+    const resolvedAt = new Date(now0.getTime() + 60 * 60 * 1000);
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `todo-stranded:${companyId}:${issueId}`,
+      evidence: {},
+      nextAction: "Board decision required",
+      resolvedAt,
+    });
+
+    const second = await svc.reconcileTodoStrandedCards({
+      now: new Date(now0.getTime() + 3 * 60 * 60 * 1000),
+    });
+    expect(second.parked).toBe(1);
+    expect(second.alreadyParkedDischargedSkipped).toBe(0);
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(2);
+    expect(await countNotices(issueId)).toBe(2);
+  });
+
+  // Seat-keying, not issue-keying: reassigning the healed card to a DIFFERENT
+  // seat is a fresh assignment for that seat, so D2 parks it again. Without this
+  // the fix would be too broad (any prior row on the issue would discharge a
+  // brand-new seat).
+  it("still parks when the healed card is reassigned to a different seat (SUP-17927)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const newAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: newAgentId,
+      companyId,
+      name: "Second Coder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const now0 = new Date();
+    const first = await svc.reconcileTodoStrandedCards({ now: now0 });
+    expect(first.parked).toBe(1);
+    expect((await readIssue(issueId))?.status).toBe("blocked");
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(1);
+
+    // Heal back to `todo` but onto a different seat.
+    await db
+      .update(issues)
+      .set({ status: "todo", updatedAt: now0, assigneeAgentId: newAgentId })
+      .where(eq(issues.id, issueId));
+
+    const now1 = new Date(now0.getTime() + 3 * 60 * 60 * 1000);
+    const second = await svc.reconcileTodoStrandedCards({ now: now1 });
+    expect(second.parked).toBe(1);
+    expect(second.alreadyParkedDischargedSkipped).toBe(0);
+    expect(second.issueIds).toEqual([issueId]);
+    expect((await readIssue(issueId))?.status).toBe("blocked");
+    // The new seat gets its own park row and notice.
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(2);
+    expect(await countNotices(issueId)).toBe(2);
+  });
 });
