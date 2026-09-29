@@ -54,22 +54,6 @@ const ALLOWLIST: AllowlistEntry[] = [
   { file: "secrets.ts", action: "secret.access.listed", reason: "agent actor" },
   // system actor: background/system join-claim event
   { file: "access.ts", action: "agent_api_key.claimed", reason: "system actor" },
-  // Occurrence-specific carve-out for the `revalidateActiveSourceRecovery`
-  // follow-up in issues.ts, which logs with
-  // `actorType: actor?.actorType ?? "system"` and no top-level boardApiKeyId.
-  // The guard classifies that expression as board-authenticable (the read
-  // path can pass a request actor) and keeps reporting it; this entry is the
-  // narrow, documented, occurrence-keyed exception for that one site, fenced
-  // to the issues.ts board-key thread (SUP-17867). If the call is reformatted,
-  // renamed, or gains the key, the marker stops matching and the guard
-  // requires boardApiKeyId here.
-  {
-    file: "issues.ts",
-    action: "issue.recovery_action_resolved",
-    actorType: 'actor?.actorType ?? "system"',
-    reason:
-      "issues.ts fence (SUP-17867) owns this request-less revalidation site; the exact-actorType marker exempts only that occurrence",
-  },
 ];
 
 function isAllowlisted(allowlist: AllowlistEntry[], file: string, action: string, actorTypeExpr: string | undefined): boolean {
@@ -361,27 +345,6 @@ describe("board-api-key activity log guard", () => {
         ).toBe(true);
       }
     }
-  });
-
-  // --- Occurrence-specific exception: prove both sides of the narrowing. ---
-
-  it("still reports the issues.ts revalidation occurrence when the exception is not applied", () => {
-    // The scanner must not have learned to classify
-    // `actor?.actorType ?? "system"` as safe: with the allowlist disabled the
-    // request-less revalidation follow-up is a board-authenticable omission
-    // and must surface. It is only suppressed by the documented,
-    // occurrence-keyed entry in ALLOWLIST.
-    const content = readFileSync(join(ROUTES_DIR, "issues.ts"), "utf-8");
-    const violations = scanSource(content, "issues.ts", []);
-    const recovery = violations.filter((v) => v.action === "issue.recovery_action_resolved");
-    expect(recovery).toHaveLength(1);
-    expect(recovery[0].detail).toContain('actorType=actor?.actorType ?? "system"');
-  });
-
-  it("exempts exactly the documented occurrence: real issues.ts scans clean with the allowlist", () => {
-    const content = readFileSync(join(ROUTES_DIR, "issues.ts"), "utf-8");
-    const violations = scanSource(content, "issues.ts");
-    expect(violations.filter((v) => v.action === "issue.recovery_action_resolved")).toHaveLength(0);
   });
 
   it("reports a same-file, same-action board-authenticable omission the exception must not cover", () => {
