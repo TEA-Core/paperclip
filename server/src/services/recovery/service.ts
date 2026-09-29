@@ -9774,6 +9774,7 @@ export function recoveryService(
       .select({
         entityId: activityLog.entityId,
         agentId: activityLog.agentId,
+        createdAt: activityLog.createdAt,
       })
       .from(activityLog)
       .where(
@@ -9782,9 +9783,52 @@ export function recoveryService(
           eq(activityLog.action, TODO_STRANDED_ACTION),
           inArray(activityLog.entityId, candidateIdList),
         ),
-      );
-    const alreadyParkedSeats = new Set(
-      priorParkRows.map((row) => `${row.entityId}:${row.agentId ?? ""}`),
+      )
+      .orderBy(desc(activityLog.createdAt));
+    const latestParkedAtBySeat = new Map<string, Date>();
+    for (const row of priorParkRows) {
+      const key = `${row.entityId}:${row.agentId ?? ""}`;
+      if (!latestParkedAtBySeat.has(key)) latestParkedAtBySeat.set(key, new Date(row.createdAt));
+    }
+
+    const boardCommentRows = await db
+      .select({
+        issueId: issueComments.issueId,
+        latestCommentAt: sql<Date | null>`MAX(${issueComments.createdAt})`,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          inArray(issueComments.issueId, candidateIdList),
+          or(
+            eq(issueComments.authorType, "user"),
+            and(isNull(issueComments.authorType), isNotNull(issueComments.authorUserId)),
+          ),
+          isNull(issueComments.deletedAt),
+        ),
+      )
+      .groupBy(issueComments.issueId);
+    const latestBoardCommentAtById = new Map(
+      boardCommentRows.map((row) => [row.issueId, row.latestCommentAt] as const),
+    );
+
+    const resolutionRows = await db
+      .select({
+        issueId: issueRecoveryActions.sourceIssueId,
+        latestResolvedAt: sql<Date | null>`MAX(${issueRecoveryActions.resolvedAt})`,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.sourceIssueId, candidateIdList),
+          eq(issueRecoveryActions.ownerType, "board"),
+          eq(issueRecoveryActions.status, "resolved"),
+          isNotNull(issueRecoveryActions.resolvedAt),
+        ),
+      )
+      .groupBy(issueRecoveryActions.sourceIssueId);
+    const latestBoardResolutionAtById = new Map(
+      resolutionRows.map((row) => [row.issueId, row.latestResolvedAt] as const),
     );
 
     for (const candidate of issueRows) {
@@ -9846,7 +9890,18 @@ export function recoveryService(
         continue;
       }
 
-      if (alreadyParkedSeats.has(`${candidate.id}:${candidate.assigneeAgentId ?? ""}`)) {
+      const seatKey = `${candidate.id}:${candidate.assigneeAgentId ?? ""}`;
+      const latestParkedAt = latestParkedAtBySeat.get(seatKey);
+      const latestBoardCommentAt = latestBoardCommentAtById.get(candidate.id) ?? null;
+      const latestBoardResolutionAt = latestBoardResolutionAtById.get(candidate.id) ?? null;
+      const latestDischargeAt = [latestBoardCommentAt, latestBoardResolutionAt]
+        .map((value) => (value ? new Date(value) : null))
+        .filter((value): value is Date => Boolean(value && !Number.isNaN(value.getTime())))
+        .reduce<Date | null>(
+          (latest, value) => (latest === null || value.getTime() > latest.getTime() ? value : latest),
+          null,
+        );
+      if (latestParkedAt && (!latestDischargeAt || latestDischargeAt.getTime() <= latestParkedAt.getTime())) {
         result.alreadyParkedDischargedSkipped += 1;
         continue;
       }

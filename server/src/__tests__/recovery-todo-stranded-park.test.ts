@@ -547,6 +547,75 @@ describeEmbeddedPostgres("recovery reconcileTodoStrandedCards", () => {
     expect(await countNotices(issueId)).toBe(1);
   });
 
+  it("re-arms the same seat after a newer board comment", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const now0 = new Date();
+    const first = await svc.reconcileTodoStrandedCards({ now: now0 });
+    expect(first.parked).toBe(1);
+
+    await db
+      .update(issues)
+      .set({ status: "todo", updatedAt: now0 })
+      .where(eq(issues.id, issueId));
+    const boardCommentAt = new Date(now0.getTime() + 60 * 60 * 1000);
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorType: "user",
+      authorUserId: "board-user",
+      body: "Board resolved the prior park; recheck this card.",
+      createdAt: boardCommentAt,
+      updatedAt: boardCommentAt,
+    });
+
+    const second = await svc.reconcileTodoStrandedCards({
+      now: new Date(now0.getTime() + 3 * 60 * 60 * 1000),
+    });
+    expect(second.parked).toBe(1);
+    expect(second.alreadyParkedDischargedSkipped).toBe(0);
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(2);
+    expect(await countNotices(issueId)).toBe(2);
+  });
+
+  it("re-arms the same seat after a newer resolved board action", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const now0 = new Date();
+    const first = await svc.reconcileTodoStrandedCards({ now: now0 });
+    expect(first.parked).toBe(1);
+
+    await db
+      .update(issues)
+      .set({ status: "todo", updatedAt: now0 })
+      .where(eq(issues.id, issueId));
+    const resolvedAt = new Date(now0.getTime() + 60 * 60 * 1000);
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `todo-stranded:${companyId}:${issueId}`,
+      evidence: {},
+      nextAction: "Board decision required",
+      resolvedAt,
+    });
+
+    const second = await svc.reconcileTodoStrandedCards({
+      now: new Date(now0.getTime() + 3 * 60 * 60 * 1000),
+    });
+    expect(second.parked).toBe(1);
+    expect(second.alreadyParkedDischargedSkipped).toBe(0);
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(2);
+    expect(await countNotices(issueId)).toBe(2);
+  });
+
   // Seat-keying, not issue-keying: reassigning the healed card to a DIFFERENT
   // seat is a fresh assignment for that seat, so D2 parks it again. Without this
   // the fix would be too broad (any prior row on the issue would discharge a
