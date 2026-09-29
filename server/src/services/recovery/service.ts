@@ -10341,11 +10341,13 @@ export function recoveryService(
     const result = {
       archived: 0,
       skippedParentNotBlocked: 0,
+      skippedFresh: 0,
+      skippedLiveBlocker: 0,
       manual: 0,
       issueIds: [] as string[],
     };
 
-    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const dayAgoMs = Date.now() - 24 * 60 * 60 * 1000;
 
     const candidates = await db
       .select({
@@ -10353,7 +10355,7 @@ export function recoveryService(
         identifier: issues.identifier,
         companyId: issues.companyId,
         parentId: issues.parentId,
-        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        updatedAt: issues.updatedAt,
         executionState: issues.executionState,
       })
       .from(issues)
@@ -10361,8 +10363,6 @@ export function recoveryService(
         and(
           eq(issues.status, "in_review"),
           isNotNull(issues.parentId),
-          sql`${issues.monitorLastTriggeredAt} is not null`,
-          sql`${issues.monitorLastTriggeredAt} <= ${dayAgo}`,
           sql`${issues.executionState}->>'currentStageType' = 'review'`,
           sql`${issues.id} not in (select ${unWakeableArchives.issueId} from ${unWakeableArchives} where ${unWakeableArchives.policy} = 'stale_in_review_child')`,
         ),
@@ -10388,6 +10388,44 @@ export function recoveryService(
           body: "Manual intervention required: stale in_review child with no matching auto-archive rule. The child is in_review but not at a review stage, so it cannot be auto-archived by this sweep.",
         });
         result.manual += 1;
+        continue;
+      }
+
+      // Staleness must be measured from the card's OWN current review-stage arm
+      // anchor (executionState.pendingSince), not from monitorLastTriggeredAt —
+      // a residue column left pointing at a previous life's monitor. Re-delivery
+      // into in_review resets pendingSince, so the 24h window now runs against
+      // the live stage rather than a stale artefact. When pendingSince is absent
+      // (legacy arm) we fall back to the row's updatedAt.
+      const ageReferenceMs = state.pendingSince
+        ? Date.parse(state.pendingSince)
+        : candidate.updatedAt
+          ? candidate.updatedAt.getTime()
+          : null;
+      if (ageReferenceMs === null || Number.isNaN(ageReferenceMs) || ageReferenceMs > dayAgoMs) {
+        result.skippedFresh += 1;
+        continue;
+      }
+
+      // Never archive a load-bearing blocker. A live 'blocks' edge into a
+      // non-terminal issue means some open card (often the parent) is blocked ON
+      // this card; archiving it would dead-end the chain and keep the parent
+      // blocked forever, so this leg can never clear by itself.
+      const liveBlockerRows = await db
+        .select({ blockedStatus: issues.status })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, candidate.companyId),
+            eq(issueRelations.issueId, candidate.id),
+            eq(issueRelations.type, "blocks"),
+            sql`${issues.status} not in ('done', 'cancelled')`,
+          ),
+        )
+        .limit(1);
+      if (liveBlockerRows.length > 0) {
+        result.skippedLiveBlocker += 1;
         continue;
       }
 
@@ -10431,7 +10469,14 @@ export function recoveryService(
       ) {
         lastStaleInReviewChildLogAt = now;
         logger.warn(
-          { archived: result.archived, skipped: result.skippedParentNotBlocked, manual: result.manual, issueIds: result.issueIds },
+          {
+            archived: result.archived,
+            skippedParentNotBlocked: result.skippedParentNotBlocked,
+            skippedFresh: result.skippedFresh,
+            skippedLiveBlocker: result.skippedLiveBlocker,
+            manual: result.manual,
+            issueIds: result.issueIds,
+          },
           "ingested stale in_review child issues",
         );
       }
