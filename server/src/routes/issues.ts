@@ -6127,6 +6127,7 @@ export function issueRoutes(
       actorId: actor?.actorId ?? "system",
       agentId: actor?.agentId ?? null,
       runId: actor?.runId ?? null,
+      boardApiKeyId: actor?.boardApiKeyId ?? null,
       action: "issue.recovery_action_resolved",
       entityType: "issue",
       entityId: input.issue.id,
