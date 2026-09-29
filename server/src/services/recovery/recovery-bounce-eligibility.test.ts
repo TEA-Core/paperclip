@@ -4,6 +4,7 @@ import {
   hasConsecutiveWakeFailures,
   isRecoveryBounceTargetLive,
   recoveryBounceStatusRank,
+  selectRecoveryBounceCandidate,
   decideRecoveryReassignment,
 } from "./service.js";
 
@@ -95,6 +96,26 @@ describe("SUP-17884: recovery bounce eligibility (pure helpers)", () => {
 
     it("rejects a non-invokable status regardless of wake history", () => {
       expect(isRecoveryBounceTargetLive("archived", null)).toBe(false);
+    });
+  });
+
+  describe("selectRecoveryBounceCandidate (C3 ordering)", () => {
+    it("prefers an idle creator over a live error return assignee", () => {
+      const selected = selectRecoveryBounceCandidate([
+        { agentId: "return-assignee", status: "error", source: "return_assignee" },
+        { agentId: "creator", status: "idle", source: "creator" },
+      ]);
+
+      expect(selected).toEqual({ agentId: "creator", source: "creator" });
+    });
+
+    it("preserves stable source order when candidates have equal status rank", () => {
+      const selected = selectRecoveryBounceCandidate([
+        { agentId: "return-assignee", status: "running", source: "return_assignee" },
+        { agentId: "creator", status: "idle", source: "creator" },
+      ]);
+
+      expect(selected).toEqual({ agentId: "return-assignee", source: "return_assignee" });
     });
   });
 

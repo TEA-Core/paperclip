@@ -1173,6 +1173,25 @@ export function recoveryBounceStatusRank(status: string | null | undefined): num
   return 2;
 }
 
+export type RecoveryBounceCandidateSource = "return_assignee" | "creator";
+
+export function selectRecoveryBounceCandidate(
+  candidates: ReadonlyArray<{
+    agentId: string;
+    status: string | null | undefined;
+    source: RecoveryBounceCandidateSource;
+  }>,
+): { agentId: string; source: RecoveryBounceCandidateSource } | null {
+  if (candidates.length === 0) return null;
+  let selected = candidates[0];
+  for (const candidate of candidates.slice(1)) {
+    if (recoveryBounceStatusRank(candidate.status) < recoveryBounceStatusRank(selected.status)) {
+      selected = candidate;
+    }
+  }
+  return { agentId: selected.agentId, source: selected.source };
+}
+
 /**
  * SUP-17884 C2, status-only form: is this status invokable AND does the recent
  * wake history not show an observably-dead streak? The org-chain term of
@@ -2813,12 +2832,13 @@ export function recoveryService(
         continue;
       }
 
-      // SUP-14225: prefer the recorded return assignee — the platform's own
-      // record of the agent that owed the next action — over the creator.
-      // The creator is the fallback when no usable return assignee is
-      // recorded (none, not in-company, or not invokable).
-      let nextAgent: typeof agents.$inferSelect | null = null;
-      let reassignSource: "return_assignee" | "creator" = "creator";
+      // SUP-14225: consider the recorded return assignee and creator together.
+      // SUP-17884 C3: prefer a live idle/active/running candidate over a live
+      // error candidate; preserve source order for equal-ranked candidates.
+      const bounceCandidates: Array<{
+        agent: typeof agents.$inferSelect;
+        source: RecoveryBounceCandidateSource;
+      }> = [];
       const returnAssigneeAgentId = readReturnAssigneeAgentId(candidate.executionState);
       if (returnAssigneeAgentId) {
         const returnAgent = await getAgent(returnAssigneeAgentId);
@@ -2826,28 +2846,40 @@ export function recoveryService(
           returnAgent &&
           returnAgent.companyId === candidate.companyId &&
           (await isAgentInvokable(returnAgent)) &&
-          // SUP-17884 C2: an observably-dead return assignee is not a recovery
-          // target; fall through to the creator instead of stranding the card.
           !(await hasConsecutiveWakeFailuresForAgent(returnAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
         ) {
-          nextAgent = returnAgent;
-          reassignSource = "return_assignee";
+          bounceCandidates.push({ agent: returnAgent, source: "return_assignee" });
         }
       }
-      if (!nextAgent) {
-        const creatorAgent = await getAgent(creatorAgentId);
-        if (
-          !creatorAgent ||
-          creatorAgent.companyId !== candidate.companyId ||
-          !(await isAgentInvokable(creatorAgent)) ||
-          // SUP-17884 C2: an observably-dead creator is not a recovery target.
-          (await hasConsecutiveWakeFailuresForAgent(creatorAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
-        ) {
-          skipped += 1;
-          continue;
-        }
-        nextAgent = creatorAgent;
+      const creatorAgent = await getAgent(creatorAgentId);
+      if (
+        creatorAgent &&
+        creatorAgent.companyId === candidate.companyId &&
+        (await isAgentInvokable(creatorAgent)) &&
+        !(await hasConsecutiveWakeFailuresForAgent(creatorAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
+      ) {
+        bounceCandidates.push({ agent: creatorAgent, source: "creator" });
       }
+      const selected = selectRecoveryBounceCandidate(
+        bounceCandidates.map(({ agent, source }) => ({
+          agentId: agent.id,
+          status: agent.status,
+          source,
+        })),
+      );
+      if (!selected) {
+        skipped += 1;
+        continue;
+      }
+      const selectedCandidate = bounceCandidates.find(({ agent, source }) =>
+        agent.id === selected.agentId && source === selected.source,
+      );
+      if (!selectedCandidate) {
+        skipped += 1;
+        continue;
+      }
+      const nextAgent = selectedCandidate.agent;
+      const reassignSource = selectedCandidate.source;
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
