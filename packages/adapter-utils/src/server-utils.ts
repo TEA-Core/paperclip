@@ -14,6 +14,13 @@ import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { deprioritizeForOom, reportOomMarkFailureOnce } from "./oom-priority.js";
 import {
+  formatOomKillNotice,
+  readCgroupOomKillCount,
+  resolveOomDetectionEnabled,
+  summarizeOomKillDelta,
+  type OomKillEvidence,
+} from "./oom-detection.js";
+import {
   evaluateRunProcessSpawn,
   getRunProcessGroupCounter,
   resolveRunProcessCap,
@@ -73,6 +80,12 @@ export interface RunProcessResult {
   // refused. The run is reported, the process is still running. Absent on every
   // normal path, so existing producers and consumers are unaffected.
   orphanedProcess?: OrphanedProcessEvidence | null;
+  // SUP-18028: set only when the shared memory cgroup recorded OOM kills across
+  // this run's window (top-level spawn -> close). A red suite in that window may
+  // be a kernel OOM-kill of a worker pool rather than a genuine failure. Absent
+  // on every run without such a delta, so existing producers/consumers are
+  // unaffected.
+  oomKillEvidence?: OomKillEvidence | null;
 }
 
 export interface TerminalResultCleanupOptions {
@@ -5473,6 +5486,24 @@ export async function runChildProcess(
           }
           throw error;
         }
+        // SUP-18028: capture the shared-cgroup oom_kill baseline at the run's
+        // spawn, so the close path can attribute any OOM kills in this window to
+        // the run instead of letting a killed test pool be read as a genuine
+        // failure. Best-effort: an unreadable counter (non-Linux, cgroup v1,
+        // unreadable /sys) leaves the baseline null and the detector simply does
+        // not fire for this run. Read BEFORE spawn so the run's own descendants
+        // (the provider CLI, its shell, any test fleet it launches) cannot
+        // inflate the baseline.
+        const oomDetectionEnabled = resolveOomDetectionEnabled();
+        let oomKillBaseline: number | null = null;
+        let oomKillEvidence: OomKillEvidence | null = null;
+        if (oomDetectionEnabled) {
+          try {
+            oomKillBaseline = await readCgroupOomKillCount();
+          } catch {
+            oomKillBaseline = null;
+          }
+        }
         const child = spawn(target.command, target.args, {
           cwd: spawnCwd,
           env: childEnv,
@@ -5643,6 +5674,31 @@ export async function runChildProcess(
           await target.cleanup?.();
         };
 
+        // SUP-18028: attribute any OOM kills in this run's window. Reads the
+        // shared-cgroup oom_kill counter again, sets `oomKillEvidence` for the
+        // result, and appends a transcript notice when the counter moved. Runs
+        // in the close handler after the child's last output has flushed
+        // (chained through `logChain`), so the notice lands after the run's own
+        // output and before the run is recorded. Best-effort: it never throws,
+        // and a null baseline (detection disabled or unmeasurable at spawn) is a
+        // no-op.
+        const measureOomKillDelta = async (): Promise<void> => {
+          if (oomKillBaseline === null) return;
+          try {
+            const observed = await readCgroupOomKillCount();
+            const evidence = summarizeOomKillDelta(oomKillBaseline, observed);
+            oomKillEvidence = evidence;
+            if (evidence && evidence.delta > 0) {
+              // Await the append (rather than chaining onto logChain, which has
+              // already flushed by the time the close handler runs) so the
+              // notice lands in the transcript before the result is recorded.
+              await opts.onLog("stderr", formatOomKillNotice(evidence));
+            }
+          } catch (err) {
+            onLogError(err, runId, "failed to measure the cgroup OOM-kill delta at run close");
+          }
+        };
+
         // One place that shapes the result, so the orphan path cannot drift
         // away from the normal close path.
         const buildResult = (
@@ -5668,6 +5724,7 @@ export async function runChildProcess(
             }
             : null,
           orphanedProcess,
+          oomKillEvidence,
         });
 
         // Report a run whose process outlived every signal we could send.
@@ -5822,7 +5879,12 @@ export async function runChildProcess(
           deadlineWarning?.cancel();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void logChain.finally(() => {
+          void logChain.finally(async () => {
+            // SUP-18028: attribute any OOM kills in this run's window before the
+            // result is shaped, so the run/card records the kill rather than a
+            // bare red exit. No-op when detection was disabled or the baseline
+            // was unmeasurable; best-effort either way.
+            await measureOomKillDelta();
             void Promise.resolve()
               .then(() => runTargetCleanup())
               .finally(() => {
