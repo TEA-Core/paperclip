@@ -96,32 +96,232 @@ async function resumeEvidence(
     },
   };
 }
+type ObservedRunRow = {
+  id: string;
+  status: string;
+  runtimeMode?: string;
+  invocationSource?: string;
+  continuationAttempt?: number;
+  observedAtIso: string;
+};
+type RunningTimeoutApiError = { atIso: string; url: string; message: string };
+type ResolveResult = {
+  body: unknown;
+  resolveCompletedAtIso: string;
+  recoveryActionPresentAtResolve: boolean;
+  settledActionFoundAtResolve: boolean;
+  providerAliveAtResolve: boolean;
+};
+type ResumeContext = {
+  originalRunIds: string[];
+  resolveCompletedAtIso: string;
+  resolveResponseBody: unknown;
+  recoveryActionPresentAtResolve: boolean;
+  settledActionFoundAtResolve: boolean;
+  originalProviderAliveAtResolve: boolean;
+  statusMetadata: Record<string, string | null>[];
+  companyId: string;
+  testInfo: TestInfo;
+  observedRunRows: ObservedRunRow[];
+  apiErrorsDuringWindow: RunningTimeoutApiError[];
+};
+// Maps the captured in-window facts to one of the three hypotheses the
+// running-timeout must decide between. The facts are authoritative; this label
+// is a convenience for the CI log and the attachment.
+function classifyRunningTimeout(input: {
+  apiErrorsDuringWindow: RunningTimeoutApiError[];
+  observedRunRowCount: number;
+  newRunIds: string[];
+  anyNewRunRunning: boolean;
+  finalIssueStatus: string;
+  finalContinuationDelivery: string | null | undefined;
+  recoveryActionPresentAtResolve: boolean;
+}): string {
+  const {
+    apiErrorsDuringWindow,
+    observedRunRowCount,
+    newRunIds,
+    anyNewRunRunning,
+    finalIssueStatus,
+    finalContinuationDelivery,
+    recoveryActionPresentAtResolve,
+  } = input;
+  if (apiErrorsDuringWindow.length > 0 && observedRunRowCount === 0) {
+    return "TEST_POLLED_WRONG_OR_STALE_STATE: every live-runs read during the 30s window failed (HTTP/parse error), so the test observed a degraded endpoint rather than a delayed resume transition.";
+  }
+  if (newRunIds.length === 0) {
+    if (!recoveryActionPresentAtResolve) {
+      return "FIXTURE_OBSERVATION_ENDED_EARLY: no unresolved recovery action existed at resolve time, so the reconcile scheduled no successor wakeup and the resume had nothing to act on.";
+    }
+    return "RESUME_TRANSITION_DELAYED_OR_ABSENT: the reconcile resolve returned 2xx but no successor run row appeared within the 30s poll window; deliverReconciledExecutions runs on a 15s single-flight sweep, so on a loaded runner its tick (or the wakeup -> claim -> spawn chain) lands after the window. continuationDelivery=" + String(finalContinuationDelivery) + ".";
+  }
+  if (!anyNewRunRunning) {
+    return "RESUME_TRANSITION_DELAYED_OR_ABSENT: successor run row(s) " + JSON.stringify(newRunIds) + " were created but never reached status 'running' within the 30s window (claim suppression, agent-invokability gate, or slow provider spawn).";
+  }
+  if (finalIssueStatus !== "todo" && finalIssueStatus !== "in_progress") {
+    return "TEST_POLLED_WRONG_OR_STALE_STATE: the issue was not in a resumable state at window end (status=" + finalIssueStatus + ").";
+  }
+  return "UNCLASSIFIED: a successor run reached 'running' yet the poll still timed out; inspect observedRunRows and statusFramesDuringWindow.";
+}
 async function running(
   request: APIRequestContext,
   issueId: string,
   adapter: "process" | "paperclip_runner",
   evidence?: ResumeEvidence[],
+  resume?: ResumeContext,
 ) {
   let run:
     | { id: string; status: string; runtimeMode?: string; processPid?: number }
     | undefined;
-  await expect
-    .poll(
-      async () => {
-        const runs = await json(
-          await request.get(`/api/issues/${issueId}/live-runs`),
-        );
-        run = runs.find(
-          (candidate: { status: string }) => candidate.status === "running",
-        );
-        if (!run && evidence) {
-          evidence.push(await resumeEvidence(request, issueId, "running-poll"));
-        }
-        return !!run;
+  const pollWindowStartMs = Date.now();
+  const pollWindowStartIso = new Date(pollWindowStartMs).toISOString();
+  try {
+    await expect
+      .poll(
+        async () => {
+          let runs: Record<string, unknown>[] = [];
+          try {
+            runs = await json(
+              await request.get(`/api/issues/${issueId}/live-runs`),
+            );
+          } catch (error) {
+            if (resume) {
+              resume.apiErrorsDuringWindow.push({
+                atIso: new Date().toISOString(),
+                url: `/api/issues/${issueId}/live-runs`,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+            return false;
+          }
+          if (resume) {
+            for (const candidate of runs) {
+              resume.observedRunRows.push({
+                id: String(candidate.id),
+                status: String(candidate.status),
+                runtimeMode:
+                  typeof candidate.runtimeMode === "string"
+                    ? candidate.runtimeMode
+                    : undefined,
+                invocationSource:
+                  typeof candidate.invocationSource === "string"
+                    ? candidate.invocationSource
+                    : undefined,
+                continuationAttempt:
+                  typeof candidate.continuationAttempt === "number"
+                    ? candidate.continuationAttempt
+                    : undefined,
+                observedAtIso: new Date().toISOString(),
+              });
+            }
+          }
+          run = runs.find(
+            (candidate: { status: string }) => candidate.status === "running",
+          );
+          if (!run && evidence) {
+            evidence.push(await resumeEvidence(request, issueId, "running-poll"));
+          }
+          return !!run;
+        },
+        { timeout: 30_000 },
+      )
+      .toBe(true);
+  } catch (error) {
+    if (!resume) throw error;
+    const pollWindowMs = Date.now() - pollWindowStartMs;
+    const distinctRunIds = [
+      ...new Set(resume.observedRunRows.map((row) => row.id)),
+    ];
+    const newRunIds = distinctRunIds.filter(
+      (id) => !resume.originalRunIds.includes(id),
+    );
+    const newRunStatuses = new Map<string, string[]>();
+    for (const row of resume.observedRunRows) {
+      if (!newRunIds.includes(row.id)) continue;
+      const statuses = newRunStatuses.get(row.id) ?? [];
+      if (!statuses.includes(row.status)) statuses.push(row.status);
+      newRunStatuses.set(row.id, statuses);
+    }
+    const anyNewRunRunning = [...newRunStatuses.values()].some((statuses) =>
+      statuses.includes("running"),
+    );
+    let finalIssueState = {
+      status: "unknown",
+      executionRunId: null as string | null,
+    };
+    let finalContinuationDelivery: string | null | undefined;
+    try {
+      const [issue, recovery] = await Promise.all([
+        json(await request.get(`/api/issues/${issueId}`)),
+        json(await request.get(`/api/issues/${issueId}/recovery-actions`)),
+      ]);
+      finalIssueState = {
+        status: String(issue.status),
+        executionRunId:
+          (issue.executionRunId as string | null | undefined) ?? null,
+      };
+      const active = recovery.active as Record<string, unknown> | null;
+      const actions = (recovery.actions as Record<string, unknown>[]) ?? [];
+      const lastEvidence =
+        active?.evidence ?? actions[actions.length - 1]?.evidence;
+      finalContinuationDelivery = evidenceField(
+        lastEvidence,
+        "continuationDelivery",
+      );
+    } catch {
+      // The final snapshot is unavailable; the in-window facts still stand.
+    }
+    const statusFramesDuringWindow = resume.statusMetadata.filter(
+      (entry) => entry.issueId === issueId,
+    );
+    const verdict = classifyRunningTimeout({
+      apiErrorsDuringWindow: resume.apiErrorsDuringWindow,
+      observedRunRowCount: resume.observedRunRows.length,
+      newRunIds,
+      anyNewRunRunning,
+      finalIssueStatus: finalIssueState.status,
+      finalContinuationDelivery,
+      recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
+    });
+    await emitEvidence(
+      resume.testInfo,
+      "composer-stop-running-timeout-evidence",
+      {
+        kind: "composer-stop-running-timeout-evidence",
+        issueId,
+        adapter,
+        companyId: resume.companyId,
+        pollWindowStartIso,
+        pollWindowEndIso: new Date().toISOString(),
+        pollWindowMs,
+        resolveCompletedAtIso: resume.resolveCompletedAtIso,
+        resolveToPollWindowStartMs:
+          pollWindowStartMs - Date.parse(resume.resolveCompletedAtIso),
+        resolveResponseBody: resume.resolveResponseBody,
+        observedRunRows: resume.observedRunRows,
+        distinctRunIds,
+        newRunIds,
+        newRunStatuses: Object.fromEntries(newRunStatuses),
+        finalIssueState,
+        finalContinuationDelivery,
+        recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
+        settledActionFoundAtResolve: resume.settledActionFoundAtResolve,
+        originalProviderAliveAtResolve: resume.originalProviderAliveAtResolve,
+        apiErrorsDuringWindow: resume.apiErrorsDuringWindow,
+        statusFramesDuringWindow,
+        verdict,
       },
-      { timeout: 30_000 },
-    )
-    .toBe(true);
+    );
+    throw new Error(
+      `composer-stop resume running-timeout (issue=${issueId}, adapter=${adapter}): ${verdict} :: ` +
+        `pollWindowMs=${pollWindowMs} newRunIds=${JSON.stringify(newRunIds)} ` +
+        `finalIssueStatus=${finalIssueState.status} ` +
+        `finalContinuationDelivery=${String(finalContinuationDelivery)} ` +
+        `apiErrors=${resume.apiErrorsDuringWindow.length} :: ` +
+        `see the composer-stop-running-timeout-evidence attachment. Original: ` +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
   let fullRun = await json(await request.get(`/api/heartbeat-runs/${run!.id}`));
   await expect
     .poll(
@@ -249,6 +449,7 @@ async function reconcileDemoExecution(
   );
   const status = response.status();
   const body = await response.text();
+  const resolveCompletedAtIso = new Date().toISOString();
   if (!response.ok()) {
     const verdict = providerAliveAtResolve
       ? "H1_REAPING_LATE: a guard-checked PID of the reconciled run was alive at resolve; inspect guardPids[].cmdline/groupMembers to confirm it is the immortal provider fixture ('stop fixture ready'/'working') rather than an unrelated reused pid — Stop had not reaped the provider before recovery resolve."
@@ -289,9 +490,19 @@ async function reconcileDemoExecution(
     providerAliveAtResolve,
     stopInitiationToResolveMs,
     stopCompletionToResolveMs,
+    recoveryActionPresentAtResolve: recovery.active != null,
+    settledActionFoundAtResolve: settled != null,
+    resolveCompletedAtIso,
     httpStatus: status,
+    responseBody: body,
   });
-  return JSON.parse(body);
+  return {
+    body: JSON.parse(body),
+    resolveCompletedAtIso,
+    recoveryActionPresentAtResolve: recovery.active != null,
+    settledActionFoundAtResolve: settled != null,
+    providerAliveAtResolve,
+  };
 }
 
 async function menu(page: Page, action: string) {
@@ -707,12 +918,15 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       // timing out. The rest of this spec already uses 15-35s for its
       // server-backed waits; match that.
       await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 30_000 });
+      const resumeInitiatedAtIso = new Date().toISOString();
+      let parentResolve: ResolveResult | null = null;
+      let childResolve: ResolveResult | null = null;
       if (adapter === "process") {
         // Legacy processes lack runner stop/action proof, so releasing the hold
         // preserves their recovery gate until the fixture reconciles them.
         expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
         expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
-        await reconcileDemoExecution(
+        parentResolve = await reconcileDemoExecution(
           request,
           parent.id,
           parentRun.id,
@@ -722,7 +936,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         resumeEvidenceLog.push(
           await resumeEvidence(request, parent.id, "after-parent-resolve"),
         );
-        await reconcileDemoExecution(
+        childResolve = await reconcileDemoExecution(
           request,
           child.id,
           childRun.id,
@@ -733,6 +947,26 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
           await resumeEvidence(request, child.id, "after-child-resolve"),
         );
       }
+      const resumeContextFor = (
+        originalRunId: string,
+        resolve: ResolveResult | null,
+      ): ResumeContext => ({
+        originalRunIds: [originalRunId],
+        resolveCompletedAtIso:
+          resolve?.resolveCompletedAtIso ?? resumeInitiatedAtIso,
+        resolveResponseBody: resolve?.body ?? null,
+        recoveryActionPresentAtResolve:
+          resolve?.recoveryActionPresentAtResolve ?? false,
+        settledActionFoundAtResolve:
+          resolve?.settledActionFoundAtResolve ?? false,
+        originalProviderAliveAtResolve:
+          resolve?.providerAliveAtResolve ?? false,
+        statusMetadata,
+        companyId: company.id,
+        testInfo,
+        observedRunRows: [],
+        apiErrorsDuringWindow: [],
+      });
       // A verified stopped native runner can honor the explicitly selected
       // Wake agents option without another manual reconciliation step.
       const resumedParentRun = await running(
@@ -740,12 +974,14 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         parent.id,
         adapter,
         resumeEvidenceLog,
+        resumeContextFor(parentRun.id, parentResolve),
       );
       const resumedChildRun = await running(
         request,
         child.id,
         adapter,
         resumeEvidenceLog,
+        resumeContextFor(childRun.id, childResolve),
       );
       expect(resumedParentRun.id).not.toBe(parentRun.id);
       expect(resumedChildRun.id).not.toBe(childRun.id);
