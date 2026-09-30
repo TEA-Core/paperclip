@@ -1,3 +1,4 @@
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
   test,
@@ -5,6 +6,7 @@ import {
   type APIRequestContext,
   type APIResponse,
   type Page,
+  type TestInfo,
 } from "@playwright/test";
 
 async function json(response: APIResponse) {
@@ -147,10 +149,13 @@ async function running(
   }
   return fullRun;
 }
+type ResolveTiming = { stopClickedAt: number; stopObservedAt: number };
 async function reconcileDemoExecution(
   request: APIRequestContext,
   issueId: string,
   runId: string,
+  testInfo: TestInfo,
+  timing: ResolveTiming,
 ) {
   // These deterministic fixtures only print output. No external action occurred.
   // Master requires recorded outcomes before a cancelled provider can restart.
@@ -187,8 +192,47 @@ async function reconcileDemoExecution(
   const actionId = recovery.active?.id ?? settled?.details?.recoveryActionId;
   expect(actionId).toBeTruthy();
   const reconciledRunId: string = settled?.runId ?? runId;
-  await json(
-    await request.post(`/api/issues/${issueId}/recovery-actions/resolve`, {
+  // The 409 guard (validateExecutionReconciliation,
+  // server/src/services/execution-recovery-resolution.ts) process.kills the run named by
+  // executionReconciliation.runId — reconciledRunId here — and only lets resolve through when
+  // BOTH that run's recorded processPid and -processGroupId are dead. Capture that run's own
+  // PIDs plus the original run's PIDs and their test-side liveness at the resolve attempt, so a
+  // real 409 is decidable between "Stop had not reaped the provider" (a guard-checked PID is
+  // alive at resolve) and "resolve fired before stop-completion was observable" (every
+  // guard-checked PID is dead at resolve, i.e. the guard observed a provider the spec never
+  // awaited or a PID reused between the two kill(2) checks).
+  type RunPids = { processPid?: number; processGroupId?: number };
+  const [targetRun, originalRun] = await Promise.all([
+    json(await request.get(`/api/heartbeat-runs/${reconciledRunId}`)) as Promise<RunPids>,
+    json(await request.get(`/api/heartbeat-runs/${runId}`)) as Promise<RunPids>,
+  ]);
+  const guardPids: { pid: number; role: string }[] = [];
+  if (typeof targetRun.processPid === "number")
+    guardPids.push({ pid: targetRun.processPid, role: "processPid" });
+  if (
+    typeof targetRun.processGroupId === "number" &&
+    targetRun.processGroupId > 0
+  )
+    guardPids.push({ pid: -targetRun.processGroupId, role: "processGroupId" });
+  const originalPids: { pid: number; role: string }[] = [];
+  if (typeof originalRun.processPid === "number")
+    originalPids.push({ pid: originalRun.processPid, role: "processPid" });
+  if (
+    typeof originalRun.processGroupId === "number" &&
+    originalRun.processGroupId > 0
+  )
+    originalPids.push({ pid: -originalRun.processGroupId, role: "processGroupId" });
+  const resolveAttemptedAt = Date.now();
+  const liveness = guardPids.map((entry) =>
+    probePidLiveness(entry.pid, entry.role),
+  );
+  const stopInitiationToResolveMs = resolveAttemptedAt - timing.stopClickedAt;
+  const stopCompletionToResolveMs = resolveAttemptedAt - timing.stopObservedAt;
+  const providerAliveAtResolve = liveness.some((entry) => entry.alive);
+
+  const response = await request.post(
+    `/api/issues/${issueId}/recovery-actions/resolve`,
+    {
       data: {
         actionId,
         outcome: "restored",
@@ -201,8 +245,53 @@ async function reconcileDemoExecution(
             "The deterministic acceptance fixture only emits console/protocol output. The verified stopped process performed no external actions.",
         },
       },
-    }),
+    },
   );
+  const status = response.status();
+  const body = await response.text();
+  if (!response.ok()) {
+    const verdict = providerAliveAtResolve
+      ? "H1_REAPING_LATE: a guard-checked PID of the reconciled run was alive at resolve; inspect guardPids[].cmdline/groupMembers to confirm it is the immortal provider fixture ('stop fixture ready'/'working') rather than an unrelated reused pid — Stop had not reaped the provider before recovery resolve."
+      : "H2_OBSERVATION_RACE: every guard-checked PID of the reconciled run was dead at resolve, yet the guard observed a live provider; resolve raced stop-completion observability (the guard checked a pid the spec never awaited, or a pid was reused between the spec's and the guard's kill(2) checks).";
+    const evidence = {
+      kind: "composer-stop-resolve-conflict",
+      issueId,
+      originalRunId: runId,
+      reconciledRunId,
+      reconciledRunIsOriginal: reconciledRunId === runId,
+      guardPids: liveness,
+      originalRunPids: originalPids,
+      providerAliveAtResolve,
+      stopClickedAtIso: new Date(timing.stopClickedAt).toISOString(),
+      stopObservedAtIso: new Date(timing.stopObservedAt).toISOString(),
+      resolveAttemptedAtIso: new Date(resolveAttemptedAt).toISOString(),
+      stopInitiationToResolveMs,
+      stopCompletionToResolveMs,
+      verdict,
+      httpStatus: status,
+      responseBody: body,
+    };
+    await emitEvidence(testInfo, "composer-stop-409-evidence", evidence);
+    throw new Error(
+      `composer-stop recovery resolve ${status} (issue=${issueId}, reconciledRun=${reconciledRunId}, originalRun=${runId}): ` +
+        `stopInitiationToResolve=${stopInitiationToResolveMs}ms stopCompletionToResolve=${stopCompletionToResolveMs}ms ` +
+        `guardLiveness=${JSON.stringify(liveness)} originalRunPids=${JSON.stringify(originalPids)} :: ${verdict} :: body=${body}`,
+    );
+  }
+  await emitEvidence(testInfo, "composer-stop-resolve-evidence", {
+    kind: "composer-stop-resolve-evidence",
+    issueId,
+    originalRunId: runId,
+    reconciledRunId,
+    reconciledRunIsOriginal: reconciledRunId === runId,
+    guardPids: liveness,
+    originalRunPids: originalPids,
+    providerAliveAtResolve,
+    stopInitiationToResolveMs,
+    stopCompletionToResolveMs,
+    httpStatus: status,
+  });
+  return JSON.parse(body);
 }
 
 async function menu(page: Page, action: string) {
@@ -220,6 +309,122 @@ function processAlive(pid: number) {
     return true;
   } catch {
     return false;
+  }
+}
+
+// The 409 guard (validateExecutionReconciliation) probes liveness with
+// process.kill(pid, 0) — a positive pid for the recorded provider, a negative
+// pid for the process group. These probes run in the same OS as the guard, so
+// they agree on liveness. For a real 409 we additionally fingerprint the live
+// pid via /proc so "the provider was not reaped yet" (H1) is decidable from
+// "the pid was reused by an unrelated process / the guard observed a stale
+// provider" (H2). /proc is Linux-only; when a field is unreadable we degrade to
+// liveness-only rather than failing the diagnostic run.
+function procField(statRaw: string, index: number): number | undefined {
+  const close = statRaw.lastIndexOf(")");
+  if (close < 0) return undefined;
+  const field = statRaw.slice(close + 2).trim().split(/\s+/)[index];
+  const value = Number(field);
+  return Number.isNaN(value) ? undefined : value;
+}
+function procCmdline(pid: number): string | undefined {
+  try {
+    const args = readFileSync(`/proc/${pid}/cmdline`, "utf8")
+      .split("\0")
+      .filter(Boolean)
+      .join(" ");
+    return args ? args.slice(0, 400) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function procPpid(pid: number): number | undefined {
+  try {
+    return procField(readFileSync(`/proc/${pid}/stat`, "utf8"), 1);
+  } catch {
+    return undefined;
+  }
+}
+function processGroupMembers(pgid: number): number[] {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return [];
+  }
+  const members: number[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const pgrp = procField(
+        readFileSync(`/proc/${entry}/stat`, "utf8"),
+        2,
+      );
+      if (pgrp === pgid) members.push(Number(entry));
+    } catch {
+      // Process exited or is unreadable between the kill(0) probe and the read.
+    }
+  }
+  return members;
+}
+type PidLiveness = {
+  pid: number;
+  role: string;
+  alive: boolean;
+  cmdline?: string;
+  ppid?: number;
+  groupMembers?: { pid: number; cmdline?: string }[];
+};
+function probePidLiveness(pid: number, role: string): PidLiveness {
+  let alive = false;
+  try {
+    process.kill(pid, 0);
+    alive = true;
+  } catch {
+    alive = false;
+  }
+  const result: PidLiveness = { pid, role, alive };
+  if (!alive) return result;
+  const target = Math.abs(pid);
+  if (pid < 0) {
+    result.groupMembers = processGroupMembers(target).map((member) => ({
+      pid: member,
+      cmdline: procCmdline(member),
+    }));
+    const leader = result.groupMembers[0];
+    if (leader) result.ppid = procPpid(leader.pid);
+  } else {
+    result.cmdline = procCmdline(target);
+    result.ppid = procPpid(target);
+  }
+  return result;
+}
+
+// Evidence is authoritative in the Playwright attachment (persisted on failure).
+// When PAPERCLIP_STOP_EVIDENCE_DIR is set — a diagnostic-only harness, unset in
+// CI — also mirror each record to disk so a passing baseline's numbers remain
+// inspectable after Playwright cleans test-results.
+async function emitEvidence(
+  testInfo: TestInfo,
+  name: string,
+  evidence: unknown,
+) {
+  const body = JSON.stringify(evidence, null, 2);
+  await testInfo.attach(name, { body, contentType: "application/json" });
+  const dir = process.env.PAPERCLIP_STOP_EVIDENCE_DIR;
+  if (!dir) return;
+  // The parent and child reconciles share `name`; scope the mirror per issue so
+  // both records survive (a passing baseline otherwise keeps only the last).
+  const issueId =
+    typeof evidence === "object" && evidence !== null
+      ? (evidence as { issueId?: unknown }).issueId
+      : undefined;
+  const fileSuffix = typeof issueId === "string" ? `-${issueId}` : "";
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${dir}/${name}${fileSuffix}.json`, body);
+  } catch {
+    // Best-effort mirror; the attachment above stays authoritative.
   }
 }
 
@@ -507,11 +712,23 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         // preserves their recovery gate until the fixture reconciles them.
         expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
         expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
-        await reconcileDemoExecution(request, parent.id, parentRun.id);
+        await reconcileDemoExecution(
+          request,
+          parent.id,
+          parentRun.id,
+          testInfo,
+          { stopClickedAt: clickedAt, stopObservedAt: stoppedAt },
+        );
         resumeEvidenceLog.push(
           await resumeEvidence(request, parent.id, "after-parent-resolve"),
         );
-        await reconcileDemoExecution(request, child.id, childRun.id);
+        await reconcileDemoExecution(
+          request,
+          child.id,
+          childRun.id,
+          testInfo,
+          { stopClickedAt: clickedAt, stopObservedAt: stoppedAt },
+        );
         resumeEvidenceLog.push(
           await resumeEvidence(request, child.id, "after-child-resolve"),
         );
