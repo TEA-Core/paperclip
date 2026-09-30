@@ -65,12 +65,15 @@ async function safeSnapshot(
 }
 
 function recordInstrumentationFailure(
-  resume: ResumeContext | undefined,
+  target: ResumeContext | InstrumentationFailure[] | undefined,
   stage: string,
   error: unknown,
 ) {
-  if (!resume || resume.instrumentationFailures.length >= 25) return;
-  resume.instrumentationFailures.push({
+  const failures = Array.isArray(target)
+    ? target
+    : target?.instrumentationFailures;
+  if (!failures || failures.length >= 25) return;
+  failures.push({
     atIso: new Date().toISOString(),
     stage,
     message: error instanceof Error ? error.message : String(error),
@@ -199,7 +202,8 @@ type ResolveResult = {
 };
 type ResumeContext = {
   originalRunIds: string[];
-  resolveCompletedAtIso: string;
+  resolveCompletedAtIso: string | null;
+  resumeInitiatedAtIso: string;
   resolveResponseBody: unknown;
   // Whether a process-adapter reconcile actually produced resolve facts. The
   // native (paperclip_runner) path has no manual reconcile step, so this is
@@ -391,7 +395,8 @@ async function running(
       .toBe(true);
   } catch (error) {
     if (!resume) throw error;
-    const pollWindowMs = Date.now() - pollWindowStartMs;
+    const pollWindowEndMs = Date.now();
+    const pollWindowMs = pollWindowEndMs - pollWindowStartMs;
     const distinctRunIds = [
       ...new Set(resume.observedRunRows.map((row) => row.id)),
     ];
@@ -478,8 +483,7 @@ async function running(
         typeof cdRaw === "string" ? cdRaw : cdRaw === null ? null : undefined;
     }
     // Correction 2: bound status-frame evidence to the poll window by the
-    // frame's eventCreatedAt so pre-resume and prior-run frames are excluded.
-    const pollWindowEndMs = Date.now();
+    // frame's eventCreatedAt so pre-resume and post-timeout frames are excluded.
     const pollWindowEndIso = new Date(pollWindowEndMs).toISOString();
     const statusFramesDuringWindow = resume.statusMetadata.filter(
       (entry) =>
@@ -515,8 +519,10 @@ async function running(
         pollWindowEndIso,
         pollWindowMs,
         resolveCompletedAtIso: resume.resolveCompletedAtIso,
-        resolveToPollWindowStartMs:
-          pollWindowStartMs - Date.parse(resume.resolveCompletedAtIso),
+        resumeInitiatedAtIso: resume.resumeInitiatedAtIso,
+        resolveToPollWindowStartMs: resume.resolveCompletedAtIso
+          ? pollWindowStartMs - Date.parse(resume.resolveCompletedAtIso)
+          : null,
         hasResolveEvidence: resume.hasResolveEvidence,
         resolveResponseBody: resume.resolveResponseBody,
         observedRunRows: resume.observedRunRows,
@@ -883,7 +889,9 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       await request.get("/api/instance/settings/experimental"),
     );
     const statusMetadata: Record<string, string | null>[] = [];
+    const instrumentationFailures: InstrumentationFailure[] = [];
     const resumeEvidenceLog: ResumeEvidence[] = [];
+    let currentResumeContext: ResumeContext | undefined;
     page.on("websocket", (socket) => {
       socket.on("framereceived", ({ payload: frame }) => {
         try {
@@ -913,8 +921,12 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
           if (typeof event.createdAt === "string")
             entry.eventCreatedAt = event.createdAt;
           statusMetadata.push(entry);
-        } catch {
-          // Non-JSON frames are irrelevant and are not retained.
+        } catch (error) {
+          recordInstrumentationFailure(
+            currentResumeContext?.instrumentationFailures ?? instrumentationFailures,
+            "websocket-status-frame",
+            error,
+          );
         }
       });
     });
@@ -1212,8 +1224,8 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         resolve: ResolveResult | null,
       ): ResumeContext => ({
         originalRunIds: [originalRunId],
-        resolveCompletedAtIso:
-          resolve?.resolveCompletedAtIso ?? resumeInitiatedAtIso,
+        resolveCompletedAtIso: resolve?.resolveCompletedAtIso ?? null,
+        resumeInitiatedAtIso,
         resolveResponseBody: resolve?.body ?? null,
         // Only the process adapter runs the manual reconcile that yields a
         // ResolveResult; native keeps these null so no resolve facts are
@@ -1231,23 +1243,27 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         observedRunRows: [],
         apiErrorsDuringWindow: [],
         successfulPollCount: 0,
-        instrumentationFailures: [],
+        instrumentationFailures: [...instrumentationFailures],
       });
       // A verified stopped native runner can honor the explicitly selected
       // Wake agents option without another manual reconciliation step.
+      const parentResumeContext = resumeContextFor(parentRun.id, parentResolve);
+      currentResumeContext = parentResumeContext;
       const resumedParentRun = await running(
         request,
         parent.id,
         adapter,
         resumeEvidenceLog,
-        resumeContextFor(parentRun.id, parentResolve),
+        parentResumeContext,
       );
+      const childResumeContext = resumeContextFor(childRun.id, childResolve);
+      currentResumeContext = childResumeContext;
       const resumedChildRun = await running(
         request,
         child.id,
         adapter,
         resumeEvidenceLog,
-        resumeContextFor(childRun.id, childResolve),
+        childResumeContext,
       );
       expect(resumedParentRun.id).not.toBe(parentRun.id);
       expect(resumedChildRun.id).not.toBe(childRun.id);
