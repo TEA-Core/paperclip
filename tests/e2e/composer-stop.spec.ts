@@ -8,6 +8,17 @@ import {
   type Page,
   type TestInfo,
 } from "@playwright/test";
+import {
+  buildRunningTimeoutEvidence,
+  createStatusFrameCollector,
+  observeLiveRuns,
+  recordInstrumentationFailure,
+  type InstrumentationFailure,
+  type LiveRun,
+  type ObservedRunRow,
+  type RunningTimeoutApiError,
+  type StatusMetadata,
+} from "./support/composer-stop-evidence.js";
 
 async function json(response: APIResponse) {
   const text = await response.text();
@@ -64,21 +75,6 @@ async function safeSnapshot(
   }
 }
 
-function recordInstrumentationFailure(
-  target: ResumeContext | InstrumentationFailure[] | undefined,
-  stage: string,
-  error: unknown,
-) {
-  const failures = Array.isArray(target)
-    ? target
-    : target?.instrumentationFailures;
-  if (!failures || failures.length >= 25) return;
-  failures.push({
-    atIso: new Date().toISOString(),
-    stage,
-    message: error instanceof Error ? error.message : String(error),
-  });
-}
 function snapshotFailure(
   snapshot: SafeSnapshot,
   label: string,
@@ -179,20 +175,6 @@ async function resumeEvidence(
     },
   };
 }
-type ObservedRunRow = {
-  id: string;
-  status: string;
-  runtimeMode?: string;
-  invocationSource?: string;
-  continuationAttempt?: number;
-  observedAtIso: string;
-};
-type RunningTimeoutApiError = { atIso: string; url: string; message: string };
-type InstrumentationFailure = {
-  atIso: string;
-  stage: string;
-  message: string;
-};
 type ResolveResult = {
   body: unknown;
   resolveCompletedAtIso: string;
@@ -205,105 +187,17 @@ type ResumeContext = {
   resolveCompletedAtIso: string | null;
   resumeInitiatedAtIso: string;
   resolveResponseBody: unknown;
-  // Whether a process-adapter reconcile actually produced resolve facts. The
-  // native (paperclip_runner) path has no manual reconcile step, so this is
-  // false there and the resolve facts below stay null rather than being filled
-  // with fabricated "false" values that would look like observed evidence.
   hasResolveEvidence: boolean;
   recoveryActionPresentAtResolve: boolean | null;
   settledActionFoundAtResolve: boolean | null;
   originalProviderAliveAtResolve: boolean | null;
-  statusMetadata: Record<string, string | null>[];
+  statusMetadata: StatusMetadata[];
   companyId: string;
   testInfo: TestInfo;
   observedRunRows: ObservedRunRow[];
   apiErrorsDuringWindow: RunningTimeoutApiError[];
   successfulPollCount: number;
   instrumentationFailures: InstrumentationFailure[];
-};
-// Maps the captured same-attempt facts to one of the hypotheses the
-// running-timeout must decide between. Facts are authoritative; this label is
-// a convenience for the CI log and the attachment. Buckets:
-//  - OBSERVATION_FAILURE: the same-attempt final snapshots are missing/failed,
-//    so the final state is unobserved (a degraded read, NOT a transition).
-//  - TEST_POLLED_WRONG_OR_STALE_STATE: in-window reads or the final state do
-//    not match a healthy transition.
-//  - RESUME_TRANSITION_DELAYED_OR_ABSENT: the resume did not reach 'running'
-//    within the window on a loaded runner.
-//  - FIXTURE_OBSERVATION_ENDED_EARLY: process reconcile saw no unresolved OR
-//    settled recovery action, so no successor wakeup was scheduled.
-// Resolve/recovery classification is scoped to the process adapter (the only
-// path that emits a manual reconcile ResolveResult); the native path keeps its
-// transition evidence separate rather than fabricating resolve facts.
-function classifyRunningTimeout(input: {
-  adapter: "process" | "paperclip_runner";
-  apiErrorsDuringWindow: RunningTimeoutApiError[];
-  instrumentationFailures: InstrumentationFailure[];
-  observedRunRowCount: number;
-  successfulPollCount: number;
-  newRunIds: string[];
-  anyNewRunRunning: boolean;
-  finalIssueStatus: string | null;
-  finalContinuationDelivery: string | null | undefined;
-  hasResolveEvidence: boolean;
-  recoveryActionPresentAtResolve: boolean | null;
-  settledActionFoundAtResolve: boolean | null;
-  finalSnapshotFailure: string | null;
-}): string {
-  const {
-    adapter,
-    apiErrorsDuringWindow,
-    observedRunRowCount,
-    newRunIds,
-    anyNewRunRunning,
-    finalIssueStatus,
-    finalContinuationDelivery,
-    hasResolveEvidence,
-    recoveryActionPresentAtResolve,
-    settledActionFoundAtResolve,
-    finalSnapshotFailure,
-  } = input;
-  if (finalSnapshotFailure) {
-    return `OBSERVATION_FAILURE: ${finalSnapshotFailure}`;
-  }
-  if (input.instrumentationFailures.length > 0) {
-    const instrumentationFailure = input.instrumentationFailures[0];
-    return `OBSERVATION_FAILURE: running-window instrumentation failed at ${instrumentationFailure.stage}: ${instrumentationFailure.message}`;
-  }
-  if (apiErrorsDuringWindow.length > 0) {
-    const pollError = apiErrorsDuringWindow[0];
-    return `OBSERVATION_FAILURE: a running-window live-runs observation failed before timeout: ${pollError.url} ${pollError.message}`;
-  }
-  if (input.successfulPollCount === 0) {
-    return "OBSERVATION_FAILURE: the running-window live-runs observation captured no successful reads, so the timeout cannot distinguish an absent transition from an unavailable observation.";
-  }
-  if (newRunIds.length === 0) {
-    // Only the process adapter's manual reconcile can prove no wake was
-    // scheduled. A settled (resolved-with-replay-blocked) action is still proof
-    // a wake WAS scheduled, so it must not read as "nothing to act on".
-    const sawRecoveryAtResolve =
-      recoveryActionPresentAtResolve === true ||
-      settledActionFoundAtResolve === true;
-    if (adapter === "process" && hasResolveEvidence && !sawRecoveryAtResolve) {
-      return "FIXTURE_OBSERVATION_ENDED_EARLY: the process reconcile observed neither an active nor a settled recovery action at resolve time, so it scheduled no successor wakeup and the resume had nothing to act on.";
-    }
-    return "RESUME_TRANSITION_DELAYED_OR_ABSENT: no successor run row appeared within the 30s poll window; deliverReconciledExecutions runs on a 15s single-flight sweep, so on a loaded runner its tick (or the wakeup -> claim -> spawn chain) lands after the window. continuationDelivery=" + String(finalContinuationDelivery) + ".";
-  }
-  if (!anyNewRunRunning) {
-    return "RESUME_TRANSITION_DELAYED_OR_ABSENT: successor run row(s) " + JSON.stringify(newRunIds) + " were created but never reached status 'running' within the 30s window (claim suppression, agent-invokability gate, or slow provider spawn).";
-  }
-  if (finalIssueStatus !== "todo" && finalIssueStatus !== "in_progress") {
-    return "TEST_POLLED_WRONG_OR_STALE_STATE: the issue was not in a resumable state at window end (status=" + finalIssueStatus + ").";
-  }
-  return "UNCLASSIFIED: a successor run reached 'running' yet the poll still timed out; inspect observedRunRows and statusFramesDuringWindow.";
-}
-type LiveRun = {
-  id: string;
-  status: string;
-  runtimeMode?: string;
-  invocationSource?: string;
-  continuationAttempt?: number;
-  processPid?: number;
 };
 async function running(
   request: APIRequestContext,
@@ -312,9 +206,7 @@ async function running(
   evidence?: ResumeEvidence[],
   resume?: ResumeContext,
 ) {
-  let run:
-    | { id: string; status: string; runtimeMode?: string; processPid?: number }
-    | undefined;
+  let run: { id: string; status: string; runtimeMode?: string; processPid?: number } | undefined;
   const pollWindowStartMs = Date.now();
   const pollWindowStartIso = new Date(pollWindowStartMs).toISOString();
   try {
@@ -331,7 +223,17 @@ async function running(
                 `live-runs response was not an array: ${JSON.stringify(body).slice(0, 2000)}`,
               );
             }
-            runs = body as LiveRun[];
+            const validation = observeLiveRuns(
+              body,
+              resume ? resume.observedRunRows : undefined,
+            );
+            if (!validation.valid) {
+              throw new Error(validation.error ?? "malformed live-runs row");
+            }
+            if (resume) {
+              resume.successfulPollCount += 1;
+            }
+            runs = validation.rows;
           } catch (error) {
             if (resume) {
               resume.apiErrorsDuringWindow.push({
@@ -342,52 +244,22 @@ async function running(
             }
             return false;
           }
-          if (resume) {
-            resume.successfulPollCount += 1;
-            try {
-              for (const candidate of runs) {
-                resume.observedRunRows.push({
-                  id: String(candidate.id),
-                  status: String(candidate.status),
-                  runtimeMode:
-                    typeof candidate.runtimeMode === "string"
-                      ? candidate.runtimeMode
-                      : undefined,
-                  invocationSource:
-                    typeof candidate.invocationSource === "string"
-                      ? candidate.invocationSource
-                      : undefined,
-                  continuationAttempt:
-                    typeof candidate.continuationAttempt === "number"
-                      ? candidate.continuationAttempt
-                      : undefined,
-                  observedAtIso: new Date().toISOString(),
-                });
+            run = runs.find((candidate) => candidate.status === "running");
+            if (!run && evidence && resume) {
+              try {
+                evidence.push(
+                  await resumeEvidence(request, issueId, "running-poll"),
+                );
+              } catch (error) {
+                // resumeEvidence asserts 2xx; a transient failure is an
+                // instrumentation failure, not evidence the resume failed.
+                recordInstrumentationFailure(
+                  resume.instrumentationFailures,
+                  "running-poll-evidence",
+                  error,
+                );
               }
-            } catch (error) {
-              // Capturing rows is instrumentation, not the running check; a
-              // failure here must not turn into a false running-timeout.
-              recordInstrumentationFailure(resume, "observed-run-row", error);
             }
-          }
-          run = runs.find(
-            (candidate: { status: string }) => candidate.status === "running",
-          );
-          if (!run && evidence) {
-            try {
-              evidence.push(
-                await resumeEvidence(request, issueId, "running-poll"),
-              );
-            } catch (error) {
-              // resumeEvidence asserts 2xx; a transient failure is an
-              // instrumentation failure, not evidence the resume failed.
-              recordInstrumentationFailure(
-                resume,
-                "running-poll-evidence",
-                error,
-              );
-            }
-          }
           return !!run;
         },
         { timeout: 30_000 },
@@ -397,22 +269,7 @@ async function running(
     if (!resume) throw error;
     const pollWindowEndMs = Date.now();
     const pollWindowMs = pollWindowEndMs - pollWindowStartMs;
-    const distinctRunIds = [
-      ...new Set(resume.observedRunRows.map((row) => row.id)),
-    ];
-    const newRunIds = distinctRunIds.filter(
-      (id) => !resume.originalRunIds.includes(id),
-    );
-    const newRunStatuses = new Map<string, string[]>();
-    for (const row of resume.observedRunRows) {
-      if (!newRunIds.includes(row.id)) continue;
-      const statuses = newRunStatuses.get(row.id) ?? [];
-      if (!statuses.includes(row.status)) statuses.push(row.status);
-      newRunStatuses.set(row.id, statuses);
-    }
-    const anyNewRunRunning = [...newRunStatuses.values()].some((statuses) =>
-      statuses.includes("running"),
-    );
+
     // Correction 1: make fresh, same-attempt final requests for all four
     // authoritative sources and preserve a safe status/body/error for each.
     // A per-request failure stays an observation failure; it never collapses
@@ -482,68 +339,40 @@ async function running(
       finalContinuationDelivery =
         typeof cdRaw === "string" ? cdRaw : cdRaw === null ? null : undefined;
     }
-    // Correction 2: bound status-frame evidence to the poll window by the
-    // frame's eventCreatedAt so pre-resume and post-timeout frames are excluded.
-    const pollWindowEndIso = new Date(pollWindowEndMs).toISOString();
-    const statusFramesDuringWindow = resume.statusMetadata.filter(
-      (entry) =>
-        entry.issueId === issueId &&
-        typeof entry.eventCreatedAt === "string" &&
-        Date.parse(entry.eventCreatedAt) >= pollWindowStartMs &&
-        Date.parse(entry.eventCreatedAt) <= pollWindowEndMs,
-    );
-    const verdict = classifyRunningTimeout({
+    const evidence = buildRunningTimeoutEvidence({
       adapter,
       apiErrorsDuringWindow: resume.apiErrorsDuringWindow,
-      observedRunRowCount: resume.observedRunRows.length,
+      instrumentationFailures: resume.instrumentationFailures,
+      observedRunRows: resume.observedRunRows,
       successfulPollCount: resume.successfulPollCount,
-      newRunIds,
-      anyNewRunRunning,
       finalIssueStatus: finalIssueState.status,
       finalContinuationDelivery,
-      instrumentationFailures: resume.instrumentationFailures,
       hasResolveEvidence: resume.hasResolveEvidence,
       recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
       settledActionFoundAtResolve: resume.settledActionFoundAtResolve,
       finalSnapshotFailure: finalSnapshotFailure || null,
+      issueId,
+      companyId: resume.companyId,
+      pollWindowStartMs,
+      pollWindowEndMs,
+      originalRunIds: resume.originalRunIds,
+      finalLiveRuns: finalSnapshots[1].body,
+      statusMetadata: resume.statusMetadata,
+      finalSnapshots,
+      finalIssueState,
+      resolveCompletedAtIso: resume.resolveCompletedAtIso,
+      resumeInitiatedAtIso: resume.resumeInitiatedAtIso,
+      resolveResponseBody: resume.resolveResponseBody,
+      originalProviderAliveAtResolve: resume.originalProviderAliveAtResolve,
     });
     await emitEvidence(
       resume.testInfo,
       "composer-stop-running-timeout-evidence",
-      {
-        kind: "composer-stop-running-timeout-evidence",
-        issueId,
-        adapter,
-        companyId: resume.companyId,
-        pollWindowStartIso,
-        pollWindowEndIso,
-        pollWindowMs,
-        resolveCompletedAtIso: resume.resolveCompletedAtIso,
-        resumeInitiatedAtIso: resume.resumeInitiatedAtIso,
-        resolveToPollWindowStartMs: resume.resolveCompletedAtIso
-          ? pollWindowStartMs - Date.parse(resume.resolveCompletedAtIso)
-          : null,
-        hasResolveEvidence: resume.hasResolveEvidence,
-        resolveResponseBody: resume.resolveResponseBody,
-        observedRunRows: resume.observedRunRows,
-        distinctRunIds,
-        newRunIds,
-        newRunStatuses: Object.fromEntries(newRunStatuses),
-        finalSnapshots,
-        finalIssueState,
-        finalContinuationDelivery,
-        recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
-        settledActionFoundAtResolve: resume.settledActionFoundAtResolve,
-        originalProviderAliveAtResolve: resume.originalProviderAliveAtResolve,
-        apiErrorsDuringWindow: resume.apiErrorsDuringWindow,
-        instrumentationFailures: resume.instrumentationFailures,
-        statusFramesDuringWindow,
-        verdict,
-      },
+      evidence,
     );
     throw new Error(
-      `composer-stop resume running-timeout (issue=${issueId}, adapter=${adapter}): ${verdict} :: ` +
-        `pollWindowMs=${pollWindowMs} newRunIds=${JSON.stringify(newRunIds)} ` +
+      `composer-stop resume running-timeout (issue=${issueId}, adapter=${adapter}): ${evidence.verdict} :: ` +
+        `pollWindowMs=${pollWindowMs} newRunIds=${JSON.stringify(evidence.newRunIds)} ` +
         `finalIssueStatus=${String(finalIssueState.status)} ` +
         `finalContinuationDelivery=${String(finalContinuationDelivery)} ` +
         `apiErrors=${resume.apiErrorsDuringWindow.length} ` +
@@ -892,43 +721,16 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
     const instrumentationFailures: InstrumentationFailure[] = [];
     const resumeEvidenceLog: ResumeEvidence[] = [];
     let currentResumeContext: ResumeContext | undefined;
+    const statusFrameCollector = createStatusFrameCollector(company.id);
     page.on("websocket", (socket) => {
-      socket.on("framereceived", ({ payload: frame }) => {
-        try {
-          const event = JSON.parse(
-            typeof frame === "string" ? frame : frame.toString("utf8"),
-          );
-          if (
-            event.companyId !== company.id ||
-            event.type !== "heartbeat.run.status"
-          )
-            return;
-          // Retain only scalar status routing evidence for this owned company,
-          // never raw frames, provider output, errors, or tool payloads.
-          const entry: Record<string, string | null> = {};
-          for (const key of [
-            "runId",
-            "agentId",
-            "status",
-            "issueId",
-            "deliveryId",
-            "startedAt",
-            "finishedAt",
-          ] as const) {
-            const value = event.payload?.[key];
-            if (value === null || typeof value === "string") entry[key] = value;
-          }
-          if (typeof event.createdAt === "string")
-            entry.eventCreatedAt = event.createdAt;
-          statusMetadata.push(entry);
-        } catch (error) {
-          recordInstrumentationFailure(
-            currentResumeContext?.instrumentationFailures ?? instrumentationFailures,
-            "websocket-status-frame",
-            error,
-          );
-        }
-      });
+        socket.on("framereceived", ({ payload: frame }) => {
+          const text =
+            typeof frame === "string" ? frame : new TextDecoder().decode(frame);
+          statusFrameCollector.ingest(text);
+          statusMetadata.push(...statusFrameCollector.entries.splice(0));
+          const targetFailures = currentResumeContext?.instrumentationFailures ?? instrumentationFailures;
+          targetFailures.push(...statusFrameCollector.instrumentationFailures.splice(0));
+        });
     });
     try {
       await json(
