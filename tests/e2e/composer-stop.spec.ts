@@ -163,6 +163,14 @@ function classifyRunningTimeout(input: {
   }
   return "UNCLASSIFIED: a successor run reached 'running' yet the poll still timed out; inspect observedRunRows and statusFramesDuringWindow.";
 }
+type LiveRun = {
+  id: string;
+  status: string;
+  runtimeMode?: string;
+  invocationSource?: string;
+  continuationAttempt?: number;
+  processPid?: number;
+};
 async function running(
   request: APIRequestContext,
   issueId: string,
@@ -179,7 +187,7 @@ async function running(
     await expect
       .poll(
         async () => {
-          let runs: Record<string, unknown>[] = [];
+          let runs: LiveRun[] = [];
           try {
             runs = await json(
               await request.get(`/api/issues/${issueId}/live-runs`),
@@ -264,10 +272,9 @@ async function running(
       const actions = (recovery.actions as Record<string, unknown>[]) ?? [];
       const lastEvidence =
         active?.evidence ?? actions[actions.length - 1]?.evidence;
-      finalContinuationDelivery = evidenceField(
-        lastEvidence,
-        "continuationDelivery",
-      );
+      const cdRaw = evidenceField(lastEvidence, "continuationDelivery");
+      finalContinuationDelivery =
+        typeof cdRaw === "string" ? cdRaw : cdRaw === null ? null : undefined;
     } catch {
       // The final snapshot is unavailable; the in-window facts still stand.
     }
