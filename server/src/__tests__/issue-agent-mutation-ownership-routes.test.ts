@@ -5,6 +5,10 @@ import { getTableName, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import type { budgetService } from "../services/budgets.js";
+import type { issueApprovalService } from "../services/issue-approvals.js";
+import type { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import type { taskWatchdogService } from "../services/task-watchdogs.js";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
@@ -56,7 +60,7 @@ const mockCompanyService = vi.hoisted(() => ({
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
-  getInvocationBlock: vi.fn(async () => null),
+  getInvocationBlock: vi.fn<ReturnType<typeof budgetService>["getInvocationBlock"]>(async () => null),
 }));
 
 const mockProjectService = vi.hoisted(() => ({
@@ -102,16 +106,16 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),
   unlink: vi.fn(),
-  listApprovalsForIssue: vi.fn(async () => []),
+  listApprovalsForIssue: vi.fn<ReturnType<typeof issueApprovalService>["listApprovalsForIssue"]>(async () => []),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
-  getActiveForIssue: vi.fn(async () => null),
-  listActiveForIssues: vi.fn(async () => new Map()),
-  resolveActiveForIssue: vi.fn(async () => null),
+  getActiveForIssue: vi.fn<ReturnType<typeof issueRecoveryActionService>["getActiveForIssue"]>(async () => null),
+  listActiveForIssues: vi.fn<ReturnType<typeof issueRecoveryActionService>["listActiveForIssues"]>(async () => new Map()),
+  resolveActiveForIssue: vi.fn<ReturnType<typeof issueRecoveryActionService>["resolveActiveForIssue"]>(async () => null),
 }));
 const mockTaskWatchdogService = vi.hoisted(() => ({
-  getActiveForIssue: vi.fn(async () => null),
-  revalidateMutationScope: vi.fn(async () => ({
+  getActiveForIssue: vi.fn<ReturnType<typeof taskWatchdogService>["getActiveForIssue"]>(async () => null),
+  revalidateMutationScope: vi.fn<ReturnType<typeof taskWatchdogService>["revalidateMutationScope"]>(async () => ({
     allowed: true,
     classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
   })),
