@@ -56,7 +56,7 @@ const mockCompanyService = vi.hoisted(() => ({
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
-  getInvocationBlock: vi.fn(async () => null),
+  getInvocationBlock: vi.fn<() => Promise<{ scope: string; reason: string } | null>>(async () => null),
 }));
 
 const mockProjectService = vi.hoisted(() => ({
@@ -2975,7 +2975,7 @@ describe("agent issue mutation checkout ownership", () => {
       id: recoveryActionId,
       ownerAgentId: peerAgentId,
       returnOwnerAgentId: ownerAgentId,
-    });
+    } as never);
 
     const res = await request(await createApp(peerActor()))
       .post(`/api/issues/${issueId}/recovery-actions/resolve`)
@@ -3424,7 +3424,7 @@ describe("agent issue mutation checkout ownership", () => {
         ownerType: "board",
         ownerAgentId: null,
         returnOwnerAgentId: ownerAgentId,
-      });
+      } as never);
       const db = createRunContextDb({}, ownerAgentId, ownerRunId, [{
         id: "88888888-8888-4888-8888-888888888888",
         companyId,
@@ -3457,7 +3457,7 @@ describe("agent issue mutation checkout ownership", () => {
       id: recoveryActionId,
       ownerAgentId: peerAgentId,
       returnOwnerAgentId: ownerAgentId,
-    });
+    } as never);
 
     const res = await request(await createApp(peerActor()))
       .post(`/api/issues/${issueId}/recovery-actions/resolve`)
@@ -3476,7 +3476,7 @@ describe("agent issue mutation checkout ownership", () => {
       id: recoveryActionId,
       ownerAgentId: peerAgentId,
       returnOwnerAgentId: ownerAgentId,
-    });
+    } as never);
     mockBudgetService.getInvocationBlock.mockResolvedValue({
       scope: "agent",
       reason: "hard_limit_reached",
@@ -3499,8 +3499,8 @@ describe("agent issue mutation checkout ownership", () => {
       id: recoveryActionId,
       ownerAgentId: peerAgentId,
       returnOwnerAgentId: ownerAgentId,
-    });
-    mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([{ status: "pending" }]);
+    } as never);
+    mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([{ status: "pending" }] as never);
 
     const res = await request(await createApp(peerActor()))
       .post(`/api/issues/${issueId}/recovery-actions/resolve`)
@@ -3512,11 +3512,14 @@ describe("agent issue mutation checkout ownership", () => {
   });
 
   it("uses the authorization decision path for assignment changes", async () => {
-    const decide = vi.fn(async () => ({
-      allowed: false,
-      action: "tasks:assign",
-      reason: "deny_policy_restricted",
-      explanation: "Target agent requires approval before task assignment.",
+    const decide = vi.fn(async (input: { action: string }) => ({
+      allowed: input.action === "issue:mutate",
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "allow_self" : "deny_policy_restricted",
+      explanation:
+        input.action === "issue:mutate"
+          ? "Allowed because the actor owns the assigned issue."
+          : "Target agent requires approval before task assignment.",
     }));
     decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:mutate",
@@ -3709,7 +3712,7 @@ describe("agent issue mutation checkout ownership", () => {
         reason:
           "Task-watchdog review is stale: the watched subtree now has a live, waiting, already-reviewed, or not-applicable path, so this run's stopped-subtree review no longer applies. The run should stop mutating this subtree rather than retrying.",
         classification: { state: "live", liveIssueIds: [issueId] },
-      });
+      } as never);
 
       const app = await createApp(watchdogActor(), createWatchdogDb());
       const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
@@ -3729,7 +3732,7 @@ describe("agent issue mutation checkout ownership", () => {
         reason:
           "Task-watchdog review is stale: the watched subtree now has a live, waiting, already-reviewed, or not-applicable path, so this run's stopped-subtree review no longer applies. The run should stop mutating this subtree rather than retrying.",
         classification: { state: "live", liveIssueIds: [issueId] },
-      });
+      } as never);
 
       const app = await createApp(watchdogActor(), createWatchdogDb());
       const res = await request(app)
