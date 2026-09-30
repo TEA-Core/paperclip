@@ -669,6 +669,14 @@ The server cannot lower its own `oom_score_adj`; that needs `CAP_SYS_RESOURCE`, 
 
 Set `0` to disable. The adjustment is best-effort: a dead pid, a non-Linux host or a denied write is a no-op and never fails a run.
 
+## Agent Subprocess CPU Priority
+
+Agent runs also share the server container's CPU cgroup. At equal priority the scheduler splits CPU per runnable thread, so an agent that starts a large test fleet or a CPU-load reproduction outweighs the server. When the agent-uid split is armed (`PAPERCLIP_AGENT_UID`), the setuid spawn shim lowers its own priority after it drops to the agent uid and before it execs, and the whole agent tree inherits that priority. The step is relative to the server's priority and capped at 19.
+
+- `AGENT_NICE` Docker build arg (default `10`, range `0`–`19`)
+
+Set `0` to disable. The shim reads no environment, so changing the value needs an image rebuild. Without the uid split, agents run at the server's priority.
+
 Structured `workspace_git_scan` logs expose the operation name, a non-reversible workspace-path hash, queue and execution durations, active/queued counts, cache and single-flight use, and terminal outcome. Saturation and timeout warnings are rate-limited so an overload does not create a second logging storm.
 
 ## Worktree-local Instances
