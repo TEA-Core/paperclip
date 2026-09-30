@@ -27,6 +27,57 @@ async function task(
     }),
   );
 }
+type SafeSnapshot = {
+  url: string;
+  status: number | null;
+  ok: boolean;
+  body: unknown;
+  error: string | null;
+};
+// Same-attempt evidence read that never throws on a non-2xx, transport, or
+// parse failure. It preserves status/body/error so a degraded or failed
+// observation stays an observation failure instead of collapsing into an
+// "unknown" state that the timeout classifier would misread as a transition.
+async function safeSnapshot(
+  request: APIRequestContext,
+  url: string,
+): Promise<SafeSnapshot> {
+  try {
+    const response = await request.get(url);
+    const status = response.status();
+    const raw = await response.text();
+    let body: unknown;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      body = raw.slice(0, 2000);
+    }
+    return { url, status, ok: response.ok(), body, error: null };
+  } catch (error) {
+    return {
+      url,
+      status: null,
+      ok: false,
+      body: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+// Records a per-tick instrumentation failure (run-row capture or a per-tick
+// evidence read) without turning it into a running-timeout signal. Capped so a
+// pathological loop cannot grow the attachment unboundedly.
+function recordInstrumentationFailure(
+  resume: ResumeContext | undefined,
+  stage: string,
+  error: unknown,
+) {
+  if (!resume || resume.instrumentationFailures.length >= 25) return;
+  resume.instrumentationFailures.push({
+    atIso: new Date().toISOString(),
+    stage,
+    message: error instanceof Error ? error.message : String(error),
+  });
+}
 type ResumeEvidence = Record<string, unknown> & {
   label: string;
   capturedAt: string;
@@ -105,6 +156,11 @@ type ObservedRunRow = {
   observedAtIso: string;
 };
 type RunningTimeoutApiError = { atIso: string; url: string; message: string };
+type InstrumentationFailure = {
+  atIso: string;
+  stage: string;
+  message: string;
+};
 type ResolveResult = {
   body: unknown;
   resolveCompletedAtIso: string;
@@ -116,44 +172,76 @@ type ResumeContext = {
   originalRunIds: string[];
   resolveCompletedAtIso: string;
   resolveResponseBody: unknown;
-  recoveryActionPresentAtResolve: boolean;
-  settledActionFoundAtResolve: boolean;
-  originalProviderAliveAtResolve: boolean;
+  // Whether a process-adapter reconcile actually produced resolve facts. The
+  // native (paperclip_runner) path has no manual reconcile step, so this is
+  // false there and the resolve facts below stay null rather than being filled
+  // with fabricated "false" values that would look like observed evidence.
+  hasResolveEvidence: boolean;
+  recoveryActionPresentAtResolve: boolean | null;
+  settledActionFoundAtResolve: boolean | null;
+  originalProviderAliveAtResolve: boolean | null;
   statusMetadata: Record<string, string | null>[];
   companyId: string;
   testInfo: TestInfo;
   observedRunRows: ObservedRunRow[];
   apiErrorsDuringWindow: RunningTimeoutApiError[];
+  instrumentationFailures: InstrumentationFailure[];
 };
-// Maps the captured in-window facts to one of the three hypotheses the
-// running-timeout must decide between. The facts are authoritative; this label
-// is a convenience for the CI log and the attachment.
+// Maps the captured same-attempt facts to one of the hypotheses the
+// running-timeout must decide between. Facts are authoritative; this label is
+// a convenience for the CI log and the attachment. Buckets:
+//  - OBSERVATION_FAILURE: the same-attempt final snapshots are missing/failed,
+//    so the final state is unobserved (a degraded read, NOT a transition).
+//  - TEST_POLLED_WRONG_OR_STALE_STATE: in-window reads or the final state do
+//    not match a healthy transition.
+//  - RESUME_TRANSITION_DELAYED_OR_ABSENT: the resume did not reach 'running'
+//    within the window on a loaded runner.
+//  - FIXTURE_OBSERVATION_ENDED_EARLY: process reconcile saw no unresolved OR
+//    settled recovery action, so no successor wakeup was scheduled.
+// Resolve/recovery classification is scoped to the process adapter (the only
+// path that emits a manual reconcile ResolveResult); the native path keeps its
+// transition evidence separate rather than fabricating resolve facts.
 function classifyRunningTimeout(input: {
+  adapter: "process" | "paperclip_runner";
   apiErrorsDuringWindow: RunningTimeoutApiError[];
   observedRunRowCount: number;
   newRunIds: string[];
   anyNewRunRunning: boolean;
-  finalIssueStatus: string;
+  finalIssueStatus: string | null;
   finalContinuationDelivery: string | null | undefined;
-  recoveryActionPresentAtResolve: boolean;
+  hasResolveEvidence: boolean;
+  recoveryActionPresentAtResolve: boolean | null;
+  settledActionFoundAtResolve: boolean | null;
 }): string {
   const {
+    adapter,
     apiErrorsDuringWindow,
     observedRunRowCount,
     newRunIds,
     anyNewRunRunning,
     finalIssueStatus,
     finalContinuationDelivery,
+    hasResolveEvidence,
     recoveryActionPresentAtResolve,
+    settledActionFoundAtResolve,
   } = input;
+  if (finalIssueStatus === null) {
+    return "OBSERVATION_FAILURE: the same-attempt final issue snapshot failed, so the final issue state is unobserved. This is a degraded read, not evidence the resume was delayed/absent; inspect finalSnapshots[].status/error for the per-request cause and re-run.";
+  }
   if (apiErrorsDuringWindow.length > 0 && observedRunRowCount === 0) {
     return "TEST_POLLED_WRONG_OR_STALE_STATE: every live-runs read during the 30s window failed (HTTP/parse error), so the test observed a degraded endpoint rather than a delayed resume transition.";
   }
   if (newRunIds.length === 0) {
-    if (!recoveryActionPresentAtResolve) {
-      return "FIXTURE_OBSERVATION_ENDED_EARLY: no unresolved recovery action existed at resolve time, so the reconcile scheduled no successor wakeup and the resume had nothing to act on.";
+    // Only the process adapter's manual reconcile can prove no wake was
+    // scheduled. A settled (resolved-with-replay-blocked) action is still proof
+    // a wake WAS scheduled, so it must not read as "nothing to act on".
+    const sawRecoveryAtResolve =
+      recoveryActionPresentAtResolve === true ||
+      settledActionFoundAtResolve === true;
+    if (adapter === "process" && hasResolveEvidence && !sawRecoveryAtResolve) {
+      return "FIXTURE_OBSERVATION_ENDED_EARLY: the process reconcile observed neither an active nor a settled recovery action at resolve time, so it scheduled no successor wakeup and the resume had nothing to act on.";
     }
-    return "RESUME_TRANSITION_DELAYED_OR_ABSENT: the reconcile resolve returned 2xx but no successor run row appeared within the 30s poll window; deliverReconciledExecutions runs on a 15s single-flight sweep, so on a loaded runner its tick (or the wakeup -> claim -> spawn chain) lands after the window. continuationDelivery=" + String(finalContinuationDelivery) + ".";
+    return "RESUME_TRANSITION_DELAYED_OR_ABSENT: no successor run row appeared within the 30s poll window; deliverReconciledExecutions runs on a 15s single-flight sweep, so on a loaded runner its tick (or the wakeup -> claim -> spawn chain) lands after the window. continuationDelivery=" + String(finalContinuationDelivery) + ".";
   }
   if (!anyNewRunRunning) {
     return "RESUME_TRANSITION_DELAYED_OR_ABSENT: successor run row(s) " + JSON.stringify(newRunIds) + " were created but never reached status 'running' within the 30s window (claim suppression, agent-invokability gate, or slow provider spawn).";
@@ -203,31 +291,49 @@ async function running(
             return false;
           }
           if (resume) {
-            for (const candidate of runs) {
-              resume.observedRunRows.push({
-                id: String(candidate.id),
-                status: String(candidate.status),
-                runtimeMode:
-                  typeof candidate.runtimeMode === "string"
-                    ? candidate.runtimeMode
-                    : undefined,
-                invocationSource:
-                  typeof candidate.invocationSource === "string"
-                    ? candidate.invocationSource
-                    : undefined,
-                continuationAttempt:
-                  typeof candidate.continuationAttempt === "number"
-                    ? candidate.continuationAttempt
-                    : undefined,
-                observedAtIso: new Date().toISOString(),
-              });
+            try {
+              for (const candidate of runs) {
+                resume.observedRunRows.push({
+                  id: String(candidate.id),
+                  status: String(candidate.status),
+                  runtimeMode:
+                    typeof candidate.runtimeMode === "string"
+                      ? candidate.runtimeMode
+                      : undefined,
+                  invocationSource:
+                    typeof candidate.invocationSource === "string"
+                      ? candidate.invocationSource
+                      : undefined,
+                  continuationAttempt:
+                    typeof candidate.continuationAttempt === "number"
+                      ? candidate.continuationAttempt
+                      : undefined,
+                  observedAtIso: new Date().toISOString(),
+                });
+              }
+            } catch (error) {
+              // Capturing rows is instrumentation, not the running check; a
+              // failure here must not turn into a false running-timeout.
+              recordInstrumentationFailure(resume, "observed-run-row", error);
             }
           }
           run = runs.find(
             (candidate: { status: string }) => candidate.status === "running",
           );
           if (!run && evidence) {
-            evidence.push(await resumeEvidence(request, issueId, "running-poll"));
+            try {
+              evidence.push(
+                await resumeEvidence(request, issueId, "running-poll"),
+              );
+            } catch (error) {
+              // resumeEvidence asserts 2xx; a transient failure is an
+              // instrumentation failure, not evidence the resume failed.
+              recordInstrumentationFailure(
+                resume,
+                "running-poll-evidence",
+                error,
+              );
+            }
           }
           return !!run;
         },
@@ -253,21 +359,40 @@ async function running(
     const anyNewRunRunning = [...newRunStatuses.values()].some((statuses) =>
       statuses.includes("running"),
     );
-    let finalIssueState = {
-      status: "unknown",
-      executionRunId: null as string | null,
+    // Correction 1: make fresh, same-attempt final requests for all four
+    // authoritative sources and preserve a safe status/body/error for each.
+    // A per-request failure stays an observation failure; it never collapses
+    // the issue state to "unknown" that a transition verdict would misread.
+    const finalSnapshots = await Promise.all([
+      safeSnapshot(request, `/api/issues/${issueId}`),
+      safeSnapshot(request, `/api/issues/${issueId}/live-runs`),
+      safeSnapshot(request, `/api/issues/${issueId}/recovery-actions`),
+      safeSnapshot(request, `/api/issues/${issueId}/tree-control/state`),
+    ]);
+    const issueSnap = finalSnapshots[0];
+    const recoverySnap = finalSnapshots[2];
+    const issueOk =
+      issueSnap.ok &&
+      issueSnap.body !== null &&
+      typeof issueSnap.body === "object";
+    const issueBody = issueOk
+      ? (issueSnap.body as Record<string, unknown>)
+      : null;
+    const finalIssueState = {
+      status:
+        typeof issueBody?.status === "string" ? (issueBody.status as string) : null,
+      executionRunId:
+        typeof issueBody?.executionRunId === "string"
+          ? (issueBody.executionRunId as string)
+          : null,
     };
     let finalContinuationDelivery: string | null | undefined;
-    try {
-      const [issue, recovery] = await Promise.all([
-        json(await request.get(`/api/issues/${issueId}`)),
-        json(await request.get(`/api/issues/${issueId}/recovery-actions`)),
-      ]);
-      finalIssueState = {
-        status: String(issue.status),
-        executionRunId:
-          (issue.executionRunId as string | null | undefined) ?? null,
-      };
+    if (
+      recoverySnap.ok &&
+      recoverySnap.body !== null &&
+      typeof recoverySnap.body === "object"
+    ) {
+      const recovery = recoverySnap.body as Record<string, unknown>;
       const active = recovery.active as Record<string, unknown> | null;
       const actions = (recovery.actions as Record<string, unknown>[]) ?? [];
       const lastEvidence =
@@ -275,20 +400,29 @@ async function running(
       const cdRaw = evidenceField(lastEvidence, "continuationDelivery");
       finalContinuationDelivery =
         typeof cdRaw === "string" ? cdRaw : cdRaw === null ? null : undefined;
-    } catch {
-      // The final snapshot is unavailable; the in-window facts still stand.
     }
+    // Correction 2: bound status-frame evidence to the poll window by the
+    // frame's eventCreatedAt so pre-resume and prior-run frames are excluded.
+    const pollWindowEndMs = Date.now();
+    const pollWindowEndIso = new Date(pollWindowEndMs).toISOString();
     const statusFramesDuringWindow = resume.statusMetadata.filter(
-      (entry) => entry.issueId === issueId,
+      (entry) =>
+        entry.issueId === issueId &&
+        typeof entry.eventCreatedAt === "string" &&
+        Date.parse(entry.eventCreatedAt) >= pollWindowStartMs &&
+        Date.parse(entry.eventCreatedAt) <= pollWindowEndMs,
     );
     const verdict = classifyRunningTimeout({
+      adapter,
       apiErrorsDuringWindow: resume.apiErrorsDuringWindow,
       observedRunRowCount: resume.observedRunRows.length,
       newRunIds,
       anyNewRunRunning,
       finalIssueStatus: finalIssueState.status,
       finalContinuationDelivery,
+      hasResolveEvidence: resume.hasResolveEvidence,
       recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
+      settledActionFoundAtResolve: resume.settledActionFoundAtResolve,
     });
     await emitEvidence(
       resume.testInfo,
@@ -299,22 +433,25 @@ async function running(
         adapter,
         companyId: resume.companyId,
         pollWindowStartIso,
-        pollWindowEndIso: new Date().toISOString(),
+        pollWindowEndIso,
         pollWindowMs,
         resolveCompletedAtIso: resume.resolveCompletedAtIso,
         resolveToPollWindowStartMs:
           pollWindowStartMs - Date.parse(resume.resolveCompletedAtIso),
+        hasResolveEvidence: resume.hasResolveEvidence,
         resolveResponseBody: resume.resolveResponseBody,
         observedRunRows: resume.observedRunRows,
         distinctRunIds,
         newRunIds,
         newRunStatuses: Object.fromEntries(newRunStatuses),
+        finalSnapshots,
         finalIssueState,
         finalContinuationDelivery,
         recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
         settledActionFoundAtResolve: resume.settledActionFoundAtResolve,
         originalProviderAliveAtResolve: resume.originalProviderAliveAtResolve,
         apiErrorsDuringWindow: resume.apiErrorsDuringWindow,
+        instrumentationFailures: resume.instrumentationFailures,
         statusFramesDuringWindow,
         verdict,
       },
@@ -322,9 +459,10 @@ async function running(
     throw new Error(
       `composer-stop resume running-timeout (issue=${issueId}, adapter=${adapter}): ${verdict} :: ` +
         `pollWindowMs=${pollWindowMs} newRunIds=${JSON.stringify(newRunIds)} ` +
-        `finalIssueStatus=${finalIssueState.status} ` +
+        `finalIssueStatus=${String(finalIssueState.status)} ` +
         `finalContinuationDelivery=${String(finalContinuationDelivery)} ` +
-        `apiErrors=${resume.apiErrorsDuringWindow.length} :: ` +
+        `apiErrors=${resume.apiErrorsDuringWindow.length} ` +
+        `instrumentationFailures=${resume.instrumentationFailures.length} :: ` +
         `see the composer-stop-running-timeout-evidence attachment. Original: ` +
         (error instanceof Error ? error.message : String(error)),
     );
@@ -962,17 +1100,22 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         resolveCompletedAtIso:
           resolve?.resolveCompletedAtIso ?? resumeInitiatedAtIso,
         resolveResponseBody: resolve?.body ?? null,
+        // Only the process adapter runs the manual reconcile that yields a
+        // ResolveResult; native keeps these null so no resolve facts are
+        // fabricated for the native transition path.
+        hasResolveEvidence: resolve !== null,
         recoveryActionPresentAtResolve:
-          resolve?.recoveryActionPresentAtResolve ?? false,
+          resolve?.recoveryActionPresentAtResolve ?? null,
         settledActionFoundAtResolve:
-          resolve?.settledActionFoundAtResolve ?? false,
+          resolve?.settledActionFoundAtResolve ?? null,
         originalProviderAliveAtResolve:
-          resolve?.providerAliveAtResolve ?? false,
+          resolve?.providerAliveAtResolve ?? null,
         statusMetadata,
         companyId: company.id,
         testInfo,
         observedRunRows: [],
         apiErrorsDuringWindow: [],
+        instrumentationFailures: [],
       });
       // A verified stopped native runner can honor the explicitly selected
       // Wake agents option without another manual reconciliation step.
