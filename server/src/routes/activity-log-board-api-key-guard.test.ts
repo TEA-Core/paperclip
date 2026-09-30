@@ -12,6 +12,7 @@
  * scanned `routes/` subdirectories and did not exclude `*.spec.ts`). It now
  * walks those four subtrees recursively and treats `logActivityInTransaction`
  * as a first-class call shape. Test files (`__tests__/`, `*.test.ts`,
+<<<<<<< HEAD
  * `*.spec.ts`) are excluded.
  *
  * Landing mode (SUP-17958, Shape 1 "quarantine warn-first" ruling, 2026-09-30):
@@ -20,6 +21,11 @@
  * SUP-18015 (PR 2) remediates the reported sites and restores hard-fail in the
  * same change. The site names emitted by the warning are the quarantine record
  * PR 2 consumes; do not delete the scan or the message to make the test green.
+=======
+ * `*.spec.ts`) are excluded. The guard is expected to be RED on the unfixed
+ * tree until SUP-18015 (PR 2) closes the reported sites; it must name every
+ * site.
+>>>>>>> c116b2dc16 (test(SUP-18014): widen board API-key source guard [PPC BE])
  *
  * The guard parses the COMPLETE second argument of each call (a comment- and
  * string-aware, balanced-brace parse — not a fixed line window) and requires a
@@ -380,37 +386,30 @@ function scanSource(content: string, fileName: string, allowlist: AllowlistEntry
 }
 
 describe("board-api-key activity log guard", () => {
-  it("warns on every board-authenticable logActivity/persistActivity/logActivityInTransaction call missing boardApiKeyId (non-blocking quarantine)", () => {
-    const files = collectSourceFiles();
-    const allViolations: Violation[] = [];
+<<<<<<< HEAD
+   it("all board-authenticable logActivity/persistActivity/logActivityInTransaction calls in the widened scope pass boardApiKeyId", () => {
+     const files = collectSourceFiles();
+     const allViolations: Violation[] = [];
 
-    for (const file of files) {
-      const content = readFileSync(file, "utf-8");
-      const base = file.split("/").pop() as string;
-      allViolations.push(...scanSource(content, base));
-    }
+     for (const file of files) {
+       const content = readFileSync(file, "utf-8");
+       const base = file.split("/").pop() as string;
+       allViolations.push(...scanSource(content, base));
+     }
 
-    // WARN-FIRST QUARANTINE (SUP-17958 Shape 1 ruling, 2026-09-30): PR 1 lands
-    // the widened guard non-blocking so it does not fail the build. The scan
-    // still runs and names every reportable site — that warning is the record
-    // SUP-18015 (PR 2) remediates against and then flips this guard back to
-    // hard-fail. Do not "fix" redness by deleting the scan or the message.
-    if (allViolations.length > 0) {
-      const summary = allViolations
-        .map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`)
-        .join("\n");
-      console.warn(
-        `board-api-key guard [WARN-FIRST, non-blocking]: boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s). SUP-18015 (PR 2) remediates these and restores hard-fail.\n` +
-          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" (or the transaction/actor equivalent) to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.\n` +
-          `${summary}`,
-      );
-    }
+     if (allViolations.length > 0) {
+       const summary = allViolations
+         .map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`)
+         .join("\\n");
+       throw new Error(
+         `boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s):\\n${summary}\\n\\n` +
+           `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" (or the transaction/actor equivalent) to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.`,
+       );
+     }
 
-    // The guard ran and produced a well-formed result; redness is reported as a
-    // warning above, not a failure, in this PR.
-    expect(files.length).toBeGreaterThan(200);
-    expect(allViolations).toEqual(expect.any(Array));
-  });
+     expect(files.length).toBeGreaterThan(200);
+     expect(allViolations).toEqual(expect.any(Array));
+   });
 
   it("allowlist entries reference valid files, actions, and actorType markers", () => {
     const files = collectSourceFiles();
