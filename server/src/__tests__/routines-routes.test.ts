@@ -642,6 +642,7 @@ describe("routine routes", () => {
     }, {
       agentId: null,
       userId: "board-user",
+      boardApiKeyId: null,
     });
   });
 

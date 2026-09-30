@@ -3151,6 +3151,7 @@ describe("agent issue mutation checkout ownership", () => {
         agentId: ownerAgentId,
         failedRunId: ownerRunId,
         initiatedByUserId: "board-user",
+        boardApiKeyId: null,
       });
       expect(mockIssueService.update).toHaveBeenCalledExactlyOnceWith(
         issueId,
