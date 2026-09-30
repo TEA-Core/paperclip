@@ -5831,6 +5831,7 @@ export function agentRoutes(
             agentId: agent.id,
             failedRunId: failedRun.id,
             initiatedByUserId: req.actor.userId!,
+            boardApiKeyId: getActorInfo(req).boardApiKeyId,
           }),
         );
         let receipt;
