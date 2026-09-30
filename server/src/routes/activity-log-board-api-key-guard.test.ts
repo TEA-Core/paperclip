@@ -408,6 +408,7 @@ describe("board-api-key activity log guard", () => {
 
     // The guard ran and produced a well-formed result; redness is reported as a
     // warning above, not a failure, in this PR.
+    expect(files.length).toBeGreaterThan(200);
     expect(allViolations).toEqual(expect.any(Array));
   });
 
