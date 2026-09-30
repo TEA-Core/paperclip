@@ -91,35 +91,35 @@ jobs:
           git config user.email "lockfile-bot@users.noreply.github.com"
 
           PR_BODY=$(cat <<EOF
-## Thinking Path
+          ## Thinking Path
 
-> - Paperclip is the open source app people use to manage AI agents for work.
-> - The Refresh Lockfile workflow keeps dependency lockfiles aligned with patch changes.
-> - This generated pull request carries the lockfile update for the target branch.
+          > - Paperclip is the open source app people use to manage AI agents for work.
+          > - The Refresh Lockfile workflow keeps dependency lockfiles aligned with patch changes.
+          > - This generated pull request carries the lockfile update for the target branch.
 
-## Linked Issues or Issue Description
+          ## Linked Issues or Issue Description
 
-This is an automated lockfile refresh. It changes only pnpm-lock.yaml after dependencies changed on the target branch.
+          This is an automated lockfile refresh. It changes only pnpm-lock.yaml after dependencies changed on the target branch.
 
-## What Changed
+          ## What Changed
 
-- Refreshed pnpm-lock.yaml.
+          - Refreshed pnpm-lock.yaml.
 
-## Verification
+          ## Verification
 
-- The workflow checks that no unexpected files changed.
+          - The workflow checks that no unexpected files changed.
 
-## Risks
+          ## Risks
 
-Low risk. This pull request contains only generated lockfile metadata.
+          Low risk. This pull request contains only generated lockfile metadata.
 
-## Model Used
+          ## Model Used
 
-None — workflow-generated.
+          None — workflow-generated.
 
-Paperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)
-EOF
-)
+          Paperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)
+          EOF
+          )
 
           # The exact command a human runs to open the PR by hand. Emitted in the
           # ::error:: remediation below so the pushed branch is never left unpointed.
