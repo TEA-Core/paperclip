@@ -148,7 +148,7 @@ function click(element: Element | null | undefined) {
 function renderCompanyEnvironments(queryClient: QueryClient, initialPath = ENVIRONMENTS_PATH) {
   return (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[initialPath]}>
+      <MemoryRouter initialEntries={[initialPath]} useTransitions={false}>
         <TooltipProvider>
           <Routes>
             <Route path={ENVIRONMENTS_PATH} element={<CompanyEnvironments />} />
