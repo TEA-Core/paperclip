@@ -548,9 +548,79 @@ describe("parseIssueExecutionState", () => {
     });
     expect(state!.deliveryAuthor).toBeNull();
   });
+
+  it("preserves the delivery block across parse (SUP-18038)", () => {
+    const deliveryBlock = {
+      repo: { owner: "TEA-Core", repo: "Trading-Signal-Platform" },
+      branch: "SUP-17982-example-layer-2",
+      headSha: "7a033211c7abb84af43f688aa1d6219bfdb1deda",
+      recordedAt: "2026-09-30T07:29:30.409Z",
+      recordedByRunId: "bbac9cbd-0000-0000-0000-000000000000",
+    };
+    const state = parseIssueExecutionState({
+      status: "pending",
+      currentStageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      delivery: deliveryBlock,
+    });
+    expect(state).not.toBeNull();
+    expect(state!.delivery).toStrictEqual(deliveryBlock);
+  });
 });
 
 describe("issue execution policy transitions", () => {
+  it("preserves the delivery block when a transition rebuilds the state (SUP-18038)", () => {
+    const deliveryBlock = {
+      repo: { owner: "TEA-Core", repo: "Trading-Signal-Platform" },
+      branch: "SUP-17982-example-layer-2",
+      headSha: "7a033211c7abb84af43f688aa1d6219bfdb1deda",
+      recordedAt: "2026-09-30T07:29:30.409Z",
+      recordedByRunId: "bbac9cbd-0000-0000-0000-000000000000",
+    };
+    const policy = twoStagePolicy();
+    const reviewStageId = policy.stages[0].id;
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          deliveryAuthor: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          delivery: deliveryBlock,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "recovery resolve restored",
+    });
+    const nextExecutionState = result.patch.executionState as Record<string, unknown> | null;
+    expect(nextExecutionState).not.toBeNull();
+    expect(nextExecutionState!.delivery).toStrictEqual(deliveryBlock);
+    expect(nextExecutionState!.deliveryAuthor).toStrictEqual({
+      type: "agent",
+      agentId: coderAgentId,
+    });
+  });
+
   describe("happy path: executor → review → approval → done", () => {
     const policy = twoStagePolicy();
 

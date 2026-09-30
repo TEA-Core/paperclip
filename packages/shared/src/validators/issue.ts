@@ -557,6 +557,15 @@ export const issueExecutionStateSchema = z.object({
    * catchall — keeps typo-checking on every other key of the ladder intact.
    */
   approvalStatus: z.unknown().optional(),
+  /**
+   * Out-of-band delivery provenance block stamped by `deliver.sh` (Phase 7b)
+   * and preserved across whole-object round-trips (SUP-18038). Enumerated,
+   * not modeled: consumers read the raw jsonb column and cast, so the schema
+   * must preserve the key without owning its shape. An enumerated `z.unknown()`
+   * member — NOT a catchall — keeps typo-checking on every other key of the
+   * ladder intact.
+   */
+  delivery: z.unknown().optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({

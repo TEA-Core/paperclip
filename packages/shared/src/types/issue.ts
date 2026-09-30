@@ -778,6 +778,12 @@ export interface IssueExecutionState {
    * the key survives round-trips and does not own its shape.
    */
   approvalStatus?: unknown;
+  /**
+   * Out-of-band delivery provenance block stamped by `deliver.sh` (Phase 7b)
+   * and preserved across whole-object round-trips (SUP-18038). Same
+   * enumerated-unknown pattern as `approvalStatus`.
+   */
+  delivery?: unknown;
 }
 
 export interface IssueExecutionDecision {
