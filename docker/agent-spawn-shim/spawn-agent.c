@@ -52,6 +52,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -106,6 +107,29 @@
 #error "AGENT_OOM_SCORE_ADJ must be within the kernel range -1000..1000"
 #endif
 
+/* How many nice steps below its caller (the server) the agent tree runs.
+ * Agent runs share the server's container, and so its CPU cgroup: at equal
+ * priority the scheduler splits CPU per runnable thread, so an agent that
+ * launches a large test fleet or a deliberate CPU-load reproduction outweighs
+ * the control plane. On 2026-09-30 one agent's 128 busy-loop workers drove the
+ * host to load 184 at the server's own priority. At 10, a nice-0 thread
+ * competing with 16 busy agent threads on two cores got 0.68 of a core instead
+ * of 0.11 (measured on the production kernel, in a container, with the workers
+ * in their own sessions).
+ *
+ * COMPILE-TIME, for the same reason as AGENT_OOM_SCORE_ADJ: this binary reads no
+ * environment. 0 compiles the step out and leaves the inherited priority alone.
+ * A negative value would let the agent tree outrank the server, so it fails the
+ * build — and the step runs after the privilege drop anyway, where the kernel
+ * refuses an unprivileged process any attempt to raise its own priority. */
+#ifndef AGENT_NICE
+#define AGENT_NICE 10
+#endif
+
+#if AGENT_NICE < 0 || AGENT_NICE > 19
+#error "AGENT_NICE must be within 0..19 — agents must never outrank the server"
+#endif
+
 #define EXIT_USAGE 64
 #define EXIT_PRECONDITION 70
 #define EXIT_EXEC 127
@@ -128,6 +152,16 @@ static void fail_msg(const char *what) {
 static void oom_warn(const char *what) {
   fprintf(stderr, "paperclip-spawn-agent: %s: %s (continuing; the agent tree keeps "
                   "its inherited OOM priority)\n",
+          what, strerror(errno));
+}
+#endif
+
+#if AGENT_NICE != 0
+/* Report and CONTINUE, like oom_warn: a lower priority is best-effort and must
+ * never stop the exec, but a failure must not be silent. */
+static void nice_warn(const char *what) {
+  fprintf(stderr, "paperclip-spawn-agent: %s: %s (continuing; the agent tree keeps "
+                  "its inherited CPU priority)\n",
           what, strerror(errno));
 }
 #endif
@@ -290,6 +324,28 @@ int main(int argc, char **argv) {
       _exit(EXIT_PRECONDITION);
     }
   }
+
+  /* Lower the agent tree's CPU priority AGENT_NICE steps below the caller's,
+   * capped at the kernel ceiling of 19. Relative rather than absolute, so the
+   * agents stay below the server whatever priority the server itself runs at.
+   * It inherits across fork and exec, so this one call covers the provider CLI
+   * and everything it launches. Done here, after the drop, on purpose: an
+   * unprivileged process may only lower its own priority, so no build value and
+   * no bug in this block can ever put an agent above the server. */
+#if AGENT_NICE != 0
+  {
+    errno = 0;
+    const int current = getpriority(PRIO_PROCESS, 0);
+    if (current == -1 && errno != 0) {
+      nice_warn("cannot read the current CPU priority");
+    } else {
+      const int target = current + AGENT_NICE > 19 ? 19 : current + AGENT_NICE;
+      if (target > current && setpriority(PRIO_PROCESS, 0, target) != 0) {
+        nice_warn("cannot lower the CPU priority");
+      }
+    }
+  }
+#endif
 
   /* Unprivileged from here. execvp's PATH search is the caller's PATH, which is
    * safe precisely because we are already at AGENT_UID — it resolves with the

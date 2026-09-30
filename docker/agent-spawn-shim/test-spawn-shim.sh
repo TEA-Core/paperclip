@@ -115,6 +115,39 @@ echo "T_OOM_INHERIT_ON<<:"
 as_node sh -c 'echo 300 > /proc/self/oom_score_adj && exec '"$SHIM"' sh -c "cat /proc/self/oom_score_adj"' 2>&1
 echo ":>>"
 
+# --- The shim lowers the agent tree's CPU priority, so a runaway agent workload
+#     (a test fleet, a deliberate CPU-load reproduction) cannot starve the server
+#     it shares the container with. 2026-09-30: one agent's 128 busy-loop workers
+#     at the server's own priority drove the host to load 184. `nice` with no
+#     arguments prints the current niceness.
+#       BASE      without the shim the caller runs at 0, so 10 is never ambient
+#       NICE      through the shim it is the default 10
+#       TREE      a grandchild inherits it
+#       BUILDARG  -DAGENT_NICE=15 reads 15, so the value is not hardcoded
+#       OFF       -DAGENT_NICE=0 leaves the caller's priority alone
+#       RELATIVE  a caller already at 5 lands at 15: the step is relative to the
+#                 server, so agents always sit below whatever the server runs at
+#       CAP       a caller already at 15 lands at 19, the kernel ceiling
+#       NEG       a negative build arg is a compile error: agents must never be
+#                 able to outrank the server
+echo "T_NICE_BASE<<:"; as_node nice 2>&1; echo ":>>"
+echo "T_NICE<<:";      as_node "$SHIM" nice 2>&1; echo ":>>"
+echo "T_NICE_TREE<<:"; as_node "$SHIM" sh -c 'sh -c nice' 2>&1; echo ":>>"
+
+SHIMN15=/usr/local/sbin/paperclip-spawn-agent-n15
+gcc -O2 -Wall -Wextra -Werror -DAGENT_NICE=15 -o "$SHIMN15" /tmp/spawn-agent.c \
+  && chown root:root "$SHIMN15" && chmod 4755 "$SHIMN15"
+echo "T_NICE_BUILDARG<<:"; as_node "$SHIMN15" nice 2>&1; echo ":>>"
+
+SHIMN0=/usr/local/sbin/paperclip-spawn-agent-n0
+gcc -O2 -Wall -Wextra -Werror -DAGENT_NICE=0 -o "$SHIMN0" /tmp/spawn-agent.c \
+  && chown root:root "$SHIMN0" && chmod 4755 "$SHIMN0"
+echo "T_NICE_OFF<<:"; as_node "$SHIMN0" nice 2>&1; echo ":>>"
+echo "T_NICE_RELATIVE<<:"; as_node nice -n 5 "$SHIM" nice 2>&1; echo ":>>"
+echo "T_NICE_CAP<<:"; as_node nice -n 15 "$SHIM" nice 2>&1; echo ":>>"
+gcc -O2 -Wall -Wextra -Werror -DAGENT_NICE=-5 -o /tmp/shim-neg /tmp/spawn-agent.c >/dev/null 2>&1; RC=$?
+echo "T_NICE_NEG<<:"; echo "rc=$RC"; echo ":>>"
+
 # --- THE acceptance test for the whole chain: cross-uid /proc read is denied.
 #     Run a long-lived process as uid 1000 and read its environ as uid 1001.
 # The victim must genuinely BE uid 1000. Backgrounding the helper function is
@@ -217,6 +250,33 @@ esac
 [ "$(sec OOM_TREE)" = "500" ] \
   && ok "the mark is inherited by a grandchild — the whole agent tree is covered" \
   || no "grandchild did not inherit the mark: $(sec OOM_TREE)"
+
+# BASE is the fail-control: if the bare caller already ran at 10, every
+# assertion below would pass with the shim doing nothing.
+[ "$(sec NICE_BASE)" = "0" ] \
+  && ok "control: an unmarked uid-1000 child runs at nice 0" \
+  || no "control void — unmarked child is not at nice 0: $(sec NICE_BASE)"
+[ "$(sec NICE)" = "10" ] \
+  && ok "shim lowers the agent tree's CPU priority to nice 10" \
+  || no "shim did not lower CPU priority: $(sec NICE)"
+[ "$(sec NICE_TREE)" = "10" ] \
+  && ok "the lowered priority is inherited by a grandchild" \
+  || no "grandchild did not inherit the lowered priority: $(sec NICE_TREE)"
+[ "$(sec NICE_BUILDARG)" = "15" ] \
+  && ok "-DAGENT_NICE=15 is honoured (15, so the value is not hardcoded)" \
+  || no "AGENT_NICE build arg ignored: $(sec NICE_BUILDARG)"
+[ "$(sec NICE_OFF)" = "0" ] \
+  && ok "-DAGENT_NICE=0 leaves the caller's priority alone" \
+  || no "AGENT_NICE=0 changed the priority: $(sec NICE_OFF)"
+[ "$(sec NICE_RELATIVE)" = "15" ] \
+  && ok "the step is relative: a caller at nice 5 lands at 15" \
+  || no "priority step is not relative to the caller: $(sec NICE_RELATIVE)"
+[ "$(sec NICE_CAP)" = "19" ] \
+  && ok "the step caps at the kernel ceiling: a caller at nice 15 lands at 19" \
+  || no "priority step did not cap at 19: $(sec NICE_CAP)"
+[ "$(sec NICE_NEG)" != "rc=0" ] \
+  && ok "a negative AGENT_NICE fails to compile — agents can never outrank the server" \
+  || no "a negative AGENT_NICE compiled: $(sec NICE_NEG)"
 
 case "$(sec NOSETUID)" in
   *"not running with euid 0"*) ok "a stripped setuid bit fails loudly, no silent uid-1000 fallback" ;;

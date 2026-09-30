@@ -360,6 +360,10 @@ ARG AGENTS_GID=1002
 # tree inherits it. A build arg rather than an env var because the shim reads no
 # environment at all; see docker/agent-spawn-shim/spawn-agent.c. 0 disables it.
 ARG AGENT_OOM_SCORE_ADJ=500
+# nice steps the shim puts the agent tree below the server (0..19, capped at 19),
+# so an agent's CPU load cannot starve the control plane it shares the container
+# with. A build arg for the same reason as the one above. 0 disables it.
+ARG AGENT_NICE=10
 # buildx injects these automatically. They let the exec probes below run only on
 # a native build: under binfmt/qemu emulation (BUILDPLATFORM != TARGETPLATFORM)
 # the kernel never honours the setuid bit, so the probes can never pass there.
@@ -381,7 +385,7 @@ RUN if getent passwd "${AGENT_UID}" >/dev/null \
   && usermod -aG agents node \
   && gcc -O2 -Wall -Wextra -Werror \
        -DAGENT_UID=${AGENT_UID} -DAGENT_GID=${AGENT_GID} -DAGENTS_GID=${AGENTS_GID} \
-       -DAGENT_OOM_SCORE_ADJ=${AGENT_OOM_SCORE_ADJ} \
+       -DAGENT_OOM_SCORE_ADJ=${AGENT_OOM_SCORE_ADJ} -DAGENT_NICE=${AGENT_NICE} \
        -o /usr/local/sbin/paperclip-spawn-agent /tmp/spawn-agent.c \
   && rm -f /tmp/spawn-agent.c \
   && chown root:root /usr/local/sbin/paperclip-spawn-agent \

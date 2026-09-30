@@ -87,6 +87,31 @@ test("the shim refuses to run unprivileged instead of silently staying uid 1000"
   assert.match(shimSource, /geteuid\(\)\s*!=\s*0/, "must refuse to continue without euid 0");
 });
 
+test("the shim lowers the agent tree's CPU priority after the drop, never raising it", () => {
+  // Agent runs share the server's container, so without this an agent's CPU
+  // load competes with the control plane at equal weight (2026-09-30: load 184).
+  assert.match(shimSource, /#define\s+AGENT_NICE\s+10\b/, "AGENT_NICE must default to 10 at compile time");
+  assert.match(
+    shimSource,
+    /#if\s+AGENT_NICE\s*<\s*0[^\n]*\n#error/,
+    "a negative AGENT_NICE must be a compile error: agents must never outrank the server",
+  );
+  // After the drop, so the kernel itself refuses any attempt to RAISE priority
+  // (an unprivileged process can only lower its own), and before exec so the
+  // whole agent tree inherits it.
+  const drop = shimSource.indexOf("setuid(AGENT_UID)");
+  const renice = shimSource.indexOf("setpriority(PRIO_PROCESS");
+  const exec = shimSource.indexOf("execvp(");
+  assert.ok(renice > 0, "the shim must call setpriority");
+  assert.ok(drop > 0 && renice > drop, "the priority change must come after the privilege drop");
+  assert.ok(renice < exec, "the priority change must precede exec so the agent tree inherits it");
+});
+
+test("Dockerfile threads AGENT_NICE into the shim build", () => {
+  assert.match(dockerfileInstructions, /^ARG AGENT_NICE=\d+$/m, "AGENT_NICE must be a build arg with a default");
+  assert.match(dockerfileInstructions, /-DAGENT_NICE=\$\{AGENT_NICE\}/, "the shim build must receive AGENT_NICE");
+});
+
 test("Dockerfile creates both principals and the shared group", () => {
   assert.match(dockerfile, /groupadd -g \$\{AGENTS_GID\} agents/, "the agents group must exist");
   assert.match(dockerfile, /useradd -u \$\{AGENT_UID\}[^\n]*-G agents[^\n]*node-agent/, "node-agent must be in agents");
