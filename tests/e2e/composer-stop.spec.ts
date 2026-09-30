@@ -63,9 +63,7 @@ async function safeSnapshot(
     };
   }
 }
-// Records a per-tick instrumentation failure (run-row capture or a per-tick
-// evidence read) without turning it into a running-timeout signal. Capped so a
-// pathological loop cannot grow the attachment unboundedly.
+
 function recordInstrumentationFailure(
   resume: ResumeContext | undefined,
   stage: string,
@@ -100,6 +98,24 @@ function evidenceField(value: unknown, key: string) {
     return undefined;
   }
   return (value as Record<string, unknown>)[key];
+}
+function isRecoveryActionShape(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const action = value as Record<string, unknown>;
+  const evidence = action.evidence;
+  return (
+    typeof action.id === "string" &&
+    (action.status === "active" ||
+      action.status === "escalated" ||
+      action.status === "resolved" ||
+      action.status === "cancelled") &&
+    typeof action.cause === "string" &&
+    typeof evidence === "object" &&
+    evidence !== null &&
+    !Array.isArray(evidence)
+  );
 }
 async function resumeEvidence(
   request: APIRequestContext,
@@ -218,6 +234,7 @@ type ResumeContext = {
 function classifyRunningTimeout(input: {
   adapter: "process" | "paperclip_runner";
   apiErrorsDuringWindow: RunningTimeoutApiError[];
+  instrumentationFailures: InstrumentationFailure[];
   observedRunRowCount: number;
   successfulPollCount: number;
   newRunIds: string[];
@@ -244,6 +261,10 @@ function classifyRunningTimeout(input: {
   } = input;
   if (finalSnapshotFailure) {
     return `OBSERVATION_FAILURE: ${finalSnapshotFailure}`;
+  }
+  if (input.instrumentationFailures.length > 0) {
+    const instrumentationFailure = input.instrumentationFailures[0];
+    return `OBSERVATION_FAILURE: running-window instrumentation failed at ${instrumentationFailure.stage}: ${instrumentationFailure.message}`;
   }
   if (apiErrorsDuringWindow.length > 0) {
     const pollError = apiErrorsDuringWindow[0];
@@ -416,8 +437,9 @@ async function running(
         : null;
     const recoveryOk =
       recoveryBody !== null &&
-      (recoveryBody.active === null || typeof recoveryBody.active === "object") &&
-      Array.isArray(recoveryBody.actions);
+      (recoveryBody.active === null || isRecoveryActionShape(recoveryBody.active)) &&
+      Array.isArray(recoveryBody.actions) &&
+      recoveryBody.actions.every(isRecoveryActionShape);
     const treeBody =
       finalSnapshots[3].ok &&
       finalSnapshots[3].body !== null &&
@@ -475,6 +497,7 @@ async function running(
       anyNewRunRunning,
       finalIssueStatus: finalIssueState.status,
       finalContinuationDelivery,
+      instrumentationFailures: resume.instrumentationFailures,
       hasResolveEvidence: resume.hasResolveEvidence,
       recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
       settledActionFoundAtResolve: resume.settledActionFoundAtResolve,
@@ -1097,15 +1120,22 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       await expect(
         page.getByText("Subtree is paused.", { exact: true }),
       ).toBeVisible();
-      // Cross the isolated server's ten-second scheduler interval repeatedly.
+      // Cross the isolated server's ten-second scheduler interval repeatedly,
+      // retaining evidence without asserting an instantaneous empty snapshot.
+      // A successor may already be scheduled by the time the resume request
+      // returns; the later process reconcile must not duplicate that wake.
       for (let i = 0; i < 3; i++) {
         await new Promise((resolve) => setTimeout(resolve, 10_000));
-        expect(
-          await json(await request.get(`/api/issues/${parent.id}/live-runs`)),
-        ).toEqual([]);
-        expect(
-          await json(await request.get(`/api/issues/${child.id}/live-runs`)),
-        ).toEqual([]);
+        const [parentLiveRuns, childLiveRuns] = await Promise.all([
+          safeSnapshot(request, `/api/issues/${parent.id}/live-runs`),
+          safeSnapshot(request, `/api/issues/${child.id}/live-runs`),
+        ]);
+        resumeEvidenceLog.push({
+          label: `after-resume-scheduler-window-${i + 1}`,
+          capturedAt: new Date().toISOString(),
+          parentLiveRuns,
+          childLiveRuns,
+        } as ResumeEvidence);
       }
       await menu(page, "Resume subtree");
       await page.getByRole("dialog").getByRole("checkbox").check();
