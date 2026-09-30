@@ -1330,3 +1330,79 @@ describe("issueExecutionStateSchema principal strictness", () => {
     expect(parsed.success ? [] : unrecognizedKeys(parsed.error)).toContain("agentIdd");
   });
 });
+
+describe("issueExecutionStateSchema delivery preservation (SUP-18038)", () => {
+  const deliveryBlock = {
+    repo: { owner: "TEA-Core", repo: "Trading-Signal-Platform" },
+    branch: "SUP-17982-example-layer-2",
+    headSha: "7a033211c7abb84af43f688aa1d6219bfdb1deda",
+    recordedAt: "2026-09-30T07:29:30.409Z",
+    recordedByRunId: "bbac9cbd-0000-0000-0000-000000000000",
+  };
+
+  it("preserves the delivery block across a full parse round-trip", () => {
+    const input = {
+      status: "pending" as const,
+      currentStageId: "044300c9-e352-4b38-9a3c-1579a7bb9a96",
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      deliveryAuthor: { type: "agent" as const, agentId: "22222222-2222-4222-8222-222222222222", userId: null },
+      delivery: deliveryBlock,
+    };
+
+    const parsed = issueExecutionStateSchema.safeParse(input);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.delivery).toStrictEqual(deliveryBlock);
+      expect(parsed.data.deliveryAuthor).toStrictEqual(input.deliveryAuthor);
+    }
+  });
+
+  it("preserves delivery byte-identical through a second parse (persist simulation)", () => {
+    const input = {
+      status: "pending" as const,
+      currentStageId: "044300c9-e352-4b38-9a3c-1579a7bb9a96",
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      delivery: deliveryBlock,
+    };
+
+    const first = issueExecutionStateSchema.parse(input);
+    const second = issueExecutionStateSchema.parse(JSON.parse(JSON.stringify(first)));
+    expect(second.delivery).toStrictEqual(deliveryBlock);
+    expect(second.deliveryAuthor).toBeNull();
+  });
+
+  it("still strips unrecognized top-level keys (enumerated not catchall)", () => {
+    const input = {
+      status: "pending" as const,
+      currentStageId: "044300c9-e352-4b38-9a3c-1579a7bb9a96",
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      delivery: deliveryBlock,
+      deliveryyy: "typo-key",
+    };
+
+    const parsed = issueExecutionStateSchema.safeParse(input);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.delivery).toStrictEqual(deliveryBlock);
+      expect("deliveryyy" in parsed.data).toBe(false);
+    }
+  });
+});

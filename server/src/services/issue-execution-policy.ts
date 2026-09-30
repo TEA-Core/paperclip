@@ -1067,6 +1067,7 @@ function buildCompletedState(
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
     approvalStatus: previous?.approvalStatus,
+    delivery: previous?.delivery,
   };
 }
 
@@ -1091,6 +1092,7 @@ function buildStateWithCompletedStages(input: {
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
+    delivery: input.previous?.delivery,
   };
 }
 
@@ -1115,6 +1117,7 @@ function buildSkippedStageCompletedState(input: {
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
+    delivery: input.previous?.delivery,
   };
 }
 
@@ -1145,6 +1148,7 @@ function buildPendingState(input: {
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
     pendingSince: new Date().toISOString(),
     approvalStatus: input.previous?.approvalStatus,
+    delivery: input.previous?.delivery,
   };
 }
 
