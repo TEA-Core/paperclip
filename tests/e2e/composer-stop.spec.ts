@@ -78,6 +78,19 @@ function recordInstrumentationFailure(
     message: error instanceof Error ? error.message : String(error),
   });
 }
+function snapshotFailure(
+  snapshot: SafeSnapshot,
+  label: string,
+  valid: boolean,
+) {
+  if (!snapshot.ok) {
+    return `${label} request failed: status=${String(snapshot.status)} error=${String(snapshot.error)} body=${JSON.stringify(snapshot.body)}`;
+  }
+  if (!valid) {
+    return `${label} response was malformed: status=${String(snapshot.status)} body=${JSON.stringify(snapshot.body)}`;
+  }
+  return null;
+}
 type ResumeEvidence = Record<string, unknown> & {
   label: string;
   capturedAt: string;
@@ -185,6 +198,7 @@ type ResumeContext = {
   testInfo: TestInfo;
   observedRunRows: ObservedRunRow[];
   apiErrorsDuringWindow: RunningTimeoutApiError[];
+  successfulPollCount: number;
   instrumentationFailures: InstrumentationFailure[];
 };
 // Maps the captured same-attempt facts to one of the hypotheses the
@@ -205,6 +219,7 @@ function classifyRunningTimeout(input: {
   adapter: "process" | "paperclip_runner";
   apiErrorsDuringWindow: RunningTimeoutApiError[];
   observedRunRowCount: number;
+  successfulPollCount: number;
   newRunIds: string[];
   anyNewRunRunning: boolean;
   finalIssueStatus: string | null;
@@ -212,6 +227,7 @@ function classifyRunningTimeout(input: {
   hasResolveEvidence: boolean;
   recoveryActionPresentAtResolve: boolean | null;
   settledActionFoundAtResolve: boolean | null;
+  finalSnapshotFailure: string | null;
 }): string {
   const {
     adapter,
@@ -224,12 +240,17 @@ function classifyRunningTimeout(input: {
     hasResolveEvidence,
     recoveryActionPresentAtResolve,
     settledActionFoundAtResolve,
+    finalSnapshotFailure,
   } = input;
-  if (finalIssueStatus === null) {
-    return "OBSERVATION_FAILURE: the same-attempt final issue snapshot failed, so the final issue state is unobserved. This is a degraded read, not evidence the resume was delayed/absent; inspect finalSnapshots[].status/error for the per-request cause and re-run.";
+  if (finalSnapshotFailure) {
+    return `OBSERVATION_FAILURE: ${finalSnapshotFailure}`;
   }
-  if (apiErrorsDuringWindow.length > 0 && observedRunRowCount === 0) {
-    return "TEST_POLLED_WRONG_OR_STALE_STATE: every live-runs read during the 30s window failed (HTTP/parse error), so the test observed a degraded endpoint rather than a delayed resume transition.";
+  if (apiErrorsDuringWindow.length > 0) {
+    const pollError = apiErrorsDuringWindow[0];
+    return `OBSERVATION_FAILURE: a running-window live-runs observation failed before timeout: ${pollError.url} ${pollError.message}`;
+  }
+  if (input.successfulPollCount === 0) {
+    return "OBSERVATION_FAILURE: the running-window live-runs observation captured no successful reads, so the timeout cannot distinguish an absent transition from an unavailable observation.";
   }
   if (newRunIds.length === 0) {
     // Only the process adapter's manual reconcile can prove no wake was
@@ -277,9 +298,15 @@ async function running(
         async () => {
           let runs: LiveRun[] = [];
           try {
-            runs = await json(
+            const body = await json(
               await request.get(`/api/issues/${issueId}/live-runs`),
             );
+            if (!Array.isArray(body)) {
+              throw new Error(
+                `live-runs response was not an array: ${JSON.stringify(body).slice(0, 2000)}`,
+              );
+            }
+            runs = body as LiveRun[];
           } catch (error) {
             if (resume) {
               resume.apiErrorsDuringWindow.push({
@@ -291,6 +318,7 @@ async function running(
             return false;
           }
           if (resume) {
+            resume.successfulPollCount += 1;
             try {
               for (const candidate of runs) {
                 resume.observedRunRows.push({
@@ -378,6 +406,37 @@ async function running(
     const issueBody = issueOk
       ? (issueSnap.body as Record<string, unknown>)
       : null;
+    const liveRunsOk =
+      finalSnapshots[1].ok && Array.isArray(finalSnapshots[1].body);
+    const recoveryBody =
+      recoverySnap.ok &&
+      recoverySnap.body !== null &&
+      typeof recoverySnap.body === "object"
+        ? (recoverySnap.body as Record<string, unknown>)
+        : null;
+    const recoveryOk =
+      recoveryBody !== null &&
+      (recoveryBody.active === null || typeof recoveryBody.active === "object") &&
+      Array.isArray(recoveryBody.actions);
+    const treeBody =
+      finalSnapshots[3].ok &&
+      finalSnapshots[3].body !== null &&
+      typeof finalSnapshots[3].body === "object"
+        ? (finalSnapshots[3].body as Record<string, unknown>)
+        : null;
+    const treeOk = treeBody !== null && "activePauseHold" in treeBody;
+    const finalSnapshotFailure = [
+      snapshotFailure(
+        issueSnap,
+        "issue",
+        issueOk && typeof issueBody?.status === "string",
+      ),
+      snapshotFailure(finalSnapshots[1], "live-runs", liveRunsOk),
+      snapshotFailure(recoverySnap, "recovery-actions", recoveryOk),
+      snapshotFailure(finalSnapshots[3], "tree-control/state", treeOk),
+    ]
+      .filter((failure): failure is string => failure !== null)
+      .join("; ");
     const finalIssueState = {
       status:
         typeof issueBody?.status === "string" ? (issueBody.status as string) : null,
@@ -387,14 +446,9 @@ async function running(
           : null,
     };
     let finalContinuationDelivery: string | null | undefined;
-    if (
-      recoverySnap.ok &&
-      recoverySnap.body !== null &&
-      typeof recoverySnap.body === "object"
-    ) {
-      const recovery = recoverySnap.body as Record<string, unknown>;
-      const active = recovery.active as Record<string, unknown> | null;
-      const actions = (recovery.actions as Record<string, unknown>[]) ?? [];
+    if (recoveryOk && recoveryBody) {
+      const active = recoveryBody.active as Record<string, unknown> | null;
+      const actions = recoveryBody.actions as Record<string, unknown>[];
       const lastEvidence =
         active?.evidence ?? actions[actions.length - 1]?.evidence;
       const cdRaw = evidenceField(lastEvidence, "continuationDelivery");
@@ -416,6 +470,7 @@ async function running(
       adapter,
       apiErrorsDuringWindow: resume.apiErrorsDuringWindow,
       observedRunRowCount: resume.observedRunRows.length,
+      successfulPollCount: resume.successfulPollCount,
       newRunIds,
       anyNewRunRunning,
       finalIssueStatus: finalIssueState.status,
@@ -423,6 +478,7 @@ async function running(
       hasResolveEvidence: resume.hasResolveEvidence,
       recoveryActionPresentAtResolve: resume.recoveryActionPresentAtResolve,
       settledActionFoundAtResolve: resume.settledActionFoundAtResolve,
+      finalSnapshotFailure: finalSnapshotFailure || null,
     });
     await emitEvidence(
       resume.testInfo,
@@ -1067,30 +1123,59 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       let parentResolve: ResolveResult | null = null;
       let childResolve: ResolveResult | null = null;
       if (adapter === "process") {
-        // Legacy processes lack runner stop/action proof, so releasing the hold
-        // preserves their recovery gate until the fixture reconciles them.
-        expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
-        expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
-        parentResolve = await reconcileDemoExecution(
+        const parentResumeSnapshot = await safeSnapshot(
           request,
-          parent.id,
-          parentRun.id,
-          testInfo,
-          { stopClickedAt: clickedAt, stopObservedAt: stoppedAt },
+          `/api/issues/${parent.id}/live-runs`,
+        );
+        const childResumeSnapshot = await safeSnapshot(
+          request,
+          `/api/issues/${child.id}/live-runs`,
         );
         resumeEvidenceLog.push(
-          await resumeEvidence(request, parent.id, "after-parent-resolve"),
+          {
+            label: "after-resume-before-process-reconcile",
+            capturedAt: new Date().toISOString(),
+            parentLiveRuns: parentResumeSnapshot,
+            childLiveRuns: childResumeSnapshot,
+          } as ResumeEvidence,
         );
-        childResolve = await reconcileDemoExecution(
-          request,
-          child.id,
-          childRun.id,
-          testInfo,
-          { stopClickedAt: clickedAt, stopObservedAt: stoppedAt },
-        );
-        resumeEvidenceLog.push(
-          await resumeEvidence(request, child.id, "after-child-resolve"),
-        );
+        const parentLiveRuns = parentResumeSnapshot.ok &&
+          Array.isArray(parentResumeSnapshot.body)
+          ? parentResumeSnapshot.body
+          : null;
+        const childLiveRuns = childResumeSnapshot.ok &&
+          Array.isArray(childResumeSnapshot.body)
+          ? childResumeSnapshot.body
+          : null;
+        if (parentLiveRuns === null || childLiveRuns === null) {
+          throw new Error(
+            `composer-stop resume pre-reconcile observation failed: parent=${JSON.stringify(parentResumeSnapshot)} child=${JSON.stringify(childResumeSnapshot)}`,
+          );
+        }
+        if (parentLiveRuns.length === 0) {
+          parentResolve = await reconcileDemoExecution(
+            request,
+            parent.id,
+            parentRun.id,
+            testInfo,
+            { stopClickedAt: clickedAt, stopObservedAt: stoppedAt },
+          );
+          resumeEvidenceLog.push(
+            await resumeEvidence(request, parent.id, "after-parent-resolve"),
+          );
+        }
+        if (childLiveRuns.length === 0) {
+          childResolve = await reconcileDemoExecution(
+            request,
+            child.id,
+            childRun.id,
+            testInfo,
+            { stopClickedAt: clickedAt, stopObservedAt: stoppedAt },
+          );
+          resumeEvidenceLog.push(
+            await resumeEvidence(request, child.id, "after-child-resolve"),
+          );
+        }
       }
       const resumeContextFor = (
         originalRunId: string,
@@ -1115,6 +1200,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         testInfo,
         observedRunRows: [],
         apiErrorsDuringWindow: [],
+        successfulPollCount: 0,
         instrumentationFailures: [],
       });
       // A verified stopped native runner can honor the explicitly selected
