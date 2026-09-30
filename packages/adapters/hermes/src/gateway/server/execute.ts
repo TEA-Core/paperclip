@@ -25,7 +25,7 @@ import {
   isRemotePlainHttp,
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
-import { apiUrl, normalizeBaseUrl, redactUrlCredentials } from "./base-url.js";
+import { apiUrl, normalizeBaseUrl } from "./base-url.js";
 
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
@@ -774,6 +774,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorMessage: `Invalid Hermes gateway apiBaseUrl: ${apiBaseUrlValue}`,
     };
   }
+  // URL userinfo (user:pass@host) is rejected, not sent: Node's fetch refuses to
+  // construct a Request from a credential-bearing URL, so a run could never
+  // authenticate this way. Deliberately reject at this earliest shared boundary
+  // (before any fetch) with a stable, secret-free error and route auth through
+  // the apiKey header instead. This must not echo the configured URL.
+  if (baseUrl.username !== "" || baseUrl.password !== "") {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "hermes_gateway_api_base_url_userinfo_rejected",
+      errorMessage:
+        "Hermes gateway apiBaseUrl must not embed URL credentials (user:pass@host). " +
+        "The gateway request path does not send URL userinfo; authenticate with apiKey instead.",
+    };
+  }
   if (isRemotePlainHttp(baseUrl) && !allowsInsecureRemoteHttp(ctx.config)) {
     return {
       exitCode: 1,
@@ -830,15 +846,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runHeaders["X-Hermes-Session-Key"],
   ]);
   const body = buildRunBody(ctx, sessionKey);
+  // apiBaseUrl is credential-free here: URL userinfo was rejected above, so the
+  // display URL and the URL that reaches fetch are the same.
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
-  // apiBaseUrl may carry userinfo (user:pass@host). Keep the credential on the
-  // URL that reaches fetch; only the display sinks see the masked copy.
-  const redactedCreateRunUrl = apiUrl(redactUrlCredentials(baseUrl), "/v1/runs");
 
   await ctx.onMeta?.({
     adapterType: ADAPTER_TYPE,
     command: "POST /v1/runs",
-    commandArgs: [redactedCreateRunUrl],
+    commandArgs: [createRunUrl],
     context: {
       runId: ctx.runId,
       timeoutSec,
@@ -847,7 +862,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       hasSessionKey: Boolean(sessionKey),
     },
   });
-  await ctx.onLog("stdout", `[hermes-gateway] creating run at ${redactedCreateRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
+  await ctx.onLog("stdout", `[hermes-gateway] creating run at ${createRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
 
   let runId: string | null = null;

@@ -581,27 +581,17 @@ describe("execute", () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/stop"))).toBe(true);
   });
 
-  it("keeps apiBaseUrl userinfo out of logs and metadata while still authenticating the request", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/v1/runs")) {
-        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
-      }
-      if (url.endsWith("/events")) {
-        return new Response(
-          sseStream(
-            [
-              "event: run.completed",
-              "data: {\"status\":\"completed\",\"output\":\"done\"}",
-              "",
-            ].join("\n"),
-          ),
-          { status: 200, headers: { "content-type": "text/event-stream" } },
-        );
-      }
-      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+  it("rejects URL userinfo in apiBaseUrl before the fetch boundary instead of sending it", async () => {
+    // The prior implementation passed the credential-bearing URL straight to
+    // fetch; Node's real fetch refuses it with "Request cannot be constructed
+    // from a URL that includes credentials", so that path could never
+    // authenticate. This sentinel proves the deliberate pre-fetch rejection:
+    // no request is attempted, and if the guard regressed the spy would throw
+    // deterministically instead of a stub masking an impossible runtime path.
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("D1 sentinel: URL userinfo must be rejected before fetch is reached");
     });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", fetchSpy);
 
     const ctx = makeCtx({
       apiBaseUrl: "http://user:sekrit@127.0.0.1:8642/",
@@ -610,23 +600,26 @@ describe("execute", () => {
     });
     const result = await execute(ctx);
 
-    expect(result.exitCode).toBe(0);
+    // Deliberate rejection: the credential-bearing URL never reaches fetch.
+    expect(fetchSpy).not.toHaveBeenCalled();
 
-    // The credential still reaches the network so the request authenticates.
-    const fetchedUrls = fetchMock.mock.calls.map(([input]) => String(input));
-    expect(fetchedUrls).toContain("http://user:sekrit@127.0.0.1:8642/v1/runs");
+    // Stable, clear adapter error that does not echo the configured URL.
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_api_base_url_userinfo_rejected");
+    expect(result.errorMessage).toContain("must not embed URL credentials");
+    expect(result.errorMessage).toContain("authenticate with apiKey");
+    expect(result.errorMessage).not.toContain("sekrit");
+    expect(result.errorMessage).not.toContain("user:sekrit");
 
-    // ...but the persisted stdout line and run-metadata commandArgs never leak it.
+    // No sink is reached after rejection, so nothing can leak the credential.
     const logText = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map(([, line]) => String(line)).join("\n");
-    expect(logText).toContain("creating run at http://REDACTED@127.0.0.1:8642/v1/runs");
     expect(logText).not.toContain("sekrit");
-
     const commandArgs = (ctx.onMeta as ReturnType<typeof vi.fn>).mock.calls
       .map(([meta]) => ((meta as { commandArgs?: unknown[] } | undefined)?.commandArgs ?? []))
       .flat()
       .map(String);
-    expect(commandArgs).toContain("http://REDACTED@127.0.0.1:8642/v1/runs");
     expect(commandArgs.join("\n")).not.toContain("sekrit");
+    expect(JSON.stringify(result)).not.toContain("sekrit");
   });
 });
 
