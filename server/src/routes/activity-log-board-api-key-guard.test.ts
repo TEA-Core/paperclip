@@ -1,9 +1,20 @@
 /**
- * Regression guard: every board-authenticable `logActivity`/`persistActivity`
- * call site in `server/src/routes/` must pass `boardApiKeyId` in the same call.
+ * Regression guard: every board-authenticable `logActivity` /
+ * `persistActivity` / `logActivityInTransaction` call site under
+ * `server/src/{routes,services,modules,middleware}` must pass `boardApiKeyId`
+ * in the same call.
  *
  * This is a source check — omitting the property produces no type error and no
  * runtime error, just a NULL column, so only a source scan can catch it.
+ *
+ * Scope (PR 1 of SUP-17958): the guard was historically routes/-only
+ * (`readdirSync` on the top level of `routes/`, a scope limit that also never
+ * scanned `routes/` subdirectories and did not exclude `*.spec.ts`). It now
+ * walks those four subtrees recursively and treats `logActivityInTransaction`
+ * as a first-class call shape. Test files (`__tests__/`, `*.test.ts`,
+ * `*.spec.ts`) are excluded. The guard is expected to be RED on the unfixed
+ * tree until SUP-18015 (PR 2) closes the reported sites; it must name every
+ * site.
  *
  * The guard parses the COMPLETE second argument of each call (a comment- and
  * string-aware, balanced-brace parse — not a fixed line window) and requires a
@@ -17,7 +28,7 @@
  *    spread that may resolve to a user, or a missing actorType) is treated as
  *    potentially user and must carry a top-level `boardApiKeyId`.
  *
- * Exception mechanism is keyed by route file + action string, and — where a
+ * Exception mechanism is keyed by file + action string, and — where a
  * file/action pair is shared by multiple calls — by the exempted call's exact
  * `actorType` expression, so an entry covers a single occurrence, not a
  * file/action class. Markers are stable across line shifts and never pin a
@@ -29,7 +40,59 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-const ROUTES_DIR = join(__dirname, "..", "routes");
+const SRC_ROOT = join(__dirname, "..");
+
+/**
+ * The guard's scope: these four subtrees of `server/src`, walked recursively.
+ * `routes/` is included so the historical routes/ fence is a strict subset of
+ * the widened walk (no previously-covered site is dropped by the widening).
+ */
+const SCAN_DIRS = ["routes", "services", "modules", "middleware"];
+
+/**
+ * A directory is recursed into unless it is a test-fixture directory
+ * (`__tests__`). A file is scanned only when it is a `.ts` source file that is
+ * not a test file (`*.test.ts`, `*.spec.ts`). Kept as a pure predicate so the
+ * recursive-scan and test-file-exclusion behavior can be asserted directly.
+ */
+function isScannable(name: string, isDirectory: boolean): boolean {
+  if (isDirectory) return name !== "__tests__";
+  if (!name.endsWith(".ts")) return false;
+  if (name.endsWith(".test.ts")) return false;
+  if (name.endsWith(".spec.ts")) return false;
+  return true;
+}
+
+/** Recursively collect the scannable source files across the guard's scope. */
+function collectSourceFiles(root: string = SRC_ROOT): string[] {
+  const out: string[] = [];
+  for (const dir of SCAN_DIRS) {
+    walkScannable(join(root, dir), out);
+  }
+  return out;
+}
+
+function walkScannable(dir: string, out: string[]): void {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return; // a scope directory that does not exist yet contributes no files
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (isScannable(entry.name, true)) walkScannable(join(dir, entry.name), out);
+    } else if (entry.isFile() && isScannable(entry.name, false)) {
+      out.push(join(dir, entry.name));
+    }
+  }
+}
+
+/** Resolve a guard-scoped file by basename (the first match in walk order). */
+function pathByBasename(files: string[], base: string): string {
+  const hit = files.find((f) => f.endsWith(`/${base}`));
+  return hit ?? join(files[0], base);
+}
 
 /**
  * Explicit route/action exceptions for board-authenticable sites that are
@@ -237,17 +300,19 @@ interface Violation {
   detail: string;
 }
 
-const CALL_RE = /(?<![\w$.])(logActivity|persistActivity)\s*\(/g;
+const CALL_RE = /(?<![\w$.])(logActivity|persistActivity|logActivityInTransaction)\s*\(/g;
 
 /**
  * Scan one source file and return board-api-key violations.
  *
  * Scope limit (documented, matching the transaction guard): a call whose second
  * argument is not an inline object literal (i.e. a helper-built object such as
- * `logActivity(db, buildDependencyWakeWithheldActivity({...}))`) is not
- * statically verifiable and is skipped. Every current site of that shape in
- * `server/src/routes/` is a `system`-actor event (the helpers return
- * `actorType: "system"`), so this is not masking a board-authenticable gap.
+ * `logActivity(db, buildDependencyWakeWithheldActivity({...}))`, or a call
+ * routed through a variable such as `const auditActivity = isTransactionHandle(db)
+ * ? logActivityInTransaction : logActivity`) is not statically verifiable and
+ * is skipped. Every current site of that shape in the scanned scope is a
+ * `system`-actor event (the helpers return `actorType: "system"`), so this is
+ * not masking a board-authenticable gap.
  */
 function scanSource(content: string, fileName: string, allowlist: AllowlistEntry[] = ALLOWLIST): Violation[] {
   const code = toCodeOnly(content);
@@ -310,20 +375,23 @@ function scanSource(content: string, fileName: string, allowlist: AllowlistEntry
 }
 
 describe("board-api-key activity log guard", () => {
-  it("all board-authenticable logActivity/persistActivity calls in routes/ pass boardApiKeyId", () => {
-    const files = readdirSync(ROUTES_DIR).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+  it("all board-authenticable logActivity/persistActivity/logActivityInTransaction calls in the widened scope pass boardApiKeyId", () => {
+    const files = collectSourceFiles();
     const allViolations: Violation[] = [];
 
     for (const file of files) {
-      const content = readFileSync(join(ROUTES_DIR, file), "utf-8");
-      allViolations.push(...scanSource(content, file));
+      const content = readFileSync(file, "utf-8");
+      const base = file.split("/").pop() as string;
+      allViolations.push(...scanSource(content, base));
     }
 
     if (allViolations.length > 0) {
-      const summary = allViolations.map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`).join("\n");
+      const summary = allViolations
+        .map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`)
+        .join("\n");
       throw new Error(
         `boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s):\n${summary}\n\n` +
-          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.`,
+          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" (or the transaction/actor equivalent) to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.`,
       );
     }
 
@@ -331,8 +399,9 @@ describe("board-api-key activity log guard", () => {
   });
 
   it("allowlist entries reference valid files, actions, and actorType markers", () => {
+    const files = collectSourceFiles();
     for (const entry of ALLOWLIST) {
-      const content = readFileSync(join(ROUTES_DIR, entry.file), "utf-8");
+      const content = readFileSync(pathByBasename(files, entry.file), "utf-8");
       const actionPattern = new RegExp(`action\\s*:\\s*["']${entry.action}["']`);
       expect(
         actionPattern.test(content),
@@ -467,5 +536,94 @@ describe("board-api-key activity log guard", () => {
       "}",
     ].join("\n");
     expect(scanSource(snippet, "synthetic.ts")).toHaveLength(0);
+  });
+
+  // --- Widened-scope behavior: transaction calls, recursion, test-file exclusion. ---
+
+  it("flags a board-authenticable logActivityInTransaction call that omits the top-level boardApiKeyId", () => {
+    const snippet = [
+      'import { logActivityInTransaction } from "../services/activity-log";',
+      "export function handler(tx: any, actor: any) {",
+      "  return logActivityInTransaction(tx, {",
+      "    companyId: actor.companyId,",
+      "    actorType: actor.actorType,",
+      "    actorId: actor.actorId,",
+      '    action: "synthetic.tx_missing",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "synthetic.ts");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].action).toBe("synthetic.tx_missing");
+  });
+
+  it("passes a logActivityInTransaction call that carries a top-level boardApiKeyId", () => {
+    const snippet = [
+      'import { logActivityInTransaction } from "../services/activity-log";',
+      "export function handler(tx: any, actor: any) {",
+      "  return logActivityInTransaction(tx, {",
+      "    companyId: actor.companyId,",
+      "    actorType: actor.actorType,",
+      "    boardApiKeyId: actor.boardApiKeyId,",
+      "    actorId: actor.actorId,",
+      '    action: "synthetic.tx_ok",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    expect(scanSource(snippet, "synthetic.ts")).toHaveLength(0);
+  });
+
+  it("exempts a literal system-actor logActivityInTransaction call without boardApiKeyId", () => {
+    const snippet = [
+      'import { logActivityInTransaction } from "../services/activity-log";',
+      "export function handler(tx: any) {",
+      "  return logActivityInTransaction(tx, {",
+      '    companyId: "c1",',
+      '    actorType: "system",',
+      '    actorId: "background",',
+      '    action: "synthetic.tx_system_ok",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    expect(scanSource(snippet, "synthetic.ts")).toHaveLength(0);
+  });
+
+  it("recurses into subdirectories rather than only scanning each scope's top level", () => {
+    // The historical routes/ guard used a non-recursive readdirSync, so any
+    // file nested below the top level of a scope would be silently skipped.
+    // Proving the walk reaches below the top level closes that hole.
+    const files = collectSourceFiles();
+    const nestedModuleFiles = files.filter((f) => {
+      const rel = f.slice(SRC_ROOT.length).replace(/^\/+/, "").split("/");
+      // rel e.g. ["modules", "active-run-watchdog", "adapters", "postgres.ts"]
+      return rel[0] === "modules" && rel.length >= 4;
+    });
+    expect(
+      nestedModuleFiles.length,
+      "expected at least one modules/ source file nested below the top level",
+    ).toBeGreaterThan(0);
+  });
+
+  it("excludes *.spec.ts, *.test.ts, *.tsx, and __tests__/ from the scan", () => {
+    // Pure predicate: assert the exclusion rules directly.
+    expect(isScannable("foo.spec.ts", false)).toBe(false);
+    expect(isScannable("foo.test.ts", false)).toBe(false);
+    expect(isScannable("foo.ts", false)).toBe(true);
+    expect(isScannable("foo.tsx", false)).toBe(false);
+    expect(isScannable("__tests__", true)).toBe(false);
+    expect(isScannable("adapters", true)).toBe(true);
+
+    // And the real walk honors the predicate over the live tree.
+    const files = collectSourceFiles();
+    const offenders = files.filter(
+      (f) => f.endsWith(".spec.ts") || f.endsWith(".test.ts") || f.includes("/__tests__/"),
+    );
+    expect(offenders).toEqual([]);
   });
 });
