@@ -12203,6 +12203,7 @@ export function issueRoutes(
                 agentId: lockedIssue.assigneeAgentId,
                 failedRunId,
                 initiatedByUserId: req.actor.userId,
+                boardApiKeyId: getActorInfo(req).boardApiKeyId,
               },
             );
           }
