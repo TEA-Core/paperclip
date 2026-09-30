@@ -701,6 +701,26 @@ describe("shared gateway base URL (run + probe)", () => {
 });
 
 describe("testEnvironment", () => {
+  it("keeps apiBaseUrl userinfo out of check messages", async () => {
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "hermes_gateway",
+      config: {
+        apiBaseUrl: "http://user:sekrit@127.0.0.1:9119/",
+        apiKey: "secret-key",
+      },
+    });
+
+    const mapped = result.checks.find((check) => check.code === "hermes_gateway_dashboard_root_mapped");
+    expect(mapped).toBeTruthy();
+    expect(mapped!.message).toContain("http://REDACTED@127.0.0.1:9119/api");
+    expect(mapped!.message).not.toContain("sekrit");
+    expect(JSON.stringify(result)).not.toContain("sekrit");
+  });
+
   it("fails remote plain HTTP before probing health", async () => {
     const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);

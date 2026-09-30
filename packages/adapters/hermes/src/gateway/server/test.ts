@@ -10,7 +10,7 @@ import {
   isRemotePlainHttp,
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
-import { apiUrl, isDefaultDashboardApiEntry, normalizeBaseUrl } from "./base-url.js";
+import { apiUrl, isDefaultDashboardApiEntry, normalizeBaseUrl, redactUrlCredentials } from "./base-url.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -69,7 +69,7 @@ export async function testEnvironment(
     checks.push({
       code: "hermes_gateway_dashboard_root_mapped",
       level: "info",
-      message: `Default Hermes dashboard root mapped to API base ${parsed.toString()}.`,
+      message: `Default Hermes dashboard root mapped to API base ${redactUrlCredentials(parsed).toString()}.`,
       hint: "Hermes dashboard routes such as /chat are browser UI routes. Paperclip gateway calls use /api/health and /api/v1/runs.",
     });
   }
