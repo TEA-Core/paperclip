@@ -1201,6 +1201,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       mockResolver(async () => openSnapshot);
       // SUP-15315 gate: live head is covered by the card's pinned stamp → authorized.
       mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // SUP-17965: the gate verifies the head's real stamp, so stub it as stamped.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_test_token",
         scope: "company",
@@ -1250,6 +1252,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       // SUP-15315 gate: head is authorized (stamp match), so the sweep reaches
       // the re-enqueue attempt — which then fails because no token resolves.
       mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // SUP-17965: the gate verifies the head's real stamp, so stub it as stamped.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: null,
         reason: "No GitHub token resolvable for paperclipai/paperclip",
@@ -1295,6 +1299,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       ]);
       mockResolver(async () => openSnapshot);
       mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // SUP-17965: the gate verifies the head's real stamp, so stub it as stamped.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_fetched",
         scope: "company",
@@ -1330,6 +1336,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       ]);
       mockResolver(async () => openSnapshot);
       mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // SUP-17965: the gate verifies the head's real stamp, so stub it as stamped.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_tok",
         scope: "company",
@@ -1785,7 +1793,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       expect(mockUpdate).not.toHaveBeenCalled();
     });
 
-    it("does not call the status reader when the pinned stamp covers the live head (AC5)", async () => {
+    it("verifies the live head carries a real paperclip/approved stamp even when the approval anchor covers it (AC5, re-pinned by SUP-17965)", async () => {
       const { service } = makeService(
         {
           candidates: [candidateRow()],
@@ -1799,6 +1807,10 @@ describe("createDoneCloseLandingBackstopService", () => {
       ]);
       mockResolver(async () => openSnapshot);
       mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // SUP-17965: the anchor covering the live head no longer short-circuits —
+      // the gate must confirm the head actually carries a success stamp before
+      // re-enqueueing (the merge boundary enforces exactly this predicate).
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_test_token",
         scope: "company",
@@ -1815,9 +1827,81 @@ describe("createDoneCloseLandingBackstopService", () => {
         reenqueued: 1,
         escalated: 0, draftStranded: 0,
       });
-      // Stamp match short-circuits the status read (AC5).
-      expect(mockFetchHeadApprovedStatusViaTokenCandidates).not.toHaveBeenCalled();
+      // The status reader IS consulted (the anchor is not trusted as a stamp).
+      expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA,
+      );
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+    });
+
+    // SUP-17965 (#846): case (b) — the card is terminal, so no stamp can ever be
+    // published for the live head. The approval ANCHOR (`approvedHeadSha`) points
+    // at the live head, but the head carries no real `paperclip/approved` success
+    // status (the anchor is written before/independently of the stamp publish).
+    // Re-enqueueing this head only re-runs the failing Approval precondition and
+    // burns runner-hours. This is the "show it failing first" guard: against the
+    // pre-fix code the anchor===live-head shortcut re-enqueues (enableAutoMerge is
+    // called) even though the head is unstamped, so this assertion fails.
+    it("REFUSES (never re-enqueues) a terminal card whose approval anchor is on the live head but no paperclip/approved stamp was ever published (case b: no stamp can exist; #846 shape)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        },
+        { wakeup },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      // Live head IS the anchor head…
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // …but that head carries NO paperclip/approved success status — the Approval
+      // precondition would fail at this head, and a terminal card cannot re-stamp it.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: false });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      const result = await service.sweep();
+
+      expect(result).toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 1, draftStranded: 0,
+      });
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      // AC2: durable refusal row naming the anchor head AND the live head (equal here)
+      // plus the case-(b) reason.
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_reenqueue_refused",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#514",
+          headSha: LIVE_SHA,
+          approvedHeadSha: LIVE_SHA,
+          reason: expect.stringContaining("approval can never publish for this head"),
+        }),
+      }));
+      // AC3: reaches the existing escalate path exactly once; the unblock action
+      // names re-approval (not rebase / CI).
+      expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+        status: "blocked",
+        unblockDescriptor: expect.objectContaining({
+          owner: "board",
+          action: expect.stringContaining("Re-approve PR paperclipai/paperclip#514"),
+        }),
+      }));
+      expect(wakeup).toHaveBeenCalledTimes(1);
     });
   });
 });
@@ -2084,6 +2168,11 @@ describe("SUP-15953: re-enqueue leg decoupled from the 24h landing verdict + eje
     ]);
     mockResolver(async () => snapshot);
     mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+    // SUP-17965: the head-authorization gate now verifies the live head actually
+    // carries a paperclip/approved success status (the anchor alone is not a
+    // stamp). Default the live head to stamped so the re-enqueue tests below stay
+    // authorised; tests that want a refusal/defer override this after the call.
+    mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
   }
 
   it("AC1: re-enqueues a PR only 90 min past its close skip — not gated behind the 24h verdict grace", async () => {
@@ -2927,6 +3016,8 @@ describe("SUP-16689: draft-stranded done cards", () => {
       ]);
       mockResolver(async () => openSnapshot);
       mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // SUP-17965: the gate verifies the head's real stamp, so stub it as stamped.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_test_token",
         scope: "company",
@@ -2979,6 +3070,8 @@ describe("SUP-16689: draft-stranded done cards", () => {
       ]);
       mockResolver(async () => openSnapshot);
       mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // SUP-17965: the gate verifies the head's real stamp, so stub it as stamped.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_test_token",
         scope: "company",

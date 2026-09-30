@@ -1187,12 +1187,24 @@ export function createDoneCloseLandingBackstopService(
   }
 
   /**
-   * SUP-15315: authorizes a PR's live head for the re-enqueue path. Resolves the
-   * live head SHA; if it is covered by the card's pinned approval stamp it is
-   * `authorized` without a second read (AC5). Otherwise the live head must carry
-   * its own `paperclip/approved` success status, else the head is positively
-   * UNSTAMPED → `refused`. Any unreadable head or status → `deferred` (fail
-   * closed, AC4).
+   * SUP-15315 / SUP-17965: authorizes a PR's live head for the re-enqueue path.
+   * Resolves the live head SHA and REQUIRES that head to carry a real
+   * `paperclip/approved` success status — the same predicate the merge boundary
+   * (`check-paperclip-approved.sh`) consumes. Only then is the head `authorized`;
+   * otherwise it is positively UNSTAMPED → `refused`. Any unreadable head or
+   * status → `deferred` (fail closed, AC4).
+   *
+   * SUP-17965 (#846): the previous version short-circuited to `authorized` when
+   * the live head equaled the card's pinned anchor (`approvedHeadSha`) WITHOUT a
+   * status read. The anchor is written before/independently of the stamp publish,
+   * so a terminal (done) card whose first publish was skipped/failed/never ran
+   * has an anchor but no real stamp — the re-enqueue was then refused by the
+   * boundary on the very next check and re-enqueued again, indefinitely, burning
+   * runner-hours. A terminal card can never (re)publish a stamp, so the anchor
+   * must NOT be trusted as a stamp: the live head's real status is the single
+   * source of truth. This hard-refuses case (b) (no stamp can ever exist) while
+   * case (a) (head moved, a fresh re-approval can re-stamp the new head) still
+   * authorizes once that fresh approval lands a success status on the live head.
    */
   async function authorizeReenqueueHead(
     companyId: string,
@@ -1208,9 +1220,10 @@ export function createDoneCloseLandingBackstopService(
     );
     if (!head.ok) return { kind: "deferred", reason: head.reason };
     const liveHeadSha = head.headSha;
-    if (approvedHeadSha !== null && liveHeadSha === approvedHeadSha) {
-      return { kind: "authorized" };
-    }
+    // SUP-17965: the anchor alone is not a stamp. Even when it covers the live
+    // head, verify the head actually carries a paperclip/approved success status
+    // — that is the exact predicate the merge boundary enforces, so a re-enqueued
+    // head is one the boundary will not immediately re-eject.
     const status = await fetchHeadApprovedStatusViaTokenCandidates(
       db,
       companyId,
@@ -1220,15 +1233,26 @@ export function createDoneCloseLandingBackstopService(
     );
     if (!status.ok) return { kind: "deferred", reason: status.reason };
     if (status.approved) return { kind: "authorized" };
-    return {
-      kind: "refused",
-      headSha: liveHeadSha,
-      approvedHeadSha,
-      reason:
-        approvedHeadSha !== null
-          ? `approval stamp stranded: the card approved head ${approvedHeadSha.slice(0, 7)} but the live head is ${liveHeadSha.slice(0, 7)}, and that head carries no paperclip/approved success status`
-          : `no valid approval on head: the live head ${liveHeadSha.slice(0, 7)} carries no paperclip/approved success status and the card has no pinned approvedHeadSha`,
-    };
+    const shortLive = liveHeadSha.slice(0, 7);
+    const shortAnchor = approvedHeadSha !== null ? approvedHeadSha.slice(0, 7) : null;
+    let reason: string;
+    if (approvedHeadSha !== null && liveHeadSha === approvedHeadSha) {
+      // Case (b): the card's approval anchor points at the live head, but that
+      // head carries no paperclip/approved success status. A terminal card cannot
+      // publish a new stamp, so re-enqueueing would only re-run the failing
+      // Approval precondition. (#846)
+      reason =
+        `approval can never publish for this head: the card's approval anchor is on the live head ${shortLive} but that head carries no paperclip/approved success status — a terminal card cannot (re)publish a stamp, so re-enqueue would only re-run the failing Approval precondition`;
+    } else if (approvedHeadSha !== null) {
+      // Case (a): the head moved past the stamped head; a fresh re-approval can
+      // re-stamp the new head, so this refusal is provisional, not terminal.
+      reason =
+        `approval stamp stranded: the card approved head ${shortAnchor} but the live head is ${shortLive}, and that head carries no paperclip/approved success status`;
+    } else {
+      reason =
+        `no valid approval on head: the live head ${shortLive} carries no paperclip/approved success status and the card has no pinned approvedHeadSha`;
+    }
+    return { kind: "refused", headSha: liveHeadSha, approvedHeadSha, reason };
   }
 
   /**
