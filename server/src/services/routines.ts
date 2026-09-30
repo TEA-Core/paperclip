@@ -1851,6 +1851,7 @@ export function routineService(
       companyId: input.companyId,
       actorType: "user",
       actorId: input.userId,
+      boardApiKeyId: null,
       action: "issue.inbox_touched",
       entityType: "issue",
       entityId: input.issueId,

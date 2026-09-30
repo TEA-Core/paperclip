@@ -268,6 +268,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     const resolvedByUserId = req.actor.userId ?? "board";
     const approved = await proposals.approve(companyId, proposal.id, {
       resolvedByUserId,
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       cascade: req.body?.cascade === true,
       overrides: req.body?.overrides,
       assertCanResolve: (lockedProposal, txDb) => assertCanResolveProposal({
@@ -300,6 +301,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     const resolvedByUserId = req.actor.userId ?? "board";
     const proposal = await proposals.transition(companyId, req.params.id as string, "rejected", {
       resolvedByUserId, reason,
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
     });
     await notifySecretProposalResolution({
       proposal: existing,

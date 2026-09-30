@@ -3899,6 +3899,7 @@ export function agentRoutes(
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+          boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
           source: "skill-sync",
         },
       });
@@ -4988,6 +4989,7 @@ export function agentRoutes(
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+          boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
           source: "instructions_path_patch",
         },
       },
@@ -5057,6 +5059,7 @@ export function agentRoutes(
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+          boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
           source: "instructions_bundle_patch",
         },
       },
@@ -5123,6 +5126,7 @@ export function agentRoutes(
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+          boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
           source: "instructions_bundle_file_put",
         },
       },
@@ -5362,6 +5366,7 @@ export function agentRoutes(
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
         source: "patch",
       },
       claudeLogin: {
@@ -7000,7 +7005,7 @@ export function agentRoutes(
 
     const row = await recovery.recordWatchdogDecision({
       runId: existing.id,
-      actor: req.actor,
+      actor: { ...req.actor, boardApiKeyId: getActorInfo(req).boardApiKeyId },
       decision: decision as "snooze" | "continue" | "dismissed_false_positive",
       evaluationIssueId,
       reason,

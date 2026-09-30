@@ -14,7 +14,7 @@ export function announcementService(db: Db) {
       });
       return Boolean(row);
     },
-    async dismiss(userId: string, announcementId: string, companyId: string) {
+    async dismiss(userId: string, announcementId: string, companyId: string, boardApiKeyId?: string | null) {
       const result = await db.transaction(async (tx) => {
         const known = await tx.query.announcementPublications.findFirst({
           where: eq(announcementPublications.announcementId, announcementId),
@@ -31,7 +31,7 @@ export function announcementService(db: Db) {
           .onConflictDoNothing().returning();
         if (!inserted) return { known: true, publication: null };
         const activity = await persistActivity(tx as unknown as Db, {
-          companyId, actorType: "user", actorId: userId,
+          companyId, actorType: "user", actorId: userId, boardApiKeyId: boardApiKeyId ?? null,
           action: "announcement.dismissed", entityType: "announcement", entityId: announcementId,
         });
         return { known: true, publication: activity.publication };

@@ -8071,6 +8071,7 @@ export function issueRoutes(
       actorAgentId: input.actor.agentId,
       actorUserId:
         input.actor.actorType === "user" ? input.actor.actorId : null,
+      boardApiKeyId: input.actor.actorType === "user" ? input.actor.boardApiKeyId ?? null : null,
     });
     await logActivity(db, {
       companyId: watchdogParent.companyId,
@@ -11158,6 +11159,7 @@ export function issueRoutes(
             executionState: nextExecutionState,
             actorAgentId: null,
             actorUserId: boardUserId,
+            boardApiKeyId: actor.boardApiKeyId,
           } as Parameters<typeof svc.update>[1],
           tx,
           postCommitActivityPublications,
@@ -12203,6 +12205,7 @@ export function issueRoutes(
                 agentId: lockedIssue.assigneeAgentId,
                 failedRunId,
                 initiatedByUserId: req.actor.userId,
+                boardApiKeyId: getActorInfo(req).boardApiKeyId,
               },
             );
           }
@@ -12370,6 +12373,7 @@ export function issueRoutes(
             ...updateFields,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
           };
           const updatedIssue =
             sourceIssueStatus === "done" || sourceIssueStatus === "cancelled"
@@ -16284,6 +16288,7 @@ export function issueRoutes(
     await heartbeat.triggerIssueMonitor(issue.id, {
       actorType: actor.actorType,
       actorId: actor.actorId,
+      boardApiKeyId: actor.boardApiKeyId ?? null,
       agentId: actor.agentId ?? null,
       runId: actor.runId ?? null,
     });
@@ -16378,6 +16383,7 @@ export function issueRoutes(
         actor: {
           userId: actor.actorId,
           runId: actor.runId,
+          boardApiKeyId: actor.boardApiKeyId,
         },
       });
 
@@ -22436,6 +22442,7 @@ export function issueRoutes(
         status: typeof transition.patch.status === "string" ? transition.patch.status : "done",
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
       };
 
       const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);

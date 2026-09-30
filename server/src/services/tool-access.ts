@@ -257,6 +257,7 @@ import {
 type ActorInfo = {
   actorType?: "agent" | "user" | "system" | "plugin";
   actorId?: string | null;
+  boardApiKeyId?: string | null;
   sessionId?: string | null;
   actorSource?:
     | "local_implicit"
@@ -4868,6 +4869,7 @@ export function toolAccessService(
         companyId: input.companyId,
         actorType: input.actor?.actorType ?? "system",
         actorId: input.actor?.actorId ?? "tool-access-service",
+        boardApiKeyId: input.actor?.boardApiKeyId ?? null,
         action:
           input.action === "stop"
             ? "tool_runtime_slot.operator_stopped"
@@ -18512,6 +18514,7 @@ export function toolAccessService(
           companyId: connection.companyId,
           actorType: actor?.actorType ?? "system",
           actorId: actor?.actorId ?? "system",
+          boardApiKeyId: actor?.boardApiKeyId ?? null,
           action: "tool_connection.install_access_extended",
           entityType: "tool_connection",
           entityId: connection.id,

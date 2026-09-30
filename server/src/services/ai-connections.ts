@@ -434,6 +434,7 @@ export function aiConnectionService(db: Db) {
     verifiedCredential: string,
     sessionId?: string,
     attemptStartedAt = new Date(),
+    boardApiKeyId?: string | null,
   ) {
     if (!(await membership(companyId, userId)))
       throw forbidden("An active company member must own this connection");
@@ -765,6 +766,7 @@ export function aiConnectionService(db: Db) {
         companyId,
         actorType: "user",
         actorId: userId,
+        boardApiKeyId: boardApiKeyId ?? null,
         action: reconnect
           ? "ai_connection.reconnected"
           : "ai_connection.connected",

@@ -89,6 +89,7 @@ type AgentConfigSnapshot = Pick<typeof agents.$inferSelect, ConfigRevisionField>
 interface RevisionMetadata {
   createdByAgentId?: string | null;
   createdByUserId?: string | null;
+  boardApiKeyId?: string | null;
   source?: string;
   rolledBackFromRevisionId?: string | null;
 }
@@ -535,6 +536,7 @@ export function agentService(db: Db) {
         companyId: agent.companyId,
         actorType,
         actorId,
+        boardApiKeyId: actor.boardApiKeyId ?? null,
         agentId: actor.createdByAgentId ?? null,
         action: "secret.binding.created",
         entityType: "agent",

@@ -248,6 +248,7 @@ export function companySkillPolicyService(db: Db) {
       }
       await logActivityInTransaction(transactionDb, {
         ...input.activity,
+        boardApiKeyId: input.activity.boardApiKeyId ?? null,
         companyId: input.companyId,
         action: "company.skill_policy_replaced",
         entityType: "company_skill_policy",
@@ -277,6 +278,7 @@ export function companySkillPolicyService(db: Db) {
       if (existing) {
         await logActivityInTransaction(transactionDb, {
           ...input.activity,
+          boardApiKeyId: input.activity.boardApiKeyId ?? null,
           companyId: input.companyId,
           action: "company.skill_policy_reset",
           entityType: "company_skill_policy",

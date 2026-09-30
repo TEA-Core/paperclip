@@ -263,6 +263,7 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
 
     await logActivity(db, {
       companyId,
+      boardApiKeyId: input.actor.type === "board" ? input.actor.boardApiKeyId ?? null : null,
       actorType: input.actor.type === "agent" ? "agent" : "user",
       actorId: input.actor.type === "agent"
         ? input.actor.agentId ?? "agent"

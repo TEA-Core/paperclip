@@ -1603,6 +1603,7 @@ export function createToolGatewayService(
     issueId: string | null;
     actorType?: LogActivityInput["actorType"];
     actorId?: string;
+    boardApiKeyId?: string | null;
     action: string;
     details: Record<string, unknown>;
   }) {
@@ -1718,6 +1719,7 @@ export function createToolGatewayService(
       input.companyId;
     await logActivity(db, {
       companyId: input.companyId,
+      boardApiKeyId: input.boardApiKeyId ?? null,
       actorType:
         input.actorType ??
         input.session?.actorType ??

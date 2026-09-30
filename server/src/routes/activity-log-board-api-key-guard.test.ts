@@ -128,6 +128,9 @@ const ALLOWLIST: AllowlistEntry[] = [
   { file: "secrets.ts", action: "secret.access.listed", reason: "agent actor" },
   // system actor: background/system join-claim event
   { file: "access.ts", action: "agent_api_key.claimed", reason: "system actor" },
+  // request-less: durable comment-delivery path (issue_comments carries no board
+  // key, so the resuming comment's board provenance is not in scope here)
+  { file: "agent-conversations.ts", action: "issue.tree_hold_released", actorType: '"user"', reason: "request-less comment-delivery path" },
 ];
 
 function isAllowlisted(allowlist: AllowlistEntry[], file: string, action: string, actorTypeExpr: string | undefined): boolean {

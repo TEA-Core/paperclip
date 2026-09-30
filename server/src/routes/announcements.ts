@@ -4,7 +4,7 @@ import { companies, type Db } from "@paperclipai/db";
 import { ANNOUNCEMENT_ANIMATION_CSP, announcementIdSchema, dismissAnnouncementSchema } from "@paperclipai/shared";
 import { badRequest, forbidden, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { assertAuthenticated, assertBoard, hasCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertBoard, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { announcementService } from "../services/announcements.js";
 import { announcementFeedService, type AnnouncementFeedOptions } from "../services/announcement-feed.js";
 
@@ -54,7 +54,7 @@ export function announcementRoutes(db: Db, options: AnnouncementFeedOptions) {
     if (!await db.query.companies.findFirst({ where: eq(companies.id, companyId), columns: { id: true } })) {
       throw notFound("Company not found");
     }
-    if (!await service.dismiss(req.actor.userId!, id.data, companyId)) throw notFound("Announcement not found");
+    if (!await service.dismiss(req.actor.userId!, id.data, companyId, getActorInfo(req).boardApiKeyId)) throw notFound("Announcement not found");
     res.status(204).end();
   });
   return router;

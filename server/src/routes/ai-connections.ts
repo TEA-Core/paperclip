@@ -185,7 +185,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     assertLocalLoginAvailable();
     const userId = await assertAiConnectionCreateAccess(db, req, companyId, intent);
     res.setHeader("Cache-Control", "no-store");
-    res.status(201).json(await localLogin.start(companyId, userId, intent, restart));
+    res.status(201).json(await localLogin.start(companyId, userId, intent, restart, getActorInfo(req).boardApiKeyId));
   });
   router.post("/companies/:companyId/ai-connections/local/check", validate(localAiConnectionSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -202,7 +202,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     assertBoard(req);
     assertCompanyAccess(req, req.params.companyId as string);
     const id = z.string().uuid().parse(req.params.sessionId);
-    await localLogin.cancel(req.params.companyId as string, getActorInfo(req).actorId, id);
+    await localLogin.cancel(req.params.companyId as string, getActorInfo(req).actorId, id, getActorInfo(req).boardApiKeyId);
     res.json({ ok: true });
   });
   router.get("/companies/:companyId/ai-connections", async (req, res) => {
@@ -289,6 +289,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
         input.apiKey!,
         undefined,
         attemptStartedAt,
+        getActorInfo(req).boardApiKeyId,
       );
       res.status(201).json(result);
     },
@@ -304,12 +305,12 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
       const userId = await assertAiConnectionCreateAccess(db, req, companyId, input);
       if (localSessionId || input.provider === "openai" || input.provider === "xai") {
         if (!localSessionId) throw unprocessable("Start a separate local sign-in for this connection before connecting.");
-        res.status(201).json(await localLogin.complete(companyId, userId, localSessionId, input));
+        res.status(201).json(await localLogin.complete(companyId, userId, localSessionId, input, getActorInfo(req).boardApiKeyId));
         return;
       }
       const attemptStartedAt = new Date();
       const credential = await readVerifiedLocalAiCredential(input.provider);
-      res.status(201).json(await service.save(companyId, userId, input, credential, undefined, attemptStartedAt));
+      res.status(201).json(await service.save(companyId, userId, input, credential, undefined, attemptStartedAt, getActorInfo(req).boardApiKeyId));
     },
   );
   router.put(
