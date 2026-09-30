@@ -1044,6 +1044,7 @@ describe("agent live run routes", () => {
           agentId: routeAgentId,
           failedRunId: failedChatRunId,
           initiatedByUserId: "local-board",
+          boardApiKeyId: null,
         });
         expect(
           mockChatRunRetries.processFailedChatRunRetry,

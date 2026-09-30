@@ -12899,6 +12899,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       agentId: string;
       failedRunId: string;
       initiatedByUserId: string;
+      boardApiKeyId?: string | null;
     },
   ): Promise<{ actionId: string; issueId: string }> {
     const source = await failedChatRetrySource(tx, input);
@@ -12965,6 +12966,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       companyId: input.companyId,
       actorType: "user",
       actorId: input.initiatedByUserId,
+      boardApiKeyId: input.boardApiKeyId ?? null,
       action: "chat.failed_run_retry_requested",
       entityType: "heartbeat_run",
       entityId: input.failedRunId,
