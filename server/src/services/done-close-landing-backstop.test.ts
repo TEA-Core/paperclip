@@ -1903,6 +1903,62 @@ describe("createDoneCloseLandingBackstopService", () => {
       }));
       expect(wakeup).toHaveBeenCalledTimes(1);
     });
+
+    // SUP-17965: case (a) — the head MOVED past the stranded anchor, so the stamp
+    // is only stale, not permanently unreachable. A fresh re-approval can re-stamp
+    // the NEW head; once that real paperclip/approved success status lands on the
+    // live head the gate must authorize and re-enqueue. This is the positive
+    // direction that pairs with the case-(b) hard-refusal above: the anchor being
+    // on an old head never blocks a genuinely-approved new head.
+    it("AUTHORIZED: when the head moved past a stranded anchor and the new head gains a legitimate paperclip/approved success, the card re-enters the queue (case a: stale stamp, not terminal)", async () => {
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          // The card's approval anchor is pinned on an OLDER head (STAMPED_SHA) —
+          // the head moved past it, so the anchor no longer covers the live head.
+          issueExecutionState: { approvalStatus: { approvedHeadSha: STAMPED_SHA } },
+        },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      // Live head is NOT the anchor head (head moved)…
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // …but the new head now carries a real paperclip/approved success status
+      // (a legitimate re-approval landed after the earlier refusal).
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      const result = await service.sweep();
+
+      // Case (a) still works: a freshly-approved head re-enters the queue.
+      expect(result).toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 1,
+        escalated: 0, draftStranded: 0,
+      });
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+      // The gate consulted the live head's real stamp (the moved anchor alone does
+      // not authorize; the new head's success status does).
+      expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA,
+      );
+      // No refusal row / no escalation: this head is approvable, so it quiesces by
+      // landing, not by a board action.
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
   });
 });
 
