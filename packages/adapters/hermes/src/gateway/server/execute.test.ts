@@ -2,6 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
+import { apiUrl, normalizeBaseUrl, redactUrlCredentials } from "./base-url.js";
 
 function makeCtx(config: Record<string, unknown>): AdapterExecutionContext {
   return {
@@ -579,9 +580,140 @@ describe("execute", () => {
     expect(result.errorCode).toBe("hermes_gateway_timeout");
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/stop"))).toBe(true);
   });
+
+  it("rejects URL userinfo in apiBaseUrl before the fetch boundary instead of sending it", async () => {
+    // The prior implementation passed the credential-bearing URL straight to
+    // fetch; Node's real fetch refuses it with "Request cannot be constructed
+    // from a URL that includes credentials", so that path could never
+    // authenticate. This sentinel proves the deliberate pre-fetch rejection:
+    // no request is attempted, and if the guard regressed the spy would throw
+    // deterministically instead of a stub masking an impossible runtime path.
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("D1 sentinel: URL userinfo must be rejected before fetch is reached");
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const ctx = makeCtx({
+      apiBaseUrl: "http://user:sekrit@127.0.0.1:8642/",
+      apiKey: "secret-key",
+      timeoutSec: 5,
+    });
+    const result = await execute(ctx);
+
+    // Deliberate rejection: the credential-bearing URL never reaches fetch.
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Stable, clear adapter error that does not echo the configured URL.
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_api_base_url_userinfo_rejected");
+    expect(result.errorMessage).toContain("must not embed URL credentials");
+    expect(result.errorMessage).toContain("authenticate with apiKey");
+    expect(result.errorMessage).not.toContain("sekrit");
+    expect(result.errorMessage).not.toContain("user:sekrit");
+
+    // No sink is reached after rejection, so nothing can leak the credential.
+    const logText = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map(([, line]) => String(line)).join("\n");
+    expect(logText).not.toContain("sekrit");
+    const commandArgs = (ctx.onMeta as ReturnType<typeof vi.fn>).mock.calls
+      .map(([meta]) => ((meta as { commandArgs?: unknown[] } | undefined)?.commandArgs ?? []))
+      .flat()
+      .map(String);
+    expect(commandArgs.join("\n")).not.toContain("sekrit");
+    expect(JSON.stringify(result)).not.toContain("sekrit");
+  });
+});
+
+describe("shared gateway base URL (run + probe)", () => {
+  it("strips query and fragment so probe and run target the same origin+path", () => {
+    const base = normalizeBaseUrl("http://10.10.1.5:8642/risk/?x=1#frag");
+    expect(base).not.toBeNull();
+    const health = apiUrl(base!, "/health");
+    const run = apiUrl(base!, "/v1/runs");
+    expect(health).toBe("http://10.10.1.5:8642/risk/health");
+    expect(run).toBe("http://10.10.1.5:8642/risk/v1/runs");
+    // Same origin+path; only the endpoint differs.
+    const originPath = (u: string) => u.replace(/\/(health|v1\/runs)$/, "");
+    expect(originPath(health)).toBe(originPath(run));
+  });
+
+  it("still maps the bare 9119 dashboard root to /api and drops the query", () => {
+    const base = normalizeBaseUrl("http://127.0.0.1:9119/?probe=1");
+    expect(base).not.toBeNull();
+    expect(apiUrl(base!, "/v1/runs")).toBe("http://127.0.0.1:9119/api/v1/runs");
+  });
+
+  it("redactUrlCredentials masks userinfo on a copy without touching the original", () => {
+    const original = new URL("http://user:sekrit@127.0.0.1:8642/");
+    const redacted = redactUrlCredentials(original);
+    expect(redacted.toString()).toBe("http://REDACTED@127.0.0.1:8642/");
+    // Original is preserved so the live credential can still be used for fetch.
+    expect(original.toString()).toBe("http://user:sekrit@127.0.0.1:8642/");
+  });
+
+  it("composes the same origin+path in the run executor and the Test-Connection probe", async () => {
+    const apiBaseUrl = "http://127.0.0.1:8642/risk/?x=1#frag";
+
+    const fetchRun = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-1", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(
+          sseStream(
+            [
+              "event: run.completed",
+              "data: {\"status\":\"completed\",\"output\":\"done\"}",
+              "",
+            ].join("\n"),
+          ),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    const fetchProbe = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response("{}", { status: 200 }));
+
+    vi.stubGlobal("fetch", fetchRun);
+    await execute(makeCtx({ apiBaseUrl, apiKey: "secret-key", timeoutSec: 5 }));
+    const runUrl = fetchRun.mock.calls.find(([input]) => String(input).endsWith("/v1/runs"))?.[0];
+
+    vi.stubGlobal("fetch", fetchProbe);
+    await testEnvironment({
+      companyId: "company-1",
+      adapterType: "hermes_gateway",
+      config: { apiBaseUrl, apiKey: "secret-key" },
+    });
+    const probeUrl = fetchProbe.mock.calls[0]?.[0];
+
+    expect(String(runUrl)).toBe("http://127.0.0.1:8642/risk/v1/runs");
+    expect(String(probeUrl)).toBe("http://127.0.0.1:8642/risk/health");
+    const originPath = (u: string) => u.replace(/\/(v1\/runs|health)$/, "");
+    expect(originPath(String(runUrl))).toBe(originPath(String(probeUrl)));
+  });
 });
 
 describe("testEnvironment", () => {
+  it("keeps apiBaseUrl userinfo out of check messages", async () => {
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "hermes_gateway",
+      config: {
+        apiBaseUrl: "http://user:sekrit@127.0.0.1:9119/",
+        apiKey: "secret-key",
+      },
+    });
+
+    const mapped = result.checks.find((check) => check.code === "hermes_gateway_dashboard_root_mapped");
+    expect(mapped).toBeTruthy();
+    expect(mapped!.message).toContain("http://REDACTED@127.0.0.1:9119/api");
+    expect(mapped!.message).not.toContain("sekrit");
+    expect(JSON.stringify(result)).not.toContain("sekrit");
+  });
+
   it("fails remote plain HTTP before probing health", async () => {
     const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
