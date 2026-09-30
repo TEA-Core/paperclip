@@ -152,7 +152,8 @@ async function createApp(db: unknown = {}) {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
-      source: "local_implicit",
+      source: "board_key",
+      keyId: "33333333-3333-4333-8333-333333333333",
       isInstanceAdmin: false,
     };
     next();
@@ -181,11 +182,12 @@ function makeIssue() {
   };
 }
 
-function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Record<string, unknown>) {
+function issueUpdateWithReceipt<T extends Record<string, unknown>>(issue: T, patch: Record<string, unknown>) {
   const {
     actorAgentId: _actorAgentId,
     actorUserId: _actorUserId,
     blockedByIssueIds: _blockedByIssueIds,
+    boardApiKeyId: _boardApiKeyId,
     ...issuePatch
   } = patch;
   const updated = {
@@ -264,6 +266,35 @@ describe("issue activity event routes", () => {
       .send({ title: issue.title });
     expect(noOp.status).toBe(200);
     expect(noOp.body.changes).not.toHaveProperty("title");
+  });
+
+  it("keeps board API-key provenance out of mutation responses and changes receipts", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      issueUpdateWithReceipt(issue, patch));
+
+    const response = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ priority: "high" });
+
+    expect(response.status).toBe(200);
+    expect(response.body).not.toHaveProperty("boardApiKeyId");
+    expect(response.body.changes).not.toHaveProperty("boardApiKeyId");
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({ boardApiKeyId: "33333333-3333-4333-8333-333333333333" }),
+    );
+    await vi.waitFor(() => {
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          boardApiKeyId: "33333333-3333-4333-8333-333333333333",
+          action: "issue.updated",
+          details: expect.not.objectContaining({ boardApiKeyId: expect.anything() }),
+        }),
+      );
+    });
   });
 
   it("echoes scalar blocker state and summaries when setting and clearing blockers", async () => {
