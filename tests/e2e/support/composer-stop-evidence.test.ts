@@ -55,6 +55,9 @@ describe("composer stop evidence", () => {
       apiErrorsDuringWindow: [],
       instrumentationFailures: collector.instrumentationFailures,
       statusMetadata: [],
+      successfulPollCount: 1,
+      finalIssueStatus: "in_progress",
+      finalSnapshotFailure: null,
       finalSnapshots: [],
       finalIssueState: { status: "in_progress", executionRunId: "run-1" },
       finalContinuationDelivery: null,
@@ -91,22 +94,99 @@ describe("composer stop evidence", () => {
     }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE);
   });
 
-  it("classifies a successor found only in the final snapshot as late", () => {
-    expect(classifyRunningTimeout({
+  it("classifies a running successor found only in the final snapshot as late", () => {
+    const evidence = buildRunningTimeoutEvidence({
+      issueId: "issue-1",
       adapter: "paperclip_runner",
+      companyId: "company-1",
+      pollWindowStartMs: 1000,
+      pollWindowEndMs: 2000,
+      originalRunIds: ["run-1"],
+      observedRunRows: [{ id: "run-1", status: "running", observedAtIso: "1970-01-01T00:00:01.500Z" }],
+      finalLiveRuns: [{ id: "run-1", status: "running" }, { id: "successor", status: "running" }],
       apiErrorsDuringWindow: [],
       instrumentationFailures: [],
-      observedRunRows: [],
-      successfulPollCount: 2,
-      finalNewRunIds: ["successor"],
-      anyNewRunRunning: false,
+      statusMetadata: [],
+      successfulPollCount: 1,
       finalIssueStatus: "in_progress",
+      finalSnapshotFailure: null,
+      finalSnapshots: [],
+      finalIssueState: { status: "in_progress", executionRunId: "run-1" },
       finalContinuationDelivery: null,
       hasResolveEvidence: false,
       recoveryActionPresentAtResolve: null,
       settledActionFoundAtResolve: null,
+      originalProviderAliveAtResolve: null,
+      resolveCompletedAtIso: null,
+      resumeInitiatedAtIso: "1970-01-01T00:00:01.000Z",
+    });
+
+    expect(evidence.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.LATE_TRANSITION);
+    expect(evidence.verdictMessage).toContain("appeared only in the final snapshot");
+  });
+
+  it("does not call a polling-seen non-running successor final-only", () => {
+    const evidence = buildRunningTimeoutEvidence({
+      issueId: "issue-1",
+      adapter: "paperclip_runner",
+      companyId: "company-1",
+      pollWindowStartMs: 1000,
+      pollWindowEndMs: 2000,
+      originalRunIds: ["run-1"],
+      observedRunRows: [
+        { id: "run-1", status: "running", observedAtIso: "1970-01-01T00:00:01.500Z" },
+        { id: "successor", status: "queued", observedAtIso: "1970-01-01T00:00:01.500Z" },
+      ],
+      finalLiveRuns: [{ id: "run-1", status: "running" }, { id: "successor", status: "running" }],
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: [],
+      statusMetadata: [],
+      successfulPollCount: 1,
+      finalIssueStatus: "in_progress",
       finalSnapshotFailure: null,
-    }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.LATE_TRANSITION);
+      finalSnapshots: [],
+      finalIssueState: { status: "in_progress", executionRunId: "run-1" },
+      finalContinuationDelivery: null,
+      hasResolveEvidence: false,
+      recoveryActionPresentAtResolve: null,
+      settledActionFoundAtResolve: null,
+      originalProviderAliveAtResolve: null,
+      resolveCompletedAtIso: null,
+      resumeInitiatedAtIso: "1970-01-01T00:00:01.000Z",
+    });
+
+    expect(evidence.verdict).not.toBe(RUNNING_TIMEOUT_VERDICTS.LATE_TRANSITION);
+    expect(evidence.verdictMessage).not.toContain("appeared only in the final snapshot");
+  });
+
+  it("treats malformed final live-runs rows as an observation failure", () => {
+    const evidence = buildRunningTimeoutEvidence({
+      issueId: "issue-1",
+      adapter: "paperclip_runner",
+      companyId: "company-1",
+      pollWindowStartMs: 1000,
+      pollWindowEndMs: 2000,
+      originalRunIds: ["run-1"],
+      observedRunRows: [{ id: "run-1", status: "running", observedAtIso: "1970-01-01T00:00:01.500Z" }],
+      finalLiveRuns: [{ id: "run-1", status: "running" }, { id: "successor" }],
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: [],
+      statusMetadata: [],
+      successfulPollCount: 1,
+      finalIssueStatus: "in_progress",
+      finalSnapshotFailure: null,
+      finalSnapshots: [],
+      finalIssueState: { status: "in_progress", executionRunId: "run-1" },
+      finalContinuationDelivery: null,
+      hasResolveEvidence: false,
+      recoveryActionPresentAtResolve: null,
+      settledActionFoundAtResolve: null,
+      originalProviderAliveAtResolve: null,
+      resolveCompletedAtIso: null,
+      resumeInitiatedAtIso: "1970-01-01T00:00:01.000Z",
+    });
+
+    expect(evidence.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE);
   });
 
   it("keeps the precedence order explicit", () => {
@@ -125,8 +205,8 @@ describe("composer stop evidence", () => {
       settledActionFoundAtResolve: null,
       finalSnapshotFailure: "failed",
     };
-    expect(classifyRunningTimeout(input).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.INSTRUMENTATION_FAILURE);
-    expect(classifyRunningTimeout({ ...input, instrumentationFailures: [] }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE);
+    expect(classifyRunningTimeout(input).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE);
+    expect(classifyRunningTimeout({ ...input, finalSnapshotFailure: null }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.INSTRUMENTATION_FAILURE);
     expect(classifyRunningTimeout({ ...input, instrumentationFailures: [], apiErrorsDuringWindow: [], finalSnapshotFailure: null, successfulPollCount: 1, anyNewRunRunning: false }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.LATE_TRANSITION);
     expect(classifyRunningTimeout({ ...input, instrumentationFailures: [], apiErrorsDuringWindow: [], finalSnapshotFailure: null, successfulPollCount: 1, finalNewRunIds: [], anyNewRunRunning: true }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.RESUME_TRANSITION_OBSERVED);
     expect(classifyRunningTimeout({ ...input, instrumentationFailures: [], apiErrorsDuringWindow: [], finalSnapshotFailure: null, successfulPollCount: 1, finalNewRunIds: [], anyNewRunRunning: false }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.NO_TRANSITION);
@@ -161,6 +241,9 @@ describe("composer stop evidence", () => {
       finalLiveRuns: [{ id: "run-1", status: "running" }],
       apiErrorsDuringWindow: [],
       instrumentationFailures: [],
+      successfulPollCount: 1,
+      finalIssueStatus: "in_progress",
+      finalSnapshotFailure: null,
       statusMetadata: [
         { issueId: "issue-1", status: "running", eventCreatedAt: "1970-01-01T00:00:01.500Z" },
         { issueId: "issue-1", status: "cancelled", eventCreatedAt: "1970-01-01T00:00:03.000Z" },

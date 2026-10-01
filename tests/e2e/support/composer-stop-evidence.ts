@@ -176,17 +176,17 @@ export function classifyRunningTimeout(input: RunningTimeoutInput): RunningTimeo
     finalContinuationDelivery,
     finalSnapshotFailure,
   } = input;
+  if (finalSnapshotFailure) {
+    return {
+      verdict: RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE,
+      message: finalSnapshotFailure,
+    };
+  }
   if (instrumentationFailures.length > 0) {
     const failure = instrumentationFailures[0];
     return {
       verdict: RUNNING_TIMEOUT_VERDICTS.INSTRUMENTATION_FAILURE,
       message: `running-window instrumentation failed at ${failure.stage}: ${failure.message}`,
-    };
-  }
-  if (finalSnapshotFailure) {
-    return {
-      verdict: RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE,
-      message: finalSnapshotFailure,
     };
   }
   if (apiErrorsDuringWindow.length > 0) {
@@ -236,14 +236,17 @@ export type RunningTimeoutEvidenceInput = Omit<RunningTimeoutInput, "finalNewRun
   originalProviderAliveAtResolve?: boolean | null;
 };
 
-function liveRunRowsFromFinalSnapshot(value: unknown): Array<{ id: string; status: string }> {
+function validateFinalLiveRuns(value: unknown): {
+  rows: Array<{ id: string; status: string }>;
+  error: string | null;
+} {
   let candidates: unknown = value;
-  if (isRecord(value) && Array.isArray(value.body)) candidates = value.body;
-  if (!Array.isArray(candidates)) return [];
-  return candidates
-    .filter(isRecord)
-    .filter((candidate) => typeof candidate.id === "string" && typeof candidate.status === "string")
-    .map((candidate) => ({ id: candidate.id as string, status: candidate.status as string }));
+  if (isRecord(value) && "body" in value) candidates = value.body;
+  const result = validateLiveRuns(candidates);
+  return {
+    rows: result.rows.map((row) => ({ id: row.id, status: row.status })),
+    error: result.valid ? null : result.error,
+  };
 }
 
 export function buildRunningTimeoutEvidence(input: RunningTimeoutEvidenceInput) {
@@ -251,22 +254,31 @@ export function buildRunningTimeoutEvidence(input: RunningTimeoutEvidenceInput) 
     const atMs = Date.parse(failure.atIso);
     return atMs >= input.pollWindowStartMs && atMs <= input.pollWindowEndMs;
   });
-  const finalRunRows = liveRunRowsFromFinalSnapshot(input.finalLiveRuns);
+  const finalLiveRunsResult = validateFinalLiveRuns(input.finalLiveRuns);
+  const finalRunRows = finalLiveRunsResult.rows;
+  const pollingRunIds = new Set(input.observedRunRows.map((row) => row.id));
+  const finalOnlyRunIds = finalRunRows
+    .map((row) => row.id)
+    .filter((id) => !pollingRunIds.has(id));
   const distinctRunIds = [
-    ...new Set([
-      ...input.observedRunRows.map((row) => row.id),
-      ...finalRunRows.map((row) => row.id),
-    ]),
+    ...new Set([...pollingRunIds, ...finalRunRows.map((row) => row.id)]),
   ];
   const newRunIds = distinctRunIds.filter((id) => !input.originalRunIds.includes(id));
-  const anyNewRunRunning =
-    input.observedRunRows.some((row) => newRunIds.includes(row.id) && row.status === "running") ||
-    finalRunRows.some((row) => newRunIds.includes(row.id) && row.status === "running");
+  const anyNewRunRunning = input.observedRunRows.some(
+    (row) => newRunIds.includes(row.id) && row.status === "running",
+  );
+  const finalSnapshotFailure = [
+    input.finalSnapshotFailure,
+    finalLiveRunsResult.error ? `live-runs final snapshot: ${finalLiveRunsResult.error}` : null,
+  ]
+    .filter((failure): failure is string => failure !== null)
+    .join("; ") || null;
   const classification = classifyRunningTimeout({
     ...input,
     instrumentationFailures: pollFailures,
-    finalNewRunIds: newRunIds,
+    finalNewRunIds: finalOnlyRunIds.filter((id) => !input.originalRunIds.includes(id)),
     anyNewRunRunning,
+    finalSnapshotFailure,
   });
   const statusFramesDuringWindow = input.statusMetadata.filter((entry) => {
     if (entry.issueId !== input.issueId || typeof entry.eventCreatedAt !== "string") return false;
