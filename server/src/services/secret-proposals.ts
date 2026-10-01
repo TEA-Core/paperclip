@@ -565,6 +565,7 @@ export function createSecretProposalsService(db: Db) {
 
   async function applySecretApproval(txDb: Db, proposal: Proposal, input: {
     resolvedByUserId: string;
+    boardApiKeyId?: string | null;
     overrides?: { name?: string; description?: string | null; providerConfigId?: string | null };
   }) {
     if (!proposal.valueCiphertext) throw conflict("Proposed secret value is no longer available");
@@ -601,6 +602,7 @@ export function createSecretProposalsService(db: Db) {
       companyId: proposal.companyId,
       actorType: "user",
       actorId: input.resolvedByUserId,
+      boardApiKeyId: input.boardApiKeyId ?? null,
       action: "secret.created",
       entityType: "secret",
       entityId: created.id,
@@ -613,6 +615,7 @@ export function createSecretProposalsService(db: Db) {
 
   async function markApproved(txDb: Db, proposal: Proposal, input: {
     resolvedByUserId: string;
+    boardApiKeyId?: string | null;
     createdSecretId?: string | null;
     appliedBindingConfigPath?: string | null;
   }) {
@@ -635,6 +638,7 @@ export function createSecretProposalsService(db: Db) {
       companyId: proposal.companyId,
       actorType: "user",
       actorId: input.resolvedByUserId,
+      boardApiKeyId: input.boardApiKeyId ?? null,
       action: "secret.proposal.approved",
       entityType: "company_secret_proposal",
       entityId: proposal.id,
@@ -658,6 +662,7 @@ export function createSecretProposalsService(db: Db) {
     proposal: Proposal,
     secret: typeof companySecrets.$inferSelect,
     resolvedByUserId: string,
+    boardApiKeyId?: string | null,
   ) {
     if (!proposal.targetId || !proposal.configPath) throw conflict("Binding proposal is incomplete");
     const agentSvc = agentService(txDb);
@@ -706,6 +711,7 @@ export function createSecretProposalsService(db: Db) {
       companyId: proposal.companyId,
       actorType: "user",
       actorId: resolvedByUserId,
+      boardApiKeyId: boardApiKeyId ?? null,
       action: "agent.updated",
       entityType: "agent",
       entityId: target.id,
@@ -715,6 +721,7 @@ export function createSecretProposalsService(db: Db) {
 
   async function approve(companyId: string, proposalId: string, input: {
     resolvedByUserId: string;
+    boardApiKeyId?: string | null;
     cascade?: boolean;
     overrides?: { name?: string; description?: string | null; providerConfigId?: string | null };
     assertCanResolve?: (proposal: Proposal, txDb: Db) => Promise<void>;
@@ -729,6 +736,7 @@ export function createSecretProposalsService(db: Db) {
         const created = await applySecretApproval(txDb, proposal, input);
         return markApproved(txDb, proposal, {
           resolvedByUserId: input.resolvedByUserId,
+          boardApiKeyId: input.boardApiKeyId,
           createdSecretId: created.id,
         });
       }
@@ -750,6 +758,7 @@ export function createSecretProposalsService(db: Db) {
           const created = await applySecretApproval(txDb, dependency, input);
           await markApproved(txDb, dependency, {
             resolvedByUserId: input.resolvedByUserId,
+            boardApiKeyId: input.boardApiKeyId,
             createdSecretId: created.id,
           });
           secretId = created.id;
@@ -760,9 +769,10 @@ export function createSecretProposalsService(db: Db) {
       if (!liveSecret || liveSecret.companyId !== companyId || liveSecret.status !== "active") {
         throw conflict("Binding proposal secret is not active");
       }
-      await applyBindingApproval(txDb, proposal, liveSecret, input.resolvedByUserId);
+      await applyBindingApproval(txDb, proposal, liveSecret, input.resolvedByUserId, input.boardApiKeyId ?? null);
       return markApproved(txDb, proposal, {
         resolvedByUserId: input.resolvedByUserId,
+        boardApiKeyId: input.boardApiKeyId,
         appliedBindingConfigPath: proposal.configPath,
       });
     });
@@ -770,6 +780,7 @@ export function createSecretProposalsService(db: Db) {
 
   async function transition(companyId: string, proposalId: string, status: Exclude<SecretProposalTerminalStatus, "approved">, input: {
     resolvedByUserId?: string | null;
+    boardApiKeyId?: string | null;
     reason?: string | null;
     proposerAgentId?: string | null;
   } = {}) {
@@ -812,6 +823,7 @@ export function createSecretProposalsService(db: Db) {
         companyId,
         actorType,
         actorId,
+        boardApiKeyId: input.boardApiKeyId ?? null,
         action: `secret.proposal.${status}`,
         entityType: "company_secret_proposal",
         entityId: proposal.id,
@@ -824,6 +836,7 @@ export function createSecretProposalsService(db: Db) {
           companyId,
           actorType,
           actorId,
+          boardApiKeyId: input.boardApiKeyId ?? null,
           action: "secret.proposal.rejected",
           entityType: "company_secret_proposal",
           entityId: dependent.id,

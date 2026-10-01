@@ -22,6 +22,7 @@ import {
 export interface StalledReviewDecisionActor {
   userId: string;
   runId?: string | null;
+  boardApiKeyId?: string | null;
 }
 
 export interface DecideStalledReviewInput {
@@ -138,6 +139,7 @@ export function stalledReviewDecisionService(db: Db) {
             companyId: updated.companyId,
             actorType: "user",
             actorId: input.actor.userId,
+            boardApiKeyId: input.actor.boardApiKeyId ?? null,
             runId: input.actor.runId ?? null,
             action: "issue.stalled_review_decided",
             entityType: "issue",
@@ -204,6 +206,7 @@ export function stalledReviewDecisionService(db: Db) {
             companyId: updated.companyId,
             actorType: "user",
             actorId: input.actor.userId,
+            boardApiKeyId: input.actor.boardApiKeyId ?? null,
             runId: input.actor.runId ?? null,
             action: "issue.comment_added",
             entityType: "issue",
@@ -220,6 +223,7 @@ export function stalledReviewDecisionService(db: Db) {
           companyId: updated.companyId,
           actorType: "user",
           actorId: input.actor.userId,
+          boardApiKeyId: input.actor.boardApiKeyId ?? null,
           runId: input.actor.runId ?? null,
           action: "issue.stalled_review_decided",
           entityType: "issue",

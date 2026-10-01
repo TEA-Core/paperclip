@@ -11535,6 +11535,7 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        boardApiKeyId?: string | null;
         /**
          * Internal only. Set by `provisionIssueExecutionWorkspace` when it writes
          * back the workspace the project's own policy just produced, so that
@@ -11588,6 +11589,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        boardApiKeyId,
         systemWorkspaceBinding,
         companyGuard,
         ...issueData
@@ -12060,6 +12062,7 @@ export function issueService(db: Db) {
                     ? "user"
                     : "system",
                 actorId: actorAgentId ?? actorUserId ?? "issue_service",
+                boardApiKeyId: boardApiKeyId ?? null,
                 agentId: actorAgentId ?? null,
                 action: "execution_workspace.source_issue_reopened",
                 entityType: "execution_workspace",
@@ -12125,6 +12128,7 @@ export function issueService(db: Db) {
                     ? "user"
                     : "system",
                 actorId: actorAgentId ?? actorUserId ?? "issue_service",
+                boardApiKeyId: boardApiKeyId ?? null,
                 agentId: actorAgentId ?? null,
                 action: "issue.thread_interaction_expired",
                 entityType: "issue",
@@ -12267,6 +12271,7 @@ export function issueService(db: Db) {
             companyId: updated.companyId,
             actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
             actorId: actorAgentId ?? actorUserId ?? "issue_service",
+            boardApiKeyId: boardApiKeyId ?? null,
             agentId: actorAgentId ?? null,
             action: updated.hiddenAt ? "issue.hidden" : "issue.unhidden",
             entityType: "issue",
@@ -12358,6 +12363,7 @@ export function issueService(db: Db) {
             companyId: updated.companyId,
             actorType: "user",
             actorId: actorUserId,
+            boardApiKeyId: boardApiKeyId ?? null,
             action: "issue.inbox_archived",
             entityType: "issue",
             entityId: updated.id,

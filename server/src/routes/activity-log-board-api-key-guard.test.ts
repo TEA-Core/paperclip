@@ -12,14 +12,9 @@
  * scanned `routes/` subdirectories and did not exclude `*.spec.ts`). It now
  * walks those four subtrees recursively and treats `logActivityInTransaction`
  * as a first-class call shape. Test files (`__tests__/`, `*.test.ts`,
- * `*.spec.ts`) are excluded.
- *
- * Landing mode (SUP-17958, Shape 1 "quarantine warn-first" ruling, 2026-09-30):
- * this PR (PR 1) lands the widened guard NON-BLOCKING — the main scan computes
- * and names every reportable site but warns instead of failing the build.
- * SUP-18015 (PR 2) remediates the reported sites and restores hard-fail in the
- * same change. The site names emitted by the warning are the quarantine record
- * PR 2 consumes; do not delete the scan or the message to make the test green.
+ * `*.spec.ts`) are excluded. The guard is expected to be GREEN after
+ * SUP-18015 (PR 2) closes the reported sites; it must name every site if one
+ * regresses.
  *
  * The guard parses the COMPLETE second argument of each call (a comment- and
  * string-aware, balanced-brace parse — not a fixed line window) and requires a
@@ -122,6 +117,9 @@ const ALLOWLIST: AllowlistEntry[] = [
   { file: "secrets.ts", action: "secret.access.listed", reason: "agent actor" },
   // system actor: background/system join-claim event
   { file: "access.ts", action: "agent_api_key.claimed", reason: "system actor" },
+  // request-less: durable comment-delivery path (issue_comments carries no board
+  // key, so the resuming comment's board provenance is not in scope here)
+  { file: "agent-conversations.ts", action: "issue.tree_hold_released", actorType: '"user"', reason: "request-less comment-delivery path" },
 ];
 
 function isAllowlisted(allowlist: AllowlistEntry[], file: string, action: string, actorTypeExpr: string | undefined): boolean {
@@ -380,7 +378,7 @@ function scanSource(content: string, fileName: string, allowlist: AllowlistEntry
 }
 
 describe("board-api-key activity log guard", () => {
-  it("warns on every board-authenticable logActivity/persistActivity/logActivityInTransaction call missing boardApiKeyId (non-blocking quarantine)", () => {
+  it("all board-authenticable logActivity/persistActivity/logActivityInTransaction calls in the widened scope pass boardApiKeyId", () => {
     const files = collectSourceFiles();
     const allViolations: Violation[] = [];
 
@@ -390,26 +388,17 @@ describe("board-api-key activity log guard", () => {
       allViolations.push(...scanSource(content, base));
     }
 
-    // WARN-FIRST QUARANTINE (SUP-17958 Shape 1 ruling, 2026-09-30): PR 1 lands
-    // the widened guard non-blocking so it does not fail the build. The scan
-    // still runs and names every reportable site — that warning is the record
-    // SUP-18015 (PR 2) remediates against and then flips this guard back to
-    // hard-fail. Do not "fix" redness by deleting the scan or the message.
     if (allViolations.length > 0) {
       const summary = allViolations
         .map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`)
         .join("\n");
-      console.warn(
-        `board-api-key guard [WARN-FIRST, non-blocking]: boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s). SUP-18015 (PR 2) remediates these and restores hard-fail.\n` +
-          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" (or the transaction/actor equivalent) to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.\n` +
-          `${summary}`,
+      throw new Error(
+        `boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s):\n${summary}\n\n` +
+          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" (or the transaction/actor equivalent) to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.`,
       );
     }
 
-    // The guard ran and produced a well-formed result; redness is reported as a
-    // warning above, not a failure, in this PR.
-    expect(files.length).toBeGreaterThan(200);
-    expect(allViolations).toEqual(expect.any(Array));
+    expect(allViolations).toHaveLength(0);
   });
 
   it("allowlist entries reference valid files, actions, and actorType markers", () => {

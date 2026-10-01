@@ -202,6 +202,7 @@ export function createToolRuntimeSupervisor(db: Db, options: ToolRuntimeSupervis
       companyId: input.companyId,
       actorType: input.agentId ? "agent" : "system",
       actorId: input.agentId ?? "tool-runtime-supervisor",
+      boardApiKeyId: null,
       action: input.action,
       entityType: "tool_runtime_slot",
       entityId: input.slotId,

@@ -12318,6 +12318,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitor: IssueExecutionMonitorPolicy | null;
     actorType: "user" | "agent" | "system";
     actorId: string;
+    boardApiKeyId?: string | null;
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
@@ -12400,6 +12401,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: input.claimed.companyId,
         actorType: input.actorType,
         actorId: input.actorId,
+        boardApiKeyId: input.boardApiKeyId ?? null,
         agentId: input.agentId,
         runId: input.runId,
         action: "issue.monitor_recovery_issue_created",
@@ -12430,6 +12432,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: input.claimed.companyId,
         actorType: input.actorType,
         actorId: input.actorId,
+        boardApiKeyId: input.boardApiKeyId ?? null,
         agentId: input.agentId,
         runId: input.runId,
         action: "issue.monitor_escalated_to_board",
@@ -12481,6 +12484,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: input.claimed.companyId,
       actorType: input.actorType,
       actorId: input.actorId,
+      boardApiKeyId: input.boardApiKeyId ?? null,
       agentId: input.agentId,
       runId: input.runId,
       action: "issue.monitor_recovery_wake_queued",
@@ -12501,6 +12505,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     now: Date;
     actorType: "user" | "agent" | "system";
     actorId: string;
+    boardApiKeyId?: string | null;
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
@@ -12522,6 +12527,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: input.claimed.companyId,
       actorType: input.actorType,
       actorId: input.actorId,
+      boardApiKeyId: input.boardApiKeyId ?? null,
       agentId: input.agentId,
       runId: input.runId,
       action: "issue.monitor_exhausted",
@@ -12547,6 +12553,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       monitor: input.monitor,
       actorType: input.actorType,
       actorId: input.actorId,
+      boardApiKeyId: input.boardApiKeyId,
       agentId: input.agentId,
       runId: input.runId,
       activitySource: input.activitySource,
@@ -12564,6 +12571,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeReason: string;
       actorType: "user" | "agent" | "system";
       actorId: string;
+      boardApiKeyId?: string | null;
       agentId: string | null;
       runId: string | null;
       clearOnClientError: boolean;
@@ -12636,6 +12644,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         now: input.now,
         actorType: input.actorType,
         actorId: input.actorId,
+        boardApiKeyId: input.boardApiKeyId,
         agentId: input.agentId,
         runId: input.runId,
         activitySource: input.activitySource,
@@ -12747,6 +12756,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: claimed.companyId,
         actorType: input.actorType,
         actorId: input.actorId,
+        boardApiKeyId: input.boardApiKeyId ?? null,
         agentId: input.agentId,
         runId: input.runId,
         action: "issue.monitor_triggered",
@@ -12784,6 +12794,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             companyId: claimed.companyId,
             actorType: input.actorType,
             actorId: input.actorId,
+            boardApiKeyId: input.boardApiKeyId ?? null,
             agentId: input.agentId,
             runId: input.runId,
             action: "issue.monitor_skipped",
@@ -12829,6 +12840,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       now?: Date;
       actorType?: "user" | "agent" | "system";
       actorId?: string | null;
+      boardApiKeyId?: string | null;
       agentId?: string | null;
       runId?: string | null;
       wakeReason?: string;
@@ -12897,6 +12909,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeReason: input?.wakeReason ?? "issue_monitor_due",
       actorType,
       actorId,
+      boardApiKeyId: input?.boardApiKeyId ?? null,
       agentId: input?.agentId ?? null,
       runId: input?.runId ?? null,
       clearOnClientError: false,
@@ -12966,6 +12979,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           wakeReason: "issue_monitor_due",
           actorType: "system",
           actorId: "heartbeat_scheduler",
+          boardApiKeyId: null,
           agentId: null,
           runId: null,
           clearOnClientError: true,
@@ -20894,7 +20908,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         opts?.explicitRetry ? { previousId: metadata.pendingCleanupManualAttemptId } : undefined);
       if (!claimed) continue;
       if (opts?.explicitRetry) await logActivity(db, {
-        companyId: row.companyId, actorType: "user", actorId: opts.explicitRetry.actorId,
+        companyId: row.companyId, actorType: "user", actorId: opts.explicitRetry.actorId, boardApiKeyId: null,
         action: "environment_lease.cleanup_retried", entityType: "environment_lease", entityId: row.id,
         runId: opts.explicitRetry.runId, details: { attempt: attempts + 1, reason: opts.explicitRetry.reason ?? "retry_failed_run" },
       });

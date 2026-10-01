@@ -99,6 +99,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
     for (const publication of publications) publishActivity(publication);
     if (restored) await logActivity(db, { companyId: restored.companyId, actorType: "user",
       actorId: loaded.interaction.resolvedByUserId ?? loaded.interaction.addresseeUserId!,
+      boardApiKeyId: null,
       action: "issue.updated", entityType: "issue", entityId: restored.id,
       details: { status: restored.status, _previous: { status: "blocked" }, source: "ai_connection_restored", interactionId: loaded.interaction.id } });
     return restored;

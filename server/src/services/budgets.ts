@@ -870,6 +870,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       incidentId: string,
       input: BudgetIncidentResolutionInput,
       actorUserId: string,
+      boardApiKeyId?: string | null,
     ): Promise<BudgetIncident> => {
       const incident = await db
         .select()
@@ -939,6 +940,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         companyId: incident.companyId,
         actorType: "user",
         actorId: actorUserId,
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "budget.incident_resolved",
         entityType: "budget_incident",
         entityId: incident.id,

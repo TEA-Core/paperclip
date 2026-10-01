@@ -8658,6 +8658,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 companyId: endpoint.companyId,
                 actorType: "user",
                 actorId: principal.userId!,
+                boardApiKeyId: null,
                 action: "issue.thread_interaction_answered",
                 entityType: "issue",
                 entityId: issue.id,
@@ -8775,6 +8776,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: endpoint.companyId,
               actorType: "user",
               actorId: principal.userId!,
+              boardApiKeyId: null,
               action:
                 decision === "accept"
                   ? "issue.thread_interaction_accepted"
@@ -16136,6 +16138,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: taskEndpoint.companyId,
               actorType: taskUserId ? "user" : "system",
               actorId: taskUserId ?? "chat:imessage-photon",
+              boardApiKeyId: null,
               action: "issue.comment_added",
               entityType: "issue",
               entityId: issue.id,
@@ -19550,6 +19553,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           companyId: issue.companyId,
           actorType: "user",
           actorId: resolvedByUserId,
+          boardApiKeyId: null,
           action:
             interaction.status === "accepted"
               ? "issue.thread_interaction_accepted"
@@ -20925,6 +20929,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: issue.companyId,
               actorType: "user",
               actorId: principal.userId!,
+              boardApiKeyId: null,
               action: "issue.thread_interaction_answered",
               entityType: "issue",
               entityId: issue.id,
@@ -21645,6 +21650,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               companyId: issue.companyId,
               actorType: "user",
               actorId: principal.userId!,
+              boardApiKeyId: null,
               action: "issue.thread_interaction_answered",
               entityType: "issue",
               entityId: issue.id,
@@ -23060,6 +23066,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: scope.companyId,
             actorType: authorization.userId ? "user" : "system",
             actorId: authorization.userId ?? `chat:${principal.principal.id}`,
+            boardApiKeyId: null,
             action: "chat.discord_command_recorded",
             entityType: "chat_endpoint",
             entityId: scope.endpointId,
@@ -26094,6 +26101,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           companyId: current.companyId,
           actorType: actorUserId ? "user" : "system",
           actorId: actorUserId ?? "slack-session-stop",
+          boardApiKeyId: null,
           action:
             code === "slack_session_stop_cancelled"
               ? "chat.slack_session_stopped"
@@ -26459,6 +26467,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           companyId: action.companyId,
           actorType: "user",
           actorId: claim.userId,
+          boardApiKeyId: null,
           action: cancellationWon
             ? "chat.slack_session_stopped"
             : "chat.slack_session_stop_filtered",

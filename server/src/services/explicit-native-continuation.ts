@@ -267,7 +267,7 @@ export async function admitExplicitNativeContinuation(input: {
       },
     }).where(eq(issueRecoveryActions.id, action.id));
   }
-  await persistActivity(db, { companyId, actorType: "user", actorId,
+  await persistActivity(db, { companyId, actorType: "user", actorId, boardApiKeyId: null,
     action: "issue.execution_recovery_settled", entityType: "issue", entityId: issueId,
     details: { continuation: retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
       recoveryActionIds: actions.map(action => action.id), previousRunIds: sources.map(run => run.id) },

@@ -117,7 +117,7 @@ export type FoldOutcome =
   | { kind: "stale" };
 
 export type WatchdogDecisionActor =
-  | { type: "board"; userId?: string | null; runId?: string | null }
+  | { type: "board"; userId?: string | null; runId?: string | null; boardApiKeyId?: string | null }
   | { type: "agent"; agentId?: string | null; runId?: string | null }
   | { type: "none" };
 

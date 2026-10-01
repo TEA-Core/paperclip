@@ -269,7 +269,11 @@ function actorForMutation(req: Request): PipelineActor {
     return { type: "agent", agentId: req.actor.agentId, runId: req.actor.runId };
   }
   if (req.actor.type === "board") {
-    return { type: "user", userId: req.actor.userId ?? "board" };
+    return {
+      type: "user",
+      userId: req.actor.userId ?? "board",
+      boardApiKeyId: req.actor.source === "board_key" ? req.actor.keyId ?? null : null,
+    };
   }
   throw unauthorized();
 }

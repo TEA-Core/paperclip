@@ -436,6 +436,7 @@ export function activityRoutes(db: Db) {
     const event = await svc.create({
       companyId,
       ...req.body,
+      boardApiKeyId: getActorInfo(req).boardApiKeyId,
       details: req.body.details ? sanitizeRecord(req.body.details) : null,
     });
     res.status(201).json(event);

@@ -206,7 +206,7 @@ async function resolveRoutineResponsibleUserId(db: Db, companyId: string, actorU
   return resolveCompanyDefaultResponsibleUserId(db, companyId);
 }
 
-type Actor = { agentId?: string | null; userId?: string | null; runId?: string | null };
+type Actor = { agentId?: string | null; userId?: string | null; runId?: string | null; boardApiKeyId?: string | null };
 type RoutineRow = typeof routines.$inferSelect;
 type RoutineTriggerRow = typeof routineTriggers.$inferSelect;
 
@@ -1844,6 +1844,7 @@ export function routineService(
       companyId: string;
       issueId: string;
       userId: string;
+      boardApiKeyId?: string | null;
       touchedAt: Date;
     },
   ) {
@@ -1851,6 +1852,7 @@ export function routineService(
       companyId: input.companyId,
       actorType: "user",
       actorId: input.userId,
+      boardApiKeyId: input.boardApiKeyId ?? null,
       action: "issue.inbox_touched",
       entityType: "issue",
       entityId: input.issueId,
@@ -1978,6 +1980,7 @@ export function routineService(
 
       const triggeredAt = new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
+      const manualRunnerBoardApiKeyId = input.source === "manual" ? input.actor?.boardApiKeyId ?? null : null;
       const latestRevisionResponsibleUserId = input.routine.latestRevisionId
         ? await txDb
             .select({
@@ -2034,6 +2037,7 @@ export function routineService(
               companyId: input.routine.companyId,
               issueId: activeIssue.id,
               userId: manualRunnerUserId,
+              boardApiKeyId: manualRunnerBoardApiKeyId,
               touchedAt: triggeredAt,
             });
           }
@@ -2106,6 +2110,7 @@ export function routineService(
               companyId: input.routine.companyId,
               issueId: existingIssue.id,
               userId: manualRunnerUserId,
+              boardApiKeyId: manualRunnerBoardApiKeyId,
               touchedAt: triggeredAt,
             });
           }

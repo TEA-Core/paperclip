@@ -96,7 +96,7 @@ const DEFAULT_STAGES = [
 ] as const;
 
 export type PipelineActor =
-  | { type: "user"; userId: string }
+  | { type: "user"; userId: string; boardApiKeyId?: string | null }
   | { type: "agent"; agentId: string; runId: string }
   | { type: "system" };
 
@@ -2849,6 +2849,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     await logActivityInTransaction(dbOrTx as Db, {
       companyId: input.companyId,
       ...actorPatch,
+      boardApiKeyId: input.actor.type === "user" ? input.actor.boardApiKeyId ?? null : null,
       action: "routine.origin_stamped",
       entityType: "routine",
       entityId: input.routineId,
@@ -2897,6 +2898,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     await logActivityInTransaction(dbOrTx as Db, {
       companyId: input.companyId,
       ...actorPatch,
+      boardApiKeyId: input.actor.type === "user" ? input.actor.boardApiKeyId ?? null : null,
       action: "routine.origin_cleared",
       entityType: "routine",
       entityId: input.routineId,
@@ -3774,6 +3776,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         await logActivityInTransaction(txDb, {
           companyId: input.companyId,
           ...activityActorPatch(input.actor),
+          boardApiKeyId: input.actor.type === "user" ? input.actor.boardApiKeyId ?? null : null,
           action: "pipeline.stage_automation_env_updated",
           entityType: "pipeline_stage",
           entityId: input.stageId,
