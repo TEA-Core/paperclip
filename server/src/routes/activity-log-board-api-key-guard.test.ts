@@ -12,20 +12,9 @@
  * scanned `routes/` subdirectories and did not exclude `*.spec.ts`). It now
  * walks those four subtrees recursively and treats `logActivityInTransaction`
  * as a first-class call shape. Test files (`__tests__/`, `*.test.ts`,
-<<<<<<< HEAD
- * `*.spec.ts`) are excluded.
- *
- * Landing mode (SUP-17958, Shape 1 "quarantine warn-first" ruling, 2026-09-30):
- * this PR (PR 1) lands the widened guard NON-BLOCKING — the main scan computes
- * and names every reportable site but warns instead of failing the build.
- * SUP-18015 (PR 2) remediates the reported sites and restores hard-fail in the
- * same change. The site names emitted by the warning are the quarantine record
- * PR 2 consumes; do not delete the scan or the message to make the test green.
-=======
- * `*.spec.ts`) are excluded. The guard is expected to be RED on the unfixed
- * tree until SUP-18015 (PR 2) closes the reported sites; it must name every
- * site.
->>>>>>> c116b2dc16 (test(SUP-18014): widen board API-key source guard [PPC BE])
+ * `*.spec.ts`) are excluded. The guard is expected to be GREEN after
+ * SUP-18015 (PR 2) closes the reported sites; it must name every site if one
+ * regresses.
  *
  * The guard parses the COMPLETE second argument of each call (a comment- and
  * string-aware, balanced-brace parse — not a fixed line window) and requires a
@@ -389,30 +378,28 @@ function scanSource(content: string, fileName: string, allowlist: AllowlistEntry
 }
 
 describe("board-api-key activity log guard", () => {
-<<<<<<< HEAD
-   it("all board-authenticable logActivity/persistActivity/logActivityInTransaction calls in the widened scope pass boardApiKeyId", () => {
-     const files = collectSourceFiles();
-     const allViolations: Violation[] = [];
+  it("all board-authenticable logActivity/persistActivity/logActivityInTransaction calls in the widened scope pass boardApiKeyId", () => {
+    const files = collectSourceFiles();
+    const allViolations: Violation[] = [];
 
-     for (const file of files) {
-       const content = readFileSync(file, "utf-8");
-       const base = file.split("/").pop() as string;
-       allViolations.push(...scanSource(content, base));
-     }
+    for (const file of files) {
+      const content = readFileSync(file, "utf-8");
+      const base = file.split("/").pop() as string;
+      allViolations.push(...scanSource(content, base));
+    }
 
-     if (allViolations.length > 0) {
-       const summary = allViolations
-         .map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`)
-         .join("\\n");
-       throw new Error(
-         `boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s):\\n${summary}\\n\\n` +
-           `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" (or the transaction/actor equivalent) to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.`,
-       );
-     }
+    if (allViolations.length > 0) {
+      const summary = allViolations
+        .map((v) => `  ${v.file}:${v.line} — ${v.action} (${v.detail})`)
+        .join("\n");
+      throw new Error(
+        `boardApiKeyId missing from ${allViolations.length} board-authenticable logActivity call site(s):\n${summary}\n\n` +
+          `Add "boardApiKeyId: getActorInfo(req).boardApiKeyId" (or the transaction/actor equivalent) to each call, or add an occurrence-specific entry to the ALLOWLIST (file + action +, when a file/action pair is shared, the exact actorType expression) if the site is genuinely request-less or fence-owned.`,
+      );
+    }
 
-     expect(files.length).toBeGreaterThan(200);
-     expect(allViolations).toEqual(expect.any(Array));
-   });
+    expect(allViolations).toHaveLength(0);
+  });
 
   it("allowlist entries reference valid files, actions, and actorType markers", () => {
     const files = collectSourceFiles();
