@@ -184,6 +184,7 @@ type ResolveResult = {
   providerAliveAtResolve: boolean;
 };
 type ResumeContext = {
+  issueId: string;
   originalRunIds: string[];
   resolveCompletedAtIso: string | null;
   resumeInitiatedAtIso: string;
@@ -716,7 +717,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
     const originalSettings = await json(
       await request.get("/api/instance/settings/experimental"),
     );
-    const statusMetadata: Record<string, string | null>[] = [];
+    const statusMetadata: StatusMetadata[] = [];
     const instrumentationFailures: InstrumentationFailure[] = [];
     const resumeEvidenceLog: ResumeEvidence[] = [];
     let currentResumeContext: ResumeContext | undefined;
@@ -725,7 +726,11 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         socket.on("framereceived", ({ payload: frame }) => {
           const text =
             typeof frame === "string" ? frame : new TextDecoder().decode(frame);
-          statusFrameCollector.ingest(text);
+          const targetContext = currentResumeContext;
+          statusFrameCollector.ingest(text, targetContext ? {
+            issueId: targetContext.issueId,
+            runId: targetContext.originalRunIds[0],
+          } : undefined);
           statusMetadata.push(...statusFrameCollector.entries.splice(0));
           const targetFailures = currentResumeContext?.instrumentationFailures ?? instrumentationFailures;
           targetFailures.push(...statusFrameCollector.instrumentationFailures.splice(0));
@@ -1021,9 +1026,11 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         }
       }
       const resumeContextFor = (
+        issueId: string,
         originalRunId: string,
         resolve: ResolveResult | null,
       ): ResumeContext => ({
+        issueId,
         originalRunIds: [originalRunId],
         resolveCompletedAtIso: resolve?.resolveCompletedAtIso ?? null,
         resumeInitiatedAtIso,
@@ -1048,7 +1055,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       });
       // A verified stopped native runner can honor the explicitly selected
       // Wake agents option without another manual reconciliation step.
-      const parentResumeContext = resumeContextFor(parentRun.id, parentResolve);
+      const parentResumeContext = resumeContextFor(parent.id, parentRun.id, parentResolve);
       currentResumeContext = parentResumeContext;
       const resumedParentRun = await running(
         request,
@@ -1057,7 +1064,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         resumeEvidenceLog,
         parentResumeContext,
       );
-      const childResumeContext = resumeContextFor(childRun.id, childResolve);
+      const childResumeContext = resumeContextFor(child.id, childRun.id, childResolve);
       currentResumeContext = childResumeContext;
       const resumedChildRun = await running(
         request,

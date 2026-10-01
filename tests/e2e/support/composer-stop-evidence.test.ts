@@ -24,15 +24,67 @@ describe("composer stop evidence", () => {
   it("records instrumentation only for an owned status frame with malformed payload", () => {
     const collector = createStatusFrameCollector("company-1");
 
-    collector.ingest(JSON.stringify({
-      companyId: "company-1",
-      type: "heartbeat.run.status",
-      payload: null,
-    }));
+    collector.ingest(
+      JSON.stringify({
+        companyId: "company-1",
+        type: "heartbeat.run.status",
+        payload: null,
+      }),
+      { issueId: "issue-1", runId: "run-1" },
+    );
 
     expect(collector.entries).toEqual([]);
     expect(collector.instrumentationFailures).toHaveLength(1);
-    expect(collector.instrumentationFailures[0].stage).toBe("websocket-status-frame");
+    expect(collector.instrumentationFailures[0]).toMatchObject({
+      stage: "websocket-status-frame",
+      issueId: "issue-1",
+      runId: "run-1",
+    });
+  });
+
+  it("ignores malformed frames attributed to another issue or run", () => {
+    const collector = createStatusFrameCollector("company-1");
+
+    collector.ingest(
+      JSON.stringify({
+        companyId: "company-1",
+        type: "heartbeat.run.status",
+        payload: null,
+      }),
+      { issueId: "issue-2", runId: "run-2" },
+    );
+
+    const evidence = buildRunningTimeoutEvidence({
+      issueId: "issue-1",
+      adapter: "paperclip_runner",
+      companyId: "company-1",
+      pollWindowStartMs: Date.parse("2026-01-01T00:01:00.000Z"),
+      pollWindowEndMs: Date.parse("2026-01-01T00:02:00.000Z"),
+      originalRunIds: ["run-1"],
+      observedRunRows: [{ id: "run-1", status: "running", observedAtIso: "2026-01-01T00:01:30.000Z" }],
+      finalLiveRuns: [{ id: "run-1", status: "running" }],
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: collector.instrumentationFailures.map((failure) => ({
+        ...failure,
+        atIso: "2026-01-01T00:01:30.000Z",
+      })),
+      statusMetadata: [],
+      successfulPollCount: 1,
+      finalIssueStatus: "in_progress",
+      finalSnapshotFailure: null,
+      finalSnapshots: [],
+      finalIssueState: { status: "in_progress", executionRunId: "run-1" },
+      finalContinuationDelivery: null,
+      hasResolveEvidence: false,
+      recoveryActionPresentAtResolve: null,
+      settledActionFoundAtResolve: null,
+      originalProviderAliveAtResolve: null,
+      resolveCompletedAtIso: null,
+      resumeInitiatedAtIso: "2026-01-01T00:01:00.000Z",
+    });
+
+    expect(evidence.instrumentationFailures).toEqual([]);
+    expect(evidence.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.NO_TRANSITION);
   });
 
   it("does not carry global frame failures into a later poll window", () => {

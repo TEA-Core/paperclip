@@ -14,6 +14,13 @@ export type InstrumentationFailure = {
   atIso: string;
   stage: string;
   message: string;
+  issueId?: string;
+  runId?: string;
+};
+
+export type EvidenceOwnership = {
+  issueId: string;
+  runId: string;
 };
 
 export type ObservedRunRow = {
@@ -27,6 +34,7 @@ export type ObservedRunRow = {
 
 export type StatusMetadata = Record<string, string | null> & {
   eventCreatedAt?: string;
+  issueId?: string | null;
 };
 
 export type LiveRun = {
@@ -80,9 +88,10 @@ export function recordInstrumentationFailure(
   stage: string,
   error: unknown,
   atIso = new Date().toISOString(),
+  ownership?: EvidenceOwnership,
 ) {
   if (failures.length >= 25) return;
-  failures.push({ atIso, stage, message: errorMessage(error) });
+  failures.push({ atIso, stage, message: errorMessage(error), ...ownership });
 }
 
 export function validateLiveRuns(value: unknown): {
@@ -142,7 +151,7 @@ export function createStatusFrameCollector(companyId: string) {
   return {
     entries,
     instrumentationFailures,
-    ingest(frame: string | Uint8Array) {
+    ingest(frame: string | Uint8Array, ownership?: EvidenceOwnership) {
       let event: unknown;
       try {
         event = JSON.parse(typeof frame === "string" ? frame : new TextDecoder().decode(frame));
@@ -150,8 +159,15 @@ export function createStatusFrameCollector(companyId: string) {
         return;
       }
       if (!isRecord(event) || event.companyId !== companyId || event.type !== "heartbeat.run.status") return;
+      if (!ownership) return;
       if (!isRecord(event.payload)) {
-        recordInstrumentationFailure(instrumentationFailures, "websocket-status-frame", "owned heartbeat.run.status payload was malformed");
+        recordInstrumentationFailure(
+          instrumentationFailures,
+          "websocket-status-frame",
+          "owned heartbeat.run.status payload was malformed",
+          new Date().toISOString(),
+          ownership,
+        );
         return;
       }
       const entry: StatusMetadata = {};
@@ -159,6 +175,7 @@ export function createStatusFrameCollector(companyId: string) {
         const value = event.payload[key];
         if (value === null || typeof value === "string") entry[key] = value;
       }
+      entry.issueId = ownership.issueId;
       if (typeof event.createdAt === "string") entry.eventCreatedAt = event.createdAt;
       entries.push(entry);
     },
@@ -268,7 +285,14 @@ function validateFinalLiveRuns(value: unknown): {
 export function buildRunningTimeoutEvidence(input: RunningTimeoutEvidenceInput) {
   const pollFailures = input.instrumentationFailures.filter((failure) => {
     const atMs = Date.parse(failure.atIso);
-    return atMs >= input.pollWindowStartMs && atMs <= input.pollWindowEndMs;
+    const inPollWindow = atMs >= input.pollWindowStartMs && atMs <= input.pollWindowEndMs;
+    if (!inPollWindow) return false;
+    if (failure.stage !== "websocket-status-frame") return true;
+    return (
+      failure.issueId === input.issueId &&
+      failure.runId !== undefined &&
+      input.originalRunIds.includes(failure.runId)
+    );
   });
   const finalLiveRunsResult = validateFinalLiveRuns(input.finalLiveRuns);
   const finalRunRows = finalLiveRunsResult.rows;
