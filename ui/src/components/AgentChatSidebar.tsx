@@ -52,7 +52,7 @@ export function AgentChatSidebar({
               event.stopPropagation();
               onToggleStar(agent.id);
             }}
-            className={cn("absolute right-2 top-(--pct-50) -translate-y-(--pct-50) text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/agent-chat:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100", pinned && "opacity-100")}
+            className={cn("absolute right-2 top-(--pct-50) -translate-y-(--pct-50) text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/agent-chat:opacity-100 group-focus-within/agent-chat:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100", pinned && "opacity-100")}
           >
             <Star
               aria-hidden="true"
