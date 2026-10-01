@@ -9,6 +9,7 @@ import {
   type TestInfo,
 } from "@playwright/test";
 import {
+  attachEvidenceOrRethrow,
   buildRunningTimeoutEvidence,
   createStatusFrameCollector,
   observeLiveRuns,
@@ -365,21 +366,19 @@ async function running(
       resolveResponseBody: resume.resolveResponseBody,
       originalProviderAliveAtResolve: resume.originalProviderAliveAtResolve,
     });
-    await emitEvidence(
-      resume.testInfo,
-      "composer-stop-running-timeout-evidence",
+    const originalError = error;
+    await attachEvidenceOrRethrow(
+      () => emitEvidence(
+        resume.testInfo,
+        "composer-stop-running-timeout-evidence",
+        evidence,
+      ),
       evidence,
+      resume.instrumentationFailures,
+      "running-timeout-evidence-attachment",
+      error,
     );
-    throw new Error(
-      `composer-stop resume running-timeout (issue=${issueId}, adapter=${adapter}): ${evidence.verdict} :: ` +
-        `pollWindowMs=${pollWindowMs} newRunIds=${JSON.stringify(evidence.newRunIds)} ` +
-        `finalIssueStatus=${String(finalIssueState.status)} ` +
-        `finalContinuationDelivery=${String(finalContinuationDelivery)} ` +
-        `apiErrors=${resume.apiErrorsDuringWindow.length} ` +
-        `instrumentationFailures=${resume.instrumentationFailures.length} :: ` +
-        `see the composer-stop-running-timeout-evidence attachment. Original: ` +
-        (error instanceof Error ? error.message : String(error)),
-    );
+    throw originalError;
   }
   let fullRun = await json(await request.get(`/api/heartbeat-runs/${run!.id}`));
   await expect

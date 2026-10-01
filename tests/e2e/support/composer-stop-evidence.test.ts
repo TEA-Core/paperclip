@@ -215,16 +215,22 @@ describe("composer stop evidence", () => {
   it("records attachment failure and rethrows the original timeout unchanged", async () => {
     const timeout = new Error("timeout");
     const failures: { atIso: string; stage: string; message: string }[] = [];
+    const evidence: {
+      verdict?: (typeof RUNNING_TIMEOUT_VERDICTS)[keyof typeof RUNNING_TIMEOUT_VERDICTS];
+      instrumentationFailures?: typeof failures;
+    } = {};
 
     await expect(attachEvidenceOrRethrow(
       async () => {
         throw new Error("attachment failed");
       },
-      {},
+      evidence,
       failures,
       "attachment",
       timeout,
     )).rejects.toBe(timeout);
+    expect(evidence.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.INSTRUMENTATION_FAILURE);
+    expect(evidence.instrumentationFailures).toBe(failures);
     expect(failures).toHaveLength(1);
     expect(failures[0].stage).toBe("attachment");
   });
