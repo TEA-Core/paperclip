@@ -167,6 +167,7 @@ export function createStatusFrameCollector(companyId: string) {
 
 export function classifyRunningTimeout(input: RunningTimeoutInput): RunningTimeoutClassification {
   const {
+    adapter,
     apiErrorsDuringWindow,
     instrumentationFailures,
     successfulPollCount,
@@ -174,6 +175,9 @@ export function classifyRunningTimeout(input: RunningTimeoutInput): RunningTimeo
     anyNewRunRunning,
     finalIssueStatus,
     finalContinuationDelivery,
+    hasResolveEvidence,
+    recoveryActionPresentAtResolve,
+    settledActionFoundAtResolve,
     finalSnapshotFailure,
   } = input;
   if (finalSnapshotFailure) {
@@ -200,6 +204,18 @@ export function classifyRunningTimeout(input: RunningTimeoutInput): RunningTimeo
     return {
       verdict: RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE,
       message: "the running-window live-runs observation captured no successful reads",
+    };
+  }
+  if (
+    adapter === "process" &&
+    hasResolveEvidence &&
+    finalNewRunIds.length === 0 &&
+    recoveryActionPresentAtResolve !== true &&
+    settledActionFoundAtResolve !== true
+  ) {
+    return {
+      verdict: RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE,
+      message: "FIXTURE_OBSERVATION_ENDED_EARLY: the process reconcile observed neither an active nor a settled recovery action at resolve time, so it scheduled no successor wakeup and the resume had nothing to act on.",
     };
   }
   if (finalNewRunIds.length > 0 && !anyNewRunRunning) {

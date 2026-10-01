@@ -94,6 +94,69 @@ describe("composer stop evidence", () => {
     }).verdict).toBe(RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE);
   });
 
+  it("classifies process observation ending before recovery evidence as an observation failure", () => {
+    const classification = classifyRunningTimeout({
+      adapter: "process",
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: [],
+      observedRunRows: [{ id: "run-1", status: "running", observedAtIso: "now" }],
+      successfulPollCount: 1,
+      finalNewRunIds: [],
+      anyNewRunRunning: false,
+      finalIssueStatus: "in_progress",
+      finalContinuationDelivery: null,
+      hasResolveEvidence: true,
+      recoveryActionPresentAtResolve: false,
+      settledActionFoundAtResolve: false,
+      finalSnapshotFailure: null,
+    });
+
+    expect(classification.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE);
+    expect(classification.message).toContain("FIXTURE_OBSERVATION_ENDED_EARLY");
+  });
+
+  it("does not classify process observation as ended early when recovery evidence settled", () => {
+    const classification = classifyRunningTimeout({
+      adapter: "process",
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: [],
+      observedRunRows: [{ id: "run-1", status: "running", observedAtIso: "now" }],
+      successfulPollCount: 1,
+      finalNewRunIds: [],
+      anyNewRunRunning: false,
+      finalIssueStatus: "in_progress",
+      finalContinuationDelivery: null,
+      hasResolveEvidence: true,
+      recoveryActionPresentAtResolve: false,
+      settledActionFoundAtResolve: true,
+      finalSnapshotFailure: null,
+    });
+
+    expect(classification.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.NO_TRANSITION);
+    expect(classification.message).not.toContain("FIXTURE_OBSERVATION_ENDED_EARLY");
+  });
+
+  it("does not apply process observation-ended-early handling to native runs", () => {
+    const classification = classifyRunningTimeout({
+      adapter: "paperclip_runner",
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: [],
+      observedRunRows: [{ id: "run-1", status: "running", observedAtIso: "now" }],
+      successfulPollCount: 1,
+      finalNewRunIds: [],
+      anyNewRunRunning: false,
+      finalIssueStatus: "in_progress",
+      finalContinuationDelivery: null,
+      hasResolveEvidence: true,
+      recoveryActionPresentAtResolve: false,
+      settledActionFoundAtResolve: false,
+      finalSnapshotFailure: null,
+    });
+
+    expect(classification.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.NO_TRANSITION);
+    expect(classification.message).not.toContain("FIXTURE_OBSERVATION_ENDED_EARLY");
+  });
+
   it("classifies a running successor found only in the final snapshot as late", () => {
     const evidence = buildRunningTimeoutEvidence({
       issueId: "issue-1",
