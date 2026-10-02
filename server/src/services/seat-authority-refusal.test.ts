@@ -88,10 +88,20 @@ describe("resolveCallerSeat", () => {
     expect(resolveCallerSeat({ agentId: PARTICIPANT, userId: null }, completed)).toBe("other");
   });
 
-  it("names the return assignee from state, falling back to the policy", () => {
+  // The card goes where resolveReturnAssignee (issue-execution-policy.ts) sends it:
+  // policy.returnAssigneeAgentId first, then executionState.returnAssignee.
+  it("names the return assignee from the policy, falling back to state", () => {
     expect(resolveCallerSeat({ agentId: RETURN_ASSIGNEE, userId: null }, pendingIssue())).toBe("returnAssignee");
     const policyOnly = pendingIssue({ executionState: null });
     expect(resolveCallerSeat({ agentId: RETURN_ASSIGNEE, userId: null }, policyOnly)).toBe("returnAssignee");
+    const stateOnly = pendingIssue({ executionPolicy: { stages: [] } });
+    expect(resolveCallerSeat({ agentId: RETURN_ASSIGNEE, userId: null }, stateOnly)).toBe("returnAssignee");
+  });
+
+  it("when the policy was re-pointed after the stage armed, the policy's return assignee wins (a37e3e65 shape)", () => {
+    const repointed = pendingIssue({ executionPolicy: { returnAssigneeAgentId: STRANGER, stages: [] } });
+    expect(resolveCallerSeat({ agentId: STRANGER, userId: null }, repointed)).toBe("returnAssignee");
+    expect(resolveCallerSeat({ agentId: RETURN_ASSIGNEE, userId: null }, repointed)).toBe("other");
   });
 
   it("names a write that travelled the ancestor escape hatch ancestor-hatch", () => {
@@ -174,6 +184,12 @@ describe("next-action sentences", () => {
     expect(text).toContain("done with a comment approves");
     expect(text).toContain("blocked with a comment parks it");
     expect(text).toContain("Do not hand the card away");
+    // applyIssueExecutionStageTransition: the holder's in_review with no assignee is
+    // not a stage advance, so it is accepted (its inline comment lands); only an
+    // assignee naming someone else, alone or with in_review, reaches this 422.
+    expect(text).not.toContain("non-verdict in_review write is refused");
+    expect(text).toContain("An assignee write naming anyone but you (alone or with in_review) is refused");
+    expect(text).toContain("an in_review write without one is accepted and does not move the stage");
   });
 
   it("self-gated stage on a ladder that has run is terminal from every seat", () => {
@@ -182,6 +198,14 @@ describe("next-action sentences", () => {
     expect(text).toContain("games the gate");
     expect(text).toContain("Never drop the stage");
     expect(text).toContain(RECORD_AND_ASK_BOARD);
+  });
+
+  it("self-gated stage on a ladder that has run keeps the payload fix for a board caller (board rearm is a lever)", () => {
+    const text = selfGatedNextAction("other", { ladderHasRun: true, boardActor: true });
+    expect(text).toBe(
+      "Give the stage a participant that is not the return assignee, or change the return assignee. Never drop the stage to make this pass.",
+    );
+    expect(selfGatedNextAction("other", { ladderHasRun: true, boardActor: false })).toContain("games the gate");
   });
 
   it("self-gated stage at attach time keeps the one lawful payload fix", () => {

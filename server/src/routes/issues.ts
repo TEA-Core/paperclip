@@ -17149,7 +17149,13 @@ export function issueRoutes(
         companyId: existing.companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: requestedAssigneeAgentId ?? null,
-        refusalContext: { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+        // A board caller keeps the payload-fix remedy on a ladder that has run:
+        // its rearmExecutionPolicy is the board's own close-ladder lever.
+        refusalContext: {
+          caller: refusalCaller,
+          issue: existing as unknown as RefusalIssue,
+          boardActor: req.actor.type === "board",
+        },
       });
       await assertExecutionPolicyAgentReferencesResolve({
         companyId: existing.companyId,
