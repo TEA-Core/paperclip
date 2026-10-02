@@ -17182,7 +17182,12 @@ export function issueRoutes(
         executionPolicy: nextExecutionPolicy,
         executionState: existing.executionState,
         incomingAssigneeAgentId: normalizedAssigneeAgentId,
-        refusalContext: { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+        // A board caller gets the unchanged base message: changing the stage's
+        // participants is its own lawful repair, so the seat tail is wrong for it.
+        refusalContext:
+          req.actor.type === "board"
+            ? undefined
+            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
       });
     }
     if (updateFields.executionPolicy !== undefined) {

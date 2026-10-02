@@ -2578,6 +2578,24 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    it("gives a board caller the unchanged base 422, with no seat or next action", async () => {
+      // Changing the stage's participants is the board's own lawful repair, so
+      // the caller-aware tail ("ask the board", "never change the participants")
+      // is wrong for it (re-audit 2026-10-02).
+      const res = await request(await createApp(boardActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: gateReviewerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe(
+        `Refusing assigneeAgentId write: ${gateReviewerAgentId} is a participant of incomplete review stage ${gateStageId} and the write would make the stage self-satisfiable, because it cannot be cleared without the assignee approving their own work (participants excluding the assignee: 0, approvalsNeeded: 1)`,
+      );
+      expect(res.body.details.guard).toBe("assignee_review_gate");
+      expect(res.body.details).not.toHaveProperty("callerSeat");
+      expect(res.body.details).not.toHaveProperty("nextAction");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("allows the write when other participants can clear the stage without the assignee", async () => {
       mockIssueService.getById.mockResolvedValue(
         gateIssue({
