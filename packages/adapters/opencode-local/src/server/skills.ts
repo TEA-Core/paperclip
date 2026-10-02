@@ -8,6 +8,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import {
   buildPersistentSkillSnapshot,
+  buildRuntimeMountedSkillSnapshot,
   ensurePaperclipSkillSymlink,
   readPaperclipRuntimeSkillEntries,
   readInstalledSkillTargets,
@@ -64,18 +65,65 @@ async function buildOpenCodeSkillSnapshot(config: Record<string, unknown>): Prom
     externalDetail: "Installed outside Paperclip management in the shared skills home.",
     warnings: [
       "OpenCode currently uses the shared Claude skills home (~/.claude/skills).",
+      "Removing a skill updates this agent's desired skills only. Its link stays in the shared skills home, where other agents can still load it, until an operator cleans the home.",
+    ],
+  });
+}
+
+/**
+ * Snapshot for a `skillIsolation: "desired-only"` agent. Its local runs stage
+ * the desired set into a private per-run HOME
+ * (prepareOpenCodeIsolatedSkillsHome), so the shared skills home says nothing
+ * about this agent. A desired skill is reported as configured ("staged per
+ * run"), never as missing because no link exists in the shared home. A skill
+ * whose source is missing is still reported as missing.
+ */
+async function buildOpenCodeDesiredOnlySkillSnapshot(
+  config: Record<string, unknown>,
+): Promise<AdapterSkillSnapshot> {
+  const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  const desiredSkills = resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
+  return buildRuntimeMountedSkillSnapshot({
+    adapterType: "opencode_local",
+    availableEntries,
+    desiredSkills,
+    mode: "ephemeral",
+    configuredDetail:
+      "Staged per run (desired-only): linked into the run's private HOME when each local run starts. The shared skills home is not used.",
+    warnings: [
+      "skillIsolation=desired-only: each local run sees only this agent's desired skills. A skill sync never reads or writes the shared skills home.",
     ],
   });
 }
 
 export async function listOpenCodeSkills(ctx: AdapterSkillContext): Promise<AdapterSkillSnapshot> {
+  if (resolveOpenCodeSkillIsolation(ctx.config) === "desired-only") {
+    return buildOpenCodeDesiredOnlySkillSnapshot(ctx.config);
+  }
   return buildOpenCodeSkillSnapshot(ctx.config);
 }
 
+/**
+ * Apply an agent's desired skills to its runtime.
+ *
+ * desired-only: no filesystem effect. Each local run stages its own set into
+ * a private per-run HOME, so a sync never reads or writes the shared skills
+ * home.
+ *
+ * shared: LINK ONLY. Every shared agent on the host reads this one skills
+ * home, so it holds the union of their skills. Unlinking the skills this
+ * caller does not desire removed them from every other agent until that
+ * agent's next run re-linked them. A removal therefore changes the agent's
+ * desired skills only. The link stays until an operator cleans the shared
+ * home.
+ */
 export async function syncOpenCodeSkills(
   ctx: AdapterSkillContext,
   desiredSkills: string[],
 ): Promise<AdapterSkillSnapshot> {
+  if (resolveOpenCodeSkillIsolation(ctx.config) === "desired-only") {
+    return buildOpenCodeDesiredOnlySkillSnapshot(ctx.config);
+  }
   const availableEntries = await readPaperclipRuntimeSkillEntries(ctx.config, __moduleDir);
   const desiredSet = new Set([
     ...resolveLegacyPaperclipDesiredSkillNames({}, availableEntries),
@@ -83,21 +131,11 @@ export async function syncOpenCodeSkills(
   ]);
   const skillsHome = resolveOpenCodeSkillsHome(ctx.config);
   await fs.mkdir(skillsHome, { recursive: true });
-  const installed = await readInstalledSkillTargets(skillsHome);
-  const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));
 
   for (const available of availableEntries) {
     if (!desiredSet.has(available.key)) continue;
     const target = path.join(skillsHome, available.runtimeName);
     await ensurePaperclipSkillSymlink(available.source, target);
-  }
-
-  for (const [name, installedEntry] of installed.entries()) {
-    const available = availableByRuntimeName.get(name);
-    if (!available) continue;
-    if (desiredSet.has(available.key)) continue;
-    if (installedEntry.targetPath !== available.source) continue;
-    await fs.unlink(path.join(skillsHome, name)).catch(() => {});
   }
 
   return buildOpenCodeSkillSnapshot(ctx.config);

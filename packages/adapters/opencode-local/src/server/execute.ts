@@ -96,6 +96,7 @@ import {
   resolveOpenCodeSkillIsolation,
   resolveOpenCodeSkillsHome,
 } from "./skills.js";
+import { formatOpenCodeSkillExposureLine } from "./exposure-line.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -735,25 +736,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   }
-  // One line per run naming the skill mode and how many skills it exposes
-  // (SUP-17881), so the union-vs-desired-only cost of every run is greppable.
+  // One line per run naming the skill mode, how many skills it exposes
+  // (SUP-17881) and their sorted names, so the union-vs-desired-only
+  // cost of every run and the shared home's membership are readable from the
+  // run log. The format is a frozen contract: see exposure-line.ts.
   if (!executionTargetIsRemote) {
     if (isolatedSkillsHome && localSkillsDir) {
-      const exposedCount = (
-        await fs.readdir(localSkillsDir, { withFileTypes: true }).catch(() => [])
-      ).length;
+      const exposedNames = await fs.readdir(localSkillsDir).catch((): string[] => []);
       await onLog(
         "stdout",
-        `[paperclip] skillIsolation=desired-only: run exposes ${exposedCount} skill(s) via per-run HOME ${isolatedSkillsHome}\n`,
+        formatOpenCodeSkillExposureLine({
+          mode: "desired-only",
+          names: exposedNames,
+          location: isolatedSkillsHome,
+        }),
       );
     } else {
       const skillsHome = resolveOpenCodeSkillsHome(config);
-      const sharedCount = (
-        await fs.readdir(skillsHome, { withFileTypes: true }).catch(() => [])
-      ).length;
+      const sharedNames = await fs.readdir(skillsHome).catch((): string[] => []);
       await onLog(
         "stdout",
-        `[paperclip] skillIsolation=shared: run exposes ${sharedCount} skill(s) via shared skills home ${skillsHome}\n`,
+        formatOpenCodeSkillExposureLine({
+          mode: "shared",
+          names: sharedNames,
+          location: skillsHome,
+        }),
       );
     }
   } else if (resolveOpenCodeSkillIsolation(config) === "desired-only") {

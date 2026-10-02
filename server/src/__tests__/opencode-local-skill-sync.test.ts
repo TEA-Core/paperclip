@@ -46,3 +46,176 @@ describe("opencode local skill sync", () => {
     expect((await fs.lstat(path.join(home, ".claude", "skills", "paperclip"))).isSymbolicLink()).toBe(true);
   });
 });
+
+// Shared callers: a skill sync never prunes the shared skills home.
+
+const SHARED_REMOVE_WARNING =
+  "Removing a skill updates this agent's desired skills only. Its link stays in the shared skills home, where other agents can still load it, until an operator cleans the home.";
+
+async function createSkillDir(root: string, name: string): Promise<string> {
+  const dir = path.join(root, name);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "SKILL.md"), `# ${name}\n`, "utf8");
+  return dir;
+}
+
+/** Every entry of a skills home as [name, readlink target or null], sorted by name. */
+async function listSkillsHome(skillsHome: string): Promise<Array<[string, string | null]>> {
+  const names = (await fs.readdir(skillsHome).catch((): string[] => [])).sort();
+  return Promise.all(
+    names.map(async (name): Promise<[string, string | null]> => [
+      name,
+      await fs.readlink(path.join(skillsHome, name)).catch(() => null),
+    ]),
+  );
+}
+
+async function makePruneFixture(cleanupDirs: Set<string>) {
+  const root = await makeTempDir("paperclip-opencode-prune-");
+  cleanupDirs.add(root);
+  const home = path.join(root, "home");
+  await fs.mkdir(home, { recursive: true });
+  const sources = path.join(root, "src");
+  const runtimeSkills = [
+    { key: "pc/alpha", runtimeName: "alpha", source: await createSkillDir(sources, "alpha") },
+    { key: "pc/beta", runtimeName: "beta", source: await createSkillDir(sources, "beta") },
+    { key: "pc/gamma", runtimeName: "gamma", source: await createSkillDir(sources, "gamma") },
+  ];
+  const ctxFor = (agentId: string, desiredSkills: string[], extra: Record<string, unknown> = {}) => ({
+    agentId,
+    companyId: "company-1",
+    adapterType: "opencode_local",
+    config: {
+      env: { HOME: home },
+      paperclipRuntimeSkills: runtimeSkills,
+      paperclipSkillSync: { desiredSkills },
+      ...extra,
+    },
+  });
+  return { home, skillsHome: path.join(home, ".claude", "skills"), runtimeSkills, ctxFor };
+}
+
+describe("opencode local skill sync: shared callers link only", () => {
+  const cleanupDirs = new Set<string>();
+
+  afterEach(async () => {
+    await Promise.all(Array.from(cleanupDirs).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+    cleanupDirs.clear();
+  });
+
+  it("(1) keeps peers' links when a shared caller adds a skill", async () => {
+    const { skillsHome, runtimeSkills, ctxFor } = await makePruneFixture(cleanupDirs);
+    await syncOpenCodeSkills(ctxFor("peer", ["pc/alpha", "pc/beta"]), ["pc/alpha", "pc/beta"]);
+    const peersBefore = await listSkillsHome(skillsHome);
+    expect(peersBefore.map(([name]) => name)).toEqual(["alpha", "beta"]);
+
+    await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"]), ["pc/gamma"]);
+
+    expect(await listSkillsHome(skillsHome)).toEqual([
+      ...peersBefore,
+      ["gamma", runtimeSkills[2]!.source],
+    ]);
+  });
+
+  it("(3) keeps the link when a shared caller removes a skill only it desires", async () => {
+    const { skillsHome, runtimeSkills, ctxFor } = await makePruneFixture(cleanupDirs);
+    await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"]), ["pc/gamma"]);
+
+    const snapshot = await syncOpenCodeSkills(ctxFor("caller", []), []);
+
+    expect(await listSkillsHome(skillsHome)).toEqual([["gamma", runtimeSkills[2]!.source]]);
+    const gamma = snapshot.entries.find((entry) => entry.key === "pc/gamma");
+    expect(gamma?.desired).toBe(false);
+    expect(gamma?.state).toBe("stale");
+    expect(snapshot.warnings).toContain(SHARED_REMOVE_WARNING);
+  });
+});
+
+// Desired-only callers: a sync never reads or writes the shared skills home.
+
+const DESIRED_ONLY_STAGED_DETAIL =
+  "Staged per run (desired-only): linked into the run's private HOME when each local run starts. The shared skills home is not used.";
+
+describe("opencode local skill sync: desired-only callers never touch the shared home", () => {
+  const cleanupDirs = new Set<string>();
+  const desiredOnly = { skillIsolation: "desired-only" };
+
+  afterEach(async () => {
+    await Promise.all(Array.from(cleanupDirs).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+    cleanupDirs.clear();
+  });
+
+  it("(2) leaves the shared home's listing identical across a desired-only remove then add", async () => {
+    const { skillsHome, ctxFor } = await makePruneFixture(cleanupDirs);
+    await syncOpenCodeSkills(ctxFor("peer", ["pc/alpha", "pc/beta"]), ["pc/alpha", "pc/beta"]);
+    const before = await listSkillsHome(skillsHome);
+    expect(before.map(([name]) => name)).toEqual(["alpha", "beta"]);
+
+    const removed = await syncOpenCodeSkills(ctxFor("caller", [], desiredOnly), []);
+    const added = await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"], desiredOnly), ["pc/gamma"]);
+
+    expect(await listSkillsHome(skillsHome)).toEqual(before);
+    expect(removed.entries.filter((entry) => entry.desired)).toEqual([]);
+    expect(added.mode).toBe("ephemeral");
+    expect(added.entries.find((entry) => entry.key === "pc/gamma")).toMatchObject({
+      desired: true,
+      state: "configured",
+      targetPath: null,
+      detail: DESIRED_ONLY_STAGED_DETAIL,
+    });
+    // The shared-home remove warning describes the shared home, which a desired-only snapshot never reports on.
+    expect(removed.warnings).not.toContain(SHARED_REMOVE_WARNING);
+    expect(added.warnings).not.toContain(SHARED_REMOVE_WARNING);
+  });
+
+  it("(2b) lists a desired skill as staged per run, never as missing", async () => {
+    const { ctxFor } = await makePruneFixture(cleanupDirs);
+
+    const snapshot = await listOpenCodeSkills(ctxFor("caller", ["pc/gamma"], desiredOnly));
+
+    expect(snapshot.mode).toBe("ephemeral");
+    expect(snapshot.entries.find((entry) => entry.key === "pc/gamma")).toMatchObject({
+      desired: true,
+      state: "configured",
+      detail: DESIRED_ONLY_STAGED_DETAIL,
+    });
+    expect(snapshot.entries.filter((entry) => entry.state === "missing")).toEqual([]);
+    expect(snapshot.warnings).not.toContain(SHARED_REMOVE_WARNING);
+  });
+
+  it("(2c) creates nothing under a fresh HOME", async () => {
+    const { home, ctxFor } = await makePruneFixture(cleanupDirs);
+
+    await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"], desiredOnly), ["pc/gamma"]);
+
+    await expect(fs.lstat(path.join(home, ".claude"))).rejects.toThrow();
+  });
+
+  it("(2d) still reports a desired skill whose source is missing as missing", async () => {
+    const { runtimeSkills, ctxFor } = await makePruneFixture(cleanupDirs);
+
+    const snapshot = await listOpenCodeSkills(
+      ctxFor("caller", ["pc/gamma"], {
+        ...desiredOnly,
+        paperclipRuntimeSkills: [
+          ...runtimeSkills.slice(0, 2),
+          { ...runtimeSkills[2]!, sourceStatus: "missing", missingDetail: "The skill version snapshot was deleted." },
+        ],
+      }),
+    );
+
+    expect(snapshot.entries.find((entry) => entry.key === "pc/gamma")).toMatchObject({
+      desired: true,
+      state: "missing",
+      detail: "The skill version snapshot was deleted.",
+    });
+  });
+
+  it("(2e) treats a misspelled skillIsolation value as shared and still links", async () => {
+    const { skillsHome, runtimeSkills, ctxFor } = await makePruneFixture(cleanupDirs);
+
+    await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"], { skillIsolation: "desired_only" }), ["pc/gamma"]);
+
+    expect(await listSkillsHome(skillsHome)).toEqual([["gamma", runtimeSkills[2]!.source]]);
+  });
+});
