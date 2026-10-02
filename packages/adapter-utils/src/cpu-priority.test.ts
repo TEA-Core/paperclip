@@ -184,7 +184,8 @@ describe("deprioritizeCpu covers every thread", () => {
     ).not.toThrow();
   });
 
-  it.skipIf(process.platform !== "linux")(
+  // At nice 19 there is no lower priority to step to, so nothing is observable.
+  it.skipIf(process.platform !== "linux" || os.getPriority() >= 19)(
     "lowers the threads a real process already started",
     async () => {
       // A child with two worker threads, all started before the step runs.
