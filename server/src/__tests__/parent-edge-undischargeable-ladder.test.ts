@@ -693,6 +693,58 @@ describeEmbeddedPostgres("parent edge that would add an undischargeable ladder (
     expect(byTitle).toHaveLength(0);
   });
 
+  it("allows a re-parent of a title-and-description-declared redo child without its label", async () => {
+    const { companyId, issuePrefix } = await seedCompany();
+    const supportQaeAgentId = await seedSupportQaeAgent(companyId);
+    const parent = await seedAdvancedNonConformingParent(
+      companyId,
+      issuePrefix,
+      1,
+      supportQaeAgentId,
+      true,
+    );
+    await seedQualifyingChild(
+      companyId,
+      issuePrefix,
+      2,
+      parent.id,
+      supportQaeAgentId,
+    );
+
+    const otherParentId = randomUUID();
+    await db.insert(issues).values({
+      id: otherParentId,
+      companyId,
+      issueNumber: 3,
+      identifier: `${issuePrefix}-3`,
+      title: "Benign parent",
+      status: "todo",
+      priority: "medium",
+    });
+    const childId = randomUUID();
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      issueNumber: 4,
+      identifier: `${issuePrefix}-4`,
+      parentId: otherParentId,
+      parentLinkKind: "decomposition",
+      title: "[redo] Child being re-homed",
+      description: "work-type:redo\n\nRetry the same deliverable.",
+      status: "todo",
+      priority: "medium",
+      originKind: "manual",
+    });
+
+    const res = await request(createApp(companyId))
+      .patch(`/api/issues/${childId}`)
+      .send({ parentId: parent.id });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const edge = await edgeFor(childId);
+    expect(edge?.parentId).toBe(parent.id);
+  });
+
   it("allows a re-parent of a carve-out-labelled child into an advanced, non-conforming parent", async () => {
     // The re-parent path resolves the label set off the stored row, so it needs
     // its own pin: the create-side fix does not reach it.

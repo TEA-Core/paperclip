@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  hasLadderCarveOutDeclaration,
   isLadderArmingParentEdge,
   LADDERED_CHILD_CARVE_OUT_LABEL_NAMES,
 } from "./laddered-child-eligibility.js";
@@ -72,6 +73,26 @@ describe("isLadderArmingParentEdge", () => {
         status: "todo",
         parentLinkKind: "process",
       }),
+    ).toBe(false);
+  });
+
+  it("does not count a declaration-based carve-out child", () => {
+    expect(
+      isLadderArmingParentEdge({
+        originKind: "manual",
+        status: "todo",
+        hasCarveOutDeclaration: true,
+      }),
+    ).toBe(false);
+    expect(hasLadderCarveOutDeclaration("[redo] retry", "Details")).toBe(true);
+    expect(
+      hasLadderCarveOutDeclaration(
+        "ordinary",
+        "\nwork-type:delivery\nDetails",
+      ),
+    ).toBe(true);
+    expect(
+      hasLadderCarveOutDeclaration("ordinary", "Details\nwork-type:redo"),
     ).toBe(false);
   });
 

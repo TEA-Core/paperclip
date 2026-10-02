@@ -5,7 +5,10 @@ import {
   buildUndischargeableLadderEdgeConflict,
   evaluateUndischargeableLadderEdge,
 } from "../services/parent-edge-close-ladder-gate.js";
-import { edgeCarriesLadderCarveOutLabel } from "../services/laddered-child-eligibility.js";
+import {
+  edgeCarriesLadderCarveOutLabel,
+  hasLadderCarveOutDeclaration,
+} from "../services/laddered-child-eligibility.js";
 import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -18030,6 +18033,10 @@ export function issueRoutes(
                 originKind: existing.originKind,
                 status: effectiveStatus ?? existing.status,
                 hasCarveOutLabel,
+                hasCarveOutDeclaration: hasLadderCarveOutDeclaration(
+                  existing.title,
+                  existing.description,
+                ),
               },
             );
             if (!ladderVerdict.ok) {
