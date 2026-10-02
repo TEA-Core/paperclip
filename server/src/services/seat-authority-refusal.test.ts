@@ -160,6 +160,22 @@ describe("next-action sentences", () => {
     expect(other).not.toContain("returns the card to you");
   });
 
+  // Re-audit 3: the stage holder's own assignee-only / in_review write falls out
+  // of its decision branch and reaches this refusal with seat currentParticipant.
+  // It must not be told it does not hold the stage.
+  it("the stage holder's non-verdict write is told it holds the stage and only its verdict moves it", () => {
+    const text = stageHeldElsewhereNextAction("currentParticipant", {
+      stageType: "review",
+      participant: { type: "agent", agentId: PARTICIPANT, userId: null },
+    });
+    expect(text).not.toContain("does not hold");
+    expect(text).toContain("Your seat (currentParticipant) holds this review stage");
+    expect(text).toContain("only your decision moves it");
+    expect(text).toContain("done with a comment approves");
+    expect(text).toContain("blocked with a comment parks it");
+    expect(text).toContain("Do not hand the card away");
+  });
+
   it("self-gated stage on a ladder that has run is terminal from every seat", () => {
     const text = selfGatedNextAction("assignee", { ladderHasRun: true });
     expect(text).toContain("already run");

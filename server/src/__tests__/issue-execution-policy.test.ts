@@ -1278,6 +1278,48 @@ describe("issue execution policy transitions", () => {
       expect(details.currentParticipant).toEqual({ type: "agent", agentId: qaAgentId, userId: null });
     });
 
+    it("the stage holder's assignee-only write keeps the prefix and says it holds the stage", () => {
+      let err: HttpError | null = null;
+      try {
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: undefined,
+          requestedAssigneePatch: { assigneeAgentId: coderAgentId },
+          actor: { agentId: qaAgentId },
+          commentBody: "Handing back",
+        });
+      } catch (e) {
+        err = e as HttpError;
+      }
+      expect(err).toBeInstanceOf(HttpError);
+      expect(err!.status).toBe(422);
+      expect(
+        err!.message.startsWith("Only the active reviewer or approver can advance the current execution stage. "),
+      ).toBe(true);
+      const details = err!.details as { callerSeat: string; nextAction: string };
+      expect(details.callerSeat).toBe("currentParticipant");
+      expect(details.nextAction).toContain("holds this review stage");
+      expect(details.nextAction).not.toContain("does not hold");
+      expect(details.nextAction).toContain("only your decision moves it");
+    });
+
     it("an unrelated agent is seat other; an ancestor writing through the hatch is seat ancestor-hatch", () => {
       expect((refusalFor({ agentId: ctoAgentId }).details as { callerSeat: string }).callerSeat).toBe("other");
       const hatch = refusalFor({ agentId: ctoAgentId }, { viaAncestorHatch: true });

@@ -179,6 +179,17 @@ export function stageHeldElsewhereNextAction(
   stage: { stageType: string | null; participant: RefusalPrincipal | null },
 ): string {
   const stageName = stage.stageType ? `${stage.stageType} stage` : "stage";
+  if (seat === "currentParticipant") {
+    // The holder reaches this refusal only with a non-verdict write: an
+    // assignee-only PATCH, or in_review plus an assignee (its decision branch
+    // handles done, blocked and every other status).
+    return (
+      `Your seat (currentParticipant) holds this ${stageName}, and only your decision moves it: ` +
+      "done with a comment approves; todo, in_progress or cancelled with a comment requests changes; " +
+      "blocked with a comment parks it. An assignee-only write or a non-verdict in_review write is refused. " +
+      "Do not hand the card away."
+    );
+  }
   const returns =
     // Only a changes_requested decision hands the card back: an approve moves it to the
     // next stage's participant or completes the workflow with the approver.
