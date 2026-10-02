@@ -68,6 +68,15 @@ import {
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
 import { DEFAULT_AGENT_OOM_SCORE_ADJ } from "./oom-priority.js";
+import { resolveAgentNice } from "./cpu-priority.js";
+
+// Field 19 of /proc/<pid>/stat is the nice value. The comm field (2) may contain
+// spaces and parentheses, so count from the LAST ')'.
+async function readNice(pid: number): Promise<number> {
+  const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+  const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  return Number.parseInt(rest[16]!, 10);
+}
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -438,6 +447,37 @@ describe("runChildProcess OOM deprioritization (SUP-17610)", () => {
       // The run still completes cleanly — the mark must not break the spawn.
       expect(result.exitCode).toBe(0);
       expect(observedAdj).toBe(DEFAULT_AGENT_OOM_SCORE_ADJ);
+    },
+  );
+
+  // Same seam, CPU instead of memory: agent runs share the server's CPU cgroup,
+  // so the run child is put PAPERCLIP_AGENT_NICE steps below the server. On the
+  // unarmed path the server does it; under the uid split the setuid shim does
+  // (test-spawn-shim.sh), and the server must not add a second step.
+  it.skipIf(process.platform !== "linux" || uidGateArmed)(
+    "lowers the spawned run child's CPU priority below the server's on the unarmed path",
+    async () => {
+      let observedNice: number | null = null;
+      const own = os.getPriority();
+
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "setTimeout(() => {}, 1500);"],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+          onSpawn: async (meta) => {
+            observedNice = await readNice(meta.pid);
+          },
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(observedNice).toBe(Math.min(19, own + resolveAgentNice(process.env)));
     },
   );
 });
