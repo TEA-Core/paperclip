@@ -62,16 +62,26 @@ const MIGRATION_ALTER_SUBTYPES = new Set([
  * - functions that run SQL text or read a table named in a string:
  *   query_to_xml*, table_to_xml*, cursor_to_xml*, schema_to_xml*, database_to_xml*,
  *   ts_stat, dblink*
- * - server file and large-object access: pg_read_file, pg_read_binary_file, pg_ls_*,
- *   pg_stat_file, lo_import, lo_export, lo_get, lo_put
+ * - server file access: pg_read_file, pg_read_binary_file, pg_ls_*, pg_stat_file,
+ *   pg_file_* (the adminpack functions pg_file_write, pg_file_rename, pg_file_unlink,
+ *   pg_file_sync)
+ * - large objects: every lo_* function (lo_import, lo_export, lo_get, lo_put, lo_open,
+ *   lo_create, lo_creat, lo_unlink, lo_truncate, lo_from_bytea and the rest), loread, lowrite
  * - settings and sequence values: set_config, setval
- * - backend and server control: pg_terminate_backend, pg_cancel_backend,
- *   pg_reload_conf, pg_rotate_logfile
+ * - backend and server control: pg_terminate_backend, pg_cancel_backend, pg_reload_conf,
+ *   pg_rotate_logfile, pg_switch_wal, pg_promote, pg_backup_start, pg_backup_stop,
+ *   pg_start_backup, pg_stop_backup
+ * - notifications and logical decoding: pg_notify, every pg_logical_* function
+ *   (pg_logical_emit_message, pg_logical_slot_get_changes and the other slot get and peek functions)
+ * - replication slots: pg_create_physical_replication_slot, pg_create_logical_replication_slot,
+ *   pg_copy_physical_replication_slot, pg_copy_logical_replication_slot,
+ *   pg_drop_replication_slot, pg_replication_slot_advance
  *
  * It does not cover every function that reads a relation by name or has a side effect.
  * nextval, pg_advisory_*lock* and pg_sleep* are deliberately allowed, and so is every
- * other function that is not listed here. The real fix for those is to run plugin SQL
- * under a non-superuser runtime role, not a longer list.
+ * other function that is not listed here (for example pg_replication_origin_*,
+ * pg_create_restore_point, pg_stat_reset* and pg_export_snapshot). The real fix for those
+ * is to run plugin SQL under a non-superuser runtime role, not a longer list.
  */
 const DISALLOWED_FUNCTION_PATTERNS = [
   "(?:query|table|cursor|schema|database)_to_xml\\w*",
@@ -80,12 +90,23 @@ const DISALLOWED_FUNCTION_PATTERNS = [
   "pg_read_(?:binary_)?file",
   "pg_ls_\\w+",
   "pg_stat_file",
-  "lo_(?:import|export|get|put)",
+  "pg_file_\\w+",
+  "lo_\\w+",
+  "loread",
+  "lowrite",
   "set_config",
   "setval",
   "pg_(?:terminate|cancel)_backend",
   "pg_reload_conf",
   "pg_rotate_logfile",
+  "pg_switch_wal",
+  "pg_promote",
+  "pg_(?:backup_start|backup_stop|start_backup|stop_backup)",
+  "pg_notify",
+  "pg_logical_\\w+",
+  "pg_(?:create|copy)_(?:physical|logical)_replication_slot",
+  "pg_drop_replication_slot",
+  "pg_replication_slot_advance",
 ];
 const DISALLOWED_FUNCTION_RE = new RegExp(`^(?:${DISALLOWED_FUNCTION_PATTERNS.join("|")})$`);
 const RUNTIME_STATEMENT_COUNT_ERROR = "Plugin runtime SQL must contain exactly one statement";
@@ -357,6 +378,10 @@ export function validatePluginMigrationStatement(
   }
   if (kind === "CreateTableAsStmt" && node.objtype !== "OBJECT_TABLE") {
     throw new Error("Plugin migrations may contain DDL or namespace-scoped backfill statements only");
+  }
+  if (kind === "CreateTableAsStmt" && isNode(node.query) && isNode(node.query.ExecuteStmt)) {
+    // EXECUTE runs a prepared statement by name. Its query text is invisible to the relation rule.
+    throw new Error("Plugin migrations cannot create a table from EXECUTE");
   }
 
   assertMigrationTarget(migrationTarget(kind, node), namespace);
