@@ -158,17 +158,24 @@ export function describePrincipal(principal: RefusalPrincipal | null | undefined
   return "its participant";
 }
 
-/** Mechanism D (ADR-072 close-ladder shape) 409, for every agent seat, the assignee included. */
+/**
+ * Mechanism D (ADR-072 close-ladder shape) 409, for every agent seat, the assignee included.
+ * control-plane-403.md §7 grants the one post-answer re-send to the stage holder
+ * alone ("the approver re-sends its verdict once"), so only currentParticipant
+ * is told to re-send; every other seat records, asks the board, and stops.
+ */
 export function mechanismDNextAction(seat: CallerSeat): string {
+  const holder = seat === "currentParticipant";
   return (
     `Your seat (${seat}) cannot lawfully repair this close ladder: no re-arm, no added or reordered stage, ` +
-    "no relabelled or re-parented child, no courier card, and no second close until the board answers. " +
+    "no relabelled or re-parented child, no courier card, and " +
+    (holder ? "no second close until the board answers. " : "no second close from your seat. ") +
     `${RECORD_AND_ASK_BOARD} The board's levers are a carve-out label ` +
     `(${BOARD_CARVE_OUT_LABELS.join(", ")}) on a child that is not decomposition work, ` +
-    "or a board rearmExecutionPolicy with the full close ladder. " +
+    "or a board rearmExecutionPolicy with the full close ladder." +
     // Persisted as the thread record's Remedy line, which the run the board's answer
-    // wakes reads first: it must not forbid that run's one lawful write.
-    "Once the board reports the ladder repaired, re-send the refused close or verdict once."
+    // wakes reads first: it must not forbid the holder's one lawful write.
+    (holder ? " Once the board reports the ladder repaired, re-send the refused close or verdict once." : "")
   );
 }
 
@@ -206,7 +213,7 @@ export function stageHeldElsewhereNextAction(
   return (
     `Your seat (${seat}) does not hold this ${stageName}; ${describePrincipal(stage.participant)} holds it${returns}. ` +
     "No status or assignee write from your seat advances it. Record this refusal (its message and details) on a " +
-    "card you own; ask the board only if the stage must move without its participant's decision. " +
+    "card you own; the stage's participant decides it. If you own no card in this run, write nothing more. " +
     "Do not re-send it, re-shape it, or reach the same outcome through another field, card, route or seat."
   );
 }
