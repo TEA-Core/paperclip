@@ -611,6 +611,57 @@ describeEmbeddedPostgres("parent edge that would add an undischargeable ladder (
     expect(edge?.parentLinkKind).toBe("decomposition");
   });
 
+  it("allows a re-parent whose description declares redo without its carve-out label", async () => {
+    const { companyId, issuePrefix } = await seedCompany();
+    const supportQaeAgentId = await seedSupportQaeAgent(companyId);
+    const parent = await seedAdvancedNonConformingParent(
+      companyId,
+      issuePrefix,
+      1,
+      supportQaeAgentId,
+      true,
+    );
+    await seedQualifyingChild(
+      companyId,
+      issuePrefix,
+      2,
+      parent.id,
+      supportQaeAgentId,
+    );
+
+    const otherParentId = randomUUID();
+    await db.insert(issues).values({
+      id: otherParentId,
+      companyId,
+      issueNumber: 3,
+      identifier: `${issuePrefix}-3`,
+      title: "Benign parent",
+      status: "todo",
+      priority: "medium",
+    });
+    const childId = randomUUID();
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      issueNumber: 4,
+      identifier: `${issuePrefix}-4`,
+      parentId: otherParentId,
+      parentLinkKind: "decomposition",
+      title: "Child being re-homed",
+      status: "todo",
+      priority: "medium",
+      originKind: "manual",
+    });
+
+    const res = await request(createApp(companyId))
+      .patch(`/api/issues/${childId}`)
+      .send({ parentId: parent.id, description: "work-type:redo\\n\\nRetry" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const edge = await edgeFor(childId);
+    expect(edge?.parentId).toBe(parent.id);
+  });
+
   it("allows a work-type:redo child on the same advanced, non-conforming parent (carve-out label)", async () => {
     // The round-1 regression, pinned. `countLadderedChildren` has never counted
     // a child carrying one of the four carve-out labels (SUP-15464 /

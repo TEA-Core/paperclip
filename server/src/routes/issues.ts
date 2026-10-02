@@ -18029,6 +18029,12 @@ export function issueRoutes(
                 parentLinkKind: effectiveParentLinkKind,
                 originKind: existing.originKind,
                 status: effectiveStatus ?? existing.status,
+                title: updateFields.title === undefined
+                  ? existing.title
+                  : (updateFields.title as string | null),
+                description: updateFields.description === undefined
+                  ? existing.description
+                  : (updateFields.description as string | null),
                 hasCarveOutLabel,
               },
             );
