@@ -231,6 +231,64 @@ export function janitorLockPath(dataDir) {
   return path.join(dataDir, ".opencode-db-janitor.lock");
 }
 
+function resolveAgentUid() {
+  const raw = process.env.PAPERCLIP_AGENT_UID?.trim();
+  if (raw) {
+    const uid = Number(raw);
+    if (Number.isInteger(uid) && uid >= 0) return uid;
+  }
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+
+function resolveAgentGids() {
+  const gids = new Set(typeof process.getgroups === "function" ? process.getgroups() : []);
+  const primaryGid = process.env.PAPERCLIP_AGENT_GID?.trim()
+    ? Number(process.env.PAPERCLIP_AGENT_GID)
+    : typeof process.getgid === "function"
+      ? process.getgid()
+      : Number.NaN;
+  if (Number.isInteger(primaryGid) && primaryGid >= 0) gids.add(primaryGid);
+  const sharedGid = process.env.PAPERCLIP_AGENTS_GID?.trim()
+    ? Number(process.env.PAPERCLIP_AGENTS_GID)
+    : Number.NaN;
+  if (Number.isInteger(sharedGid) && sharedGid >= 0) gids.add(sharedGid);
+  return gids;
+}
+
+function databaseAgentId(databasePath) {
+  const name = path.basename(databasePath);
+  const match = /^opencode-agent-(.+)\.db$/.exec(name);
+  return match?.[1] ?? null;
+}
+
+function assertAgentWritable(databasePath, agentUid, {
+  agentId = databaseAgentId(databasePath),
+  stat = fs.statSync,
+  agentGids = resolveAgentGids(),
+} = {}) {
+  if (agentUid == null || agentId == null) return;
+
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const filePath = `${databasePath}${suffix}`;
+    let info;
+    try {
+      info = stat(filePath);
+    } catch (err) {
+      if (err?.code === "ENOENT") continue;
+      throw err;
+    }
+    const mode = info.mode & 0o777;
+    const writable =
+      agentUid === 0 ||
+      (info.uid === agentUid && (mode & 0o200) !== 0) ||
+      (agentGids.has(info.gid) && (mode & 0o020) !== 0) ||
+      (mode & 0o002) !== 0;
+    if (!writable) {
+      throw new Error(`agent ${agentId} (uid ${agentUid}) cannot write ${filePath}`);
+    }
+  }
+}
+
 /** How long a lock we cannot attribute to a live process is honoured before it
  * is treated as debris. Generous, because stealing a live holder's lock is the
  * failure this is guarding against. */
@@ -389,6 +447,9 @@ export function janitorRunDatabase({
   idle = true,
   allowVacuum = true,
   pause = pauseSync,
+  agentId = databaseAgentId(databasePath),
+  agentUid = null,
+  agentGids = resolveAgentGids(),
 }) {
   const report = {
     databasePath,
@@ -404,6 +465,7 @@ export function janitorRunDatabase({
 
   const db = new DatabaseSync(databasePath);
   try {
+    assertAgentWritable(databasePath, agentUid, { agentId, agentGids });
     db.exec(`PRAGMA busy_timeout = ${Math.floor(busyTimeoutMs)}`);
     // Off by default on every new connection, and the whole prune depends on it:
     // without it, deleting a session would orphan its messages and parts instead
@@ -496,6 +558,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const args = parseJanitorArgs(argv);
   const log = deps.log ?? console.log;
   const nowMs = deps.nowMs ?? Date.now();
+  const agentUid = deps.agentUid ?? resolveAgentUid();
+  const agentGids = deps.agentGids ?? resolveAgentGids();
   const { DatabaseSync } = deps.DatabaseSync
     ? { DatabaseSync: deps.DatabaseSync }
     : await import("node:sqlite");
@@ -541,6 +605,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
           DatabaseSync,
           apply: args.apply,
           olderThanDays: args.olderThanDays,
+          agentId: databaseAgentId(databasePath),
+          agentUid,
+          agentGids,
           nowMs,
           vacuumMinFreeMb: args.vacuumMinFreeMb,
           deleteBatchSize: args.deleteBatchSize,
