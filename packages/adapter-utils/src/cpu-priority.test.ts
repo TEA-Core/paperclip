@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
@@ -42,6 +45,8 @@ describe("deprioritizeCpu", () => {
     ]);
     return {
       priorities,
+      // Never read the real /proc for these fake pids.
+      listThreads: (pid: number) => [pid],
       getPriority: (pid: number) => {
         const value = priorities.get(pid);
         if (value === undefined) throw new Error(`ESRCH ${pid}`);
@@ -100,6 +105,7 @@ describe("deprioritizeCpu", () => {
     const onError = vi.fn();
     const result = deprioritizeCpu(4242, 10, {
       platform: "linux",
+      listThreads: () => [4242],
       getPriority: () => 0,
       setPriority: () => {
         throw new Error("EPERM");
@@ -116,6 +122,110 @@ describe("deprioritizeCpu", () => {
     expect(deprioritizeCpu(9999, 10, { ...sched, platform: "linux", onError })).toBeNull();
     expect(onError).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("deprioritizeCpu covers every thread", () => {
+  it("lowers every listed thread, not just the main one", () => {
+    // On Linux a nice value belongs to a thread. Threads the agent already
+    // started would keep the server's priority if only the main one moved.
+    const priorities = new Map<number, number>([
+      [0, 0],
+      [4242, 0],
+      [4243, 0],
+      [4244, 12],
+    ]);
+    const result = deprioritizeCpu(4242, 10, {
+      platform: "linux",
+      listThreads: () => [4242, 4243, 4244],
+      getPriority: (pid) => priorities.get(pid)!,
+      setPriority: (pid, value) => void priorities.set(pid, value),
+    });
+    expect(result).toBe(10);
+    expect(priorities.get(4242)).toBe(10);
+    expect(priorities.get(4243)).toBe(10);
+    // Never raises a thread that is already lower.
+    expect(priorities.get(4244)).toBe(12);
+  });
+
+  it("ignores a thread that exits between listing and setting", () => {
+    const onError = vi.fn();
+    const priorities = new Map<number, number>([
+      [0, 0],
+      [4242, 0],
+    ]);
+    const result = deprioritizeCpu(4242, 10, {
+      platform: "linux",
+      listThreads: () => [4242, 4243],
+      getPriority: (pid) => {
+        const value = priorities.get(pid);
+        if (value === undefined) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+        return value;
+      },
+      setPriority: (pid, value) => void priorities.set(pid, value),
+      onError,
+    });
+    expect(result).toBe(10);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("keeps a throwing reporter inside the best-effort boundary", () => {
+    expect(() =>
+      deprioritizeCpu(4242, 10, {
+        platform: "linux",
+        listThreads: () => [4242],
+        getPriority: () => 0,
+        setPriority: () => {
+          throw new Error("EPERM");
+        },
+        onError: () => {
+          throw new Error("logger down");
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "lowers the threads a real process already started",
+    async () => {
+      // A child with two worker threads, all started before the step runs.
+      const child = spawn(
+        process.execPath,
+        [
+          "-e",
+          [
+            "const { Worker } = require('node:worker_threads');",
+            "for (let i = 0; i < 2; i++) new Worker('setTimeout(() => {}, 5000)', { eval: true });",
+            "setTimeout(() => {}, 5000);",
+          ].join(" "),
+        ],
+        { stdio: "ignore" },
+      );
+      try {
+        const pid = child.pid!;
+        // Wait until the worker threads exist, so they predate the step.
+        let tids: string[] = [];
+        for (let i = 0; i < 100; i++) {
+          tids = await fs.readdir(`/proc/${pid}/task`);
+          if (tids.length >= 9) break;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        const target = Math.min(19, os.getPriority() + 10);
+        expect(deprioritizeCpu(pid, 10)).toBe(target);
+
+        tids = await fs.readdir(`/proc/${pid}/task`);
+        const nices = await Promise.all(
+          tids.map(async (tid) => {
+            const stat = await fs.readFile(`/proc/${pid}/task/${tid}/stat`, "utf8");
+            return Number.parseInt(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[16]!, 10);
+          }),
+        );
+        expect(nices.length).toBeGreaterThan(1);
+        expect(new Set(nices)).toEqual(new Set([target]));
+      } finally {
+        child.kill();
+      }
+    },
+  );
 });
 
 describe("isAgentSpawnShim", () => {

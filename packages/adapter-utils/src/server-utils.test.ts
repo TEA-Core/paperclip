@@ -68,7 +68,7 @@ import {
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
 import { DEFAULT_AGENT_OOM_SCORE_ADJ } from "./oom-priority.js";
-import { DEFAULT_AGENT_NICE } from "./cpu-priority.js";
+import { resolveAgentNice } from "./cpu-priority.js";
 
 // Field 19 of /proc/<pid>/stat is the nice value. The comm field (2) may contain
 // spaces and parentheses, so count from the LAST ')'.
@@ -451,7 +451,7 @@ describe("runChildProcess OOM deprioritization (SUP-17610)", () => {
   );
 
   // Same seam, CPU instead of memory: agent runs share the server's CPU cgroup,
-  // so the run child is put DEFAULT_AGENT_NICE steps below the server. On the
+  // so the run child is put PAPERCLIP_AGENT_NICE steps below the server. On the
   // unarmed path the server does it; under the uid split the setuid shim does
   // (test-spawn-shim.sh), and the server must not add a second step.
   it.skipIf(process.platform !== "linux" || uidGateArmed)(
@@ -477,7 +477,7 @@ describe("runChildProcess OOM deprioritization (SUP-17610)", () => {
       );
 
       expect(result.exitCode).toBe(0);
-      expect(observedNice).toBe(Math.min(19, own + DEFAULT_AGENT_NICE));
+      expect(observedNice).toBe(Math.min(19, own + resolveAgentNice(process.env)));
     },
   );
 });

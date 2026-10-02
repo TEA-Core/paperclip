@@ -41,7 +41,7 @@ import {
   type AcpxEngineExecutorOptions,
 } from "./execute.js";
 import { ACPX_HANDSHAKE_TIMEOUT_MS } from "./constants.js";
-import { DEFAULT_AGENT_NICE } from "../cpu-priority.js";
+import { resolveAgentNice } from "../cpu-priority.js";
 import { runChildProcess, SpawnEnvelopeTooLargeError } from "../server-utils.js";
 import { setExpensiveWorkspaceGitExecutor } from "../git-workspace-sync.js";
 import { resolveReferencedSourceIgnore } from "../sandbox-managed-runtime.js";
@@ -651,7 +651,7 @@ describe("shared ACPX engine runtime behavior", () => {
   };
 
   // Agent runs share the server's CPU cgroup, so the host spawnAgent callback
-  // puts the provider child DEFAULT_AGENT_NICE steps below the server. When the
+  // puts the provider child PAPERCLIP_AGENT_NICE steps below the server. When the
   // spawned command IS the setuid uid-split shim, the shim takes that step
   // itself after dropping privilege, so the host must not add a second one.
   const readNice = async (pid: number): Promise<number> => {
@@ -677,7 +677,7 @@ describe("shared ACPX engine runtime behavior", () => {
         options: { env: { PATH: process.env.PATH ?? "" } },
       });
       try {
-        expect(await readNice(child.pid!)).toBe(Math.min(19, os.getPriority() + DEFAULT_AGENT_NICE));
+        expect(await readNice(child.pid!)).toBe(Math.min(19, os.getPriority() + resolveAgentNice(process.env)));
       } finally {
         child.kill();
       }

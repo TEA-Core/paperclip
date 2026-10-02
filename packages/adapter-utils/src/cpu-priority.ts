@@ -1,3 +1,4 @@
+import { readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -68,6 +69,11 @@ export function isAgentSpawnShim(command: string, env: NodeJS.ProcessEnv = proce
 }
 
 export interface DeprioritizeCpuOptions {
+  /**
+   * Injection seam for tests. Lists the thread ids of `pid`; defaults to
+   * `/proc/<pid>/task`, falling back to the pid alone where that is unreadable.
+   */
+  listThreads?: (pid: number) => number[];
   /** Injection seams for tests; default to node:os. `pid` 0 means this process. */
   getPriority?: (pid: number) => number;
   setPriority?: (pid: number, priority: number) => void;
@@ -77,10 +83,33 @@ export interface DeprioritizeCpuOptions {
   onError?: (error: unknown) => void;
 }
 
+function listThreadsFromProc(pid: number): number[] {
+  try {
+    const tids = readdirSync(`/proc/${pid}/task`)
+      .map((entry) => Number(entry))
+      .filter((tid) => Number.isInteger(tid) && tid > 0);
+    return tids.length > 0 ? tids : [pid];
+  } catch {
+    return [pid];
+  }
+}
+
+function isGoneError(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === "ESRCH";
+}
+
 /**
  * Puts `pid` `steps` nice levels below this process, capped at 19. Returns the
  * niceness written, or `null` when nothing was changed. Never lowers a child
  * that already sits at or below the target, and never throws.
+ *
+ * EVERY THREAD. On Linux a nice value belongs to a thread, and a new thread or
+ * process inherits it from the thread that creates it. The call runs right after
+ * spawn(), but the child's runtime may already have started worker threads by
+ * then, and those would keep the server's priority if only the main thread
+ * moved. So each thread listed in `/proc/<pid>/task` is stepped; threads and
+ * processes created afterwards inherit the lowered value from their creator. A
+ * thread that exits between the listing and the step is skipped silently.
  */
 export function deprioritizeCpu(
   pid: number | undefined,
@@ -96,15 +125,41 @@ export function deprioritizeCpu(
 
   const getPriority = options.getPriority ?? ((target: number) => os.getPriority(target));
   const setPriority = options.setPriority ?? ((target: number, value: number) => os.setPriority(target, value));
+  const listThreads = options.listThreads ?? listThreadsFromProc;
+  // A throwing reporter must not escape: the callers run this between spawn()
+  // and installing the child's handlers.
+  const report = (error: unknown) => {
+    try {
+      options.onError?.(error);
+    } catch {
+      // best-effort
+    }
+  };
+
+  let target: number;
+  let threads: number[];
   try {
-    const target = Math.min(getPriority(0) + step, NICE_MAX);
-    if (getPriority(pid) >= target) return null;
-    setPriority(pid, target);
-    return target;
+    target = Math.min(getPriority(0) + step, NICE_MAX);
+    threads = listThreads(pid);
   } catch (error) {
-    options.onError?.(error);
+    report(error);
     return null;
   }
+
+  let stepped = false;
+  let failure: unknown = null;
+  for (const tid of threads) {
+    try {
+      if (getPriority(tid) >= target) continue;
+      setPriority(tid, target);
+      stepped = true;
+    } catch (error) {
+      if (tid !== pid && isGoneError(error)) continue;
+      failure ??= error;
+    }
+  }
+  if (failure !== null) report(failure);
+  return stepped ? target : null;
 }
 
 let cpuStepFailureReported = false;
