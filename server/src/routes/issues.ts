@@ -15099,6 +15099,7 @@ export function issueRoutes(
         refusalContext: {
           caller: createRefusalCaller(req),
           issue: { assigneeAgentId: normalizedAssigneeAgentRef.id ?? null, executionState: null },
+          boardActor: req.actor.type === "board",
         },
       });
       await assertExecutionPolicyAgentReferencesResolve({
@@ -15891,6 +15892,7 @@ export function issueRoutes(
         refusalContext: {
           caller: createRefusalCaller(req),
           issue: { assigneeAgentId: normalizedAssigneeAgentRef.id ?? null, executionState: null },
+          boardActor: req.actor.type === "board",
         },
       });
       await assertExecutionPolicyAgentReferencesResolve({
@@ -16148,6 +16150,7 @@ export function issueRoutes(
               assigneeAgentId: (child.assigneeAgentId as string | null | undefined) ?? null,
               executionState: null,
             },
+            boardActor: req.actor.type === "board",
           },
         });
         await assertExecutionPolicyAgentReferencesResolve({
