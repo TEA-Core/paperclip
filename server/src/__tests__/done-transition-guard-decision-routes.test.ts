@@ -1283,7 +1283,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(parentIssueId)).toBe("in_review");
   });
 
-  it("PATCH: the assignee holding no live stage keeps the ADR-103 remedy verbatim (board ruling 2026-10-02 F1)", async () => {
+  it("PATCH: the assignee holding no live stage gets the board text too; the board owns close-ladder repair (board ruling 2026-10-02 F1)", async () => {
     const { companyId, implementerAgentId, parentIssueId, identifier } = await seedDecomposedCloseLadder("MD3A", {
       ladderedChildren: 2,
       excludedChildren: 0,
@@ -1306,11 +1306,13 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.body.details.mechanism).toBe("D");
     expect(res.body.details.callerSeat).toBe("assignee");
     expect(res.body.error.startsWith("Mechanism D (ADR-072 close-ladder shape) refused:")).toBe(true);
-    // The guard's own message, remedy sentence included, is unchanged for the assignee.
-    expect(res.body.error).toMatch(/Add (any|the) missing review\/approval stages/);
-    expect(res.body.error).not.toContain("Your seat");
-    expect(res.body.details.remedy).toContain("Re-parent");
-    expect(res.body.details.remedy).toContain("process");
+    // control-plane-403 §7: no agent repairs the ladder, the assignee included. The
+    // guard's own ADR-103 remedy (re-parent / declare process / add stages) is the
+    // board's lever, so the assignee gets the same record-and-ask text as any seat.
+    expect(res.body.error).not.toMatch(/Add (any|the) missing/);
+    expect(res.body.error).toContain("Your seat (assignee) cannot lawfully repair this close ladder");
+    expect(res.body.details.remedy).toContain("ask the board");
+    expect(res.body.details.remedy).not.toContain("Re-parent");
     expect(res.body.details.nextAction).toBe(res.body.details.remedy);
 
     // The thread record names the refusing caller's seat beside the remedy it was given.

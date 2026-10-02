@@ -171,11 +171,13 @@ describe("next-action sentences", () => {
     expect(selfGatedLadderHasRun({ currentStageId: STAGE })).toBe(true);
   });
 
-  it("self-satisfying assignee write: the assignee may pick another assignee; other seats record and ask the board", () => {
+  it("self-satisfying assignee write: terminal for every seat, the assignee included (record and ask the board)", () => {
     const asAssignee = selfSatisfyingAssigneeNextAction("assignee", { stageId: STAGE });
-    expect(asAssignee).toContain(`not a participant of stage ${STAGE}`);
+    expect(asAssignee).toMatch(/^Your seat \(assignee\) cannot clear this/);
+    expect(asAssignee).toContain("keep the card as it is");
+    expect(asAssignee).toContain(RECORD_AND_ASK_BOARD);
     expect(asAssignee).toContain("Never re-point returnAssigneeAgentId");
-    expect(asAssignee).not.toContain("ask the board");
+    expect(asAssignee).not.toContain("hand the card to");
     const asOther = selfSatisfyingAssigneeNextAction("ancestor-hatch", { stageId: STAGE });
     expect(asOther).toMatch(/^Your seat \(ancestor-hatch\) cannot clear this/);
     expect(asOther).toContain(RECORD_AND_ASK_BOARD);
@@ -194,6 +196,12 @@ describe("next-action sentences", () => {
     const none = ancestorHatchNextAction({ forbiddenFields: ["title", "comment"], liveStage: null });
     expect(none).toContain("title, comment");
     expect(none).toContain("re-sending the write without them does not reach the outcome");
-    expect(none).toContain(RECORD_AND_ASK_BOARD);
+    // control-plane-403 §7 / escalation.md: the assignment hop is the one lawful change of seat
+    // on a card with no live stage, so this branch names it and does not forbid "another seat".
+    expect(none).toContain("assignment hop");
+    expect(none).toContain("ask the board");
+    expect(none).not.toContain(RECORD_AND_ASK_BOARD);
+    expect(none).not.toMatch(/route or seat/);
+    expect(live).toContain("route or seat");
   });
 });

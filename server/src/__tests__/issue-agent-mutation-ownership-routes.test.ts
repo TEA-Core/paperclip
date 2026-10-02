@@ -2148,6 +2148,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.body.details.callerSeat).toBe("ancestor-hatch");
       expect(res.body.details.nextAction).toContain("Your seat (ancestor-hatch) cannot write");
       expect(res.body.details.nextAction).toContain("re-sending the write without them does not reach the outcome");
+      expect(res.body.details.nextAction).toContain("assignment hop");
       expect(res.body.details.nextAction).toContain("ask the board");
       expect(res.body.error).toContain(res.body.details.nextAction);
       expect(mockIssueService.update).not.toHaveBeenCalled();
