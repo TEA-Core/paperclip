@@ -8,7 +8,6 @@ import {
   labels as labelsTable,
 } from "@paperclipai/db";
 import {
-  countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
   GitHubAuthError,
@@ -1980,47 +1979,6 @@ describe("evaluateDoneTransitionGuard", () => {
         expect.anything(),
         expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
       );
-    });
-
-    it("excludes unlabelled redo and delivery declarations only on the first non-empty line", async () => {
-      setupDbMock({
-        issues: [
-          {
-            ...manualChild("redo-1", "SUP-18190", "40000000-0000-4000-8000-000000000001"),
-            title: "[redo] title-only child",
-            description: "Details first.",
-          },
-          {
-            ...manualChild("redo-2", "SUP-18191", "50000000-0000-4000-8000-000000000002"),
-            title: "body-only child",
-            description: "\nwork-type:redo\nDetails follow.",
-          },
-          {
-            ...manualChild("redo-3", "SUP-18192", "50000000-0000-4000-8000-000000000003"),
-            title: "[redo] declared child",
-            description: "work-type:redo\nDetails follow.",
-          },
-          {
-            ...manualChild("delivery-1", "SUP-18193", "50000000-0000-4000-8000-000000000004"),
-            title: "delivery child",
-            description: "work-type:delivery\nDetails follow.",
-          },
-          {
-            ...manualChild("buried-1", "SUP-18194", "50000000-0000-4000-8000-000000000005"),
-            title: "ordinary child",
-            description: "Details first.\nwork-type:redo",
-          },
-          manualChild("genuine-1", "SUP-18195", "50000000-0000-4000-8000-000000000006"),
-        ],
-        labels: [redoLabelRow],
-        issueLabels: [],
-      });
-
-      await expect(countLadderedChildren(mockDb, "company-1", "issue-1")).resolves.toEqual({
-        count: 2,
-        identifiers: ["SUP-18194", "SUP-18195"],
-        excludedChildIdentifiers: ["SUP-18190", "SUP-18191", "SUP-18192", "SUP-18193"],
-      });
     });
 
     it("arms mechanism D for the identical two manual children when they carry no redo label (AC3 negative control)", async () => {

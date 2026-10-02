@@ -151,10 +151,7 @@ import {
   buildUndischargeableLadderEdgeConflict,
   evaluateUndischargeableLadderEdge,
 } from "./parent-edge-close-ladder-gate.js";
-import {
-  edgeCarriesLadderCarveOutLabel,
-  hasLadderCarveOutDeclaration,
-} from "./laddered-child-eligibility.js";
+import { edgeCarriesLadderCarveOutLabel } from "./laddered-child-eligibility.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
   type CurrentUserRedactionOptions,
@@ -11035,10 +11032,6 @@ export function issueService(db: Db) {
               originKind: issueData.originKind,
               status: issueData.status,
               hasCarveOutLabel,
-              hasCarveOutDeclaration: hasLadderCarveOutDeclaration(
-                issueData.title,
-                issueData.description,
-              ),
             },
           );
           if (!ladderVerdict.ok) {
