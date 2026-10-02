@@ -134,6 +134,15 @@ describe("next-action sentences", () => {
     expect(text).not.toMatch(/Add (any|the) missing/);
   });
 
+  // The text is persisted as the `[Terminal status refused]` record's Remedy line, which the
+  // NEXT run reads, including the run the board's answer wakes. It must not forbid the one
+  // lawful next step (control-plane-403.md §7: when the board answers, re-send once).
+  it("Mechanism D: the no-second-close bar lasts until the board answers, then one re-send", () => {
+    const text = mechanismDNextAction("currentParticipant");
+    expect(text).toContain("no second close until the board answers");
+    expect(text).toMatch(/Once the board reports the ladder repaired, re-send the refused close or verdict once\.$/);
+  });
+
   it("stage held elsewhere: names the holder, says no write from this seat advances it, and keeps the board as the exception", () => {
     const text = stageHeldElsewhereNextAction("returnAssignee", {
       stageType: "review",
@@ -141,7 +150,10 @@ describe("next-action sentences", () => {
     });
     expect(text).toContain("Your seat (returnAssignee) does not hold this review stage");
     expect(text).toContain(`agent ${PARTICIPANT} holds it`);
-    expect(text).toContain("returns the card to you");
+    // On approve the card goes to the next stage or stays with the approver; only a
+    // changes_requested decision hands it back (issue-execution-policy.ts).
+    expect(text).toContain("if it requests changes the card returns to you");
+    expect(text).not.toContain("when it is decided");
     expect(text).toContain("on a card you own");
     expect(text).toContain("ask the board only if");
     const other = stageHeldElsewhereNextAction("other", { stageType: null, participant: null });

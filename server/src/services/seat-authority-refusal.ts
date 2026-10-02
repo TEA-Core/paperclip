@@ -155,10 +155,13 @@ export function describePrincipal(principal: RefusalPrincipal | null | undefined
 export function mechanismDNextAction(seat: CallerSeat): string {
   return (
     `Your seat (${seat}) cannot lawfully repair this close ladder: no re-arm, no added or reordered stage, ` +
-    "no relabelled or re-parented child, no courier card, and no second close. " +
+    "no relabelled or re-parented child, no courier card, and no second close until the board answers. " +
     `${RECORD_AND_ASK_BOARD} The board's levers are a carve-out label ` +
     `(${BOARD_CARVE_OUT_LABELS.join(", ")}) on a child that is not decomposition work, ` +
-    "or a board rearmExecutionPolicy with the full close ladder."
+    "or a board rearmExecutionPolicy with the full close ladder. " +
+    // Persisted as the thread record's Remedy line, which the run the board's answer
+    // wakes reads first: it must not forbid that run's one lawful write.
+    "Once the board reports the ladder repaired, re-send the refused close or verdict once."
   );
 }
 
@@ -177,7 +180,9 @@ export function stageHeldElsewhereNextAction(
 ): string {
   const stageName = stage.stageType ? `${stage.stageType} stage` : "stage";
   const returns =
-    seat === "returnAssignee" ? ", and the stage returns the card to you when it is decided" : "";
+    // Only a changes_requested decision hands the card back: an approve moves it to the
+    // next stage's participant or completes the workflow with the approver.
+    seat === "returnAssignee" ? ", and if it requests changes the card returns to you" : "";
   return (
     `Your seat (${seat}) does not hold this ${stageName}; ${describePrincipal(stage.participant)} holds it${returns}. ` +
     "No status or assignee write from your seat advances it. Record this refusal (its message and details) on a " +
