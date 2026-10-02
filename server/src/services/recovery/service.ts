@@ -10528,15 +10528,17 @@ export function recoveryService(
         continue;
       }
 
-      await db
-        .update(issues)
-        .set({ hiddenAt: new Date() })
-        .where(eq(issues.id, candidate.id));
+      await db.transaction(async (tx) => {
+        await tx
+          .update(issues)
+          .set({ hiddenAt: new Date() })
+          .where(eq(issues.id, candidate.id));
 
-      await db.insert(unWakeableArchives).values({
-        companyId: candidate.companyId,
-        issueId: candidate.id,
-        policy: "stale_in_review_child",
+        await tx.insert(unWakeableArchives).values({
+          companyId: candidate.companyId,
+          issueId: candidate.id,
+          policy: "stale_in_review_child",
+        });
       });
 
       result.archived += 1;

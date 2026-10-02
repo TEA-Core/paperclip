@@ -1877,6 +1877,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       issueId: sourceIssueId,
       policy: "stale_in_review_child",
     });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId: randomUUID(),
+      issueId: controlIssueId,
+      status: "failed",
+    });
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
