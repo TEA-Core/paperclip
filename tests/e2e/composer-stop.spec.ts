@@ -186,6 +186,7 @@ type ResolveResult = {
 type ResumeContext = {
   issueId: string;
   originalRunIds: string[];
+  statusRunId: string;
   resolveCompletedAtIso: string | null;
   resumeInitiatedAtIso: string;
   resolveResponseBody: unknown;
@@ -247,6 +248,7 @@ async function running(
             return false;
           }
             run = runs.find((candidate) => candidate.status === "running");
+            if (run && resume) resume.statusRunId = run.id;
             if (!run && evidence && resume) {
               try {
                 evidence.push(
@@ -729,7 +731,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
           const targetContext = currentResumeContext;
           statusFrameCollector.ingest(text, targetContext ? {
             issueId: targetContext.issueId,
-            runId: targetContext.originalRunIds[0],
+            runId: targetContext.statusRunId,
           } : undefined);
           statusMetadata.push(...statusFrameCollector.entries.splice(0));
           const targetFailures = currentResumeContext?.instrumentationFailures ?? instrumentationFailures;
@@ -1032,6 +1034,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       ): ResumeContext => ({
         issueId,
         originalRunIds: [originalRunId],
+        statusRunId: originalRunId,
         resolveCompletedAtIso: resolve?.resolveCompletedAtIso ?? null,
         resumeInitiatedAtIso,
         resolveResponseBody: resolve?.body ?? null,
@@ -1064,6 +1067,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         resumeEvidenceLog,
         parentResumeContext,
       );
+      parentResumeContext.statusRunId = resumedParentRun.id;
       const childResumeContext = resumeContextFor(child.id, childRun.id, childResolve);
       currentResumeContext = childResumeContext;
       const resumedChildRun = await running(
@@ -1073,6 +1077,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         resumeEvidenceLog,
         childResumeContext,
       );
+      childResumeContext.statusRunId = resumedChildRun.id;
       expect(resumedParentRun.id).not.toBe(parentRun.id);
       expect(resumedChildRun.id).not.toBe(childRun.id);
       if (adapter === "paperclip_runner") {
