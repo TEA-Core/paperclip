@@ -432,6 +432,10 @@ only inside the plugin namespace. Runtime `ctx.db.query()` allows `SELECT` from
 `ctx.db.execute()` allows `INSERT`, `UPDATE`, and `DELETE` only against the
 plugin namespace.
 
+Every relation must be schema-qualified: the plugin namespace, or a whitelisted
+`public` table for reads. CTE names are the only unqualified relation names the
+host accepts.
+
 ### Trusted Local Folders
 
 Trusted local plugins can request operator-configured folders per company:
