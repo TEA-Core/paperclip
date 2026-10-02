@@ -655,7 +655,7 @@ describeEmbeddedPostgres("parent edge that would add an undischargeable ladder (
 
     const res = await request(createApp(companyId))
       .patch(`/api/issues/${childId}`)
-      .send({ parentId: parent.id, description: "work-type:redo\\n\\nRetry" });
+      .send({ parentId: parent.id, description: "work-type:redo\n\nRetry" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     const edge = await edgeFor(childId);
