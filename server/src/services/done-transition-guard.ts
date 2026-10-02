@@ -1205,6 +1205,8 @@ export async function countLadderedChildren(
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
       originKind: issues.originKind,
+      title: issues.title,
+      description: issues.description,
       // ADR-103 M2: the edge's own kind, read lazily at close from the live row.
       // A `process` edge is not a decomposition signal (the child gates no slice
       // of this parent's deliverable), so it is excluded below just like a
@@ -1325,7 +1327,20 @@ export async function countLadderedChildren(
     // identically to a carve-out-labelled child. Back-compat keeps the label
     // check, so a child carrying any of the five carve-out labels is treated as
     // `process` regardless of the column value (no relabelling campaign needed).
-    if (row.parentLinkKind === "process" || carveOutChildIds?.has(row.id)) {
+    const firstNonEmptyDescriptionLine = row.description
+      ?.split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+    const hasDeclaredCarveOut =
+      firstNonEmptyDescriptionLine === "work-type:redo" ||
+      firstNonEmptyDescriptionLine === "work-type:delivery";
+    const hasRedoTitle = row.title?.startsWith("[redo]") ?? false;
+    if (
+      row.parentLinkKind === "process" ||
+      carveOutChildIds?.has(row.id) ||
+      hasDeclaredCarveOut ||
+      hasRedoTitle
+    ) {
       excludedChildIdentifiers.push(row.identifier ?? "<unnamed>");
       continue;
     }
