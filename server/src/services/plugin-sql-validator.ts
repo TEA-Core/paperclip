@@ -109,6 +109,8 @@ const DISALLOWED_FUNCTION_PATTERNS = [
   "pg_replication_slot_advance",
 ];
 const DISALLOWED_FUNCTION_RE = new RegExp(`^(?:${DISALLOWED_FUNCTION_PATTERNS.join("|")})$`);
+/** The largest text, in UTF-8 bytes, that the validators and the migration split hand to the parser. */
+const MAX_PLUGIN_SQL_BYTES = 16 * 1024 * 1024;
 const RUNTIME_STATEMENT_COUNT_ERROR = "Plugin runtime SQL must contain exactly one statement";
 const MIGRATION_STATEMENT_COUNT_ERROR = "Plugin migration statement must contain exactly one statement";
 
@@ -179,6 +181,13 @@ function parseRawStatements(sqlText: string): RawStatement[] {
   if (!active) {
     throw new Error("Plugin SQL parser is not loaded; call loadPluginSqlParser() first");
   }
+  // libpg-query mallocs a buffer for the whole text and never checks the result. A text near
+  // 1 GiB makes that fail, and every later parse in the process then fails with it. Reject far
+  // below that, before the text reaches the parser.
+  const byteLength = Buffer.byteLength(sqlText, "utf8");
+  if (byteLength > MAX_PLUGIN_SQL_BYTES) {
+    throw new Error("Plugin SQL does not parse: input exceeds 16 MiB");
+  }
   // The parser stops reading at the first NUL, so text after one is neither validated nor split.
   // A NUL never parses.
   if (sqlText.includes("\u0000")) {
@@ -193,7 +202,7 @@ function parseRawStatements(sqlText: string): RawStatement[] {
   }
   // Defense in depth: the byte count the parser's wrapper allocates must equal the real UTF-8
   // length, or part of the text would go unparsed. Fail closed if the two ever differ.
-  if (parserInputByteLength(sqlText) !== Buffer.byteLength(sqlText, "utf8")) {
+  if (parserInputByteLength(sqlText) !== byteLength) {
     throw new Error("Plugin SQL does not parse: encoding mismatch");
   }
   let tree: { stmts?: RawStatement[] };
@@ -255,9 +264,12 @@ export function splitPluginMigrationSql(fileSql: string): string[] {
 }
 
 function stripSqlForKeywordScan(input: string): string {
+  // The quoted-text patterns are written as an unrolled loop. The alternation form
+  // (a non-quote or a doubled quote, repeated) uses one backtracking frame per character and
+  // overflows the stack on a string literal of a few MiB.
   return input
-    .replace(/'([^']|'')*'/g, "''")
-    .replace(/"([^"]|"")*"/g, "\"\"")
+    .replace(/'[^']*(?:''[^']*)*'/g, "''")
+    .replace(/"[^"]*(?:""[^"]*)*"/g, "\"\"")
     .replace(/--.*$/gm, "")
     .replace(/\/\*[\s\S]*?\*\//g, "");
 }

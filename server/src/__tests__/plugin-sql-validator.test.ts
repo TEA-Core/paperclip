@@ -1041,3 +1041,68 @@ describe("plugin SQL validator: unpaired UTF-16 surrogates", () => {
     });
   });
 });
+
+describe("plugin SQL validator: input size", () => {
+  // libpg-query mallocs a buffer for the whole text without checking the result. A text past about
+  // 1 GiB makes that fail, and every later parse in the process then fails too. The validators cap
+  // the text well below that, before it reaches the parser.
+  const MAX_BYTES = 16 * 1024 * 1024;
+  const THREE_BYTE = String.fromCharCode(0x65e5);
+  const FOUR_BYTE = String.fromCharCode(0xd83d, 0xde80);
+
+  /** `prefix + filler + suffix` with exactly `totalBytes` bytes of UTF-8. The filler is `unit` repeated, then ASCII. */
+  function padded(prefix: string, suffix: string, unit: string, totalBytes: number): string {
+    const room = totalBytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix);
+    const unitBytes = Buffer.byteLength(unit);
+    const text = prefix + unit.repeat(Math.floor(room / unitBytes)) + "a".repeat(room % unitBytes) + suffix;
+    expect(Buffer.byteLength(text)).toBe(totalBytes);
+    return text;
+  }
+
+  const statements = [
+    { target: "runtime query", prefix: "SELECT id FROM plugin_x.t WHERE n = '", suffix: "'", run: (text: string) => validatePluginRuntimeQuery(text, "plugin_x") },
+    { target: "runtime execute", prefix: "INSERT INTO plugin_x.t (n) VALUES ('", suffix: "')", run: (text: string) => validatePluginRuntimeExecute(text, "plugin_x") },
+    { target: "migration statement", prefix: "COMMENT ON TABLE plugin_x.a IS '", suffix: "'", run: (text: string) => validatePluginMigrationStatement(text, "plugin_x") },
+  ];
+  const units = [
+    { name: "ASCII text", unit: "a" },
+    { name: "three-byte characters", unit: THREE_BYTE },
+    { name: "four-byte characters", unit: FOUR_BYTE },
+  ];
+  const combos = statements.flatMap((statement) => units.map((unit) => ({ ...statement, ...unit })));
+
+  it.each(combos)("parses a $target of exactly 16 MiB made of $name", ({ prefix, suffix, unit, run }) => {
+    expect(() => run(padded(prefix, suffix, unit, MAX_BYTES))).not.toThrow();
+  });
+
+  it.each(combos)("rejects a $target one byte over 16 MiB made of $name", ({ prefix, suffix, unit, run }) => {
+    expect(() => run(padded(prefix, suffix, unit, MAX_BYTES + 1))).toThrow(/does not parse: input exceeds 16 MiB/);
+  });
+
+  it("counts UTF-8 bytes, not characters: a text with fewer characters than the cap is still over it", () => {
+    const text = padded("SELECT id FROM plugin_x.t WHERE n = '", "'", THREE_BYTE, MAX_BYTES + 3);
+    expect(text.length).toBeLessThan(MAX_BYTES);
+    expect(() => validatePluginRuntimeQuery(text, "plugin_x")).toThrow(/input exceeds 16 MiB/);
+    const pairs = padded("SELECT id FROM plugin_x.t WHERE n = '", "'", FOUR_BYTE, MAX_BYTES + 4);
+    expect(pairs.length).toBeLessThan(MAX_BYTES);
+    expect(() => validatePluginRuntimeQuery(pairs, "plugin_x")).toThrow(/input exceeds 16 MiB/);
+  });
+
+  it("applies the cap to a whole migration file, however many statements it holds", () => {
+    const statement = "CREATE TABLE plugin_x.t (id int);\n";
+    const atCap = padded("-- ", "\n" + statement, "a", MAX_BYTES);
+    expect(splitPluginMigrationSql(atCap)).toHaveLength(1);
+    const overCap = padded("-- ", "\n" + statement, "a", MAX_BYTES + 1);
+    expect(() => splitPluginMigrationSql(overCap)).toThrow(/does not parse: input exceeds 16 MiB/);
+    const manyStatements = statement.repeat(Math.ceil(MAX_BYTES / statement.length) + 1);
+    expect(() => splitPluginMigrationSql(manyStatements)).toThrow(/input exceeds 16 MiB/);
+  });
+
+  it("keeps parsing normally after it rejects an over-size text", () => {
+    expect(() => validatePluginRuntimeQuery(padded("SELECT id FROM plugin_x.t WHERE n = '", "'", "a", MAX_BYTES + 1), "plugin_x")).toThrow(
+      /input exceeds 16 MiB/,
+    );
+    expect(() => validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).not.toThrow();
+    expect(splitPluginMigrationSql("CREATE TABLE plugin_x.t (id int);")).toEqual(["CREATE TABLE plugin_x.t (id int)"]);
+  });
+});

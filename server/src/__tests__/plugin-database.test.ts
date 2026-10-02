@@ -922,6 +922,32 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(notes).toEqual([]);
   });
 
+  it("records a failed migration when the migration file is over 16 MiB", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const statement = `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`;
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `-- ${"a".repeat(16 * 1024 * 1024)}\n${statement}`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await expect(
+      pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/input exceeds 16 MiB/);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
+    // The parser still works afterwards.
+    const second = manifest("paperclip.escape");
+    const secondRoot = await createPluginPackage(second, `CREATE TABLE ${derivePluginDatabaseNamespace(second.id)}.notes (id uuid PRIMARY KEY);`);
+    const secondId = await installPluginRecord(second);
+    await pluginDatabaseService(db).applyMigrations(secondId, second, secondRoot);
+  });
+
   it("validates a statement that follows a dollar-quote end and runs nothing from that statement on", async () => {
     const pluginManifest = manifest();
     const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
