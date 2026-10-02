@@ -228,6 +228,65 @@ describe("assertAssigneeWriteDoesNotSelfSatisfyReviewStage (SUP-13526)", () => {
     });
   });
 
+  // Board ruling 2026-10-02 (F1 server half): caller-aware. The prefix through
+  // the existing parenthetical is byte-identical; the seat-specific next action
+  // follows it and travels in details. Without a refusal context (the recovery
+  // service) nothing changes.
+  describe("caller-aware refusal", () => {
+    const stage = {
+      id: GATE_STAGE_ID,
+      type: "review",
+      approvalsNeeded: 1,
+      participants: [{ id: "44444444-4444-4444-8444-444444444444", type: "agent", agentId: ASSIGNEE_ID }],
+    };
+    const legacyMessage =
+      `Refusing assigneeAgentId write: ${ASSIGNEE_ID} is a participant of incomplete review stage ${GATE_STAGE_ID} ` +
+      "and the write would make the stage self-satisfiable, because it cannot be cleared without the assignee " +
+      "approving their own work (participants excluding the assignee: 0, approvalsNeeded: 1)";
+    const refuse = (refusalContext?: Parameters<typeof assertAssigneeWriteDoesNotSelfSatisfyReviewStage>[0]["refusalContext"]) => {
+      try {
+        assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+          executionPolicy: policyWithStages([stage]),
+          executionState: incompleteState({ currentParticipant: { type: "agent", agentId: OTHER_AGENT_ID, userId: null } }),
+          incomingAssigneeAgentId: ASSIGNEE_ID,
+          refusalContext,
+        });
+      } catch (thrown) {
+        return thrown as { message: string; details: Record<string, unknown> };
+      }
+      throw new Error("expected throw");
+    };
+
+    it("tells the assignee to pick a non-participant or keep the card, and never to re-point the return assignee", () => {
+      const err = refuse({
+        caller: { agentId: OTHER_AGENT_ID },
+        issue: { assigneeAgentId: OTHER_AGENT_ID, executionState: { status: "idle" } },
+      });
+      expect(err.message.startsWith(`${legacyMessage}. Your seat (assignee): `)).toBe(true);
+      expect(err.details.callerSeat).toBe("assignee");
+      expect(String(err.details.nextAction)).toContain(`not a participant of stage ${GATE_STAGE_ID}`);
+      expect(String(err.details.nextAction)).toContain("Never re-point returnAssigneeAgentId");
+      expect(err.details).toMatchObject({ guard: "assignee_review_gate", issueStageId: GATE_STAGE_ID });
+    });
+
+    it("tells any other seat it cannot clear this and to record and ask the board", () => {
+      const err = refuse({
+        caller: { agentId: "66666666-6666-4666-8666-666666666666", viaAncestorHatch: true },
+        issue: { assigneeAgentId: OTHER_AGENT_ID, executionState: null },
+      });
+      expect(err.details.callerSeat).toBe("ancestor-hatch");
+      expect(String(err.details.nextAction)).toContain("Your seat (ancestor-hatch) cannot clear this");
+      expect(String(err.details.nextAction)).toContain("ask the board");
+      expect(err.message).toContain(String(err.details.nextAction));
+    });
+
+    it("without a refusal context the message is unchanged", () => {
+      const err = refuse(undefined);
+      expect(err.message).toBe(legacyMessage);
+      expect(err.details.callerSeat).toBeUndefined();
+    });
+  });
+
   it("is a no-op when the stage stays clearable without the assignee", () => {
     expect(() =>
       assertAssigneeWriteDoesNotSelfSatisfyReviewStage({

@@ -176,6 +176,11 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toMatch(/gated solely by its own return assignee/);
     expect(res.body.details?.returnAssigneeSource).toBe("assigneeAgentId");
+    // Board ruling 2026-10-02 (F1): caller-aware. On create nothing has run, so
+    // the attach-time remedy is the one lawful payload fix and stays verbatim.
+    expect(res.body.details?.ladderHasRun).toBe(false);
+    expect(typeof res.body.details?.callerSeat).toBe("string");
+    expect(res.body.details?.nextAction).toMatch(/^Give the stage a participant that is not the return assignee/);
     expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
   });
 
@@ -226,6 +231,9 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
 
     expect(patched.status, JSON.stringify(patched.body)).toBe(422);
     expect(patched.body.error).toMatch(/gated solely by its own return assignee/);
+    // The stored issue's ladder never ran, so this is still the attach-time payload error.
+    expect(patched.body.details?.ladderHasRun).toBe(false);
+    expect(typeof patched.body.details?.callerSeat).toBe("string");
   });
 
   it("accepts a PATCH that moves the assignee off the collision in the same body", async () => {

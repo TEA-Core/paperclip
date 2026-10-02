@@ -1,6 +1,12 @@
 import type { IssueExecutionStage } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import {
+  type RefusalCaller,
+  type RefusalIssue,
+  resolveCallerSeat,
+  selfSatisfyingAssigneeNextAction,
+} from "./seat-authority-refusal.js";
 
 export interface SelfSatisfyingReviewStageFinding {
   stageId: string;
@@ -106,18 +112,26 @@ export function assertAssigneeWriteDoesNotSelfSatisfyReviewStage(input: {
   executionPolicy: unknown;
   executionState: unknown;
   incomingAssigneeAgentId: string | null | undefined;
+  /**
+   * Board ruling 2026-10-02 (F1): the writer and the issue as stored. When
+   * present the 422 names the caller's seat and a seat-specific next action
+   * after the unchanged message. Absent (the recovery service) it is unchanged.
+   */
+  refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): void {
   const finding = findSelfSatisfyingReviewStage(input);
   if (!finding) return;
-  throw unprocessable(
-    `Refusing assigneeAgentId write: ${finding.assigneeAgentId} is a participant of incomplete review stage ${finding.stageId} and the write would make the stage self-satisfiable, because it cannot be cleared without the assignee approving their own work (participants excluding the assignee: ${finding.participantsExcludingAssignee}, approvalsNeeded: ${finding.approvalsNeeded})`,
-    {
-      guard: "assignee_review_gate",
-      issueStageId: finding.stageId,
-      stageType: finding.stageType,
-      assigneeAgentId: finding.assigneeAgentId,
-      participantsExcludingAssignee: finding.participantsExcludingAssignee,
-      approvalsNeeded: finding.approvalsNeeded,
-    },
-  );
+  const message = `Refusing assigneeAgentId write: ${finding.assigneeAgentId} is a participant of incomplete review stage ${finding.stageId} and the write would make the stage self-satisfiable, because it cannot be cleared without the assignee approving their own work (participants excluding the assignee: ${finding.participantsExcludingAssignee}, approvalsNeeded: ${finding.approvalsNeeded})`;
+  const details: Record<string, unknown> = {
+    guard: "assignee_review_gate",
+    issueStageId: finding.stageId,
+    stageType: finding.stageType,
+    assigneeAgentId: finding.assigneeAgentId,
+    participantsExcludingAssignee: finding.participantsExcludingAssignee,
+    approvalsNeeded: finding.approvalsNeeded,
+  };
+  if (!input.refusalContext) throw unprocessable(message, details);
+  const callerSeat = resolveCallerSeat(input.refusalContext.caller, input.refusalContext.issue);
+  const nextAction = selfSatisfyingAssigneeNextAction(callerSeat, { stageId: finding.stageId });
+  throw unprocessable(`${message}. ${nextAction}`, { ...details, callerSeat, nextAction });
 }

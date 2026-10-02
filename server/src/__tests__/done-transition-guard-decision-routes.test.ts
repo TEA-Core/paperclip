@@ -281,7 +281,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
    */
   async function seedDecomposedCloseLadder(
     issuePrefix: string,
-    opts: { ladderedChildren: number; excludedChildren: number },
+    opts: { ladderedChildren: number; excludedChildren: number; completedWorkflow?: boolean },
   ) {
     const companyId = randomUUID();
     const supportQaeAgentId = randomUUID();
@@ -380,9 +380,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       identifier,
       issueNumber: 1,
       title: "Decomposed parent with a shape-incomplete ADR-072 close ladder",
-      status: "in_review",
+      status: opts.completedWorkflow ? "in_progress" : "in_review",
       priority: "medium",
-      assigneeAgentId: execCtoAgentId,
+      // completedWorkflow: every stage decided and the card back with its
+      // implementer, so the implementer is the assignee holding no live stage.
+      assigneeAgentId: opts.completedWorkflow ? implementerAgentId : execCtoAgentId,
       createdByUserId: "cloud-user-1",
       executionWorkspaceId,
       executionPolicy: {
@@ -404,7 +406,21 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         ],
         returnAssigneeAgentId: implementerAgentId,
       },
-      executionState: {
+      executionState: opts.completedWorkflow ? {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent", agentId: implementerAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [reviewStageId, approvalStageId],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved",
+        monitor: null,
+        changesRequestedCount: 0,
+      } : {
         status: "pending",
         currentStageId: approvalStageId,
         currentStageIndex: 1,
@@ -493,6 +509,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     return {
       companyId,
       execCtoAgentId,
+      implementerAgentId,
       parentIssueId,
       identifier,
       branchName,
@@ -1243,15 +1260,67 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.code).toBe("done_transition_missing_delivery");
     expect(res.body.details.remedy).not.toContain("Merge the issue's pull request");
-    expect(res.body.details.remedy).toContain("Re-parent");
-    expect(res.body.details.remedy).toContain("process");
     expect(res.body.details.mechanism).toBe("D");
+    // Board ruling 2026-10-02 (F1 server half): the approver holding the live
+    // stage is also the assignee in in_review, but it does not repair a close
+    // ladder: the board does. So its seat is currentParticipant, the ADR-103
+    // re-parent/declare-process remedy is withheld from it, and both the message
+    // tail and details.remedy point it at recording the refusal and asking the
+    // board. The message prefix is byte-identical.
+    expect(res.body.details.callerSeat).toBe("currentParticipant");
+    expect(res.body.error.startsWith("Mechanism D (ADR-072 close-ladder shape) refused:")).toBe(true);
+    expect(res.body.error).not.toMatch(/Add (any|the) missing/);
+    expect(res.body.error).toContain("Your seat (currentParticipant) cannot lawfully repair this close ladder");
+    expect(res.body.details.nextAction).toBe(res.body.details.remedy);
+    expect(res.body.details.remedy).toContain("ask the board");
+    expect(res.body.details.remedy).toContain("rearmExecutionPolicy");
+    expect(res.body.details.remedy).not.toContain("Re-parent");
     // M3.5: the counted identifiers and the carve-out-excluded set both travel in details.
     expect(res.body.details.ladderedChildIdentifiers).toEqual(
       expect.arrayContaining(ladderedChildIdentifiers),
     );
     expect(res.body.details.excludedChildIdentifiers).toEqual(excludedChildIdentifiers);
     expect(await statusOf(parentIssueId)).toBe("in_review");
+  });
+
+  it("PATCH: the assignee holding no live stage keeps the ADR-103 remedy verbatim (board ruling 2026-10-02 F1)", async () => {
+    const { companyId, implementerAgentId, parentIssueId, identifier } = await seedDecomposedCloseLadder("MD3A", {
+      ladderedChildren: 2,
+      excludedChildren: 0,
+      completedWorkflow: true,
+    });
+    currentActor = agentActor(
+      companyId,
+      implementerAgentId,
+      await seedRun(companyId, implementerAgentId, parentIssueId),
+    );
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.mechanism).toBe("D");
+    expect(res.body.details.callerSeat).toBe("assignee");
+    expect(res.body.error.startsWith("Mechanism D (ADR-072 close-ladder shape) refused:")).toBe(true);
+    // The guard's own message, remedy sentence included, is unchanged for the assignee.
+    expect(res.body.error).toMatch(/Add (any|the) missing review\/approval stages/);
+    expect(res.body.error).not.toContain("Your seat");
+    expect(res.body.details.remedy).toContain("Re-parent");
+    expect(res.body.details.remedy).toContain("process");
+    expect(res.body.details.nextAction).toBe(res.body.details.remedy);
+
+    // The thread record names the refusing caller's seat beside the remedy it was given.
+    const records = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, parentIssueId));
+    const record = records.find((r) => r.body.includes("done_transition_missing_delivery"));
+    expect(record?.body).toContain("Caller seat: assignee");
+    expect(await statusOf(parentIssueId)).toBe("in_progress");
   });
 
   it("PATCH: a true delivery/head refusal on the same decision-carrying door still carries merge-first (ADR-103 M3)", async () => {
