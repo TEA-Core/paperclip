@@ -65,10 +65,11 @@ const MIGRATION_ALTER_SUBTYPES = new Set([
  * This is a fixed deny-list of names, not a complete function policy. It covers:
  * - functions that run SQL text or read a table named in a string:
  *   query_to_xml*, table_to_xml*, cursor_to_xml*, schema_to_xml*, database_to_xml*,
- *   ts_stat, dblink*
+ *   ts_stat, ts_rewrite (its two-argument form runs a SELECT given as text), dblink*
  * - server file access: pg_read_file, pg_read_binary_file, pg_ls_*, pg_stat_file,
  *   pg_file_* (the adminpack functions pg_file_write, pg_file_rename, pg_file_unlink,
  *   pg_file_sync)
+ * - server paths: pg_relation_filepath, pg_tablespace_location
  * - large objects: every lo_* function (lo_import, lo_export, lo_get, lo_put, lo_open,
  *   lo_create, lo_creat, lo_unlink, lo_truncate, lo_from_bytea and the rest), loread, lowrite
  * - settings and sequence values: set_config, setval
@@ -84,16 +85,20 @@ const MIGRATION_ALTER_SUBTYPES = new Set([
  * It does not cover every function that reads a relation by name or has a side effect.
  * nextval, pg_advisory_*lock* and pg_sleep* are deliberately allowed, and so is every
  * other function that is not listed here (for example pg_replication_origin_*,
- * pg_create_restore_point, pg_stat_reset* and pg_export_snapshot). The real fix for those
- * is to run plugin SQL under a non-superuser runtime role, not a longer list.
+ * pg_create_restore_point, pg_stat_reset* and pg_export_snapshot). A deny-list closes only
+ * the misses already found. The durable close is an allowlist of FuncCall names together
+ * with a non-superuser runtime role for plugin SQL, not a longer deny-list.
  */
 const DISALLOWED_FUNCTION_PATTERNS = [
   "(?:query|table|cursor|schema|database)_to_xml\\w*",
   "ts_stat",
+  "ts_rewrite",
   "dblink\\w*",
   "pg_read_(?:binary_)?file",
   "pg_ls_\\w+",
   "pg_stat_file",
+  "pg_relation_filepath",
+  "pg_tablespace_location",
   "pg_file_\\w+",
   "lo_\\w+",
   "loread",

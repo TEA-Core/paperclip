@@ -53,6 +53,7 @@ const DENIED_FUNCTIONS: DeniedFunction[] = [
   { name: "database_to_xmlschema", args: "true, false, ''" },
   { name: "database_to_xml_and_xmlschema", args: "true, false, ''" },
   { name: "ts_stat", args: "'select 1'" },
+  { name: "ts_rewrite", args: "'a'::tsquery, 'SELECT to_tsquery(name), to_tsquery(name) FROM public.agents'" },
   { name: "dblink", args: "'dbname=x', 'select 1'" },
   { name: "dblink_exec", args: "'dbname=x', 'select 1'" },
   { name: "dblink_connect", args: "'dbname=x'" },
@@ -63,6 +64,9 @@ const DENIED_FUNCTIONS: DeniedFunction[] = [
   { name: "pg_ls_logdir", args: "" },
   { name: "pg_ls_waldir", args: "" },
   { name: "pg_stat_file", args: "'postmaster.pid'" },
+  // server paths
+  { name: "pg_relation_filepath", args: "'public.agents'" },
+  { name: "pg_tablespace_location", args: "1663" },
   { name: "lo_import", args: "'/tmp/x'" },
   { name: "lo_export", args: "1, '/tmp/x'" },
   { name: "lo_get", args: "1234" },
@@ -114,10 +118,14 @@ const DENIED_FUNCTIONS: DeniedFunction[] = [
 ];
 
 /**
- * The administrative, server-file, large-object, notification and replication functions. Each is also
- * tried schema-qualified and quoted, because the list matches the last part of the name.
+ * The administrative, server-file, server-path, large-object, notification and replication functions,
+ * and ts_rewrite. Each is also tried schema-qualified and quoted, because the list matches the last
+ * part of the name.
  */
 const ADMIN_FUNCTIONS = new Set([
+  "ts_rewrite",
+  "pg_relation_filepath",
+  "pg_tablespace_location",
   "pg_terminate_backend",
   "pg_cancel_backend",
   "pg_reload_conf",
@@ -258,6 +266,7 @@ const QUERY_REJECTS: SqlCase[] = [
   { name: "a schema-qualified function that reads a server file", sql: "SELECT pg_catalog.pg_read_file('postmaster.pid')", reason: /cannot call pg_read_file/ },
   { name: "a function that changes a setting", sql: "SELECT set_config('search_path', 'public', false)", reason: /cannot call set_config/ },
   { name: "a quoted function name in mixed case", sql: "SELECT \"Set_Config\"('search_path', 'public', false)", reason: /cannot call set_config/ },
+  { name: "an unquoted mixed-case call to ts_rewrite", sql: "SELECT TS_ReWrite('a'::tsquery, 'SELECT to_tsquery(name), to_tsquery(name) FROM public.agents')", reason: /cannot call ts_rewrite/ },
   { name: "a denied function in the FROM clause", sql: "SELECT * FROM pg_ls_dir('.')", reason: /cannot call pg_ls_dir/ },
   { name: "a denied function inside ROWS FROM", sql: "SELECT * FROM ROWS FROM (pg_ls_dir('.')) AS x", reason: /cannot call pg_ls_dir/ },
   { name: "a denied function in a lateral join", sql: "SELECT * FROM plugin_x.t, LATERAL pg_read_file(t.p)", reason: /cannot call pg_read_file/ },
@@ -344,6 +353,7 @@ const EXECUTE_REJECTS: SqlCase[] = [
   { name: "a row lock inside INSERT ... SELECT", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM plugin_x.s FOR UPDATE", reason: /cannot use SELECT INTO or row locks/ },
   { name: "a row lock inside an UPDATE ... FROM subquery", sql: "UPDATE plugin_x.t SET v = 1 FROM (SELECT id FROM plugin_x.s FOR SHARE) s WHERE s.id = t.id", reason: /cannot use SELECT INTO or row locks/ },
   { name: "a value from a function that runs SQL text", sql: "INSERT INTO plugin_x.t (word) SELECT word FROM ts_stat('SELECT to_tsvector(title) FROM public.issues')", reason: /cannot call ts_stat/ },
+  { name: "a value from ts_rewrite, which runs SQL text", sql: "INSERT INTO plugin_x.t (q) SELECT ts_rewrite('a'::tsquery, 'SELECT to_tsquery(name), to_tsquery(name) FROM public.agents')", reason: /cannot call ts_rewrite/ },
   { name: "a denied function in UPDATE ... SET", sql: "UPDATE plugin_x.t SET v = lo_get(1234)", reason: /cannot call lo_get/ },
   { name: "a denied function in VALUES", sql: "INSERT INTO plugin_x.t (id) VALUES (pg_terminate_backend(1))", reason: /cannot call pg_terminate_backend/ },
   { name: "a denied function in RETURNING", sql: "INSERT INTO plugin_x.t (id) VALUES (1) RETURNING setval('s', 1)", reason: /cannot call setval/ },
@@ -439,6 +449,9 @@ const MIGRATION_REJECTS: SqlCase[] = [
   { name: "a denied function in a column type conversion", sql: "ALTER TABLE plugin_test.t ALTER COLUMN v TYPE text USING pg_read_file(v)", reason: /cannot call pg_read_file/ },
   { name: "a denied function in a backfill UPDATE", sql: "UPDATE plugin_test.t SET v = lo_get(1234)", reason: /cannot call lo_get/ },
   { name: "a denied function in a backfill INSERT", sql: "INSERT INTO plugin_test.t (v) VALUES (pg_terminate_backend(1))", reason: /cannot call pg_terminate_backend/ },
+  { name: "ts_rewrite in a backfill INSERT ... SELECT", sql: "INSERT INTO plugin_test.t (q) SELECT ts_rewrite('a'::tsquery, 'SELECT to_tsquery(name), to_tsquery(name) FROM public.agents')", reason: /cannot call ts_rewrite/ },
+  { name: "pg_relation_filepath in a backfill INSERT ... SELECT", sql: "INSERT INTO plugin_test.t (v) SELECT pg_relation_filepath('public.agents')", reason: /cannot call pg_relation_filepath/ },
+  { name: "pg_tablespace_location in a backfill UPDATE", sql: "UPDATE plugin_test.t SET v = pg_tablespace_location(1663)", reason: /cannot call pg_tablespace_location/ },
   { name: "a denied function in CREATE TABLE AS", sql: "CREATE TABLE plugin_test.c AS SELECT lo_put(1234, 0, 'abc'::bytea) AS r", reason: /cannot call lo_put/ },
   { name: "a pg_catalog-qualified denied function in a view", sql: "CREATE VIEW plugin_test.v AS SELECT pg_catalog.pg_cancel_backend(1) AS r", reason: /cannot call pg_cancel_backend/ },
   { name: "a quoted denied function in a view", sql: 'CREATE VIEW plugin_test.v AS SELECT "pg_rotate_logfile"() AS r', reason: /cannot call pg_rotate_logfile/ },
