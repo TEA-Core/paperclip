@@ -1,0 +1,533 @@
+import { parseSync } from "libpg-query";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import type { PluginDatabaseCoreReadTable } from "@paperclipai/shared";
+import {
+  loadPluginSqlParser,
+  validatePluginMigrationStatement,
+  validatePluginRuntimeExecute,
+  validatePluginRuntimeQuery,
+} from "../services/plugin-database.js";
+
+beforeAll(async () => {
+  await loadPluginSqlParser();
+});
+
+type SqlCase = {
+  name: string;
+  sql: string;
+  namespace?: string;
+  coreReadTables?: PluginDatabaseCoreReadTable[];
+  /** The rule that must reject the statement. Unused for cases that must pass. */
+  reason?: RegExp;
+};
+
+const RUNTIME_NAMESPACE = "plugin_x";
+const RUNTIME_CORE_READ_TABLES: PluginDatabaseCoreReadTable[] = ["agents", "heartbeat_runs", "issues"];
+const MIGRATION_NAMESPACE = "plugin_test";
+const MIGRATION_CORE_READ_TABLES: PluginDatabaseCoreReadTable[] = ["issues"];
+/** A derived-looking namespace with a hash suffix, like the ones derivePluginDatabaseNamespace returns. */
+const EXAMPLE_NAMESPACE = "plugin_example_0123456789";
+
+/**
+ * A function the deny-list rejects, with arguments the parser accepts. The parser does not
+ * check argument types or whether the function exists, so the arguments only need to parse.
+ */
+type DeniedFunction = { name: string; args: string };
+
+const DENIED_FUNCTIONS: DeniedFunction[] = [
+  // SQL text or a table named in a string
+  { name: "query_to_xml", args: "'select 1', true, false, ''" },
+  { name: "query_to_xml_and_xmlschema", args: "'select 1', true, false, ''" },
+  { name: "table_to_xml", args: "'public.company_skills', true, false, ''" },
+  { name: "table_to_xmlschema", args: "'public.company_skills', true, false, ''" },
+  { name: "table_to_xml_and_xmlschema", args: "'public.company_skills', true, false, ''" },
+  { name: "cursor_to_xml", args: "'c', 1, true, false, ''" },
+  { name: "cursor_to_xmlschema", args: "'c', true, false, ''" },
+  { name: "schema_to_xml", args: "'public', true, false, ''" },
+  { name: "schema_to_xmlschema", args: "'public', true, false, ''" },
+  { name: "schema_to_xml_and_xmlschema", args: "'public', true, false, ''" },
+  { name: "database_to_xml", args: "true, false, ''" },
+  { name: "database_to_xmlschema", args: "true, false, ''" },
+  { name: "database_to_xml_and_xmlschema", args: "true, false, ''" },
+  { name: "ts_stat", args: "'select 1'" },
+  { name: "dblink", args: "'dbname=x', 'select 1'" },
+  { name: "dblink_exec", args: "'dbname=x', 'select 1'" },
+  { name: "dblink_connect", args: "'dbname=x'" },
+  // server files and large objects
+  { name: "pg_read_file", args: "'postmaster.pid'" },
+  { name: "pg_read_binary_file", args: "'postmaster.pid'" },
+  { name: "pg_ls_dir", args: "'.'" },
+  { name: "pg_ls_logdir", args: "" },
+  { name: "pg_ls_waldir", args: "" },
+  { name: "pg_stat_file", args: "'postmaster.pid'" },
+  { name: "lo_import", args: "'/tmp/x'" },
+  { name: "lo_export", args: "1, '/tmp/x'" },
+  { name: "lo_get", args: "1234" },
+  { name: "lo_put", args: "1234, 0, 'abc'::bytea" },
+  // settings and sequence values
+  { name: "set_config", args: "'search_path', 'public', false" },
+  { name: "setval", args: "'public.some_seq', 1" },
+  // backend and server control
+  { name: "pg_terminate_backend", args: "1" },
+  { name: "pg_cancel_backend", args: "1" },
+  { name: "pg_reload_conf", args: "" },
+  { name: "pg_rotate_logfile", args: "" },
+];
+
+/** The administrative and large-object functions. Each is also tried schema-qualified and quoted, because the list matches the last part of the name. */
+const ADMIN_FUNCTIONS = new Set([
+  "pg_terminate_backend",
+  "pg_cancel_backend",
+  "pg_reload_conf",
+  "pg_rotate_logfile",
+  "lo_get",
+  "lo_put",
+  "setval",
+]);
+
+function deniedFunctionQueryCases(): SqlCase[] {
+  return DENIED_FUNCTIONS.flatMap(({ name, args }) => {
+    const reason = new RegExp(`cannot call ${name}\\(\\)`);
+    const cases: SqlCase[] = [{ name: `a call to ${name}`, sql: `SELECT ${name}(${args})`, reason }];
+    if (ADMIN_FUNCTIONS.has(name)) {
+      cases.push(
+        { name: `a pg_catalog-qualified call to ${name}`, sql: `SELECT pg_catalog.${name}(${args})`, reason },
+        { name: `a quoted call to ${name}`, sql: `SELECT "${name}"(${args})`, reason },
+        { name: `a quoted, pg_catalog-qualified call to ${name}`, sql: `SELECT pg_catalog."${name}"(${args})`, reason },
+      );
+    }
+    return cases;
+  });
+}
+
+/** Statements the keyword scan rejects in every validator, before the statement kind is checked. */
+const BANNED_STATEMENTS: Array<{ name: string; sql: string }> = [
+  { name: "CREATE EXTENSION", sql: "CREATE EXTENSION IF NOT EXISTS dblink" },
+  { name: "CREATE TRIGGER", sql: "CREATE TRIGGER t_after AFTER INSERT ON plugin_x.t FOR EACH ROW EXECUTE FUNCTION plugin_x.f()" },
+  { name: "CREATE EVENT TRIGGER", sql: "CREATE EVENT TRIGGER e_start ON ddl_command_start EXECUTE FUNCTION plugin_x.f()" },
+  { name: "CREATE FUNCTION", sql: "CREATE FUNCTION plugin_x.f() RETURNS int LANGUAGE sql AS 'select 1'" },
+  { name: "CREATE OR REPLACE FUNCTION", sql: "CREATE OR REPLACE FUNCTION plugin_x.f() RETURNS int LANGUAGE sql AS 'select 1'" },
+  { name: "CREATE LANGUAGE", sql: "CREATE LANGUAGE plpgsql" },
+  { name: "GRANT", sql: "GRANT SELECT ON plugin_x.t TO PUBLIC" },
+  { name: "REVOKE", sql: "REVOKE SELECT ON plugin_x.t FROM PUBLIC" },
+  { name: "ALTER FUNCTION ... SECURITY DEFINER", sql: "ALTER FUNCTION plugin_x.f() SECURITY DEFINER" },
+  { name: "COPY", sql: "COPY plugin_x.t TO '/tmp/out'" },
+  { name: "CALL", sql: "CALL plugin_x.p()" },
+  { name: "a DO block with $$", sql: "DO $$ BEGIN END $$" },
+  { name: "a DO block with LANGUAGE", sql: "DO LANGUAGE plpgsql $$ BEGIN END $$" },
+];
+
+const BANNED_REASON = /disallowed statement or clause/;
+const bannedCases = (): SqlCase[] =>
+  BANNED_STATEMENTS.map((b) => ({ name: `${b.name} (keyword scan)`, sql: b.sql, reason: BANNED_REASON }));
+
+/** Text that does not parse as PostgreSQL. These cannot go through the "reject case parses" guard. */
+const UNPARSEABLE: SqlCase[] = [
+  { name: "a syntax error", sql: "SELEC id FROM plugin_x.t", reason: /Plugin SQL does not parse/ },
+  { name: "an empty string", sql: "", reason: /Plugin SQL does not parse/ },
+  { name: "an unterminated string literal", sql: "SELECT 'x", reason: /Plugin SQL does not parse/ },
+  { name: "an unterminated parenthesis", sql: "CREATE TABLE plugin_test.t (id int", reason: /Plugin SQL does not parse/ },
+];
+
+const QUERY_REJECTS: SqlCase[] = [
+  { name: "an unqualified relation", sql: "SELECT * FROM heartbeat_run_events WHERE company_id = $1", reason: /ctx\.db\.query relation "heartbeat_run_events" must use a fully qualified schema name/ },
+  { name: "an unqualified quoted relation", sql: 'SELECT * FROM "tool_invocations"', reason: /fully qualified/ },
+  { name: "a comma join to a non-whitelisted public table", sql: "SELECT a.id FROM public.agents a, public.company_skills s", reason: /not whitelisted/ },
+  { name: "a comma join to an unqualified relation", sql: "SELECT a.id FROM public.agents a, tool_connection_installs i", reason: /fully qualified/ },
+  { name: "ONLY on a non-whitelisted public table", sql: "SELECT * FROM ONLY public.activity_log", reason: /not whitelisted/ },
+  { name: "a parenthesized join", sql: "SELECT * FROM (public.activity_log l JOIN plugin_x.t t ON true)", reason: /not whitelisted/ },
+  { name: "a quoted schema with spaces around the dot", sql: 'SELECT * FROM "public" . company_skills', reason: /not whitelisted/ },
+  { name: "whitespace around the dot", sql: "SELECT * FROM public . activity_log", reason: /not whitelisted/ },
+  { name: "a newline before the dot", sql: "SELECT * FROM public\n.activity_log", reason: /not whitelisted/ },
+  { name: "a comment used as a separator", sql: "SELECT * FROM/**/public.activity_log", reason: /not whitelisted/ },
+  { name: "an unqualified relation inside a CTE body", sql: "WITH s AS (SELECT * FROM company_skills) SELECT * FROM s", reason: /fully qualified/ },
+  { name: "an unqualified relation inside a scalar subquery", sql: "SELECT (SELECT json_agg(t) FROM tool_catalog_entries t) AS x", reason: /fully qualified/ },
+  { name: "a CTE body that reads the table its CTE name shadows", sql: "WITH company_skills AS (SELECT * FROM company_skills) SELECT * FROM company_skills", reason: /fully qualified/ },
+  { name: "a CTE body that reads a CTE defined after it", sql: "WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS id) SELECT * FROM a", reason: /fully qualified/ },
+  { name: "a CTE name used outside the subquery that defines it", sql: "SELECT * FROM (WITH x AS (SELECT 1 AS id) SELECT * FROM x) s, x", reason: /fully qualified/ },
+  { name: "a quoted CTE name that differs in case from the relation it is read as", sql: 'WITH "A" AS (SELECT 1 AS id) SELECT * FROM a', reason: /fully qualified/ },
+  { name: "a schema-qualified relation that shares its name with a CTE", sql: "WITH company_skills AS (SELECT 1 AS id) SELECT * FROM public.company_skills", reason: /not whitelisted/ },
+  { name: "a database-qualified relation", sql: "SELECT * FROM paperclip.public.agents", reason: /database-qualified/ },
+  { name: "a database-qualified namespace relation", sql: "SELECT * FROM paperclip.plugin_x.t", reason: /database-qualified relation paperclip\.plugin_x\.t/ },
+  { name: "a qualified non-whitelisted public table", sql: "SELECT * FROM public.tool_invocations", reason: /not whitelisted/ },
+  { name: "another plugin schema", sql: "SELECT * FROM plugin_other_abc.t", reason: /cannot read schema/ },
+  { name: "a quoted mixed-case schema that only looks like the namespace", sql: 'SELECT * FROM "Plugin_X".t', reason: /cannot read schema/ },
+  { name: "a quoted upper-case public schema", sql: 'SELECT * FROM "PUBLIC".agents', reason: /cannot read schema "PUBLIC"/ },
+  { name: "a unicode-escaped schema name that decodes to public", sql: 'SELECT * FROM U&"pub\\006cic".company_skills', reason: /public\.company_skills, which is not whitelisted/ },
+  { name: "a pg_catalog relation", sql: "SELECT * FROM pg_catalog.pg_authid", reason: /cannot read schema "pg_catalog"/ },
+  { name: "a temp-schema relation", sql: "SELECT * FROM pg_temp.t", reason: /cannot read schema "pg_temp"/ },
+  { name: "SELECT INTO", sql: "SELECT * INTO plugin_x.snap FROM plugin_x.t", reason: /SELECT INTO/ },
+  { name: "SELECT INTO a temporary table", sql: "SELECT * INTO TEMP snap FROM plugin_x.t", reason: /SELECT INTO/ },
+  { name: "a row lock", sql: "SELECT * FROM public.agents FOR SHARE", reason: /lock rows/ },
+  { name: "FOR UPDATE on a namespace table", sql: "SELECT id FROM plugin_x.t FOR UPDATE", reason: /lock rows/ },
+  { name: "FOR NO KEY UPDATE on a whitelisted table", sql: "SELECT id FROM public.issues FOR NO KEY UPDATE", reason: /lock rows/ },
+  { name: "FOR KEY SHARE on a whitelisted table", sql: "SELECT id FROM public.issues FOR KEY SHARE", reason: /lock rows/ },
+  { name: "FOR UPDATE ... SKIP LOCKED on a whitelisted table", sql: "SELECT id FROM public.issues FOR UPDATE OF issues SKIP LOCKED", reason: /lock rows/ },
+  { name: "a row lock inside a subquery", sql: "SELECT * FROM (SELECT id FROM public.issues FOR UPDATE) s", reason: /lock rows/ },
+  { name: "TABLE on a non-whitelisted public table", sql: "TABLE public.company_skills", reason: /not whitelisted/ },
+  { name: "a data-modifying CTE", sql: "WITH d AS (DELETE FROM plugin_x.t RETURNING id) SELECT id FROM d", reason: /mutation/ },
+  { name: "a DELETE in a CTE over a whitelisted table", sql: "WITH d AS (DELETE FROM public.agents RETURNING id) SELECT id FROM d", reason: /mutation/ },
+  { name: "an UPDATE in a CTE over a whitelisted table", sql: "WITH u AS (UPDATE public.agents SET name = 'x' RETURNING id) SELECT id FROM u", reason: /mutation/ },
+  { name: "an INSERT in a CTE over a whitelisted table", sql: "WITH i AS (INSERT INTO public.agents (id) VALUES (1) RETURNING id) SELECT id FROM i", reason: /mutation/ },
+  { name: "a MERGE in a CTE over a whitelisted table", sql: "WITH m AS (MERGE INTO public.agents a USING plugin_x.s s ON a.id = s.id WHEN MATCHED THEN DELETE RETURNING a.id) SELECT id FROM m", reason: /mutation/ },
+  { name: "a data-modifying CTE inside a subquery", sql: "SELECT * FROM (WITH d AS (DELETE FROM public.agents RETURNING id) SELECT id FROM d) s", reason: /mutation/ },
+  { name: "an UPDATE statement", sql: "UPDATE plugin_x.t SET v = 1", reason: /only allows SELECT/ },
+  { name: "a DELETE statement", sql: "DELETE FROM plugin_x.t", reason: /only allows SELECT/ },
+  { name: "an INSERT statement", sql: "INSERT INTO plugin_x.t (id) VALUES (1)", reason: /only allows SELECT/ },
+  { name: "EXPLAIN", sql: "EXPLAIN SELECT 1", reason: /only allows SELECT/ },
+  { name: "SET", sql: "SET search_path = public", reason: /only allows SELECT/ },
+  { name: "a DO block with a tagged dollar quote", sql: "DO $tag$ BEGIN NULL; END $tag$", reason: /only allows SELECT/ },
+  { name: "two statements", sql: "SELECT id FROM plugin_x.t; SELECT 1", reason: /Plugin runtime SQL must contain exactly one statement/ },
+  { name: "a comment with no statement", sql: "-- nothing here", reason: /Plugin runtime SQL must contain exactly one statement/ },
+  { name: "a function that runs SQL text", sql: "SELECT query_to_xml('select * from public.company_skills', true, false, '')", reason: /cannot call query_to_xml/ },
+  { name: "a function that reads a relation named in a string", sql: "SELECT table_to_xml('public.company_skills', true, false, '')", reason: /cannot call table_to_xml/ },
+  { name: "a schema-qualified function that reads a server file", sql: "SELECT pg_catalog.pg_read_file('postmaster.pid')", reason: /cannot call pg_read_file/ },
+  { name: "a function that changes a setting", sql: "SELECT set_config('search_path', 'public', false)", reason: /cannot call set_config/ },
+  { name: "a quoted function name in mixed case", sql: "SELECT \"Set_Config\"('search_path', 'public', false)", reason: /cannot call set_config/ },
+  { name: "a denied function in the FROM clause", sql: "SELECT * FROM pg_ls_dir('.')", reason: /cannot call pg_ls_dir/ },
+  { name: "a denied function inside ROWS FROM", sql: "SELECT * FROM ROWS FROM (pg_ls_dir('.')) AS x", reason: /cannot call pg_ls_dir/ },
+  { name: "a denied function in a lateral join", sql: "SELECT * FROM plugin_x.t, LATERAL pg_read_file(t.p)", reason: /cannot call pg_read_file/ },
+  { name: "a denied function in a CTE body", sql: "WITH s AS (SELECT pg_read_file('x') AS c) SELECT c FROM s", reason: /cannot call pg_read_file/ },
+  { name: "a denied function in a scalar subquery", sql: "SELECT (SELECT lo_get(1234)) AS x", reason: /cannot call lo_get/ },
+  { name: "a denied function in WHERE", sql: "SELECT id FROM plugin_x.t WHERE id = pg_terminate_backend(1)::int", reason: /cannot call pg_terminate_backend/ },
+  { name: "a denied function in ORDER BY", sql: "SELECT id FROM plugin_x.t ORDER BY set_config('a', 'b', false)", reason: /cannot call set_config/ },
+  { name: "a denied function in a join condition", sql: "SELECT a.id FROM plugin_x.t a JOIN plugin_x.u b ON setval('s', 1) > 0", reason: /cannot call setval/ },
+  ...deniedFunctionQueryCases(),
+  ...bannedCases(),
+];
+
+const QUERY_PASSES: SqlCase[] = [
+  { name: "a whitelisted public read", sql: "SELECT agent_id, status FROM public.heartbeat_runs WHERE id = $1" },
+  { name: "a namespace join to a whitelisted table", sql: "SELECT r.id FROM plugin_x.rows r JOIN public.issues i ON i.id = r.issue_id" },
+  { name: "EXTRACT(... FROM an unqualified column)", sql: "SELECT EXTRACT(DOW FROM created_at) AS do_flag FROM plugin_x.rows" },
+  { name: "EXTRACT(... FROM a qualified column)", sql: "SELECT EXTRACT(DOW FROM r.created_at) AS dow FROM plugin_x.t r" },
+  { name: "a quoted whitelisted table", sql: 'SELECT * FROM "public"."agents"' },
+  { name: "an unquoted upper-case namespace", sql: "SELECT * FROM PLUGIN_X.t" },
+  { name: "an unquoted upper-case public schema", sql: "SELECT * FROM PUBLIC.agents" },
+  { name: "a recursive CTE", sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t" },
+  { name: "a CTE chain", sql: "WITH a AS (SELECT id FROM plugin_x.t), b AS (SELECT id FROM a) SELECT * FROM b JOIN public.agents g ON g.id = b.id" },
+  { name: "a CTE read from a subquery", sql: "WITH a AS (SELECT id FROM plugin_x.t) SELECT * FROM (SELECT id FROM a) s" },
+  { name: "a CTE defined inside a subquery and read there", sql: "SELECT * FROM (WITH x AS (SELECT 1 AS id) SELECT id FROM x) s" },
+  { name: "a parenthesized set operation with its own WITH", sql: "(WITH x AS (SELECT 1 AS a) SELECT a FROM x) UNION ALL SELECT 2" },
+  { name: "a VALUES list", sql: "VALUES (1), (2)" },
+  { name: "a trailing semicolon", sql: "SELECT id FROM plugin_x.t;" },
+  { name: "ordinary function calls", sql: "SELECT count(*) AS n, coalesce(max(r.created_at), now()) AS latest, lower(r.label) AS label FROM plugin_x.t r GROUP BY lower(r.label)" },
+  { name: "a set-returning function in FROM", sql: "SELECT n FROM generate_series(1, 3) AS n" },
+  { name: "a function whose name only starts with a denied name", sql: "SELECT plugin_x.set_config_cache(1)" },
+  { name: "a function whose name only ends with a denied name", sql: "SELECT plugin_x.reset_set_config(1)" },
+  { name: "an outer CTE read from the main body of a subquery that has its own WITH", sql: "WITH a AS (SELECT 1 AS id) SELECT * FROM (WITH x AS (SELECT 2 AS id) SELECT a.id FROM a, x) s" },
+  { name: "a CTE read from a nested WITH inside another CTE body", sql: "WITH a AS (SELECT 1 AS id), b AS (WITH c AS (SELECT id FROM a) SELECT id FROM c) SELECT id FROM b" },
+  // The deny-list is a fixed list of names, not a function policy. These three stay allowed on purpose;
+  // the real fix is a non-superuser runtime role. See DISALLOWED_FUNCTION_PATTERNS.
+  { name: "nextval, which the deny-list deliberately leaves out", sql: "SELECT nextval('plugin_x.some_seq')" },
+  { name: "pg_advisory_xact_lock, which the deny-list deliberately leaves out", sql: "SELECT pg_advisory_xact_lock(42)" },
+  { name: "pg_sleep, which the deny-list deliberately leaves out", sql: "SELECT pg_sleep(0)" },
+  { name: "a string literal that mentions a core table", sql: "SELECT 'see from public.company_skills' AS note FROM plugin_x.t" },
+  { name: "banned words inside a string literal", sql: "SELECT 'grant copy call revoke' AS w FROM plugin_x.t" },
+  { name: "a banned word inside an escaped-quote string literal", sql: "SELECT 'it''s a call' AS w FROM plugin_x.t" },
+  { name: "a banned word as a quoted identifier", sql: 'SELECT "copy" FROM plugin_x.t' },
+  { name: "a banned word inside a line comment", sql: "SELECT id FROM plugin_x.t -- grant everything\n" },
+  { name: "a banned word inside a block comment", sql: "SELECT id /* revoke all */ FROM plugin_x.t" },
+  {
+    name: "a run-selection query that left-joins a namespace table",
+    namespace: EXAMPLE_NAMESPACE,
+    coreReadTables: ["heartbeat_runs"],
+    sql: `SELECT h.id, h.agent_id, h.status, h.created_at, h.finished_at, h.log_store, h.log_ref, h.log_bytes,
+       h.context_snapshot->>'issueId' AS issue_id
+FROM public.heartbeat_runs h LEFT JOIN ${EXAMPLE_NAMESPACE}.ex_runs r ON r.run_id = h.id AND r.company_id = h.company_id
+WHERE h.company_id = $1 AND h.created_at > now() - interval '36 days' AND h.finished_at IS NOT NULL
+  AND (r.run_id IS NULL OR r.row_version < $2)
+ORDER BY (r.run_id IS NULL) DESC, h.finished_at LIMIT 200`,
+  },
+];
+
+const EXECUTE_REJECTS: SqlCase[] = [
+  { name: "a public target", sql: "UPDATE public.issues SET title = $1", reason: /target must be inside plugin namespace/ },
+  { name: "an unqualified target", sql: "UPDATE issues SET title = $1", reason: /target must be inside plugin namespace/ },
+  { name: "a target in another plugin schema", sql: "INSERT INTO plugin_other_abc.t (id) VALUES ($1)", reason: /target must be inside plugin namespace/ },
+  { name: "a database-qualified target", sql: "INSERT INTO paperclip.plugin_x.t (id) VALUES ($1)", reason: /target must be inside plugin namespace/ },
+  { name: "a quoted mixed-case target schema", sql: 'UPDATE "Plugin_X".t SET v = $1', reason: /target must be inside plugin namespace/ },
+  { name: "INSERT ... SELECT from an unqualified relation", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM issues", reason: /ctx\.db\.execute relation "issues" must use a fully qualified schema name/ },
+  { name: "DELETE ... USING an unqualified relation", sql: "DELETE FROM plugin_x.t USING issues i WHERE i.id = t.id", reason: /fully qualified/ },
+  { name: "INSERT ... SELECT FROM ONLY a public table", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM ONLY public.agents", reason: /non-plugin schemas/ },
+  { name: "UPDATE ... FROM a public table", sql: "UPDATE plugin_x.t SET v = 1 FROM public.agents a WHERE a.id = t.id", reason: /non-plugin schemas/ },
+  { name: "UPDATE ... SET from a subquery over a public table", sql: "UPDATE plugin_x.t SET v = (SELECT count(*) FROM public.issues)", reason: /non-plugin schemas/ },
+  { name: "DELETE ... USING another plugin schema", sql: "DELETE FROM plugin_x.t USING plugin_other_abc.s s WHERE s.id = t.id", reason: /non-plugin schemas/ },
+  { name: "a database-qualified relation in a SELECT", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM paperclip.plugin_x.s", reason: /database-qualified relation paperclip\.plugin_x\.s/ },
+  { name: "a comma join in UPDATE ... FROM", sql: "UPDATE plugin_x.t SET v = 1 FROM plugin_x.s, issues i WHERE i.id = s.id", reason: /fully qualified/ },
+  { name: "a leading WITH", sql: "WITH s AS (SELECT 1 AS id) INSERT INTO plugin_x.t (id) SELECT id FROM s", reason: /only allows INSERT, UPDATE, or DELETE/ },
+  { name: "a leading WITH on a DELETE", sql: "WITH s AS (SELECT 1 AS id) DELETE FROM plugin_x.t USING s WHERE s.id = t.id", reason: /only allows INSERT, UPDATE, or DELETE/ },
+  { name: "a SELECT statement", sql: "SELECT 1", reason: /only allows INSERT, UPDATE, or DELETE/ },
+  { name: "a MERGE statement", sql: "MERGE INTO plugin_x.t USING plugin_x.s ON t.id = s.id WHEN MATCHED THEN DELETE", reason: /only allows INSERT, UPDATE, or DELETE/ },
+  { name: "TRUNCATE", sql: "TRUNCATE plugin_x.t", reason: /only allows INSERT, UPDATE, or DELETE/ },
+  { name: "a DO block with a tagged dollar quote", sql: "DO $tag$ BEGIN NULL; END $tag$", reason: /only allows INSERT, UPDATE, or DELETE/ },
+  { name: "two statements", sql: "INSERT INTO plugin_x.t (id) VALUES (1); INSERT INTO plugin_x.t (id) VALUES (2)", reason: /Plugin runtime SQL must contain exactly one statement/ },
+  { name: "a comment with no statement", sql: "/* nothing here */", reason: /Plugin runtime SQL must contain exactly one statement/ },
+  { name: "a data-modifying CTE inside an INSERT ... SELECT subquery", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM (WITH d AS (DELETE FROM plugin_x.u RETURNING id) SELECT id FROM d) s", reason: /cannot nest data-modifying statements/ },
+  { name: "a nested INSERT inside an INSERT", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM (WITH i AS (INSERT INTO plugin_x.u (id) VALUES (1) RETURNING id) SELECT id FROM i) s", reason: /cannot nest data-modifying statements/ },
+  { name: "a data-modifying CTE inside an UPDATE ... FROM subquery", sql: "UPDATE plugin_x.t SET v = 1 FROM (WITH d AS (DELETE FROM plugin_x.u RETURNING id) SELECT id FROM d) s WHERE s.id = t.id", reason: /cannot nest data-modifying statements/ },
+  { name: "SELECT INTO inside INSERT ... SELECT", sql: "INSERT INTO plugin_x.t (id) SELECT id INTO plugin_x.z FROM plugin_x.s", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "a row lock inside INSERT ... SELECT", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM plugin_x.s FOR UPDATE", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "a row lock inside an UPDATE ... FROM subquery", sql: "UPDATE plugin_x.t SET v = 1 FROM (SELECT id FROM plugin_x.s FOR SHARE) s WHERE s.id = t.id", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "a value from a function that runs SQL text", sql: "INSERT INTO plugin_x.t (word) SELECT word FROM ts_stat('SELECT to_tsvector(title) FROM public.issues')", reason: /cannot call ts_stat/ },
+  { name: "a denied function in UPDATE ... SET", sql: "UPDATE plugin_x.t SET v = lo_get(1234)", reason: /cannot call lo_get/ },
+  { name: "a denied function in VALUES", sql: "INSERT INTO plugin_x.t (id) VALUES (pg_terminate_backend(1))", reason: /cannot call pg_terminate_backend/ },
+  { name: "a denied function in RETURNING", sql: "INSERT INTO plugin_x.t (id) VALUES (1) RETURNING setval('s', 1)", reason: /cannot call setval/ },
+  { name: "a denied function in ON CONFLICT ... DO UPDATE", sql: "INSERT INTO plugin_x.t (id, v) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = pg_read_file('x')", reason: /cannot call pg_read_file/ },
+  { name: "a denied function in a DELETE condition", sql: "DELETE FROM plugin_x.t WHERE v = set_config('a', 'b', false)", reason: /cannot call set_config/ },
+  { name: "a pg_catalog-qualified denied function", sql: "UPDATE plugin_x.t SET v = pg_catalog.pg_reload_conf()", reason: /cannot call pg_reload_conf/ },
+  { name: "a quoted denied function", sql: 'UPDATE plugin_x.t SET v = "pg_rotate_logfile"()', reason: /cannot call pg_rotate_logfile/ },
+  ...bannedCases(),
+];
+
+const EXECUTE_PASSES: SqlCase[] = [
+  { name: "a namespace insert", sql: "INSERT INTO plugin_x.t (id) VALUES ($1)" },
+  { name: "an insert with RETURNING", sql: "INSERT INTO plugin_x.t (id) VALUES ($1) RETURNING id" },
+  { name: "an unquoted upper-case namespace target", sql: "UPDATE PLUGIN_X.t SET v = $1" },
+  { name: "INSERT ... SELECT from the namespace", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM plugin_x.s WHERE id = $1" },
+  { name: "INSERT ... SELECT from a subquery with its own WITH", sql: "INSERT INTO plugin_x.t (id) SELECT id FROM (WITH s AS (SELECT id FROM plugin_x.u) SELECT id FROM s) x" },
+  { name: "an upsert that compares EXCLUDED values", sql: "INSERT INTO plugin_x.t AS t (id, v) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE t.v IS DISTINCT FROM EXCLUDED.v" },
+  { name: "UPDATE ... FROM the namespace", sql: "UPDATE plugin_x.t SET v = s.v FROM plugin_x.s s WHERE s.id = t.id" },
+  { name: "DELETE ... USING the namespace", sql: "DELETE FROM plugin_x.t USING plugin_x.s s WHERE s.id = t.id RETURNING t.id" },
+  { name: "a trailing semicolon", sql: "DELETE FROM plugin_x.t WHERE id = $1;" },
+];
+
+const MIGRATION_REJECTS: SqlCase[] = [
+  { name: "an unqualified CREATE TABLE", sql: "CREATE TABLE rows (id uuid PRIMARY KEY, issue_id uuid REFERENCES public.issues(id))", reason: /fully qualified/ },
+  { name: "a backfill into a public table", sql: "WITH source_rows AS (SELECT id FROM plugin_test.rows) INSERT INTO public.issues (id) SELECT id FROM source_rows", reason: /public/ },
+  { name: "an UPDATE of a public table", sql: "UPDATE public.issues SET title = 'bad'", reason: /public/ },
+  { name: "CREATE TABLE in public", sql: "CREATE TABLE public.rows (id uuid PRIMARY KEY)", reason: /public/ },
+  { name: "a DO block", sql: "DO $$ BEGIN END $$", reason: /disallowed/ },
+  { name: "a DO block with a tagged dollar quote", sql: "DO $tag$ BEGIN NULL; END $tag$", reason: /DDL or namespace-scoped backfill/ },
+  { name: "COMMENT ON a core table", sql: "COMMENT ON TABLE public.issues IS 'x'", reason: /COMMENT target/ },
+  { name: "COMMENT ON a core column", sql: "COMMENT ON COLUMN public.issues.title IS 'x'", reason: /COMMENT target/ },
+  { name: "COMMENT ON another plugin schema", sql: "COMMENT ON SCHEMA plugin_other IS 'x'", reason: /COMMENT target/ },
+  { name: "COMMENT ON a table named like the namespace", sql: "COMMENT ON TABLE plugin_test IS 'x'", reason: /COMMENT target/ },
+  { name: "COMMENT ON a role named like the namespace", sql: "COMMENT ON ROLE plugin_test IS 'x'", reason: /COMMENT target/ },
+  { name: "COMMENT ON a function", sql: "COMMENT ON FUNCTION plugin_test.f() IS 'x'", reason: /COMMENT target/ },
+  { name: "INHERITS from a core table", sql: "CREATE TABLE plugin_test.t (id uuid) INHERITS (public.issues)", reason: /inherit/ },
+  { name: "INHERITS from an unqualified table", sql: "CREATE TABLE plugin_test.t (id uuid) INHERITS (parent_rows)", reason: /cannot inherit from or partition/ },
+  { name: "INHERITS from another plugin's table", sql: "CREATE TABLE plugin_test.t (id uuid) INHERITS (plugin_other.p)", reason: /cannot inherit from or partition/ },
+  { name: "INHERITS from a database-qualified table", sql: "CREATE TABLE plugin_test.t (id uuid) INHERITS (paperclip.plugin_test.p)", reason: /cannot inherit from or partition/ },
+  { name: "PARTITION OF a core table", sql: "CREATE TABLE plugin_test.p PARTITION OF public.issues FOR VALUES IN ('x')", reason: /inherit/ },
+  { name: "ALTER TABLE ... INHERIT a core table", sql: "ALTER TABLE plugin_test.t INHERIT public.issues", reason: /AT_AddInherit/ },
+  { name: "ALTER TABLE ... ATTACH PARTITION a core table", sql: "ALTER TABLE plugin_test.t ATTACH PARTITION public.issues FOR VALUES IN ('x')", reason: /AT_AttachPartition/ },
+  { name: "ALTER TABLE ... OWNER TO", sql: "ALTER TABLE plugin_test.t OWNER TO someone", reason: /AT_ChangeOwner/ },
+  { name: "ALTER TABLE ... ENABLE ROW LEVEL SECURITY", sql: "ALTER TABLE plugin_test.t ENABLE ROW LEVEL SECURITY", reason: /AT_EnableRowSecurity/ },
+  { name: "moving a table to another schema", sql: "ALTER TABLE plugin_test.t SET SCHEMA public", reason: /DDL or namespace-scoped backfill/ },
+  { name: "renaming a core table", sql: "ALTER TABLE public.issues RENAME TO issues_old", reason: /cannot mutate or define objects in public\.issues/ },
+  { name: "renaming a schema", sql: "ALTER SCHEMA plugin_test RENAME TO plugin_other", reason: /fully qualified schema names/ },
+  { name: "CREATE INDEX on a core table", sql: "CREATE INDEX rows_idx ON public.issues (id)", reason: /cannot mutate or define objects in public\.issues/ },
+  { name: "CREATE INDEX on an unqualified table", sql: "CREATE INDEX rows_idx ON rows (id)", reason: /fully qualified schema names/ },
+  { name: "an INSERT into another plugin's schema", sql: "INSERT INTO plugin_other.t (id) SELECT id FROM plugin_test.rows", reason: /outside namespace "plugin_test"/ },
+  { name: "a database-qualified target", sql: "CREATE TABLE paperclip.plugin_test.t (id int)", reason: /database-qualified relation paperclip\.plugin_test\.t/ },
+  { name: "a backfill that reads a database-qualified relation", sql: "INSERT INTO plugin_test.t (id) SELECT id FROM paperclip.public.issues", reason: /database-qualified relation paperclip\.public\.issues/ },
+  { name: "a backfill that reads an unqualified relation", sql: "INSERT INTO plugin_test.t (id) SELECT id FROM agents", reason: /Plugin migration relation "agents" must use a fully qualified schema name/ },
+  { name: "a backfill with a comma join to a non-whitelisted table", sql: "UPDATE plugin_test.t SET v = 1 FROM plugin_test.s, public.agents a WHERE a.id = s.id", reason: /not whitelisted/ },
+  { name: "a backfill that reads another plugin's schema", sql: "INSERT INTO plugin_test.t (id) SELECT id FROM plugin_other.s", reason: /outside namespace "plugin_test"/ },
+  { name: "a foreign key to a non-whitelisted core table", sql: "CREATE TABLE plugin_test.rows (id uuid PRIMARY KEY, agent_id uuid REFERENCES public.agents(id))", reason: /public\.agents, which is not whitelisted/ },
+  { name: "CREATE TABLE AS from an unqualified relation", sql: "CREATE TABLE plugin_test.c AS SELECT * FROM agents", reason: /fully qualified/ },
+  { name: "CREATE TABLE AS into a core schema", sql: "CREATE TABLE public.c AS SELECT id FROM plugin_test.rows", reason: /cannot mutate or define objects in public\.c/ },
+  { name: "a materialized view over namespace tables", sql: "CREATE MATERIALIZED VIEW plugin_test.mv AS SELECT id FROM plugin_test.rows", reason: /DDL or namespace-scoped backfill/ },
+  { name: "a materialized view over a whitelisted core table", sql: "CREATE MATERIALIZED VIEW plugin_test.mv AS SELECT id FROM public.issues", reason: /DDL or namespace-scoped backfill/ },
+  { name: "REFRESH MATERIALIZED VIEW", sql: "REFRESH MATERIALIZED VIEW plugin_test.mv", reason: /DDL or namespace-scoped backfill/ },
+  { name: "SELECT INTO at the top level", sql: "SELECT * INTO plugin_test.snap FROM plugin_test.rows", reason: /DDL or namespace-scoped backfill/ },
+  { name: "DELETE", sql: "DELETE FROM plugin_test.t", reason: /cannot delete data/ },
+  { name: "DROP TABLE", sql: "DROP TABLE plugin_test.t", reason: /Destructive/ },
+  { name: "TRUNCATE", sql: "TRUNCATE plugin_test.t", reason: /Destructive/ },
+  { name: "MERGE", sql: "MERGE INTO plugin_test.t USING plugin_test.s ON t.id = s.id WHEN MATCHED THEN DELETE", reason: /DDL or namespace-scoped backfill/ },
+  { name: "two statements", sql: "CREATE TABLE plugin_test.a (id int); CREATE TABLE plugin_test.b (id int)", reason: /Plugin migration statement must contain exactly one statement/ },
+  { name: "a comment with no statement", sql: "-- nothing here", reason: /Plugin migration statement must contain exactly one statement/ },
+  { name: "a DELETE in a CTE over a whitelisted table", sql: "WITH d AS (DELETE FROM public.issues RETURNING id) INSERT INTO plugin_test.t (id) SELECT id FROM d", reason: /cannot nest data-modifying statements/ },
+  { name: "an UPDATE in a CTE over a whitelisted table", sql: "WITH u AS (UPDATE public.issues SET title = 'x' RETURNING id) UPDATE plugin_test.t SET v = 1 FROM u WHERE u.id = t.id", reason: /cannot nest data-modifying statements/ },
+  { name: "an INSERT in a CTE over a whitelisted table", sql: "WITH i AS (INSERT INTO public.issues (id) VALUES (1) RETURNING id) INSERT INTO plugin_test.t (id) SELECT id FROM i", reason: /cannot nest data-modifying statements/ },
+  { name: "a MERGE in a CTE over a whitelisted table", sql: "WITH m AS (MERGE INTO public.issues i USING plugin_test.s s ON i.id = s.id WHEN MATCHED THEN DELETE RETURNING i.id) INSERT INTO plugin_test.t (id) SELECT id FROM m", reason: /cannot nest data-modifying statements/ },
+  { name: "a data-modifying CTE inside a subquery of a backfill", sql: "INSERT INTO plugin_test.t (id) SELECT id FROM (WITH d AS (DELETE FROM public.issues RETURNING id) SELECT id FROM d) s", reason: /cannot nest data-modifying statements/ },
+  { name: "SELECT INTO inside a backfill", sql: "INSERT INTO plugin_test.t (id) SELECT id INTO plugin_test.z FROM plugin_test.s", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "SELECT INTO inside CREATE TABLE AS", sql: "CREATE TABLE plugin_test.c AS SELECT id INTO plugin_test.z FROM plugin_test.s", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "a row lock on a whitelisted table inside a backfill", sql: "INSERT INTO plugin_test.t (id) SELECT id FROM public.issues FOR UPDATE", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "a row lock on a whitelisted table inside an UPDATE ... FROM subquery", sql: "UPDATE plugin_test.t SET v = 1 FROM (SELECT id FROM public.issues FOR SHARE) s WHERE s.id = t.id", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "a row lock inside CREATE TABLE AS", sql: "CREATE TABLE plugin_test.c AS SELECT id FROM public.issues FOR NO KEY UPDATE", reason: /cannot use SELECT INTO or row locks/ },
+  { name: "a namespace view over a whitelisted table", sql: "CREATE VIEW plugin_test.v AS SELECT r.id FROM plugin_test.rows r JOIN public.issues i ON i.id = r.issue_id", reason: /Plugin views cannot read public\.issues/ },
+  { name: "CREATE OR REPLACE VIEW over a whitelisted table", sql: "CREATE OR REPLACE VIEW plugin_test.v AS SELECT id FROM public.issues", reason: /Plugin views cannot read public\.issues/ },
+  { name: "a view over a whitelisted table through a CTE", sql: "CREATE VIEW plugin_test.v AS WITH a AS (SELECT id FROM public.issues) SELECT id FROM a", reason: /Plugin views cannot read public\.issues/ },
+  { name: "a view in a core schema", sql: "CREATE VIEW public.v AS SELECT id FROM plugin_test.rows", reason: /cannot mutate or define objects in public\.v/ },
+  { name: "a view with an unqualified name", sql: "CREATE VIEW v AS SELECT id FROM plugin_test.rows", reason: /fully qualified schema names/ },
+  { name: "a view over a catalog relation", sql: "CREATE VIEW plugin_test.v AS SELECT * FROM pg_catalog.pg_authid", reason: /outside namespace "plugin_test"/ },
+  { name: "a view whose body runs SQL text", sql: "CREATE VIEW plugin_test.v AS SELECT query_to_xml('select * from public.company_skills', true, false, '') AS x", reason: /cannot call query_to_xml/ },
+  { name: "a denied function in a column default", sql: "CREATE TABLE plugin_test.t (n bigint DEFAULT setval('public.some_seq', 1))", reason: /cannot call setval/ },
+  { name: "a denied function in an index expression", sql: "CREATE INDEX t_idx ON plugin_test.t ((set_config('a', 'b', false)))", reason: /cannot call set_config/ },
+  { name: "a denied function in a CHECK constraint", sql: "ALTER TABLE plugin_test.t ADD CONSTRAINT t_chk CHECK (pg_reload_conf())", reason: /cannot call pg_reload_conf/ },
+  { name: "a denied function in a column type conversion", sql: "ALTER TABLE plugin_test.t ALTER COLUMN v TYPE text USING pg_read_file(v)", reason: /cannot call pg_read_file/ },
+  { name: "a denied function in a backfill UPDATE", sql: "UPDATE plugin_test.t SET v = lo_get(1234)", reason: /cannot call lo_get/ },
+  { name: "a denied function in a backfill INSERT", sql: "INSERT INTO plugin_test.t (v) VALUES (pg_terminate_backend(1))", reason: /cannot call pg_terminate_backend/ },
+  { name: "a denied function in CREATE TABLE AS", sql: "CREATE TABLE plugin_test.c AS SELECT lo_put(1234, 0, 'abc'::bytea) AS r", reason: /cannot call lo_put/ },
+  { name: "a pg_catalog-qualified denied function in a view", sql: "CREATE VIEW plugin_test.v AS SELECT pg_catalog.pg_cancel_backend(1) AS r", reason: /cannot call pg_cancel_backend/ },
+  { name: "a quoted denied function in a view", sql: 'CREATE VIEW plugin_test.v AS SELECT "pg_rotate_logfile"() AS r', reason: /cannot call pg_rotate_logfile/ },
+  { name: "a namespace name with a space", sql: "CREATE TABLE plugin_test.t (id int)", namespace: "plugin test", reason: /Unsafe SQL namespace: plugin test/ },
+  { name: "a namespace name that ends a statement", sql: "CREATE TABLE plugin_test.t (id int)", namespace: "plugin_test; DROP SCHEMA public", reason: /Unsafe SQL namespace/ },
+  { name: "a namespace name that starts with a digit", sql: "CREATE TABLE plugin_test.t (id int)", namespace: "1plugin", reason: /Unsafe SQL namespace/ },
+  { name: "a namespace name with a hyphen", sql: "CREATE TABLE plugin_test.t (id int)", namespace: "plugin-test", reason: /Unsafe SQL namespace/ },
+  { name: "an empty namespace name", sql: "CREATE TABLE plugin_test.t (id int)", namespace: "", reason: /Unsafe SQL namespace/ },
+  { name: "a namespace name with a double quote", sql: "CREATE TABLE plugin_test.t (id int)", namespace: 'plugin_test"', reason: /Unsafe SQL namespace/ },
+  ...bannedCases(),
+];
+
+const MIGRATION_PASSES: SqlCase[] = [
+  { name: "CREATE TABLE with a whitelisted public foreign key", sql: "CREATE TABLE plugin_test.rows (id uuid PRIMARY KEY, issue_id uuid REFERENCES public.issues(id))" },
+  { name: "CREATE TABLE ... INHERITS a namespace table", sql: "CREATE TABLE plugin_test.child (id uuid) INHERITS (plugin_test.parent)" },
+  { name: "CREATE TABLE ... PARTITION OF a namespace table", sql: "CREATE TABLE plugin_test.p1 PARTITION OF plugin_test.p FOR VALUES IN ('x')" },
+  { name: "CREATE INDEX", sql: "CREATE INDEX IF NOT EXISTS rows_issue_idx ON plugin_test.rows (issue_id)" },
+  { name: "a WITH ... INSERT backfill", sql: "WITH source_rows AS (SELECT id FROM plugin_test.rows) INSERT INTO plugin_test.row_copies (id) SELECT id FROM source_rows ON CONFLICT (id) DO NOTHING" },
+  { name: "an INSERT backfill that reads a whitelisted core table", sql: "INSERT INTO plugin_test.rows (id) SELECT id FROM public.issues" },
+  { name: "an UPDATE ... FROM backfill", sql: "UPDATE plugin_test.rows r SET copied_from_id = s.id FROM plugin_test.source_rows s WHERE s.id = r.id" },
+  { name: "COMMENT ON a namespace table", sql: "COMMENT ON TABLE plugin_test.rows IS 'rows'" },
+  { name: "COMMENT ON a namespace column", sql: "COMMENT ON COLUMN plugin_test.rows.issue_id IS 'fk'" },
+  { name: "COMMENT ON the namespace schema", sql: "COMMENT ON SCHEMA plugin_test IS 'plugin schema'" },
+  { name: "CREATE TABLE AS from the namespace", sql: "CREATE TABLE plugin_test.c AS SELECT id FROM plugin_test.rows" },
+  { name: "RENAME COLUMN inside the namespace", sql: "ALTER TABLE plugin_test.rows RENAME COLUMN label TO title" },
+  { name: "RENAME TO inside the namespace", sql: "ALTER TABLE plugin_test.rows RENAME TO rows_old" },
+  { name: "ALTER TABLE ... ADD COLUMN", sql: "ALTER TABLE plugin_test.rows ADD COLUMN note text" },
+  { name: "ALTER TABLE ... SET DEFAULT", sql: "ALTER TABLE plugin_test.rows ALTER COLUMN note SET DEFAULT 'x'" },
+  { name: "ALTER TABLE ... SET NOT NULL", sql: "ALTER TABLE plugin_test.rows ALTER COLUMN note SET NOT NULL" },
+  { name: "ALTER TABLE ... DROP NOT NULL", sql: "ALTER TABLE plugin_test.rows ALTER COLUMN note DROP NOT NULL" },
+  { name: "ALTER TABLE ... ALTER COLUMN TYPE", sql: "ALTER TABLE plugin_test.rows ALTER COLUMN note TYPE varchar(20)" },
+  { name: "ALTER TABLE ... ADD CONSTRAINT with a whitelisted foreign key", sql: "ALTER TABLE plugin_test.rows ADD CONSTRAINT rows_issue_fk FOREIGN KEY (issue_id) REFERENCES public.issues(id)" },
+  { name: "ALTER TABLE ... DROP CONSTRAINT", sql: "ALTER TABLE plugin_test.rows DROP CONSTRAINT rows_issue_fk" },
+  { name: "ALTER TABLE ... VALIDATE CONSTRAINT", sql: "ALTER TABLE plugin_test.rows VALIDATE CONSTRAINT rows_issue_fk" },
+  { name: "DROP COLUMN inside the namespace", sql: "ALTER TABLE plugin_test.rows DROP COLUMN label" },
+  { name: "a trailing semicolon", sql: "CREATE TABLE plugin_test.rows (id uuid PRIMARY KEY);" },
+  { name: "a namespace view over namespace tables", sql: "CREATE VIEW plugin_test.v AS SELECT r.id FROM plugin_test.rows r JOIN plugin_test.source_rows s ON s.id = r.id" },
+  { name: "a namespace view with its own CTE", sql: "CREATE VIEW plugin_test.v AS WITH a AS (SELECT id FROM plugin_test.rows) SELECT id FROM a" },
+  { name: "a column default that calls nextval", sql: "CREATE TABLE plugin_test.t (n bigint DEFAULT nextval('plugin_test.t_seq'))" },
+  { name: "banned words inside a string literal", sql: "COMMENT ON TABLE plugin_test.rows IS 'grant copy call'" },
+];
+
+function runQuery(c: SqlCase): void {
+  validatePluginRuntimeQuery(c.sql, c.namespace ?? RUNTIME_NAMESPACE, c.coreReadTables ?? RUNTIME_CORE_READ_TABLES);
+}
+
+function runExecute(c: SqlCase): void {
+  validatePluginRuntimeExecute(c.sql, c.namespace ?? RUNTIME_NAMESPACE);
+}
+
+function runMigration(c: SqlCase): void {
+  validatePluginMigrationStatement(c.sql, c.namespace ?? MIGRATION_NAMESPACE, c.coreReadTables ?? MIGRATION_CORE_READ_TABLES);
+}
+
+describe("plugin SQL validator: ctx.db.query", () => {
+  it.each(QUERY_REJECTS)("rejects $name", (c) => {
+    expect(() => runQuery(c)).toThrow(c.reason);
+  });
+  it.each(QUERY_PASSES)("allows $name", (c) => {
+    expect(() => runQuery(c)).not.toThrow();
+  });
+  it.each(UNPARSEABLE)("rejects text that does not parse: $name", (c) => {
+    expect(() => runQuery(c)).toThrow(c.reason);
+  });
+});
+
+describe("plugin SQL validator: ctx.db.execute", () => {
+  it.each(EXECUTE_REJECTS)("rejects $name", (c) => {
+    expect(() => runExecute(c)).toThrow(c.reason);
+  });
+  it.each(EXECUTE_PASSES)("allows $name", (c) => {
+    expect(() => runExecute(c)).not.toThrow();
+  });
+  it.each(UNPARSEABLE)("rejects text that does not parse: $name", (c) => {
+    expect(() => runExecute(c)).toThrow(c.reason);
+  });
+});
+
+describe("plugin SQL validator: migrations", () => {
+  it.each(MIGRATION_REJECTS)("rejects $name", (c) => {
+    expect(() => runMigration(c)).toThrow(c.reason);
+  });
+  it.each(MIGRATION_PASSES)("allows $name", (c) => {
+    expect(() => runMigration(c)).not.toThrow();
+  });
+  it.each(UNPARSEABLE)("rejects text that does not parse: $name", (c) => {
+    expect(() => runMigration(c)).toThrow(c.reason);
+  });
+});
+
+describe("plugin SQL validator: case table integrity", () => {
+  const rejectCases = [...QUERY_REJECTS, ...EXECUTE_REJECTS, ...MIGRATION_REJECTS];
+  it.each(rejectCases)("reject case parses as PostgreSQL: $name", (c) => {
+    expect(() => parseSync(c.sql)).not.toThrow();
+    expect(c.reason).toBeInstanceOf(RegExp);
+  });
+  it.each(UNPARSEABLE)("unparseable case really does not parse: $name", (c) => {
+    expect(() => parseSync(c.sql)).toThrow();
+  });
+  it("lists each denied function once", () => {
+    const names = DENIED_FUNCTIONS.map((f) => f.name);
+    expect(new Set(names).size).toBe(names.length);
+  });
+});
+
+describe("plugin SQL validator: parser loading", () => {
+  it("does not load the parser when the server imports the plugin database service", async () => {
+    vi.resetModules();
+    let parserImported = false;
+    vi.doMock("libpg-query", async (importOriginal) => {
+      parserImported = true;
+      return importOriginal();
+    });
+    try {
+      const fresh = await import("../services/plugin-database.js");
+      expect(parserImported).toBe(false);
+      await fresh.loadPluginSqlParser();
+      expect(parserImported).toBe(true);
+    } finally {
+      vi.doUnmock("libpg-query");
+    }
+  });
+
+  it("gives concurrent callers the same in-flight load and resolves once it is loaded", async () => {
+    vi.resetModules();
+    const fresh = await import("../services/plugin-sql-validator.js");
+    const first = fresh.loadPluginSqlParser();
+    const second = fresh.loadPluginSqlParser();
+    expect(second).toBe(first);
+    await first;
+    await expect(fresh.loadPluginSqlParser()).resolves.toBeUndefined();
+    expect(() => fresh.validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).not.toThrow();
+  });
+
+  it("fails only the call that needed the parser when the load fails, and retries on the next call", async () => {
+    vi.resetModules();
+    let loads = 0;
+    vi.doMock("libpg-query", async (importOriginal) => {
+      const real = await importOriginal<typeof import("libpg-query")>();
+      return {
+        ...real,
+        loadModule: async () => {
+          loads += 1;
+          if (loads === 1) throw new Error("wasm build failed");
+          return real.loadModule();
+        },
+      };
+    });
+    try {
+      const fresh = await import("../services/plugin-sql-validator.js");
+      await expect(fresh.loadPluginSqlParser()).rejects.toThrow(/wasm build failed/);
+      expect(() => fresh.validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).toThrow(/not loaded/);
+      await expect(fresh.loadPluginSqlParser()).resolves.toBeUndefined();
+      expect(loads).toBe(2);
+      expect(() => fresh.validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).not.toThrow();
+    } finally {
+      vi.doUnmock("libpg-query");
+    }
+  });
+
+  it("rejects every statement until the parser is loaded", async () => {
+    vi.resetModules();
+    const fresh = await import("../services/plugin-sql-validator.js");
+    expect(() => fresh.validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).toThrow(/not loaded/);
+    expect(() => fresh.validatePluginRuntimeExecute("INSERT INTO plugin_x.t (id) VALUES (1)", "plugin_x")).toThrow(/not loaded/);
+    expect(() => fresh.validatePluginMigrationStatement("CREATE TABLE plugin_x.t (id int)", "plugin_x")).toThrow(/not loaded/);
+    await fresh.loadPluginSqlParser();
+    expect(() => fresh.validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).not.toThrow();
+  });
+});

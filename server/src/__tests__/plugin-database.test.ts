@@ -20,6 +20,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   derivePluginDatabaseNamespace,
+  loadPluginSqlParser,
   pluginDatabaseService,
   validatePluginMigrationStatement,
   validatePluginRuntimeExecute,
@@ -39,6 +40,10 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describe("plugin database SQL validation", () => {
+  beforeAll(async () => {
+    await loadPluginSqlParser();
+  });
+
   it("allows namespace migrations with whitelisted public foreign keys", () => {
     expect(() =>
       validatePluginMigrationStatement(
@@ -599,6 +604,66 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       .from(pluginMigrations)
       .where(eq(pluginMigrations.pluginId, pluginId));
     expect(migration?.status).toBe("failed");
+  });
+
+  it("loads the SQL parser itself in applyMigrations, execute and query", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    // Each call gets a fresh module graph, so the parser is not loaded yet.
+    const freshService = async () => {
+      vi.resetModules();
+      const fresh = await import("../services/plugin-database.js");
+      return fresh.pluginDatabaseService(db);
+    };
+
+    await (await freshService()).applyMigrations(pluginId, pluginManifest, packageRoot);
+    await expect(
+      (await freshService()).execute(pluginId, `INSERT INTO ${namespace}.notes (id) VALUES ($1)`, [randomUUID()]),
+    ).resolves.toEqual({ rowCount: 1 });
+    await expect(
+      (await freshService()).query(pluginId, `SELECT id FROM ${namespace}.notes`),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("rejects a namespace view over a core table, so no write reaches the core table through it", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE VIEW ${namespace}.issue_view AS SELECT id, title FROM public.issues;`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "TST",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Original",
+      status: "todo",
+      priority: "medium",
+      identifier: "TST-1",
+    });
+    const pluginDb = pluginDatabaseService(db);
+
+    await expect(
+      pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/Plugin views cannot read public\.issues/);
+    await expect(
+      pluginDb.execute(pluginId, `UPDATE ${namespace}.issue_view SET title = $1 WHERE id = $2`, ["changed", issueId]),
+    ).rejects.toThrow();
+    const [issue] = await db.select({ title: issues.title }).from(issues).where(eq(issues.id, issueId));
+    expect(issue?.title).toBe("Original");
   });
 
   it("rolls back plugin install when migration validation fails", async () => {

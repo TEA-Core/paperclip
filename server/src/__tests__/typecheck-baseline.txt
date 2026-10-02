@@ -1186,7 +1186,7 @@ server/src/__tests__/photon/photon.test.ts(622,36): TS2339
 server/src/__tests__/photon/photon.test.ts(644,36): TS2339
 server/src/__tests__/pipelines-service.test.ts(125,79): TS2741
 server/src/__tests__/pipelines-service.test.ts(1561,7): TS2353
-server/src/__tests__/plugin-database.test.ts(193,34): TS2322
+server/src/__tests__/plugin-database.test.ts(198,34): TS2322
 server/src/__tests__/plugin-environment-driver-ready-recovery.test.ts(220,24): TS2352
 server/src/__tests__/plugin-environment-driver-ready-recovery.test.ts(270,24): TS2352
 server/src/__tests__/plugin-environment-driver-ready-recovery.test.ts(76,5): TS2322

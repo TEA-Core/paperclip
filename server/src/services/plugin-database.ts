@@ -11,17 +11,24 @@ import {
 } from "@paperclipai/db";
 import type {
   PaperclipPluginManifestV1,
-  PluginDatabaseCoreReadTable,
   PluginMigrationRecord,
 } from "@paperclipai/shared";
+import {
+  loadPluginSqlParser,
+  validatePluginMigrationStatement,
+  validatePluginRuntimeExecute,
+  validatePluginRuntimeQuery,
+} from "./plugin-sql-validator.js";
+
+export {
+  loadPluginSqlParser,
+  validatePluginMigrationStatement,
+  validatePluginRuntimeExecute,
+  validatePluginRuntimeQuery,
+} from "./plugin-sql-validator.js";
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_POSTGRES_IDENTIFIER_LENGTH = 63;
-
-type SqlRef = { schema: string; table: string; keyword: string };
-type QualifiedRefPattern =
-  | { pattern: RegExp; groups: "keyword-schema-table" }
-  | { pattern: RegExp; groups: "schema-table"; keyword: string };
 
 export type PluginDatabaseRuntimeResult<T = Record<string, unknown>> = {
   rows?: T[];
@@ -112,196 +119,8 @@ function splitSqlStatements(input: string): string[] {
   return statements;
 }
 
-function stripSqlForKeywordScan(input: string): string {
-  return input
-    .replace(/'([^']|'')*'/g, "''")
-    .replace(/"([^"]|"")*"/g, "\"\"")
-    .replace(/--.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
-}
-
-function normaliseSql(input: string): string {
-  return stripSqlForKeywordScan(input).replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function extractQualifiedRefs(statement: string): SqlRef[] {
-  const refs: SqlRef[] = [];
-  const patterns: QualifiedRefPattern[] = [
-    {
-      pattern: /\b(from|join|references|into|update)\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-      groups: "keyword-schema-table",
-    },
-    {
-      pattern: /\b(alter\s+table|create\s+table|create\s+view|drop\s+table|truncate\s+table)\s+(?:if\s+(?:not\s+)?exists\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-      groups: "keyword-schema-table",
-    },
-    {
-      pattern: /\bcreate\s+(?:unique\s+)?index(?:\s+concurrently)?\s+(?:if\s+not\s+exists\s+)?"?[A-Za-z_][A-Za-z0-9_]*"?\s+on\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-      groups: "schema-table",
-      keyword: "create index",
-    },
-  ];
-
-  for (const { pattern, ...mapping } of patterns) {
-    for (const match of statement.matchAll(pattern)) {
-      if (mapping.groups === "keyword-schema-table") {
-        refs.push({ keyword: match[1]!.toLowerCase(), schema: match[2]!, table: match[3]! });
-      } else {
-        refs.push({ keyword: mapping.keyword, schema: match[1]!, table: match[2]! });
-      }
-    }
-  }
-  return refs;
-}
-
-function assertAllowedPublicRead(
-  ref: SqlRef,
-  allowedCoreReadTables: ReadonlySet<string>,
-): void {
-  if (ref.schema !== "public") return;
-  if (!allowedCoreReadTables.has(ref.table)) {
-    throw new Error(`Plugin SQL references public.${ref.table}, which is not whitelisted`);
-  }
-  if (!["from", "join", "references"].includes(ref.keyword)) {
-    throw new Error(`Plugin SQL cannot mutate or define objects in public.${ref.table}`);
-  }
-}
-
-function assertNoBannedSql(statement: string): void {
-  const normalized = normaliseSql(statement);
-  const banned = [
-    /\bcreate\s+extension\b/,
-    /\bcreate\s+(?:event\s+)?trigger\b/,
-    /\bcreate\s+(?:or\s+replace\s+)?function\b/,
-    /\bcreate\s+language\b/,
-    /\bgrant\b/,
-    /\brevoke\b/,
-    /\bsecurity\s+definer\b/,
-    /\bcopy\b/,
-    /\bcall\b/,
-    /\bdo\s+(?:\$\$|language\b)/,
-  ];
-  const matched = banned.find((pattern) => pattern.test(normalized));
-  if (matched) {
-    throw new Error(`Plugin SQL contains a disallowed statement or clause: ${matched.source}`);
-  }
-}
-
-export function validatePluginMigrationStatement(
-  statement: string,
-  namespace: string,
-  coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
-): void {
-  assertIdentifier(namespace, "namespace");
-  assertNoBannedSql(statement);
-
-  const normalized = normaliseSql(statement);
-  if (/^\s*(drop|truncate)\b/.test(normalized)) {
-    throw new Error("Destructive plugin migrations are not allowed in Phase 1");
-  }
-
-  if (/\bdelete\s+from\b/.test(normalized)) {
-    throw new Error("Plugin migrations cannot delete data");
-  }
-
-  const ddlOrBackfillAllowed =
-    /^(create|alter|comment)\b/.test(normalized) ||
-    /^(insert\s+into|update)\b/.test(normalized) ||
-    (normalized.startsWith("with ") && /\b(insert\s+into|update)\b/.test(normalized));
-  if (!ddlOrBackfillAllowed) {
-    throw new Error("Plugin migrations may contain DDL or namespace-scoped backfill statements only");
-  }
-
-  const refs = extractQualifiedRefs(statement);
-  if (refs.length === 0 && !normalized.startsWith("comment ")) {
-    throw new Error("Plugin migration objects must use fully qualified schema names");
-  }
-
-  const objectRefKeywords = new Set([
-    "alter table",
-    "create index",
-    "create table",
-    "create view",
-    "drop table",
-    "into",
-    "truncate table",
-    "update",
-  ]);
-  const hasQualifiedObjectRef = refs.some((ref) => objectRefKeywords.has(ref.keyword));
-  if (!hasQualifiedObjectRef && !normalized.startsWith("comment ")) {
-    throw new Error("Plugin migration objects must use fully qualified schema names");
-  }
-
-  const allowedCoreReadTables = new Set(coreReadTables);
-  for (const ref of refs) {
-    if (ref.schema === namespace) continue;
-    if (ref.schema === "public") {
-      assertAllowedPublicRead(ref, allowedCoreReadTables);
-      continue;
-    }
-    throw new Error(`Plugin SQL references schema "${ref.schema}" outside namespace "${namespace}"`);
-  }
-}
-
-export function validatePluginRuntimeQuery(
-  query: string,
-  namespace: string,
-  coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
-): void {
-  const statements = splitSqlStatements(query);
-  if (statements.length !== 1) {
-    throw new Error("Plugin runtime SQL must contain exactly one statement");
-  }
-  const statement = statements[0]!;
-  assertNoBannedSql(statement);
-  const normalized = normaliseSql(statement);
-  if (!normalized.startsWith("select ") && !normalized.startsWith("with ")) {
-    throw new Error("ctx.db.query only allows SELECT statements");
-  }
-  if (/\b(insert|update|delete|alter|create|drop|truncate)\b/.test(normalized)) {
-    throw new Error("ctx.db.query cannot contain mutation or DDL keywords");
-  }
-
-  const allowedCoreReadTables = new Set(coreReadTables);
-  for (const ref of extractQualifiedRefs(statement)) {
-    if (ref.schema === namespace) continue;
-    if (ref.schema === "public") {
-      assertAllowedPublicRead(ref, allowedCoreReadTables);
-      continue;
-    }
-    throw new Error(`ctx.db.query cannot read schema "${ref.schema}"`);
-  }
-}
-
-export function validatePluginRuntimeExecute(query: string, namespace: string): void {
-  const statements = splitSqlStatements(query);
-  if (statements.length !== 1) {
-    throw new Error("Plugin runtime SQL must contain exactly one statement");
-  }
-  const statement = statements[0]!;
-  assertNoBannedSql(statement);
-  const normalized = normaliseSql(statement);
-  if (!/^(insert\s+into|update|delete\s+from)\b/.test(normalized)) {
-    throw new Error("ctx.db.execute only allows INSERT, UPDATE, or DELETE");
-  }
-  if (/\b(alter|create|drop|truncate)\b/.test(normalized)) {
-    throw new Error("ctx.db.execute cannot contain DDL keywords");
-  }
-
-  const refs = extractQualifiedRefs(statement);
-  const target = refs.find((ref) => ["into", "update", "from"].includes(ref.keyword));
-  if (!target || target.schema !== namespace) {
-    throw new Error(`ctx.db.execute target must be inside plugin namespace "${namespace}"`);
-  }
-  for (const ref of refs) {
-    if (ref.schema !== namespace) {
-      throw new Error("ctx.db.execute cannot reference public or other non-plugin schemas");
-    }
-  }
-}
-
 function bindSql(statement: string, params: readonly unknown[] = []): SQL {
-  // Safe only after callers run the plugin SQL validators above.
+  // Safe only after callers run the plugin SQL validators in plugin-sql-validator.ts.
   if (params.length === 0) return sql.raw(statement);
   const chunks: SQL[] = [];
   let cursor = 0;
@@ -467,6 +286,7 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       options: ApplyPluginMigrationsOptions = {},
     ) {
       if (!manifest.database) return null;
+      await loadPluginSqlParser();
       const namespace = await ensureNamespace(pluginId, manifest);
       if (!namespace) return null;
 
@@ -555,6 +375,7 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
     getRuntimeNamespace,
 
     async query<T = Record<string, unknown>>(pluginId: string, statement: string, params?: unknown[]): Promise<T[]> {
+      await loadPluginSqlParser();
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
@@ -563,6 +384,7 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
     },
 
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
+      await loadPluginSqlParser();
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
       const result = await db.execute(bindSql(statement, params));
