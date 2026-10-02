@@ -20,9 +20,10 @@
  *   - `details.nextAction` is the seat-specific next-action sentence, and the
  *     same sentence follows the prefix in the message, so an agent that reads
  *     only `error` still gets it;
- *   - when the caller's seat CAN lawfully act (the assignee on Mechanism D, any
- *     writer of a policy that has not run yet on the self-gated 422) the existing
- *     remedy is kept unchanged.
+ *   - when the caller's seat CAN lawfully act (any writer of a policy that has
+ *     not run yet on the self-gated 422, a board user on Mechanism D) the existing
+ *     remedy is kept unchanged. Close-ladder repair is the board's: an agent
+ *     assignee gets the record-and-ask text like every other agent seat.
  *
  * This module is pure: no DB, no imports from the policy service (which imports
  * it), so it cannot form an import cycle.
@@ -127,10 +128,10 @@ function returnAssigneeOf(issue: RefusalIssue): RefusalPrincipal | null {
  *
  * The live-stage seat wins over the assignee seat on purpose. In `in_review`
  * the stage machine assigns the card to its current participant, so every
- * approver is also the assignee; under the 2026-10-02 ruling the approver does
- * not repair a close ladder (the board does), so it must not be handed the
- * assignee's ADR-103 remedy. "assignee" therefore means "holds the card and no
- * live stage on it".
+ * approver is also the assignee, and the live-stage texts (who decides the
+ * stage) apply to it. "assignee" therefore means "holds the card and no live
+ * stage on it". Under the 2026-10-02 ruling neither seat repairs a close
+ * ladder; the board does.
  */
 export function resolveCallerSeat(caller: RefusalCaller, issue: RefusalIssue | null | undefined): CallerSeat {
   if (!issue) return caller.viaAncestorHatch ? "ancestor-hatch" : "other";
@@ -150,7 +151,7 @@ export function describePrincipal(principal: RefusalPrincipal | null | undefined
   return "its participant";
 }
 
-/** Mechanism D (ADR-072 close-ladder shape) 409, for every seat except the assignee. */
+/** Mechanism D (ADR-072 close-ladder shape) 409, for every agent seat, the assignee included. */
 export function mechanismDNextAction(seat: CallerSeat): string {
   return (
     `Your seat (${seat}) cannot lawfully repair this close ladder: no re-arm, no added or reordered stage, ` +
@@ -213,13 +214,13 @@ export function selfGatedNextAction(seat: CallerSeat, ctx: { ladderHasRun: boole
 export function selfSatisfyingAssigneeNextAction(seat: CallerSeat, ctx: { stageId: string }): string {
   const noGaming =
     "Never re-point returnAssigneeAgentId or change the stage's participants to pass this check.";
-  if (seat === "assignee") {
-    return (
-      `Your seat (assignee): hand the card to an agent that is not a participant of stage ${ctx.stageId}, or keep ` +
-      `it; the stage hands the card to its own participant when the work enters review. ${noGaming}`
-    );
-  }
-  return `Your seat (${seat}) cannot clear this. ${RECORD_AND_ASK_BOARD} ${noGaming}`;
+  // control-plane-403 §7: this refusal is terminal at the first refusal for every
+  // seat; re-picking the assignee is a re-shape, not a payload fix.
+  const keep =
+    seat === "assignee"
+      ? `: keep the card as it is (stage ${ctx.stageId} hands the card to its own participant when the work enters review)`
+      : "";
+  return `Your seat (${seat}) cannot clear this${keep}. ${RECORD_AND_ASK_BOARD} ${noGaming}`;
 }
 
 /** 403 "Ancestor escape hatch only permits ...". */
@@ -237,8 +238,14 @@ export function ancestorHatchNextAction(input: {
       "decides it. Do not re-send it, re-shape it, or reach the same outcome through another field, card, route or seat."
     );
   }
+  // No live stage: escalation.md keeps the assignment hop (assigneeAgentId set to
+  // yourself, then the write as the assignee) as the one lawful change of seat, so
+  // this branch names it and does not forbid "another seat".
   return (
     `Your seat (ancestor-hatch) cannot write ${fields} on this issue, and re-sending the write without them does ` +
-    `not reach the outcome they were for. ${RECORD_AND_ASK_BOARD}`
+    "not reach the outcome they were for. The only change of seat is the assignment hop: take the card over as its " +
+    "assignee (a PATCH of assigneeAgentId to yourself and nothing else), then make the write as the assignee. " +
+    "Otherwise record this refusal (its message and details) on a card you own and ask the board. " +
+    "Do not re-send it, re-shape it, or reach the same outcome through another field, card or route."
   );
 }

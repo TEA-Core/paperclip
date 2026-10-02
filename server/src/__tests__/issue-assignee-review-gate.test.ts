@@ -257,14 +257,16 @@ describe("assertAssigneeWriteDoesNotSelfSatisfyReviewStage (SUP-13526)", () => {
       throw new Error("expected throw");
     };
 
-    it("tells the assignee to pick a non-participant or keep the card, and never to re-point the return assignee", () => {
+    it("is terminal for the assignee too: keep the card, record and ask the board, never re-point the return assignee", () => {
       const err = refuse({
         caller: { agentId: OTHER_AGENT_ID },
         issue: { assigneeAgentId: OTHER_AGENT_ID, executionState: { status: "idle" } },
       });
-      expect(err.message.startsWith(`${legacyMessage}. Your seat (assignee): `)).toBe(true);
+      expect(err.message.startsWith(`${legacyMessage}. Your seat (assignee) cannot clear this`)).toBe(true);
       expect(err.details.callerSeat).toBe("assignee");
-      expect(String(err.details.nextAction)).toContain(`not a participant of stage ${GATE_STAGE_ID}`);
+      expect(String(err.details.nextAction)).toContain("keep the card as it is");
+      expect(String(err.details.nextAction)).toContain("ask the board");
+      expect(String(err.details.nextAction)).not.toContain("hand the card to");
       expect(String(err.details.nextAction)).toContain("Never re-point returnAssigneeAgentId");
       expect(err.details).toMatchObject({ guard: "assignee_review_gate", issueStageId: GATE_STAGE_ID });
     });

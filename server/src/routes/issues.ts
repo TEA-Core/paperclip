@@ -4825,13 +4825,14 @@ export function issueRoutes(
           : guardResult.remedy ??
             "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
       // Board ruling 2026-10-02 (F1 server half): mechanism D is a seat-authority
-      // refusal. The ADR-103 remedy (re-parent / declare process / add stages
-      // while the pointer has not advanced) is kept verbatim only for the
-      // assignee holding no live stage. Every other seat — including the
-      // approver holding the live stage, who is also the in_review assignee —
-      // gets the byte-identical diagnosis prefix followed by "you cannot repair
-      // this ladder: record the refusal on a card you own and ask the board".
-      // A board caller keeps the remedy and is reminded it holds the levers.
+      // refusal, and close-ladder repair is the BOARD's (control-plane-403 §7:
+      // "no agent repairs that ladder, not the approver and not the assignee").
+      // Every agent seat, the assignee included, gets the byte-identical
+      // diagnosis prefix followed by "you cannot repair this ladder: record the
+      // refusal on a card you own and ask the board". The ADR-103 remedy
+      // (re-parent / declare process / add stages) names the board's levers, so
+      // only a board caller keeps it, with a reminder that it holds them.
+      // guardResult.reason itself is unchanged (done-transition-guard.test.ts).
       let refusalError = guardResult.reason;
       let refusalRemedy = remedy;
       let callerSeat: CallerSeat | undefined;
@@ -4839,7 +4840,7 @@ export function issueRoutes(
         callerSeat = resolveCallerSeat(caller, issue as unknown as RefusalIssue);
         if (boardActor) {
           refusalRemedy = `${remedy} ${mechanismDBoardNote()}`;
-        } else if (callerSeat !== "assignee") {
+        } else {
           refusalRemedy = mechanismDNextAction(callerSeat);
           refusalError = `${guardResult.diagnosis ?? guardResult.reason} ${refusalRemedy}`;
         }
