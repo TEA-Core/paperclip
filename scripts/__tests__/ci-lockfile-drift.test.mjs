@@ -62,6 +62,19 @@ test("pr.yml decides regeneration from a frozen-install probe, not from changed 
   );
 });
 
+test("the policy probe runs before its strict install and the install stays after recovery", () => {
+  const policy = jobs(prWorkflow).get("policy");
+  const probeIndex = policy.indexOf("pnpm install --lockfile-only --ignore-scripts --frozen-lockfile");
+  const regenerateIndex = policy.indexOf("pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile");
+  const strictInstallIndex = policy.indexOf("run: pnpm install --frozen-lockfile");
+
+  assert.ok(probeIndex !== -1, "the policy job must probe frozen-lockfile compatibility");
+  assert.ok(regenerateIndex !== -1, "the policy job must regenerate after a failed probe");
+  assert.ok(strictInstallIndex !== -1, "the policy job must retain a strict frozen install");
+  assert.ok(probeIndex < strictInstallIndex, "the recovery probe must precede the strict install");
+  assert.ok(regenerateIndex < strictInstallIndex, "regeneration must precede the strict install");
+});
+
 test("pr.yml uploads the regenerated lockfile whenever the probe regenerated one", () => {
   const policy = jobs(prWorkflow).get("policy");
   const probeIndex = policy.indexOf("--frozen-lockfile");

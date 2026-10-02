@@ -439,6 +439,12 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test composer-stop evidence collector
+        run: npx vitest run --config tests/e2e/support/vitest.config.ts
+
   typecheck_release_registry:
     name: Typecheck + Release Registry
     needs: [policy]
