@@ -53,6 +53,8 @@ export type RunningTimeoutInput = {
   observedRunRows: ObservedRunRow[];
   successfulPollCount: number;
   finalNewRunIds: string[];
+  newRunIds?: string[];
+  observedNewRunRunning?: boolean;
   anyNewRunRunning: boolean;
   finalIssueStatus: string | null;
   finalContinuationDelivery: string | null | undefined;
@@ -170,12 +172,32 @@ export function createStatusFrameCollector(companyId: string) {
         );
         return;
       }
+      const payload = event.payload;
+      if (
+        (typeof payload.issueId === "string" && payload.issueId !== ownership.issueId) ||
+        (typeof payload.runId === "string" && payload.runId !== ownership.runId)
+      ) {
+        return;
+      }
+      if (
+        typeof payload.issueId !== "string" ||
+        typeof payload.runId !== "string" ||
+        typeof payload.status !== "string"
+      ) {
+        recordInstrumentationFailure(
+          instrumentationFailures,
+          "websocket-status-frame",
+          "owned heartbeat.run.status payload was incomplete",
+          new Date().toISOString(),
+          ownership,
+        );
+        return;
+      }
       const entry: StatusMetadata = {};
       for (const key of ["runId", "agentId", "status", "issueId", "deliveryId", "startedAt", "finishedAt"] as const) {
-        const value = event.payload[key];
+        const value = payload[key];
         if (value === null || typeof value === "string") entry[key] = value;
       }
-      entry.issueId = ownership.issueId;
       if (typeof event.createdAt === "string") entry.eventCreatedAt = event.createdAt;
       entries.push(entry);
     },
@@ -189,7 +211,9 @@ export function classifyRunningTimeout(input: RunningTimeoutInput): RunningTimeo
     instrumentationFailures,
     successfulPollCount,
     finalNewRunIds,
+    newRunIds = finalNewRunIds,
     anyNewRunRunning,
+    observedNewRunRunning = anyNewRunRunning,
     finalIssueStatus,
     finalContinuationDelivery,
     hasResolveEvidence,
@@ -226,7 +250,7 @@ export function classifyRunningTimeout(input: RunningTimeoutInput): RunningTimeo
   if (
     adapter === "process" &&
     hasResolveEvidence &&
-    finalNewRunIds.length === 0 &&
+    newRunIds.length === 0 &&
     recoveryActionPresentAtResolve !== true &&
     settledActionFoundAtResolve !== true
   ) {
@@ -235,7 +259,7 @@ export function classifyRunningTimeout(input: RunningTimeoutInput): RunningTimeo
       message: "FIXTURE_OBSERVATION_ENDED_EARLY: the process reconcile observed neither an active nor a settled recovery action at resolve time, so it scheduled no successor wakeup and the resume had nothing to act on.",
     };
   }
-  if (finalNewRunIds.length > 0 && !anyNewRunRunning) {
+  if (finalNewRunIds.length > 0 && !observedNewRunRunning) {
     return {
       verdict: RUNNING_TIMEOUT_VERDICTS.LATE_TRANSITION,
       message: `successor run row(s) ${JSON.stringify(finalNewRunIds)} appeared only in the final snapshot`,
@@ -304,9 +328,14 @@ export function buildRunningTimeoutEvidence(input: RunningTimeoutEvidenceInput) 
     ...new Set([...pollingRunIds, ...finalRunRows.map((row) => row.id)]),
   ];
   const newRunIds = distinctRunIds.filter((id) => !input.originalRunIds.includes(id));
-  const anyNewRunRunning = input.observedRunRows.some(
+  const observedNewRunRunning = input.observedRunRows.some(
     (row) => newRunIds.includes(row.id) && row.status === "running",
   );
+  const anyNewRunRunning =
+    observedNewRunRunning ||
+    finalRunRows.some(
+      (row) => newRunIds.includes(row.id) && row.status === "running",
+    );
   const finalSnapshotFailure = [
     input.finalSnapshotFailure,
     finalLiveRunsResult.error ? `live-runs final snapshot: ${finalLiveRunsResult.error}` : null,
@@ -317,6 +346,8 @@ export function buildRunningTimeoutEvidence(input: RunningTimeoutEvidenceInput) 
     ...input,
     instrumentationFailures: pollFailures,
     finalNewRunIds: finalOnlyRunIds.filter((id) => !input.originalRunIds.includes(id)),
+    newRunIds,
+    observedNewRunRunning,
     anyNewRunRunning,
     finalSnapshotFailure,
   });

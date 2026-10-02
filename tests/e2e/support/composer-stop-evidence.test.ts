@@ -87,6 +87,110 @@ describe("composer stop evidence", () => {
     expect(evidence.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.NO_TRANSITION);
   });
 
+  it("ignores a malformed status frame for another issue or run", () => {
+    const collector = createStatusFrameCollector("company-1");
+
+    collector.ingest(
+      JSON.stringify({
+        companyId: "company-1",
+        type: "heartbeat.run.status",
+        payload: { issueId: "issue-2", runId: "run-2" },
+      }),
+      { issueId: "issue-1", runId: "run-1" },
+    );
+
+    expect(collector.entries).toEqual([]);
+    expect(collector.instrumentationFailures).toEqual([]);
+  });
+
+  it("classifies empty and incomplete owned status payloads as instrumentation failures", () => {
+    const collector = createStatusFrameCollector("company-1");
+    const ownership = { issueId: "issue-1", runId: "run-1" };
+
+    collector.ingest(
+      JSON.stringify({ companyId: "company-1", type: "heartbeat.run.status", payload: {} }),
+      ownership,
+    );
+    collector.ingest(
+      JSON.stringify({
+        companyId: "company-1",
+        type: "heartbeat.run.status",
+        payload: { issueId: "issue-1", runId: "run-1" },
+      }),
+      ownership,
+    );
+
+    expect(collector.entries).toEqual([]);
+    expect(collector.instrumentationFailures).toHaveLength(2);
+  });
+
+  it("does not classify a successor seen during polling as ended early when final rows omit it", () => {
+    const evidence = buildRunningTimeoutEvidence({
+      issueId: "issue-1",
+      adapter: "process",
+      companyId: "company-1",
+      pollWindowStartMs: 1000,
+      pollWindowEndMs: 2000,
+      originalRunIds: ["run-1"],
+      observedRunRows: [
+        { id: "run-1", status: "running", observedAtIso: "1970-01-01T00:00:01.500Z" },
+        { id: "successor", status: "queued", observedAtIso: "1970-01-01T00:00:01.500Z" },
+      ],
+      finalLiveRuns: [{ id: "run-1", status: "running" }],
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: [],
+      statusMetadata: [],
+      successfulPollCount: 1,
+      finalIssueStatus: "in_progress",
+      finalSnapshotFailure: null,
+      finalSnapshots: [],
+      finalIssueState: { status: "in_progress", executionRunId: "run-1" },
+      finalContinuationDelivery: null,
+      hasResolveEvidence: true,
+      recoveryActionPresentAtResolve: false,
+      settledActionFoundAtResolve: false,
+      originalProviderAliveAtResolve: null,
+      resolveCompletedAtIso: null,
+      resumeInitiatedAtIso: "1970-01-01T00:00:01.000Z",
+    });
+
+    expect(evidence.verdict).not.toBe(RUNNING_TIMEOUT_VERDICTS.OBSERVATION_FAILURE);
+    expect(evidence.verdictMessage).not.toContain("FIXTURE_OBSERVATION_ENDED_EARLY");
+  });
+
+  it("uses final running state when a successor was queued during polling", () => {
+    const evidence = buildRunningTimeoutEvidence({
+      issueId: "issue-1",
+      adapter: "paperclip_runner",
+      companyId: "company-1",
+      pollWindowStartMs: 1000,
+      pollWindowEndMs: 2000,
+      originalRunIds: ["run-1"],
+      observedRunRows: [
+        { id: "run-1", status: "running", observedAtIso: "1970-01-01T00:00:01.500Z" },
+        { id: "successor", status: "queued", observedAtIso: "1970-01-01T00:00:01.500Z" },
+      ],
+      finalLiveRuns: [{ id: "run-1", status: "running" }, { id: "successor", status: "running" }],
+      apiErrorsDuringWindow: [],
+      instrumentationFailures: [],
+      statusMetadata: [],
+      successfulPollCount: 1,
+      finalIssueStatus: "in_progress",
+      finalSnapshotFailure: null,
+      finalSnapshots: [],
+      finalIssueState: { status: "in_progress", executionRunId: "run-1" },
+      finalContinuationDelivery: null,
+      hasResolveEvidence: false,
+      recoveryActionPresentAtResolve: null,
+      settledActionFoundAtResolve: null,
+      originalProviderAliveAtResolve: null,
+      resolveCompletedAtIso: null,
+      resumeInitiatedAtIso: "1970-01-01T00:00:01.000Z",
+    });
+
+    expect(evidence.verdict).toBe(RUNNING_TIMEOUT_VERDICTS.RESUME_TRANSITION_OBSERVED);
+  });
+
   it("does not carry global frame failures into a later poll window", () => {
     const collector = createStatusFrameCollector("company-1");
     collector.instrumentationFailures.push({
