@@ -128,11 +128,18 @@ worker starts, records checksums in `plugin_migrations`, and rejects changed
 already-applied migrations.
 
 Migration SQL may create or alter objects only inside `ctx.db.namespace`. It may
-reference whitelisted `public` core tables for foreign keys or read-only views,
-but may not mutate/alter/drop/truncate public tables, create extensions,
-triggers, untrusted languages, or runtime multi-statement SQL. Runtime
-`ctx.db.query()` is restricted to `SELECT`; runtime `ctx.db.execute()` is
-restricted to namespace-local `INSERT`, `UPDATE`, and `DELETE`.
+reference whitelisted `public` core tables for foreign keys. A view may read only
+`ctx.db.namespace`. Migration SQL may not mutate/alter/drop/truncate public
+tables, create extensions, triggers, untrusted languages, or runtime
+multi-statement SQL. Runtime `ctx.db.query()` is restricted to `SELECT`; runtime
+`ctx.db.execute()` is restricted to namespace-local `INSERT`, `UPDATE`, and
+`DELETE`.
+
+The host parses plugin SQL with the PostgreSQL grammar before it runs it. Every
+relation must be schema-qualified: either `ctx.db.namespace` or a whitelisted
+`public` core table in a read position. The only unqualified relation names the
+host accepts are CTE names that the same statement defines. Each
+`ctx.db.query()` or `ctx.db.execute()` call must hold exactly one statement.
 
 ### Scoped plugin API routes
 

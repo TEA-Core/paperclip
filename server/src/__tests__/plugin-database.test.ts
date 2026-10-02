@@ -20,7 +20,9 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   derivePluginDatabaseNamespace,
+  loadPluginSqlParser,
   pluginDatabaseService,
+  splitPluginMigrationSql,
   validatePluginMigrationStatement,
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
@@ -39,6 +41,10 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describe("plugin database SQL validation", () => {
+  beforeAll(async () => {
+    await loadPluginSqlParser();
+  });
+
   it("allows namespace migrations with whitelisted public foreign keys", () => {
     expect(() =>
       validatePluginMigrationStatement(
@@ -308,6 +314,19 @@ describe("buildPluginWorkerEnv", () => {
   });
 });
 
+// Records the text of every migration statement the service validates. Everything else is the real module.
+const validatedMigrationStatements = vi.hoisted(() => [] as string[]);
+vi.mock("../services/plugin-sql-validator.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../services/plugin-sql-validator.js")>();
+  return {
+    ...real,
+    validatePluginMigrationStatement: (...args: Parameters<typeof real.validatePluginMigrationStatement>) => {
+      validatedMigrationStatements.push(args[0]);
+      return real.validatePluginMigrationStatement(...args);
+    },
+  };
+});
+
 describeEmbeddedPostgres("plugin database namespaces", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -513,6 +532,39 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(uniqueColumnSets).not.toContain("paperclip_page_bindings:company_id,wiki_id,page_path");
   });
 
+  it("applies the orchestration smoke example migrations through the production validator", async () => {
+    const pluginManifest: PaperclipPluginManifestV1 = {
+      ...manifest("paperclipai.plugin-orchestration-smoke-example"),
+      database: {
+        namespaceSlug: "orchestration_smoke",
+        migrationsDir: "migrations",
+        coreReadTables: ["issues"],
+      },
+    };
+    const repoRoot = path.basename(process.cwd()) === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+    const packageRoot = path.join(repoRoot, "packages", "plugins", "examples", "plugin-orchestration-smoke-example");
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id, pluginManifest.database?.namespaceSlug);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    try {
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const migrations = await db
+        .select()
+        .from(pluginMigrations)
+        .where(and(eq(pluginMigrations.pluginId, pluginId), eq(pluginMigrations.status, "applied")));
+      expect(migrations.map((migration) => migration.migrationKey)).toEqual(["001_orchestration_smoke.sql"]);
+      const [table] = Array.from(
+        (await db.execute(
+          sql.raw(`SELECT to_regclass('${namespace}.smoke_runs')::text AS name`),
+        )) as Iterable<{ name: string | null }>,
+      );
+      expect(table?.name).toBe(`${namespace}.smoke_runs`);
+    } finally {
+      await db.execute(sql.raw(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`));
+    }
+  });
+
   it("applies migrations once and allows whitelisted core joins at runtime", async () => {
     const pluginManifest = manifest();
     const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
@@ -599,6 +651,379 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       .from(pluginMigrations)
       .where(eq(pluginMigrations.pluginId, pluginId));
     expect(migration?.status).toBe("failed");
+  });
+
+  it("loads the SQL parser itself in applyMigrations, execute and query", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    // Each call gets a fresh module graph, so the parser is not loaded yet.
+    const freshService = async () => {
+      vi.resetModules();
+      const fresh = await import("../services/plugin-database.js");
+      return fresh.pluginDatabaseService(db);
+    };
+
+    await (await freshService()).applyMigrations(pluginId, pluginManifest, packageRoot);
+    await expect(
+      (await freshService()).execute(pluginId, `INSERT INTO ${namespace}.notes (id) VALUES ($1)`, [randomUUID()]),
+    ).resolves.toEqual({ rowCount: 1 });
+    await expect(
+      (await freshService()).query(pluginId, `SELECT id FROM ${namespace}.notes`),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("rejects a namespace view over a core table, so no write reaches the core table through it", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE VIEW ${namespace}.issue_view AS SELECT id, title FROM public.issues;`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "TST",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Original",
+      status: "todo",
+      priority: "medium",
+      identifier: "TST-1",
+    });
+    const pluginDb = pluginDatabaseService(db);
+
+    await expect(
+      pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/Plugin views cannot read public\.issues/);
+    await expect(
+      pluginDb.execute(pluginId, `UPDATE ${namespace}.issue_view SET title = $1 WHERE id = $2`, ["changed", issueId]),
+    ).rejects.toThrow();
+    const [issue] = await db.select({ title: issues.title }).from(issues).where(eq(issues.id, issueId));
+    expect(issue?.title).toBe("Original");
+  });
+
+  it("runs a migration whose dollar-quoted comment holds a semicolon and multi-byte text", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      [
+        `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+        "-- naïve — 🚀",
+        `COMMENT ON TABLE ${namespace}.notes IS $$notes; café$$;`,
+      ].join("\n"),
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+    const [row] = Array.from(
+      (await db.execute(
+        sql.raw(`SELECT obj_description('${namespace}.notes'::regclass, 'pg_class') AS comment`),
+      )) as Iterable<{ comment: string | null }>,
+    );
+    expect(row?.comment).toBe("notes; café");
+  });
+
+  it("records a failed migration when the migration file does not parse", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(pluginManifest, `CREATE TABLE ${namespace}.broken (`);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await expect(
+      pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/does not parse/);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
+    expect(migration?.errorMessage).toMatch(/does not parse/);
+  });
+
+  /**
+   * Runs applyMigrations on a database handle that records every statement text run inside the
+   * migration transaction. The validator mock at the top of this file records the validated texts.
+   */
+  async function applyMigrationsRecordingStatements(
+    pluginId: string,
+    pluginManifest: PaperclipPluginManifestV1,
+    packageRoot: string,
+  ) {
+    const { PgDialect } = await import("drizzle-orm/pg-core");
+    const dialect = new PgDialect();
+    const executed: string[] = [];
+    const passThrough = (target: object, prop: string | symbol) => {
+      const value: unknown = Reflect.get(target, prop);
+      return typeof value === "function" ? value.bind(target) : value;
+    };
+    const recordingDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop !== "transaction") return passThrough(target, prop);
+        return (callback: (tx: unknown) => Promise<unknown>) =>
+          target.transaction((tx) =>
+            callback(
+              new Proxy(tx, {
+                get(txTarget, txProp) {
+                  if (txProp !== "execute") return passThrough(txTarget, txProp);
+                  return (query: ReturnType<typeof sql.raw>) => {
+                    executed.push(dialect.sqlToQuery(query).sql);
+                    return txTarget.execute(query);
+                  };
+                },
+              }),
+            ),
+          );
+      },
+    });
+    validatedMigrationStatements.length = 0;
+    let failure: unknown;
+    try {
+      await pluginDatabaseService(recordingDb).applyMigrations(pluginId, pluginManifest, packageRoot);
+    } catch (error) {
+      failure = error;
+    }
+    return {
+      validated: [...validatedMigrationStatements],
+      transactionStatements: executed,
+      executed: executed.filter(
+        (text) => !text.includes("pg_advisory_xact_lock") && !/^SET LOCAL standard_conforming_strings/.test(text),
+      ),
+      failure,
+    };
+  }
+
+  it("executes exactly the statements it validated, byte for byte and in file order", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const file = [
+      "-- naïve — 🚀 ; header",
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY, body text);`,
+      `COMMENT ON TABLE ${namespace}.notes IS $$ ' ; $$;`,
+      "/* ; */",
+      `COMMENT ON COLUMN ${namespace}.notes.body IS 'a;b'`,
+    ].join("\n");
+    const packageRoot = await createPluginPackage(pluginManifest, file);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    const { validated, executed, failure } = await applyMigrationsRecordingStatements(pluginId, pluginManifest, packageRoot);
+
+    expect(failure).toBeUndefined();
+    const fragments = splitPluginMigrationSql(file);
+    expect(fragments).toHaveLength(3);
+    expect(validated).toEqual(fragments);
+    expect(executed).toEqual(fragments);
+  });
+
+  it("turns standard_conforming_strings on as the first statement of the migration transaction", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    const { transactionStatements, failure } = await applyMigrationsRecordingStatements(pluginId, pluginManifest, packageRoot);
+
+    expect(failure).toBeUndefined();
+    expect(transactionStatements[0]).toBe("SET LOCAL standard_conforming_strings = on");
+  });
+
+  it("reads migration strings with standard_conforming_strings on when the database default is off", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    // With the setting off the server reads 'a\' as a string that holds a quote, so the statement ends at
+    // the semicolon that follows. With it on, which is how the validator parses, the second quoted text
+    // continues the same comment and the migration is one statement.
+    const file = [
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+      `COMMENT ON TABLE ${namespace}.notes IS 'a\\'`,
+      "' ; ALTER TABLE public.issues ADD COLUMN escaped_column int; --'",
+    ].join("\n");
+    const packageRoot = await createPluginPackage(pluginManifest, file);
+    const pluginId = await installPluginRecord(pluginManifest);
+    const [database] = Array.from(
+      (await db.execute(sql`SELECT current_database() AS name`)) as Iterable<{ name: string }>,
+    );
+    const databaseName = `"${database!.name.replaceAll('"', '""')}"`;
+
+    await db.execute(sql.raw(`ALTER DATABASE ${databaseName} SET standard_conforming_strings = off`));
+    try {
+      // A new pool, so every connection it opens starts with the database default.
+      const offDb = createDb(tempDb!.connectionString);
+      const [setting] = Array.from(
+        (await offDb.execute(sql`SHOW standard_conforming_strings`)) as Iterable<{ standard_conforming_strings: string }>,
+      );
+      expect(setting?.standard_conforming_strings).toBe("off");
+
+      await pluginDatabaseService(offDb).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const [comment] = Array.from(
+        (await db.execute(
+          sql.raw(`SELECT obj_description('${namespace}.notes'::regclass, 'pg_class') AS comment`),
+        )) as Iterable<{ comment: string | null }>,
+      );
+      expect(comment?.comment).toBe("a\\ ; ALTER TABLE public.issues ADD COLUMN escaped_column int; --");
+      const columns = Array.from(
+        (await db.execute(
+          sql`SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'issues' AND column_name = 'escaped_column'`,
+        )) as Iterable<{ column_name: string }>,
+      );
+      expect(columns).toEqual([]);
+    } finally {
+      await db.execute(sql.raw(`ALTER DATABASE ${databaseName} RESET standard_conforming_strings`));
+      await db.execute(sql.raw("ALTER TABLE public.issues DROP COLUMN IF EXISTS escaped_column"));
+    }
+  });
+
+  it("records a failed migration when the migration file holds a NUL", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY)${String.fromCharCode(0)}; ALTER TABLE public.issues ADD COLUMN escaped_column int`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await expect(
+      pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/does not parse/);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
+  });
+
+  it("rejects a query and an execute that hide a statement behind unpaired surrogates, and leaves core data alone", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY, body text);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "TST",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Original",
+      status: "todo",
+      priority: "medium",
+      identifier: "TST-1",
+    });
+    const pluginDb = pluginDatabaseService(db);
+    await pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot);
+    // The parser's input buffer comes out one byte short per unpaired surrogate, so the text after
+    // this many of them is never parsed, but the driver still sends it to the server.
+    const tail = "; DELETE FROM public.issues ";
+    const padding = String.fromCharCode(0xd800).repeat(tail.length);
+
+    await expect(
+      pluginDb.query(pluginId, `SELECT id FROM ${namespace}.notes WHERE body = '${padding}'${tail}`),
+    ).rejects.toThrow(/unpaired UTF-16 surrogate/);
+    await expect(
+      pluginDb.execute(pluginId, `INSERT INTO ${namespace}.notes (id, body) VALUES ('${randomUUID()}', '${padding}')${tail}`),
+    ).rejects.toThrow(/unpaired UTF-16 surrogate/);
+
+    const remaining = await db.select({ title: issues.title }).from(issues);
+    expect(remaining).toEqual([{ title: "Original" }]);
+    const notes = Array.from(
+      (await db.execute(sql.raw(`SELECT id FROM ${namespace}.notes`))) as Iterable<{ id: string }>,
+    );
+    expect(notes).toEqual([]);
+  });
+
+  it("records a failed migration when the migration file is over 1 MiB", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const statement = `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`;
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `-- ${"a".repeat(1024 * 1024)}\n${statement}`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await expect(
+      pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/input exceeds 1 MiB/);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
+    // The parser still works afterwards.
+    const second = manifest("paperclip.escape");
+    const secondRoot = await createPluginPackage(second, `CREATE TABLE ${derivePluginDatabaseNamespace(second.id)}.notes (id uuid PRIMARY KEY);`);
+    const secondId = await installPluginRecord(second);
+    await pluginDatabaseService(db).applyMigrations(secondId, second, secondRoot);
+  });
+
+  it("validates a statement that follows a dollar-quote end and runs nothing from that statement on", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const file = [
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+      `COMMENT ON TABLE ${namespace}.notes IS $$ ' $$;`,
+      `DROP TABLE ${namespace}.notes;`,
+      `COMMENT ON TABLE ${namespace}.notes IS ' $$'`,
+    ].join("\n");
+    const packageRoot = await createPluginPackage(pluginManifest, file);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    const { validated, executed, failure } = await applyMigrationsRecordingStatements(pluginId, pluginManifest, packageRoot);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/Destructive plugin migrations/);
+    const fragments = splitPluginMigrationSql(file);
+    expect(fragments).toHaveLength(4);
+    expect(validated).toEqual(fragments.slice(0, 3));
+    expect(executed).toEqual(fragments.slice(0, 2));
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
+  });
+
+  it("runs a migration file that starts with a byte order mark", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `\uFEFFCREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("applied");
   });
 
   it("rolls back plugin install when migration validation fails", async () => {
