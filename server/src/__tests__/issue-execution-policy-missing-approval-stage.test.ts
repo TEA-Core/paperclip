@@ -362,11 +362,15 @@ function ladderedChildRow(
   identifier: string,
   originKind: string = "manual",
   status: string = "in_review",
+  title = `${identifier} title`,
+  description = `${identifier} description`,
 ) {
   return {
     id,
     identifier,
     status,
+    title,
+    description,
     executionPolicy: {
       stages: [{ id: "stage-x", type: "review", participants: [{ type: "agent", agentId: AGENT_ID }] }],
     },
@@ -553,20 +557,23 @@ describe("issue execution policy missing approval stage", () => {
       // SUP-15958: `countLadderedChildren` runs up to three indexed reads on the
       // PATCH path. Route each to its own state so the real helper's exclusions
       // are exercised; every other select keeps the hoisted handoff-agent-row
-      // default. The child decomposition is the only 7-key projection on the
+      // default. The child decomposition is the only 9-key projection on the
       // path, so it is matched by signature alone (no table-identity assumption);
       // the carve-out label reads are matched by table + single-key projection.
-      // ADR-103 M2b added `parentLinkKind` to this projection, so the signature
-      // tracks the current column set.
+      // ADR-103 M2b added `parentLinkKind` to this projection, and SUP-18196
+      // added the title/description declaration fields, so the signature tracks
+      // the current column set.
       const childSignature =
-        keys.length === 7
+        keys.length === 9
         && keys.includes("id")
-        && keys.includes("identifier")
-        && keys.includes("status")
-        && keys.includes("executionPolicy")
-        && keys.includes("executionState")
-        && keys.includes("originKind")
-        && keys.includes("parentLinkKind");
+         && keys.includes("identifier")
+         && keys.includes("status")
+         && keys.includes("executionPolicy")
+         && keys.includes("executionState")
+         && keys.includes("originKind")
+         && keys.includes("title")
+         && keys.includes("description")
+         && keys.includes("parentLinkKind");
       return {
         from: (table: unknown) => {
           let rows: unknown[] = HANDOFF_AGENT_ROWS;
@@ -970,6 +977,38 @@ describe("issue execution policy missing approval stage", () => {
 
     expect(res.status).toBe(200);
     expect(gapActivityInputs()).toEqual([]);
+  });
+
+  it("projects and applies unlabelled redo declarations without excluding buried declarations", async () => {
+    const issue = parentIssue(reviewOnlyPolicy());
+    childRowsState.rows = [
+      ladderedChildRow("child-title-redo", "PAP-2", "manual", "in_review", "[redo] title declaration", "Details first."),
+      ladderedChildRow("child-description-redo", "PAP-3", "manual", "in_review", "ordinary title", "\nwork-type:redo\nDetails follow."),
+      ladderedChildRow("child-description-delivery", "PAP-4", "manual", "in_review", "ordinary title", "work-type:delivery\nDetails follow."),
+      ladderedChildRow("child-buried-redo", "PAP-5", "manual", "in_review", "ordinary title", "Details first.\nwork-type:redo"),
+      ladderedChildRow("child-genuine", "PAP-6", "manual", "in_review", "ordinary title", "Details first."),
+    ];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp(agentActor()))
+      .patch(`/api/issues/${PARENT_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      code: "done_transition_missing_approval_stage",
+      details: {
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-5", "PAP-6"],
+        excludedChildIdentifiers: ["PAP-2", "PAP-3", "PAP-4"],
+      },
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   // Distinguishing regression (SUP-15958): the SUP-15826 / SUP-15813 shape — a
