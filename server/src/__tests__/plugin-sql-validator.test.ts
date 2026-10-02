@@ -741,7 +741,7 @@ describe("plugin SQL validator: migration split", () => {
         name: "multi-byte text before every boundary",
         file: "-- ünïcödé\nCOMMENT ON TABLE plugin_x.a IS '🚀;';\n-- 日本語\nCOMMENT ON TABLE plugin_x.b IS $$ñ;$$;\nCOMMENT ON TABLE plugin_x.c IS '€'",
       },
-      { name: "the smuggling shape", file: "COMMENT ON TABLE plugin_x.a IS $$ ' $$;\nDROP TABLE plugin_x.a;\nCOMMENT ON TABLE plugin_x.a IS ' $$'" },
+      { name: "a statement after a dollar-quote end that holds an apostrophe", file: "COMMENT ON TABLE plugin_x.a IS $$ ' $$;\nDROP TABLE plugin_x.a;\nCOMMENT ON TABLE plugin_x.a IS ' $$'" },
     ];
 
     it.each(files)("cuts fragments that are verbatim slices of the file, with only separators between them: $name", ({ file }) => {
@@ -775,5 +775,91 @@ describe("plugin SQL validator: migration split", () => {
         );
       }
     });
+  });
+});
+
+const NUL = String.fromCharCode(0);
+const NBSP = String.fromCharCode(0xa0);
+const IDEOGRAPHIC_SPACE = String.fromCharCode(0x3000);
+const ZERO_WIDTH_NO_BREAK_SPACE = String.fromCharCode(0xfeff);
+
+describe("plugin SQL validator: NUL bytes", () => {
+  // The parser stops reading at the first NUL. Text after one must never be validated as if it were
+  // the whole statement, or dropped from a split.
+  it("rejects a migration file whose first statement holds a NUL before its semicolon", () => {
+    const file = `CREATE TABLE plugin_x.a (id int)${NUL}; ALTER TABLE public.issues ADD COLUMN extra int`;
+    expect(() => splitPluginMigrationSql(file)).toThrow(/does not parse/);
+  });
+
+  it("rejects a migration file with a NUL after a semicolon, so no later statement is dropped", () => {
+    const file = `CREATE TABLE plugin_x.a (id int);${NUL}\nCREATE TABLE plugin_x.b (id int);\nCREATE TABLE plugin_x.c (id int);`;
+    expect(() => splitPluginMigrationSql(file)).toThrow(/does not parse/);
+  });
+
+  it("rejects a migration file that holds only a NUL", () => {
+    expect(() => splitPluginMigrationSql(NUL)).toThrow(/does not parse/);
+  });
+
+  it("rejects a NUL inside a string literal", () => {
+    expect(() => splitPluginMigrationSql(`COMMENT ON TABLE plugin_x.a IS 'a${NUL}b';`)).toThrow(/does not parse/);
+  });
+
+  it("rejects a NUL in a single migration statement", () => {
+    expect(() =>
+      validatePluginMigrationStatement(`CREATE TABLE plugin_x.a (id int)${NUL}; ALTER TABLE public.issues ADD COLUMN extra int`, "plugin_x"),
+    ).toThrow(/does not parse/);
+  });
+
+  it("rejects a NUL in a runtime query", () => {
+    expect(() =>
+      validatePluginRuntimeQuery(`SELECT id FROM plugin_x.t${NUL}; SELECT id FROM public.issues`, "plugin_x"),
+    ).toThrow(/does not parse/);
+    expect(() => validatePluginRuntimeQuery(`SELECT id FROM plugin_x.t WHERE note = 'a${NUL}b'`, "plugin_x")).toThrow(
+      /does not parse/,
+    );
+  });
+
+  it("rejects a NUL in a runtime execute", () => {
+    expect(() =>
+      validatePluginRuntimeExecute(`DELETE FROM plugin_x.t${NUL}; DELETE FROM public.issues`, "plugin_x"),
+    ).toThrow(/does not parse/);
+  });
+});
+
+describe("plugin SQL validator: whitespace that is part of a name", () => {
+  // PostgreSQL skips only space, tab, newline, carriage return, form feed and vertical tab between
+  // tokens. Any other character, including a Unicode space, belongs to the word next to it.
+  it.each([
+    { name: "a no-break space", character: NBSP },
+    { name: "an ideographic space", character: IDEOGRAPHIC_SPACE },
+    { name: "a zero-width no-break space", character: ZERO_WIDTH_NO_BREAK_SPACE },
+  ])("keeps $name that ends the last word of a statement, so the fragment parses like the file", ({ character }) => {
+    const file = `ALTER TABLE plugin_x.a RENAME TO b${character};\nCREATE TABLE plugin_x.c (id int)`;
+    const [fragment] = splitPluginMigrationSql(file);
+    expect(fragment).toBe(`ALTER TABLE plugin_x.a RENAME TO b${character}`);
+    const newName = (statements: ReturnType<typeof parseSync>) =>
+      (statements.stmts?.[0]?.stmt as { RenameStmt?: { newname?: string } } | undefined)?.RenameStmt?.newname;
+    expect(newName(parseSync(file))).toBe(`b${character}`);
+    expect(newName(parseSync(fragment!))).toBe(`b${character}`);
+    expect(splitPluginMigrationSql(fragment!)).toEqual([fragment]);
+  });
+
+  it.each([
+    { name: "a no-break space", character: NBSP },
+    { name: "an ideographic space", character: IDEOGRAPHIC_SPACE },
+  ])("rejects $name between two statements instead of trimming it", ({ character }) => {
+    expect(() =>
+      splitPluginMigrationSql(`CREATE TABLE plugin_x.a (id int);\n${character}CREATE TABLE plugin_x.b (id int)`),
+    ).toThrow(/does not parse/);
+  });
+
+  it("does not treat a file that holds only a Unicode space as empty", () => {
+    expect(() => splitPluginMigrationSql(NBSP)).toThrow(/does not parse/);
+  });
+
+  it("trims every character PostgreSQL skips between tokens", () => {
+    expect(splitPluginMigrationSql(" \t\r\n\f\vCREATE TABLE plugin_x.a (id int) \t\r\n\f\v;\n")).toEqual([
+      "CREATE TABLE plugin_x.a (id int)",
+    ]);
   });
 });

@@ -765,7 +765,10 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     }
     return {
       validated: [...validatedMigrationStatements],
-      executed: executed.filter((text) => !text.includes("pg_advisory_xact_lock")),
+      transactionStatements: executed,
+      executed: executed.filter(
+        (text) => !text.includes("pg_advisory_xact_lock") && !/^SET LOCAL standard_conforming_strings/.test(text),
+      ),
       failure,
     };
   }
@@ -790,6 +793,88 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(fragments).toHaveLength(3);
     expect(validated).toEqual(fragments);
     expect(executed).toEqual(fragments);
+  });
+
+  it("turns standard_conforming_strings on as the first statement of the migration transaction", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    const { transactionStatements, failure } = await applyMigrationsRecordingStatements(pluginId, pluginManifest, packageRoot);
+
+    expect(failure).toBeUndefined();
+    expect(transactionStatements[0]).toBe("SET LOCAL standard_conforming_strings = on");
+  });
+
+  it("reads migration strings with standard_conforming_strings on when the database default is off", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    // With the setting off the server reads 'a\' as a string that holds a quote, so the statement ends at
+    // the semicolon that follows. With it on, which is how the validator parses, the second quoted text
+    // continues the same comment and the migration is one statement.
+    const file = [
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+      `COMMENT ON TABLE ${namespace}.notes IS 'a\\'`,
+      "' ; ALTER TABLE public.issues ADD COLUMN escaped_column int; --'",
+    ].join("\n");
+    const packageRoot = await createPluginPackage(pluginManifest, file);
+    const pluginId = await installPluginRecord(pluginManifest);
+    const [database] = Array.from(
+      (await db.execute(sql`SELECT current_database() AS name`)) as Iterable<{ name: string }>,
+    );
+    const databaseName = `"${database!.name.replaceAll('"', '""')}"`;
+
+    await db.execute(sql.raw(`ALTER DATABASE ${databaseName} SET standard_conforming_strings = off`));
+    try {
+      // A new pool, so every connection it opens starts with the database default.
+      const offDb = createDb(tempDb!.connectionString);
+      const [setting] = Array.from(
+        (await offDb.execute(sql`SHOW standard_conforming_strings`)) as Iterable<{ standard_conforming_strings: string }>,
+      );
+      expect(setting?.standard_conforming_strings).toBe("off");
+
+      await pluginDatabaseService(offDb).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const [comment] = Array.from(
+        (await db.execute(
+          sql.raw(`SELECT obj_description('${namespace}.notes'::regclass, 'pg_class') AS comment`),
+        )) as Iterable<{ comment: string | null }>,
+      );
+      expect(comment?.comment).toBe("a\\ ; ALTER TABLE public.issues ADD COLUMN escaped_column int; --");
+      const columns = Array.from(
+        (await db.execute(
+          sql`SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'issues' AND column_name = 'escaped_column'`,
+        )) as Iterable<{ column_name: string }>,
+      );
+      expect(columns).toEqual([]);
+    } finally {
+      await db.execute(sql.raw(`ALTER DATABASE ${databaseName} RESET standard_conforming_strings`));
+      await db.execute(sql.raw("ALTER TABLE public.issues DROP COLUMN IF EXISTS escaped_column"));
+    }
+  });
+
+  it("records a failed migration when the migration file holds a NUL", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY)${String.fromCharCode(0)}; ALTER TABLE public.issues ADD COLUMN escaped_column int`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await expect(
+      pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/does not parse/);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
   });
 
   it("validates a statement that follows a dollar-quote end and runs nothing from that statement on", async () => {

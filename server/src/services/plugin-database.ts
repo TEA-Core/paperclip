@@ -241,6 +241,11 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       const persistFailure = options.persistFailure ?? true;
 
       const applyWithClient = async (client: PluginDatabaseClient) => {
+        // The validator parses with standard_conforming_strings on, so the server must read every
+        // migration statement the same way. A session or role default of off would let a backslash
+        // before a quote end a string for the server but not for the validator. SET LOCAL ends with
+        // this transaction, and a migration cannot change it (SET and set_config are not allowed).
+        await client.execute(sql`SET LOCAL standard_conforming_strings = on`);
         await client.execute(sql`SELECT pg_advisory_xact_lock(${lockKey})`);
         for (const migrationKey of migrationFiles) {
           const content = await readFile(path.join(migrationDir, migrationKey), "utf8");
@@ -323,6 +328,8 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
+      // The validator parses with the default standard_conforming_strings = on. This path assumes the
+      // server runs with that default and does not set it per statement; migrations do (applyMigrations).
       const result = await db.execute(bindSql(statement, params));
       return Array.from(result as Iterable<T>);
     },
@@ -331,6 +338,7 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       await loadPluginSqlParser();
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
+      // Same default-on assumption for standard_conforming_strings as in query(); see applyMigrations.
       const result = await db.execute(bindSql(statement, params));
       return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
     },
