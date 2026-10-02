@@ -115,7 +115,8 @@ export function assertAssigneeWriteDoesNotSelfSatisfyReviewStage(input: {
   /**
    * Board ruling 2026-10-02 (F1): the writer and the issue as stored. When
    * present the 422 names the caller's seat and a seat-specific next action
-   * after the unchanged message. Absent (the recovery service) it is unchanged.
+   * after the unchanged message. Absent (the recovery service, or a board caller)
+   * it is unchanged.
    */
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): void {
