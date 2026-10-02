@@ -1849,12 +1849,29 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("skips stale archived in_review children", async () => {
-    const { companyId, coderId, sourceIssueId } = await seedCompany();
-    await db.update(issues).set({ status: "in_review", executionState: {
-      status: "pending",
-      currentStageType: "review",
-      currentParticipant: { type: "agent", agentId: coderId },
-    }}).where(eq(issues.id, sourceIssueId));
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const controlIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: controlIssueId,
+      companyId,
+      title: "Eligible in-review control",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    const staleUpdatedAt = new Date("2020-01-01T00:00:00.000Z");
+    const pendingReviewState = {
+      status: "pending" as const,
+      currentStageType: "review" as const,
+      currentParticipant: { type: "agent" as const, agentId: coderId },
+    };
+    await db.update(issues).set({
+      status: "in_review",
+      executionState: pendingReviewState,
+      updatedAt: staleUpdatedAt,
+    }).where(inArray(issues.id, [sourceIssueId, controlIssueId]));
     await db.insert(unWakeableArchives).values({
       companyId,
       issueId: sourceIssueId,
@@ -1865,6 +1882,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStrandedAssignedIssues();
 
+    expect(result.issueIds).toContain(controlIssueId);
     expect(result.issueIds).not.toContain(sourceIssueId);
     expect(result.escalated).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
