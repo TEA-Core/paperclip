@@ -430,6 +430,13 @@ export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "blocked",
   "escalated",
   "cancelled",
+  // SUP-17034: the two `cancelled`-status writers were persisting the same
+  // `cancelled` outcome for opposite reasons. `superseded` = still broken,
+  // re-detected under a new identity; `condition_cleared` = the condition
+  // cleared on its own. Both still carry `status: "cancelled"`; the outcome
+  // now distinguishes them. Pre-change rows keep the bare `cancelled` value.
+  "superseded",
+  "condition_cleared",
 ] as const;
 export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
 

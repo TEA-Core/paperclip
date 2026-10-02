@@ -308,6 +308,60 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
+  it("stamps the superseded outcome when a new failure identity supersedes the active action", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+
+    const first = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "recovery:fingerprint-A",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const second = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "recovery:fingerprint-B",
+      supersedeOnIdentityChange: true,
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // The new failure identity gets a fresh active action, not the prior id.
+    expect(second.id).not.toBe(first.id);
+    expect(second.status).toBe("active");
+    expect(second.fingerprint).toBe("recovery:fingerprint-B");
+
+    // The prior action was cancelled with the `superseded` outcome, not the
+    // generic `cancelled` outcome (SUP-17034).
+    const prior = await db
+      .select({
+        status: issueRecoveryActions.status,
+        outcome: issueRecoveryActions.outcome,
+        resolutionNote: issueRecoveryActions.resolutionNote,
+      })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, first.id))
+      .then((rows) => rows[0]);
+    expect(prior).toMatchObject({ status: "cancelled", outcome: "superseded" });
+    expect(prior?.resolutionNote).toMatch(/superseded/);
+
+    // And the source now resolves to the new active action only.
+    expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: second.id });
+  });
+
   it("does not resurrect an exhausted action via upsertSourceScoped", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
@@ -1555,7 +1609,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       row.fingerprint.endsWith("workspace_base_ref:origin/fix/bar"),
     );
     expect(priorAction?.status).toBe("cancelled");
-    expect(priorAction?.outcome).toBe("cancelled");
+    expect(priorAction?.outcome).toBe("superseded");
     expect(newAction?.status).toBe("active");
     expect(newAction?.attemptCount).toBe(1);
     expect(newAction?.id).not.toBe(priorAction?.id);
