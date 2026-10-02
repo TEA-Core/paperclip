@@ -75,6 +75,33 @@ describe("isLadderArmingParentEdge", () => {
     ).toBe(false);
   });
 
+  it("does not count exact redo or delivery declarations without a label", () => {
+    expect(
+      isLadderArmingParentEdge({
+        parentLinkKind: "decomposition",
+        title: "[redo] Repair the bounced child",
+        description: "work-type:redo\n\nDetails",
+      }),
+    ).toBe(false);
+    expect(
+      isLadderArmingParentEdge({
+        parentLinkKind: "decomposition",
+        title: "Delivery helper",
+        description: "\n work-type:delivery \nDetails",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not treat buried work-type declarations as carve-outs", () => {
+    expect(
+      isLadderArmingParentEdge({
+        parentLinkKind: "decomposition",
+        title: "Ordinary child",
+        description: "Details\nwork-type:redo",
+      }),
+    ).toBe(true);
+  });
+
   it("does not count a carve-out-labelled child (SUP-15464 / SUP-15533 / SUP-16586 / SUP-17177 / SUP-17553)", () => {
     // The arm round 1 of this fix left out. `countLadderedChildren` excludes a
     // child carrying any of the five carve-out labels, so the gate must not

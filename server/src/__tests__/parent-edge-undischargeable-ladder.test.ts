@@ -579,6 +579,38 @@ describeEmbeddedPostgres("parent edge that would add an undischargeable ladder (
     expect(edge?.parentId).toBe(parent.id);
   });
 
+  it("allows a declared redo child without its carve-out label", async () => {
+    const { companyId, issuePrefix } = await seedCompany();
+    const supportQaeAgentId = await seedSupportQaeAgent(companyId);
+    const parent = await seedAdvancedNonConformingParent(
+      companyId,
+      issuePrefix,
+      1,
+      supportQaeAgentId,
+      true,
+    );
+    await seedQualifyingChild(
+      companyId,
+      issuePrefix,
+      2,
+      parent.id,
+      supportQaeAgentId,
+    );
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Declared redo child",
+        description: "work-type:redo\n\nImplementation details",
+        parentId: parent.id,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const edge = await edgeFor(res.body.id);
+    expect(edge?.parentId).toBe(parent.id);
+    expect(edge?.parentLinkKind).toBe("decomposition");
+  });
+
   it("allows a work-type:redo child on the same advanced, non-conforming parent (carve-out label)", async () => {
     // The round-1 regression, pinned. `countLadderedChildren` has never counted
     // a child carrying one of the four carve-out labels (SUP-15464 /
