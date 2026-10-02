@@ -2113,7 +2113,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
   });
 
-  it("leaves hidden issues out of stranded-issue reconciliation", async () => {
+  it("reconciles hidden issues in the stranded-issue sweep", async () => {
     const { issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -2125,8 +2125,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
 
-    expect(result.issueIds).not.toContain(issueId);
-    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).toContain(issueId);
   });
 
   it.each(["settled", "rejected", "late_callback"] as const)(

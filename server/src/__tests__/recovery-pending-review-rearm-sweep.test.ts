@@ -11,6 +11,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  unWakeableArchives,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
@@ -172,6 +173,69 @@ describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
       source: "issue_graph_liveness.pending_review_rearm",
       rearm: true,
     });
+  });
+
+  it("re-arms a hidden stale in_review issue with an agent participant and no decision", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const now = new Date();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Hidden needs review",
+      status: "in_review",
+      priority: "high",
+      executionState: buildExecutionState(agentId),
+      hiddenAt: new Date("2026-03-19T00:05:00.000Z"),
+      updatedAt: new Date(now.getTime() - 60_000),
+    });
+
+    const { mockEnqueue } = makeMockEnqueueWakeup();
+    const recovery = recoveryService(db, { enqueueWakeup: mockEnqueue });
+    const result = await recovery.reconcilePendingReviewRearm({
+      now,
+      rearmWindowMs: 1000,
+      rearmMaxCount: 3,
+    });
+
+    expect(result.checked).toBe(1);
+    expect(result.reArmed).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect(mockEnqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips stale archived in_review children", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const now = new Date();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Archived stale child review",
+      status: "in_review",
+      priority: "high",
+      executionState: buildExecutionState(agentId),
+      updatedAt: new Date(now.getTime() - 60_000),
+    });
+    await db.insert(unWakeableArchives).values({
+      companyId,
+      issueId,
+      policy: "stale_in_review_child",
+    });
+
+    const { mockEnqueue } = makeMockEnqueueWakeup();
+    const recovery = recoveryService(db, { enqueueWakeup: mockEnqueue });
+    const result = await recovery.reconcilePendingReviewRearm({
+      now,
+      rearmWindowMs: 1000,
+      rearmMaxCount: 3,
+    });
+
+    expect(result.checked).toBe(0);
+    expect(result.reArmed).toBe(0);
+    expect(mockEnqueue).not.toHaveBeenCalled();
   });
 
   it("skips dependency-blocked in_review issues", async () => {

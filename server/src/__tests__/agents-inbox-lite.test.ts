@@ -169,6 +169,36 @@ describeEmbeddedPostgres("agents inbox-lite", () => {
     expect(ids.has(nonParticipantReviewIssueId)).toBe(false);
   });
 
+  it("returns hidden pending review issues for the reviewer", async () => {
+    const companyId = await seedCompany();
+    const reviewerId = randomUUID();
+    await seedAgent(companyId, reviewerId);
+
+    const hiddenIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: hiddenIssueId,
+      companyId,
+      title: "Hidden pending review",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerId,
+      hiddenAt: new Date("2026-03-19T00:05:00.000Z"),
+      executionState: {
+        status: "pending",
+        currentStageType: "review",
+        currentStageId: randomUUID(),
+        currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+        lastDecisionId: null,
+      },
+    });
+
+    const app = appFor(agentActor(companyId, reviewerId));
+    const res = await request(app).get("/api/agents/me/inbox-lite");
+
+    expect(res.status).toBe(200);
+    expect(res.body.map((i: { id: string }) => i.id)).toContain(hiddenIssueId);
+  });
+
   it("does not return pending review issues for a non-participant agent", async () => {
     const companyId = await seedCompany();
     const reviewerId = randomUUID();

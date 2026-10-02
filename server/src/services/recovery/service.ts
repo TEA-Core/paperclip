@@ -5727,7 +5727,16 @@ export function recoveryService(
           opts?.issueCreatedAtGte
             ? gte(issues.createdAt, opts.issueCreatedAtGte)
             : undefined,
-          isNull(issues.hiddenAt),
+          isNull(issues.harnessKind),
+          not(
+            sql`exists (
+              select 1
+              from ${unWakeableArchives}
+              where ${unWakeableArchives.issueId} = ${issues.id}
+                and ${unWakeableArchives.companyId} = ${issues.companyId}
+                and ${unWakeableArchives.policy} = 'stale_in_review_child'
+            )`,
+          ),
           not(unadmittedChatWakeupCondition(issues.id, issues.companyId)),
         ),
       );
@@ -7885,7 +7894,7 @@ export function recoveryService(
 
     const filters = [
       eq(issues.status, "in_review"),
-      visibleIssueCondition(),
+      isNull(issues.harnessKind),
       sql`${issues.executionState}->>'status' = 'pending'`,
       sql`${issues.executionState}->>'currentStageType' = 'review'`,
       sql`NOT EXISTS (
@@ -7896,6 +7905,13 @@ export function recoveryService(
       )`,
       sql`${issues.executionState}->'currentParticipant'->>'type' = 'agent'`,
       sql`${issues.executionState}->'currentParticipant'->>'agentId' is not null`,
+      sql`not exists (
+        select 1
+        from ${unWakeableArchives}
+        where ${unWakeableArchives.issueId} = ${issues.id}
+          and ${unWakeableArchives.companyId} = ${issues.companyId}
+          and ${unWakeableArchives.policy} = 'stale_in_review_child'
+      )`,
       lt(issues.updatedAt, cutoff),
     ];
     if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
@@ -10512,15 +10528,17 @@ export function recoveryService(
         continue;
       }
 
-      await db
-        .update(issues)
-        .set({ hiddenAt: new Date() })
-        .where(eq(issues.id, candidate.id));
+      await db.transaction(async (tx) => {
+        await tx
+          .update(issues)
+          .set({ hiddenAt: new Date() })
+          .where(eq(issues.id, candidate.id));
 
-      await db.insert(unWakeableArchives).values({
-        companyId: candidate.companyId,
-        issueId: candidate.id,
-        policy: "stale_in_review_child",
+        await tx.insert(unWakeableArchives).values({
+          companyId: candidate.companyId,
+          issueId: candidate.id,
+          policy: "stale_in_review_child",
+        });
       });
 
       result.archived += 1;
