@@ -532,6 +532,39 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(uniqueColumnSets).not.toContain("paperclip_page_bindings:company_id,wiki_id,page_path");
   });
 
+  it("applies the orchestration smoke example migrations through the production validator", async () => {
+    const pluginManifest: PaperclipPluginManifestV1 = {
+      ...manifest("paperclipai.plugin-orchestration-smoke-example"),
+      database: {
+        namespaceSlug: "orchestration_smoke",
+        migrationsDir: "migrations",
+        coreReadTables: ["issues"],
+      },
+    };
+    const repoRoot = path.basename(process.cwd()) === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+    const packageRoot = path.join(repoRoot, "packages", "plugins", "examples", "plugin-orchestration-smoke-example");
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id, pluginManifest.database?.namespaceSlug);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    try {
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const migrations = await db
+        .select()
+        .from(pluginMigrations)
+        .where(and(eq(pluginMigrations.pluginId, pluginId), eq(pluginMigrations.status, "applied")));
+      expect(migrations.map((migration) => migration.migrationKey)).toEqual(["001_orchestration_smoke.sql"]);
+      const [table] = Array.from(
+        (await db.execute(
+          sql.raw(`SELECT to_regclass('${namespace}.smoke_runs')::text AS name`),
+        )) as Iterable<{ name: string | null }>,
+      );
+      expect(table?.name).toBe(`${namespace}.smoke_runs`);
+    } finally {
+      await db.execute(sql.raw(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`));
+    }
+  });
+
   it("applies migrations once and allows whitelisted core joins at runtime", async () => {
     const pluginManifest = manifest();
     const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
