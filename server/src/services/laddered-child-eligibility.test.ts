@@ -80,7 +80,6 @@ describe("isLadderArmingParentEdge", () => {
       isLadderArmingParentEdge({
         parentLinkKind: "decomposition",
         title: "[redo] Repair the bounced child",
-        description: "work-type:redo\n\nDetails",
       }),
     ).toBe(false);
     expect(
