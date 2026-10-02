@@ -24,7 +24,7 @@ Affirm that you did this search by checking the dedup-search box in the PR templ
 - Touch the **smallest possible number of files**
 - Make sure the change is very targeted and easy to review
 - All tests pass and CI is green
-- Greptile score is 5/5 with all comments addressed
+- CodeRabbit is green on the current head with all comments addressed
 - Use the [PR template](.github/PULL_REQUEST_TEMPLATE.md)
 
 These almost always get merged quickly when they're clean.
@@ -39,7 +39,7 @@ These almost always get merged quickly when they're clean.
   - Clear description of what & why
   - Proof it works (manual testing notes)
   - All tests passing and CI green
-  - Greptile score 5/5 with all comments addressed
+  - CodeRabbit is green on the current head with all comments addressed
   - [PR template](.github/PULL_REQUEST_TEMPLATE.md) fully filled out
 
 PRs that follow this path are **much** more likely to be accepted, even when they're large.
@@ -142,15 +142,15 @@ an empty `pull_request.number` in a `concurrency.group` collapses every queue en
 into one group — which, with `cancel-in-progress`, makes each entry cancel the one
 ahead of it. See `.github/workflows/pr.yml` for the shape that handles both events.
 
-### Greptile Review
+### CodeRabbit Review
 
-We use [Greptile](https://greptile.com) for automated code review. Your PR must achieve a **5/5 Greptile score** before it can be merged, with:
+We use [CodeRabbit](https://www.coderabbit.ai) for automated code review. Your PR must have a **green CodeRabbit review on the current head** before it can be merged, with:
 
-- **No open P2 (or higher) comments**
+- **No open comments**
 - **No open recommendations**
 - **No open follow-ups**
 
-We hold the bar high here on purpose — we want code quality to be as high as possible. If Greptile leaves comments, fix them (or, if a comment is wrong, reply explaining why) and request a re-review.
+We hold the bar high here on purpose — we want code quality to be as high as possible. If CodeRabbit leaves comments, fix them (or, if a comment is wrong, reply explaining why).
 
 ## Helping Other Contributors
 
