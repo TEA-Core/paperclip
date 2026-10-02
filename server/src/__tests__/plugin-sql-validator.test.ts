@@ -863,3 +863,181 @@ describe("plugin SQL validator: whitespace that is part of a name", () => {
     ]);
   });
 });
+
+describe("plugin SQL validator: unpaired UTF-16 surrogates", () => {
+  // libpg-query sizes its input buffer by counting every surrogate as four bytes, but it writes an
+  // unpaired one as three. The buffer comes out short and the end of the text is never parsed, while
+  // the driver sends the whole string to the server.
+  const HIGH = String.fromCharCode(0xd800);
+  const LOW = String.fromCharCode(0xdc00);
+  const ROCKET = String.fromCharCode(0xd83d, 0xde80);
+  const THREE_BYTE = String.fromCharCode(0x65e5);
+  const TAIL = "; DELETE FROM public.issues ";
+  const PAD = TAIL.length;
+
+  type Shape = { name: string; build: (padding: string) => { runtime: string; execute: string; migration: string } };
+  const inLiteral = (padding: string) => ({
+    runtime: `SELECT id FROM plugin_x.t WHERE n = '${padding}'${TAIL}`,
+    execute: `INSERT INTO plugin_x.t (n) VALUES ('${padding}')${TAIL}`,
+    migration: `COMMENT ON TABLE plugin_x.a IS '${padding}'${TAIL}`,
+  });
+  const inBlockComment = (padding: string) => ({
+    runtime: `SELECT id FROM plugin_x.t /* ${padding} */${TAIL}`,
+    execute: `INSERT INTO plugin_x.t (n) VALUES (1) /* ${padding} */${TAIL}`,
+    migration: `COMMENT ON TABLE plugin_x.a IS 'x' /* ${padding} */${TAIL}`,
+  });
+  const inLineComment = (padding: string) => ({
+    runtime: `SELECT id FROM plugin_x.t -- ${padding}\n${TAIL}`,
+    execute: `INSERT INTO plugin_x.t (n) VALUES (1) -- ${padding}\n${TAIL}`,
+    migration: `COMMENT ON TABLE plugin_x.a IS 'x' -- ${padding}\n${TAIL}`,
+  });
+  const beforeSemicolon = (padding: string) => ({
+    runtime: `SELECT id FROM plugin_x.t WHERE n = 'x'${padding}${TAIL}`,
+    execute: `INSERT INTO plugin_x.t (n) VALUES (1)${padding}${TAIL}`,
+    migration: `COMMENT ON TABLE plugin_x.a IS 'x'${padding}${TAIL}`,
+  });
+  const shapes: Shape[] = [
+    { name: "in a string literal", build: inLiteral },
+    { name: "in a block comment", build: inBlockComment },
+    { name: "in a line comment", build: inLineComment },
+    { name: "directly before the semicolon", build: beforeSemicolon },
+  ];
+  const paddings = [
+    { name: "lone high surrogates", padding: HIGH.repeat(PAD) },
+    { name: "lone low surrogates", padding: LOW.repeat(PAD) },
+    { name: "high surrogates followed by three-byte characters", padding: (HIGH + THREE_BYTE).repeat(PAD) },
+    { name: "low surrogates followed by two-byte characters", padding: (LOW + "é").repeat(PAD) },
+    { name: "a single lone high surrogate", padding: HIGH },
+    { name: "a single lone low surrogate", padding: LOW },
+  ];
+  const combos = shapes.flatMap((shape) => paddings.map((p) => ({ shape: shape.name, build: shape.build, padding: p.padding, kind: p.name })));
+
+  it.each(combos)("rejects $kind $shape in a runtime query", ({ build, padding }) => {
+    expect(() => validatePluginRuntimeQuery(build(padding).runtime, "plugin_x")).toThrow(/does not parse: it contains an unpaired UTF-16 surrogate/);
+  });
+
+  it.each(combos)("rejects $kind $shape in a runtime execute", ({ build, padding }) => {
+    expect(() => validatePluginRuntimeExecute(build(padding).execute, "plugin_x")).toThrow(/does not parse: it contains an unpaired UTF-16 surrogate/);
+  });
+
+  it.each(combos)("rejects $kind $shape in a migration statement and a migration file", ({ build, padding }) => {
+    const { migration } = build(padding);
+    expect(() => validatePluginMigrationStatement(migration, "plugin_x")).toThrow(/does not parse: it contains an unpaired UTF-16 surrogate/);
+    expect(() => splitPluginMigrationSql(migration)).toThrow(/does not parse: it contains an unpaired UTF-16 surrogate/);
+  });
+
+  it("rejects an unpaired surrogate at the very start and the very end of the text", () => {
+    expect(() => validatePluginRuntimeQuery(`${LOW}SELECT id FROM plugin_x.t`, "plugin_x")).toThrow(/unpaired UTF-16 surrogate/);
+    expect(() => validatePluginRuntimeQuery(`SELECT id FROM plugin_x.t -- ${HIGH}`, "plugin_x")).toThrow(/unpaired UTF-16 surrogate/);
+  });
+
+  it("rejects a high surrogate that a low surrogate does not directly follow, and a low surrogate that no high surrogate precedes", () => {
+    expect(() => validatePluginRuntimeQuery(`SELECT '${HIGH}${HIGH}${LOW}${LOW}'`, "plugin_x")).toThrow(/unpaired UTF-16 surrogate/);
+    expect(() => validatePluginRuntimeQuery(`SELECT '${ROCKET}${LOW}'`, "plugin_x")).toThrow(/unpaired UTF-16 surrogate/);
+    expect(() => validatePluginRuntimeQuery(`SELECT '${HIGH}${ROCKET}'`, "plugin_x")).toThrow(/unpaired UTF-16 surrogate/);
+  });
+
+  it("still parses well-formed surrogate pairs, and sees the whole text after them", () => {
+    const rockets = ROCKET.repeat(PAD);
+    expect(() => validatePluginRuntimeQuery(`SELECT id FROM plugin_x.t WHERE n = '${rockets}'`, "plugin_x")).not.toThrow();
+    expect(() => validatePluginRuntimeExecute(`INSERT INTO plugin_x.t (n) VALUES ('${rockets}')`, "plugin_x")).not.toThrow();
+    expect(() => validatePluginMigrationStatement(`COMMENT ON TABLE plugin_x.a IS '${rockets}'`, "plugin_x")).not.toThrow();
+    // Nothing is cut off: the statement after the emoji is read, so the text is two statements.
+    expect(() => validatePluginRuntimeQuery(`SELECT id FROM plugin_x.t WHERE n = '${rockets}'${TAIL}`, "plugin_x")).toThrow(
+      /exactly one statement/,
+    );
+    expect(splitPluginMigrationSql(`COMMENT ON TABLE plugin_x.a IS '${rockets}';\nCOMMENT ON TABLE plugin_x.b IS '${rockets}'`)).toEqual([
+      `COMMENT ON TABLE plugin_x.a IS '${rockets}'`,
+      `COMMENT ON TABLE plugin_x.b IS '${rockets}'`,
+    ]);
+  });
+
+  it("fails closed when the parser's byte count for the text differs from the real UTF-8 length", () => {
+    // Stands in for any future change in how libpg-query encodes its input.
+    const text = "SELECT id FROM plugin_x.t WHERE n = 'é日🚀'";
+    const realByteLength = Buffer.byteLength.bind(Buffer);
+    const spy = vi.spyOn(Buffer, "byteLength").mockImplementation(((value: string, encoding?: BufferEncoding) =>
+      realByteLength(value, encoding) + (value === text ? 1 : 0)) as typeof Buffer.byteLength);
+    try {
+      expect(() => validatePluginRuntimeQuery(text, "plugin_x")).toThrow(/does not parse: encoding mismatch/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(() => validatePluginRuntimeQuery(text, "plugin_x")).not.toThrow();
+  });
+
+  describe("fuzz", () => {
+    // Deterministic generator, so a failure reproduces.
+    function seededRandom(seed: number) {
+      let state = seed >>> 0;
+      return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let t = state;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    const WELL_FORMED_ATOMS = ["a", "b", " ", "x1", "é", THREE_BYTE, ROCKET, "ñ", "€"];
+    const UNPAIRED_ATOMS = [HIGH, LOW, HIGH + THREE_BYTE, LOW + "é", HIGH + HIGH, LOW + LOW, HIGH + "a", LOW + ROCKET];
+    const TAILS = [TAIL, "; DROP TABLE plugin_x.t", "; DELETE FROM public.agents WHERE true ", ";\nDELETE FROM public.issues"];
+    const ITERATIONS = 3000;
+
+    function noise(random: () => number, atoms: string[], length: number) {
+      let out = "";
+      for (let i = 0; i < length; i += 1) out += atoms[Math.floor(random() * atoms.length)]!;
+      return out;
+    }
+
+    it("never lets a statement hidden behind unpaired surrogates through any validator", () => {
+      const random = seededRandom(0x5eed);
+      const accepted: string[] = [];
+      let parserSawOneStatement = 0;
+      let checked = 0;
+      for (let i = 0; i < ITERATIONS; i += 1) {
+        const mixed = noise(random, [...WELL_FORMED_ATOMS, ...UNPAIRED_ATOMS, ...UNPAIRED_ATOMS], 1 + Math.floor(random() * 70));
+        const tail = TAILS[Math.floor(random() * TAILS.length)]!;
+        const shape = [inLiteral, inBlockComment, inLineComment, beforeSemicolon][Math.floor(random() * 4)]!;
+        const built = shape(mixed).runtime.replace(TAIL, tail);
+        const exec = shape(mixed).execute.replace(TAIL, tail);
+        const migration = shape(mixed).migration.replace(TAIL, tail);
+        checked += 1;
+        // Control: the raw parser, with no guard, reads the whole text as one statement for many of these.
+        try {
+          if ((parseSync(built).stmts ?? []).length === 1) parserSawOneStatement += 1;
+        } catch {
+          // The cut can land inside a word; that text does not parse, which is not the fault under test.
+        }
+        for (const [label, run] of [
+          ["query", () => validatePluginRuntimeQuery(built, "plugin_x")],
+          ["execute", () => validatePluginRuntimeExecute(exec, "plugin_x")],
+          ["migration", () => validatePluginMigrationStatement(migration, "plugin_x")],
+          // A file may hold many statements, so the split itself accepts the tail; its validation must not.
+          ["file", () => splitPluginMigrationSql(migration).forEach((fragment) => validatePluginMigrationStatement(fragment, "plugin_x"))],
+        ] as const) {
+          try {
+            run();
+            accepted.push(`${label}: ${JSON.stringify(label === "query" ? built : label === "execute" ? exec : migration)}`);
+          } catch {
+            // Rejected, as every one of these must be: each holds a second statement after the noise.
+          }
+        }
+      }
+      expect(checked).toBe(ITERATIONS);
+      // The generator must hit the fault: without the guard the parser reads many of these as one statement.
+      expect(parserSawOneStatement).toBeGreaterThan(100);
+      expect(accepted.length).toBe(0);
+    });
+
+    it("accepts the same noise when it is well formed and nothing follows it", () => {
+      const random = seededRandom(0xfeed);
+      for (let i = 0; i < ITERATIONS; i += 1) {
+        const clean = noise(random, WELL_FORMED_ATOMS, 1 + Math.floor(random() * 70)).replaceAll("'", "");
+        expect(() => validatePluginRuntimeQuery(`SELECT id FROM plugin_x.t WHERE n = '${clean}'`, "plugin_x")).not.toThrow();
+        expect(() => validatePluginRuntimeExecute(`INSERT INTO plugin_x.t (n) VALUES ('${clean}')`, "plugin_x")).not.toThrow();
+        expect(() => validatePluginMigrationStatement(`COMMENT ON TABLE plugin_x.a IS '${clean}'`, "plugin_x")).not.toThrow();
+        expect(splitPluginMigrationSql(`COMMENT ON TABLE plugin_x.a IS '${clean}';\nCOMMENT ON TABLE plugin_x.b IS 'x'`)).toHaveLength(2);
+      }
+    });
+  });
+});

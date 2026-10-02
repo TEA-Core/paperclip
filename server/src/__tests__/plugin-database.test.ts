@@ -877,6 +877,51 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(migration?.status).toBe("failed");
   });
 
+  it("rejects a query and an execute that hide a statement behind unpaired surrogates, and leaves core data alone", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY, body text);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "TST",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Original",
+      status: "todo",
+      priority: "medium",
+      identifier: "TST-1",
+    });
+    const pluginDb = pluginDatabaseService(db);
+    await pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot);
+    // The parser's input buffer comes out one byte short per unpaired surrogate, so the text after
+    // this many of them is never parsed, but the driver still sends it to the server.
+    const tail = "; DELETE FROM public.issues ";
+    const padding = String.fromCharCode(0xd800).repeat(tail.length);
+
+    await expect(
+      pluginDb.query(pluginId, `SELECT id FROM ${namespace}.notes WHERE body = '${padding}'${tail}`),
+    ).rejects.toThrow(/unpaired UTF-16 surrogate/);
+    await expect(
+      pluginDb.execute(pluginId, `INSERT INTO ${namespace}.notes (id, body) VALUES ('${randomUUID()}', '${padding}')${tail}`),
+    ).rejects.toThrow(/unpaired UTF-16 surrogate/);
+
+    const remaining = await db.select({ title: issues.title }).from(issues);
+    expect(remaining).toEqual([{ title: "Original" }]);
+    const notes = Array.from(
+      (await db.execute(sql.raw(`SELECT id FROM ${namespace}.notes`))) as Iterable<{ id: string }>,
+    );
+    expect(notes).toEqual([]);
+  });
+
   it("validates a statement that follows a dollar-quote end and runs nothing from that statement on", async () => {
     const pluginManifest = manifest();
     const namespace = derivePluginDatabaseNamespace(pluginManifest.id);

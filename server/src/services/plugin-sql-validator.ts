@@ -141,6 +141,39 @@ function isNode(value: unknown): value is AstNode {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasUnpairedSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      i += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The byte count libpg-query's WASM wrapper allocates for a query string (emscripten lengthBytesUTF8). */
+function parserInputByteLength(text: string): number {
+  let length = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x7f) {
+      length += 1;
+    } else if (code <= 0x7ff) {
+      length += 2;
+    } else if (code >= 0xd800 && code <= 0xdfff) {
+      length += 4;
+      i += 1;
+    } else {
+      length += 3;
+    }
+  }
+  return length;
+}
+
 function parseRawStatements(sqlText: string): RawStatement[] {
   const active = parser;
   if (!active) {
@@ -150,6 +183,18 @@ function parseRawStatements(sqlText: string): RawStatement[] {
   // A NUL never parses.
   if (sqlText.includes("\u0000")) {
     throw new Error("Plugin SQL does not parse: it contains a NUL character");
+  }
+  // libpg-query sizes its input buffer by counting every UTF-16 surrogate as four bytes and
+  // skipping the next unit, but it writes an unpaired surrogate as three bytes. The buffer comes
+  // out short and the end of the text is silently never parsed, while the driver sends all of it
+  // to the server. Text that is not well-formed UTF-16 never parses.
+  if (hasUnpairedSurrogate(sqlText)) {
+    throw new Error("Plugin SQL does not parse: it contains an unpaired UTF-16 surrogate");
+  }
+  // Defense in depth: the byte count the parser's wrapper allocates must equal the real UTF-8
+  // length, or part of the text would go unparsed. Fail closed if the two ever differ.
+  if (parserInputByteLength(sqlText) !== Buffer.byteLength(sqlText, "utf8")) {
+    throw new Error("Plugin SQL does not parse: encoding mismatch");
   }
   let tree: { stmts?: RawStatement[] };
   try {
