@@ -416,3 +416,146 @@ describe("OpenCode local skillIsolation=desired-only", () => {
   });
 });
 
+describe("OpenCode local exposure line names the exposed skills (PR-6 c)", () => {
+  async function runAndCaptureLogs(input: {
+    root: string;
+    runId: string;
+    configuredHome: string;
+    extraConfig: Record<string, unknown>;
+  }): Promise<string[]> {
+    const workspace = path.join(input.root, "workspace");
+    const commandPath = path.join(input.root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValueOnce(probeResult({
+      stdout: JSON.stringify({ type: "text", sessionID: `session-${input.runId}`, part: { text: "done" } }),
+    }));
+    const logs: string[] = [];
+    const result = await execute({
+      runId: input.runId,
+      agent: {
+        id: "agent-exposure",
+        companyId: "company-1",
+        name: "OpenCode Coder",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: commandPath,
+        cwd: workspace,
+        model: "openai/gpt-5",
+        env: { HOME: input.configuredHome, OPENCODE_ALLOW_ALL_MODELS: "1" },
+        promptTemplate: "Do the thing.",
+        ...input.extraConfig,
+      },
+      context: {},
+      authToken: "run-jwt-token",
+      onLog: async (_stream: string, chunk: string) => {
+        logs.push(chunk);
+      },
+    } as never);
+    expect(result.exitCode).toBe(0);
+    return logs;
+  }
+
+  function exposureLines(logs: string[]): string[] {
+    return logs.filter((chunk) => chunk.startsWith("[paperclip] skillIsolation=") && chunk.includes(" run exposes "));
+  }
+
+  it("(4) lists every entry of the shared skills home, peers' links and real directories included", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-exposure-shared-"));
+    const configuredHome = path.join(root, "configured-home");
+    const skillsHome = path.join(configuredHome, ".claude", "skills");
+    const skillAlpha = await createSkillDir(path.join(root, "src-alpha"), "alpha");
+    await fs.mkdir(skillsHome, { recursive: true });
+    await fs.symlink(await createSkillDir(path.join(root, "src-peer"), "peer"), path.join(skillsHome, "peer"));
+    await createSkillDir(skillsHome, "real-dir-skill");
+    const previousHome = process.env.HOME;
+    process.env.HOME = path.join(root, "process-home");
+    try {
+      const logs = await runAndCaptureLogs({
+        root,
+        runId: "run-exposure-shared",
+        configuredHome,
+        extraConfig: {
+          paperclipRuntimeSkills: [{ key: "pc/alpha", runtimeName: "alpha", source: skillAlpha }],
+          paperclipSkillSync: { desiredSkills: ["pc/alpha"] },
+        },
+      });
+      expect(exposureLines(logs)).toEqual([
+        `[paperclip] skillIsolation=shared: run exposes 3 skill(s) via shared skills home ${skillsHome} names=alpha,peer,real-dir-skill\n`,
+      ]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("(4b) lists only the desired skills for a desired-only run", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-exposure-desired-"));
+    const configuredHome = path.join(root, "configured-home");
+    const skillAlpha = await createSkillDir(path.join(root, "src-alpha"), "alpha");
+    const skillBeta = await createSkillDir(path.join(root, "src-beta"), "beta");
+    await fs.mkdir(path.join(configuredHome, ".claude", "skills"), { recursive: true });
+    await fs.symlink(skillBeta, path.join(configuredHome, ".claude", "skills", "beta"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = path.join(root, "process-home");
+    try {
+      const logs = await runAndCaptureLogs({
+        root,
+        runId: "run-exposure-desired",
+        configuredHome,
+        extraConfig: {
+          skillIsolation: "desired-only",
+          paperclipRuntimeSkills: [
+            { key: "pc/alpha", runtimeName: "alpha", source: skillAlpha },
+            { key: "pc/beta", runtimeName: "beta", source: skillBeta },
+          ],
+          paperclipSkillSync: { desiredSkills: ["pc/alpha"] },
+        },
+      });
+      const isolatedHome = childEnvFor("run-exposure-desired").HOME;
+      expect(exposureLines(logs)).toEqual([
+        `[paperclip] skillIsolation=desired-only: run exposes 1 skill(s) via per-run HOME ${isolatedHome} names=alpha\n`,
+      ]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // chmod cannot hide a directory from root, so this case runs only as a normal user.
+  it.skipIf(process.getuid?.() === 0)("(4c) prints an empty list when the shared skills home cannot be read", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-exposure-unreadable-"));
+    const configuredHome = path.join(root, "configured-home");
+    const skillsHome = path.join(configuredHome, ".claude", "skills");
+    await createSkillDir(skillsHome, "real-dir-skill");
+    await fs.chmod(skillsHome, 0o000);
+    const previousHome = process.env.HOME;
+    process.env.HOME = path.join(root, "process-home");
+    try {
+      const logs = await runAndCaptureLogs({
+        root,
+        runId: "run-exposure-unreadable",
+        configuredHome,
+        extraConfig: {
+          paperclipRuntimeSkills: [],
+          paperclipSkillSync: { desiredSkills: [] },
+        },
+      });
+      expect(exposureLines(logs)).toEqual([
+        `[paperclip] skillIsolation=shared: run exposes 0 skill(s) via shared skills home ${skillsHome} names=\n`,
+      ]);
+    } finally {
+      await fs.chmod(skillsHome, 0o755);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
