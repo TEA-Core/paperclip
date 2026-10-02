@@ -922,19 +922,19 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(notes).toEqual([]);
   });
 
-  it("records a failed migration when the migration file is over 16 MiB", async () => {
+  it("records a failed migration when the migration file is over 1 MiB", async () => {
     const pluginManifest = manifest();
     const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
     const statement = `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`;
     const packageRoot = await createPluginPackage(
       pluginManifest,
-      `-- ${"a".repeat(16 * 1024 * 1024)}\n${statement}`,
+      `-- ${"a".repeat(1024 * 1024)}\n${statement}`,
     );
     const pluginId = await installPluginRecord(pluginManifest);
 
     await expect(
       pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
-    ).rejects.toThrow(/input exceeds 16 MiB/);
+    ).rejects.toThrow(/input exceeds 1 MiB/);
 
     const [migration] = await db
       .select()

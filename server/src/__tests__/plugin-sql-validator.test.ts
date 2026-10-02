@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { parseSync } from "libpg-query";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { PluginDatabaseCoreReadTable } from "@paperclipai/shared";
@@ -8,6 +9,7 @@ import {
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
 } from "../services/plugin-database.js";
+import { stripSqlForKeywordScan } from "../services/plugin-sql-validator.js";
 
 beforeAll(async () => {
   await loadPluginSqlParser();
@@ -1043,10 +1045,10 @@ describe("plugin SQL validator: unpaired UTF-16 surrogates", () => {
 });
 
 describe("plugin SQL validator: input size", () => {
-  // libpg-query mallocs a buffer for the whole text without checking the result. A text past about
-  // 1 GiB makes that fail, and every later parse in the process then fails too. The validators cap
-  // the text well below that, before it reaches the parser.
-  const MAX_BYTES = 16 * 1024 * 1024;
+  // The parser's WASM heap stops at 1 GiB, and its parse tree and JSON output take up to about 220
+  // times the input (a column list of single letters). Past the heap the parser dies with a
+  // PostgreSQL FATAL. The validators cap the text at 1 MiB, before it reaches the parser.
+  const MAX_BYTES = 1024 * 1024;
   const THREE_BYTE = String.fromCharCode(0x65e5);
   const FOUR_BYTE = String.fromCharCode(0xd83d, 0xde80);
 
@@ -1071,21 +1073,21 @@ describe("plugin SQL validator: input size", () => {
   ];
   const combos = statements.flatMap((statement) => units.map((unit) => ({ ...statement, ...unit })));
 
-  it.each(combos)("parses a $target of exactly 16 MiB made of $name", ({ prefix, suffix, unit, run }) => {
+  it.each(combos)("parses a $target of exactly 1 MiB made of $name", ({ prefix, suffix, unit, run }) => {
     expect(() => run(padded(prefix, suffix, unit, MAX_BYTES))).not.toThrow();
   });
 
-  it.each(combos)("rejects a $target one byte over 16 MiB made of $name", ({ prefix, suffix, unit, run }) => {
-    expect(() => run(padded(prefix, suffix, unit, MAX_BYTES + 1))).toThrow(/does not parse: input exceeds 16 MiB/);
+  it.each(combos)("rejects a $target one byte over 1 MiB made of $name", ({ prefix, suffix, unit, run }) => {
+    expect(() => run(padded(prefix, suffix, unit, MAX_BYTES + 1))).toThrow(/does not parse: input exceeds 1 MiB/);
   });
 
   it("counts UTF-8 bytes, not characters: a text with fewer characters than the cap is still over it", () => {
     const text = padded("SELECT id FROM plugin_x.t WHERE n = '", "'", THREE_BYTE, MAX_BYTES + 3);
     expect(text.length).toBeLessThan(MAX_BYTES);
-    expect(() => validatePluginRuntimeQuery(text, "plugin_x")).toThrow(/input exceeds 16 MiB/);
+    expect(() => validatePluginRuntimeQuery(text, "plugin_x")).toThrow(/input exceeds 1 MiB/);
     const pairs = padded("SELECT id FROM plugin_x.t WHERE n = '", "'", FOUR_BYTE, MAX_BYTES + 4);
     expect(pairs.length).toBeLessThan(MAX_BYTES);
-    expect(() => validatePluginRuntimeQuery(pairs, "plugin_x")).toThrow(/input exceeds 16 MiB/);
+    expect(() => validatePluginRuntimeQuery(pairs, "plugin_x")).toThrow(/input exceeds 1 MiB/);
   });
 
   it("applies the cap to a whole migration file, however many statements it holds", () => {
@@ -1093,16 +1095,529 @@ describe("plugin SQL validator: input size", () => {
     const atCap = padded("-- ", "\n" + statement, "a", MAX_BYTES);
     expect(splitPluginMigrationSql(atCap)).toHaveLength(1);
     const overCap = padded("-- ", "\n" + statement, "a", MAX_BYTES + 1);
-    expect(() => splitPluginMigrationSql(overCap)).toThrow(/does not parse: input exceeds 16 MiB/);
+    expect(() => splitPluginMigrationSql(overCap)).toThrow(/does not parse: input exceeds 1 MiB/);
     const manyStatements = statement.repeat(Math.ceil(MAX_BYTES / statement.length) + 1);
-    expect(() => splitPluginMigrationSql(manyStatements)).toThrow(/input exceeds 16 MiB/);
+    expect(() => splitPluginMigrationSql(manyStatements)).toThrow(/input exceeds 1 MiB/);
   });
 
   it("keeps parsing normally after it rejects an over-size text", () => {
     expect(() => validatePluginRuntimeQuery(padded("SELECT id FROM plugin_x.t WHERE n = '", "'", "a", MAX_BYTES + 1), "plugin_x")).toThrow(
-      /input exceeds 16 MiB/,
+      /input exceeds 1 MiB/,
     );
     expect(() => validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).not.toThrow();
     expect(splitPluginMigrationSql("CREATE TABLE plugin_x.t (id int);")).toEqual(["CREATE TABLE plugin_x.t (id int)"]);
+  });
+});
+
+describe("plugin SQL validator: parser faults", () => {
+  // A trap, an abort, a stack overflow or an exhausted heap stops the WASM parser in the middle of a
+  // parse. The memory that parse took is never freed, and a PostgreSQL FATAL also sets
+  // process.exitCode. The validator drops that instance and builds a new one on the next load.
+  const wasm = (globalThis as unknown as {
+    WebAssembly: { RuntimeError: ErrorConstructor; instantiate: (...args: unknown[]) => Promise<unknown> };
+  }).WebAssembly;
+  const SMALL = "SELECT id FROM plugin_x.t";
+
+  type Validator = typeof import("../services/plugin-sql-validator.js");
+  type Faulty = {
+    fresh: Validator;
+    failNextParse: (fault: () => never) => void;
+    mockedParses: () => number;
+    mockedLoads: () => number;
+  };
+
+  /** A fresh copy of the validator whose first parser is a wrapper that can be told to fail. */
+  async function withFaultyParser(run: (faulty: Faulty) => Promise<void>): Promise<void> {
+    vi.resetModules();
+    let pending: (() => never) | null = null;
+    let parses = 0;
+    let loads = 0;
+    vi.doMock("libpg-query", async (importOriginal) => {
+      const real = await importOriginal<typeof import("libpg-query")>();
+      return {
+        ...real,
+        loadModule: async () => {
+          loads += 1;
+          return real.loadModule();
+        },
+        parseSync: (text: string) => {
+          parses += 1;
+          const fault = pending;
+          pending = null;
+          if (fault) fault();
+          return real.parseSync(text);
+        },
+      };
+    });
+    const exitCodeBefore = process.exitCode;
+    try {
+      const fresh = await import("../services/plugin-sql-validator.js");
+      await fresh.loadPluginSqlParser();
+      await run({
+        fresh,
+        failNextParse: (fault) => {
+          pending = fault;
+        },
+        mockedParses: () => parses,
+        mockedLoads: () => loads,
+      });
+    } finally {
+      vi.doUnmock("libpg-query");
+      process.exitCode = exitCodeBefore;
+    }
+  }
+
+  const fatal = (): never => {
+    // What Emscripten does on a PostgreSQL FATAL: set the exit code, then throw a plain object.
+    process.exitCode = 1;
+    throw { name: "ExitStatus", message: "Program terminated with exit(1)", status: 1 };
+  };
+  const OUT_OF_MEMORY = /^Plugin SQL does not parse: parser out of memory$/;
+  const FAULTS: Array<{ name: string; fault: () => never; message: RegExp }> = [
+    { name: "a PostgreSQL FATAL (a thrown non-Error and a set exit code)", fault: fatal, message: OUT_OF_MEMORY },
+    {
+      name: "an Emscripten abort",
+      fault: () => {
+        throw new wasm.RuntimeError("Aborted(OOM)");
+      },
+      message: OUT_OF_MEMORY,
+    },
+    {
+      name: "an out-of-bounds memory access",
+      fault: () => {
+        throw new wasm.RuntimeError("memory access out of bounds");
+      },
+      message: OUT_OF_MEMORY,
+    },
+    {
+      name: "a failed allocation in the wrapper",
+      fault: () => {
+        throw new Error("Failed to allocate memory for parse result");
+      },
+      message: OUT_OF_MEMORY,
+    },
+    {
+      name: "a PostgreSQL out-of-memory error",
+      fault: () => {
+        throw new Error("out of memory");
+      },
+      message: OUT_OF_MEMORY,
+    },
+    {
+      name: "a stack overflow inside the parser",
+      fault: () => {
+        throw new RangeError("Maximum call stack size exceeded");
+      },
+      message: /^Plugin SQL does not parse: Maximum call stack size exceeded$/,
+    },
+    {
+      name: "any other WASM trap",
+      fault: () => {
+        throw new wasm.RuntimeError("null function or function signature mismatch");
+      },
+      message: /^Plugin SQL does not parse: null function or function signature mismatch$/,
+    },
+  ];
+
+  it.each(FAULTS)("drops the parser after $name and builds a new one on the next load", async ({ fault, message }) => {
+    await withFaultyParser(async ({ fresh, failNextParse, mockedParses, mockedLoads }) => {
+      process.exitCode = undefined;
+      failNextParse(fault);
+      expect(() => fresh.validatePluginRuntimeQuery(SMALL, "plugin_x")).toThrow(message);
+      expect(process.exitCode).toBeUndefined();
+      // The faulted instance is gone: nothing parses until the next load.
+      expect(() => fresh.validatePluginRuntimeQuery(SMALL, "plugin_x")).toThrow(/not loaded/);
+      const parsesAtFault = mockedParses();
+      await fresh.loadPluginSqlParser();
+      expect(() => fresh.validatePluginRuntimeQuery(SMALL, "plugin_x")).not.toThrow();
+      expect(() => fresh.validatePluginRuntimeExecute("INSERT INTO plugin_x.t (id) VALUES (1)", "plugin_x")).not.toThrow();
+      expect(fresh.splitPluginMigrationSql("CREATE TABLE plugin_x.a (id int); CREATE TABLE plugin_x.b (id int);")).toHaveLength(2);
+      // The new parser is a new WASM instance: neither the import that faulted nor a reload of it.
+      expect(mockedParses()).toBe(parsesAtFault);
+      expect(mockedLoads()).toBe(1);
+    });
+  });
+
+  const ENTRY_POINTS: Array<{ name: string; run: (validator: Validator) => unknown }> = [
+    { name: "runtime query", run: (validator) => validator.validatePluginRuntimeQuery(SMALL, "plugin_x") },
+    {
+      name: "runtime execute",
+      run: (validator) => validator.validatePluginRuntimeExecute("INSERT INTO plugin_x.t (id) VALUES (1)", "plugin_x"),
+    },
+    {
+      name: "migration statement",
+      run: (validator) => validator.validatePluginMigrationStatement("CREATE TABLE plugin_x.a (id int)", "plugin_x"),
+    },
+    { name: "migration split", run: (validator) => validator.splitPluginMigrationSql("CREATE TABLE plugin_x.a (id int);") },
+  ];
+
+  it.each(ENTRY_POINTS)("handles a fault the same way in the $name", async ({ run }) => {
+    await withFaultyParser(async ({ fresh, failNextParse }) => {
+      process.exitCode = undefined;
+      failNextParse(fatal);
+      expect(() => run(fresh)).toThrow(OUT_OF_MEMORY);
+      expect(process.exitCode).toBeUndefined();
+      expect(() => run(fresh)).toThrow(/not loaded/);
+      await fresh.loadPluginSqlParser();
+      expect(() => run(fresh)).not.toThrow();
+    });
+  });
+
+  it("puts back the exit code the process had before the fault", async () => {
+    await withFaultyParser(async ({ fresh, failNextParse }) => {
+      process.exitCode = 3;
+      failNextParse(fatal);
+      expect(() => fresh.validatePluginMigrationStatement("CREATE TABLE plugin_x.a (id int)", "plugin_x")).toThrow(OUT_OF_MEMORY);
+      expect(process.exitCode).toBe(3);
+    });
+  });
+
+  it("keeps the parser after an ordinary syntax error", async () => {
+    await withFaultyParser(async ({ fresh, mockedParses, mockedLoads }) => {
+      expect(() => fresh.validatePluginRuntimeQuery("SELECT FROM WHERE", "plugin_x")).toThrow(/does not parse: syntax error/);
+      const parsesBefore = mockedParses();
+      await fresh.loadPluginSqlParser();
+      expect(() => fresh.validatePluginRuntimeQuery(SMALL, "plugin_x")).not.toThrow();
+      expect(mockedParses()).toBe(parsesBefore + 1);
+      expect(mockedLoads()).toBe(1);
+    });
+  });
+
+  it("fails every later call at once, and logs once, when a new parser cannot be built", async () => {
+    await withFaultyParser(async ({ fresh, failNextParse }) => {
+      failNextParse(() => {
+        throw new wasm.RuntimeError("memory access out of bounds");
+      });
+      expect(() => fresh.validatePluginRuntimeQuery(SMALL, "plugin_x")).toThrow(OUT_OF_MEMORY);
+      const instantiate = vi.spyOn(wasm, "instantiate").mockRejectedValueOnce(new Error("wasm instantiate failed"));
+      const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const unavailable = /^Plugin SQL parser is unavailable \(restart required\)$/;
+        await expect(fresh.loadPluginSqlParser()).rejects.toThrow(unavailable);
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await expect(fresh.loadPluginSqlParser()).rejects.toThrow(unavailable);
+          for (const { run } of ENTRY_POINTS) {
+            expect(() => run(fresh)).toThrow(unavailable);
+          }
+        }
+        // No second attempt to build a parser, and one log line for the whole outage.
+        expect(instantiate).toHaveBeenCalledTimes(1);
+        const ours = logged.mock.calls.filter((args) => String(args[0]).includes("restart required"));
+        expect(ours).toHaveLength(1);
+        expect(String(ours[0]![0])).toMatch(/wasm instantiate failed/);
+      } finally {
+        instantiate.mockRestore();
+        logged.mockRestore();
+      }
+    });
+  });
+});
+
+describe("plugin SQL validator: fresh process", () => {
+  // Each case runs in a new Node process, so the parser's WASM heap starts empty, as on a server that
+  // has just started. A fault shows up as a PostgreSQL FATAL on stderr, a non-zero exit code or a
+  // parser that no longer parses.
+  const VALIDATOR_URL = new URL("../services/plugin-sql-validator.ts", import.meta.url).href;
+  const MAX_BYTES = 1024 * 1024;
+  const FRESH_PROCESS_TIMEOUT_MS = 120_000;
+
+  function runInFreshProcess(body: string): Record<string, unknown> {
+    const script = [
+      `const v = await import(${JSON.stringify(VALIDATOR_URL)});`,
+      "await v.loadPluginSqlParser();",
+      "const report = {};",
+      "const message = (error) => String(error?.message ?? error);",
+      body,
+      "await v.loadPluginSqlParser();",
+      "try { v.validatePluginRuntimeQuery('SELECT id FROM plugin_x.t', 'plugin_x'); report.small = 'accepted'; } catch (error) { report.small = message(error); }",
+      "report.exitCode = String(process.exitCode);",
+      "process.stdout.write(JSON.stringify(report));",
+    ].join("\n");
+    const env = { ...process.env };
+    delete env.NODE_OPTIONS;
+    const result = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "--eval", script], {
+      encoding: "utf8",
+      env,
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: FRESH_PROCESS_TIMEOUT_MS,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).not.toMatch(/FATAL|out of memory/i);
+    expect(result.status).toBe(0);
+    return JSON.parse(result.stdout) as Record<string, unknown>;
+  }
+
+  // The five shapes with the largest parse tree per input byte that review measured. Without a cap,
+  // each fails in a fresh process at the size given (the 1 GiB WASM heap runs out).
+  const SHAPES = [
+    { name: "a column list (fails at about 4.6 MiB)", head: "SELECT ", unit: "a,", tail: "a FROM plugin_x.t", run: "(s) => v.validatePluginRuntimeQuery(s, 'plugin_x')" },
+    { name: "a star list (fails at about 5.0 MiB)", head: "SELECT ", unit: "*,", tail: "* FROM plugin_x.t", run: "(s) => v.validatePluginRuntimeQuery(s, 'plugin_x')" },
+    { name: "a qualified column list (fails at about 7.4 MiB)", head: "SELECT ", unit: "a.b,", tail: "a.b FROM plugin_x.t", run: "(s) => v.validatePluginRuntimeQuery(s, 'plugin_x')" },
+    { name: "a file of SELECT 1 statements (fails at about 9.6 MiB)", head: "", unit: "SELECT 1;", tail: "", run: "(s) => v.splitPluginMigrationSql(s)" },
+    {
+      name: "a VALUES list (fails at about 13.3 MiB)",
+      head: "INSERT INTO plugin_x.t (n) VALUES ",
+      unit: "(1),",
+      tail: "(1)",
+      run: "(s) => { v.validatePluginMigrationStatement(s, 'plugin_x'); v.splitPluginMigrationSql(s); }",
+    },
+  ];
+
+  it.each(SHAPES)(
+    "parses $name of exactly 1 MiB and keeps parsing afterwards",
+    ({ head, unit, tail, run }) => {
+      const report = runInFreshProcess(
+        [
+          `const head = ${JSON.stringify(head)}, unit = ${JSON.stringify(unit)}, tail = ${JSON.stringify(tail)};`,
+          `const room = ${MAX_BYTES} - Buffer.byteLength(head) - Buffer.byteLength(tail);`,
+          "const text = head + unit.repeat(Math.floor(room / unit.length)) + ' '.repeat(room % unit.length) + tail;",
+          "report.bytes = Buffer.byteLength(text);",
+          "const externalBefore = process.memoryUsage().external;",
+          `try { (${run})(text); report.big = 'accepted'; } catch (error) { report.big = message(error); }`,
+          "report.heapGrowthMiB = Math.round((process.memoryUsage().external - externalBefore) / 1048576);",
+        ].join("\n"),
+      );
+      expect(report.bytes).toBe(MAX_BYTES);
+      expect(report.big).toBe("accepted");
+      expect(report.small).toBe("accepted");
+      expect(report.exitCode).toBe("undefined");
+      // The WASM heap stops at 1 GiB; the worst shape at the cap must stay well inside it.
+      expect(report.heapGrowthMiB).toBeLessThan(512);
+    },
+    FRESH_PROCESS_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps parsing after 80 statements in a row that overflow the parser's stack",
+    () => {
+      // Each overflow abandons a parse whose memory is never freed. On one WASM instance about 50 of
+      // these exhaust the heap, and from then on every parse fails.
+      const report = runInFreshProcess(
+        [
+          "const deep = 'SELECT ' + '1+'.repeat(100000) + '1';",
+          "report.outcomes = {};",
+          "for (let i = 0; i < 80; i += 1) {",
+          "  await v.loadPluginSqlParser();",
+          "  let outcome;",
+          "  try { v.validatePluginRuntimeQuery(deep, 'plugin_x'); outcome = 'accepted'; } catch (error) { outcome = message(error); }",
+          "  report.outcomes[outcome] = (report.outcomes[outcome] ?? 0) + 1;",
+          "}",
+          // Count only what is still referenced: a dropped instance is freed by the next collection.
+          "for (let i = 0; i < 3; i += 1) { globalThis.gc(); await new Promise((resolve) => setTimeout(resolve, 50)); }",
+          "report.heapMiB = Math.round(process.memoryUsage().external / 1048576);",
+        ].join("\n"),
+      );
+      expect(report.outcomes).toEqual({ "Plugin SQL does not parse: Maximum call stack size exceeded": 80 });
+      expect(report.small).toBe("accepted");
+      expect(report.exitCode).toBe("undefined");
+      expect(report.heapMiB).toBeLessThan(512);
+    },
+    FRESH_PROCESS_TIMEOUT_MS,
+  );
+});
+
+describe("plugin SQL validator: keyword scan", () => {
+  // The keyword scan removes comments and empties quoted text before it looks for banned keywords.
+  // It reads the text once, left to right, like PostgreSQL's lexer. This is the code it replaced:
+  // four regular expressions run one after another. The comment pattern was quadratic on many
+  // unterminated comment openers, and none of them knew about dollar quotes, nesting or escapes.
+  function regexStrip(input: string): string {
+    return input
+      .replace(/'[^']*(?:''[^']*)*'/g, "''")
+      .replace(/"[^"]*(?:""[^"]*)*"/g, '""')
+      .replace(/--.*$/gm, "")
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+  }
+
+  function seededRandom(seed: number) {
+    let state = seed >>> 0;
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const pick = <T,>(random: () => number, items: readonly T[]): T => items[Math.floor(random() * items.length)]!;
+  function fill(random: () => number, atoms: readonly string[], max: number): string {
+    let out = "";
+    const count = Math.floor(random() * max);
+    for (let i = 0; i < count; i += 1) out += pick(random, atoms);
+    return out;
+  }
+
+  const ROCKET = String.fromCharCode(0xd83d, 0xde80);
+  const LINE_SEPARATOR = String.fromCharCode(0x2028);
+  const WORDS = ["select", "grant", "copy", "call", "create", "a", "x1", "t_2", "plugin_x", "ñandú", "日本", "a$b", "do", "U"];
+  const CODE = [";", ",", "(", ")", "+", "=", "<>", ".", "::", "*", "%", "&", "1", "42", "3.5", "$1", "[", "]"];
+  const SPACE = [" ", "  ", "\t", "\n", "\r\n"];
+  const TEXT = ["a", " ", "grant", "copy", ";", "1", "日", ROCKET, "\n", "\t", "x y", ","];
+
+  /**
+   * One token of SQL that the old regular expressions read the same way PostgreSQL does. They read
+   * every single quote first, then every double quote, then line comments, then block comments, so a
+   * construct may hold only the marks that a later pass, or none, looks at. Every construct is closed.
+   */
+  function token(random: () => number): string {
+    switch (Math.floor(random() * 10)) {
+      case 0:
+        return pick(random, WORDS);
+      case 1:
+        return pick(random, CODE);
+      case 2:
+      case 3:
+        return pick(random, SPACE);
+      case 4:
+        return `'${fill(random, [...TEXT, '"', "''", "--", "/*", "*/", "$$", "$t$", "\\", "-", "/", "*"], 8)}'`;
+      case 5:
+        // No backslash: the regular expressions do not know E'' escapes.
+        return `E'${fill(random, [...TEXT, '"', "''", "--", "/*", "*/", "$$"], 8)}'`;
+      case 6:
+        return `"${fill(random, [...TEXT, '""', "--", "/*", "*/", "$$", "\\", "-", "/", "*"], 8)}"`;
+      case 7:
+        return `--${fill(random, [...TEXT.filter((atom) => atom !== "\n"), "--", "/*", "*/", "$$", "-", "\\"], 8)}${pick(random, ["\n", "\r\n"])}`;
+      case 8:
+        // No slash (it could open a nested comment) and no dash (it could start a line comment).
+        return `/*${fill(random, [...TEXT, "$$", "*", "\\"], 8)}*/`;
+      default: {
+        const tag = pick(random, ["", "t", "a1", "日"]);
+        return `$${tag}$${fill(random, [...TEXT, "\\", "*"], 8)}$${tag}$`;
+      }
+    }
+  }
+
+  /** Joins tokens, with a space where two of them would otherwise merge into one PostgreSQL token. */
+  function statement(random: () => number): string {
+    let out = "";
+    let previous = "";
+    const count = 1 + Math.floor(random() * 24);
+    for (let i = 0; i < count; i += 1) {
+      const next = token(random);
+      const last = out.at(-1) ?? " ";
+      const merges =
+        // Words and numbers run together, and an identifier swallows a following dollar sign.
+        (/^[\p{L}\p{N}_$]/u.test(next) && /[\p{L}\p{N}_$]/u.test(last)) ||
+        // A quote right after an E'' string continues it, with backslash escapes; and a word that
+        // is only E or e would start an escape string.
+        (next.startsWith("'") && (previous.startsWith("E'") || /(^|[^\p{L}\p{N}_$])[eE]$/u.test(out)));
+      out += merges ? ` ${next}` : next;
+      previous = next;
+    }
+    return out;
+  }
+
+  it("matches the old regular expressions on every text they read correctly", () => {
+    const random = seededRandom(0x5ca1ab1e);
+    const mismatches: string[] = [];
+    let changed = 0;
+    for (let i = 0; i < 20000; i += 1) {
+      const text = statement(random);
+      const expected = regexStrip(text);
+      if (expected !== text) changed += 1;
+      if (stripSqlForKeywordScan(text) !== expected && mismatches.length < 5) mismatches.push(JSON.stringify(text));
+    }
+    expect(mismatches).toEqual([]);
+    // Most generated texts hold something to remove, so the comparison is not vacuous.
+    expect(changed).toBeGreaterThan(15000);
+  });
+
+  // Where the old expressions misread the text, the scan follows PostgreSQL's lexer instead.
+  const LEXER_CASES: Array<{ name: string; text: string; expected: string }> = [
+    { name: "a nested block comment", text: "a /* x /* y */ grant */ b", expected: "a  b" },
+    { name: "an escaped quote in an E'' string", text: "a E'x\\' grant ' b", expected: "a E'' b" },
+    { name: "an E'' string right after a dollar quote", text: "$$x$$E'\\' grant ' b", expected: "$$x$$E'' b" },
+    { name: "a backslash in a standard string", text: "a 'x\\' b 'y'", expected: "a '' b ''" },
+    { name: "a word that ends in e before a string", text: "type'x\\' grant", expected: "type'' grant" },
+    { name: "a single quote in a line comment", text: "a -- it's\ngrant 'x'", expected: "a \ngrant ''" },
+    { name: "a single quote in a block comment", text: "a /* it's */ grant 'x'", expected: "a  grant ''" },
+    { name: "a double quote in a line comment", text: 'a -- say "hi\nb', expected: "a \nb" },
+    { name: "a line comment opener in a block comment", text: "a /* -- */ grant", expected: "a  grant" },
+    { name: "a comment opener in a dollar quote", text: "a $$ /* $$ grant /* */ b", expected: "a $$ /* $$ grant  b" },
+    { name: "a line comment opener in a dollar quote", text: "a $t$ -- x $t$ grant", expected: "a $t$ -- x $t$ grant" },
+    { name: "a single quote in a dollar quote", text: "a $$ it's $$ grant 'x'", expected: "a $$ it's $$ grant ''" },
+    { name: "dollar signs inside an identifier", text: "a$$ grant", expected: "a$$ grant" },
+    { name: "a line comment that ends at a carriage return", text: "a -- x\rgrant", expected: "a \rgrant" },
+    { name: "a Unicode line separator in a line comment", text: `a -- x${LINE_SEPARATOR}grant\nb`, expected: "a \nb" },
+  ];
+
+  it.each(LEXER_CASES)("reads $name as PostgreSQL does", ({ text, expected }) => {
+    expect(stripSqlForKeywordScan(text)).toBe(expected);
+  });
+
+  it("accepts keywords that PostgreSQL reads as comment or string text", () => {
+    expect(() => validatePluginRuntimeQuery("SELECT id FROM plugin_x.t /* a /* b */ grant */", "plugin_x")).not.toThrow();
+    expect(() => validatePluginRuntimeQuery("SELECT id FROM plugin_x.t WHERE n = E'\\' grant '", "plugin_x")).not.toThrow();
+    expect(() => validatePluginMigrationStatement("COMMENT ON TABLE plugin_x.a IS E'\\' revoke '", "plugin_x")).not.toThrow();
+  });
+
+  it("still reads a dollar-quoted body as text to scan, as before", () => {
+    expect(() => validatePluginMigrationStatement("COMMENT ON TABLE plugin_x.a IS $$ grant $$", "plugin_x")).toThrow(
+      /disallowed statement or clause/,
+    );
+    expect(() => validatePluginMigrationStatement("COMMENT ON TABLE plugin_x.a IS $t$ it's grant $t$", "plugin_x")).toThrow(
+      /disallowed statement or clause/,
+    );
+  });
+
+  // Inputs that made the old expressions slow (a comment opener scanned to the end of the text, once
+  // per opener) or overflow the stack. Each is exactly 1 MiB, the size cap.
+  const CAP = 1024 * 1024;
+  function exactly(prefix: string, unit: string, suffix: string): string {
+    const room = CAP - Buffer.byteLength(prefix) - Buffer.byteLength(suffix);
+    const text = prefix + " ".repeat(room % unit.length) + unit.repeat(Math.floor(room / unit.length)) + suffix;
+    expect(Buffer.byteLength(text)).toBe(CAP);
+    return text;
+  }
+  const BUDGET_MS = 500;
+
+  const SCAN_ONLY = [
+    { name: "unterminated comment openers", text: () => exactly("", "/*", "") },
+    { name: "comment openers inside a dollar quote", text: () => exactly("$$", "/*", "$$") },
+    { name: "comment openers and letters inside a dollar quote", text: () => exactly("$$", "/*a", "$$") },
+    { name: "comment closers", text: () => exactly("", "*/", "") },
+    { name: "line comment openers", text: () => exactly("", "--", "") },
+    { name: "single quotes", text: () => exactly("", "'", "") },
+    { name: "doubled single quotes", text: () => exactly("'", "''", "'") },
+    { name: "double quotes", text: () => exactly("", '"', "") },
+    { name: "backslashes in an E'' string", text: () => exactly("E'", "\\", "'") },
+    { name: "dollar signs", text: () => exactly("", "$", "") },
+    { name: "dollar tags that never close", text: () => exactly("", "$a", "") },
+  ];
+
+  it.each(SCAN_ONLY)("scans 1 MiB of $name in linear time", ({ text }) => {
+    const input = text();
+    const started = performance.now();
+    expect(() => stripSqlForKeywordScan(input)).not.toThrow();
+    expect(performance.now() - started).toBeLessThan(BUDGET_MS);
+  });
+
+  const THROUGH_VALIDATOR = [
+    {
+      name: "comment openers inside a dollar quote",
+      run: () => validatePluginRuntimeQuery(exactly("SELECT id FROM plugin_x.t WHERE n = $$", "/*", "$$"), "plugin_x"),
+    },
+    {
+      name: "comment openers and letters inside a dollar quote",
+      run: () => validatePluginMigrationStatement(exactly("COMMENT ON TABLE plugin_x.a IS $$", "/*a", "$$"), "plugin_x"),
+    },
+    {
+      name: "a string literal of doubled quotes",
+      run: () => validatePluginRuntimeQuery(exactly("SELECT id FROM plugin_x.t WHERE n = '", "''", "'"), "plugin_x"),
+    },
+    {
+      name: "a string literal of quotes and letters",
+      run: () => validatePluginRuntimeExecute(exactly("INSERT INTO plugin_x.t (n) VALUES ('", "a''", "a')"), "plugin_x"),
+    },
+    {
+      name: "a quoted identifier of doubled quotes",
+      run: () => validatePluginRuntimeQuery(exactly('SELECT id AS "', '""', '" FROM plugin_x.t'), "plugin_x"),
+    },
+  ];
+
+  it.each(THROUGH_VALIDATOR)("validates 1 MiB of $name within the time budget", ({ run }) => {
+    const started = performance.now();
+    expect(run).not.toThrow();
+    expect(performance.now() - started).toBeLessThan(BUDGET_MS);
   });
 });

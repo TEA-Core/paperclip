@@ -6,12 +6,16 @@
  * read whitelist. The parser sees whitespace, comments, quoting and case folding
  * exactly as the database does.
  *
- * This module is pure. It imports only `libpg-query`, so a plugin repository can
- * copy it byte for byte to run the same checks in its own tests.
+ * This module is pure. It imports only `libpg-query` and Node built-ins, so a plugin
+ * repository can copy it byte for byte to run the same checks in its own tests.
  *
- * Call `loadPluginSqlParser()` once before any validator. The validators are
- * synchronous and reject every statement while the parser is not loaded.
+ * Call `loadPluginSqlParser()` before any validator. The validators are synchronous
+ * and reject every statement while the parser is not loaded. A parser that faults
+ * (see `isParserFault`) is dropped, and the next `loadPluginSqlParser()` builds a new one.
  */
+
+import { createRequire } from "node:module";
+import { dirname } from "node:path";
 
 type PgQueryParser = Pick<typeof import("libpg-query"), "loadModule" | "parseSync">;
 type AstNode = { [key: string]: unknown };
@@ -109,34 +113,98 @@ const DISALLOWED_FUNCTION_PATTERNS = [
   "pg_replication_slot_advance",
 ];
 const DISALLOWED_FUNCTION_RE = new RegExp(`^(?:${DISALLOWED_FUNCTION_PATTERNS.join("|")})$`);
-/** The largest text, in UTF-8 bytes, that the validators and the migration split hand to the parser. */
-const MAX_PLUGIN_SQL_BYTES = 16 * 1024 * 1024;
+/**
+ * The largest text, in UTF-8 bytes, that the validators and the migration split hand to the parser.
+ * The parser's WASM heap stops at 1 GiB, and its parse tree plus JSON output take up to about 220
+ * times the input (a column list such as `SELECT a,a,...`, which runs out at about 4.6 MiB). At
+ * 1 MiB the worst measured shape uses about 160 MiB of that heap.
+ */
+const MAX_PLUGIN_SQL_BYTES = 1024 * 1024;
 const RUNTIME_STATEMENT_COUNT_ERROR = "Plugin runtime SQL must contain exactly one statement";
 const MIGRATION_STATEMENT_COUNT_ERROR = "Plugin migration statement must contain exactly one statement";
+const PARSER_NOT_LOADED_ERROR = "Plugin SQL parser is not loaded; call loadPluginSqlParser() first";
+const PARSER_UNAVAILABLE_ERROR = "Plugin SQL parser is unavailable (restart required)";
+const PARSER_OUT_OF_MEMORY = /out of memory|Aborted|memory access out of bounds|Failed to allocate/i;
 
 let parser: PgQueryParser | null = null;
 let parserLoading: Promise<void> | null = null;
+/** How many parsers faulted. After the first fault every load builds a new WASM instance. */
+let parserFaults = 0;
+/** Set when a new parser could not be built after a fault. Every later call then fails at once. */
+let parserUnavailable = false;
 
 /**
- * Loads the WASM parser once. Safe to call many times and from many callers.
- * The import is dynamic: libpg-query starts its WASM build when it is imported, so
- * a server that never runs plugin SQL never pays for it, and a failed load rejects
- * only this promise.
+ * Loads the WASM parser. Safe to call many times and from many callers; concurrent
+ * callers share one load. The first import is dynamic: libpg-query starts its WASM
+ * build when it is imported, so a server that never runs plugin SQL never pays for
+ * it, and a failed first load rejects only this promise (the next call retries).
+ * After a parser fault the load builds a new WASM instance instead; if that fails,
+ * the parser stays unavailable until the process restarts.
  */
 export function loadPluginSqlParser(): Promise<void> {
+  if (parserUnavailable) return Promise.reject(new Error(PARSER_UNAVAILABLE_ERROR));
   if (parser) return Promise.resolve();
   if (!parserLoading) {
-    parserLoading = import("libpg-query")
+    const rebuild = parserFaults > 0;
+    parserLoading = (rebuild ? requireNewParserInstance() : import("libpg-query"))
       .then(async (lib) => {
         await lib.loadModule();
         parser = lib;
       })
       .catch((error: unknown) => {
         parserLoading = null;
-        throw error;
+        if (!rebuild) throw error;
+        parserUnavailable = true;
+        console.error(`${PARSER_UNAVAILABLE_ERROR}: building a new parser after a fault failed: ${describeThrown(error)}`);
+        throw new Error(PARSER_UNAVAILABLE_ERROR);
       });
   }
   return parserLoading;
+}
+
+/**
+ * Evaluates libpg-query's package entry again, which builds a new WASM instance.
+ * libpg-query builds its instance once, when its entry is first evaluated, and keeps
+ * it for the life of that module. Removing the package's files from the CommonJS
+ * module cache makes `require` evaluate them again. The removal also drops the cache's
+ * hold on the old instance, so its memory is freed once nothing else refers to it.
+ * (The instance from the first, dynamic import stays referenced by the ESM loader.)
+ * It is async so that a failed require rejects the load instead of throwing from it.
+ */
+async function requireNewParserInstance(): Promise<PgQueryParser> {
+  const require = createRequire(import.meta.url);
+  const packageDir = dirname(require.resolve("libpg-query"));
+  for (const cached of Object.keys(require.cache)) {
+    if (dirname(cached) === packageDir) delete require.cache[cached];
+  }
+  return require("libpg-query") as PgQueryParser;
+}
+
+function describeThrown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Whether an error thrown by the parser means its WASM instance can no longer be trusted.
+ * A syntax error comes back as an ordinary error after PostgreSQL has cleaned up. These do not:
+ * - a thrown value that is not an Error: a PostgreSQL FATAL ends in Emscripten's exit(),
+ *   which throws an ExitStatus object (and sets process.exitCode)
+ * - a WebAssembly trap or Emscripten abort (a RuntimeError)
+ * - a stack overflow inside the WASM code (a RangeError), which abandons the parse and never
+ *   frees its memory; about 50 deeply nested statements of 200 KiB exhaust the heap
+ * - an exhausted heap or a failed allocation
+ */
+function isParserFault(error: unknown): boolean {
+  if (!(error instanceof Error)) return true;
+  if (error.name === "RuntimeError" || error.name === "RangeError") return true;
+  return PARSER_OUT_OF_MEMORY.test(error.message);
+}
+
+function dropFaultedParser(faulted: PgQueryParser): void {
+  if (parser !== faulted) return;
+  parser = null;
+  parserLoading = null;
+  parserFaults += 1;
 }
 
 function isNode(value: unknown): value is AstNode {
@@ -177,16 +245,14 @@ function parserInputByteLength(text: string): number {
 }
 
 function parseRawStatements(sqlText: string): RawStatement[] {
+  if (parserUnavailable) throw new Error(PARSER_UNAVAILABLE_ERROR);
   const active = parser;
-  if (!active) {
-    throw new Error("Plugin SQL parser is not loaded; call loadPluginSqlParser() first");
-  }
-  // libpg-query mallocs a buffer for the whole text and never checks the result. A text near
-  // 1 GiB makes that fail, and every later parse in the process then fails with it. Reject far
-  // below that, before the text reaches the parser.
+  if (!active) throw new Error(PARSER_NOT_LOADED_ERROR);
+  // A large text can exhaust the parser's 1 GiB WASM heap (see MAX_PLUGIN_SQL_BYTES), and
+  // libpg-query does not check its own malloc for the input copy. Reject before the parser.
   const byteLength = Buffer.byteLength(sqlText, "utf8");
   if (byteLength > MAX_PLUGIN_SQL_BYTES) {
-    throw new Error("Plugin SQL does not parse: input exceeds 16 MiB");
+    throw new Error("Plugin SQL does not parse: input exceeds 1 MiB");
   }
   // The parser stops reading at the first NUL, so text after one is neither validated nor split.
   // A NUL never parses.
@@ -206,11 +272,20 @@ function parseRawStatements(sqlText: string): RawStatement[] {
     throw new Error("Plugin SQL does not parse: encoding mismatch");
   }
   let tree: { stmts?: RawStatement[] };
+  const exitCodeBefore = process.exitCode;
   try {
     tree = active.parseSync(sqlText) as { stmts?: RawStatement[] };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Plugin SQL does not parse: ${message}`);
+    // Emscripten's exit() sets process.exitCode before it throws. The server did not exit.
+    if (process.exitCode !== exitCodeBefore) process.exitCode = exitCodeBefore;
+    if (!isParserFault(error)) {
+      throw new Error(`Plugin SQL does not parse: ${describeThrown(error)}`);
+    }
+    dropFaultedParser(active);
+    if (!(error instanceof Error) || PARSER_OUT_OF_MEMORY.test(error.message)) {
+      throw new Error("Plugin SQL does not parse: parser out of memory");
+    }
+    throw new Error(`Plugin SQL does not parse: ${error.message}`);
   }
   return tree.stmts ?? [];
 }
@@ -263,15 +338,150 @@ export function splitPluginMigrationSql(fileSql: string): string[] {
     .filter((statement) => statement.length > 0);
 }
 
-function stripSqlForKeywordScan(input: string): string {
-  // The quoted-text patterns are written as an unrolled loop. The alternation form
-  // (a non-quote or a doubled quote, repeated) uses one backtracking frame per character and
-  // overflows the stack on a string literal of a few MiB.
-  return input
-    .replace(/'[^']*(?:''[^']*)*'/g, "''")
-    .replace(/"[^"]*(?:""[^"]*)*"/g, "\"\"")
-    .replace(/--.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
+/** A character that can start an identifier or a dollar-quote tag: a letter, `_` or any non-ASCII character. */
+function isWordStart(code: number): boolean {
+  return (code >= 0x61 && code <= 0x7a) || (code >= 0x41 && code <= 0x5a) || code === 0x5f || code >= 0x80;
+}
+
+function isDigit(code: number): boolean {
+  return code >= 0x30 && code <= 0x39;
+}
+
+/** The end of quoted text that opened just before `from`, where the quote written twice stands for itself. */
+function endOfQuoted(text: string, from: number, quote: string): number {
+  let at = from;
+  for (;;) {
+    const close = text.indexOf(quote, at);
+    if (close === -1) return text.length;
+    if (text[close + 1] !== quote) return close + 1;
+    at = close + 2;
+  }
+}
+
+/** The end of an E'' string whose text starts at `from`: a backslash escapes the next character. */
+function endOfEscapeString(text: string, from: number): number {
+  for (let at = from; at < text.length; at += 1) {
+    const char = text[at];
+    if (char === "\\") {
+      at += 1;
+    } else if (char === "'") {
+      if (text[at + 1] !== "'") return at + 1;
+      at += 1;
+    }
+  }
+  return text.length;
+}
+
+/** The end of a block comment whose text starts at `from`. Block comments nest. */
+function endOfBlockComment(text: string, from: number): number {
+  let depth = 1;
+  let at = from;
+  while (at < text.length) {
+    if (text[at] === "/" && text[at + 1] === "*") {
+      depth += 1;
+      at += 2;
+    } else if (text[at] === "*" && text[at + 1] === "/") {
+      depth -= 1;
+      at += 2;
+      if (depth === 0) return at;
+    } else {
+      at += 1;
+    }
+  }
+  return text.length;
+}
+
+/** The end of a line comment: the next newline or carriage return, which is not part of it. */
+function endOfLineComment(text: string, from: number): number {
+  for (let at = from; at < text.length; at += 1) {
+    if (text[at] === "\n" || text[at] === "\r") return at;
+  }
+  return text.length;
+}
+
+/** The dollar-quote delimiter (`$$` or `$tag$`) that starts at `at`, or null if none does. */
+function dollarDelimiterAt(text: string, at: number): string | null {
+  let end = at + 1;
+  if (text[end] !== "$") {
+    if (end >= text.length || !isWordStart(text.charCodeAt(end))) return null;
+    end += 1;
+    while (end < text.length && (isWordStart(text.charCodeAt(end)) || isDigit(text.charCodeAt(end)))) end += 1;
+    if (text[end] !== "$") return null;
+  }
+  return text.slice(at, end + 1);
+}
+
+/**
+ * Returns the text with comments removed and quoted text emptied, for the keyword scan. It reads
+ * the text once, left to right, the way PostgreSQL's lexer does with standard_conforming_strings
+ * on, so its time is linear in the length of the text:
+ * - `--` to the end of the line is removed (the line break stays);
+ * - a block comment is removed, nested comments included;
+ * - '…' (also the B, X, N and U& forms) becomes '', with '' inside read as a quote;
+ * - E'…' becomes E'', with a backslash escaping the next character;
+ * - "…" becomes "", with "" inside read as a quote;
+ * - $tag$…$tag$ is kept as written, so its text is scanned as before, but quote and comment
+ *   marks inside it start nothing;
+ * - everything else is copied. Identifiers and numbers are read whole, so a `$` or `e'` inside
+ *   one does not start a dollar quote or an E'' string.
+ *
+ * Exported for tests.
+ */
+export function stripSqlForKeywordScan(input: string): string {
+  const parts: string[] = [];
+  let copiedTo = 0;
+  let at = 0;
+  const drop = (end: number, replacement: string) => {
+    parts.push(input.slice(copiedTo, at), replacement);
+    at = end;
+    copiedTo = end;
+  };
+  while (at < input.length) {
+    const char = input[at];
+    const next = input[at + 1];
+    const code = input.charCodeAt(at);
+    if (char === "-" && next === "-") {
+      drop(endOfLineComment(input, at + 2), "");
+    } else if (char === "/" && next === "*") {
+      drop(endOfBlockComment(input, at + 2), "");
+    } else if (char === "'") {
+      drop(endOfQuoted(input, at + 1, "'"), "''");
+    } else if (char === "\"") {
+      drop(endOfQuoted(input, at + 1, "\""), "\"\"");
+    } else if ((char === "e" || char === "E") && next === "'") {
+      // Only reached at the start of a token: identifiers are read whole below.
+      at += 1;
+      drop(endOfEscapeString(input, at + 1), "''");
+    } else if (char === "$") {
+      const delimiter = dollarDelimiterAt(input, at);
+      if (delimiter === null) {
+        at += 1;
+      } else {
+        const close = input.indexOf(delimiter, at + delimiter.length);
+        at = close === -1 ? input.length : close + delimiter.length;
+      }
+    } else if (isWordStart(code)) {
+      // An identifier or keyword: letters, digits, `_`, `$` and non-ASCII characters.
+      at += 1;
+      while (at < input.length) {
+        const part = input.charCodeAt(at);
+        if (!isWordStart(part) && !isDigit(part) && part !== 0x24) break;
+        at += 1;
+      }
+    } else if (isDigit(code)) {
+      // A number. It does not take a `$`, so `1$$…$$` is a number and then a dollar quote.
+      at += 1;
+      while (at < input.length) {
+        const part = input.charCodeAt(at);
+        if (!isDigit(part) && !(part < 0x80 && isWordStart(part))) break;
+        at += 1;
+      }
+    } else {
+      at += 1;
+    }
+  }
+  parts.push(input.slice(copiedTo));
+  return parts.join("");
 }
 
 function assertNoBannedSql(statement: string): void {
