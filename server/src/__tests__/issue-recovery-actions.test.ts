@@ -20,6 +20,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  unWakeableArchives,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -155,6 +156,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
     await db.delete(issueInboxArchives);
+    await db.delete(unWakeableArchives);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
@@ -1844,6 +1846,28 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         payload: expect.objectContaining({ recoveryCause: "dispatch_unlaunched" }),
       }),
     );
+  });
+
+  it("skips stale archived in_review children", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "in_review", executionState: {
+      status: "pending",
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: coderId },
+    }}).where(eq(issues.id, sourceIssueId));
+    await db.insert(unWakeableArchives).values({
+      companyId,
+      issueId: sourceIssueId,
+      policy: "stale_in_review_child",
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.issueIds).not.toContain(sourceIssueId);
+    expect(result.escalated).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("stands down while the latest run was cancelled by a board operator", async () => {

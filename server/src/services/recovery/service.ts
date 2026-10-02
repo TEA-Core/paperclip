@@ -5728,6 +5728,15 @@ export function recoveryService(
             ? gte(issues.createdAt, opts.issueCreatedAtGte)
             : undefined,
           isNull(issues.harnessKind),
+          not(
+            sql`exists (
+              select 1
+              from ${unWakeableArchives}
+              where ${unWakeableArchives.issueId} = ${issues.id}
+                and ${unWakeableArchives.companyId} = ${issues.companyId}
+                and ${unWakeableArchives.policy} = 'stale_in_review_child'
+            )`,
+          ),
           not(unadmittedChatWakeupCondition(issues.id, issues.companyId)),
         ),
       );
@@ -7896,6 +7905,13 @@ export function recoveryService(
       )`,
       sql`${issues.executionState}->'currentParticipant'->>'type' = 'agent'`,
       sql`${issues.executionState}->'currentParticipant'->>'agentId' is not null`,
+      sql`not exists (
+        select 1
+        from ${unWakeableArchives}
+        where ${unWakeableArchives.issueId} = ${issues.id}
+          and ${unWakeableArchives.companyId} = ${issues.companyId}
+          and ${unWakeableArchives.policy} = 'stale_in_review_child'
+      )`,
       lt(issues.updatedAt, cutoff),
     ];
     if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
