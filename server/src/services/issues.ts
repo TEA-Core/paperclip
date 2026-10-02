@@ -11031,6 +11031,8 @@ export function issueService(db: Db) {
               parentLinkKind: issueData.parentLinkKind,
               originKind: issueData.originKind,
               status: issueData.status,
+              title: issueData.title,
+              description: issueData.description,
               hasCarveOutLabel,
             },
           );
