@@ -201,7 +201,7 @@ export function stageHeldElsewhereNextAction(
     return (
       `Your seat (currentParticipant) holds this ${stageName}, and only your decision moves it: ` +
       "done with a comment approves; todo, in_progress or cancelled with a comment requests changes; " +
-      "blocked with a comment parks it. An assignee write naming anyone but you (alone or with in_review) is refused; " +
+      "blocked with a comment and an unblockDescriptor naming yourself parks it (control-plane-403.md §6). An assignee write naming anyone but you (alone or with in_review) is refused; " +
       "an in_review write without one is accepted and does not move the stage. " +
       "Do not hand the card away."
     );

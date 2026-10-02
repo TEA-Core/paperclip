@@ -197,7 +197,12 @@ describe("next-action sentences", () => {
     expect(text).toContain("Your seat (currentParticipant) holds this review stage");
     expect(text).toContain("only your decision moves it");
     expect(text).toContain("done with a comment approves");
-    expect(text).toContain("blocked with a comment parks it");
+    // routes/issues.ts enteringBlocked guard: a bare comment-only blocked 422s; with no
+    // edge (it freezes the stage) the park needs a self-owned unblockDescriptor.
+    expect(text).not.toContain("blocked with a comment parks it");
+    expect(text).toContain(
+      "blocked with a comment and an unblockDescriptor naming yourself parks it (control-plane-403.md §6)",
+    );
     expect(text).toContain("Do not hand the card away");
     // applyIssueExecutionStageTransition: the holder's in_review with no assignee is
     // not a stage advance, so it is accepted (its inline comment lands); only an
