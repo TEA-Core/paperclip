@@ -153,7 +153,19 @@ describe("next-action sentences", () => {
     expect(text).toMatch(/Once the board reports the ladder repaired, re-send the refused close or verdict once\.$/);
   });
 
-  it("stage held elsewhere: names the holder, says no write from this seat advances it, and keeps the board as the exception", () => {
+  // control-plane-403.md §7 / write-safety-core item 4: the one post-answer re-send is
+  // the stage holder's. Every other seat records, asks the board, and does not re-send.
+  for (const seat of ["assignee", "returnAssignee", "ancestor-hatch", "other"] as const) {
+    it(`Mechanism D: ${seat} is not told to re-send after the board answers`, () => {
+      const text = mechanismDNextAction(seat);
+      expect(text).toContain(RECORD_AND_ASK_BOARD);
+      expect(text).toContain("no second close from your seat");
+      expect(text).not.toContain("until the board answers");
+      expect(text).not.toMatch(/re-send the refused close/);
+    });
+  }
+
+  it("stage held elsewhere: names the holder, says no write from this seat advances it, and leaves it to the participant", () => {
     const text = stageHeldElsewhereNextAction("returnAssignee", {
       stageType: "review",
       participant: { type: "agent", agentId: PARTICIPANT, userId: null },
@@ -165,7 +177,10 @@ describe("next-action sentences", () => {
     expect(text).toContain("if it requests changes the card returns to you");
     expect(text).not.toContain("when it is decided");
     expect(text).toContain("on a card you own");
-    expect(text).toContain("ask the board only if");
+    // control-plane-403.md §7: its current participant owns it; no board ask from this seat.
+    expect(text).not.toContain("ask the board");
+    expect(text).toContain("the stage's participant decides it");
+    expect(text).toContain("If you own no card in this run, write nothing more");
     const other = stageHeldElsewhereNextAction("other", { stageType: null, participant: null });
     expect(other).not.toContain("returns the card to you");
   });
