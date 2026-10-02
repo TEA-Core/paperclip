@@ -94,7 +94,9 @@ Core fields:
   only) gives the run a per-run HOME whose .claude/skills holds exactly the
   agent's desiredSkills, so its available-skills listing is scoped to that
   set while all other HOME-dependent state (git config, opencode's per-agent
-  session DB, caches) carries over unchanged. Remote targets ignore this key.
+  session DB, caches) carries over unchanged. A skill sync for a
+  "desired-only" agent never reads or writes the shared skills home. Remote
+  targets ignore this key.
 
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds

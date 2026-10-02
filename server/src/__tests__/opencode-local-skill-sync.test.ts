@@ -130,3 +130,92 @@ describe("opencode local skill sync: shared callers link only (PR-6 b)", () => {
     expect(snapshot.warnings).toContain(SHARED_REMOVE_WARNING);
   });
 });
+
+// PR-6 (a): a desired-only caller never reads or writes the shared skills home.
+
+const DESIRED_ONLY_STAGED_DETAIL =
+  "Staged per run (desired-only): linked into the run's private HOME when each local run starts. The shared skills home is not used.";
+
+describe("opencode local skill sync: desired-only callers never touch the shared home (PR-6 a)", () => {
+  const cleanupDirs = new Set<string>();
+  const desiredOnly = { skillIsolation: "desired-only" };
+
+  afterEach(async () => {
+    await Promise.all(Array.from(cleanupDirs).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+    cleanupDirs.clear();
+  });
+
+  it("(2) leaves the shared home's listing identical across a desired-only remove then add", async () => {
+    const { skillsHome, ctxFor } = await makePruneFixture(cleanupDirs);
+    await syncOpenCodeSkills(ctxFor("peer", ["pc/alpha", "pc/beta"]), ["pc/alpha", "pc/beta"]);
+    const before = await listSkillsHome(skillsHome);
+    expect(before.map(([name]) => name)).toEqual(["alpha", "beta"]);
+
+    const removed = await syncOpenCodeSkills(ctxFor("caller", [], desiredOnly), []);
+    const added = await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"], desiredOnly), ["pc/gamma"]);
+
+    expect(await listSkillsHome(skillsHome)).toEqual(before);
+    expect(removed.entries.filter((entry) => entry.desired)).toEqual([]);
+    expect(added.mode).toBe("ephemeral");
+    expect(added.entries.find((entry) => entry.key === "pc/gamma")).toMatchObject({
+      desired: true,
+      state: "configured",
+      targetPath: null,
+      detail: DESIRED_ONLY_STAGED_DETAIL,
+    });
+    // The shared-home remove warning describes the shared home, which a desired-only snapshot never reports on.
+    expect(removed.warnings).not.toContain(SHARED_REMOVE_WARNING);
+    expect(added.warnings).not.toContain(SHARED_REMOVE_WARNING);
+  });
+
+  it("(2b) lists a desired skill as staged per run, never as missing", async () => {
+    const { ctxFor } = await makePruneFixture(cleanupDirs);
+
+    const snapshot = await listOpenCodeSkills(ctxFor("caller", ["pc/gamma"], desiredOnly));
+
+    expect(snapshot.mode).toBe("ephemeral");
+    expect(snapshot.entries.find((entry) => entry.key === "pc/gamma")).toMatchObject({
+      desired: true,
+      state: "configured",
+      detail: DESIRED_ONLY_STAGED_DETAIL,
+    });
+    expect(snapshot.entries.filter((entry) => entry.state === "missing")).toEqual([]);
+    expect(snapshot.warnings).not.toContain(SHARED_REMOVE_WARNING);
+  });
+
+  it("(2c) creates nothing under a fresh HOME", async () => {
+    const { home, ctxFor } = await makePruneFixture(cleanupDirs);
+
+    await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"], desiredOnly), ["pc/gamma"]);
+
+    await expect(fs.lstat(path.join(home, ".claude"))).rejects.toThrow();
+  });
+
+  it("(2d) still reports a desired skill whose source is missing as missing", async () => {
+    const { runtimeSkills, ctxFor } = await makePruneFixture(cleanupDirs);
+
+    const snapshot = await listOpenCodeSkills(
+      ctxFor("caller", ["pc/gamma"], {
+        ...desiredOnly,
+        paperclipRuntimeSkills: [
+          ...runtimeSkills.slice(0, 2),
+          { ...runtimeSkills[2]!, sourceStatus: "missing", missingDetail: "The skill version snapshot was deleted." },
+        ],
+      }),
+    );
+
+    expect(snapshot.entries.find((entry) => entry.key === "pc/gamma")).toMatchObject({
+      desired: true,
+      state: "missing",
+      detail: "The skill version snapshot was deleted.",
+    });
+  });
+
+  it("(2e) treats a misspelled skillIsolation value as shared and still links", async () => {
+    const { skillsHome, runtimeSkills, ctxFor } = await makePruneFixture(cleanupDirs);
+
+    await syncOpenCodeSkills(ctxFor("caller", ["pc/gamma"], { skillIsolation: "desired_only" }), ["pc/gamma"]);
+
+    expect(await listSkillsHome(skillsHome)).toEqual([["gamma", runtimeSkills[2]!.source]]);
+  });
+});
