@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -560,6 +560,54 @@ test("main exits non-zero when a database fails", async () => {
   }
 });
 
+test("main exits non-zero when an agent cannot write its WAL", async () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [30] });
+  const walPath = `${databasePath}-wal`;
+  const writer = new DatabaseSync(databasePath);
+  try {
+    writer.exec("PRAGMA journal_mode = WAL");
+    writer.exec("BEGIN");
+    writer.prepare("INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, ?)").run("wal_fixture", 1);
+    writer.exec("COMMIT");
+    assert.ok(statSync(walPath).size > 0, "fixture should leave a real non-empty WAL");
+    chmodSync(walPath, 0o444);
+    const modeBefore = statSync(walPath).mode;
+    const checkedPaths = [databasePath, walPath, `${databasePath}-shm`];
+    const metadataBefore = new Map(
+      checkedPaths.map((filePath) => {
+        const info = statSync(filePath);
+        return [filePath, { mode: info.mode, uid: info.uid, gid: info.gid }];
+      }),
+    );
+    const lines = [];
+    const code = await main(["--apply", "--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync,
+      agentUid: process.getuid?.() ?? -1,
+      agentGids: new Set([process.getgid?.() ?? -1]),
+    });
+    assert.equal(code, 1);
+    assert.ok(
+      lines.some(
+        (line) => line.includes("FAILED") && line.includes("agent-1") && line.includes(walPath),
+      ),
+    );
+    assert.equal(statSync(walPath).mode, modeBefore);
+    for (const [filePath, metadata] of metadataBefore) {
+      const info = statSync(filePath);
+      assert.deepEqual(
+        { mode: info.mode & 0o777, uid: info.uid, gid: info.gid },
+        { ...metadata, mode: metadata.mode & 0o777 },
+        `${filePath} metadata changed`,
+      );
+    }
+  } finally {
+    writer.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("main exits zero when every database is healthy", async () => {
   const { dir } = makeDatabase({ sessions: [30] });
   try {
@@ -567,6 +615,8 @@ test("main exits zero when every database is healthy", async () => {
       log: () => {},
       nowMs: NOW_MS,
       DatabaseSync,
+      agentUid: process.getuid?.() ?? -1,
+      agentGids: new Set([process.getgid?.() ?? -1]),
     });
     assert.equal(code, 0);
   } finally {
