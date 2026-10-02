@@ -1011,6 +1011,8 @@ describe("issue execution policy missing approval stage", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  // Verification: pnpm exec vitest run --config vitest.config.ts issue-execution-policy-missing-approval-stage --no-file-parallelism
+
   // Distinguishing regression (SUP-15958): the SUP-15826 / SUP-15813 shape — a
   // card whose ONLY child is a work-type:redo child. The redo child is itself a
   // genuine laddered child (manual origin, a policy, a completed stage), so under
