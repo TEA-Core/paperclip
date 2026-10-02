@@ -1,0 +1,138 @@
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  DEFAULT_AGENT_NICE,
+  deprioritizeCpu,
+  isAgentSpawnShim,
+  resolveAgentNice,
+} from "./cpu-priority.js";
+
+describe("resolveAgentNice", () => {
+  it("defaults when the env var is absent or blank", () => {
+    expect(resolveAgentNice({})).toBe(DEFAULT_AGENT_NICE);
+    expect(DEFAULT_AGENT_NICE).toBe(10);
+    expect(resolveAgentNice({ PAPERCLIP_AGENT_NICE: "   " })).toBe(DEFAULT_AGENT_NICE);
+  });
+
+  it("honours a configured value", () => {
+    expect(resolveAgentNice({ PAPERCLIP_AGENT_NICE: "15" })).toBe(15);
+    expect(resolveAgentNice({ PAPERCLIP_AGENT_NICE: "0" })).toBe(0);
+  });
+
+  it("clamps to 0..19", () => {
+    expect(resolveAgentNice({ PAPERCLIP_AGENT_NICE: "25" })).toBe(19);
+    // A negative step would raise agents above the server. That needs
+    // CAP_SYS_NICE and is never the intent, so it means "no step".
+    expect(resolveAgentNice({ PAPERCLIP_AGENT_NICE: "-5" })).toBe(0);
+  });
+
+  it("falls back to the default on an unparseable value", () => {
+    for (const raw of ["high", "5.5", "10x", "0x10"]) {
+      expect(resolveAgentNice({ PAPERCLIP_AGENT_NICE: raw })).toBe(DEFAULT_AGENT_NICE);
+    }
+  });
+});
+
+describe("deprioritizeCpu", () => {
+  function fakeScheduler(server: number, child: number) {
+    const priorities = new Map<number, number>([
+      [0, server],
+      [4242, child],
+    ]);
+    return {
+      priorities,
+      getPriority: (pid: number) => {
+        const value = priorities.get(pid);
+        if (value === undefined) throw new Error(`ESRCH ${pid}`);
+        return value;
+      },
+      setPriority: vi.fn((pid: number, value: number) => {
+        priorities.set(pid, value);
+      }),
+    };
+  }
+
+  it("puts the child the configured number of steps below the server", () => {
+    const sched = fakeScheduler(0, 0);
+    expect(deprioritizeCpu(4242, 10, { ...sched, platform: "linux" })).toBe(10);
+    expect(sched.priorities.get(4242)).toBe(10);
+  });
+
+  it("is relative to the server's own priority", () => {
+    const sched = fakeScheduler(5, 5);
+    expect(deprioritizeCpu(4242, 10, { ...sched, platform: "linux" })).toBe(15);
+  });
+
+  it("caps at the kernel ceiling of 19", () => {
+    const sched = fakeScheduler(15, 15);
+    expect(deprioritizeCpu(4242, 10, { ...sched, platform: "linux" })).toBe(19);
+  });
+
+  it("never raises a child that already sits at or below the target", () => {
+    const sched = fakeScheduler(0, 12);
+    expect(deprioritizeCpu(4242, 10, { ...sched, platform: "linux" })).toBeNull();
+    expect(sched.setPriority).not.toHaveBeenCalled();
+    expect(sched.priorities.get(4242)).toBe(12);
+  });
+
+  it("does nothing for a step of 0", () => {
+    const sched = fakeScheduler(0, 0);
+    expect(deprioritizeCpu(4242, 0, { ...sched, platform: "linux" })).toBeNull();
+    expect(sched.setPriority).not.toHaveBeenCalled();
+  });
+
+  it("does nothing on Windows, where priorities are classes, not nice values", () => {
+    const sched = fakeScheduler(0, 0);
+    expect(deprioritizeCpu(4242, 10, { ...sched, platform: "win32" })).toBeNull();
+    expect(sched.setPriority).not.toHaveBeenCalled();
+  });
+
+  it("ignores a missing or invalid pid", () => {
+    const sched = fakeScheduler(0, 0);
+    for (const pid of [undefined, 0, -1, 1.5]) {
+      expect(deprioritizeCpu(pid, 10, { ...sched, platform: "linux" })).toBeNull();
+    }
+    expect(sched.setPriority).not.toHaveBeenCalled();
+  });
+
+  it("never throws, and reports a failure", () => {
+    const onError = vi.fn();
+    const result = deprioritizeCpu(4242, 10, {
+      platform: "linux",
+      getPriority: () => 0,
+      setPriority: () => {
+        throw new Error("EPERM");
+      },
+      onError,
+    });
+    expect(result).toBeNull();
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a child that exited before it could be read", () => {
+    const onError = vi.fn();
+    const sched = fakeScheduler(0, 0);
+    expect(deprioritizeCpu(9999, 10, { ...sched, platform: "linux", onError })).toBeNull();
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("isAgentSpawnShim", () => {
+  it("recognises the default shim path", () => {
+    expect(isAgentSpawnShim("/usr/local/sbin/paperclip-spawn-agent", {})).toBe(true);
+  });
+
+  it("recognises an overridden shim path, also after normalisation", () => {
+    const env = { PAPERCLIP_AGENT_SPAWN_SHIM: "/opt/shim/spawn" };
+    expect(isAgentSpawnShim("/opt/shim/spawn", env)).toBe(true);
+    expect(isAgentSpawnShim("/opt/shim/../shim/spawn", env)).toBe(true);
+    expect(isAgentSpawnShim("/usr/local/sbin/paperclip-spawn-agent", env)).toBe(false);
+  });
+
+  it("does not match an ordinary agent command", () => {
+    expect(isAgentSpawnShim("/usr/local/bin/opencode", {})).toBe(false);
+    expect(isAgentSpawnShim(process.execPath, {})).toBe(false);
+    expect(isAgentSpawnShim(path.basename("/usr/local/sbin/paperclip-spawn-agent"), {})).toBe(false);
+  });
+});

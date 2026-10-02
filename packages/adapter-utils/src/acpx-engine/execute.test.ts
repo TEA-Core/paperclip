@@ -41,6 +41,7 @@ import {
   type AcpxEngineExecutorOptions,
 } from "./execute.js";
 import { ACPX_HANDSHAKE_TIMEOUT_MS } from "./constants.js";
+import { DEFAULT_AGENT_NICE } from "../cpu-priority.js";
 import { runChildProcess, SpawnEnvelopeTooLargeError } from "../server-utils.js";
 import { setExpensiveWorkspaceGitExecutor } from "../git-workspace-sync.js";
 import { resolveReferencedSourceIgnore } from "../sandbox-managed-runtime.js";
@@ -648,6 +649,73 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(typeof spawnAgent).toBe("function");
     return spawnAgent as SpawnAgentProbe;
   };
+
+  // Agent runs share the server's CPU cgroup, so the host spawnAgent callback
+  // puts the provider child DEFAULT_AGENT_NICE steps below the server. When the
+  // spawned command IS the setuid uid-split shim, the shim takes that step
+  // itself after dropping privilege, so the host must not add a second one.
+  const readNice = async (pid: number): Promise<number> => {
+    const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return Number.parseInt(rest[16]!, 10);
+  };
+
+  it.skipIf(process.platform !== "linux")(
+    "lowers the provider child's CPU priority below the server's in the host spawnAgent callback",
+    async () => {
+      const { runtimeOptions } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(await makeTempRoot(), "state"),
+      });
+      const spawnAgent = readSpawnAgent(runtimeOptions) as unknown as (
+        input: Parameters<SpawnAgentProbe>[0],
+      ) => { pid?: number; kill: () => void };
+      const child = spawnAgent({
+        command: process.execPath,
+        args: ["--eval", "setTimeout(() => {}, 2000)"],
+        options: { env: { PATH: process.env.PATH ?? "" } },
+      });
+      try {
+        expect(await readNice(child.pid!)).toBe(Math.min(19, os.getPriority() + DEFAULT_AGENT_NICE));
+      } finally {
+        child.kill();
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "leaves the priority step to the setuid shim when the spawned command is the shim",
+    async () => {
+      const previous = process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+      // Stand-in shim: any executable at the configured shim path. The host
+      // must recognise it by path and skip its own step.
+      process.env.PAPERCLIP_AGENT_SPAWN_SHIM = process.execPath;
+      try {
+        const { runtimeOptions } = await runExecutor({
+          agent: "custom",
+          agentCommand: "node ./fake-acp.js",
+          stateDir: path.join(await makeTempRoot(), "state"),
+        });
+        const spawnAgent = readSpawnAgent(runtimeOptions) as unknown as (
+          input: Parameters<SpawnAgentProbe>[0],
+        ) => { pid?: number; kill: () => void };
+        const child = spawnAgent({
+          command: process.execPath,
+          args: ["--eval", "setTimeout(() => {}, 2000)"],
+          options: { env: { PATH: process.env.PATH ?? "" } },
+        });
+        try {
+          expect(await readNice(child.pid!)).toBe(os.getPriority());
+        } finally {
+          child.kill();
+        }
+      } finally {
+        if (previous === undefined) delete process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+        else process.env.PAPERCLIP_AGENT_SPAWN_SHIM = previous;
+      }
+    },
+  );
 
   it("runs the launch guard on acpx's final resolved argv inside the host spawnAgent callback", async () => {
     // The configured `agentCommand` is not the launched envelope: acpx tokenizes

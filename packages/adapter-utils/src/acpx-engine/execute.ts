@@ -40,6 +40,7 @@ import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } 
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import { deprioritizeForOom, reportOomMarkFailureOnce } from "../oom-priority.js";
+import { deprioritizeCpu, isAgentSpawnShim, reportCpuStepFailureOnce } from "../cpu-priority.js";
 import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
 import {
   classifyWorkspaceRestoreFailure,
@@ -4726,6 +4727,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 console.warn({ err, command }, message),
               ),
             });
+            // Same seam for CPU (../cpu-priority.ts): the provider tree runs
+            // DEFAULT_AGENT_NICE steps below the server. This is the only step an
+            // agent without its ACP uid-split lane flag gets, because acpx then
+            // spawns the provider directly as the server's uid. When the lane flag
+            // IS armed, `command` is the setuid shim, which takes the step itself.
+            if (!isAgentSpawnShim(command)) {
+              deprioritizeCpu(child.pid, undefined, {
+                onError: reportCpuStepFailureOnce((message, err) =>
+                  console.warn({ err, command }, message),
+                ),
+              });
+            }
             return child;
           },
           onAgentStderr: prepared.childStderrLogPath

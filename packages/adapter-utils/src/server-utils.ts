@@ -13,6 +13,7 @@ import {
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { deprioritizeForOom, reportOomMarkFailureOnce } from "./oom-priority.js";
+import { deprioritizeCpu, isAgentSpawnShim, reportCpuStepFailureOnce } from "./cpu-priority.js";
 import {
   formatOomKillNotice,
   readCgroupOomKillCount,
@@ -5536,6 +5537,15 @@ export async function runChildProcess(
         deprioritizeForOom(child.pid, undefined, {
           onError: reportOomMarkFailureOnce((message, err) => onLogError(err, runId, message)),
         });
+        // Same seam for CPU: put the run child DEFAULT_AGENT_NICE steps below the
+        // server, inherited by its whole tree (./cpu-priority.ts). Skipped when
+        // the child IS the setuid shim, which takes that step itself after
+        // dropping privilege — stepping it here too would double the step.
+        if (!isAgentSpawnShim(target.command)) {
+          deprioritizeCpu(child.pid, undefined, {
+            onError: reportCpuStepFailureOnce((message, err) => onLogError(err, runId, message)),
+          });
+        }
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 

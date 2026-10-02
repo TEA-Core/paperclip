@@ -673,9 +673,12 @@ Set `0` to disable. The adjustment is best-effort: a dead pid, a non-Linux host 
 
 Agent runs also share the server container's CPU cgroup. At equal priority the scheduler splits CPU per runnable thread, so an agent that starts a large test fleet or a CPU-load reproduction outweighs the server. When the agent-uid split is armed (`PAPERCLIP_AGENT_UID`), the setuid spawn shim lowers its own priority after it drops to the agent uid and before it execs, and the whole agent tree inherits that priority. The step is relative to the server's priority and capped at 19.
 
-- `AGENT_NICE` Docker build arg (default `10`, range `0`–`19`)
+When the shim is not in the spawn path, the server takes the same step itself right after it spawns the agent child. This covers deployments without the uid split, and claude_local ACP agents without their `PAPERCLIP_ACP_AGENT_UID_SPLIT` lane flag, which acpx spawns directly as the server's uid. The server never takes the step on a shim child, because the shim already takes it.
 
-Set `0` to disable. The shim reads no environment, so changing the value needs an image rebuild. Without the uid split, agents run at the server's priority.
+- `AGENT_NICE` Docker build arg (default `10`, range `0`–`19`): the step the shim takes under the uid split
+- `PAPERCLIP_AGENT_NICE` (default `10`, range `0`–`19`): the step the server takes when the shim is not in the spawn path
+
+Set either to `0` to disable that step. The shim reads no environment, so changing its value needs an image rebuild. The server-side step is best-effort: a failure is logged once per process and never fails a run.
 
 Structured `workspace_git_scan` logs expose the operation name, a non-reversible workspace-path hash, queue and execution durations, active/queued counts, cache and single-flight use, and terminal outcome. Saturation and timeout warnings are rate-limited so an overload does not create a second logging storm.
 
