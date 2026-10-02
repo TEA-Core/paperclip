@@ -64,6 +64,7 @@ async function buildOpenCodeSkillSnapshot(config: Record<string, unknown>): Prom
     externalDetail: "Installed outside Paperclip management in the shared skills home.",
     warnings: [
       "OpenCode currently uses the shared Claude skills home (~/.claude/skills).",
+      "Removing a skill updates this agent's desired skills only. Its link stays in the shared skills home, where other agents can still load it, until an operator cleans the home.",
     ],
   });
 }
@@ -72,6 +73,15 @@ export async function listOpenCodeSkills(ctx: AdapterSkillContext): Promise<Adap
   return buildOpenCodeSkillSnapshot(ctx.config);
 }
 
+/**
+ * Apply an agent's desired skills to the shared skills home: LINK ONLY.
+ *
+ * Every shared agent on the host reads this one skills home, so it holds the
+ * union of their skills. Unlinking the skills this caller does not desire
+ * removed them from every other agent until that agent's next run re-linked
+ * them. A removal therefore changes the agent's desired skills only. The link
+ * stays until an operator cleans the shared home.
+ */
 export async function syncOpenCodeSkills(
   ctx: AdapterSkillContext,
   desiredSkills: string[],
@@ -83,21 +93,11 @@ export async function syncOpenCodeSkills(
   ]);
   const skillsHome = resolveOpenCodeSkillsHome(ctx.config);
   await fs.mkdir(skillsHome, { recursive: true });
-  const installed = await readInstalledSkillTargets(skillsHome);
-  const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));
 
   for (const available of availableEntries) {
     if (!desiredSet.has(available.key)) continue;
     const target = path.join(skillsHome, available.runtimeName);
     await ensurePaperclipSkillSymlink(available.source, target);
-  }
-
-  for (const [name, installedEntry] of installed.entries()) {
-    const available = availableByRuntimeName.get(name);
-    if (!available) continue;
-    if (desiredSet.has(available.key)) continue;
-    if (installedEntry.targetPath !== available.source) continue;
-    await fs.unlink(path.join(skillsHome, name)).catch(() => {});
   }
 
   return buildOpenCodeSkillSnapshot(ctx.config);

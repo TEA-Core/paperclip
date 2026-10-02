@@ -87,7 +87,10 @@ Core fields:
 - env (object, optional): KEY=VALUE environment variables
 - skillIsolation (string, optional): "shared" (default) or "desired-only". "shared"
   symlinks the agent's desiredSkills into the shared skills home, so the run
-  sees the union of every agent's skills there. "desired-only" (local runs
+  sees the union of every agent's skills there. A skill sync in "shared" mode
+  only adds links: removing a skill changes the agent's desired skills, but
+  its link stays in the shared home (other agents can still load it) until an
+  operator cleans the home. "desired-only" (local runs
   only) gives the run a per-run HOME whose .claude/skills holds exactly the
   agent's desiredSkills, so its available-skills listing is scoped to that
   set while all other HOME-dependent state (git config, opencode's per-agent
