@@ -228,8 +228,23 @@ describe("next-action sentences", () => {
     expect(selfGatedNextAction("other", { ladderHasRun: true, boardActor: false })).toContain("games the gate");
   });
 
-  it("self-gated stage at attach time keeps the one lawful payload fix", () => {
-    const text = selfGatedNextAction("assignee", { ladderHasRun: false });
+  it("self-gated stage at attach time gives an agent only the same-write reassign", () => {
+    // issue-creation.md §Resolving the collision 422: the agent's ONE payload fix is
+    // the same-write assigneeAgentId; changing a stage participant is a gamed gate.
+    for (const seat of ["assignee", "other"] as const) {
+      const text = selfGatedNextAction(seat, { ladderHasRun: false });
+      expect(text).toBe(
+        "Put the implementer's assigneeAgentId in the same write as this executionPolicy, so the return assignee is not this stage's participant. Never change a stage participant or drop a stage to make this pass.",
+      );
+      expect(text).not.toContain("Give the stage a participant");
+    }
+    expect(selfGatedNextAction("assignee", { ladderHasRun: false, boardActor: false })).not.toContain(
+      "Give the stage a participant",
+    );
+  });
+
+  it("self-gated stage at attach time keeps the base remedy for a board caller", () => {
+    const text = selfGatedNextAction("other", { ladderHasRun: false, boardActor: true });
     expect(text).toBe(
       "Give the stage a participant that is not the return assignee, or change the return assignee. Never drop the stage to make this pass.",
     );

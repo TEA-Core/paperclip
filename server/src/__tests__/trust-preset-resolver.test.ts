@@ -286,8 +286,9 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
     ).not.toThrow();
   });
 
-  // Board ruling 2026-10-02 (F1 server half): caller-aware. At attach time the
-  // existing remedy is the one lawful payload fix and stays verbatim; on a
+  // Board ruling 2026-10-02 (F1 server half): caller-aware. At attach time an
+  // agent is given only its one payload fix (the same-write reassign) and a
+  // board caller keeps the existing remedy; on a
   // ladder that has already run, changing a participant or the return assignee
   // to pass the check games the gate, so every seat is told to record and ask
   // the board. The message prefix is byte-identical either way.
@@ -308,18 +309,19 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
     };
     const prefix = `Execution policy stage 0 (approval) is gated solely by its own return assignee ${returnAssigneeAgentId}`;
 
-    it("keeps the attach-time remedy verbatim when the issue's ladder has not run", () => {
+    it("gives an agent only the same-write reassign when the issue's ladder has not run", () => {
       const err = refuse({ caller: { agentId: ctoAgentId }, issue: null });
       expect(err.message.startsWith(prefix)).toBe(true);
-      expect(err.message).toMatch(
-        /Give the stage a participant that is not the return assignee, or change the return assignee\. Never drop the stage to make this pass\.$/,
-      );
+      // issue-creation.md §Resolving the collision 422: changing a stage participant
+      // is a gamed gate for an agent, so the agent's tail names only the reassign.
+      expect(err.message).not.toContain("Give the stage a participant that is not the return assignee");
       const details = err.details as Record<string, unknown>;
       expect(details.callerSeat).toBe("other");
       expect(details.ladderHasRun).toBe(false);
       expect(details.nextAction).toBe(
-        "Give the stage a participant that is not the return assignee, or change the return assignee. Never drop the stage to make this pass.",
+        "Put the implementer's assigneeAgentId in the same write as this executionPolicy, so the return assignee is not this stage's participant. Never change a stage participant or drop a stage to make this pass.",
       );
+      expect(err.message.endsWith(String(details.nextAction))).toBe(true);
       // The pre-existing detail keys are unchanged.
       expect(details).toMatchObject({ stageIndex: 0, stageType: "approval", returnAssigneeAgentId });
     });

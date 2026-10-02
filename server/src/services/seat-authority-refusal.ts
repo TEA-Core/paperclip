@@ -233,6 +233,16 @@ export const SELF_GATED_ATTACH_TIME_REMEDY =
   "Never drop the stage to make this pass.";
 
 /**
+ * The attach-time tail for a non-board caller. Agent doctrine (issue-creation.md
+ * §Resolving the collision 422) gives the agent ONE payload fix, the same-write
+ * reassign; changing a stage participant is a gamed gate from an agent seat, so
+ * the board-only half of the remedy above is not offered.
+ */
+export const SELF_GATED_ATTACH_TIME_AGENT_REMEDY =
+  "Put the implementer's assigneeAgentId in the same write as this executionPolicy, so the return assignee " +
+  "is not this stage's participant. Never change a stage participant or drop a stage to make this pass.";
+
+/**
  * 422 "Execution policy stage <n> (<type>) is gated solely by its own return assignee ...".
  * A board user keeps the payload fix on a ladder that has run too: a board
  * rearmExecutionPolicy is one of the board's own close-ladder levers.
@@ -241,7 +251,8 @@ export function selfGatedNextAction(
   seat: CallerSeat,
   ctx: { ladderHasRun: boolean; boardActor?: boolean },
 ): string {
-  if (!ctx.ladderHasRun || ctx.boardActor) return SELF_GATED_ATTACH_TIME_REMEDY;
+  if (ctx.boardActor) return SELF_GATED_ATTACH_TIME_REMEDY;
+  if (!ctx.ladderHasRun) return SELF_GATED_ATTACH_TIME_AGENT_REMEDY;
   return (
     "This issue's ladder has already run, so this is not a payload fix: changing a participant or the return " +
     `assignee now to pass this check games the gate, from any seat (yours: ${seat}). Never drop the stage. ` +
