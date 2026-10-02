@@ -40,8 +40,10 @@ export type AssertIssueExecutionPolicySatisfiableInput = {
    * carries `details.callerSeat` / `details.nextAction` and, on a ladder that has
    * already run, replaces the attach-time remedy with the terminal next action.
    * Absent (plugin host, internal callers) the refusal is unchanged.
+   * `boardActor`: a board user keeps the payload-fix remedy on a ladder that
+   * has run, because a board rearmExecutionPolicy is the board's own lever.
    */
-  refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
+  refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null; boardActor?: boolean };
 };
 
 /**
@@ -129,7 +131,7 @@ export function assertIssueExecutionPolicyGatesAreEnforceable(
     }
     const callerSeat = resolveCallerSeat(refusalContext.caller, refusalContext.issue);
     const ladderHasRun = selfGatedLadderHasRun(refusalContext.issue?.executionState ?? null);
-    const nextAction = selfGatedNextAction(callerSeat, { ladderHasRun });
+    const nextAction = selfGatedNextAction(callerSeat, { ladderHasRun, boardActor: refusalContext.boardActor === true });
     throw unprocessable(`${diagnosis} ${nextAction}`, {
       stageIndex: index,
       stageType,

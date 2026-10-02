@@ -21,9 +21,10 @@
  *     same sentence follows the prefix in the message, so an agent that reads
  *     only `error` still gets it;
  *   - when the caller's seat CAN lawfully act (any writer of a policy that has
- *     not run yet on the self-gated 422, a board user on Mechanism D) the existing
- *     remedy is kept unchanged. Close-ladder repair is the board's: an agent
- *     assignee gets the record-and-ask text like every other agent seat.
+ *     not run yet on the self-gated 422, a board user on the self-gated 422 and
+ *     on Mechanism D) the existing remedy is kept unchanged. Close-ladder
+ *     repair is the board's: an agent assignee gets the record-and-ask text
+ *     like every other agent seat.
  *
  * This module is pure: no DB, no imports from the policy service (which imports
  * it), so it cannot form an import cycle.
@@ -113,13 +114,19 @@ export function liveStageOf(issue: RefusalIssue | null | undefined): {
   };
 }
 
+/**
+ * Same order as resolveReturnAssignee in issue-execution-policy.ts, which decides
+ * where a changes_requested sends the card: the policy's returnAssigneeAgentId
+ * first, then executionState.returnAssignee. They differ when the policy is
+ * re-pointed after the stage armed (a37e3e65 / SUP-18002).
+ */
 function returnAssigneeOf(issue: RefusalIssue): RefusalPrincipal | null {
-  const state = readState(issue.executionState);
-  const fromState = readPrincipal(state?.returnAssignee);
-  if (fromState && (fromState.agentId || fromState.userId)) return fromState;
   const policy = readState(issue.executionPolicy);
   const declared = policy?.returnAssigneeAgentId;
-  return typeof declared === "string" && declared ? { type: "agent", agentId: declared, userId: null } : null;
+  if (typeof declared === "string" && declared) return { type: "agent", agentId: declared, userId: null };
+  const state = readState(issue.executionState);
+  const fromState = readPrincipal(state?.returnAssignee);
+  return fromState && (fromState.agentId || fromState.userId) ? fromState : null;
 }
 
 /**
@@ -180,13 +187,15 @@ export function stageHeldElsewhereNextAction(
 ): string {
   const stageName = stage.stageType ? `${stage.stageType} stage` : "stage";
   if (seat === "currentParticipant") {
-    // The holder reaches this refusal only with a non-verdict write: an
-    // assignee-only PATCH, or in_review plus an assignee (its decision branch
-    // handles done, blocked and every other status).
+    // The holder reaches this refusal only with an assignee write naming someone
+    // else, alone or with in_review (its decision branch handles done, blocked
+    // and every other status). Its in_review with no assignee is not a stage
+    // advance: it is accepted, its inline comment lands, and the stage stays.
     return (
       `Your seat (currentParticipant) holds this ${stageName}, and only your decision moves it: ` +
       "done with a comment approves; todo, in_progress or cancelled with a comment requests changes; " +
-      "blocked with a comment parks it. An assignee-only write or a non-verdict in_review write is refused. " +
+      "blocked with a comment parks it. An assignee write naming anyone but you (alone or with in_review) is refused; " +
+      "an in_review write without one is accepted and does not move the stage. " +
       "Do not hand the card away."
     );
   }
@@ -216,9 +225,16 @@ export const SELF_GATED_ATTACH_TIME_REMEDY =
   "Give the stage a participant that is not the return assignee, or change the return assignee. " +
   "Never drop the stage to make this pass.";
 
-/** 422 "Execution policy stage <n> (<type>) is gated solely by its own return assignee ...". */
-export function selfGatedNextAction(seat: CallerSeat, ctx: { ladderHasRun: boolean }): string {
-  if (!ctx.ladderHasRun) return SELF_GATED_ATTACH_TIME_REMEDY;
+/**
+ * 422 "Execution policy stage <n> (<type>) is gated solely by its own return assignee ...".
+ * A board user keeps the payload fix on a ladder that has run too: a board
+ * rearmExecutionPolicy is one of the board's own close-ladder levers.
+ */
+export function selfGatedNextAction(
+  seat: CallerSeat,
+  ctx: { ladderHasRun: boolean; boardActor?: boolean },
+): string {
+  if (!ctx.ladderHasRun || ctx.boardActor) return SELF_GATED_ATTACH_TIME_REMEDY;
   return (
     "This issue's ladder has already run, so this is not a payload fix: changing a participant or the return " +
     `assignee now to pass this check games the gate, from any seat (yours: ${seat}). Never drop the stage. ` +
