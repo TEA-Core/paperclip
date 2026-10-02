@@ -298,6 +298,11 @@ const QUERY_PASSES: SqlCase[] = [
   { name: "a set-returning function in FROM", sql: "SELECT n FROM generate_series(1, 3) AS n" },
   { name: "a function whose name only starts with a denied name", sql: "SELECT plugin_x.set_config_cache(1)" },
   { name: "a function whose name only ends with a denied name", sql: "SELECT plugin_x.reset_set_config(1)" },
+  // The deny-list matches the whole last part of a function name, not a prefix, a suffix or a column name.
+  { name: "a namespace function whose name contains ts_rewrite", sql: "SELECT plugin_x.my_ts_rewrite_helper('a')" },
+  { name: "a column named ts_rewrite", sql: "SELECT t.ts_rewrite, ts_rewrite FROM plugin_x.t t" },
+  { name: "pg_relation_filenode, which is not the denied pg_relation_filepath", sql: "SELECT pg_relation_filenode('plugin_x.t')" },
+  { name: "pg_tablespace_size, which is not the denied pg_tablespace_location", sql: "SELECT pg_tablespace_size('pg_default')" },
   { name: "an outer CTE read from the main body of a subquery that has its own WITH", sql: "WITH a AS (SELECT 1 AS id) SELECT * FROM (WITH x AS (SELECT 2 AS id) SELECT a.id FROM a, x) s" },
   { name: "a CTE read from a nested WITH inside another CTE body", sql: "WITH a AS (SELECT 1 AS id), b AS (WITH c AS (SELECT id FROM a) SELECT id FROM c) SELECT id FROM b" },
   // The deny-list is a fixed list of names, not a function policy. These three stay allowed on purpose;
@@ -374,6 +379,7 @@ const EXECUTE_PASSES: SqlCase[] = [
   { name: "UPDATE ... FROM the namespace", sql: "UPDATE plugin_x.t SET v = s.v FROM plugin_x.s s WHERE s.id = t.id" },
   { name: "DELETE ... USING the namespace", sql: "DELETE FROM plugin_x.t USING plugin_x.s s WHERE s.id = t.id RETURNING t.id" },
   { name: "a trailing semicolon", sql: "DELETE FROM plugin_x.t WHERE id = $1;" },
+  { name: "a column named ts_rewrite", sql: "UPDATE plugin_x.t SET ts_rewrite = $1 WHERE id = $2" },
 ];
 
 const MIGRATION_REJECTS: SqlCase[] = [
@@ -488,6 +494,7 @@ const MIGRATION_PASSES: SqlCase[] = [
   { name: "ALTER TABLE ... VALIDATE CONSTRAINT", sql: "ALTER TABLE plugin_test.rows VALIDATE CONSTRAINT rows_issue_fk" },
   { name: "DROP COLUMN inside the namespace", sql: "ALTER TABLE plugin_test.rows DROP COLUMN label" },
   { name: "a trailing semicolon", sql: "CREATE TABLE plugin_test.rows (id uuid PRIMARY KEY);" },
+  { name: "a column named ts_rewrite", sql: "CREATE TABLE plugin_test.t (id uuid PRIMARY KEY, ts_rewrite text)" },
   { name: "a namespace view over namespace tables", sql: "CREATE VIEW plugin_test.v AS SELECT r.id FROM plugin_test.rows r JOIN plugin_test.source_rows s ON s.id = r.id" },
   { name: "a namespace view with its own CTE", sql: "CREATE VIEW plugin_test.v AS WITH a AS (SELECT id FROM plugin_test.rows) SELECT id FROM a" },
   { name: "a column default that calls nextval", sql: "CREATE TABLE plugin_test.t (n bigint DEFAULT nextval('plugin_test.t_seq'))" },
