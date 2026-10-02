@@ -142,8 +142,9 @@ open a second PR for the same connection accidentally.
    package and any tightly coupled content-playbook correction, but no
    Paperclip App implementation.
 6. Run focused validation and the required PR workflow. Do not present the gate
-   until checks are green, Greptile is 5/5, all actionable review comments are
-   resolved, and the recorded PR head still matches the reviewed head.
+   until checks are green, CodeRabbit is green on the current head, all
+   actionable review comments are resolved, and the recorded PR head still
+   matches the reviewed head.
 
 ## Gate Research Before Building
 
@@ -196,7 +197,8 @@ its commit before writing code. For each accepted connection:
    evidence.
 7. Run the standard PR-preparation workflow for this connector PR. Do not hand
    it back for merge until focused verification passes, all required checks are
-   green, Greptile is 5/5, and every actionable comment is resolved.
+   green, CodeRabbit is green on the current head, and every actionable comment
+   is resolved.
 
 Complete and report each connection independently. Failure or review delay on
 one connection must not cause another connection to be bundled into its PR.
