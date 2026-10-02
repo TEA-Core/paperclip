@@ -5,10 +5,11 @@ import {
   formatOpenCodeSkillExposureLine,
 } from "./exposure-line.js";
 
-// Frozen contract for the per-run exposure line (PR-6 c, format v2).
-// Run-log readers (the jev-governor plugin's "could load" parser and its
-// prune monitor) copy these regexes, the reader below and the frozen strings
-// into their own golden tests. A change to any of them breaks those readers.
+// Frozen contract for the per-run exposure line (format v2).
+// Run-log readers (for example a plugin that parses run logs to learn which
+// skills a run could load, or a monitor that compares counts between runs)
+// copy these regexes, the reader below and the frozen strings into their own
+// golden tests. A change to any of them breaks those readers.
 const EXPOSURE_LINE_V2 =
   /^\[paperclip\] skillIsolation=(shared|desired-only): run exposes (\d+) skill\(s\) via (shared skills home|per-run HOME) (.+) names=([^ ]*)(?: \+(\d+) more)?$/;
 // Fallback for a line that starts like an exposure line but fails v2 (reader rule R6).

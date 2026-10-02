@@ -96,7 +96,7 @@ describe("compactRunLogChunk composed with redactSecretTokens", () => {
   });
 });
 
-describe("opencode exposure line on the persisted run-log path (PR-6 c)", () => {
+describe("opencode exposure line on the persisted run-log path", () => {
   // The heartbeat onLog persists redactSecretTokens(compactRunLogChunk(
   // redactCurrentUserText(chunk, { enabled: censorUsernameInLogs }))), and the
   // run-log store applies redactSecretTokens once more on append.

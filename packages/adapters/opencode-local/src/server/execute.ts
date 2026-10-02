@@ -737,7 +737,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
   // One line per run naming the skill mode, how many skills it exposes
-  // (SUP-17881) and their sorted names (PR-6), so the union-vs-desired-only
+  // (SUP-17881) and their sorted names, so the union-vs-desired-only
   // cost of every run and the shared home's membership are readable from the
   // run log. The format is a frozen contract: see exposure-line.ts.
   if (!executionTargetIsRemote) {

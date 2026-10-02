@@ -1,7 +1,7 @@
 import type { OpenCodeSkillIsolationMode } from "./skills.js";
 
 /**
- * The per-run exposure line, format v2 (PR-6 c). It is a frozen run-log
+ * The per-run exposure line, format v2. It is a frozen run-log
  * contract: run-log readers parse it to learn which skills a run could load,
  * and a prune monitor compares N between runs. Change it only together with
  * those readers.

@@ -416,7 +416,7 @@ describe("OpenCode local skillIsolation=desired-only", () => {
   });
 });
 
-describe("OpenCode local exposure line names the exposed skills (PR-6 c)", () => {
+describe("OpenCode local exposure line names the exposed skills", () => {
   async function runAndCaptureLogs(input: {
     root: string;
     runId: string;

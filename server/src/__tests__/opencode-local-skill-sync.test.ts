@@ -47,7 +47,7 @@ describe("opencode local skill sync", () => {
   });
 });
 
-// PR-6 (b): a skill sync never prunes the shared skills home.
+// Shared callers: a skill sync never prunes the shared skills home.
 
 const SHARED_REMOVE_WARNING =
   "Removing a skill updates this agent's desired skills only. Its link stays in the shared skills home, where other agents can still load it, until an operator cleans the home.";
@@ -95,7 +95,7 @@ async function makePruneFixture(cleanupDirs: Set<string>) {
   return { home, skillsHome: path.join(home, ".claude", "skills"), runtimeSkills, ctxFor };
 }
 
-describe("opencode local skill sync: shared callers link only (PR-6 b)", () => {
+describe("opencode local skill sync: shared callers link only", () => {
   const cleanupDirs = new Set<string>();
 
   afterEach(async () => {
@@ -131,12 +131,12 @@ describe("opencode local skill sync: shared callers link only (PR-6 b)", () => {
   });
 });
 
-// PR-6 (a): a desired-only caller never reads or writes the shared skills home.
+// Desired-only callers: a sync never reads or writes the shared skills home.
 
 const DESIRED_ONLY_STAGED_DETAIL =
   "Staged per run (desired-only): linked into the run's private HOME when each local run starts. The shared skills home is not used.";
 
-describe("opencode local skill sync: desired-only callers never touch the shared home (PR-6 a)", () => {
+describe("opencode local skill sync: desired-only callers never touch the shared home", () => {
   const cleanupDirs = new Set<string>();
   const desiredOnly = { skillIsolation: "desired-only" };
 
