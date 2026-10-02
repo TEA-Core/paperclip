@@ -9,6 +9,14 @@ import {
   trustPresetSchema,
 } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import {
+  type RefusalCaller,
+  type RefusalIssue,
+  resolveCallerSeat,
+  SELF_GATED_ATTACH_TIME_REMEDY,
+  selfGatedLadderHasRun,
+  selfGatedNextAction,
+} from "./seat-authority-refusal.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -26,6 +34,14 @@ export type AssertIssueExecutionPolicySatisfiableInput = {
    * assignee in hand — the guard then degrades to the declared field alone.
    */
   assigneeAgentId?: string | null;
+  /**
+   * Board ruling 2026-10-02 (F1): who is writing, and the issue as stored before
+   * this write (`issue: null` on create). When present, a self-gated refusal
+   * carries `details.callerSeat` / `details.nextAction` and, on a ladder that has
+   * already run, replaces the attach-time remedy with the terminal next action.
+   * Absent (plugin host, internal callers) the refusal is unchanged.
+   */
+  refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 };
 
 /**
@@ -59,6 +75,7 @@ export type AssertIssueExecutionPolicySatisfiableInput = {
 export function assertIssueExecutionPolicyGatesAreEnforceable(
   executionPolicy: unknown,
   assigneeAgentId?: string | null,
+  refusalContext?: AssertIssueExecutionPolicySatisfiableInput["refusalContext"],
 ): void {
   if (executionPolicy == null || typeof executionPolicy !== "object") return;
   const policy = executionPolicy as {
@@ -92,19 +109,45 @@ export function assertIssueExecutionPolicyGatesAreEnforceable(
       ? "executionPolicy.returnAssigneeAgentId"
       : "the issue's own assigneeAgentId (returnAssigneeAgentId is unset, so the runtime seeds the "
         + "return assignee from the assignee at transition time)";
-    throw unprocessable(
+    // The diagnosis is the byte-identical prefix agent doctrine quotes; the tail
+    // is the remedy. Board ruling 2026-10-02 (F1): with a refusal context the
+    // tail is seat- and ladder-aware. At attach time it is the existing remedy
+    // (the one lawful payload fix); on a ladder that has run it is terminal for
+    // every seat, because moving a participant or the return assignee then only
+    // games the gate (the a37e3e65 / SUP-18002 re-point).
+    const diagnosis =
       `Execution policy stage ${index} (${stageType}) is gated solely by its own return assignee `
       + `${returnAssigneeAgentId}, taken from ${sourceDescription}; the return assignee is excluded `
-      + "from participant selection, so the stage could never be decided by anyone else. Give the "
-      + "stage a participant that is not the return assignee, or change the return assignee. Never "
-      + "drop the stage to make this pass.",
-      { stageIndex: index, stageType, returnAssigneeAgentId, returnAssigneeSource },
-    );
+      + "from participant selection, so the stage could never be decided by anyone else.";
+    if (!refusalContext) {
+      throw unprocessable(`${diagnosis} ${SELF_GATED_ATTACH_TIME_REMEDY}`, {
+        stageIndex: index,
+        stageType,
+        returnAssigneeAgentId,
+        returnAssigneeSource,
+      });
+    }
+    const callerSeat = resolveCallerSeat(refusalContext.caller, refusalContext.issue);
+    const ladderHasRun = selfGatedLadderHasRun(refusalContext.issue?.executionState ?? null);
+    const nextAction = selfGatedNextAction(callerSeat, { ladderHasRun });
+    throw unprocessable(`${diagnosis} ${nextAction}`, {
+      stageIndex: index,
+      stageType,
+      returnAssigneeAgentId,
+      returnAssigneeSource,
+      callerSeat,
+      ladderHasRun,
+      nextAction,
+    });
   });
 }
 
 export function assertIssueExecutionPolicySatisfiable(input: AssertIssueExecutionPolicySatisfiableInput): void {
-  assertIssueExecutionPolicyGatesAreEnforceable(input.executionPolicy, input.assigneeAgentId ?? null);
+  assertIssueExecutionPolicyGatesAreEnforceable(
+    input.executionPolicy,
+    input.assigneeAgentId ?? null,
+    input.refusalContext,
+  );
   const resolution = resolveCoreTrustPreset({
     companyId: input.companyId,
     issue: {

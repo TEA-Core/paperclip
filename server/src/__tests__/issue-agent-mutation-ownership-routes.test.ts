@@ -2137,10 +2137,50 @@ describe("agent issue mutation checkout ownership", () => {
         .send(patch);
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toBe(
-        "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
-      );
+      // Board ruling 2026-10-02 (F1 server half): the prefix is byte-identical
+      // (agent doctrine quotes it); the seat-specific next action follows it.
+      expect(
+        res.body.error.startsWith(
+          "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections. ",
+        ),
+      ).toBe(true);
       expect(res.body.details.forbiddenFields).toContain(_field);
+      expect(res.body.details.callerSeat).toBe("ancestor-hatch");
+      expect(res.body.details.nextAction).toContain("Your seat (ancestor-hatch) cannot write");
+      expect(res.body.details.nextAction).toContain("re-sending the write without them does not reach the outcome");
+      expect(res.body.details.nextAction).toContain("ask the board");
+      expect(res.body.error).toContain(res.body.details.nextAction);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("on a card with a live stage, tells the hatch caller no write from its seat moves the stage", async () => {
+      const stageId = "77777777-7777-4777-8777-777777777777";
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_review",
+          assigneeAgentId: ownerAgentId,
+          executionState: {
+            status: "pending",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "approval",
+            currentParticipant: { type: "agent", agentId: ownerAgentId, userId: null },
+            returnAssignee: null,
+            completedStageIds: [],
+            skippedStageIds: [],
+          },
+        }),
+      );
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Approved." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.forbiddenFields).toEqual(["comment"]);
+      expect(res.body.details.callerSeat).toBe("ancestor-hatch");
+      expect(res.body.details.nextAction).toContain("live approval stage");
+      expect(res.body.details.nextAction).toContain(`agent ${ownerAgentId}`);
+      expect(res.body.details.nextAction).toContain("with or without comment");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
@@ -2150,10 +2190,13 @@ describe("agent issue mutation checkout ownership", () => {
         .send({ reviewRequest: { instructions: "Please approve" } });
 
       expect(res.status).toBe(403);
-      expect(res.body.error).toBe(
-        "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
-      );
+      expect(
+        res.body.error.startsWith(
+          "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
+        ),
+      ).toBe(true);
       expect(res.body.details.forbiddenFields).toContain("reviewRequest");
+      expect(res.body.details.callerSeat).toBe("ancestor-hatch");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });

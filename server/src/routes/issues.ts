@@ -383,6 +383,16 @@ import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slot
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
+  ancestorHatchNextAction,
+  liveStageOf,
+  mechanismDBoardNote,
+  mechanismDNextAction,
+  type CallerSeat,
+  type RefusalCaller,
+  type RefusalIssue,
+  resolveCallerSeat,
+} from "../services/seat-authority-refusal.js";
+import {
   isAgentDefaultProjectWorkspacePair,
   parseIssueExecutionWorkspaceSettings,
 } from "../services/execution-workspace-policy.js";
@@ -4218,6 +4228,8 @@ export function issueRoutes(
       error: string;
       remedy: string;
       runId: string | null;
+      /** Board ruling 2026-10-02 (F1): the refusing caller's seat, so the record says whose remedy it is. */
+      callerSeat?: CallerSeat;
     },
   ): Promise<void> {
     const marker = `${TERMINAL_STATUS_REFUSAL_MARKER} ${input.code}`;
@@ -4240,6 +4252,7 @@ export function issueRoutes(
       `Reason: ${input.error}`,
       `Remedy: ${input.remedy}`,
     ];
+    if (input.callerSeat) lines.push(`Caller seat: ${input.callerSeat}`);
     if (input.runId) lines.push(`Refusing run: ${input.runId}`);
     // Fail-closed (SUP-15878 precedent, SUP-17125): the thread record is the surface the
     // NEXT run reads, so persisting it is part of the refusal guarantee. A failure to
@@ -4721,6 +4734,17 @@ export function issueRoutes(
     }
   };
 
+  // Board ruling 2026-10-02 (F1): the writer as a seat-authority refusal sees it.
+  // Create paths have no stored issue yet, so a self-gated refusal there is
+  // always the attach-time payload error with its one lawful fix.
+  function createRefusalCaller(req: Request): RefusalCaller {
+    const info = getActorInfo(req);
+    return {
+      agentId: info.agentId ?? null,
+      userId: info.actorType === "user" ? info.actorId : null,
+    };
+  }
+
   type DoneTransitionGuardOutcome =
     | { ok: true }
     | { ok: false; status: number; body: Record<string, unknown> };
@@ -4753,8 +4777,12 @@ export function issueRoutes(
     // requirement is bypassed, but an audit row is written so board closes stay
     // countable in the ghost-PASS census. The delivery guard still applies in full.
     boardActor: boolean;
+    // Board ruling 2026-10-02 (F1): the writer, so a mechanism D refusal can name
+    // the caller's seat and give it a seat-specific next action. Optional: a door
+    // that passes none keeps the seat-blind body.
+    caller?: RefusalCaller;
   }): Promise<DoneTransitionGuardOutcome> {
-    const { issue, override, commentBody, runId, decisionCarried, boardActor } = input;
+    const { issue, override, commentBody, runId, decisionCarried, boardActor, caller } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
     if (guardResult.skipped || guardResult.skipReason) {
@@ -4796,21 +4824,42 @@ export function issueRoutes(
             : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
           : guardResult.remedy ??
             "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
+      // Board ruling 2026-10-02 (F1 server half): mechanism D is a seat-authority
+      // refusal. The ADR-103 remedy (re-parent / declare process / add stages
+      // while the pointer has not advanced) is kept verbatim only for the
+      // assignee holding no live stage. Every other seat — including the
+      // approver holding the live stage, who is also the in_review assignee —
+      // gets the byte-identical diagnosis prefix followed by "you cannot repair
+      // this ladder: record the refusal on a card you own and ask the board".
+      // A board caller keeps the remedy and is reminded it holds the levers.
+      let refusalError = guardResult.reason;
+      let refusalRemedy = remedy;
+      let callerSeat: CallerSeat | undefined;
+      if (mechanism === "D" && caller) {
+        callerSeat = resolveCallerSeat(caller, issue as unknown as RefusalIssue);
+        if (boardActor) {
+          refusalRemedy = `${remedy} ${mechanismDBoardNote()}`;
+        } else if (callerSeat !== "assignee") {
+          refusalRemedy = mechanismDNextAction(callerSeat);
+          refusalError = `${guardResult.diagnosis ?? guardResult.reason} ${refusalRemedy}`;
+        }
+      }
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 409 with no thread-readable code/remedy (SUP-15878 precedent).
       await postTerminalStatusRefusalComment(svc, issue.id, {
         httpStatus: 409,
         code: "done_transition_missing_delivery",
-        error: guardResult.reason,
-        remedy,
+        error: refusalError,
+        remedy: refusalRemedy,
         runId,
+        callerSeat,
       });
       return {
         ok: false,
         status: 409,
         body: {
-          error: guardResult.reason,
+          error: refusalError,
           code: "done_transition_missing_delivery",
           details: {
             issueId: issue.id,
@@ -4828,7 +4877,8 @@ export function issueRoutes(
             mechanism,
             ladderedChildIdentifiers: guardResult.ladderedChildIdentifiers ?? null,
             excludedChildIdentifiers: guardResult.excludedChildIdentifiers ?? null,
-            remedy,
+            remedy: refusalRemedy,
+            ...(callerSeat ? { callerSeat, nextAction: refusalRemedy } : {}),
           },
         },
       };
@@ -15045,6 +15095,10 @@ export function issueRoutes(
         companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        refusalContext: {
+          caller: createRefusalCaller(req),
+          issue: { assigneeAgentId: normalizedAssigneeAgentRef.id ?? null, executionState: null },
+        },
       });
       await assertExecutionPolicyAgentReferencesResolve({
         companyId,
@@ -15833,6 +15887,10 @@ export function issueRoutes(
         companyId: parent.companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        refusalContext: {
+          caller: createRefusalCaller(req),
+          issue: { assigneeAgentId: normalizedAssigneeAgentRef.id ?? null, executionState: null },
+        },
       });
       await assertExecutionPolicyAgentReferencesResolve({
         companyId: parent.companyId,
@@ -16083,6 +16141,13 @@ export function issueRoutes(
           executionPolicy: normalizedExecutionPolicy,
           assigneeAgentId:
             (child.assigneeAgentId as string | null | undefined) ?? null,
+          refusalContext: {
+            caller: createRefusalCaller(req),
+            issue: {
+              assigneeAgentId: (child.assigneeAgentId as string | null | undefined) ?? null,
+              executionState: null,
+            },
+          },
         });
         await assertExecutionPolicyAgentReferencesResolve({
           companyId: sourceIssue.companyId,
@@ -16689,14 +16754,29 @@ export function issueRoutes(
         (k) => !ANCESTOR_ALLOWED_FIELDS.has(k) && !ANCESTOR_WORKSPACE_CORRECTION_FIELDS.has(k),
       );
       if (forbidden.length > 0) {
+        // Board ruling 2026-10-02 (F1 server half): caller-aware. The prefix is
+        // byte-identical (agent doctrine quotes it); the next action says that
+        // dropping the forbidden fields does not change the seat, and that a
+        // live stage is not movable from the hatch at all (1c85903c, SUP-18200).
+        const liveStage = liveStageOf(existing as unknown as RefusalIssue);
+        const nextAction = ancestorHatchNextAction({ forbiddenFields: forbidden, liveStage });
         res.status(403).json({
-          error: "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
-          details: { forbiddenFields: forbidden },
+          error: `Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections. ${nextAction}`,
+          details: { forbiddenFields: forbidden, callerSeat: "ancestor-hatch", nextAction },
         });
         return;
       }
     }
+    const writeViaAncestorHatch =
+      mutationAccess !== true &&
+      typeof mutationAccess === "object" &&
+      mutationAccess.reason === "allow_manager_chain";
     const actor = getActorInfo(req);
+    const refusalCaller: RefusalCaller = {
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      viaAncestorHatch: writeViaAncestorHatch,
+    };
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
     const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
@@ -17068,6 +17148,7 @@ export function issueRoutes(
         companyId: existing.companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: requestedAssigneeAgentId ?? null,
+        refusalContext: { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
       });
       await assertExecutionPolicyAgentReferencesResolve({
         companyId: existing.companyId,
@@ -17094,6 +17175,7 @@ export function issueRoutes(
         executionPolicy: nextExecutionPolicy,
         executionState: existing.executionState,
         incomingAssigneeAgentId: normalizedAssigneeAgentId,
+        refusalContext: { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
       });
     }
     if (updateFields.executionPolicy !== undefined) {
@@ -17294,6 +17376,7 @@ export function issueRoutes(
         userId: actor.actorType === "user" ? actor.actorId : null,
       },
       allowBoardOverride: req.actor.type === "board",
+      actorViaAncestorHatch: writeViaAncestorHatch,
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
@@ -17724,6 +17807,7 @@ export function issueRoutes(
         runId: actor.runId ?? null,
         decisionCarried: !!transition.decision,
         boardActor: req.actor.type === "board",
+        caller: refusalCaller,
       });
       if (!outcome.ok) {
         res.status(outcome.status).json(outcome.body);
@@ -20767,6 +20851,10 @@ export function issueRoutes(
           runId: actor.runId ?? null,
           decisionCarried: true,
           boardActor: req.actor.type === "board",
+          caller: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
         });
         if (!closeOutcome.ok) {
           res.status(closeOutcome.status).json(closeOutcome.body);
@@ -22480,6 +22568,10 @@ export function issueRoutes(
           runId: actor.runId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
+          caller: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
         });
         if (!outcome.ok) {
           res.status(outcome.status).json(outcome.body);
