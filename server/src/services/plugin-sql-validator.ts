@@ -166,6 +166,31 @@ function parseSingleStatement(sqlText: string, countError: string): ParsedStatem
   return { kind, node };
 }
 
+/**
+ * Splits a migration file into the exact statements to validate and run. It uses
+ * the parser's own statement boundaries, so a semicolon inside a dollar quote, an
+ * E'' string or a comment never splits a statement. The parser reports UTF-8 byte
+ * offsets, so the slices are cut from the file's bytes.
+ *
+ * The caller must validate and run each returned string as it is. Each one is a
+ * trimmed slice of the file, taken after any leading byte order mark. The statement
+ * validators still re-parse it and reject anything that is not exactly one statement.
+ */
+export function splitPluginMigrationSql(fileSql: string): string[] {
+  // A leading byte order mark is not SQL: the parser reads it as part of the first word.
+  const text = fileSql.startsWith("\uFEFF") ? fileSql.slice(1) : fileSql;
+  if (text.trim() === "") return [];
+  const statements = parseRawStatements(text);
+  const bytes = Buffer.from(text, "utf8");
+  return statements
+    .map((entry) => {
+      const start = entry.stmt_location ?? 0;
+      const end = entry.stmt_len ? start + entry.stmt_len : bytes.length;
+      return bytes.subarray(start, end).toString("utf8").trim();
+    })
+    .filter((statement) => statement.length > 0);
+}
+
 function stripSqlForKeywordScan(input: string): string {
   return input
     .replace(/'([^']|'')*'/g, "''")

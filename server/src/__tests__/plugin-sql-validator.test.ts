@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { PluginDatabaseCoreReadTable } from "@paperclipai/shared";
 import {
   loadPluginSqlParser,
+  splitPluginMigrationSql,
   validatePluginMigrationStatement,
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
@@ -604,5 +605,175 @@ describe("plugin SQL validator: parser loading", () => {
     expect(() => fresh.validatePluginMigrationStatement("CREATE TABLE plugin_x.t (id int)", "plugin_x")).toThrow(/not loaded/);
     await fresh.loadPluginSqlParser();
     expect(() => fresh.validatePluginRuntimeQuery("SELECT id FROM plugin_x.t", "plugin_x")).not.toThrow();
+  });
+});
+
+describe("plugin SQL validator: migration split", () => {
+  it("splits on statement boundaries when comments hold multi-byte text", () => {
+    const file = "-- naïve — header\nCREATE TABLE plugin_x.a (id int);\n/* café 🚀 */\nCREATE TABLE plugin_x.b (id int);\n";
+    expect(splitPluginMigrationSql(file)).toEqual([
+      "-- naïve — header\nCREATE TABLE plugin_x.a (id int)",
+      "/* café 🚀 */\nCREATE TABLE plugin_x.b (id int)",
+    ]);
+  });
+
+  it("keeps a dollar-quoted semicolon inside its statement", () => {
+    const file = "COMMENT ON TABLE plugin_x.a IS $$a;b$$;\nCREATE INDEX a_idx ON plugin_x.a (id);";
+    expect(splitPluginMigrationSql(file)).toEqual([
+      "COMMENT ON TABLE plugin_x.a IS $$a;b$$",
+      "CREATE INDEX a_idx ON plugin_x.a (id)",
+    ]);
+  });
+
+  it("returns no statements for an empty or comment-only file", () => {
+    expect(splitPluginMigrationSql("")).toEqual([]);
+    expect(splitPluginMigrationSql("  \n")).toEqual([]);
+    expect(splitPluginMigrationSql("-- only a comment\n")).toEqual([]);
+  });
+
+  it("rejects a file that does not parse", () => {
+    expect(() => splitPluginMigrationSql("CREATE TABLE plugin_x.a (")).toThrow(/does not parse/);
+  });
+
+  it("splits a file that starts with a byte order mark", () => {
+    expect(splitPluginMigrationSql("\uFEFFCREATE TABLE plugin_x.a (id int);\nCREATE TABLE plugin_x.b (id int);")).toEqual([
+      "CREATE TABLE plugin_x.a (id int)",
+      "CREATE TABLE plugin_x.b (id int)",
+    ]);
+  });
+
+  describe("a semicolon that is not a statement boundary", () => {
+    const NEXT = "CREATE INDEX a_idx ON plugin_x.a (id)";
+    const cases: Array<{ name: string; statement: string }> = [
+      { name: "an untagged dollar-quoted body", statement: "DO $$ BEGIN PERFORM 1; PERFORM 2; END $$" },
+      { name: "a tagged dollar-quoted body", statement: "COMMENT ON TABLE plugin_x.a IS $body$one; two; three$body$" },
+      {
+        name: "a tagged dollar-quoted body that holds a different dollar quote",
+        statement: "COMMENT ON TABLE plugin_x.a IS $outer$ $$ ; $$ $inner$ ; $inner$ $outer$",
+      },
+      { name: "a line comment", statement: "CREATE TABLE plugin_x.a (id int, -- one; two\n name text)" },
+      { name: "a block comment", statement: "CREATE TABLE plugin_x.a (id int /* one; two */, name text)" },
+      { name: "a nested block comment", statement: "CREATE TABLE plugin_x.a (id int /* one /* two; */ three; */, name text)" },
+      { name: "a string literal", statement: "COMMENT ON TABLE plugin_x.a IS 'one; two'" },
+      { name: "a string literal with a doubled quote", statement: "COMMENT ON TABLE plugin_x.a IS 'it''s; here'" },
+      { name: "an escape string with a backslash-escaped quote", statement: "COMMENT ON TABLE plugin_x.a IS E'it\\'s; here'" },
+      { name: "a quoted identifier", statement: 'CREATE TABLE plugin_x."a;b" (id int)' },
+      { name: "a string literal after multi-byte text", statement: "COMMENT ON TABLE plugin_x.a IS '🚀 café; naïve'" },
+    ];
+
+    it.each(cases)("does not split on a semicolon inside $name", ({ statement }) => {
+      expect(splitPluginMigrationSql(`${statement};\n${NEXT};`)).toEqual([statement, NEXT]);
+      expect(splitPluginMigrationSql(`${NEXT};\n${statement}`)).toEqual([NEXT, statement]);
+      expect(splitPluginMigrationSql(statement)).toEqual([statement]);
+    });
+
+    it("still rejects a disallowed statement whose body holds a semicolon", () => {
+      const [fragment] = splitPluginMigrationSql(`DO $$ BEGIN PERFORM 1; END $$;\n${NEXT};`);
+      expect(fragment).toBe("DO $$ BEGIN PERFORM 1; END $$");
+      expect(() => validatePluginMigrationStatement(fragment!, "plugin_x")).toThrow(/disallowed/i);
+    });
+  });
+
+  describe("a statement that follows the end of a quoted region", () => {
+    // A hand splitter reads the apostrophe inside the dollar quote as the start of a string,
+    // so it never sees the statements after it. The parser does.
+    const AFTER_DOLLAR_QUOTE = [
+      "COMMENT ON TABLE plugin_x.a IS $$ ' $$;",
+      "DROP TABLE plugin_x.a;",
+      "COMMENT ON TABLE plugin_x.a IS ' $$'",
+    ].join("\n");
+
+    it("returns a statement that follows a dollar-quote end as its own statement", () => {
+      expect(splitPluginMigrationSql(AFTER_DOLLAR_QUOTE)).toEqual([
+        "COMMENT ON TABLE plugin_x.a IS $$ ' $$",
+        "DROP TABLE plugin_x.a",
+        "COMMENT ON TABLE plugin_x.a IS ' $$'",
+      ]);
+    });
+
+    it("validates each fragment, so a statement after a dollar-quote end is rejected when it is disallowed", () => {
+      const fragments = splitPluginMigrationSql(AFTER_DOLLAR_QUOTE);
+      expect(() => validatePluginMigrationStatement(fragments[0]!, "plugin_x")).not.toThrow();
+      expect(() => validatePluginMigrationStatement(fragments[1]!, "plugin_x")).toThrow(/Destructive/i);
+      expect(() => validatePluginMigrationStatement(fragments[2]!, "plugin_x")).not.toThrow();
+    });
+
+    it.each([
+      { name: "a table outside the plugin namespace", statement: "CREATE TABLE public.escape (id int)", reason: /public/i },
+      { name: "a delete", statement: "DELETE FROM plugin_x.a", reason: /cannot delete/i },
+      { name: "a grant", statement: "GRANT ALL ON plugin_x.a TO PUBLIC", reason: /disallowed/i },
+      {
+        name: "a function that runs SQL text",
+        statement: "INSERT INTO plugin_x.a (id) SELECT query_to_xml('select 1', true, false, '')",
+        reason: /cannot call query_to_xml/i,
+      },
+    ])("rejects $name that follows a dollar-quote end", ({ statement, reason }) => {
+      const file = `COMMENT ON TABLE plugin_x.a IS $$ ' $$;\n${statement};\nCOMMENT ON TABLE plugin_x.a IS ' $$'`;
+      const fragments = splitPluginMigrationSql(file);
+      expect(fragments).toHaveLength(3);
+      expect(fragments[1]).toBe(statement);
+      expect(() => validatePluginMigrationStatement(fragments[1]!, "plugin_x")).toThrow(reason);
+    });
+
+    it("returns a statement that follows a comment, a string and a quoted identifier as its own statement", () => {
+      const file = [
+        "COMMENT ON TABLE plugin_x.a IS 'x'; -- ; DROP TABLE plugin_x.a",
+        "/* ; */ DROP TABLE plugin_x.b;",
+        'CREATE TABLE plugin_x."c;" (id int);',
+      ].join("\n");
+      expect(splitPluginMigrationSql(file)).toEqual([
+        "COMMENT ON TABLE plugin_x.a IS 'x'",
+        "-- ; DROP TABLE plugin_x.a\n/* ; */ DROP TABLE plugin_x.b",
+        'CREATE TABLE plugin_x."c;" (id int)',
+      ]);
+    });
+  });
+
+  describe("the validated text is the executed text", () => {
+    const files: Array<{ name: string; file: string }> = [
+      { name: "plain statements", file: "CREATE TABLE plugin_x.a (id int);\nCREATE TABLE plugin_x.b (id int);\n" },
+      { name: "statements with extra separators and blank space", file: ";;\n\n  CREATE TABLE plugin_x.a (id int) ;  ;\n\t\nCREATE TABLE plugin_x.b (id int)\n;\n" },
+      {
+        name: "dollar quotes, strings and comments",
+        file: "COMMENT ON TABLE plugin_x.a IS $$ ' ; $$;\n-- ; note\nCOMMENT ON TABLE plugin_x.b IS 'a;b'; /* ; */ COMMENT ON TABLE plugin_x.c IS E'a\\';b'",
+      },
+      {
+        name: "multi-byte text before every boundary",
+        file: "-- ünïcödé\nCOMMENT ON TABLE plugin_x.a IS '🚀;';\n-- 日本語\nCOMMENT ON TABLE plugin_x.b IS $$ñ;$$;\nCOMMENT ON TABLE plugin_x.c IS '€'",
+      },
+      { name: "the smuggling shape", file: "COMMENT ON TABLE plugin_x.a IS $$ ' $$;\nDROP TABLE plugin_x.a;\nCOMMENT ON TABLE plugin_x.a IS ' $$'" },
+    ];
+
+    it.each(files)("cuts fragments that are verbatim slices of the file, with only separators between them: $name", ({ file }) => {
+      const fragments = splitPluginMigrationSql(file);
+      expect(fragments.length).toBeGreaterThan(0);
+      let cursor = 0;
+      for (const fragment of fragments) {
+        const at = file.indexOf(fragment, cursor);
+        expect(at).toBeGreaterThanOrEqual(cursor);
+        // Nothing but whitespace and statement separators sits between two fragments.
+        expect(file.slice(cursor, at)).toMatch(/^[\s;]*$/);
+        cursor = at + fragment.length;
+      }
+      expect(file.slice(cursor)).toMatch(/^[\s;]*$/);
+    });
+
+    it.each(files)("cuts fragments that each parse to exactly one statement and split to themselves: $name", ({ file }) => {
+      for (const fragment of splitPluginMigrationSql(file)) {
+        expect((parseSync(fragment).stmts ?? []).length).toBe(1);
+        expect(splitPluginMigrationSql(fragment)).toEqual([fragment]);
+        expect(fragment).toBe(fragment.trim());
+      }
+    });
+
+    it.each(files)("cuts fragments that pass the validator's one-statement check: $name", ({ file }) => {
+      // The validator throws a count error for any text that is not exactly one statement. A
+      // fragment can still be rejected for another reason, such as a DROP, but never for its count.
+      for (const fragment of splitPluginMigrationSql(file)) {
+        expect(() => validatePluginMigrationStatement(fragment, "plugin_x", ["issues"])).not.toThrow(
+          /exactly one statement/,
+        );
+      }
+    });
   });
 });

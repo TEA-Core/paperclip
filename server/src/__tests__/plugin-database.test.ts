@@ -22,6 +22,7 @@ import {
   derivePluginDatabaseNamespace,
   loadPluginSqlParser,
   pluginDatabaseService,
+  splitPluginMigrationSql,
   validatePluginMigrationStatement,
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
@@ -311,6 +312,19 @@ describe("buildPluginWorkerEnv", () => {
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
     });
   });
+});
+
+// Records the text of every migration statement the service validates. Everything else is the real module.
+const validatedMigrationStatements = vi.hoisted(() => [] as string[]);
+vi.mock("../services/plugin-sql-validator.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../services/plugin-sql-validator.js")>();
+  return {
+    ...real,
+    validatePluginMigrationStatement: (...args: Parameters<typeof real.validatePluginMigrationStatement>) => {
+      validatedMigrationStatements.push(args[0]);
+      return real.validatePluginMigrationStatement(...args);
+    },
+  };
 });
 
 describeEmbeddedPostgres("plugin database namespaces", () => {
@@ -664,6 +678,163 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     ).rejects.toThrow();
     const [issue] = await db.select({ title: issues.title }).from(issues).where(eq(issues.id, issueId));
     expect(issue?.title).toBe("Original");
+  });
+
+  it("runs a migration whose dollar-quoted comment holds a semicolon and multi-byte text", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      [
+        `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+        "-- naïve — 🚀",
+        `COMMENT ON TABLE ${namespace}.notes IS $$notes; café$$;`,
+      ].join("\n"),
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+    const [row] = Array.from(
+      (await db.execute(
+        sql.raw(`SELECT obj_description('${namespace}.notes'::regclass, 'pg_class') AS comment`),
+      )) as Iterable<{ comment: string | null }>,
+    );
+    expect(row?.comment).toBe("notes; café");
+  });
+
+  it("records a failed migration when the migration file does not parse", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(pluginManifest, `CREATE TABLE ${namespace}.broken (`);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await expect(
+      pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+    ).rejects.toThrow(/does not parse/);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
+    expect(migration?.errorMessage).toMatch(/does not parse/);
+  });
+
+  /**
+   * Runs applyMigrations on a database handle that records every statement text run inside the
+   * migration transaction. The validator mock at the top of this file records the validated texts.
+   */
+  async function applyMigrationsRecordingStatements(
+    pluginId: string,
+    pluginManifest: PaperclipPluginManifestV1,
+    packageRoot: string,
+  ) {
+    const { PgDialect } = await import("drizzle-orm/pg-core");
+    const dialect = new PgDialect();
+    const executed: string[] = [];
+    const passThrough = (target: object, prop: string | symbol) => {
+      const value: unknown = Reflect.get(target, prop);
+      return typeof value === "function" ? value.bind(target) : value;
+    };
+    const recordingDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop !== "transaction") return passThrough(target, prop);
+        return (callback: (tx: unknown) => Promise<unknown>) =>
+          target.transaction((tx) =>
+            callback(
+              new Proxy(tx, {
+                get(txTarget, txProp) {
+                  if (txProp !== "execute") return passThrough(txTarget, txProp);
+                  return (query: ReturnType<typeof sql.raw>) => {
+                    executed.push(dialect.sqlToQuery(query).sql);
+                    return txTarget.execute(query);
+                  };
+                },
+              }),
+            ),
+          );
+      },
+    });
+    validatedMigrationStatements.length = 0;
+    let failure: unknown;
+    try {
+      await pluginDatabaseService(recordingDb).applyMigrations(pluginId, pluginManifest, packageRoot);
+    } catch (error) {
+      failure = error;
+    }
+    return {
+      validated: [...validatedMigrationStatements],
+      executed: executed.filter((text) => !text.includes("pg_advisory_xact_lock")),
+      failure,
+    };
+  }
+
+  it("executes exactly the statements it validated, byte for byte and in file order", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const file = [
+      "-- naïve — 🚀 ; header",
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY, body text);`,
+      `COMMENT ON TABLE ${namespace}.notes IS $$ ' ; $$;`,
+      "/* ; */",
+      `COMMENT ON COLUMN ${namespace}.notes.body IS 'a;b'`,
+    ].join("\n");
+    const packageRoot = await createPluginPackage(pluginManifest, file);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    const { validated, executed, failure } = await applyMigrationsRecordingStatements(pluginId, pluginManifest, packageRoot);
+
+    expect(failure).toBeUndefined();
+    const fragments = splitPluginMigrationSql(file);
+    expect(fragments).toHaveLength(3);
+    expect(validated).toEqual(fragments);
+    expect(executed).toEqual(fragments);
+  });
+
+  it("validates a statement that follows a dollar-quote end and runs nothing from that statement on", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const file = [
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+      `COMMENT ON TABLE ${namespace}.notes IS $$ ' $$;`,
+      `DROP TABLE ${namespace}.notes;`,
+      `COMMENT ON TABLE ${namespace}.notes IS ' $$'`,
+    ].join("\n");
+    const packageRoot = await createPluginPackage(pluginManifest, file);
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    const { validated, executed, failure } = await applyMigrationsRecordingStatements(pluginId, pluginManifest, packageRoot);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/Destructive plugin migrations/);
+    const fragments = splitPluginMigrationSql(file);
+    expect(fragments).toHaveLength(4);
+    expect(validated).toEqual(fragments.slice(0, 3));
+    expect(executed).toEqual(fragments.slice(0, 2));
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("failed");
+  });
+
+  it("runs a migration file that starts with a byte order mark", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `\uFEFFCREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+
+    await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+    const [migration] = await db
+      .select()
+      .from(pluginMigrations)
+      .where(eq(pluginMigrations.pluginId, pluginId));
+    expect(migration?.status).toBe("applied");
   });
 
   it("rolls back plugin install when migration validation fails", async () => {

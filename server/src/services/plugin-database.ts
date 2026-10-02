@@ -15,6 +15,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   loadPluginSqlParser,
+  splitPluginMigrationSql,
   validatePluginMigrationStatement,
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
@@ -22,6 +23,7 @@ import {
 
 export {
   loadPluginSqlParser,
+  splitPluginMigrationSql,
   validatePluginMigrationStatement,
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
@@ -59,64 +61,6 @@ function assertIdentifier(value: string, label = "identifier"): string {
 
 function quoteIdentifier(value: string): string {
   return `"${assertIdentifier(value).replaceAll("\"", "\"\"")}"`;
-}
-
-function splitSqlStatements(input: string): string[] {
-  const statements: string[] = [];
-  let start = 0;
-  let quote: "'" | "\"" | null = null;
-  let lineComment = false;
-  let blockComment = false;
-
-  for (let i = 0; i < input.length; i += 1) {
-    const char = input[i]!;
-    const next = input[i + 1];
-
-    if (lineComment) {
-      if (char === "\n") lineComment = false;
-      continue;
-    }
-    if (blockComment) {
-      if (char === "*" && next === "/") {
-        blockComment = false;
-        i += 1;
-      }
-      continue;
-    }
-    if (quote) {
-      if (char === quote) {
-        if (next === quote) {
-          i += 1;
-        } else {
-          quote = null;
-        }
-      }
-      continue;
-    }
-    if (char === "-" && next === "-") {
-      lineComment = true;
-      i += 1;
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      blockComment = true;
-      i += 1;
-      continue;
-    }
-    if (char === "'" || char === "\"") {
-      quote = char;
-      continue;
-    }
-    if (char === ";") {
-      const statement = input.slice(start, i).trim();
-      if (statement) statements.push(statement);
-      start = i + 1;
-    }
-  }
-
-  const trailing = input.slice(start).trim();
-  if (trailing) statements.push(trailing);
-  return statements;
 }
 
 function bindSql(statement: string, params: readonly unknown[] = []): SQL {
@@ -314,8 +258,8 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
             continue;
           }
 
-          const statements = splitSqlStatements(content);
           try {
+            const statements = splitPluginMigrationSql(content);
             if (statements.length === 0) {
               throw new Error(`Plugin migration ${migrationKey} is empty`);
             }
