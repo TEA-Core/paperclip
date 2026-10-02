@@ -1261,7 +1261,7 @@ describe("issue execution policy transitions", () => {
       throw new Error("expected the transition to be refused");
     }
 
-    it("the return assignee is told it does not hold the stage, who does, and that the stage returns the card to it", () => {
+    it("the return assignee is told it does not hold the stage, who does, and that a changes_requested decision returns the card to it", () => {
       const err = refusalFor({ agentId: coderAgentId });
       expect(err).toBeInstanceOf(HttpError);
       expect(err.status).toBe(422);
@@ -1272,7 +1272,7 @@ describe("issue execution policy transitions", () => {
       expect(details.callerSeat).toBe("returnAssignee");
       expect(details.nextAction).toContain("Your seat (returnAssignee) does not hold this review stage");
       expect(details.nextAction).toContain(`agent ${qaAgentId} holds it`);
-      expect(details.nextAction).toContain("returns the card to you");
+      expect(details.nextAction).toContain("if it requests changes the card returns to you");
       expect(details.nextAction).toContain("on a card you own");
       expect(err.message).toContain(details.nextAction);
       expect(details.currentParticipant).toEqual({ type: "agent", agentId: qaAgentId, userId: null });

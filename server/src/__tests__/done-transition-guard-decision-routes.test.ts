@@ -1322,6 +1322,10 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .where(eq(issueComments.issueId, parentIssueId));
     const record = records.find((r) => r.body.includes("done_transition_missing_delivery"));
     expect(record?.body).toContain("Caller seat: assignee");
+    // The persisted Remedy line is what the run the board's answer wakes reads first:
+    // it must bound the no-second-close bar and name the one re-send.
+    expect(record?.body).toContain("no second close until the board answers");
+    expect(record?.body).toContain("Once the board reports the ladder repaired, re-send the refused close or verdict once.");
     expect(await statusOf(parentIssueId)).toBe("in_progress");
   });
 
