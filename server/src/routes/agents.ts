@@ -4141,6 +4141,7 @@ export function agentRoutes(
       issuesSvc.list(req.actor.companyId, {
         pendingReviewParticipantAgentId: req.actor.agentId,
         status: "in_review",
+        includeHidden: true,
         includeRoutineExecutions: true,
         limit: ISSUE_LIST_DEFAULT_LIMIT,
       }),

@@ -5727,7 +5727,7 @@ export function recoveryService(
           opts?.issueCreatedAtGte
             ? gte(issues.createdAt, opts.issueCreatedAtGte)
             : undefined,
-          isNull(issues.hiddenAt),
+          isNull(issues.harnessKind),
           not(unadmittedChatWakeupCondition(issues.id, issues.companyId)),
         ),
       );
@@ -7885,7 +7885,7 @@ export function recoveryService(
 
     const filters = [
       eq(issues.status, "in_review"),
-      visibleIssueCondition(),
+      isNull(issues.harnessKind),
       sql`${issues.executionState}->>'status' = 'pending'`,
       sql`${issues.executionState}->>'currentStageType' = 'review'`,
       sql`NOT EXISTS (
