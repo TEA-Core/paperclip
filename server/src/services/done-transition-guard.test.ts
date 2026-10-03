@@ -1988,7 +1988,7 @@ describe("evaluateDoneTransitionGuard", () => {
           {
             ...manualChild("redo-1", "SUP-18190", "40000000-0000-4000-8000-000000000001"),
             title: "[redo] title-only child",
-            description: "Details first.",
+            description: "work-type:redo\nDetails first",
           },
           {
             ...manualChild("redo-2", "SUP-18191", "50000000-0000-4000-8000-000000000002"),
