@@ -1262,19 +1262,19 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.body.details.remedy).not.toContain("Merge the issue's pull request");
     expect(res.body.details.mechanism).toBe("D");
     // Board ruling 2026-10-02 (F1 server half): the approver holding the live
-    // stage is also the assignee in in_review, but it does not repair a close
-    // ladder: the board does. So its seat is currentParticipant, the ADR-103
-    // re-parent/declare-process remedy is withheld from it, and both the message
-    // tail and details.remedy point it at recording the refusal and asking the
-    // board. The message prefix is byte-identical.
+    // stage is also the assignee in in_review, but its seat is
+    // currentParticipant. The ADR-103 re-parent/declare-process remedy is
+    // replaced by the seat label plus a pointer to the owning doctrine section
+    // (pointer principle), in the message tail and in details.remedy. The
+    // message prefix is byte-identical.
+    const pointer =
+      "Your seat: currentParticipant. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.";
     expect(res.body.details.callerSeat).toBe("currentParticipant");
     expect(res.body.error.startsWith("Mechanism D (ADR-072 close-ladder shape) refused:")).toBe(true);
     expect(res.body.error).not.toMatch(/Add (any|the) missing/);
-    expect(res.body.error).toContain("Your seat (currentParticipant) cannot lawfully repair this close ladder");
-    expect(res.body.details.nextAction).toBe(res.body.details.remedy);
-    expect(res.body.details.remedy).toContain("ask the board");
-    expect(res.body.details.remedy).toContain("rearmExecutionPolicy");
-    expect(res.body.details.remedy).not.toContain("Re-parent");
+    expect(res.body.error.endsWith(` ${pointer}`)).toBe(true);
+    expect(res.body.details.remedy).toBe(pointer);
+    expect(res.body.details.nextAction).toBe(pointer);
     // M3.5: the counted identifiers and the carve-out-excluded set both travel in details.
     expect(res.body.details.ladderedChildIdentifiers).toEqual(
       expect.arrayContaining(ladderedChildIdentifiers),
@@ -1283,7 +1283,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(parentIssueId)).toBe("in_review");
   });
 
-  it("PATCH: the assignee holding no live stage gets the board text too; the board owns close-ladder repair (board ruling 2026-10-02 F1)", async () => {
+  it("PATCH: the assignee holding no live stage keeps the existing text and ADR-103 remedy, with its seat in details (board ruling 2026-10-02 F1)", async () => {
     const { companyId, implementerAgentId, parentIssueId, identifier } = await seedDecomposedCloseLadder("MD3A", {
       ladderedChildren: 2,
       excludedChildren: 0,
@@ -1306,13 +1306,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.body.details.mechanism).toBe("D");
     expect(res.body.details.callerSeat).toBe("assignee");
     expect(res.body.error.startsWith("Mechanism D (ADR-072 close-ladder shape) refused:")).toBe(true);
-    // control-plane-403 §7: no agent repairs the ladder, the assignee included. The
-    // guard's own ADR-103 remedy (re-parent / declare process / add stages) is the
-    // board's lever, so the assignee gets the same record-and-ask text as any seat.
-    expect(res.body.error).not.toMatch(/Add (any|the) missing/);
-    expect(res.body.error).toContain("Your seat (assignee) cannot lawfully repair this close ladder");
-    expect(res.body.details.remedy).toContain("ask the board");
-    expect(res.body.details.remedy).not.toContain("Re-parent");
+    // The assignee's text is unchanged: the guard's reason and its ADR-103 remedy.
+    // control-plane-403.md §7 decides what the agent does with it.
+    expect(res.body.error).toMatch(/Add (any|the) missing/);
+    expect(res.body.error).not.toContain("Your seat");
+    expect(res.body.details.remedy).toContain("Re-parent");
+    expect(res.body.details.remedy).not.toContain("Your seat");
     expect(res.body.details.nextAction).toBe(res.body.details.remedy);
 
     // The thread record names the refusing caller's seat beside the remedy it was given.
@@ -1322,11 +1321,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .where(eq(issueComments.issueId, parentIssueId));
     const record = records.find((r) => r.body.includes("done_transition_missing_delivery"));
     expect(record?.body).toContain("Caller seat: assignee");
-    // The persisted Remedy line is what the run the board's answer wakes reads first.
-    // control-plane-403.md §7 grants the one post-answer re-send to the stage holder
-    // only, so the assignee is barred from a second close and told no re-send.
-    expect(record?.body).toContain("no second close from your seat");
-    expect(record?.body).not.toContain("re-send the refused close or verdict once");
+    expect(record?.body).toContain("Remedy: Re-parent");
     expect(await statusOf(parentIssueId)).toBe("in_progress");
   });
 

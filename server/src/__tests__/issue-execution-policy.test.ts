@@ -1227,7 +1227,8 @@ describe("issue execution policy transitions", () => {
 
     // Board ruling 2026-10-02 (F1 server half): the refusal is caller-aware. The
     // prefix stays byte-identical (agent doctrine quotes it); details carry the
-    // caller's seat and a seat-specific next action that also follows the prefix.
+    // caller's seat, the stage and its participant, and a next action (the seat
+    // label plus a pointer to control-plane-403.md §7) that also follows the prefix.
     function refusalFor(actor: { agentId: string }, opts: { viaAncestorHatch?: boolean } = {}) {
       try {
         applyIssueExecutionPolicyTransition({
@@ -1261,7 +1262,7 @@ describe("issue execution policy transitions", () => {
       throw new Error("expected the transition to be refused");
     }
 
-    it("the return assignee is told it does not hold the stage, who does, and that a changes_requested decision returns the card to it", () => {
+    it("the return assignee gets its seat label and the pointer; the participant travels in details", () => {
       const err = refusalFor({ agentId: coderAgentId });
       expect(err).toBeInstanceOf(HttpError);
       expect(err.status).toBe(422);
@@ -1270,15 +1271,16 @@ describe("issue execution policy transitions", () => {
       ).toBe(true);
       const details = err.details as { callerSeat: string; nextAction: string; currentParticipant: unknown };
       expect(details.callerSeat).toBe("returnAssignee");
-      expect(details.nextAction).toContain("Your seat (returnAssignee) does not hold this review stage");
-      expect(details.nextAction).toContain(`agent ${qaAgentId} holds it`);
-      expect(details.nextAction).toContain("if it requests changes the card returns to you");
-      expect(details.nextAction).toContain("on a card you own");
-      expect(err.message).toContain(details.nextAction);
+      expect(details.nextAction).toBe(
+        "Your seat: returnAssignee. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
+      expect(err.message).toBe(
+        `Only the active reviewer or approver can advance the current execution stage. ${details.nextAction}`,
+      );
       expect(details.currentParticipant).toEqual({ type: "agent", agentId: qaAgentId, userId: null });
     });
 
-    it("the stage holder's assignee-only write keeps the prefix and says it holds the stage", () => {
+    it("the stage holder's assignee-only write keeps the prefix and names its seat currentParticipant", () => {
       let err: HttpError | null = null;
       try {
         applyIssueExecutionPolicyTransition({
@@ -1315,16 +1317,16 @@ describe("issue execution policy transitions", () => {
       ).toBe(true);
       const details = err!.details as { callerSeat: string; nextAction: string };
       expect(details.callerSeat).toBe("currentParticipant");
-      expect(details.nextAction).toContain("holds this review stage");
-      expect(details.nextAction).not.toContain("does not hold");
-      expect(details.nextAction).toContain("only your decision moves it");
+      expect(details.nextAction).toBe(
+        "Your seat: currentParticipant. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
     });
 
     it("an unrelated agent is seat other; an ancestor writing through the hatch is seat ancestor-hatch", () => {
       expect((refusalFor({ agentId: ctoAgentId }).details as { callerSeat: string }).callerSeat).toBe("other");
       const hatch = refusalFor({ agentId: ctoAgentId }, { viaAncestorHatch: true });
       expect((hatch.details as { callerSeat: string }).callerSeat).toBe("ancestor-hatch");
-      expect(hatch.message).not.toContain("returns the card to you");
+      expect(hatch.message).toContain("Your seat: ancestor-hatch.");
     });
 
     it("board override can cancel an active review without recording an approval decision", () => {

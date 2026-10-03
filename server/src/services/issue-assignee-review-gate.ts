@@ -5,7 +5,7 @@ import {
   type RefusalCaller,
   type RefusalIssue,
   resolveCallerSeat,
-  selfSatisfyingAssigneeNextAction,
+  seatAuthorityNextAction,
 } from "./seat-authority-refusal.js";
 
 export interface SelfSatisfyingReviewStageFinding {
@@ -114,8 +114,8 @@ export function assertAssigneeWriteDoesNotSelfSatisfyReviewStage(input: {
   incomingAssigneeAgentId: string | null | undefined;
   /**
    * Board ruling 2026-10-02 (F1): the writer and the issue as stored. When
-   * present the 422 names the caller's seat and a seat-specific next action
-   * after the unchanged message. Absent (the recovery service, or a board caller)
+   * present the 422 names the caller's seat and points to the owning doctrine
+   * section after the unchanged message. Absent (the recovery service, or a board caller)
    * it is unchanged.
    */
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
@@ -133,6 +133,6 @@ export function assertAssigneeWriteDoesNotSelfSatisfyReviewStage(input: {
   };
   if (!input.refusalContext) throw unprocessable(message, details);
   const callerSeat = resolveCallerSeat(input.refusalContext.caller, input.refusalContext.issue);
-  const nextAction = selfSatisfyingAssigneeNextAction(callerSeat, { stageId: finding.stageId });
+  const nextAction = seatAuthorityNextAction(callerSeat);
   throw unprocessable(`${message}. ${nextAction}`, { ...details, callerSeat, nextAction });
 }

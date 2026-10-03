@@ -2138,7 +2138,8 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       // Board ruling 2026-10-02 (F1 server half): the prefix is byte-identical
-      // (agent doctrine quotes it); the seat-specific next action follows it.
+      // (agent doctrine quotes it); the seat label and a pointer to the owning
+      // doctrine section follow it.
       expect(
         res.body.error.startsWith(
           "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections. ",
@@ -2146,15 +2147,14 @@ describe("agent issue mutation checkout ownership", () => {
       ).toBe(true);
       expect(res.body.details.forbiddenFields).toContain(_field);
       expect(res.body.details.callerSeat).toBe("ancestor-hatch");
-      expect(res.body.details.nextAction).toContain("Your seat (ancestor-hatch) cannot write");
-      expect(res.body.details.nextAction).toContain("re-sending the write without them does not reach the outcome");
-      expect(res.body.details.nextAction).toContain("assignment hop");
-      expect(res.body.details.nextAction).toContain("ask the board");
-      expect(res.body.error).toContain(res.body.details.nextAction);
+      expect(res.body.details.nextAction).toBe(
+        "Your seat: ancestor-hatch. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
+      expect(res.body.error.endsWith(` ${res.body.details.nextAction}`)).toBe(true);
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
-    it("on a card with a live stage, tells the hatch caller no write from its seat moves the stage", async () => {
+    it("on a card with a live stage, gives the hatch caller the same seat label and pointer (control-plane-403.md §7 owns the live-stage case)", async () => {
       const stageId = "77777777-7777-4777-8777-777777777777";
       mockIssueService.getById.mockResolvedValue(
         makeIssue({
@@ -2179,9 +2179,9 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.details.forbiddenFields).toEqual(["comment"]);
       expect(res.body.details.callerSeat).toBe("ancestor-hatch");
-      expect(res.body.details.nextAction).toContain("live approval stage");
-      expect(res.body.details.nextAction).toContain(`agent ${ownerAgentId}`);
-      expect(res.body.details.nextAction).toContain("with or without comment");
+      expect(res.body.details.nextAction).toBe(
+        "Your seat: ancestor-hatch. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
@@ -2580,8 +2580,7 @@ describe("agent issue mutation checkout ownership", () => {
 
     it("gives a board caller the unchanged base 422, with no seat or next action", async () => {
       // Changing the stage's participants is the board's own lawful repair, so
-      // the caller-aware tail ("ask the board", "never change the participants")
-      // is wrong for it (re-audit 2026-10-02).
+      // the board keeps the base text exactly (re-audit 2026-10-02).
       const res = await request(await createApp(boardActor()))
         .patch(`/api/issues/${issueId}`)
         .send({ assigneeAgentId: gateReviewerAgentId });

@@ -13,7 +13,7 @@ import type {
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
-import { resolveCallerSeat, stageHeldElsewhereNextAction } from "./seat-authority-refusal.js";
+import { resolveCallerSeat, seatAuthorityNextAction } from "./seat-authority-refusal.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -1667,17 +1667,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
     if (attemptedStageAdvance && !stageStateDrifted) {
       // Board ruling 2026-10-02 (F1): caller-aware. The prefix is byte-identical
-      // (agent doctrine quotes it); the seat-specific next action follows it and
-      // travels in details, so a non-holder is told who holds the stage instead
-      // of improvising another write to move it.
+      // (agent doctrine quotes it); the caller's seat and a pointer to the owning
+      // doctrine section follow it and travel in details, with the stage and its
+      // participant, so no caller improvises another write to move it.
       const callerSeat = resolveCallerSeat(
         { agentId: input.actor.agentId ?? null, userId: input.actor.userId ?? null, viaAncestorHatch: input.actorViaAncestorHatch },
         input.issue,
       );
-      const nextAction = stageHeldElsewhereNextAction(callerSeat, {
-        stageType: activeStage.type,
-        participant: currentParticipant,
-      });
+      const nextAction = seatAuthorityNextAction(callerSeat);
       throw unprocessable(
         `Only the active reviewer or approver can advance the current execution stage. ${nextAction}`,
         {
