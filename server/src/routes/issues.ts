@@ -17760,6 +17760,21 @@ export function issueRoutes(
         });
       }
     }
+    // Board ruling 2026-10-02 (F1 server half): on this shape the typed ladder-gap
+    // 409 stands in for Mechanism D (the guard below is skipped), so it is a
+    // close-ladder refusal and caller-aware the same way. Every caller's seat goes
+    // in details. A board caller keeps the add-an-approval-stage remediation (its
+    // lever); every agent seat gets the byte-identical prefix plus its seat and the
+    // control-plane-403.md §7 pointer, since close-ladder repair is a board job.
+    const missingApprovalStageRefusal = missingApprovalStageGap
+      ? (() => {
+          const callerSeat = resolveCallerSeat(refusalCaller, existing as unknown as RefusalIssue);
+          const base = "Cannot mark this issue done: it has open child issues but no approval stage in its executionPolicy";
+          const boardCaller = req.actor.type === "board";
+          const remedy = boardCaller ? missingApprovalStageGap.remediation : seatAuthorityNextAction(callerSeat);
+          return { callerSeat, remedy, error: boardCaller ? base : `${base} ${remedy}` };
+        })()
+      : null;
     // The typed ladder-gap refusal (raised under the update lock below) replaces
     // the delivery guard's `done_transition_missing_delivery` catchall for
     // in-scope cards, so the guard is skipped only when the gap is present.
@@ -18146,7 +18161,7 @@ export function issueRoutes(
             && existing.status !== "done"
           ) {
             throw conflict(
-              "Cannot mark this issue done: it has open child issues but no approval stage in its executionPolicy",
+              missingApprovalStageRefusal!.error,
               {
                 code: MISSING_APPROVAL_STAGE_ERROR_CODE,
                 issueId: existing.id,
@@ -18155,7 +18170,9 @@ export function issueRoutes(
                 ladderedChildIdentifiers: missingApprovalStageGap.ladderedChildIdentifiers,
                 excludedChildIdentifiers: missingApprovalStageGap.excludedChildIdentifiers,
                 stageTypes: missingApprovalStageGap.stageTypes,
-                remediation: missingApprovalStageGap.remediation,
+                remediation: missingApprovalStageRefusal!.remedy,
+                callerSeat: missingApprovalStageRefusal!.callerSeat,
+                nextAction: missingApprovalStageRefusal!.remedy,
               },
             );
           }
@@ -18419,8 +18436,9 @@ export function issueRoutes(
           httpStatus: 409,
           code: MISSING_APPROVAL_STAGE_ERROR_CODE,
           error: err.message,
-          remedy: missingApprovalStageGap.remediation,
+          remedy: missingApprovalStageRefusal?.remedy ?? missingApprovalStageGap.remediation,
           runId: actor.runId ?? null,
+          callerSeat: missingApprovalStageRefusal?.callerSeat,
         });
       }
       throw err;

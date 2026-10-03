@@ -22,6 +22,9 @@
  *     is a seat label plus a POINTER to the owning doctrine section, never a
  *     restatement of its rule (board ruling 2026-10-02: a restated rule drifts
  *     from the doctrine it copies; a pointer does not);
+ *   - the route's missing-approval-stage 409 (`done_transition_missing_approval_stage`,
+ *     which stands in for Mechanism D on a decomposed parent with no approval
+ *     stage) is a close-ladder refusal too and follows the Mechanism D shape;
  *   - a board caller keeps the existing base text. On Mechanism D every agent
  *     seat, the assignee included, gets the seat label plus pointer: its
  *     ADR-103 re-parent / declare-process / add-stages remedy is the board's
