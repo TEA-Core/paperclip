@@ -33,6 +33,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const BYTES_PER_MB = 1024 * 1024;
 
@@ -261,6 +262,17 @@ function databaseAgentId(databasePath) {
   return match?.[1] ?? null;
 }
 
+function assertDatabaseExists(databasePath, stat = fs.statSync) {
+  try {
+    stat(databasePath);
+  } catch (err) {
+    if (err?.code === "ENOENT") {
+      throw new Error(`database path does not exist: ${databasePath}`);
+    }
+    throw err;
+  }
+}
+
 function assertAgentWritable(databasePath, agentUid, {
   agentId = databaseAgentId(databasePath),
   stat = fs.statSync,
@@ -463,9 +475,21 @@ export function janitorRunDatabase({
     skipped: null,
   };
 
-  const db = new DatabaseSync(databasePath);
+  assertDatabaseExists(databasePath);
+  assertAgentWritable(databasePath, agentUid, { agentId, agentGids });
+
+  const databaseUrl = pathToFileURL(databasePath);
+  databaseUrl.searchParams.set("mode", "rw");
+  let db;
   try {
-    assertAgentWritable(databasePath, agentUid, { agentId, agentGids });
+    db = new DatabaseSync(databaseUrl.href);
+  } catch (err) {
+    throw new Error(
+      `unable to open database ${databasePath}: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
+    );
+  }
+  try {
     db.exec(`PRAGMA busy_timeout = ${Math.floor(busyTimeoutMs)}`);
     // Off by default on every new connection, and the whole prune depends on it:
     // without it, deleting a session would orphan its messages and parts instead
