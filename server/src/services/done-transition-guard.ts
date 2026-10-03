@@ -116,6 +116,13 @@ export interface DoneTransitionGuardResult {
    * string for `delivery`.
    */
   remedy?: string;
+  /**
+   * Board ruling 2026-10-02 (F1): mechanism D's `reason` WITHOUT its trailing
+   * remedy sentence. The route keeps it byte-identical as the message prefix
+   * and, for an agent seat other than the assignee, appends the caller's seat
+   * and a pointer to control-plane-403.md §7. `reason` itself is unchanged.
+   */
+  diagnosis?: string;
   /** ADR-103 M3.5: the laddered children counted by mechanism A/D, printed beside the excluded set. */
   ladderedChildIdentifiers?: string[];
   /** ADR-103 M3.5: the carve-out-excluded children, printed so an exclusion is never silent. */
@@ -1877,15 +1884,16 @@ async function evaluateDoneTransitionGuardCore(
       "`work-type:process` (or `parent_link_kind: 'process'`); adding a stage " +
       "to this ladder is legal only while the pointer has not advanced past the first close-ladder " +
       `rung (ADR-102 M1). Then ${remedy.charAt(0).toLowerCase()}${remedy.slice(1)}`;
+    const diagnosis =
+      `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
+      `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
+      `(${ladderShape.ladderedChildIdentifiers.join(", ")}), and its review ladder is ${defects.join(
+        "; ",
+      )}.`;
     return {
       allowed: false,
-      reason:
-        `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
-        `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
-        `(${ladderShape.ladderedChildIdentifiers.join(", ")}), and its review ladder is ${defects.join(
-          "; ",
-        )}. ` +
-        remedy,
+      reason: `${diagnosis} ${remedy}`,
+      diagnosis,
       aheadBy: null,
       branch: null,
       defaultRef: null,
