@@ -557,17 +557,22 @@ describe("issue execution policy missing approval stage", () => {
       // SUP-15958: `countLadderedChildren` runs up to three indexed reads on the
       // PATCH path. Route each to its own state so the real helper's exclusions
       // are exercised; every other select keeps the hoisted handoff-agent-row
-      // default. The child decomposition is the only 7-key projection on the
-      // path, so it is matched by signature alone (no table-identity assumption);
-      // the carve-out label reads are matched by table + single-key projection.
-      const childSignature =
-        keys.length === 7
-        && keys.includes("id")
+       // default. The child decomposition is the only 9-key projection on the
+       // path, so it is matched by signature alone (no table-identity assumption);
+       // the carve-out label reads are matched by table + single-key projection.
+       // ADR-103 M2b added `parentLinkKind` to this projection, and SUP-18196
+       // added the title/description declaration fields, so the signature tracks
+       // the current column set.
+       const childSignature =
+         keys.length === 9
+         && keys.includes("id")
          && keys.includes("identifier")
          && keys.includes("status")
          && keys.includes("executionPolicy")
          && keys.includes("executionState")
          && keys.includes("originKind")
+         && keys.includes("title")
+         && keys.includes("description")
          && keys.includes("parentLinkKind");
       return {
         from: (table: unknown) => {
@@ -998,9 +1003,9 @@ describe("issue execution policy missing approval stage", () => {
     expect(res.body).toMatchObject({
       code: "done_transition_missing_approval_stage",
       details: {
-        ladderedChildCount: 5,
-        ladderedChildIdentifiers: ["PAP-2", "PAP-3", "PAP-4", "PAP-5", "PAP-6"],
-        excludedChildIdentifiers: [],
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-5", "PAP-6"],
+        excludedChildIdentifiers: ["PAP-2", "PAP-3", "PAP-4"],
       },
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();

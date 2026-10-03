@@ -171,7 +171,21 @@ export type LadderArmingParentEdge = {
    * all.
    */
   hasCarveOutLabel?: boolean;
+  title?: string | null;
+  description?: string | null;
 };
+
+function hasDeclaredLadderCarveOut(edge: LadderArmingParentEdge): boolean {
+  const firstNonEmptyDescriptionLine = edge.description
+    ?.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  return (
+    firstNonEmptyDescriptionLine === "work-type:redo" ||
+    firstNonEmptyDescriptionLine === "work-type:delivery" ||
+    edge.title?.startsWith("[redo]") === true
+  );
+}
 
 /**
  * Does this parent edge count toward the parent's laddered-child total, as far
@@ -211,6 +225,7 @@ export function isLadderArmingParentEdge(
   // a redo, a delivery carrier, an architecture-review terminator, or a process
   // courier — none of them answers "which child gated this work?".
   if (edge.hasCarveOutLabel === true) return false;
+  if (hasDeclaredLadderCarveOut(edge)) return false;
   return true;
 }
 
