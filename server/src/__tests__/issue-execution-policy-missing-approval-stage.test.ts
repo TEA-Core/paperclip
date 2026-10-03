@@ -1003,9 +1003,9 @@ describe("issue execution policy missing approval stage", () => {
     expect(res.body).toMatchObject({
       code: "done_transition_missing_approval_stage",
       details: {
-        ladderedChildCount: 5,
-        ladderedChildIdentifiers: ["PAP-2", "PAP-3", "PAP-4", "PAP-5", "PAP-6"],
-        excludedChildIdentifiers: [],
+        ladderedChildCount: 2,
+        ladderedChildIdentifiers: ["PAP-5", "PAP-6"],
+        excludedChildIdentifiers: ["PAP-2", "PAP-3", "PAP-4"],
       },
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
