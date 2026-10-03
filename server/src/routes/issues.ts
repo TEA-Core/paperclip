@@ -383,14 +383,11 @@ import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slot
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
-  ancestorHatchNextAction,
-  liveStageOf,
-  mechanismDBoardNote,
-  mechanismDNextAction,
   type CallerSeat,
   type RefusalCaller,
   type RefusalIssue,
   resolveCallerSeat,
+  seatAuthorityNextAction,
 } from "../services/seat-authority-refusal.js";
 import {
   isAgentDefaultProjectWorkspacePair,
@@ -4825,23 +4822,18 @@ export function issueRoutes(
           : guardResult.remedy ??
             "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
       // Board ruling 2026-10-02 (F1 server half): mechanism D is a seat-authority
-      // refusal, and close-ladder repair is the BOARD's (control-plane-403 §7:
-      // "no agent repairs that ladder, not the approver and not the assignee").
-      // Every agent seat, the assignee included, gets the byte-identical
-      // diagnosis prefix followed by "you cannot repair this ladder: record the
-      // refusal on a card you own and ask the board". The ADR-103 remedy
-      // (re-parent / declare process / add stages) names the board's levers, so
-      // only a board caller keeps it, with a reminder that it holds them.
+      // refusal. Every caller's seat is named in details. A board caller and an
+      // agent assignee keep the existing text and ADR-103 remedy byte-identical;
+      // every other seat gets the byte-identical diagnosis prefix followed by its
+      // seat and a pointer to control-plane-403.md §7, which owns the next step.
       // guardResult.reason itself is unchanged (done-transition-guard.test.ts).
       let refusalError = guardResult.reason;
       let refusalRemedy = remedy;
       let callerSeat: CallerSeat | undefined;
       if (mechanism === "D" && caller) {
         callerSeat = resolveCallerSeat(caller, issue as unknown as RefusalIssue);
-        if (boardActor) {
-          refusalRemedy = `${remedy} ${mechanismDBoardNote()}`;
-        } else {
-          refusalRemedy = mechanismDNextAction(callerSeat);
+        if (!boardActor && callerSeat !== "assignee") {
+          refusalRemedy = seatAuthorityNextAction(callerSeat);
           refusalError = `${guardResult.diagnosis ?? guardResult.reason} ${refusalRemedy}`;
         }
       }
@@ -16739,11 +16731,9 @@ export function issueRoutes(
       );
       if (forbidden.length > 0) {
         // Board ruling 2026-10-02 (F1 server half): caller-aware. The prefix is
-        // byte-identical (agent doctrine quotes it); the next action says that
-        // dropping the forbidden fields does not change the seat, and that a
-        // live stage is not movable from the hatch at all (1c85903c, SUP-18200).
-        const liveStage = liveStageOf(existing as unknown as RefusalIssue);
-        const nextAction = ancestorHatchNextAction({ forbiddenFields: forbidden, liveStage });
+        // byte-identical (agent doctrine quotes it); the seat and a pointer to
+        // control-plane-403.md §7 follow it.
+        const nextAction = seatAuthorityNextAction("ancestor-hatch");
         res.status(403).json({
           error: `Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections. ${nextAction}`,
           details: { forbiddenFields: forbidden, callerSeat: "ancestor-hatch", nextAction },

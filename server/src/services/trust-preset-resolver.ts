@@ -113,11 +113,10 @@ export function assertIssueExecutionPolicyGatesAreEnforceable(
         + "return assignee from the assignee at transition time)";
     // The diagnosis is the byte-identical prefix agent doctrine quotes; the tail
     // is the remedy. Board ruling 2026-10-02 (F1): with a refusal context the
-    // tail is seat- and ladder-aware. At attach time a board caller keeps the
-    // existing remedy and an agent is given only its one payload fix, the
-    // same-write reassign (issue-creation.md); on a ladder that has run it is terminal for
-    // every seat, because moving a participant or the return assignee then only
-    // games the gate (the a37e3e65 / SUP-18002 re-point).
+    // tail is seat- and ladder-aware. A board caller keeps the existing remedy;
+    // an agent gets its seat and a pointer to control-plane-403.md §7, whose
+    // table row says this is a payload error with one fix at attach time and
+    // terminal on a ladder that has run (the a37e3e65 / SUP-18002 re-point).
     const diagnosis =
       `Execution policy stage ${index} (${stageType}) is gated solely by its own return assignee `
       + `${returnAssigneeAgentId}, taken from ${sourceDescription}; the return assignee is excluded `

@@ -229,8 +229,8 @@ describe("assertAssigneeWriteDoesNotSelfSatisfyReviewStage (SUP-13526)", () => {
   });
 
   // Board ruling 2026-10-02 (F1 server half): caller-aware. The prefix through
-  // the existing parenthetical is byte-identical; the seat-specific next action
-  // follows it and travels in details. Without a refusal context (the recovery
+  // the existing parenthetical is byte-identical; the seat label and a pointer
+  // to control-plane-403.md §7 follow it and travel in details. Without a refusal context (the recovery
   // service) nothing changes.
   describe("caller-aware refusal", () => {
     const stage = {
@@ -257,28 +257,30 @@ describe("assertAssigneeWriteDoesNotSelfSatisfyReviewStage (SUP-13526)", () => {
       throw new Error("expected throw");
     };
 
-    it("is terminal for the assignee too: keep the card, record and ask the board, never re-point the return assignee", () => {
+    it("gives the assignee its seat label and the pointer to control-plane-403.md §7", () => {
       const err = refuse({
         caller: { agentId: OTHER_AGENT_ID },
         issue: { assigneeAgentId: OTHER_AGENT_ID, executionState: { status: "idle" } },
       });
-      expect(err.message.startsWith(`${legacyMessage}. Your seat (assignee) cannot clear this`)).toBe(true);
+      expect(err.message).toBe(
+        `${legacyMessage}. Your seat: assignee. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.`,
+      );
       expect(err.details.callerSeat).toBe("assignee");
-      expect(String(err.details.nextAction)).toContain("keep the card as it is");
-      expect(String(err.details.nextAction)).toContain("ask the board");
-      expect(String(err.details.nextAction)).not.toContain("hand the card to");
-      expect(String(err.details.nextAction)).toContain("Never re-point returnAssigneeAgentId");
+      expect(err.details.nextAction).toBe(
+        "Your seat: assignee. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
       expect(err.details).toMatchObject({ guard: "assignee_review_gate", issueStageId: GATE_STAGE_ID });
     });
 
-    it("tells any other seat it cannot clear this and to record and ask the board", () => {
+    it("gives any other seat its own label and the same pointer", () => {
       const err = refuse({
         caller: { agentId: "66666666-6666-4666-8666-666666666666", viaAncestorHatch: true },
         issue: { assigneeAgentId: OTHER_AGENT_ID, executionState: null },
       });
       expect(err.details.callerSeat).toBe("ancestor-hatch");
-      expect(String(err.details.nextAction)).toContain("Your seat (ancestor-hatch) cannot clear this");
-      expect(String(err.details.nextAction)).toContain("ask the board");
+      expect(err.details.nextAction).toBe(
+        "Your seat: ancestor-hatch. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
       expect(err.message).toContain(String(err.details.nextAction));
     });
 

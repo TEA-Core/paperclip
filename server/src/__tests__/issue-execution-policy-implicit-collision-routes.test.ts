@@ -295,7 +295,7 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     expect(rearm.body.details?.nextAction).toBe(
       "Give the stage a participant that is not the return assignee, or change the return assignee. Never drop the stage to make this pass.",
     );
-    expect(rearm.body.error).not.toMatch(/games the gate/);
+    expect(rearm.body.error).not.toContain("seat-authority refusal");
   });
 
   it("accepts a PATCH that moves the assignee off the collision in the same body", async () => {

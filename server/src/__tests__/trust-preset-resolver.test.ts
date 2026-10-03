@@ -286,12 +286,11 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
     ).not.toThrow();
   });
 
-  // Board ruling 2026-10-02 (F1 server half): caller-aware. At attach time an
-  // agent is given only its one payload fix (the same-write reassign) and a
-  // board caller keeps the existing remedy; on a
-  // ladder that has already run, changing a participant or the return assignee
-  // to pass the check games the gate, so every seat is told to record and ask
-  // the board. The message prefix is byte-identical either way.
+  // Board ruling 2026-10-02 (F1 server half): caller-aware. A board caller keeps
+  // the existing remedy; an agent gets its seat label and a pointer to
+  // control-plane-403.md §7, whose table row says this 422 is a payload error
+  // with one fix at attach time and terminal on a ladder that has run. The
+  // message prefix is byte-identical either way.
   describe("caller-aware refusal", () => {
     const ctoAgentId = "66666666-6666-4666-8666-666666666666";
     const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -309,24 +308,24 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
     };
     const prefix = `Execution policy stage 0 (approval) is gated solely by its own return assignee ${returnAssigneeAgentId}`;
 
-    it("gives an agent only the same-write reassign when the issue's ladder has not run", () => {
+    it("tells an agent it is a payload error and points it to §7 when the issue's ladder has not run", () => {
       const err = refuse({ caller: { agentId: ctoAgentId }, issue: null });
       expect(err.message.startsWith(prefix)).toBe(true);
-      // issue-creation.md §Resolving the collision 422: changing a stage participant
-      // is a gamed gate for an agent, so the agent's tail names only the reassign.
+      // The base remedy also offers changing a stage participant, a gamed gate from
+      // an agent seat, so an agent is pointed to the doctrine instead.
       expect(err.message).not.toContain("Give the stage a participant that is not the return assignee");
       const details = err.details as Record<string, unknown>;
       expect(details.callerSeat).toBe("other");
       expect(details.ladderHasRun).toBe(false);
       expect(details.nextAction).toBe(
-        "Put the implementer's assigneeAgentId in the same write as this executionPolicy, so the return assignee is not this stage's participant. Never change a stage participant or drop a stage to make this pass.",
+        "Your seat: other. No stage has run yet, so this is a payload error: see control-plane-403.md §7 for its one fix.",
       );
       expect(err.message.endsWith(String(details.nextAction))).toBe(true);
       // The pre-existing detail keys are unchanged.
       expect(details).toMatchObject({ stageIndex: 0, stageType: "approval", returnAssigneeAgentId });
     });
 
-    it("on a ladder that has run, the assignee too is told the fix games the gate and to ask the board", () => {
+    it("on a ladder that has run, the assignee too gets its seat label and the seat-authority pointer", () => {
       const err = refuse({
         caller: { agentId: ctoAgentId },
         issue: {
@@ -339,8 +338,9 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
       const details = err.details as Record<string, unknown>;
       expect(details.callerSeat).toBe("assignee");
       expect(details.ladderHasRun).toBe(true);
-      expect(String(details.nextAction)).toContain("games the gate");
-      expect(String(details.nextAction)).toContain("ask the board");
+      expect(details.nextAction).toBe(
+        "Your seat: assignee. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
       expect(err.message).toContain(String(details.nextAction));
     });
 

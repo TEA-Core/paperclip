@@ -17,14 +17,13 @@
  *     paperclip-agent-tools doctrine/control-plane-403.md §7, and
  *     scripts/paperclip-transition.sh matches it);
  *   - `details.callerSeat` is one of {@link CALLER_SEATS};
- *   - `details.nextAction` is the seat-specific next-action sentence, and the
- *     same sentence follows the prefix in the message, so an agent that reads
- *     only `error` still gets it;
- *   - when the caller's seat CAN lawfully act (any writer of a policy that has
- *     not run yet on the self-gated 422, a board user on the self-gated 422 and
- *     on Mechanism D) the existing remedy is kept unchanged. Close-ladder
- *     repair is the board's: an agent assignee gets the record-and-ask text
- *     like every other agent seat.
+ *   - `details.nextAction` is the tail that follows the prefix in the message,
+ *     so an agent that reads only `error` still gets it. A new caller-aware tail
+ *     is a seat label plus a POINTER to the owning doctrine section, never a
+ *     restatement of its rule (board ruling 2026-10-02: a restated rule drifts
+ *     from the doctrine it copies; a pointer does not);
+ *   - a board caller keeps the existing base text, and so does an agent
+ *     assignee on Mechanism D (its ADR-103 remedy is unchanged).
  *
  * This module is pure: no DB, no imports from the policy service (which imports
  * it), so it cannot form an import cycle.
@@ -60,24 +59,8 @@ export interface RefusalPrincipal {
   userId?: string | null;
 }
 
-/**
- * The carve-out labels that take a child out of the laddered-child count. Kept as
- * a literal here (not imported) so this module stays dependency-free; the
- * equality with laddered-child-eligibility.ts is pinned by
- * seat-authority-refusal.test.ts.
- */
-export const BOARD_CARVE_OUT_LABELS = [
-  "work-type:redo",
-  "work-type:delivery",
-  "work-type:architecture-review",
-  "work-type:process",
-  "work-type:recovery",
-] as const;
-
-/** The shared terminal tail: where the record goes and who decides. */
-export const RECORD_AND_ASK_BOARD =
-  "Record this refusal (its message and details) on a card you own and ask the board. " +
-  "Do not re-send it, re-shape it, or reach the same outcome through another field, card, route or seat.";
+/** The owning doctrine section every new caller-aware tail points to. */
+export const SEAT_AUTHORITY_SECTION = "control-plane-403.md §7";
 
 function sameId(a: string | null | undefined, b: string | null | undefined): boolean {
   return typeof a === "string" && a.length > 0 && a === b;
@@ -135,10 +118,9 @@ function returnAssigneeOf(issue: RefusalIssue): RefusalPrincipal | null {
  *
  * The live-stage seat wins over the assignee seat on purpose. In `in_review`
  * the stage machine assigns the card to its current participant, so every
- * approver is also the assignee, and the live-stage texts (who decides the
- * stage) apply to it. "assignee" therefore means "holds the card and no live
- * stage on it". Under the 2026-10-02 ruling neither seat repairs a close
- * ladder; the board does.
+ * approver is also the assignee, and the live-stage seat is the one that
+ * tells it what it holds. "assignee" therefore means "holds the card and no
+ * live stage on it".
  */
 export function resolveCallerSeat(caller: RefusalCaller, issue: RefusalIssue | null | undefined): CallerSeat {
   if (!issue) return caller.viaAncestorHatch ? "ancestor-hatch" : "other";
@@ -152,70 +134,9 @@ export function resolveCallerSeat(caller: RefusalCaller, issue: RefusalIssue | n
   return "other";
 }
 
-export function describePrincipal(principal: RefusalPrincipal | null | undefined): string {
-  if (principal?.agentId) return `agent ${principal.agentId}`;
-  if (principal?.userId) return `user ${principal.userId}`;
-  return "its participant";
-}
-
-/**
- * Mechanism D (ADR-072 close-ladder shape) 409, for every agent seat, the assignee included.
- * control-plane-403.md §7 grants the one post-answer re-send to the stage holder
- * alone ("the approver re-sends its verdict once"), so only currentParticipant
- * is told to re-send; every other seat records, asks the board, and stops.
- */
-export function mechanismDNextAction(seat: CallerSeat): string {
-  const holder = seat === "currentParticipant";
-  return (
-    `Your seat (${seat}) cannot lawfully repair this close ladder: no re-arm, no added or reordered stage, ` +
-    "no relabelled or re-parented child, no courier card, and " +
-    (holder ? "no second close until the board answers. " : "no second close from your seat. ") +
-    `${RECORD_AND_ASK_BOARD} The board's levers are a carve-out label ` +
-    `(${BOARD_CARVE_OUT_LABELS.join(", ")}) on a child that is not decomposition work, ` +
-    "or a board rearmExecutionPolicy with the full close ladder." +
-    // Persisted as the thread record's Remedy line, which the run the board's answer
-    // wakes reads first: it must not forbid the holder's one lawful write.
-    (holder ? " Once the board reports the ladder repaired, re-send the refused close or verdict once." : "")
-  );
-}
-
-/** Appended to the assignee/board remedy for a board caller, who holds the levers itself. */
-export function mechanismDBoardNote(): string {
-  return (
-    "As a board user you also hold the carve-out labels " +
-    `(${BOARD_CARVE_OUT_LABELS.join(", ")}) and rearmExecutionPolicy.`
-  );
-}
-
-/** 422 "Only the active reviewer or approver can advance the current execution stage". */
-export function stageHeldElsewhereNextAction(
-  seat: CallerSeat,
-  stage: { stageType: string | null; participant: RefusalPrincipal | null },
-): string {
-  const stageName = stage.stageType ? `${stage.stageType} stage` : "stage";
-  if (seat === "currentParticipant") {
-    // The holder reaches this refusal only with an assignee write naming someone
-    // else, alone or with in_review (its decision branch handles done, blocked
-    // and every other status). Its in_review with no assignee is not a stage
-    // advance: it is accepted, its inline comment lands, and the stage stays.
-    return (
-      `Your seat (currentParticipant) holds this ${stageName}, and only your decision moves it: ` +
-      "done with a comment approves; todo, in_progress or cancelled with a comment requests changes; " +
-      "blocked with a comment and an unblockDescriptor naming yourself parks it (control-plane-403.md §6). An assignee write naming anyone but you (alone or with in_review) is refused; " +
-      "an in_review write without one is accepted and does not move the stage. " +
-      "Do not hand the card away."
-    );
-  }
-  const returns =
-    // Only a changes_requested decision hands the card back: an approve moves it to the
-    // next stage's participant or completes the workflow with the approver.
-    seat === "returnAssignee" ? ", and if it requests changes the card returns to you" : "";
-  return (
-    `Your seat (${seat}) does not hold this ${stageName}; ${describePrincipal(stage.participant)} holds it${returns}. ` +
-    "No status or assignee write from your seat advances it. Record this refusal (its message and details) on a " +
-    "card you own; the stage's participant decides it. If you own no card in this run, write nothing more. " +
-    "Do not re-send it, re-shape it, or reach the same outcome through another field, card, route or seat."
-  );
+/** The caller-aware tail of every seat-authority refusal: the seat, then the pointer. */
+export function seatAuthorityNextAction(seat: CallerSeat): string {
+  return `Your seat: ${seat}. This is a seat-authority refusal: see ${SEAT_AUTHORITY_SECTION} for the next step.`;
 }
 
 /** True when the issue's ladder has run: a stage completed or skipped, or a current stage is set. */
@@ -227,75 +148,24 @@ export function selfGatedLadderHasRun(executionState: unknown): boolean {
   return typeof state.currentStageId === "string" && state.currentStageId.length > 0;
 }
 
-/** The attach-time tail of the self-gated 422, unchanged since SUP-13531. */
+/** The attach-time tail of the self-gated 422, unchanged since SUP-13531. A board caller always keeps it. */
 export const SELF_GATED_ATTACH_TIME_REMEDY =
   "Give the stage a participant that is not the return assignee, or change the return assignee. " +
   "Never drop the stage to make this pass.";
 
 /**
- * The attach-time tail for a non-board caller. Agent doctrine (issue-creation.md
- * §Resolving the collision 422) gives the agent ONE payload fix, the same-write
- * reassign; changing a stage participant is a gamed gate from an agent seat, so
- * the board-only half of the remedy above is not offered.
- */
-export const SELF_GATED_ATTACH_TIME_AGENT_REMEDY =
-  "Put the implementer's assigneeAgentId in the same write as this executionPolicy, so the return assignee " +
-  "is not this stage's participant. Never change a stage participant or drop a stage to make this pass.";
-
-/**
  * 422 "Execution policy stage <n> (<type>) is gated solely by its own return assignee ...".
- * A board user keeps the payload fix on a ladder that has run too: a board
- * rearmExecutionPolicy is one of the board's own close-ladder levers.
+ * Before any stage has run it is a payload error, not a seat-authority refusal,
+ * so an agent's tail says that and points to the same section, whose table row
+ * names the one fix.
  */
 export function selfGatedNextAction(
   seat: CallerSeat,
   ctx: { ladderHasRun: boolean; boardActor?: boolean },
 ): string {
   if (ctx.boardActor) return SELF_GATED_ATTACH_TIME_REMEDY;
-  if (!ctx.ladderHasRun) return SELF_GATED_ATTACH_TIME_AGENT_REMEDY;
-  return (
-    "This issue's ladder has already run, so this is not a payload fix: changing a participant or the return " +
-    `assignee now to pass this check games the gate, from any seat (yours: ${seat}). Never drop the stage. ` +
-    RECORD_AND_ASK_BOARD
-  );
-}
-
-/** 422 "Refusing assigneeAgentId write: ..." (self-satisfiable review stage). */
-export function selfSatisfyingAssigneeNextAction(seat: CallerSeat, ctx: { stageId: string }): string {
-  const noGaming =
-    "Never re-point returnAssigneeAgentId or change the stage's participants to pass this check.";
-  // control-plane-403 §7: this refusal is terminal at the first refusal for every
-  // seat; re-picking the assignee is a re-shape, not a payload fix.
-  const keep =
-    seat === "assignee"
-      ? `: keep the card as it is (stage ${ctx.stageId} hands the card to its own participant when the work enters review)`
-      : "";
-  return `Your seat (${seat}) cannot clear this${keep}. ${RECORD_AND_ASK_BOARD} ${noGaming}`;
-}
-
-/** 403 "Ancestor escape hatch only permits ...". */
-export function ancestorHatchNextAction(input: {
-  forbiddenFields: string[];
-  liveStage: { stageType: string | null; participant: RefusalPrincipal | null } | null;
-}): string {
-  const fields = input.forbiddenFields.join(", ");
-  if (input.liveStage) {
-    const stageName = input.liveStage.stageType ? `${input.liveStage.stageType} stage` : "stage";
-    return (
-      `Your seat (ancestor-hatch): this issue has a live ${stageName} held by ` +
-      `${describePrincipal(input.liveStage.participant)}, and no write from your seat moves it, with or without ` +
-      `${fields}. Record this refusal (its message and details) on a card you own; the stage's participant ` +
-      "decides it. Do not re-send it, re-shape it, or reach the same outcome through another field, card, route or seat."
-    );
+  if (!ctx.ladderHasRun) {
+    return `Your seat: ${seat}. No stage has run yet, so this is a payload error: see ${SEAT_AUTHORITY_SECTION} for its one fix.`;
   }
-  // No live stage: escalation.md keeps the assignment hop (assigneeAgentId set to
-  // yourself, then the write as the assignee) as the one lawful change of seat, so
-  // this branch names it and does not forbid "another seat".
-  return (
-    `Your seat (ancestor-hatch) cannot write ${fields} on this issue, and re-sending the write without them does ` +
-    "not reach the outcome they were for. The only change of seat is the assignment hop: take the card over as its " +
-    "assignee (a PATCH of assigneeAgentId to yourself and nothing else), then make the write as the assignee. " +
-    "Otherwise record this refusal (its message and details) on a card you own and ask the board. " +
-    "Do not re-send it, re-shape it, or reach the same outcome through another field, card or route."
-  );
+  return seatAuthorityNextAction(seat);
 }
