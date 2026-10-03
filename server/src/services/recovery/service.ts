@@ -72,6 +72,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { isPullOnlyAdapterType } from "../../adapters/builtin-adapter-types.js";
 import { runningProcesses } from "../../adapters/index.js";
+import { isExternalPullAgent } from "../agent-work-delivery.js";
 import {
   isNativeRunnerOwnershipHeld,
   nativeRunnerOwnershipNotHeldCondition,
@@ -9773,10 +9774,11 @@ export function recoveryService(
     const assigneeRows =
       assigneeIds.length > 0
         ? await db
-            .select({ id: agents.id, name: agents.name })
+            .select({ id: agents.id, name: agents.name, runtimeConfig: agents.runtimeConfig })
             .from(agents)
             .where(inArray(agents.id, assigneeIds))
         : [];
+    const assigneeById = new Map(assigneeRows.map((row) => [row.id, row] as const));
     const assigneeNameById = new Map(
       assigneeRows.map((row) => [row.id, row.name] as const),
     );
@@ -9849,6 +9851,10 @@ export function recoveryService(
 
     for (const candidate of issueRows) {
       const leased = Boolean(leasesByCompany.get(candidate.companyId)?.has(candidate.id));
+      const assignee = candidate.assigneeAgentId
+        ? assigneeById.get(candidate.assigneeAgentId)
+        : undefined;
+      const externalPullAssignee = assignee ? isExternalPullAgent(assignee) : false;
       const monitorFuture = hasFutureMonitorCheck(candidate.monitorNextCheckAt);
       const activePath = await hasActiveExecutionPath(
         candidate.companyId,
@@ -9894,6 +9900,10 @@ export function recoveryService(
 
       if (leased) {
         result.leasedSkipped += 1;
+        continue;
+      }
+      if (externalPullAssignee) {
+        result.thresholdSkipped += 1;
         continue;
       }
       if (activeRecoveryAction !== null) {

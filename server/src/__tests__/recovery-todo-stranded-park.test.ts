@@ -205,7 +205,7 @@ describeEmbeddedPostgres("recovery reconcileTodoStrandedCards", () => {
     return recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
   }
 
-  async function seedCompanyAndAgent() {
+  async function seedCompanyAndAgent(workDelivery?: string) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -223,7 +223,7 @@ describeEmbeddedPostgres("recovery reconcileTodoStrandedCards", () => {
       status: "active",
       adapterType: "codex_local",
       adapterConfig: {},
-      runtimeConfig: {},
+      runtimeConfig: workDelivery ? { workDelivery } : {},
       permissions: {},
     });
     return { companyId, agentId };
@@ -285,6 +285,19 @@ describeEmbeddedPostgres("recovery reconcileTodoStrandedCards", () => {
       .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
     return rows.filter((row) => (row.body ?? "").includes(NOTICE_MARKER)).length;
   }
+
+  it("does not park a stranded todo card assigned to an external-pull agent", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent("external-pull");
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const result = await svc.reconcileTodoStrandedCards({ now: new Date() });
+    expect(result.parked).toBe(0);
+    expect(result.thresholdSkipped).toBe(1);
+    expect((await readIssue(issueId))?.status).toBe("todo");
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(0);
+    expect(await countNotices(issueId)).toBe(0);
+  });
 
   it("parks a stranded assigned todo card to blocked exactly once, with one activity row (AC1/AC4/AC5)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
