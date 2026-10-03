@@ -4822,17 +4822,20 @@ export function issueRoutes(
           : guardResult.remedy ??
             "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
       // Board ruling 2026-10-02 (F1 server half): mechanism D is a seat-authority
-      // refusal. Every caller's seat is named in details. A board caller and an
-      // agent assignee keep the existing text and ADR-103 remedy byte-identical;
-      // every other seat gets the byte-identical diagnosis prefix followed by its
-      // seat and a pointer to control-plane-403.md §7, which owns the next step.
-      // guardResult.reason itself is unchanged (done-transition-guard.test.ts).
+      // refusal, and close-ladder repair is a board job. Every caller's seat is
+      // named in details. Only a board caller keeps the existing text and ADR-103
+      // remedy byte-identical (re-parent / declare process / add stages are the
+      // board's levers). Every agent seat, the assignee included, gets the
+      // byte-identical diagnosis prefix followed by its seat and a pointer to
+      // control-plane-403.md §7, which owns the next step and forbids an agent
+      // repairing the ladder. guardResult.reason itself is unchanged
+      // (done-transition-guard.test.ts).
       let refusalError = guardResult.reason;
       let refusalRemedy = remedy;
       let callerSeat: CallerSeat | undefined;
       if (mechanism === "D" && caller) {
         callerSeat = resolveCallerSeat(caller, issue as unknown as RefusalIssue);
-        if (!boardActor && callerSeat !== "assignee") {
+        if (!boardActor) {
           refusalRemedy = seatAuthorityNextAction(callerSeat);
           refusalError = `${guardResult.diagnosis ?? guardResult.reason} ${refusalRemedy}`;
         }

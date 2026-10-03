@@ -22,8 +22,10 @@
  *     is a seat label plus a POINTER to the owning doctrine section, never a
  *     restatement of its rule (board ruling 2026-10-02: a restated rule drifts
  *     from the doctrine it copies; a pointer does not);
- *   - a board caller keeps the existing base text, and so does an agent
- *     assignee on Mechanism D (its ADR-103 remedy is unchanged).
+ *   - a board caller keeps the existing base text. On Mechanism D every agent
+ *     seat, the assignee included, gets the seat label plus pointer: its
+ *     ADR-103 re-parent / declare-process / add-stages remedy is the board's
+ *     levers (close-ladder repair is a board job, control-plane-403.md §7).
  *
  * This module is pure: no DB, no imports from the policy service (which imports
  * it), so it cannot form an import cycle.

@@ -1283,7 +1283,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(parentIssueId)).toBe("in_review");
   });
 
-  it("PATCH: the assignee holding no live stage keeps the existing text and ADR-103 remedy, with its seat in details (board ruling 2026-10-02 F1)", async () => {
+  it("PATCH: an agent assignee holding no live stage gets its seat and the §7 pointer, not the ADR-103 repair remedy (board ruling 2026-10-02 F1)", async () => {
     const { companyId, implementerAgentId, parentIssueId, identifier } = await seedDecomposedCloseLadder("MD3A", {
       ladderedChildren: 2,
       excludedChildren: 0,
@@ -1306,13 +1306,18 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.body.details.mechanism).toBe("D");
     expect(res.body.details.callerSeat).toBe("assignee");
     expect(res.body.error.startsWith("Mechanism D (ADR-072 close-ladder shape) refused:")).toBe(true);
-    // The assignee's text is unchanged: the guard's reason and its ADR-103 remedy.
-    // control-plane-403.md §7 decides what the agent does with it.
-    expect(res.body.error).toMatch(/Add (any|the) missing/);
-    expect(res.body.error).not.toContain("Your seat");
-    expect(res.body.details.remedy).toContain("Re-parent");
-    expect(res.body.details.remedy).not.toContain("Your seat");
-    expect(res.body.details.nextAction).toBe(res.body.details.remedy);
+    // Close-ladder repair is the board's (control-plane-403.md §7: "not the
+    // approver and not the assignee"), so the ADR-103 re-parent / declare-process
+    // / add-stages remedy is a board lever. An agent assignee gets the same seat
+    // label plus pointer as every other agent seat, in the message tail, in
+    // details.remedy / nextAction and on the thread record.
+    const pointer =
+      "Your seat: assignee. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.";
+    expect(res.body.error).not.toMatch(/Add (any|the) missing/);
+    expect(res.body.error.endsWith(` ${pointer}`)).toBe(true);
+    expect(res.body.details.remedy).toBe(pointer);
+    expect(res.body.details.nextAction).toBe(pointer);
+    expect(res.body.details.remedy).not.toContain("Re-parent");
 
     // The thread record names the refusing caller's seat beside the remedy it was given.
     const records = await db
@@ -1321,7 +1326,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .where(eq(issueComments.issueId, parentIssueId));
     const record = records.find((r) => r.body.includes("done_transition_missing_delivery"));
     expect(record?.body).toContain("Caller seat: assignee");
-    expect(record?.body).toContain("Remedy: Re-parent");
+    expect(record?.body).toContain(`Remedy: ${pointer}`);
+    expect(record?.body).not.toContain("Re-parent");
     expect(await statusOf(parentIssueId)).toBe("in_progress");
   });
 
