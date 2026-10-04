@@ -308,6 +308,24 @@ describeEmbeddedPostgres("recovery reconcileTodoStrandedCards", () => {
     expect(await countNotices(issueId)).toBe(1);
   });
 
+  it("does not park a stale todo card assigned to an external-pull agent", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { workDelivery: "external_pull" } })
+      .where(eq(agents.id, agentId));
+    const issueId = await seedTodoCard({ companyId, agentId });
+    const svc = recovery();
+
+    const result = await svc.reconcileTodoStrandedCards({ now: new Date() });
+
+    expect(result.parked).toBe(0);
+    expect(result.externalPullSkipped).toBe(1);
+    expect((await readIssue(issueId))?.status).toBe("todo");
+    expect(await countActivity(TODO_STRANDED_ACTION, issueId)).toBe(0);
+    expect(await countNotices(issueId)).toBe(0);
+  });
+
   it("never parks an unassigned todo card (AC3)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedTodoCard({ companyId, agentId: null });
