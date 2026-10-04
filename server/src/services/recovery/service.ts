@@ -165,6 +165,7 @@ import {
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import { SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES } from "../successful-run-handoff-state.js";
+import { isExternalPullAgent } from "../agent-work-delivery.js";
 import {
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   sandboxProviderPluginRemedy,
@@ -9679,6 +9680,7 @@ export function recoveryService(
       leasedSkipped: 0,
       livePathSkipped: 0,
       thresholdSkipped: 0,
+      externalPullSkipped: 0,
       alreadyActionedSkipped: 0,
       alreadyParkedDischargedSkipped: 0,
       candidateLimitSkipped: 0,
@@ -9773,10 +9775,11 @@ export function recoveryService(
     const assigneeRows =
       assigneeIds.length > 0
         ? await db
-            .select({ id: agents.id, name: agents.name })
+            .select({ id: agents.id, name: agents.name, runtimeConfig: agents.runtimeConfig })
             .from(agents)
             .where(inArray(agents.id, assigneeIds))
         : [];
+    const assigneeById = new Map(assigneeRows.map((row) => [row.id, row] as const));
     const assigneeNameById = new Map(
       assigneeRows.map((row) => [row.id, row.name] as const),
     );
@@ -9848,6 +9851,14 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
+      const assignee = candidate.assigneeAgentId
+        ? assigneeById.get(candidate.assigneeAgentId)
+        : null;
+      if (assignee && isExternalPullAgent(assignee)) {
+        result.externalPullSkipped += 1;
+        continue;
+      }
+
       const leased = Boolean(leasesByCompany.get(candidate.companyId)?.has(candidate.id));
       const monitorFuture = hasFutureMonitorCheck(candidate.monitorNextCheckAt);
       const activePath = await hasActiveExecutionPath(
