@@ -1218,7 +1218,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     const [row] = await db
       .select({ executionState: issues.executionState, status: issues.status })
       .from(issues)
-      .where(issues.id === issueId);
+      .where(eq(issues.id, issueId));
     expect(row!.status).toBe("in_progress");
     expect((row!.executionState ?? {})?.delivery).toBeUndefined();
   });
