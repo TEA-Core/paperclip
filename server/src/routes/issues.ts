@@ -17400,6 +17400,7 @@ export function issueRoutes(
       }
     }
 
+    let deliveryIdentityWorkspaceBranchWrite = false;
     // ADR-091 D1 (SUP-14824): record the delivery identity on in_review transition.
     // Only a run that holds the issue's lease may write it, and only on a transition
     // INTO in_review. Any other actor or transition is rejected without partial write.
@@ -17463,10 +17464,25 @@ export function issueRoutes(
       // lands — mirroring the service-side gate in resolveDeliveryIdentity. This is the
       // card-boundary half D1 exists to close.
       const branchOwnership = await resolveCardDeliveryBranchOwnership(db, existing.companyId, existing.id);
+      const [deliveryWorkspace] = existing.executionWorkspaceId
+        ? await db
+            .select({ strategyType: executionWorkspaces.strategyType, branchName: executionWorkspaces.branchName })
+            .from(executionWorkspaces)
+            .where(and(
+              eq(executionWorkspaces.id, existing.executionWorkspaceId),
+              eq(executionWorkspaces.companyId, existing.companyId),
+            ))
+        : [];
+      const canRecordProjectPrimaryBranch =
+        branchOwnership.legitimate
+        && branchOwnership.branch === null
+        && deliveryWorkspace?.strategyType === "project_primary"
+        && !deliveryWorkspace.branchName;
       const recordedBranchMismatch =
-        branchOwnership.branch === null ||
-        requestedDeliveryIdentity.branch.toLowerCase() !== branchOwnership.branch.toLowerCase();
-      if (recordedBranchMismatch || !branchOwnership.legitimate) {
+        (!canRecordProjectPrimaryBranch && branchOwnership.branch === null)
+        || (branchOwnership.branch !== null
+          && requestedDeliveryIdentity.branch.toLowerCase() !== branchOwnership.branch.toLowerCase());
+      if (!canRecordProjectPrimaryBranch && (!branchOwnership.legitimate || recordedBranchMismatch)) {
         const branchReason =
           branchOwnership.branch === null
             ? "card has no execution-workspace delivery branch to validate the recorded branch against"
@@ -17501,6 +17517,7 @@ export function issueRoutes(
           recordedAt: new Date().toISOString(),
         },
       };
+      deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
     }
 
     const nextStatus = updateFields.status ?? existing.status;
@@ -17813,6 +17830,9 @@ export function issueRoutes(
     const postCommitIssueActions: IssuePostCommitAction[] = [];
     const issueUpdateData = {
       ...updateFields,
+      ...(deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId
+        ? { executionWorkspaceId: existing.executionWorkspaceId }
+        : {}),
       actorAgentId: actor.agentId ?? null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
@@ -17953,6 +17973,7 @@ export function issueRoutes(
       || persistReviewActivityTransactionally
       || reviewPolicySensitiveMutationRequested
       || workspaceReprovisionCloseId !== null
+      || deliveryIdentityWorkspaceBranchWrite
       // ADR-103 M4: a re-parent must commit atomically with its close-ladder
       // check, so force every parent-edge mutation through the transactional
       // path (a plain re-parent otherwise falls through to the non-
@@ -18128,7 +18149,23 @@ export function issueRoutes(
             });
           }
 
+          if (deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId) {
+            await tx
+              .update(executionWorkspaces)
+              .set({
+                branchName: requestedDeliveryIdentity!.branch,
+                updatedAt: new Date(),
+              })
+              .where(and(
+                eq(executionWorkspaces.id, existing.executionWorkspaceId),
+                eq(executionWorkspaces.companyId, existing.companyId),
+                eq(executionWorkspaces.strategyType, "project_primary"),
+                isNull(executionWorkspaces.branchName),
+              ));
+          }
+
           const updated = await updateIssue(tx);
+
           if (!updated) return null;
           if (commentAttachmentIds?.length) {
             // Reassignment, comment creation and upload binding commit together.

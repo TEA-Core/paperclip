@@ -828,6 +828,8 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
   interface SeedOpts {
     executionRunId?: string | null;
     status?: string;
+    strategyType?: "project_primary" | "git_worktree";
+    deliveryBranch?: string | null;
     /**
      * SUP-15909: make the execution-workspace row a real `shared_workspace` row
      * OWNED BY ANOTHER issue, carrying the given carrier branch — the ADR-083
@@ -928,10 +930,12 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       ...(carrierOwnerIssueId
         ? { mode: "shared_workspace", sourceIssueId: carrierOwnerIssueId }
         : { mode: "isolated" }),
-      strategyType: "git_worktree",
+      strategyType: opts.strategyType ?? "git_worktree",
       name: "card-ws",
       status: "active",
-      branchName: opts.sharedWorkspaceOwnerBranch ?? "SUP-14824-branch",
+      branchName: opts.strategyType === "project_primary"
+        ? opts.deliveryBranch ?? null
+        : opts.sharedWorkspaceOwnerBranch ?? "SUP-14824-branch",
       repoUrl: REPO_URL,
       createdAt: now,
       updatedAt: now,
@@ -988,6 +992,34 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.headSha).toBe(HEAD_SHA);
     expect(delivery!.recordedByRunId).toBe(runId);
     expect(typeof delivery!.recordedAt).toBe("string");
+  });
+
+  it("records deliveryIdentity for a project_primary workspace with no persisted branch (SUP-18325)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      strategyType: "project_primary",
+      deliveryBranch: null,
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-project-primary",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [workspace] = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, (await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues).where(eq(issues.id, issueId)))[0]!.executionWorkspaceId!));
+    expect(workspace!.branchName).toBe("SUP-14824-project-primary");
   });
 
   it("records a carrier child delivery identity on its owner's carrier branch (SUP-15909)", async () => {
