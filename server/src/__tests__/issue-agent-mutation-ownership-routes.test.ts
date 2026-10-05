@@ -64,6 +64,7 @@ const mockProjectService = vi.hoisted(() => ({
 }));
 
 const mockDocumentService = vi.hoisted(() => ({
+  restoreIssueDocumentRevision: vi.fn(),
   upsertIssueDocument: vi.fn(),
 }));
 
@@ -633,6 +634,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockLogActivity.mockClear();
     mockObserveCrossIssueInfluence.mockReset();
     mockObserveCrossIssueInfluence.mockResolvedValue(null);
+    mockDocumentService.restoreIssueDocumentRevision.mockReset();
     mockDocumentService.upsertIssueDocument.mockReset();
     mockWorkProductService.createForIssue.mockReset();
     mockWorkProductService.latestRunDiffSummary.mockReset();
@@ -759,6 +761,17 @@ describe("agent issue mutation checkout ownership", () => {
       issueId,
       companyId,
       objectKey: "issues/attachment-1/report.txt",
+    });
+    mockDocumentService.restoreIssueDocumentRevision.mockResolvedValue({
+      document: {
+        id: "document-1",
+        key: "plan",
+        title: "Plan",
+        format: "markdown",
+        latestRevisionId: "revision-2",
+        latestRevisionNumber: 2,
+        body: "# restored",
+      },
     });
     mockDocumentService.upsertIssueDocument.mockResolvedValue({
       created: false,
@@ -1238,6 +1251,106 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(401);
     expect(res.body.error).toBe("Agent run id required");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows the issue creator to update a document without general issue mutation access", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: peerAgentId,
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> | null }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read" ||
+        (input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true),
+      action: input.action,
+      reason: input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true
+        ? "allow_creator"
+        : "deny_missing_grant",
+      explanation: "Document creator test boundary.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# created" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
+  });
+
+  it("allows the issue creator to restore a document revision", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: peerAgentId,
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> | null }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read" ||
+        (input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true),
+      action: input.action,
+      reason: input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true
+        ? "allow_creator"
+        : "deny_missing_grant",
+      explanation: "Document creator test boundary.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/documents/plan/revisions/revision-1/restore`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockDocumentService.restoreIssueDocumentRevision).toHaveBeenCalled();
+  });
+
+  it("keeps document writes denied for an agent that did not create the issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: "another-agent-id",
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read",
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "Document creator test boundary.",
+    }));
+
+    const app = await createApp(peerActor());
+    const upsertRes = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# denied" });
+    const restoreRes = await request(app)
+      .post(`/api/issues/${issueId}/documents/plan/revisions/revision-1/restore`)
+      .send({});
+
+    expect(upsertRes.status).toBe(403);
+    expect(upsertRes.body.details.code).toBe("issue_write_no_grant");
+    expect(restoreRes.status).toBe(403);
+    expect(restoreRes.body.details.code).toBe("issue_write_no_grant");
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+    expect(mockDocumentService.restoreIssueDocumentRevision).not.toHaveBeenCalled();
+  });
+
+  it("keeps general issue mutation denied for the issue creator", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: peerAgentId,
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> | null }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read" ||
+        (input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true),
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "General issue mutation denied.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Nope" });
+
+    expect(res.status).toBe(403);
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
