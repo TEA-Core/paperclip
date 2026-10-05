@@ -6761,6 +6761,7 @@ export function issueRoutes(
       createdByAgentId: string | null;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
+    options: { allowCreatorDocumentWrite?: boolean } = {},
   ) {
     return access.decide({
       actor: req.actor,
@@ -6783,6 +6784,7 @@ export function issueRoutes(
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         createdByAgentId: issue.createdByAgentId,
+        ...(options.allowCreatorDocumentWrite ? { issueDocumentWrite: true } : {}),
       },
     });
   }
@@ -7169,7 +7171,11 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean; bypassCheckoutOwnership?: boolean } = {},
+    options: {
+      allowVisibleIssueWrite?: boolean;
+      bypassCheckoutOwnership?: boolean;
+      allowCreatorDocumentWrite?: boolean;
+    } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -7212,6 +7218,7 @@ export function issueRoutes(
       req,
       issue,
       "issue:mutate",
+      options,
     );
     if (!boundaryDecision.allowed) {
       return denyIssueWrite(
@@ -7232,6 +7239,9 @@ export function issueRoutes(
           issue.assigneeAgentId,
         )
       ) {
+        return true;
+      }
+      if (options.allowCreatorDocumentWrite && issue.createdByAgentId === actorAgentId) {
         return true;
       }
       if (issue.status === "in_progress") {
@@ -13190,7 +13200,12 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (
+        !(await assertAgentIssueMutationAllowed(req, res, issue, {
+          allowCreatorDocumentWrite: true,
+        }))
+      )
+        return;
       if (
         !(await assertDeliverableMutationAllowedByRunContext(req, res, issue))
       )
@@ -13505,7 +13520,12 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (
+        !(await assertAgentIssueMutationAllowed(req, res, issue, {
+          allowCreatorDocumentWrite: true,
+        }))
+      )
+        return;
       if (
         !(await assertDeliverableMutationAllowedByRunContext(req, res, issue))
       )

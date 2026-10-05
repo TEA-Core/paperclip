@@ -2794,6 +2794,51 @@ describeEmbeddedPostgres("authorization service", () => {
     await expect(decide("issue:mutate")).resolves.toMatchObject({ allowed: false });
   });
 
+  it("allows the creating agent to mutate only an explicitly document-scoped issue write", async () => {
+    const company = await createCompany(db, "CreatorDocumentWrite");
+    const creatorAgent = await createAgent(db, company.id);
+    const assigneeAgent = await createAgent(db, company.id);
+    const issue = await createIssue(db, company.id, {
+      title: "Created here, pinned elsewhere for document writing",
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: creatorAgent.id,
+    });
+    const resource = {
+      type: "issue" as const,
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: null,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+      createdByAgentId: creatorAgent.id,
+    };
+    const actor = {
+      type: "agent" as const,
+      agentId: creatorAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:mutate",
+      resource,
+      scope: { issueId: issue.id, issueDocumentWrite: true },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_creator",
+    });
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:mutate",
+      resource,
+      scope: { issueId: issue.id },
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
   it("still denies an unrelated agent on an issue pinned to another agent", async () => {
     const company = await createCompany(db, "EscapeHatchBoundary");
     const assigneeAgent = await createAgent(db, company.id);

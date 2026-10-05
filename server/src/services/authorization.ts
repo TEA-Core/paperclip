@@ -2338,7 +2338,8 @@ export function authorizationService(db: Db | DbTransaction) {
     }
 
     if (
-      input.action === "issue:comment" &&
+      (input.action === "issue:comment" ||
+        (input.action === "issue:mutate" && scopeBoolean(input.scope, "issueDocumentWrite"))) &&
       input.resource.type === "issue" &&
       input.resource.createdByAgentId === actorAgentId
     ) {
