@@ -1484,32 +1484,32 @@ describeEmbeddedPostgres("summary slot service", () => {
       });
       expect(forced).toEqual({ type: "agent", agentId: summarizerAgentId, userId: null });
 
-       const transition = applyIssueExecutionPolicyTransition({
-         issue: {
-           id: generationIssueId,
-           status: "in_review",
-           assigneeAgentId: reviewerAgentId,
-           assigneeUserId: null,
-           executionPolicy: policy,
-           executionState: {
-             status: "pending",
-             currentStageId: reviewStageId,
-             currentStageIndex: 0,
-             currentStageType: "review",
-             currentParticipant: { type: "agent", agentId: reviewerAgentId },
-             returnAssignee: { type: "agent", agentId: coderLeAgentId },
-             completedStageIds: [],
-             lastDecisionId: null,
-             lastDecisionOutcome: null,
-           },
-         },
-         policy,
-         requestedStatus: "in_progress",
-         requestedAssigneePatch: {},
-         actor: { agentId: reviewerAgentId },
-         commentBody: "Needs fixes",
-         forcedReturnAssignee: forced,
-       });
+      const transition = applyIssueExecutionPolicyTransition({
+        issue: {
+          id: generationIssueId,
+          status: "in_review",
+          assigneeAgentId: reviewerAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: reviewerAgentId },
+            returnAssignee: { type: "agent", agentId: coderLeAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: reviewerAgentId },
+        commentBody: "Needs fixes",
+        forcedReturnAssignee: forced,
+      });
 
       expect(transition.patch.status).toBe("in_progress");
       expect(transition.patch.assigneeAgentId).toBe(summarizerAgentId);
