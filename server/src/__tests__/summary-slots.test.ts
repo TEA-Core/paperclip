@@ -1486,7 +1486,6 @@ describeEmbeddedPostgres("summary slot service", () => {
 
       const transition = applyIssueExecutionPolicyTransition({
         issue: {
-          id: generationIssueId,
           status: "in_review",
           assigneeAgentId: reviewerAgentId,
           assigneeUserId: null,
