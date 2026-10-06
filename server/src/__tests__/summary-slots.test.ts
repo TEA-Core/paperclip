@@ -1484,10 +1484,10 @@ describeEmbeddedPostgres("summary slot service", () => {
       });
       expect(forced).toEqual({ type: "agent", agentId: summarizerAgentId, userId: null });
 
-      const transition = applyIssueExecutionPolicyTransition({
-        issue: {
-          id: generationIssueId,
-          status: "in_review",
+       const transition = applyIssueExecutionPolicyTransition({
+         issue: {
+           id: generationIssueId,
+           status: "in_review",
           assigneeAgentId: reviewerAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
