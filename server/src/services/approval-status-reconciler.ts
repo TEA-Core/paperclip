@@ -2990,11 +2990,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   }
   const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", publishOptions);
   if (outcome.kind === "armed") {
-    if (approvedHead === null) {
-      // SUP-14602: the recovery path certified this head through the same
-      // unmodified Guard A comparison, so the normal publishedHeadSha path
-      // takes over from here. pendingCandidates stays as the historical
-      // record; the idempotency pre-check keeps re-runs at zero writes.
+    if (approvedHead === null || !approvedHead.firstPublish) {
       await mergeApprovalStatus(
         db,
         row,
@@ -3007,6 +3003,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
         },
       );
     }
+
     // SUP-17274: the stamp was just healed onto the live head. When the
     // decision-time arm never succeeded (first publish refused, decision-time
     // arm failed, or never ran), re-attempt it now — same actuator, same
