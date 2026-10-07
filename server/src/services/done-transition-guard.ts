@@ -119,8 +119,9 @@ export interface DoneTransitionGuardResult {
   /**
    * Board ruling 2026-10-02 (F1): mechanism D's `reason` WITHOUT its trailing
    * remedy sentence. The route keeps it byte-identical as the message prefix
-   * and, for an agent seat other than the assignee, appends the caller's seat
-   * and a pointer to control-plane-403.md §7. `reason` itself is unchanged.
+   * and, for every agent seat (the assignee included), appends the caller's
+   * seat and a pointer to control-plane-403.md §7. A board caller keeps the
+   * base text. `reason` itself is unchanged.
    */
   diagnosis?: string;
   /** ADR-103 M3.5: the laddered children counted by mechanism A/D, printed beside the excluded set. */
