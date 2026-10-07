@@ -78,8 +78,11 @@ describeEmbeddedPostgres("connectionIntentService", () => {
   let cleanup: (() => Promise<void>) | undefined;
   let claims!: RuntimeToolsTokenClaims;
   let runId!: string;
+  let previousDenylist: string | undefined;
 
   beforeAll(async () => {
+    previousDenylist = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "";
     const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-connection-intents-");
     cleanup = tempDb.cleanup;
     connectionString = tempDb.connectionString;
@@ -150,6 +153,8 @@ describeEmbeddedPostgres("connectionIntentService", () => {
   }, 20_000);
 
   afterAll(async () => {
+    if (previousDenylist === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previousDenylist;
     await cleanup?.();
   });
 
@@ -179,6 +184,55 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("responsible-user");
     expect(serialized).not.toContain(claims.sub);
+  });
+
+  it("denies github by default without creating an interaction", async () => {
+    const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    try {
+      const service = connectionIntentService(db);
+      const search = await service.search(claims, "github");
+      const result = search.results[0]!;
+      expect(result).toMatchObject({ service: "github", state: "unavailable" });
+      expect(result.reason).toContain("github");
+      expect(result.reason).toContain("gh and GH_TOKEN");
+      expect(result.reason).toContain("no connection is needed");
+      await expect(service.request(claims, "github")).rejects.toMatchObject({
+        status: 422,
+        message: result.reason,
+      });
+      expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+      else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previous;
+    }
+  });
+
+  it("reads the denylist at call time and leaves other services unchanged", async () => {
+    const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    try {
+      process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = " CLOUDflare , supabase ";
+      const denied = await connectionIntentService(db).search(claims, "cloudflare");
+      expect(denied.results).toEqual([
+        expect.objectContaining({ service: "cloudflare", state: "unavailable" }),
+      ]);
+      expect((await connectionIntentService(db).search(claims, "github")).results).toEqual([
+        expect.objectContaining({ service: "github", state: "available" }),
+      ]);
+      await expect(connectionIntentService(db).request(claims, "cloudflare")).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining("cloudflare"),
+      });
+
+      process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "";
+      const allowed = await connectionIntentService(db).search(claims, "cloudflare");
+      expect(allowed.results).toEqual([
+        expect.objectContaining({ service: "cloudflare", state: "available" }),
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+      else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previous;
+    }
   });
 
   it("creates one addressed request, resolves after install, and then reports ready for the responsible user", async () => {
@@ -357,39 +411,46 @@ describeEmbeddedPostgres("connectionIntentService", () => {
 
   it("only advertises GitHub tool methods in search and setup options", async () => {
     const service = connectionIntentService(db);
-    const search = await service.search(claims, "github");
-    const github = search.results.find((result) => result.service === "github");
-    expect(github).toEqual(
-      expect.objectContaining({
-        methods: [
-          expect.objectContaining({
-            key: "mcp-key",
-            label: "Personal access token (advanced)",
-            auth: "api_key",
-          }),
-        ],
-      }),
-    );
-    expect(github?.methods.map((method) => method.key)).not.toContain(
-      "chat-agent",
-    );
+    const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "";
+    try {
+      const search = await service.search(claims, "github");
+      const github = search.results.find((result) => result.service === "github");
+      expect(github).toEqual(
+        expect.objectContaining({
+          methods: [
+            expect.objectContaining({
+              key: "mcp-key",
+              label: "Personal access token (advanced)",
+              auth: "api_key",
+            }),
+          ],
+        }),
+      );
+      expect(github?.methods.map((method) => method.key)).not.toContain(
+        "chat-agent",
+      );
 
-    await expect(service.request(claims, "discord")).rejects.toThrow(
-      "is not available",
-    );
+      await expect(service.request(claims, "discord")).rejects.toThrow(
+        "is not available",
+      );
 
-    const request = await service.request(claims, "github");
-    const setup = await service.setupOptions(request.interactionId!);
-    expect(setup.service.methods).toEqual([
-      expect.objectContaining({
-        key: "mcp-key",
-        label: "Personal access token (advanced)",
-        auth: "api_key",
-      }),
-    ]);
-    expect(setup.service.methods.map((method) => method.key)).not.toContain(
-      "chat-agent",
-    );
+      const request = await service.request(claims, "github");
+      const setup = await service.setupOptions(request.interactionId!);
+      expect(setup.service.methods).toEqual([
+        expect.objectContaining({
+          key: "mcp-key",
+          label: "Personal access token (advanced)",
+          auth: "api_key",
+        }),
+      ]);
+      expect(setup.service.methods.map((method) => method.key)).not.toContain(
+        "chat-agent",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+      else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previous;
+    }
   });
 
   it("serializes OAuth intent completion behind addressed-user membership revocation", async () => {
@@ -666,16 +727,23 @@ describeEmbeddedPostgres("connectionIntentService", () => {
 
 
   it("native authority discovers and requests services on an empty tool snapshot", async () => {
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    const issueId = String(run!.contextSnapshot!.issueId);
-    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
-    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
-    const authority = new PaperclipRunnerToolAuthority(db, { companyId: claims.company_id, issueId, agentId: claims.sub, runId });
-    const result = await authority.execute({ tool: "connections_search", callId: "discover", arguments: { query: "github" } });
-    expect(result).toMatchObject({ results: expect.arrayContaining([expect.objectContaining({ service: "github", state: "available" })]) });
-    const request = await authority.execute({ tool: "connection_request", callId: "request", arguments: { service: "github" } });
-    expect(request).toMatchObject({ state: "needs_user_action", interactionId: expect.any(String) });
-    await expect(authority.execute({ tool: "connection_request", callId: "bad", arguments: { service: "connection:https://private.invalid" } })).rejects.toThrow("not found");
+    const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "";
+    try {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const issueId = String(run!.contextSnapshot!.issueId);
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId: claims.company_id, issueId, agentId: claims.sub, runId });
+      const result = await authority.execute({ tool: "connections_search", callId: "discover", arguments: { query: "github" } });
+      expect(result).toMatchObject({ results: expect.arrayContaining([expect.objectContaining({ service: "github", state: "available" })]) });
+      const request = await authority.execute({ tool: "connection_request", callId: "request", arguments: { service: "github" } });
+      expect(request).toMatchObject({ state: "needs_user_action", interactionId: expect.any(String) });
+      await expect(authority.execute({ tool: "connection_request", callId: "bad", arguments: { service: "connection:https://private.invalid" } })).rejects.toThrow("not found");
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+      else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previous;
+    }
   });
 
   it("preserves an authorizing card through comments and later runs", async () => {
