@@ -286,6 +286,71 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
     ).not.toThrow();
   });
 
+  // Board ruling 2026-10-02 (F1 server half): caller-aware. A board caller keeps
+  // the existing remedy; an agent gets its seat label and a pointer to
+  // control-plane-403.md §7, whose table row says this 422 is a payload error
+  // with one fix at attach time and terminal on a ladder that has run. The
+  // message prefix is byte-identical either way.
+  describe("caller-aware refusal", () => {
+    const ctoAgentId = "66666666-6666-4666-8666-666666666666";
+    const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const refuse = (refusalContext: Parameters<typeof assertIssueExecutionPolicySatisfiable>[0]["refusalContext"]) => {
+      try {
+        assertIssueExecutionPolicySatisfiable({
+          companyId,
+          executionPolicy: policyWithStages([agentStage("approval", returnAssigneeAgentId)]),
+          refusalContext,
+        });
+      } catch (err) {
+        return err as HttpError;
+      }
+      throw new Error("expected throw");
+    };
+    const prefix = `Execution policy stage 0 (approval) is gated solely by its own return assignee ${returnAssigneeAgentId}`;
+
+    it("tells an agent it is a payload error and points it to §7 when the issue's ladder has not run", () => {
+      const err = refuse({ caller: { agentId: ctoAgentId }, issue: null });
+      expect(err.message.startsWith(prefix)).toBe(true);
+      // The base remedy also offers changing a stage participant, a gamed gate from
+      // an agent seat, so an agent is pointed to the doctrine instead.
+      expect(err.message).not.toContain("Give the stage a participant that is not the return assignee");
+      const details = err.details as Record<string, unknown>;
+      expect(details.callerSeat).toBe("other");
+      expect(details.ladderHasRun).toBe(false);
+      expect(details.nextAction).toBe(
+        "Your seat: other. No stage has run yet, so this is a payload error: see control-plane-403.md §7 for its one fix.",
+      );
+      expect(err.message.endsWith(String(details.nextAction))).toBe(true);
+      // The pre-existing detail keys are unchanged.
+      expect(details).toMatchObject({ stageIndex: 0, stageType: "approval", returnAssigneeAgentId });
+    });
+
+    it("on a ladder that has run, the assignee too gets its seat label and the seat-authority pointer", () => {
+      const err = refuse({
+        caller: { agentId: ctoAgentId },
+        issue: {
+          assigneeAgentId: ctoAgentId,
+          executionState: { status: "completed", currentStageId: null, completedStageIds: [stageId] },
+        },
+      });
+      expect(err.message.startsWith(prefix)).toBe(true);
+      expect(err.message).not.toContain("Give the stage a participant that is not the return assignee");
+      const details = err.details as Record<string, unknown>;
+      expect(details.callerSeat).toBe("assignee");
+      expect(details.ladderHasRun).toBe(true);
+      expect(details.nextAction).toBe(
+        "Your seat: assignee. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
+      expect(err.message).toContain(String(details.nextAction));
+    });
+
+    it("without a refusal context (plugin host, recovery) the message is unchanged and no seat is claimed", () => {
+      const err = refuse(undefined);
+      expect(err.message).toMatch(/Never drop the stage to make this pass\.$/);
+      expect((err.details as Record<string, unknown>).callerSeat).toBeUndefined();
+    });
+  });
+
   it("allows a policy with no declared return assignee and no assignee to check against", () => {
     expect(() =>
       assertIssueExecutionPolicySatisfiable({

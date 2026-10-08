@@ -176,6 +176,11 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toMatch(/gated solely by its own return assignee/);
     expect(res.body.details?.returnAssigneeSource).toBe("assigneeAgentId");
+    // Board ruling 2026-10-02 (F1): caller-aware. On create nothing has run, so
+    // the attach-time remedy is the one lawful payload fix and stays verbatim.
+    expect(res.body.details?.ladderHasRun).toBe(false);
+    expect(typeof res.body.details?.callerSeat).toBe("string");
+    expect(res.body.details?.nextAction).toMatch(/^Give the stage a participant that is not the return assignee/);
     expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
   });
 
@@ -226,6 +231,71 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
 
     expect(patched.status, JSON.stringify(patched.body)).toBe(422);
     expect(patched.body.error).toMatch(/gated solely by its own return assignee/);
+    // The stored issue's ladder never ran, so this is still the attach-time payload error.
+    expect(patched.body.details?.ladderHasRun).toBe(false);
+    expect(typeof patched.body.details?.callerSeat).toBe("string");
+  });
+
+  it("a board rearm on a ladder that has run keeps the payload-fix remedy (the rearm is the board's lever)", async () => {
+    // Re-audit 2026-10-02: ladderHasRun is read from the stored (pre-rearm)
+    // executionState, so a board rearmExecutionPolicy over a ladder that has run
+    // used to be told that fixing its payload "games the gate" and to "ask the
+    // board". For the board the payload fix is lawful.
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Board re-arms a ladder that has run",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          returnAssigneeAgentId: closerAgentId,
+          stages: [stageGatedBy("review", reviewerAgentId)],
+        },
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const stageId = created.body.executionPolicy.stages[0].id as string;
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        assigneeAgentId: reviewerAgentId,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: closerAgentId, userId: null },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, created.body.id));
+
+    const rearm = await request(createApp(companyId))
+      .patch(`/api/issues/${created.body.id}`)
+      .send({
+        rearmExecutionPolicy: true,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          returnAssigneeAgentId: closerAgentId,
+          stages: [stageGatedBy("approval", closerAgentId)],
+        },
+      });
+
+    expect(rearm.status, JSON.stringify(rearm.body)).toBe(422);
+    expect(rearm.body.error).toMatch(/gated solely by its own return assignee/);
+    expect(rearm.body.details?.ladderHasRun).toBe(true);
+    expect(rearm.body.details?.nextAction).toBe(
+      "Give the stage a participant that is not the return assignee, or change the return assignee. Never drop the stage to make this pass.",
+    );
+    expect(rearm.body.error).not.toContain("seat-authority refusal");
   });
 
   it("accepts a PATCH that moves the assignee off the collision in the same body", async () => {

@@ -1225,6 +1225,110 @@ describe("issue execution policy transitions", () => {
       ).toThrow("Only the active reviewer or approver can advance");
     });
 
+    // Board ruling 2026-10-02 (F1 server half): the refusal is caller-aware. The
+    // prefix stays byte-identical (agent doctrine quotes it); details carry the
+    // caller's seat, the stage and its participant, and a next action (the seat
+    // label plus a pointer to control-plane-403.md §7) that also follows the prefix.
+    function refusalFor(actor: { agentId: string }, opts: { viaAncestorHatch?: boolean } = {}) {
+      try {
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor,
+          actorViaAncestorHatch: opts.viaAncestorHatch,
+          commentBody: "Trying to bypass review",
+        });
+      } catch (err) {
+        return err as HttpError;
+      }
+      throw new Error("expected the transition to be refused");
+    }
+
+    it("the return assignee gets its seat label and the pointer; the participant travels in details", () => {
+      const err = refusalFor({ agentId: coderAgentId });
+      expect(err).toBeInstanceOf(HttpError);
+      expect(err.status).toBe(422);
+      expect(
+        err.message.startsWith("Only the active reviewer or approver can advance the current execution stage. "),
+      ).toBe(true);
+      const details = err.details as { callerSeat: string; nextAction: string; currentParticipant: unknown };
+      expect(details.callerSeat).toBe("returnAssignee");
+      expect(details.nextAction).toBe(
+        "Your seat: returnAssignee. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
+      expect(err.message).toBe(
+        `Only the active reviewer or approver can advance the current execution stage. ${details.nextAction}`,
+      );
+      expect(details.currentParticipant).toEqual({ type: "agent", agentId: qaAgentId, userId: null });
+    });
+
+    it("the stage holder's assignee-only write keeps the prefix and names its seat currentParticipant", () => {
+      let err: HttpError | null = null;
+      try {
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: undefined,
+          requestedAssigneePatch: { assigneeAgentId: coderAgentId },
+          actor: { agentId: qaAgentId },
+          commentBody: "Handing back",
+        });
+      } catch (e) {
+        err = e as HttpError;
+      }
+      expect(err).toBeInstanceOf(HttpError);
+      expect(err!.status).toBe(422);
+      expect(
+        err!.message.startsWith("Only the active reviewer or approver can advance the current execution stage. "),
+      ).toBe(true);
+      const details = err!.details as { callerSeat: string; nextAction: string };
+      expect(details.callerSeat).toBe("currentParticipant");
+      expect(details.nextAction).toBe(
+        "Your seat: currentParticipant. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
+    });
+
+    it("an unrelated agent is seat other; an ancestor writing through the hatch is seat ancestor-hatch", () => {
+      expect((refusalFor({ agentId: ctoAgentId }).details as { callerSeat: string }).callerSeat).toBe("other");
+      const hatch = refusalFor({ agentId: ctoAgentId }, { viaAncestorHatch: true });
+      expect((hatch.details as { callerSeat: string }).callerSeat).toBe("ancestor-hatch");
+      expect(hatch.message).toContain("Your seat: ancestor-hatch.");
+    });
+
     it("board override can cancel an active review without recording an approval decision", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
