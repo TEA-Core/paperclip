@@ -1011,6 +1011,18 @@ const PRE_LAUNCH_ALLOCATION_FAILURE_CODES = new Set<string>([
 const EXECUTION_REVIEW_PARTICIPANT_PRE_LAUNCH_RETRY_LIMIT = 3;
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 
+// FORK-DIVERGENCE(superseded-continuation-idle): upstream's `buildExecutionContinuation` throws
+// `continuation_task_ownership_changed` when the card moved to another assignee, or reached
+// `done`/`cancelled`, after run setup read it. Setup reads the card early and awaits many steps
+// before the builder re-reads it, so a reassign or close inside that window loses the race. The run
+// correctly fails fast, before any provider work, instead of acting on a card it no longer owns.
+// The agent did nothing wrong, so this failure must not flip it to `error`.
+function isSupersededContinuationFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message === "continuation_task_ownership_changed"
+  );
+}
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
   // FORK-DIVERGENCE(e2big-wake-env): the launch-size guard throws out of the
   // adapter before spawn; record its stable code so recovery does not retry it.
@@ -28189,9 +28201,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Keep the failed run and its safe provider refusal authoritative,
             // but return the agent to idle so clients do not also announce a
             // misleading agent-wide error for the same rejected chat turn.
+            //
+            // A continuation that lost a race with a reassign or a close is a stale
+            // precondition, not a fault of the agent either.
             keepIdleOnFailure:
               workspaceValidationSetupFailure != null ||
-              Boolean(nonRetryablePreflightCode),
+              Boolean(nonRetryablePreflightCode) ||
+              isSupersededContinuationFailure(outerErr),
             errorCode: setupFailureErrorCode,
             wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
           }).catch(() => undefined);
