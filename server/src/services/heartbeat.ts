@@ -1011,12 +1011,16 @@ const PRE_LAUNCH_ALLOCATION_FAILURE_CODES = new Set<string>([
 const EXECUTION_REVIEW_PARTICIPANT_PRE_LAUNCH_RETRY_LIMIT = 3;
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 
-// FORK-DIVERGENCE(superseded-continuation-idle): upstream's `buildExecutionContinuation` throws
-// `continuation_task_ownership_changed` when the card moved to another assignee, or reached
-// `done`/`cancelled`, after run setup read it. Setup reads the card early and awaits many steps
-// before the builder re-reads it, so a reassign or close inside that window loses the race. The run
-// correctly fails fast, before any provider work, instead of acting on a card it no longer owns.
-// The agent did nothing wrong, so this failure must not flip it to `error`.
+/**
+ * FORK-DIVERGENCE(superseded-continuation-idle): true when `error` is the failure that upstream's
+ * `buildExecutionContinuation` throws (`continuation_task_ownership_changed`) because the card moved
+ * to another assignee, or reached `done`/`cancelled`, after run setup read it.
+ *
+ * Setup reads the card early and awaits many steps before the builder re-reads it, so a reassign or
+ * close inside that window loses the race. The run correctly fails fast, before any provider work,
+ * instead of acting on a card it no longer owns. The agent did nothing wrong, so this failure must
+ * not flip it to `error`.
+ */
 function isSupersededContinuationFailure(error: unknown): boolean {
   return (
     error instanceof Error &&
