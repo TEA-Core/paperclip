@@ -472,7 +472,13 @@ describe("execute — cliVersion validation", () => {
     await expect(
       execute({
         runId: "run-unsupported-version",
-        agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "OpenCode",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: { cliVersion: "2.0.25", model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
         context: {},
