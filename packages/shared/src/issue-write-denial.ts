@@ -165,11 +165,10 @@ export function describeIssueWriteDenial(
         description:
           `${actor} can read ${issue} but holds no write grant on it. Reading a task ` +
           `does not carry the right to write to it: the grant has to come from being ` +
-          `its assignee or creator, from an org-chain ancestor relationship, or from ` +
-          `an explicit mention.`,
+          `its assignee, from an org-chain ancestor relationship, or from an explicit ` +
+          `mention.`,
         whoCanAct:
-          `${assignee}, the task creator, an org-chain ancestor of the assignee, or a ` +
-          `board member.`,
+          `${assignee}, an org-chain ancestor of the assignee, or a board member.`,
         sanctionedPath:
           `Ask ${assignee} to act, get mentioned on the task, or ${CHILD_ISSUE_PATH}.`,
       };

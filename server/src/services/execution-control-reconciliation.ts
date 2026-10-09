@@ -193,14 +193,13 @@ export async function reapStaleExecutionOwnerLeases(
  * Terminalize summary-generation cards assigned to the Summarizer whose
  * continuation paths have all died (SUP-17698 backfill, amended contract).
  *
- * The forward fix (SUP-17609) terminalizes a summary task when it writes its
- * slot revision; a card that never writes — bounced to `changes_requested`,
- * or never dispatched at all (`executionState: null`) — stays non-terminal
- * forever: `in_progress`/`blocked`/`todo` with no run is swept by nothing,
- * and the read-path dead-binding reclaim (SUP-16945) clears the slot binding
- * without terminalizing the issue. The 2026-09-27 sweep measured 17 such
- * cards: six with `executionState.status = "changes_requested"` and eleven
- * with `executionState: null`.
+ * A card that never writes — bounced to `changes_requested`, or never
+ * dispatched at all (`executionState: null`) — stays non-terminal forever:
+ * `in_progress`/`blocked`/`todo` with no run is swept by nothing, and the
+ * read-path dead-binding reclaim (SUP-16945) clears the slot binding without
+ * terminalizing the issue. The 2026-09-27 sweep measured 17 such cards: six
+ * with `executionState.status = "changes_requested"` and eleven with
+ * `executionState: null`.
  *
  * The selector is the amended population, not an execution state: every
  * non-terminal card assigned to the Summarizer with no continuation path of
@@ -217,14 +216,13 @@ export async function reapStaleExecutionOwnerLeases(
  * contract's addition (a question awaiting a human is a continuation the
  * §2a predicate does not model).
  *
- * Terminalization reuses the standard issue-update funnel — the same path
- * SUP-17609's write route runs post-commit — so the status flip, the slot
- * release via `finalizeSummarySlotsForTerminalIssue`, interaction expiry, and
- * activity logging all land in one transaction with normal close-out
- * semantics. Every continuation path is re-verified under the issue row
- * lock, so a card that gained a live run, a pending interaction, or a
- * terminal status between scan and write is left to its own owner; a re-run
- * over already-terminal rows matches nothing and is a no-op.
+ * Terminalization reuses the standard issue-update funnel, so the status flip,
+ * slot release via `finalizeSummarySlotsForTerminalIssue`, interaction expiry,
+ * and activity logging all land in one transaction with normal close-out
+ * semantics. Every continuation path is re-verified under the issue row lock,
+ * so a card that gained a live run, a pending interaction, or a terminal
+ * status between scan and write is left to its own owner; a re-run over
+ * already-terminal rows matches nothing and is a no-op.
  */
 export async function reapStrandedSummaryGenerationIssues(
   db: Db,

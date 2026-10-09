@@ -116,6 +116,14 @@ export interface DoneTransitionGuardResult {
    * string for `delivery`.
    */
   remedy?: string;
+  /**
+   * Board ruling 2026-10-02 (F1): mechanism D's `reason` WITHOUT its trailing
+   * remedy sentence. The route keeps it byte-identical as the message prefix
+   * and, for every agent seat (the assignee included), appends the caller's
+   * seat and a pointer to control-plane-403.md §7. A board caller keeps the
+   * base text. `reason` itself is unchanged.
+   */
+  diagnosis?: string;
   /** ADR-103 M3.5: the laddered children counted by mechanism A/D, printed beside the excluded set. */
   ladderedChildIdentifiers?: string[];
   /** ADR-103 M3.5: the carve-out-excluded children, printed so an exclusion is never silent. */
@@ -1205,6 +1213,8 @@ export async function countLadderedChildren(
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
       originKind: issues.originKind,
+      title: issues.title,
+      description: issues.description,
       // ADR-103 M2: the edge's own kind, read lazily at close from the live row.
       // A `process` edge is not a decomposition signal (the child gates no slice
       // of this parent's deliverable), so it is excluded below just like a
@@ -1325,7 +1335,20 @@ export async function countLadderedChildren(
     // identically to a carve-out-labelled child. Back-compat keeps the label
     // check, so a child carrying any of the five carve-out labels is treated as
     // `process` regardless of the column value (no relabelling campaign needed).
-    if (row.parentLinkKind === "process" || carveOutChildIds?.has(row.id)) {
+    const firstNonEmptyDescriptionLine = row.description
+      ?.split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+    const hasDeclaredCarveOut =
+      firstNonEmptyDescriptionLine === "work-type:redo" ||
+      firstNonEmptyDescriptionLine === "work-type:delivery";
+    const hasRedoTitle = row.title?.startsWith("[redo]") ?? false;
+    if (
+      row.parentLinkKind === "process" ||
+      carveOutChildIds?.has(row.id) ||
+      hasDeclaredCarveOut ||
+      hasRedoTitle
+    ) {
       excludedChildIdentifiers.push(row.identifier ?? "<unnamed>");
       continue;
     }
@@ -1877,15 +1900,16 @@ async function evaluateDoneTransitionGuardCore(
       "`work-type:process` (or `parent_link_kind: 'process'`); adding a stage " +
       "to this ladder is legal only while the pointer has not advanced past the first close-ladder " +
       `rung (ADR-102 M1). Then ${remedy.charAt(0).toLowerCase()}${remedy.slice(1)}`;
+    const diagnosis =
+      `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
+      `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
+      `(${ladderShape.ladderedChildIdentifiers.join(", ")}), and its review ladder is ${defects.join(
+        "; ",
+      )}.`;
     return {
       allowed: false,
-      reason:
-        `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
-        `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
-        `(${ladderShape.ladderedChildIdentifiers.join(", ")}), and its review ladder is ${defects.join(
-          "; ",
-        )}. ` +
-        remedy,
+      reason: `${diagnosis} ${remedy}`,
+      diagnosis,
       aheadBy: null,
       branch: null,
       defaultRef: null,

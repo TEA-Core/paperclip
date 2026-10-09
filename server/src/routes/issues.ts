@@ -383,6 +383,13 @@ import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slot
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
+  type CallerSeat,
+  type RefusalCaller,
+  type RefusalIssue,
+  resolveCallerSeat,
+  seatAuthorityNextAction,
+} from "../services/seat-authority-refusal.js";
+import {
   isAgentDefaultProjectWorkspacePair,
   parseIssueExecutionWorkspaceSettings,
 } from "../services/execution-workspace-policy.js";
@@ -4218,6 +4225,8 @@ export function issueRoutes(
       error: string;
       remedy: string;
       runId: string | null;
+      /** Board ruling 2026-10-02 (F1): the refusing caller's seat, so the record says whose remedy it is. */
+      callerSeat?: CallerSeat;
     },
   ): Promise<void> {
     const marker = `${TERMINAL_STATUS_REFUSAL_MARKER} ${input.code}`;
@@ -4240,6 +4249,7 @@ export function issueRoutes(
       `Reason: ${input.error}`,
       `Remedy: ${input.remedy}`,
     ];
+    if (input.callerSeat) lines.push(`Caller seat: ${input.callerSeat}`);
     if (input.runId) lines.push(`Refusing run: ${input.runId}`);
     // Fail-closed (SUP-15878 precedent, SUP-17125): the thread record is the surface the
     // NEXT run reads, so persisting it is part of the refusal guarantee. A failure to
@@ -4721,6 +4731,17 @@ export function issueRoutes(
     }
   };
 
+  // Board ruling 2026-10-02 (F1): the writer as a seat-authority refusal sees it.
+  // Create paths have no stored issue yet, so a self-gated refusal there is
+  // always the attach-time payload error with its one lawful fix.
+  function createRefusalCaller(req: Request): RefusalCaller {
+    const info = getActorInfo(req);
+    return {
+      agentId: info.agentId ?? null,
+      userId: info.actorType === "user" ? info.actorId : null,
+    };
+  }
+
   type DoneTransitionGuardOutcome =
     | { ok: true }
     | { ok: false; status: number; body: Record<string, unknown> };
@@ -4753,8 +4774,12 @@ export function issueRoutes(
     // requirement is bypassed, but an audit row is written so board closes stay
     // countable in the ghost-PASS census. The delivery guard still applies in full.
     boardActor: boolean;
+    // Board ruling 2026-10-02 (F1): the writer, so a mechanism D refusal can name
+    // the caller's seat and give it a seat-specific next action. Optional: a door
+    // that passes none keeps the seat-blind body.
+    caller?: RefusalCaller;
   }): Promise<DoneTransitionGuardOutcome> {
-    const { issue, override, commentBody, runId, decisionCarried, boardActor } = input;
+    const { issue, override, commentBody, runId, decisionCarried, boardActor, caller } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
     if (guardResult.skipped || guardResult.skipReason) {
@@ -4796,21 +4821,41 @@ export function issueRoutes(
             : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
           : guardResult.remedy ??
             "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
+      // Board ruling 2026-10-02 (F1 server half): mechanism D is a seat-authority
+      // refusal, and close-ladder repair is a board job. Every caller's seat is
+      // named in details. Only a board caller keeps the existing text and ADR-103
+      // remedy byte-identical (re-parent / declare process / add stages are the
+      // board's levers). Every agent seat, the assignee included, gets the
+      // byte-identical diagnosis prefix followed by its seat and a pointer to
+      // control-plane-403.md §7, which owns the next step and forbids an agent
+      // repairing the ladder. guardResult.reason itself is unchanged
+      // (done-transition-guard.test.ts).
+      let refusalError = guardResult.reason;
+      let refusalRemedy = remedy;
+      let callerSeat: CallerSeat | undefined;
+      if (mechanism === "D" && caller) {
+        callerSeat = resolveCallerSeat(caller, issue as unknown as RefusalIssue);
+        if (!boardActor) {
+          refusalRemedy = seatAuthorityNextAction(callerSeat);
+          refusalError = `${guardResult.diagnosis ?? guardResult.reason} ${refusalRemedy}`;
+        }
+      }
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 409 with no thread-readable code/remedy (SUP-15878 precedent).
       await postTerminalStatusRefusalComment(svc, issue.id, {
         httpStatus: 409,
         code: "done_transition_missing_delivery",
-        error: guardResult.reason,
-        remedy,
+        error: refusalError,
+        remedy: refusalRemedy,
         runId,
+        callerSeat,
       });
       return {
         ok: false,
         status: 409,
         body: {
-          error: guardResult.reason,
+          error: refusalError,
           code: "done_transition_missing_delivery",
           details: {
             issueId: issue.id,
@@ -4828,7 +4873,8 @@ export function issueRoutes(
             mechanism,
             ladderedChildIdentifiers: guardResult.ladderedChildIdentifiers ?? null,
             excludedChildIdentifiers: guardResult.excludedChildIdentifiers ?? null,
-            remedy,
+            remedy: refusalRemedy,
+            ...(callerSeat ? { callerSeat, nextAction: refusalRemedy } : {}),
           },
         },
       };
@@ -6761,6 +6807,7 @@ export function issueRoutes(
       createdByAgentId: string | null;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
+    options: { allowCreatorDocumentWrite?: boolean } = {},
   ) {
     return access.decide({
       actor: req.actor,
@@ -6783,6 +6830,7 @@ export function issueRoutes(
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         createdByAgentId: issue.createdByAgentId,
+        ...(options.allowCreatorDocumentWrite ? { issueDocumentWrite: true } : {}),
       },
     });
   }
@@ -7169,7 +7217,11 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean; bypassCheckoutOwnership?: boolean } = {},
+    options: {
+      allowVisibleIssueWrite?: boolean;
+      bypassCheckoutOwnership?: boolean;
+      allowCreatorDocumentWrite?: boolean;
+    } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -7212,6 +7264,7 @@ export function issueRoutes(
       req,
       issue,
       "issue:mutate",
+      options,
     );
     if (!boundaryDecision.allowed) {
       return denyIssueWrite(
@@ -7232,6 +7285,9 @@ export function issueRoutes(
           issue.assigneeAgentId,
         )
       ) {
+        return true;
+      }
+      if (options.allowCreatorDocumentWrite && issue.createdByAgentId === actorAgentId) {
         return true;
       }
       if (issue.status === "in_progress") {
@@ -13190,7 +13246,12 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (
+        !(await assertAgentIssueMutationAllowed(req, res, issue, {
+          allowCreatorDocumentWrite: true,
+        }))
+      )
+        return;
       if (
         !(await assertDeliverableMutationAllowedByRunContext(req, res, issue))
       )
@@ -13505,7 +13566,12 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (
+        !(await assertAgentIssueMutationAllowed(req, res, issue, {
+          allowCreatorDocumentWrite: true,
+        }))
+      )
+        return;
       if (
         !(await assertDeliverableMutationAllowedByRunContext(req, res, issue))
       )
@@ -15025,6 +15091,11 @@ export function issueRoutes(
         companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        refusalContext: {
+          caller: createRefusalCaller(req),
+          issue: { assigneeAgentId: normalizedAssigneeAgentRef.id ?? null, executionState: null },
+          boardActor: req.actor.type === "board",
+        },
       });
       await assertExecutionPolicyAgentReferencesResolve({
         companyId,
@@ -15813,6 +15884,11 @@ export function issueRoutes(
         companyId: parent.companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        refusalContext: {
+          caller: createRefusalCaller(req),
+          issue: { assigneeAgentId: normalizedAssigneeAgentRef.id ?? null, executionState: null },
+          boardActor: req.actor.type === "board",
+        },
       });
       await assertExecutionPolicyAgentReferencesResolve({
         companyId: parent.companyId,
@@ -16063,6 +16139,14 @@ export function issueRoutes(
           executionPolicy: normalizedExecutionPolicy,
           assigneeAgentId:
             (child.assigneeAgentId as string | null | undefined) ?? null,
+          refusalContext: {
+            caller: createRefusalCaller(req),
+            issue: {
+              assigneeAgentId: (child.assigneeAgentId as string | null | undefined) ?? null,
+              executionState: null,
+            },
+            boardActor: req.actor.type === "board",
+          },
         });
         await assertExecutionPolicyAgentReferencesResolve({
           companyId: sourceIssue.companyId,
@@ -16669,14 +16753,27 @@ export function issueRoutes(
         (k) => !ANCESTOR_ALLOWED_FIELDS.has(k) && !ANCESTOR_WORKSPACE_CORRECTION_FIELDS.has(k),
       );
       if (forbidden.length > 0) {
+        // Board ruling 2026-10-02 (F1 server half): caller-aware. The prefix is
+        // byte-identical (agent doctrine quotes it); the seat and a pointer to
+        // control-plane-403.md §7 follow it.
+        const nextAction = seatAuthorityNextAction("ancestor-hatch");
         res.status(403).json({
-          error: "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
-          details: { forbiddenFields: forbidden },
+          error: `Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections. ${nextAction}`,
+          details: { forbiddenFields: forbidden, callerSeat: "ancestor-hatch", nextAction },
         });
         return;
       }
     }
+    const writeViaAncestorHatch =
+      mutationAccess !== true &&
+      typeof mutationAccess === "object" &&
+      mutationAccess.reason === "allow_manager_chain";
     const actor = getActorInfo(req);
+    const refusalCaller: RefusalCaller = {
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      viaAncestorHatch: writeViaAncestorHatch,
+    };
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
     const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
@@ -17048,6 +17145,13 @@ export function issueRoutes(
         companyId: existing.companyId,
         executionPolicy: normalizedExecutionPolicy,
         assigneeAgentId: requestedAssigneeAgentId ?? null,
+        // A board caller keeps the payload-fix remedy on a ladder that has run:
+        // its rearmExecutionPolicy is the board's own close-ladder lever.
+        refusalContext: {
+          caller: refusalCaller,
+          issue: existing as unknown as RefusalIssue,
+          boardActor: req.actor.type === "board",
+        },
       });
       await assertExecutionPolicyAgentReferencesResolve({
         companyId: existing.companyId,
@@ -17074,6 +17178,12 @@ export function issueRoutes(
         executionPolicy: nextExecutionPolicy,
         executionState: existing.executionState,
         incomingAssigneeAgentId: normalizedAssigneeAgentId,
+        // A board caller gets the unchanged base message: changing the stage's
+        // participants is its own lawful repair, so the seat tail is wrong for it.
+        refusalContext:
+          req.actor.type === "board"
+            ? undefined
+            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
       });
     }
     if (updateFields.executionPolicy !== undefined) {
@@ -17274,6 +17384,7 @@ export function issueRoutes(
         userId: actor.actorType === "user" ? actor.actorId : null,
       },
       allowBoardOverride: req.actor.type === "board",
+      actorViaAncestorHatch: writeViaAncestorHatch,
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
@@ -17400,6 +17511,7 @@ export function issueRoutes(
       }
     }
 
+    let deliveryIdentityWorkspaceBranchWrite = false;
     // ADR-091 D1 (SUP-14824): record the delivery identity on in_review transition.
     // Only a run that holds the issue's lease may write it, and only on a transition
     // INTO in_review. Any other actor or transition is rejected without partial write.
@@ -17463,10 +17575,25 @@ export function issueRoutes(
       // lands — mirroring the service-side gate in resolveDeliveryIdentity. This is the
       // card-boundary half D1 exists to close.
       const branchOwnership = await resolveCardDeliveryBranchOwnership(db, existing.companyId, existing.id);
+      const [deliveryWorkspace] = existing.executionWorkspaceId
+        ? await db
+            .select({ strategyType: executionWorkspaces.strategyType, branchName: executionWorkspaces.branchName })
+            .from(executionWorkspaces)
+            .where(and(
+              eq(executionWorkspaces.id, existing.executionWorkspaceId),
+              eq(executionWorkspaces.companyId, existing.companyId),
+            ))
+        : [];
+      const canRecordProjectPrimaryBranch =
+        branchOwnership.legitimate
+        && branchOwnership.branch === null
+        && deliveryWorkspace?.strategyType === "project_primary"
+        && !deliveryWorkspace.branchName;
       const recordedBranchMismatch =
-        branchOwnership.branch === null ||
-        requestedDeliveryIdentity.branch.toLowerCase() !== branchOwnership.branch.toLowerCase();
-      if (recordedBranchMismatch || !branchOwnership.legitimate) {
+        (!canRecordProjectPrimaryBranch && branchOwnership.branch === null)
+        || (branchOwnership.branch !== null
+          && requestedDeliveryIdentity.branch.toLowerCase() !== branchOwnership.branch.toLowerCase());
+      if (!canRecordProjectPrimaryBranch && (!branchOwnership.legitimate || recordedBranchMismatch)) {
         const branchReason =
           branchOwnership.branch === null
             ? "card has no execution-workspace delivery branch to validate the recorded branch against"
@@ -17501,6 +17628,7 @@ export function issueRoutes(
           recordedAt: new Date().toISOString(),
         },
       };
+      deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
     }
 
     const nextStatus = updateFields.status ?? existing.status;
@@ -17669,6 +17797,21 @@ export function issueRoutes(
         });
       }
     }
+    // Board ruling 2026-10-02 (F1 server half): on this shape the typed ladder-gap
+    // 409 stands in for Mechanism D (the guard below is skipped), so it is a
+    // close-ladder refusal and caller-aware the same way. Every caller's seat goes
+    // in details. A board caller keeps the add-an-approval-stage remediation (its
+    // lever); every agent seat gets the byte-identical prefix plus its seat and the
+    // control-plane-403.md §7 pointer, since close-ladder repair is a board job.
+    const missingApprovalStageRefusal = missingApprovalStageGap
+      ? (() => {
+          const callerSeat = resolveCallerSeat(refusalCaller, existing as unknown as RefusalIssue);
+          const base = "Cannot mark this issue done: it has open child issues but no approval stage in its executionPolicy";
+          const boardCaller = req.actor.type === "board";
+          const remedy = boardCaller ? missingApprovalStageGap.remediation : seatAuthorityNextAction(callerSeat);
+          return { callerSeat, remedy, error: boardCaller ? base : `${base} ${remedy}` };
+        })()
+      : null;
     // The typed ladder-gap refusal (raised under the update lock below) replaces
     // the delivery guard's `done_transition_missing_delivery` catchall for
     // in-scope cards, so the guard is skipped only when the gap is present.
@@ -17687,6 +17830,7 @@ export function issueRoutes(
         runId: actor.runId ?? null,
         decisionCarried: !!transition.decision,
         boardActor: req.actor.type === "board",
+        caller: refusalCaller,
       });
       if (!outcome.ok) {
         res.status(outcome.status).json(outcome.body);
@@ -17813,6 +17957,9 @@ export function issueRoutes(
     const postCommitIssueActions: IssuePostCommitAction[] = [];
     const issueUpdateData = {
       ...updateFields,
+      ...(deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId
+        ? { executionWorkspaceId: existing.executionWorkspaceId }
+        : {}),
       actorAgentId: actor.agentId ?? null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
@@ -17953,6 +18100,7 @@ export function issueRoutes(
       || persistReviewActivityTransactionally
       || reviewPolicySensitiveMutationRequested
       || workspaceReprovisionCloseId !== null
+      || deliveryIdentityWorkspaceBranchWrite
       // ADR-103 M4: a re-parent must commit atomically with its close-ladder
       // check, so force every parent-edge mutation through the transactional
       // path (a plain re-parent otherwise falls through to the non-
@@ -18029,6 +18177,12 @@ export function issueRoutes(
                 parentLinkKind: effectiveParentLinkKind,
                 originKind: existing.originKind,
                 status: effectiveStatus ?? existing.status,
+                title: updateFields.title === undefined
+                  ? existing.title
+                  : (updateFields.title as string | null),
+                description: updateFields.description === undefined
+                  ? existing.description
+                  : (updateFields.description as string | null),
                 hasCarveOutLabel,
               },
             );
@@ -18054,7 +18208,7 @@ export function issueRoutes(
             && existing.status !== "done"
           ) {
             throw conflict(
-              "Cannot mark this issue done: it has open child issues but no approval stage in its executionPolicy",
+              missingApprovalStageRefusal!.error,
               {
                 code: MISSING_APPROVAL_STAGE_ERROR_CODE,
                 issueId: existing.id,
@@ -18063,7 +18217,9 @@ export function issueRoutes(
                 ladderedChildIdentifiers: missingApprovalStageGap.ladderedChildIdentifiers,
                 excludedChildIdentifiers: missingApprovalStageGap.excludedChildIdentifiers,
                 stageTypes: missingApprovalStageGap.stageTypes,
-                remediation: missingApprovalStageGap.remediation,
+                remediation: missingApprovalStageRefusal!.remedy,
+                callerSeat: missingApprovalStageRefusal!.callerSeat,
+                nextAction: missingApprovalStageRefusal!.remedy,
               },
             );
           }
@@ -18122,7 +18278,23 @@ export function issueRoutes(
             });
           }
 
+          if (deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId) {
+            await tx
+              .update(executionWorkspaces)
+              .set({
+                branchName: requestedDeliveryIdentity!.branch,
+                updatedAt: new Date(),
+              })
+              .where(and(
+                eq(executionWorkspaces.id, existing.executionWorkspaceId),
+                eq(executionWorkspaces.companyId, existing.companyId),
+                eq(executionWorkspaces.strategyType, "project_primary"),
+                isNull(executionWorkspaces.branchName),
+              ));
+          }
+
           const updated = await updateIssue(tx);
+
           if (!updated) return null;
           if (commentAttachmentIds?.length) {
             // Reassignment, comment creation and upload binding commit together.
@@ -18327,8 +18499,9 @@ export function issueRoutes(
           httpStatus: 409,
           code: MISSING_APPROVAL_STAGE_ERROR_CODE,
           error: err.message,
-          remedy: missingApprovalStageGap.remediation,
+          remedy: missingApprovalStageRefusal?.remedy ?? missingApprovalStageGap.remediation,
           runId: actor.runId ?? null,
+          callerSeat: missingApprovalStageRefusal?.callerSeat,
         });
       }
       throw err;
@@ -20704,6 +20877,10 @@ export function issueRoutes(
           runId: actor.runId ?? null,
           decisionCarried: true,
           boardActor: req.actor.type === "board",
+          caller: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
         });
         if (!closeOutcome.ok) {
           res.status(closeOutcome.status).json(closeOutcome.body);
@@ -22417,6 +22594,10 @@ export function issueRoutes(
           runId: actor.runId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
+          caller: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
         });
         if (!outcome.ok) {
           res.status(outcome.status).json(outcome.body);

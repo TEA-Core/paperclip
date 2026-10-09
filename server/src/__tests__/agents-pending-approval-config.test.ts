@@ -155,4 +155,63 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       metadata: { source: "hire-form" },
     });
   });
+
+  it("applies requestedAgentConfig when it is the only config payload", async () => {
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const approvalSvc = approvalService(db);
+    const pending = await agentSvc.create(companyId, {
+      name: "Placeholder",
+      role: "general",
+      title: null,
+      icon: null,
+      capabilities: null,
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      budgetMonthlyCents: 0,
+      metadata: null,
+      status: "pending_approval",
+      spentMonthlyCents: 0,
+      permissions: {},
+      lastHeartbeatAt: null,
+    });
+    const approval = await approvalSvc.create(companyId, {
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "pending",
+      payload: {
+        requestedAgentConfig: {
+          name: "Requested Coder",
+          role: "engineer",
+          title: "Software Engineer",
+          adapterType: "process",
+          adapterConfig: { command: "echo requested" },
+          runtimeConfig: { maxConcurrentRuns: 2 },
+          budgetMonthlyCents: 1234,
+          metadata: { source: "requested-config" },
+        },
+        agentId: pending.id,
+      },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    });
+
+    await approvalSvc.approve(approval.id, "board-user", "Approved requested config");
+
+    await expect(agentSvc.getById(pending.id)).resolves.toMatchObject({
+      status: "idle",
+      name: "Requested Coder",
+      role: "engineer",
+      title: "Software Engineer",
+      adapterType: "process",
+      adapterConfig: { command: "echo requested" },
+      runtimeConfig: { maxConcurrentRuns: 2 },
+      budgetMonthlyCents: 1234,
+      metadata: { source: "requested-config" },
+    });
+  });
 });

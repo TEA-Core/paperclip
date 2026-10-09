@@ -64,6 +64,7 @@ const mockProjectService = vi.hoisted(() => ({
 }));
 
 const mockDocumentService = vi.hoisted(() => ({
+  restoreIssueDocumentRevision: vi.fn(),
   upsertIssueDocument: vi.fn(),
 }));
 
@@ -633,6 +634,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockLogActivity.mockClear();
     mockObserveCrossIssueInfluence.mockReset();
     mockObserveCrossIssueInfluence.mockResolvedValue(null);
+    mockDocumentService.restoreIssueDocumentRevision.mockReset();
     mockDocumentService.upsertIssueDocument.mockReset();
     mockWorkProductService.createForIssue.mockReset();
     mockWorkProductService.latestRunDiffSummary.mockReset();
@@ -759,6 +761,17 @@ describe("agent issue mutation checkout ownership", () => {
       issueId,
       companyId,
       objectKey: "issues/attachment-1/report.txt",
+    });
+    mockDocumentService.restoreIssueDocumentRevision.mockResolvedValue({
+      document: {
+        id: "document-1",
+        key: "plan",
+        title: "Plan",
+        format: "markdown",
+        latestRevisionId: "revision-2",
+        latestRevisionNumber: 2,
+        body: "# restored",
+      },
     });
     mockDocumentService.upsertIssueDocument.mockResolvedValue({
       created: false,
@@ -1238,6 +1251,106 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(401);
     expect(res.body.error).toBe("Agent run id required");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows the issue creator to update a document without general issue mutation access", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: peerAgentId,
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> | null }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read" ||
+        (input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true),
+      action: input.action,
+      reason: input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true
+        ? "allow_creator"
+        : "deny_missing_grant",
+      explanation: "Document creator test boundary.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# created" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
+  });
+
+  it("allows the issue creator to restore a document revision", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: peerAgentId,
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> | null }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read" ||
+        (input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true),
+      action: input.action,
+      reason: input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true
+        ? "allow_creator"
+        : "deny_missing_grant",
+      explanation: "Document creator test boundary.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/documents/plan/revisions/revision-1/restore`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockDocumentService.restoreIssueDocumentRevision).toHaveBeenCalled();
+  });
+
+  it("keeps document writes denied for an agent that did not create the issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: "another-agent-id",
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read",
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "Document creator test boundary.",
+    }));
+
+    const app = await createApp(peerActor());
+    const upsertRes = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# denied" });
+    const restoreRes = await request(app)
+      .post(`/api/issues/${issueId}/documents/plan/revisions/revision-1/restore`)
+      .send({});
+
+    expect(upsertRes.status).toBe(403);
+    expect(upsertRes.body.details.code).toBe("issue_write_no_grant");
+    expect(restoreRes.status).toBe(403);
+    expect(restoreRes.body.details.code).toBe("issue_write_no_grant");
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+    expect(mockDocumentService.restoreIssueDocumentRevision).not.toHaveBeenCalled();
+  });
+
+  it("keeps general issue mutation denied for the issue creator", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      createdByAgentId: peerAgentId,
+      status: "todo",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> | null }) => ({
+      allowed: input.action === "issue:read" || input.action === "company_scope:read" ||
+        (input.action === "issue:mutate" && input.scope?.issueDocumentWrite === true),
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "General issue mutation denied.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Nope" });
+
+    expect(res.status).toBe(403);
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -2024,10 +2137,51 @@ describe("agent issue mutation checkout ownership", () => {
         .send(patch);
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toBe(
-        "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
-      );
+      // Board ruling 2026-10-02 (F1 server half): the prefix is byte-identical
+      // (agent doctrine quotes it); the seat label and a pointer to the owning
+      // doctrine section follow it.
+      expect(
+        res.body.error.startsWith(
+          "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections. ",
+        ),
+      ).toBe(true);
       expect(res.body.details.forbiddenFields).toContain(_field);
+      expect(res.body.details.callerSeat).toBe("ancestor-hatch");
+      expect(res.body.details.nextAction).toBe(
+        "Your seat: ancestor-hatch. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
+      expect(res.body.error.endsWith(` ${res.body.details.nextAction}`)).toBe(true);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("on a card with a live stage, gives the hatch caller the same seat label and pointer (control-plane-403.md §7 owns the live-stage case)", async () => {
+      const stageId = "77777777-7777-4777-8777-777777777777";
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_review",
+          assigneeAgentId: ownerAgentId,
+          executionState: {
+            status: "pending",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "approval",
+            currentParticipant: { type: "agent", agentId: ownerAgentId, userId: null },
+            returnAssignee: null,
+            completedStageIds: [],
+            skippedStageIds: [],
+          },
+        }),
+      );
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Approved." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.forbiddenFields).toEqual(["comment"]);
+      expect(res.body.details.callerSeat).toBe("ancestor-hatch");
+      expect(res.body.details.nextAction).toBe(
+        "Your seat: ancestor-hatch. This is a seat-authority refusal: see control-plane-403.md §7 for the next step.",
+      );
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
@@ -2037,10 +2191,13 @@ describe("agent issue mutation checkout ownership", () => {
         .send({ reviewRequest: { instructions: "Please approve" } });
 
       expect(res.status).toBe(403);
-      expect(res.body.error).toBe(
-        "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
-      );
+      expect(
+        res.body.error.startsWith(
+          "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
+        ),
+      ).toBe(true);
       expect(res.body.details.forbiddenFields).toContain("reviewRequest");
+      expect(res.body.details.callerSeat).toBe("ancestor-hatch");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
@@ -2418,6 +2575,23 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.error).toContain(gateStageId);
       expect(res.body.error).toContain("self-satisfiable");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("gives a board caller the unchanged base 422, with no seat or next action", async () => {
+      // Changing the stage's participants is the board's own lawful repair, so
+      // the board keeps the base text exactly (re-audit 2026-10-02).
+      const res = await request(await createApp(boardActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: gateReviewerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe(
+        `Refusing assigneeAgentId write: ${gateReviewerAgentId} is a participant of incomplete review stage ${gateStageId} and the write would make the stage self-satisfiable, because it cannot be cleared without the assignee approving their own work (participants excluding the assignee: 0, approvalsNeeded: 1)`,
+      );
+      expect(res.body.details.guard).toBe("assignee_review_gate");
+      expect(res.body.details).not.toHaveProperty("callerSeat");
+      expect(res.body.details).not.toHaveProperty("nextAction");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 

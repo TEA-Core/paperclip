@@ -1285,10 +1285,11 @@ node scripts/opencode-db-janitor.mjs --data-dir /paperclip/.local/share/opencode
 ```
 
 `--apply` takes a single-instance lock in the data directory, so a manual sweep
-and the scheduled one cannot overlap. After opening each database, the sweep also
+and the scheduled one cannot overlap. Before opening each database, the sweep
 checks that the owning agent uid can write the database and every existing `-wal`
-and `-shm` sidecar; an unwritable path reports that agent and path as failed and
-leaves its mode and owner unchanged. It exits non-zero if any database failed.
+and `-shm` sidecar; an unwritable or missing path reports that agent and path as
+failed without creating or changing anything. It exits non-zero if any database
+failed.
 
 ## Secrets in Dev
 

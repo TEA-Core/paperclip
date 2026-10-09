@@ -71,6 +71,17 @@ function availableToolConnectionMethods(
   );
 }
 
+function denylistedServiceReason(serviceSlug: string) {
+  const configured = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+  const denylist = configured === undefined
+    ? new Set(["github"])
+    : new Set(configured.split(",").map((slug) => slug.trim().toLocaleLowerCase()).filter(Boolean));
+  if (!denylist.has(serviceSlug.toLocaleLowerCase())) return null;
+  return serviceSlug.toLocaleLowerCase() === "github"
+    ? "The platform already provides github to this run through gh and GH_TOKEN; no connection is needed."
+    : `The platform already provides ${serviceSlug} to this run; no connection is needed.`;
+}
+
 export function connectionIntentService(db: Db) {
   const interactions = issueThreadInteractionService(db);
   const access = toolAccessService(db);
@@ -369,15 +380,16 @@ export function connectionIntentService(db: Db) {
       if (!score) continue;
       const ready = await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
         responsibleUserId: run.responsibleUserId!, serviceSlug: service, inventory });
+      const denylistedReason = denylistedServiceReason(service);
       const denied = !ready && matching.length > 0 && await administrativeDenial(run.companyId, agent.id, service, inventory);
       candidates.push({ score, item: {
         service, name: app.name, description: app.description ?? null, logoUrl: app.branding.logoUrl ?? null,
         methods: app.methods, source: app.source,
-        state: ready ? "ready" : denied ? "unavailable" : !app.available || !app.methods.length ? "unavailable"
+        state: denylistedReason ? "unavailable" : ready ? "ready" : denied ? "unavailable" : !app.available || !app.methods.length ? "unavailable"
           : matching.length ? "needs_user_action" : "available",
-        reason: ready ? "Connection is installed and usable by this agent" : denied ? "An administrator has not permitted executable tools for this agent; reconnecting cannot grant that permission" : !app.available ? "Connection is disabled or unavailable"
+        reason: denylistedReason ?? (ready ? "Connection is installed and usable by this agent" : denied ? "An administrator has not permitted executable tools for this agent; reconnecting cannot grant that permission" : !app.available ? "Connection is disabled or unavailable"
           : matching.some((connection) => isToolConnectionAttentionHealth(connection.healthStatus)) ? "Connection needs attention"
-          : matching.length ? "Review identity and access for this agent" : "Connect this service to continue",
+          : matching.length ? "Review identity and access for this agent" : "Connect this service to continue"),
         connectionId: ready?.id ?? null,
       }});
     }
@@ -390,6 +402,8 @@ export function connectionIntentService(db: Db) {
     options: { purpose?: "ai" } = {},
   ): Promise<ConnectionRequestResult> {
     const context = await loadRunContext(claims);
+    const denylistedReason = denylistedServiceReason(serviceSlug);
+    if (denylistedReason) throw unprocessable(denylistedReason);
     const app = await resolveService(serviceSlug, context.run.companyId, context.run.responsibleUserId!, context.agent.id, options.purpose);
     if (!app.available || app.methods.length === 0) {
       throw unprocessable(`Connection service ${serviceSlug} is not available`);

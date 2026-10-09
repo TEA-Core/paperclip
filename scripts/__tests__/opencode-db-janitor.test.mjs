@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -579,15 +588,21 @@ test("main exits non-zero when an agent cannot write its WAL", async () => {
         return [filePath, { mode: info.mode, uid: info.uid, gid: info.gid }];
       }),
     );
+    let opened = false;
+    function TrackingDatabaseSync(...args) {
+      opened = true;
+      return new DatabaseSync(...args);
+    }
     const lines = [];
     const code = await main(["--apply", "--data-dir", dir], {
       log: (line) => lines.push(line),
       nowMs: NOW_MS,
-      DatabaseSync,
+      DatabaseSync: TrackingDatabaseSync,
       agentUid: process.getuid?.() ?? -1,
       agentGids: new Set([process.getgid?.() ?? -1]),
     });
     assert.equal(code, 1);
+    assert.equal(opened, false);
     assert.ok(
       lines.some(
         (line) => line.includes("FAILED") && line.includes("agent-1") && line.includes(walPath),
@@ -604,6 +619,111 @@ test("main exits non-zero when an agent cannot write its WAL", async () => {
     }
   } finally {
     writer.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("main reports an unwritable database without opening or creating sidecars", async () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [30] });
+  try {
+    chmodSync(databasePath, 0o444);
+    assert.equal(existsSync(`${databasePath}-wal`), false);
+    assert.equal(existsSync(`${databasePath}-shm`), false);
+    const modeBefore = statSync(databasePath).mode;
+    let opened = false;
+    function TrackingDatabaseSync(...args) {
+      opened = true;
+      return new DatabaseSync(...args);
+    }
+    const lines = [];
+    const code = await main(["--apply", "--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync: TrackingDatabaseSync,
+      agentUid: process.getuid?.() ?? -1,
+      agentGids: new Set([process.getgid?.() ?? -1]),
+    });
+    assert.equal(code, 1);
+    assert.equal(opened, false);
+    assert.ok(lines.some((line) => line.includes("FAILED") && line.includes(databasePath)));
+    assert.equal(statSync(databasePath).mode, modeBefore);
+    assert.equal(existsSync(`${databasePath}-wal`), false);
+    assert.equal(existsSync(`${databasePath}-shm`), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a dry run reports an unwritable database without opening or creating sidecars", async () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [30] });
+  try {
+    chmodSync(databasePath, 0o444);
+    const lines = [];
+    const code = await main(["--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync,
+      agentUid: process.getuid?.() ?? -1,
+      agentGids: new Set([process.getgid?.() ?? -1]),
+    });
+    assert.equal(code, 1);
+    assert.ok(lines.some((line) => line.includes("FAILED") && line.includes(databasePath)));
+    assert.equal(existsSync(`${databasePath}-wal`), false);
+    assert.equal(existsSync(`${databasePath}-shm`), false);
+    assert.equal(counts(databasePath).session, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a missing database is reported without being created", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "opencode-db-janitor-test-"));
+  const databasePath = path.join(dir, "opencode-agent-missing.db");
+  try {
+    assert.throws(
+      () =>
+        janitorRunDatabase({
+          databasePath,
+          DatabaseSync,
+          apply: true,
+          olderThanDays: 7,
+          nowMs: NOW_MS,
+          agentUid: process.getuid?.() ?? -1,
+          agentGids: new Set([process.getgid?.() ?? -1]),
+        }),
+      (error) => error instanceof Error && error.message.includes(databasePath),
+    );
+    assert.equal(existsSync(databasePath), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("main reports a database removed after listing without creating it", async () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [30] });
+  const removedPath = path.join(dir, "opencode-agent-agent-2.db");
+  copyFileSync(databasePath, removedPath);
+  try {
+    let opened = 0;
+    function TrackingDatabaseSync(...args) {
+      opened += 1;
+      const db = new DatabaseSync(...args);
+      if (opened === 1) rmSync(removedPath);
+      return db;
+    }
+    const lines = [];
+    const code = await main(["--apply", "--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync: TrackingDatabaseSync,
+      agentUid: process.getuid?.() ?? -1,
+      agentGids: new Set([process.getgid?.() ?? -1]),
+    });
+    assert.equal(code, 1);
+    assert.equal(opened, 1);
+    assert.ok(lines.some((line) => line.includes("FAILED") && line.includes(removedPath)));
+    assert.equal(existsSync(removedPath), false);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

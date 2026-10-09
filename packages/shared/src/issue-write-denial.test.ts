@@ -54,6 +54,17 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.whoCanAct).toContain("CodexCoder");
   });
 
+  it("does not claim the creator has a general issue mutate grant", () => {
+    const copy = describeIssueWriteDenial("issue_write_no_grant", {
+      actorLabel: "Fable",
+      assigneeLabel: "CodexCoder",
+      issueIdentifier: "TASK-482",
+    });
+    expect(copy.description).not.toContain("assignee or creator");
+    expect(copy.whoCanAct).not.toContain("the task creator");
+    expect(copy.whoCanAct).toContain("CodexCoder");
+  });
+
   it("points a visibility denial at the sanctioned child-issue path", () => {
     const copy = describeIssueWriteDenial("issue_write_not_visible");
     // The incident detour was discovering exactly this workaround.
