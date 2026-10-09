@@ -205,36 +205,39 @@ function changedPendingApprovalConfigFields(
 }
 
 function configPatchFromApprovalPayload(payload: Record<string, unknown>) {
+  const configPayload = isPlainRecord(payload.requestedAgentConfig)
+    ? { ...payload, ...payload.requestedAgentConfig }
+    : payload;
   const patch: Partial<typeof agents.$inferInsert> = {};
-  if (typeof payload.name === "string") patch.name = payload.name;
-  if (typeof payload.role === "string") patch.role = payload.role;
-  if (Object.prototype.hasOwnProperty.call(payload, "title")) {
-    patch.title = typeof payload.title === "string" ? payload.title : null;
+  if (typeof configPayload.name === "string") patch.name = configPayload.name;
+  if (typeof configPayload.role === "string") patch.role = configPayload.role;
+  if (Object.prototype.hasOwnProperty.call(configPayload, "title")) {
+    patch.title = typeof configPayload.title === "string" ? configPayload.title : null;
   }
-  if (Object.prototype.hasOwnProperty.call(payload, "icon")) {
-    patch.icon = typeof payload.icon === "string" ? payload.icon : null;
+  if (Object.prototype.hasOwnProperty.call(configPayload, "icon")) {
+    patch.icon = typeof configPayload.icon === "string" ? configPayload.icon : null;
   }
-  if (Object.prototype.hasOwnProperty.call(payload, "reportsTo")) {
-    patch.reportsTo = typeof payload.reportsTo === "string" ? payload.reportsTo : null;
+  if (Object.prototype.hasOwnProperty.call(configPayload, "reportsTo")) {
+    patch.reportsTo = typeof configPayload.reportsTo === "string" ? configPayload.reportsTo : null;
   }
-  if (Object.prototype.hasOwnProperty.call(payload, "capabilities")) {
-    patch.capabilities = typeof payload.capabilities === "string" ? payload.capabilities : null;
+  if (Object.prototype.hasOwnProperty.call(configPayload, "capabilities")) {
+    patch.capabilities = typeof configPayload.capabilities === "string" ? configPayload.capabilities : null;
   }
-  if (typeof payload.adapterType === "string") patch.adapterType = payload.adapterType;
-  if (isPlainRecord(payload.adapterConfig)) patch.adapterConfig = payload.adapterConfig;
-  if (isPlainRecord(payload.runtimeConfig)) patch.runtimeConfig = payload.runtimeConfig;
-  if (Object.prototype.hasOwnProperty.call(payload, "defaultEnvironmentId")) {
+  if (typeof configPayload.adapterType === "string") patch.adapterType = configPayload.adapterType;
+  if (isPlainRecord(configPayload.adapterConfig)) patch.adapterConfig = configPayload.adapterConfig;
+  if (isPlainRecord(configPayload.runtimeConfig)) patch.runtimeConfig = configPayload.runtimeConfig;
+  if (Object.prototype.hasOwnProperty.call(configPayload, "defaultEnvironmentId")) {
     patch.defaultEnvironmentId =
-      typeof payload.defaultEnvironmentId === "string" ? payload.defaultEnvironmentId : null;
+      typeof configPayload.defaultEnvironmentId === "string" ? configPayload.defaultEnvironmentId : null;
   }
-  if (typeof payload.budgetMonthlyCents === "number") {
-    patch.budgetMonthlyCents = payload.budgetMonthlyCents;
+  if (typeof configPayload.budgetMonthlyCents === "number") {
+    patch.budgetMonthlyCents = configPayload.budgetMonthlyCents;
   }
-  if (Object.prototype.hasOwnProperty.call(payload, "metadata")) {
-    patch.metadata = isPlainRecord(payload.metadata) ? payload.metadata : null;
+  if (Object.prototype.hasOwnProperty.call(configPayload, "metadata")) {
+    patch.metadata = isPlainRecord(configPayload.metadata) ? configPayload.metadata : null;
   }
-  if (isPlainRecord(payload.permissions)) {
-    patch.permissions = payload.permissions;
+  if (isPlainRecord(configPayload.permissions)) {
+    patch.permissions = configPayload.permissions;
   }
   return patch;
 }
