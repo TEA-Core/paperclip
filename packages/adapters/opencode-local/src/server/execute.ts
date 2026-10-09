@@ -71,6 +71,8 @@ import {
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
+  OPENCODE_V2_CLI_VERSION,
+  verifyOpenCodeCliVersion,
   parseOpenCodeModelsOutput,
   requireOpenCodeModelId,
 } from "./models.js";
@@ -327,9 +329,48 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
 
+export async function verifyRemoteOpenCodeCliVersion(input: {
+  runId: string;
+  executionTarget: NonNullable<AdapterExecutionContext["executionTarget"]>;
+  cliVersion?: unknown;
+  command: string;
+  cwd: string;
+  env: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+}) {
+  const expectedVersion = asString(input.cliVersion, "").trim();
+  if (!expectedVersion) return;
+  const probe = await runAdapterExecutionTargetProcess(
+    input.runId,
+    input.executionTarget,
+    input.command,
+    ["--version"],
+    {
+      cwd: input.cwd,
+      env: input.env,
+      timeoutSec: Math.min(input.timeoutSec > 0 ? input.timeoutSec : 10, 10),
+      graceSec: input.graceSec,
+      onLog: async () => {},
+    },
+  );
+  if (probe.timedOut || (probe.exitCode ?? 1) !== 0) {
+    const detail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
+    throw new Error(`OpenCode CLI version probe failed for ${input.command}${detail ? `: ${detail}` : "."}`);
+  }
+  const match = /(?:^|\s)v?(\d+\.\d+\.\d+)(?:\s|$)/i.exec(`${probe.stdout}\n${probe.stderr}`);
+  const actualVersion = match?.[1] ?? null;
+  if (actualVersion !== expectedVersion) {
+    throw new Error(
+      `OpenCode CLI version mismatch: expected ${expectedVersion}, received ${actualVersion ?? "unknown"}.`,
+    );
+  }
+}
+
 export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   runId: string;
   executionTarget: NonNullable<AdapterExecutionContext["executionTarget"]>;
+  cliVersion?: unknown;
   command: string;
   model: string;
   cwd: string;
@@ -338,6 +379,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   graceSec: number;
 }) {
   const model = requireOpenCodeModelId(input.model);
+  const isV2 = asString(input.cliVersion, "").trim() === OPENCODE_V2_CLI_VERSION;
 
   // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
   // provider/model at run time (e.g. gateway-routed models that never appear in
@@ -360,7 +402,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
     input.runId,
     input.executionTarget,
     input.command,
-    ["models"],
+    ["models", ...(isV2 ? ["--standalone"] : [])],
     {
       cwd: input.cwd,
       env: input.env,
@@ -650,6 +692,7 @@ export function resolveOpenCodeSessionResume(input: {
 // passing --dir as well pins the run directory explicitly instead of relying on
 // that env side channel alone.
 export function buildOpenCodeRunArgs(input: {
+  cliVersion?: string;
   dir: string;
   model: string;
   variant: string;
@@ -659,18 +702,14 @@ export function buildOpenCodeRunArgs(input: {
   openCodeV2?: boolean;
   autoApprovePermissions?: boolean;
 }): string[] {
-  const args = input.openCodeV2
-    ? ["--standalone", "run", "--format", "json"]
-    : ["run", "--format", "json"];
+  const isV2 = input.cliVersion === OPENCODE_V2_CLI_VERSION;
+  const args = isV2 ? ["run", "--standalone", "--format", "json"] : ["run", "--format", "json"];
   if (input.printLogs) args.push("--print-logs");
-  if (input.dir && !input.openCodeV2) args.push("--dir", input.dir);
+  if (!isV2 && input.dir) args.push("--dir", input.dir);
   if (input.resumeSessionId) args.push("--session", input.resumeSessionId);
-  const model = input.openCodeV2 && input.variant
-    ? `${input.model}#${input.variant}`
-    : input.model;
-  if (model) args.push("--model", model);
-  if (!input.openCodeV2 && input.variant) args.push("--variant", input.variant);
-  if (input.autoApprovePermissions) args.push("--auto");
+  if (input.model) args.push("--model", input.variant && isV2 ? `${input.model}#${input.variant}` : input.model);
+  if (input.variant && !isV2) args.push("--variant", input.variant);
+  if (!isV2 && input.autoApprovePermissions) args.push("--auto");
   if (input.extraArgs.length > 0) args.push(...input.extraArgs);
   return args;
 }
@@ -690,6 +729,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "opencode");
+  const cliVersion = asString(config.cliVersion, "").trim();
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
 
@@ -924,6 +964,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     openCodeV2,
     runtimeMcpServers,
   });
+  if (openCodeDatabaseFile) {
+    preparedRuntimeConfig.env.OPENCODE_DB = openCodeDatabaseFile;
+  }
   const localRuntimeConfigHome = preparedRuntimeConfig.runtimeConfigHome;
   if (isolatedSkillsHome) {
     preparedRuntimeConfig.env.HOME = isolatedSkillsHome;
@@ -940,6 +983,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
+    await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+      runId,
+      target: executionTarget,
+      installCommand: ctx.runtimeCommandSpec?.installCommand,
+      detectCommand: ctx.runtimeCommandSpec?.detectCommand,
+      cwd,
+      env: runtimeEnv,
+      timeoutSec,
+      graceSec,
+      onLog,
+    });
+    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
+      installCommand: SANDBOX_INSTALL_COMMAND,
+      timeoutSec,
+    });
+    if (cliVersion === OPENCODE_V2_CLI_VERSION && !executionTargetIsRemote) {
+      await verifyOpenCodeCliVersion({ cliVersion, command, cwd, env: runtimeEnv });
+    }
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
     let loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
       runtimeEnv,
@@ -948,6 +1009,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     if (!executionTargetIsRemote) {
       await ensureOpenCodeModelConfiguredAndAvailable({
+        cliVersion,
         model,
         command,
         cwd,
@@ -1045,9 +1107,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
         );
       }
+      if (cliVersion === OPENCODE_V2_CLI_VERSION) {
+        await verifyRemoteOpenCodeCliVersion({
+          runId,
+          executionTarget,
+          cliVersion,
+          command,
+          cwd,
+          env: preparedRuntimeConfig.env,
+          timeoutSec,
+          graceSec,
+        });
+      }
       await ensureRemoteOpenCodeModelConfiguredAndAvailable({
         runId,
         executionTarget,
+        cliVersion,
         command,
         model,
         cwd,
@@ -1274,6 +1349,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const buildArgs = (resumeSessionId: string | null) =>
       buildOpenCodeRunArgs({
+        cliVersion,
         dir: effectiveExecutionCwd,
         model,
         variant,

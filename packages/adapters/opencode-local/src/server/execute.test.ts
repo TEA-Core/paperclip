@@ -78,6 +78,7 @@ vi.mock("./models.js", async (importOriginal) => {
   return {
     ...actual,
     ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
+    verifyOpenCodeCliVersion: vi.fn(async () => {}),
   };
 });
 
@@ -174,6 +175,56 @@ describe("buildOpenCodeRunArgs", () => {
       "router/coder",
       "--variant",
       "high",
+      "--auto",
+    ]);
+  });
+
+  it("uses standalone V2 syntax without changing the V1 vector", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: ["--auto"],
+        printLogs: true,
+        resumeSessionId: "ses_123",
+      }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--print-logs",
+      "--dir",
+      "/workspaces/SUP-9238",
+      "--session",
+      "ses_123",
+      "--model",
+      "router/coder",
+      "--variant",
+      "high",
+      "--auto",
+    ]);
+
+    expect(
+      buildOpenCodeRunArgs({
+        cliVersion: "2.0.26",
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: ["--auto"],
+        printLogs: true,
+        resumeSessionId: "ses_123",
+      }),
+    ).toEqual([
+      "run",
+      "--standalone",
+      "--format",
+      "json",
+      "--print-logs",
+      "--session",
+      "ses_123",
+      "--model",
+      "router/coder#high",
       "--auto",
     ]);
   });
@@ -1415,6 +1466,7 @@ describe("execute — per-agent opencode database", () => {
   beforeEach(() => {
     inheritedDatabase = process.env.OPENCODE_DB;
     delete process.env.OPENCODE_DB;
+    delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
       exitCode: 0,
@@ -1429,6 +1481,7 @@ describe("execute — per-agent opencode database", () => {
     vi.restoreAllMocks();
     if (inheritedDatabase === undefined) delete process.env.OPENCODE_DB;
     else process.env.OPENCODE_DB = inheritedDatabase;
+    delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
   });
 
   it("points the run at the agent's own database file", async () => {
@@ -1439,6 +1492,9 @@ describe("execute — per-agent opencode database", () => {
     );
     expect(call?.[4]?.env?.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
     expect(metadata.at(-1)?.env?.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
+    expect(resolveOpenCodeDatabaseFile({ agentId: "agent-1", env: {}, processEnv: {} })).toBe(
+      "opencode-agent-agent-1.db",
+    );
   });
 
   it("keeps an operator-configured OPENCODE_DB from adapterConfig.env", async () => {
