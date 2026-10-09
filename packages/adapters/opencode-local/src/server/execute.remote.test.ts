@@ -272,6 +272,71 @@ describe("opencode remote execution", () => {
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
   });
 
+  it("verifies the pinned V2 CLI and uses standalone remote probes", async () => {
+    runChildProcess.mockImplementation(async (_runId, _command, args) => {
+      if (args.includes("--version")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "opencode 2.0.26\n",
+          stderr: "",
+          pid: 122,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      if (args.includes("models")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "opencode/gpt-5-nano\n",
+          stderr: "",
+          pid: 122,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "step_start", sessionID: "session_123" }),
+          JSON.stringify({ type: "text", sessionID: "session_123", part: { text: "hello" } }),
+          JSON.stringify({ type: "step_finish", sessionID: "session_123", part: { cost: 0.001, tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } } }),
+        ].join("\n"),
+        stderr: "",
+        pid: 123,
+        startedAt: new Date().toISOString(),
+      };
+    });
+
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-v2-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-ssh-v2",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode Builder", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "opencode", cliVersion: "2.0.26", model: "opencode/gpt-5-nano", variant: "high" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: { remoteExecution: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true } },
+      onLog: async () => {},
+    });
+
+    const calls = runChildProcess.mock.calls as unknown as Array<[
+      string,
+      string,
+      string[],
+      { remoteExecution?: { remoteCwd: string } | null },
+    ]>;
+    expect(calls.map((call) => call[2])).toContainEqual(["--version"]);
+    expect(calls.map((call) => call[2])).toContainEqual(["models", "--standalone"]);
+    expect(calls.map((call) => call[2])).toContainEqual(expect.arrayContaining(["run", "--standalone", "--model", "opencode/gpt-5-nano#high"]));
+  });
+
   it("fails before the remote run when the configured model is unavailable on the SSH target", async () => {
     runChildProcess.mockImplementationOnce(async () => ({
       exitCode: 0,

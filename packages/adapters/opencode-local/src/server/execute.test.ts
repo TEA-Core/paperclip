@@ -74,6 +74,7 @@ vi.mock("./models.js", async (importOriginal) => {
   return {
     ...actual,
     ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
+    verifyOpenCodeCliVersion: vi.fn(async () => {}),
   };
 });
 
@@ -146,6 +147,56 @@ describe("buildOpenCodeRunArgs", () => {
       "router/coder",
       "--variant",
       "high",
+      "--auto",
+    ]);
+  });
+
+  it("uses standalone V2 syntax without changing the V1 vector", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: ["--auto"],
+        printLogs: true,
+        resumeSessionId: "ses_123",
+      }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--print-logs",
+      "--dir",
+      "/workspaces/SUP-9238",
+      "--session",
+      "ses_123",
+      "--model",
+      "router/coder",
+      "--variant",
+      "high",
+      "--auto",
+    ]);
+
+    expect(
+      buildOpenCodeRunArgs({
+        cliVersion: "2.0.26",
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: ["--auto"],
+        printLogs: true,
+        resumeSessionId: "ses_123",
+      }),
+    ).toEqual([
+      "run",
+      "--standalone",
+      "--format",
+      "json",
+      "--print-logs",
+      "--session",
+      "ses_123",
+      "--model",
+      "router/coder#high",
       "--auto",
     ]);
   });
@@ -415,6 +466,29 @@ describe("OpenCode local chat policy", () => {
   });
 });
 
+describe("execute — cliVersion validation", () => {
+  it("rejects unsupported versions before probing or launching", async () => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+    await expect(
+      execute({
+        runId: "run-unsupported-version",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "OpenCode",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { cliVersion: "2.0.25", model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow("Unsupported OpenCode CLI version: 2.0.25");
+    expect(runAdapterExecutionTargetProcessMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("execute — OpenRouter credentials", () => {
   it("passes an OpenRouter key and complete model to OpenCode without logging the key", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-openrouter-"));
@@ -564,25 +638,46 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     runAdapterExecutionTargetProcessMock.mockReset();
   });
 
-  it("proceeds when the remote probe exits non-zero (e.g. a transient `Unexpected error`)", async () => {
+  it("proceeds when the V1 remote probe exits non-zero (e.g. a transient `Unexpected error`)", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
   });
 
-  it("proceeds when the remote probe times out", async () => {
+  it("rejects when the V2 remote probe exits non-zero", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery failed");
+  });
+
+  it("proceeds when the V1 remote probe times out", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
   });
 
-  it("proceeds when the remote probe returns no models", async () => {
+  it("rejects when the V2 remote probe times out", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery failed");
+  });
+
+  it("proceeds when the V1 remote probe returns no models", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
+  });
+
+  it("rejects when the V2 remote probe returns no models", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery returned no models");
   });
 
   it("still rejects when the probe succeeds but the configured model is absent (guard retained)", async () => {
@@ -1252,6 +1347,7 @@ describe("execute — per-agent opencode database", () => {
   }
 
   beforeEach(() => {
+    delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
       exitCode: 0,
@@ -1265,12 +1361,13 @@ describe("execute — per-agent opencode database", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     delete process.env.OPENCODE_DB;
+    delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
   });
 
   it("points the run at the agent's own database file", async () => {
-    await execute(makeCtx());
-    const call = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
-    expect(call?.[4].env.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
+    expect(resolveOpenCodeDatabaseFile({ agentId: "agent-1", env: {}, processEnv: {} })).toBe(
+      "opencode-agent-agent-1.db",
+    );
   });
 
   it("keeps an operator-configured OPENCODE_DB from adapterConfig.env", async () => {

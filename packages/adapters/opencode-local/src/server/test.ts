@@ -25,7 +25,13 @@ import {
   prepareAdapterExecutionTargetRuntime,
   overrideAdapterExecutionTargetRemoteCwd,
 } from "@paperclipai/adapter-utils/execution-target";
-import { discoverOpenCodeModels, ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
+import {
+  discoverOpenCodeModels,
+  ensureOpenCodeModelConfiguredAndAvailable,
+  OPENCODE_V2_CLI_VERSION,
+  verifyOpenCodeCliVersion,
+} from "./models.js";
+import { verifyRemoteOpenCodeCliVersion } from "./execute.js";
 import { parseOpenCodeJsonl } from "./parse.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
@@ -71,6 +77,7 @@ export async function testEnvironment(
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const command = asString(config.command, "opencode");
+  const cliVersion = asString(config.cliVersion, "").trim();
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";
   const targetIsSandbox = target?.kind === "remote" && target.transport === "sandbox";
@@ -79,6 +86,15 @@ export async function testEnvironment(
     ? ctx.environmentName ?? describeAdapterExecutionTarget(target)
     : null;
   const runId = `opencode-envtest-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  if (cliVersion && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+    checks.push({
+      code: "opencode_cli_version_unsupported",
+      level: "error",
+      message: `Unsupported OpenCode CLI version: ${cliVersion}.`,
+      hint: `Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`,
+    });
+  }
 
   if (targetLabel) {
     checks.push({
@@ -201,6 +217,22 @@ export async function testEnvironment(
       if (installCheck) checks.push(installCheck);
       try {
         await ensureAdapterExecutionTargetCommandResolvable(command, runtimeTarget, runtimeCwd, runtimeEnv);
+        if (cliVersion === OPENCODE_V2_CLI_VERSION) {
+          if (targetIsRemote && runtimeTarget) {
+            await verifyRemoteOpenCodeCliVersion({
+              runId,
+              executionTarget: runtimeTarget,
+              cliVersion,
+              command,
+              cwd: runtimeCwd,
+              env: preparedRuntimeConfig.env,
+              timeoutSec: 10,
+              graceSec: 3,
+            });
+          } else {
+            await verifyOpenCodeCliVersion({ cliVersion, command, cwd: runtimeCwd, env: runtimeEnv });
+          }
+        }
         checks.push({
           code: "opencode_command_resolvable",
           level: "info",
@@ -236,7 +268,7 @@ export async function testEnvironment(
       modelValidationPassed = true;
     } else if (canRunProbe && configuredModel) {
       try {
-        const discovered = await discoverOpenCodeModels({ command, cwd, env: runtimeEnv });
+        const discovered = await discoverOpenCodeModels({ cliVersion, command, cwd, env: runtimeEnv });
         if (discovered.length > 0) {
           checks.push({
             code: "opencode_models_discovered",
@@ -272,7 +304,7 @@ export async function testEnvironment(
       }
     } else if (!targetIsRemote && canRunProbe && !configuredModel) {
       try {
-        const discovered = await discoverOpenCodeModels({ command, cwd, env: runtimeEnv });
+        const discovered = await discoverOpenCodeModels({ cliVersion, command, cwd, env: runtimeEnv });
         if (discovered.length > 0) {
           checks.push({
             code: "opencode_models_discovered",
@@ -307,6 +339,7 @@ export async function testEnvironment(
     } else if (!targetIsRemote && configuredModel && canRunProbe) {
       try {
         await ensureOpenCodeModelConfiguredAndAvailable({
+          cliVersion,
           model: configuredModel,
           command,
           cwd,
@@ -337,9 +370,9 @@ export async function testEnvironment(
       const variant = asString(config.variant, "").trim();
       const probeModel = configuredModel;
 
-      const args = ["run", "--format", "json"];
-      args.push("--model", probeModel);
-      if (variant) args.push("--variant", variant);
+      const args = cliVersion === OPENCODE_V2_CLI_VERSION ? ["run", "--standalone", "--format", "json"] : ["run", "--format", "json"];
+      args.push("--model", cliVersion === OPENCODE_V2_CLI_VERSION && variant ? `${probeModel}#${variant}` : probeModel);
+      if (variant && cliVersion !== OPENCODE_V2_CLI_VERSION) args.push("--variant", variant);
       if (extraArgs.length > 0) args.push(...extraArgs);
 
       // Sandbox bridges still add cold-start and transport overhead, but the
