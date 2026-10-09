@@ -466,6 +466,23 @@ describe("OpenCode local chat policy", () => {
   });
 });
 
+describe("execute — cliVersion validation", () => {
+  it("rejects unsupported versions before probing or launching", async () => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+    await expect(
+      execute({
+        runId: "run-unsupported-version",
+        agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { cliVersion: "2.0.25", model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow("Unsupported OpenCode CLI version: 2.0.25");
+    expect(runAdapterExecutionTargetProcessMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("execute — OpenRouter credentials", () => {
   it("passes an OpenRouter key and complete model to OpenCode without logging the key", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-openrouter-"));
@@ -615,25 +632,46 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     runAdapterExecutionTargetProcessMock.mockReset();
   });
 
-  it("proceeds when the remote probe exits non-zero (e.g. a transient `Unexpected error`)", async () => {
+  it("proceeds when the V1 remote probe exits non-zero (e.g. a transient `Unexpected error`)", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
   });
 
-  it("proceeds when the remote probe times out", async () => {
+  it("rejects when the V2 remote probe exits non-zero", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery failed");
+  });
+
+  it("proceeds when the V1 remote probe times out", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
   });
 
-  it("proceeds when the remote probe returns no models", async () => {
+  it("rejects when the V2 remote probe times out", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery failed");
+  });
+
+  it("proceeds when the V1 remote probe returns no models", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
+  });
+
+  it("rejects when the V2 remote probe returns no models", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery returned no models");
   });
 
   it("still rejects when the probe succeeds but the configured model is absent (guard retained)", async () => {

@@ -411,12 +411,9 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
     },
   );
 
-  // The remote availability probe is a best-effort pre-flight guard, not a gate.
-  // If `opencode models` itself cannot run on the target — timeout, transient CLI
-  // error, provider hiccup — do NOT abort the run. The real invocation is
-  // authoritative, so a probe that can't execute must never be fatal. (Previously
-  // these threw and crashed runs mid-flight, losing the agent's work + disposition.)
   if (probe.timedOut) {
+    const message = `Remote OpenCode model discovery timed out after ${probeTimeoutSec}s.`;
+    if (isV2) throw new Error(`OpenCode V2 model discovery failed for "${model}": ${message}`);
     console.warn(
       `[opencode-local] Remote model availability probe for "${model}" timed out after ${probeTimeoutSec}s; proceeding with the configured model.`,
     );
@@ -425,6 +422,8 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
 
   if ((probe.exitCode ?? 1) !== 0) {
     const detail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
+    const message = `Remote \`opencode models\` failed${detail ? `: ${detail}` : "."}`;
+    if (isV2) throw new Error(`OpenCode V2 model discovery failed for "${model}": ${message}`);
     console.warn(
       `[opencode-local] Remote \`opencode models\` could not run for "${model}"${
         detail ? ` (${detail})` : ""
@@ -435,6 +434,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
 
   const models = parseOpenCodeModelsOutput(probe.stdout);
   if (models.length === 0) {
+    if (isV2) throw new Error(`OpenCode V2 model discovery returned no models for "${model}".`);
     console.warn(
       `[opencode-local] Remote \`opencode models\` returned no models; proceeding with the configured model "${model}".`,
     );
@@ -726,6 +726,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const command = asString(config.command, "opencode");
   const cliVersion = asString(config.cliVersion, "").trim();
+  if (cliVersion && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+    throw new Error(
+      `Unsupported OpenCode CLI version: ${cliVersion}. Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`,
+    );
+  }
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
 
