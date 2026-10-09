@@ -6,6 +6,7 @@ import {
   listOpenCodeModels,
   requireOpenCodeModelId,
   resetOpenCodeModelsCacheForTests,
+  verifyOpenCodeCliVersion,
 } from "./models.js";
 
 describe("openCode models", () => {
@@ -94,6 +95,131 @@ describe("openCode models", () => {
         env: { OPENCODE_ALLOW_ALL_MODELS: "true" },
       }),
     ).rejects.toThrow("OpenCode requires `adapterConfig.model`");
+  });
+
+  it("verifies the exact V2 CLI version before using the binary", async () => {
+    const spy = vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "opencode 2.0.26\n",
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    });
+
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).resolves.toBeUndefined();
+    expect(spy.mock.calls[0]?.[2]).toEqual(["--version"]);
+  });
+
+  it("rejects a V2 binary whose reported version does not match", async () => {
+    vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "opencode 1.18.33\n",
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    });
+
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).rejects.toThrow(
+      "OpenCode CLI version mismatch",
+    );
+  });
+
+  it("accepts a version probe with a leading v", async () => {
+    vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "v2.0.26\n",
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    });
+
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).resolves.toBeUndefined();
+  });
+
+  it("rejects a failed V2 version probe", async () => {
+    vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "permission denied",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    });
+
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).rejects.toThrow(
+      "OpenCode CLI version probe failed",
+    );
+  });
+
+  it("uses standalone discovery for V2 without changing V1 discovery", async () => {
+    const spy = vi.spyOn(serverUtils, "runChildProcess").mockImplementation(async (_runId, _command, args) => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: args[0] === "--version" ? "opencode 2.0.26\n" : "openai/gpt-5\n",
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    }));
+
+    await expect(discoverOpenCodeModels({ cliVersion: "2.0.26" })).resolves.toEqual([
+      { id: "openai/gpt-5", label: "openai/gpt-5" },
+    ]);
+    expect(spy.mock.calls[0]?.[2]).toEqual(["--version"]);
+    expect(spy.mock.calls[1]?.[2]).toEqual(["models", "--standalone"]);
+
+    resetOpenCodeModelsCacheForTests();
+    await expect(discoverOpenCodeModels()).resolves.toEqual([
+      { id: "openai/gpt-5", label: "openai/gpt-5" },
+    ]);
+    expect(spy.mock.calls[2]?.[2]).toEqual(["models"]);
+  });
+
+  it("fails loudly for an empty V2 catalog", async () => {
+    vi.spyOn(serverUtils, "runChildProcess").mockImplementation(async (_runId, _command, args) => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: args[0] === "--version" ? "opencode 2.0.26\n" : "",
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    }));
+
+    await expect(
+      ensureOpenCodeModelConfiguredAndAvailable({
+        cliVersion: "2.0.26",
+        model: "openai/gpt-5",
+      }),
+    ).rejects.toThrow("OpenCode V2 model discovery returned no models");
+  });
+
+  it("fails loudly when V2 catalog discovery fails", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "provider auth failed",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    });
+
+    const promise = ensureOpenCodeModelConfiguredAndAvailable({
+      cliVersion: "2.0.26",
+      model: "openai/gpt-5",
+    });
+    const assertion = expect(promise).rejects.toThrow("OpenCode V2 model discovery failed");
+    await vi.runAllTimersAsync();
+    await assertion;
   });
 
   it("retries a transient `opencode models` failure with backoff before succeeding", async () => {

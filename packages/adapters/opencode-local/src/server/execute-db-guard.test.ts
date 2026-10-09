@@ -56,6 +56,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
 });
 
 vi.mock("./models.js", () => ({
+  OPENCODE_V2_CLI_VERSION: "2.0.26",
   ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
   isTruthyEnvFlag: (value: unknown) => value === "true" || value === "1",
   parseOpenCodeModelsOutput: () => [],
