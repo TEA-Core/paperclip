@@ -1508,7 +1508,7 @@ const failedProcessRunCancellations = new Map<
 // — shared across service instances like activeRunExecutions above — so callers
 // that must guarantee no run write is still in flight (graceful shutdown, and
 // tests tearing down a shared database) can await drainActiveRunExecutions().
-const activeRunExecutionPromises = new Set<Promise<void>>();
+const activeRunExecutionPromises = new Set<Promise<unknown>>();
 // Routes dispatch a wakeup fire-and-forget (void heartbeat.wakeup(...)). The
 // wakeup promise stays pending through its asynchronous prologue, and it
 // resolves only after it inserts the queued run and registers the run
@@ -10428,6 +10428,14 @@ export function truncateAgentErrorReason(reason: string | null | undefined): str
     return `${search.slice(0, ws)}…`;
   }
   return `${search}…`;
+}
+
+export interface HeartbeatWorkspacePreparationResult {
+  strategy: string | null;
+  cwd: string | null;
+  branchName: string | null;
+  worktreePath: string | null;
+  executionWorkspaceId: string | null;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -22541,6 +22549,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
+      workspacePreparationOnly?: boolean;
     } = {},
   ) {
     const attemptStartedAtMs = Date.now();
@@ -22686,6 +22695,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ReturnType<typeof traceStore.prepare>
     > | null = null;
     let providerTraceFinalized = false;
+    let workspacePreparationResult: HeartbeatWorkspacePreparationResult | null = null;
 
     try {
       const agent = await getAgent(run.agentId);
@@ -23025,56 +23035,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent.companyId,
         issueContext,
       );
-      let responsibleUserId: string | null =
-        await resolveResponsibleUserIdForRun({
-          run,
-          contextSnapshot: context,
-          issueContext,
-          routineEnvContext,
+      let responsibleUserId: string | null = runOptions.workspacePreparationOnly
+        ? run.responsibleUserId ?? issueContext?.responsibleUserId ?? null
+        : await resolveResponsibleUserIdForRun({
+            run,
+            contextSnapshot: context,
+            issueContext,
+            routineEnvContext,
+          });
+      if (!runOptions.workspacePreparationOnly) {
+        const identityContext = await initializeRunIdentity(db, {
+          companyId: agent.companyId,
+          runId: run.id,
+          responsibleUserId,
+          interactionId: readNonEmptyString(context.interactionId),
+          issueId,
+          messageIds:
+            run.retryOfRunId || context.retryOfRunId
+              ? []
+              : queuedCommentIdsFromRunContext(context).length
+                ? queuedCommentIdsFromRunContext(context)
+                : Array.isArray(context.wakeCommentIds)
+                  ? context.wakeCommentIds.filter(
+                      (id): id is string => typeof id === "string",
+                    )
+                  : wakeCommentId
+                    ? [wakeCommentId]
+                    : [],
+          parentContextId:
+            run.retryOfRunId || context.retryOfRunId
+              ? null
+              : (readNonEmptyString(context.originIdentityContextId) ??
+                (run.triggerDetail === "manual" || context.parentRunId
+                  ? null
+                  : (issueContext?.continuationIdentityContextId ??
+                    issueContext?.originIdentityContextId))),
+          parentRunId:
+            run.retryOfRunId ??
+            readNonEmptyString(context.retryOfRunId) ??
+            readNonEmptyString(context.parentRunId),
+          cause:
+            readNonEmptyString(context.executionIdentityCause) ??
+            readNonEmptyString(context.wakeReason) ??
+            "dispatch",
         });
-      const identityContext = await initializeRunIdentity(db, {
-        companyId: agent.companyId,
-        runId: run.id,
-        responsibleUserId,
-        interactionId: readNonEmptyString(context.interactionId),
-        issueId,
-        messageIds:
-          run.retryOfRunId || context.retryOfRunId
-            ? []
-            : queuedCommentIdsFromRunContext(context).length
-              ? queuedCommentIdsFromRunContext(context)
-              : Array.isArray(context.wakeCommentIds)
-                ? context.wakeCommentIds.filter(
-                    (id): id is string => typeof id === "string",
-                  )
-                : wakeCommentId
-                  ? [wakeCommentId]
-                  : [],
-        parentContextId:
-          run.retryOfRunId || context.retryOfRunId
-            ? null
-            : (readNonEmptyString(context.originIdentityContextId) ??
-              (run.triggerDetail === "manual" || context.parentRunId
-                ? null
-                : (issueContext?.continuationIdentityContextId ??
-                  issueContext?.originIdentityContextId))),
-        parentRunId:
-          run.retryOfRunId ??
-          readNonEmptyString(context.retryOfRunId) ??
-          readNonEmptyString(context.parentRunId),
-        cause:
-          readNonEmptyString(context.executionIdentityCause) ??
-          readNonEmptyString(context.wakeReason) ??
-          "dispatch",
-      });
-      // Initialization has persisted the active context, including an explicit
-      // absence of identity inherited from an automatic continuation.
-      responsibleUserId = identityContext.responsibleUserId;
-      run = {
-        ...run,
-        activeIdentityContextId: identityContext.id,
-        responsibleUserId,
-      };
+        responsibleUserId = identityContext.responsibleUserId;
+        run = {
+          ...run,
+          activeIdentityContextId: identityContext.id,
+          responsibleUserId,
+        };
+      }
       context.executionIdentityRunId = run.id;
       if (
         responsibleUserId &&
@@ -24229,6 +24240,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let { persistedExecutionWorkspace } = provisionWorkspaceResult;
     const { hostExecutionWorkspaceConfig, sessionConfigMetadata, sessionConfigFreshness, latestWorkspaceConfigMetadata, reusedExecutionWorkspace, workspaceReuseRequest } = provisionWorkspaceResult;
     const { resolvedWorkspace } = provisionWorkspaceResult;
+    workspacePreparationResult = {
+      strategy: executionWorkspace.strategy,
+      cwd: executionWorkspace.cwd,
+      branchName: executionWorkspace.branchName,
+      worktreePath: executionWorkspace.worktreePath,
+      executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+    };
+    if (runOptions.workspacePreparationOnly) {
+      return workspacePreparationResult;
+    }
     const taskSessionForRun = resetTaskSession ? null : taskSession;
     // Upstream #13442 (8f1905d34): every distinct repository attached to the project is
     // materialized as an editable checkout inside the task root, and the anchor/hint cwds are
@@ -28256,6 +28277,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // running or queued, force a terminal status before the lease is
         // released, so the UI never shows a finished task as "Live".
         if (
+          !runOptions.workspacePreparationOnly &&
           latestRun &&
           !nativeSessionResumeScheduled &&
           !nativeWorkspaceFinalizeScheduled &&
@@ -28429,6 +28451,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await startNextQueuedRunForAgent(run.agentId);
       }
     }
+  }
+
+  async function prepareWorkspaceForSelfDeclaredRun(
+    runId: string,
+  ): Promise<HeartbeatWorkspacePreparationResult | undefined> {
+    return executeRun(runId, { workspacePreparationOnly: true });
   }
 
   /**
@@ -33420,6 +33448,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     getRun,
+    prepareWorkspaceForSelfDeclaredRun,
 
     decorateActiveRunStatus: decorateHeartbeatRunRuntimeStatus,
     recordRuntimeProgress: recordCurrentHeartbeatRunRuntimeProgress,
