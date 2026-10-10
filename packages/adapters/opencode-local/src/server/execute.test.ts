@@ -123,6 +123,30 @@ describe("buildOpenCodeRunArgs", () => {
     ).toEqual(["run", "--format", "json"]);
   });
 
+  it("folds the V2 variant into the model and uses --auto", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-19259",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+        openCodeV2: true,
+        autoApprovePermissions: true,
+      }),
+    ).toEqual([
+      "--standalone",
+      "run",
+      "--format",
+      "json",
+      "--model",
+      "router/coder#high",
+      "--auto",
+    ]);
+  });
+
+
   it("keeps resume, variant and caller-supplied args alongside --dir", () => {
     expect(
       buildOpenCodeRunArgs({
@@ -480,6 +504,88 @@ describe("execute — OpenRouter credentials", () => {
       expect((executionCall[4] as { env: Record<string, string> }).env.OPENROUTER_API_KEY).toBe(apiKey);
       expect(JSON.stringify({ logs, metadata, result })).not.toContain(apiKey);
       expect(JSON.stringify(metadata)).toContain('"OPENROUTER_API_KEY":"***REDACTED***"');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("execute — OpenCode V2 native MCP", () => {
+  it("projects runtime MCP servers into the staged native config before the first prompt", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-mcp-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    const token = "runtime-mcp-secret";
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.0.26\\n'; fi\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, _args: string[], options: { env?: Record<string, string> }) => {
+      const configPath = path.join(options.env?.XDG_CONFIG_HOME ?? "", "opencode", "opencode.json");
+      const runtimeConfig = JSON.parse(await fs.readFile(configPath, "utf8")) as { mcp?: { servers?: Record<string, unknown> } };
+      expect(runtimeConfig.mcp?.servers?.["paperclip-assigned"]).toMatchObject({
+         type: "remote",
+         url: "https://paperclip.example/mcp",
+         codemode: false,
+         headers: { Authorization: `Bearer ${token}` },
+      });
+      return probeResult({
+        stdout: JSON.stringify({ type: "text", sessionID: "session-v2-mcp", part: { text: "done" } }),
+      });
+    });
+    const getServers = vi.fn(() => [{
+      name: "paperclip-assigned",
+      url: "https://paperclip.example/mcp",
+      token,
+      connectionId: "connection-1",
+    }]);
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+
+    try {
+      const result = await execute({
+        runId: "run-v2-mcp",
+        agent: { id: "agent-v2-mcp", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        runtimeMcp: { getServers },
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        onMeta: async (value) => { metadata.push(value); },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(getServers).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify({ logs, metadata, result })).not.toContain(token);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not fetch runtime MCP servers for OpenCode V1", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v1-mcp-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockResolvedValue(probeResult({
+      stdout: JSON.stringify({ type: "text", sessionID: "session-v1-mcp", part: { text: "done" } }),
+    }));
+    const getServers = vi.fn(() => []);
+
+    try {
+      await execute({
+        runId: "run-v1-mcp",
+        agent: { id: "agent-v1-mcp", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        runtimeMcp: { getServers },
+        onLog: async () => {},
+      });
+      expect(getServers).not.toHaveBeenCalled();
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1251,7 +1357,11 @@ describe("execute — per-agent opencode database", () => {
     } as AdapterExecutionContext;
   }
 
+  let inheritedDatabase: string | undefined;
+
   beforeEach(() => {
+    inheritedDatabase = process.env.OPENCODE_DB;
+    delete process.env.OPENCODE_DB;
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
       exitCode: 0,
@@ -1264,12 +1374,15 @@ describe("execute — per-agent opencode database", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    delete process.env.OPENCODE_DB;
+    if (inheritedDatabase === undefined) delete process.env.OPENCODE_DB;
+    else process.env.OPENCODE_DB = inheritedDatabase;
   });
 
   it("points the run at the agent's own database file", async () => {
     await execute(makeCtx());
-    const call = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
+    const call = runAdapterExecutionTargetProcessMock.mock.calls.findLast(
+      (entry) => entry[2] === "opencode",
+    );
     expect(call?.[4].env.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
   });
 
@@ -1290,6 +1403,7 @@ describe("execute — per-agent opencode database", () => {
 describe("execute — opencode database growth guard", () => {
   const TRANSIENT_STDERR = "Failed to execute statement / Unexpected server error";
   const cleanupPaths = new Set<string>();
+  let inheritedDatabase: string | undefined;
 
   async function makeDataHome() {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-guard-"));
@@ -1340,11 +1454,15 @@ describe("execute — opencode database growth guard", () => {
   }
 
   beforeEach(() => {
+    inheritedDatabase = process.env.OPENCODE_DB;
+    delete process.env.OPENCODE_DB;
     runAdapterExecutionTargetProcessMock.mockReset();
   });
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    if (inheritedDatabase === undefined) delete process.env.OPENCODE_DB;
+    else process.env.OPENCODE_DB = inheritedDatabase;
     await Promise.all(
       [...cleanupPaths].map(async (filepath) => {
         await fs.rm(filepath, { recursive: true, force: true });
