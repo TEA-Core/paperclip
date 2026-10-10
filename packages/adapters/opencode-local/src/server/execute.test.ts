@@ -3,11 +3,18 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock, ensureRuntimeCommandInstalledMock } = vi.hoisted(() => ({
+const {
+  runAdapterExecutionTargetProcessMock,
+  ensureCommandResolvableMock,
+  ensureRuntimeCommandInstalledMock,
+  runChildProcessMock,
+} = vi.hoisted(() => ({
   runAdapterExecutionTargetProcessMock: vi.fn(),
+  runChildProcessMock: vi.fn(),
   // Typed to match `ensureAdapterExecutionTargetCommandResolvable`. With a
   // bare `async () => {}` the recorded call tuple is `[]`, so `calls.at(-1)?.[3]`
   // — the sanitized env this suite exists to assert on — does not typecheck.
+  ensureRuntimeCommandInstalledMock: vi.fn(async () => {}),
   ensureCommandResolvableMock: vi.fn(async (
     _command: string,
     _target: unknown,
@@ -15,7 +22,6 @@ const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock, ensur
     _env: NodeJS.ProcessEnv,
     _options?: { installCommand?: string | null; timeoutSec?: number | null },
   ) => {}),
-  ensureRuntimeCommandInstalledMock: vi.fn(async () => {}),
 }));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
@@ -66,6 +72,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
     resolvePaperclipDesiredSkillNames: () => [],
     removeMaintainerOnlySkillSymlinks: async () => [],
     ensurePaperclipSkillSymlink: async () => "skipped" as const,
+    runChildProcess: runChildProcessMock,
   };
 });
 
@@ -125,6 +132,20 @@ describe("buildOpenCodeRunArgs", () => {
         resumeSessionId: null,
       }),
     ).toEqual(["run", "--format", "json"]);
+  });
+
+  it("does not add V2-only --auto to a V1 invocation", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+        autoApprovePermissions: true,
+      }),
+    ).not.toContain("--auto");
   });
 
   it("folds the V2 variant into the model and uses --auto", () => {
@@ -233,6 +254,17 @@ describe("resolveOpenCodeSessionResume", () => {
     expect(
       resolveOpenCodeSessionResume({ ...base, sessionId: "", sessionCwd: "/workspaces/wt-a" }),
     ).toEqual({ resume: false, sessionId: null, reason: "no_session" });
+  });
+
+  it("does not resume a V2 session that is absent from the database", () => {
+    expect(
+      resolveOpenCodeSessionResume({
+        ...base,
+        sessionId: "ses_missing",
+        sessionCwd: "/workspaces/wt-a",
+        sessionExists: false,
+      }),
+    ).toEqual({ resume: false, sessionId: "ses_missing", reason: "session_missing" });
   });
 
   // SUP-14964: the resume decision is bounded by the session's replayed
@@ -389,6 +421,37 @@ function probeResult(overrides: Record<string, unknown>) {
   } as never;
 }
 
+describe("execute — runtime command preparation", () => {
+  it("installs and resolves the command before probing its version", async () => {
+    const events: string[] = [];
+    ensureRuntimeCommandInstalledMock.mockImplementation(async () => {
+      events.push("install");
+    });
+    ensureCommandResolvableMock.mockImplementation(async () => {
+      events.push("resolve");
+    });
+    runChildProcessMock.mockImplementation(async () => {
+      events.push("version");
+      return probeResult({ stdout: "1.18.33\\n" });
+    });
+    runAdapterExecutionTargetProcessMock.mockResolvedValue(probeResult({
+      stdout: JSON.stringify({ type: "text", sessionID: "session-ordering", part: { text: "done" } }),
+    }));
+
+    const result = await execute({
+      runId: "run-ordering",
+      agent: { id: "agent-ordering", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "opencode", cwd: process.cwd(), model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {},
+      onLog: async () => {},
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(events).toEqual(["install", "resolve", "version"]);
+  });
+});
+
 // FORK DIVERGENCE (upstream's "OpenCode local skill injection" suite is split across two files here, slice 2d): this
 // file module-mocks the skill helpers away (readPaperclipRuntimeSkillEntries/ensurePaperclipSkillSymlink), so upstream's
 // "injects runtime skills into the configured child HOME" test lives unchanged in execute.skills.test.ts, where those
@@ -524,6 +587,10 @@ describe("execute — OpenCode V2 native MCP", () => {
     await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.0.26\\n'; fi\n", "utf8");
     await fs.chmod(commandPath, 0o755);
     runAdapterExecutionTargetProcessMock.mockReset();
+    runChildProcessMock.mockReset();
+    runChildProcessMock.mockImplementation(async (_runId: string, _command: string, args: string[]) => {
+      return probeResult({ stdout: args.includes("--version") ? "2.0.26\n" : "" });
+    });
     runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, _args: string[], options: { env?: Record<string, string> }) => {
       const configPath = path.join(options.env?.XDG_CONFIG_HOME ?? "", "opencode", "opencode.json");
       const runtimeConfig = JSON.parse(await fs.readFile(configPath, "utf8")) as { mcp?: { servers?: Record<string, unknown> } };
@@ -623,6 +690,8 @@ describe("execute — OpenCode V2 native MCP", () => {
     await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\n", "utf8");
     await fs.chmod(commandPath, 0o755);
     runAdapterExecutionTargetProcessMock.mockReset();
+    runChildProcessMock.mockReset();
+    runChildProcessMock.mockResolvedValue(probeResult({ stdout: "1.17.9\\n" }));
     runAdapterExecutionTargetProcessMock.mockResolvedValue(probeResult({
       stdout: JSON.stringify({ type: "text", sessionID: "session-v1-mcp", part: { text: "done" } }),
     }));
@@ -1446,7 +1515,7 @@ describe("execute — per-agent opencode database", () => {
       makeCtx({ config: { model: "router/coder", cwd: process.cwd(), env: { OPENCODE_DB: "shared.db" } } }),
     );
     const call = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
-    expect(call?.[4].env.OPENCODE_DB).toBe("shared.db");
+    expect(call?.[4]?.env?.OPENCODE_DB).toBe("shared.db");
   });
 });
 

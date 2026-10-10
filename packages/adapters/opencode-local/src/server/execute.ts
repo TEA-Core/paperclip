@@ -83,6 +83,7 @@ import {
   resolveOpenCodeDatabaseGrowthLimitBytes,
   resolveOpenCodeDatabasePath,
   resolveOpenCodeDatabasePollIntervalMs,
+  readOpenCodeV2SessionState,
   startOpenCodeDatabaseGrowthGuard,
   type OpenCodeDatabaseGrowthGuard,
   type OpenCodeDatabaseGrowthTrip,
@@ -471,6 +472,7 @@ export type OpenCodeSessionResumeDecision =
       sessionId: string | null;
       reason:
         | "no_session"
+        | "session_missing"
         | "unknown_cwd"
         | "cwd_mismatch"
         | "execution_target_mismatch"
@@ -559,7 +561,12 @@ export function resolveOpenCodeSessionResumeMaxBytes(input: {
 export async function measureOpenCodeSessionTranscriptBytes(
   databasePath: string,
   sessionId: string,
+  openCodeV2 = false,
 ): Promise<number | null> {
+  if (openCodeV2) {
+    const result = await readOpenCodeV2SessionState(databasePath, sessionId);
+    return result.ok ? result.state.transcriptBytes : null;
+  }
   if (sessionId.trim().length === 0) return null;
   try {
     const sqlite = (await import("node:sqlite")) as unknown as {
@@ -613,12 +620,16 @@ export function resolveOpenCodeSessionResume(input: {
    * to DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES when omitted.
    */
   maxSessionTranscriptBytes?: number;
+  sessionExists?: boolean;
 }): OpenCodeSessionResumeDecision {
   if (input.sessionId.length === 0) {
     return { resume: false, sessionId: null, reason: "no_session" };
   }
   if (!input.executionTargetMatches) {
     return { resume: false, sessionId: input.sessionId, reason: "execution_target_mismatch" };
+  }
+  if (input.sessionExists === false) {
+    return { resume: false, sessionId: input.sessionId, reason: "session_missing" };
   }
   if (input.sessionCwd.length === 0) {
     return { resume: false, sessionId: input.sessionId, reason: "unknown_cwd" };
@@ -670,7 +681,7 @@ export function buildOpenCodeRunArgs(input: {
     : input.model;
   if (model) args.push("--model", model);
   if (!input.openCodeV2 && input.variant) args.push("--variant", input.variant);
-  if (input.autoApprovePermissions) args.push("--auto");
+  if (input.openCodeV2 && input.autoApprovePermissions) args.push("--auto");
   if (input.extraArgs.length > 0) args.push(...input.extraArgs);
   return args;
 }
@@ -887,7 +898,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const graceSec = asNumber(config.graceSec, 20);
   const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
   Object.assign(env, deadlineEnv);
-  const initialRuntimeEnv = Object.fromEntries(
+  const preflightEnv = Object.fromEntries(
     Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
@@ -898,12 +909,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     installCommand: ctx.runtimeCommandSpec?.installCommand,
     detectCommand: ctx.runtimeCommandSpec?.detectCommand,
     cwd,
-    env: initialRuntimeEnv,
+    env: preflightEnv,
     timeoutSec,
     graceSec,
     onLog,
   });
-  await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, initialRuntimeEnv, {
+  await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, preflightEnv, {
     installCommand: SANDBOX_INSTALL_COMMAND,
     timeoutSec,
   });
@@ -912,7 +923,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     command,
     target: executionTarget,
     cwd: effectiveExecutionCwd,
-    env: initialRuntimeEnv,
+    env: preflightEnv,
     timeoutSec,
     graceSec,
   });
@@ -1095,26 +1106,43 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // preserving the previous resume behaviour.
     const sessionResumeMaxBytes = resolveOpenCodeSessionResumeMaxBytes({ env: runtimeEnv });
     let sessionTranscriptBytes: number | null = null;
+    let v2SessionState: Awaited<ReturnType<typeof readOpenCodeV2SessionState>> | null = null;
     if (runtimeSessionId && openCodeDatabaseFile && !executionTargetIsRemote) {
       const sessionTranscriptDbPath = resolveOpenCodeDatabasePath({
         databaseFile: openCodeDatabaseFile,
         env: runtimeEnv,
       });
       if (sessionTranscriptDbPath) {
-        sessionTranscriptBytes = await measureOpenCodeSessionTranscriptBytes(
-          sessionTranscriptDbPath,
-          runtimeSessionId,
-        );
+        if (openCodeV2) {
+          v2SessionState = await readOpenCodeV2SessionState(sessionTranscriptDbPath, runtimeSessionId);
+          if (v2SessionState.ok) {
+            sessionTranscriptBytes = v2SessionState.state.transcriptBytes;
+          } else {
+            await onLog(
+              "stderr",
+              `[paperclip] OpenCode V2 session state unavailable for "${runtimeSessionId}": ${v2SessionState.error}\n`,
+            );
+          }
+        } else {
+          sessionTranscriptBytes = await measureOpenCodeSessionTranscriptBytes(
+            sessionTranscriptDbPath,
+            runtimeSessionId,
+          );
+        }
       }
     }
     const resumeDecision = resolveOpenCodeSessionResume({
       sessionId: runtimeSessionId,
-      sessionCwd: runtimeSessionCwd,
+      sessionCwd:
+        openCodeV2 && v2SessionState?.ok && v2SessionState.state.cwd
+          ? v2SessionState.state.cwd
+          : runtimeSessionCwd,
       executionCwd: effectiveExecutionCwd,
       executionTargetMatches: adapterExecutionTargetSessionMatches(
         runtimeRemoteExecution,
         runtimeExecutionTarget,
       ),
+      sessionExists: openCodeV2 && v2SessionState?.ok ? v2SessionState.state.exists : undefined,
       sessionTranscriptBytes,
       maxSessionTranscriptBytes: sessionResumeMaxBytes,
     });
@@ -1123,6 +1151,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await onLog(
         "stdout",
         `[paperclip] OpenCode session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
+      );
+     } else if (!resumeDecision.resume && resumeDecision.reason === "session_missing") {
+      await onLog(
+        "stdout",
+        `[paperclip] OpenCode V2 session "${runtimeSessionId}" is absent from its database and will not be resumed. Starting a fresh session.\n`,
       );
     } else if (!resumeDecision.resume && resumeDecision.reason === "unknown_cwd") {
       await onLog(
@@ -1281,7 +1314,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         printLogs,
         resumeSessionId,
         openCodeV2,
-        autoApprovePermissions: asBoolean(config.dangerouslySkipPermissions, true),
+        autoApprovePermissions: openCodeV2 && asBoolean(config.dangerouslySkipPermissions, true),
       });
 
     const runAttempt = async (resumeSessionId: string | null) => {
@@ -1331,6 +1364,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? startOpenCodeDatabaseGrowthGuard({
             databasePath: databaseGuardPath,
             limitBytes: databaseGuardLimitBytes,
+            measureSessionBytes: openCodeV2 ? async (databasePath, id) => {
+              const result = await readOpenCodeV2SessionState(databasePath, id);
+              return result.ok ? result.state.transcriptBytes : null;
+            } : undefined,
             pollIntervalMs: databaseGuardPollIntervalMs,
             sessionId: resumeSessionId,
             onSpare: (spare) => {

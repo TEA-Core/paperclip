@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { isTruthyEnvFlag } from "./models.js";
 
 // SUP-10914: opencode rewrites an assistant message's entire row on every stream
@@ -204,21 +206,109 @@ export function readOpenCodeSessionIdFromChunk(chunk: string): string | null {
  * the caller falls back to the unattributed behaviour rather than to a wrong
  * number.
  */
+export type OpenCodeV2SessionState = {
+  exists: boolean;
+  cwd: string | null;
+  messageCount: number;
+  transcriptBytes: number;
+  finalMessage: string | null;
+};
+
+export type OpenCodeV2SessionReadResult =
+  | { ok: true; state: OpenCodeV2SessionState }
+  | { ok: false; error: string };
+
+const OPEN_CODE_V2_SQLITE_PROBE = `
+const { DatabaseSync } = require("node:sqlite");
+const databasePath = process.argv[1];
+const sessionId = process.argv[2];
+try {
+  const db = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const session = db.prepare("SELECT directory FROM session_v2 WHERE id = ?").get(sessionId);
+    const rows = db.prepare("SELECT type, data FROM session_message WHERE session_id = ? ORDER BY seq").all(sessionId);
+    let transcriptBytes = 0;
+    let messageCount = 0;
+    let finalMessage = null;
+    for (const row of rows) {
+      const data = typeof row.data === "string" ? row.data : JSON.stringify(row.data);
+      messageCount += 1;
+      transcriptBytes += Buffer.byteLength(data, "utf8");
+      if (row.type !== "assistant") continue;
+      let parsed;
+      try { parsed = JSON.parse(data); } catch { continue; }
+      if (parsed?.time?.completed == null) continue;
+      const text = Array.isArray(parsed.content)
+        ? parsed.content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("")
+        : "";
+      finalMessage = text;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      state: {
+        exists: Boolean(session),
+        cwd: typeof session?.directory === "string" ? session.directory : null,
+        messageCount: session ? messageCount : 0,
+        transcriptBytes: session ? transcriptBytes : 0,
+        finalMessage: session ? finalMessage : null,
+      },
+    }));
+  } finally {
+    db.close();
+  }
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+  process.exitCode = 1;
+}
+`;
+
+export async function readOpenCodeV2SessionState(
+  databasePath: string,
+  sessionId: string,
+): Promise<OpenCodeV2SessionReadResult> {
+  if (sessionId.trim().length === 0) return { ok: false, error: "session id is empty" };
+  try {
+    const result = await runChildProcess(
+      `opencode-v2-state-${randomUUID()}`,
+      process.execPath,
+      ["-e", OPEN_CODE_V2_SQLITE_PROBE, databasePath, sessionId],
+      {
+        cwd: path.dirname(databasePath),
+        env: {},
+        timeoutSec: 10,
+        graceSec: 2,
+        onLog: async () => {},
+      },
+    );
+    const parsed = JSON.parse(result.stdout) as OpenCodeV2SessionReadResult;
+    if (parsed && parsed.ok === true && parsed.state) return parsed;
+    if (parsed && parsed.ok === false && typeof parsed.error === "string") return parsed;
+    return {
+      ok: false,
+      error: `OpenCode V2 SQLite probe returned an invalid response: ${result.stderr.trim() || result.stdout.trim() || "no output"}`,
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+type OpenCodeSqliteRow = Record<string, unknown> | undefined;
+type OpenCodeSqliteDatabase = {
+  prepare: (sql: string) => { get: (...params: unknown[]) => OpenCodeSqliteRow };
+  close: () => void;
+};
+
+type OpenCodeSqliteModule = {
+  DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => OpenCodeSqliteDatabase;
+};
+
 export async function measureOpenCodeSessionBytes(
   databasePath: string,
   sessionId: string,
 ): Promise<number | null> {
   if (sessionId.trim().length === 0) return null;
   try {
-    const sqlite = (await import("node:sqlite")) as unknown as {
-      DatabaseSync: new (
-        path: string,
-        options?: { readOnly?: boolean },
-      ) => {
-        prepare: (sql: string) => { get: (...params: unknown[]) => Record<string, unknown> | undefined };
-        close: () => void;
-      };
-    };
+    const sqlite = (await import("node:sqlite")) as unknown as OpenCodeSqliteModule;
     const db = new sqlite.DatabaseSync(databasePath, { readOnly: true });
     try {
       const readSum = (sql: string) => {
@@ -237,6 +327,14 @@ export async function measureOpenCodeSessionBytes(
   } catch {
     return null;
   }
+}
+
+export async function measureOpenCodeV2SessionBytes(
+  databasePath: string,
+  sessionId: string,
+): Promise<number | null> {
+  const result = await readOpenCodeV2SessionState(databasePath, sessionId);
+  return result.ok ? result.state.transcriptBytes : null;
 }
 
 export function formatBytes(bytes: number): string {
