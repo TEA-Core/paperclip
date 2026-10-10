@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import express from "express";
 import request from "supertest";
@@ -7,13 +11,16 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issues,
   projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
 import { workSessionRoutes } from "../routes/work-sessions.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -27,6 +34,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported
 describeEmbeddedPostgres("work-session routes", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
+  let workspaceRoot: string;
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase(
@@ -34,13 +42,18 @@ describeEmbeddedPostgres("work-session routes", () => {
     );
     stopDb = started.cleanup;
     db = createDb(started.connectionString);
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-work-session-routes-"));
   });
 
   afterAll(async () => {
     await stopDb?.();
+    await rm(workspaceRoot, { recursive: true, force: true });
   });
 
-  async function seedExternalPullAgent() {
+  async function seedExternalPullAgent(options: {
+    repository?: { cwd: string; repoUrl?: string };
+    executionWorkspacePolicy?: Record<string, unknown>;
+  } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -59,6 +72,7 @@ describeEmbeddedPostgres("work-session routes", () => {
       companyId,
       name: "Work session project",
       status: "active",
+      executionWorkspacePolicy: options.executionWorkspacePolicy,
     });
 
     await db.insert(agents).values({
@@ -205,6 +219,64 @@ describeEmbeddedPostgres("work-session routes", () => {
       .then((rows) => rows[0]);
     expect(issue.status).toBe("in_progress");
     expect(issue.executionRunId).toBe(res.body.runId);
+  });
+
+  it("fresh self-declared sessions provision a real canonical execution workspace", async () => {
+    const repositoryCwd = path.join(workspaceRoot, "repository");
+    await mkdir(repositoryCwd, { recursive: true });
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: repositoryCwd, stdio: "ignore" });
+    git("init", "-b", "main");
+    await writeFile(path.join(repositoryCwd, "README.md"), "work session");
+    git("add", ".");
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed");
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    const fixture = await seedExternalPullAgent({
+      executionWorkspacePolicy: {
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId: fixture.companyId,
+      projectId: (await db
+        .select({ projectId: issues.projectId })
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId))
+        .then((rows) => rows[0]!)).projectId!,
+      name: "Primary repository",
+      cwd: repositoryCwd,
+      sourceType: "local_path",
+      isPrimary: true,
+    });
+
+    const app = createApp(fixture.agentId, fixture.companyId);
+    const res = await request(app).post(`/api/issues/${fixture.issueId}/work-session`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.workspace.strategy).toBe("git_worktree");
+    expect(res.body.workspace.cwd).toBeTruthy();
+    expect(res.body.workspace.branchName).toBe(`${fixture.identifier}-work-session-test-issue`);
+    expect(res.body.workspace.branchName).not.toMatch(/^self-declared-/);
+    expect(res.body.workspace.worktreePath).toBe(res.body.workspace.cwd);
+    await expect(access(res.body.workspace.cwd)).resolves.toBeUndefined();
+
+    const workspace = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, res.body.workspace.executionWorkspaceId))
+      .then((rows) => rows[0]);
+    expect(workspace).toMatchObject({
+      id: res.body.workspace.executionWorkspaceId,
+      cwd: res.body.workspace.cwd,
+      branchName: res.body.workspace.branchName,
+      providerRef: res.body.workspace.worktreePath,
+    });
   });
 
   it("run is never queued", async () => {
