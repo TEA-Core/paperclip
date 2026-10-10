@@ -120,7 +120,9 @@ describe("opencode timeout handling", () => {
     cleanupDirs.push(rootDir);
     expect(result.timedOut).toBe(true);
 
-    const call = runChildProcess.mock.calls[0] as unknown as
+    const call = (runChildProcess.mock.calls as unknown as unknown[][]).find(
+      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    ) as
       | [string, string, string[], { env: Record<string, string>; stdin?: string }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_RUN_TIMEOUT_SEC).toBe("5400");
@@ -134,7 +136,9 @@ describe("opencode timeout handling", () => {
     cleanupDirs.push(rootDir);
     expect(result.timedOut).toBe(true);
 
-    const call = runChildProcess.mock.calls[0] as unknown as
+    const call = (runChildProcess.mock.calls as unknown as unknown[][]).find(
+      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    ) as
       | [string, string, string[], { env: Record<string, string>; stdin?: string }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_RUN_DEADLINE_EPOCH).toBeUndefined();

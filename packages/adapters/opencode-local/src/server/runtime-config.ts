@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 import {
   ensureAgentAccessibleDir,
@@ -136,6 +137,8 @@ async function readJsonObject(filepath: string): Promise<Record<string, unknown>
 export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
+  openCodeV2?: boolean;
+  runtimeMcpServers?: AdapterRuntimeMcpServer[];
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
 
@@ -231,11 +234,37 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
 
   const nextConfig: Record<string, unknown> = { ...existingConfig };
+  if (input.openCodeV2 && input.runtimeMcpServers && input.runtimeMcpServers.length > 0) {
+    const existingMcpConfig = isPlainObject(existingConfig.mcp) ? existingConfig.mcp : {};
+    const existingMcpServers = isPlainObject(existingMcpConfig.servers) ? existingMcpConfig.servers : {};
+    const nextMcpServers: Record<string, unknown> = { ...existingMcpServers };
+    for (const server of input.runtimeMcpServers) {
+      nextMcpServers[server.name] = {
+        type: "remote",
+        url: server.url,
+        codemode: false,
+        headers: { Authorization: `Bearer ${server.token}` },
+      };
+    }
+    nextConfig.mcp = { ...existingMcpConfig, servers: nextMcpServers };
+    notes.push(`Injected ${input.runtimeMcpServers.length} runtime OpenCode V2 MCP server(s).`);
+  }
   if (skipPermissions) {
-    nextConfig.permission = {
-      ...existingPermission,
-      external_directory: "allow",
-    };
+    if (input.openCodeV2) {
+      delete nextConfig.permission;
+      nextConfig.permissions = [
+        { action: "*", resource: "*", effect: "allow" },
+        { action: "external_directory", resource: "*", effect: "allow" },
+      ];
+      notes.push(
+        "Injected runtime OpenCode V2 permissions allowing all actions and external-directory access.",
+      );
+    } else {
+      nextConfig.permission = {
+        ...existingPermission,
+        external_directory: "allow",
+      };
+    }
   }
   if (Object.keys(nextProvider).length > 0) {
     nextConfig.provider = nextProvider;
