@@ -73,6 +73,103 @@ describe("prepareOpenCodeRuntimeConfig", () => {
   // stale temp packs during a gc that actually completes. Paperclip runs in its
   // own git worktrees and does not use opencode's undo/revert, so turn snapshot
   // tracking off rather than pay for a gc that never finishes.
+  it("uses native V2 permissions without the V1 permission key", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      openCodeV2: true,
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(runtimeConfig.permission).toBeUndefined();
+    expect(runtimeConfig.permissions).toEqual([
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "external_directory", resource: "*", effect: "allow" },
+    ]);
+    await prepared.cleanup();
+  });
+
+  it("projects runtime MCP servers into native V2 config without leaking tokens into notes", async () => {
+    const configHome = await makeConfigHome({
+      mcp: {
+        servers: {
+          existing: { type: "remote", url: "https://existing.example/mcp" },
+        },
+      },
+    });
+    const token = "runtime-mcp-secret";
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      openCodeV2: true,
+      runtimeMcpServers: [{
+        name: "paperclip-assigned",
+        url: "https://paperclip.example/mcp",
+        token,
+        connectionId: "connection-1",
+      }],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as { mcp: { servers: Record<string, unknown> } };
+    expect(runtimeConfig.mcp).toMatchObject({
+      servers: {
+        existing: { type: "remote", url: "https://existing.example/mcp" },
+        "paperclip-assigned": {
+          type: "remote",
+          url: "https://paperclip.example/mcp",
+          codemode: false,
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      },
+    });
+    expect(prepared.notes.join("\n")).not.toContain(token);
+    await prepared.cleanup();
+  });
+
+  it("does not project runtime MCP servers into V1 config", async () => {
+    const configHome = await makeConfigHome({
+      mcp: {
+        servers: {
+          existing: { type: "remote", url: "https://existing.example/mcp" },
+        },
+      },
+    });
+    const token = "runtime-mcp-secret";
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      openCodeV2: false,
+      runtimeMcpServers: [{
+        name: "paperclip-assigned",
+        url: "https://paperclip.example/mcp",
+        token,
+        connectionId: "connection-1",
+      }],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const rawConfig = await fs.readFile(
+      path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"),
+      "utf8",
+    );
+    const runtimeConfig = JSON.parse(rawConfig) as { mcp: { servers: Record<string, unknown> } };
+    expect(runtimeConfig.mcp).toEqual({
+      servers: {
+        existing: { type: "remote", url: "https://existing.example/mcp" },
+      },
+    });
+    expect(rawConfig).not.toContain(token);
+    await prepared.cleanup();
+  });
+
   it("disables opencode snapshot tracking by default", async () => {
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
 

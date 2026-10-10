@@ -273,15 +273,25 @@ describe("opencode remote execution", () => {
   });
 
   it("fails before the remote run when the configured model is unavailable on the SSH target", async () => {
-    runChildProcess.mockImplementationOnce(async () => ({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: "openai/gpt-4.1\n",
-      stderr: "",
-      pid: 456,
-      startedAt: new Date().toISOString(),
-    }));
+    runChildProcess
+      .mockImplementationOnce(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "2.0.26\n",
+        stderr: "",
+        pid: 455,
+        startedAt: new Date().toISOString(),
+      }))
+      .mockImplementationOnce(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "openai/gpt-4.1\n",
+        stderr: "",
+        pid: 456,
+        startedAt: new Date().toISOString(),
+      }));
 
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-model-"));
     cleanupDirs.push(rootDir);
@@ -330,8 +340,9 @@ describe("opencode remote execution", () => {
       }),
     ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
 
-    expect(runChildProcess).toHaveBeenCalledTimes(1);
-    expect((runChildProcess.mock.calls[0]?.[2] as string[] | undefined) ?? []).toEqual(["models"]);
+    expect(runChildProcess).toHaveBeenCalledTimes(2);
+    expect((runChildProcess.mock.calls[0]?.[2] as string[] | undefined) ?? []).toEqual(["--version"]);
+    expect((runChildProcess.mock.calls[1]?.[2] as string[] | undefined) ?? []).toEqual(["models"]);
     expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
   });
 

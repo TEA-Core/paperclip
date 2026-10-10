@@ -28,6 +28,7 @@ import {
 import {
   asString,
   asNumber,
+  asBoolean,
   asStringArray,
   parseObject,
   buildPaperclipEnv,
@@ -49,7 +50,6 @@ import {
   stringifyPaperclipWakePayloadForEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
-  runChildProcess,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueIdentifierFromContext,
@@ -97,6 +97,7 @@ import {
   resolveOpenCodeSkillsHome,
 } from "./skills.js";
 import { formatOpenCodeSkillExposureLine } from "./exposure-line.js";
+import { probeOpenCodeCliVersion, usesOpenCodeV2Cli } from "./version.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -655,13 +656,21 @@ export function buildOpenCodeRunArgs(input: {
   extraArgs: string[];
   printLogs: boolean;
   resumeSessionId: string | null;
+  openCodeV2?: boolean;
+  autoApprovePermissions?: boolean;
 }): string[] {
-  const args = ["run", "--format", "json"];
+  const args = input.openCodeV2
+    ? ["--standalone", "run", "--format", "json"]
+    : ["run", "--format", "json"];
   if (input.printLogs) args.push("--print-logs");
-  if (input.dir) args.push("--dir", input.dir);
+  if (input.dir && !input.openCodeV2) args.push("--dir", input.dir);
   if (input.resumeSessionId) args.push("--session", input.resumeSessionId);
-  if (input.model) args.push("--model", input.model);
-  if (input.variant) args.push("--variant", input.variant);
+  const model = input.openCodeV2 && input.variant
+    ? `${input.model}#${input.variant}`
+    : input.model;
+  if (model) args.push("--model", model);
+  if (!input.openCodeV2 && input.variant) args.push("--variant", input.variant);
+  if (input.autoApprovePermissions) args.push("--auto");
   if (input.extraArgs.length > 0) args.push(...input.extraArgs);
   return args;
 }
@@ -871,17 +880,52 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void onLog("stderr", `paperclip-gh-wrapper: ${message}\n`);
     },
   });
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
+    executionTarget,
+    asNumber(config.timeoutSec, 0),
+  );
+  const graceSec = asNumber(config.graceSec, 20);
+  const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
+  Object.assign(env, deadlineEnv);
+  const initialRuntimeEnv = Object.fromEntries(
+    Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+  await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+    runId,
+    target: executionTarget,
+    installCommand: ctx.runtimeCommandSpec?.installCommand,
+    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
+    cwd,
+    env: initialRuntimeEnv,
+    timeoutSec,
+    graceSec,
+    onLog,
+  });
+  await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, initialRuntimeEnv, {
+    installCommand: SANDBOX_INSTALL_COMMAND,
+    timeoutSec,
+  });
+  const cliVersion = await probeOpenCodeCliVersion({
+    runId: `${runId}:opencode-version`,
+    command,
+    target: executionTarget,
+    cwd: effectiveExecutionCwd,
+    env: initialRuntimeEnv,
+    timeoutSec,
+    graceSec,
+  });
+  const openCodeV2 = usesOpenCodeV2Cli(cliVersion);
+  const runtimeMcpServers = openCodeV2 ? await ctx.runtimeMcp?.getServers() ?? [] : [];
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    openCodeV2,
+    runtimeMcpServers,
+  });
   const localRuntimeConfigHome = preparedRuntimeConfig.runtimeConfigHome;
   if (isolatedSkillsHome) {
-    // desired-only: repoint the child's HOME at the per-run home so opencode's
-    // external skill scans ($HOME/.claude/skills, $HOME/.agents/skills) find
-    // only the filtered set. Everything else the run reads from HOME (git
-    // config/credentials, opencode's data dir and per-agent session DB,
-    // package caches) is carried over by symlink inside that home — see
-    // prepareOpenCodeIsolatedSkillsHome. This deliberately overrides a
-    // configured config.env.HOME: isolation cannot be satisfied by pointing
-    // the child at a shared home.
     preparedRuntimeConfig.env.HOME = isolatedSkillsHome;
     const configuredHome = asString(parseObject(config.env).HOME, "");
     if (configuredHome) {
@@ -896,32 +940,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
-      executionTarget,
-      asNumber(config.timeoutSec, 0),
-    );
-    const graceSec = asNumber(config.graceSec, 20);
-    // One deadline, shared by the child's env and the prompt's wrap-up guidance —
-    // two independently computed values would drift by the spawn latency between
-    // them and quietly contradict each other. Derived from the EFFECTIVE timeout,
-    // which a remote execution target may have capped below the configured one.
-    const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
-    Object.assign(preparedRuntimeConfig.env, deadlineEnv);
-    await ensureAdapterExecutionTargetRuntimeCommandInstalled({
-      runId,
-      target: executionTarget,
-      installCommand: ctx.runtimeCommandSpec?.installCommand,
-    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
-      cwd,
-      env: runtimeEnv,
-      timeoutSec,
-      graceSec,
-      onLog,
-    });
-    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
-      installCommand: SANDBOX_INSTALL_COMMAND,
-      timeoutSec,
-    });
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
     let loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
       runtimeEnv,
@@ -1262,6 +1280,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         extraArgs,
         printLogs,
         resumeSessionId,
+        openCodeV2,
+        autoApprovePermissions: asBoolean(config.dangerouslySkipPermissions, true),
       });
 
     const runAttempt = async (resumeSessionId: string | null) => {
