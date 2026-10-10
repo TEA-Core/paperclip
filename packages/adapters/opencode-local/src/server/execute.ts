@@ -880,14 +880,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void onLog("stderr", `paperclip-gh-wrapper: ${message}\n`);
     },
   });
+  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
+    executionTarget,
+    asNumber(config.timeoutSec, 0),
+  );
+  const graceSec = asNumber(config.graceSec, 20);
+  const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
+  Object.assign(env, deadlineEnv);
+  const initialRuntimeEnv = Object.fromEntries(
+    Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+  await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+    runId,
+    target: executionTarget,
+    installCommand: ctx.runtimeCommandSpec?.installCommand,
+    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
+    cwd,
+    env: initialRuntimeEnv,
+    timeoutSec,
+    graceSec,
+    onLog,
+  });
+  await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, initialRuntimeEnv, {
+    installCommand: SANDBOX_INSTALL_COMMAND,
+    timeoutSec,
+  });
   const cliVersion = await probeOpenCodeCliVersion({
     runId: `${runId}:opencode-version`,
     command,
     target: executionTarget,
     cwd: effectiveExecutionCwd,
-    env,
-    timeoutSec: asNumber(config.timeoutSec, 0),
-    graceSec: asNumber(config.graceSec, 20),
+    env: initialRuntimeEnv,
+    timeoutSec,
+    graceSec,
   });
   const openCodeV2 = usesOpenCodeV2Cli(cliVersion);
   const runtimeMcpServers = openCodeV2 ? await ctx.runtimeMcp?.getServers() ?? [] : [];
@@ -899,14 +926,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const localRuntimeConfigHome = preparedRuntimeConfig.runtimeConfigHome;
   if (isolatedSkillsHome) {
-    // desired-only: repoint the child's HOME at the per-run home so opencode's
-    // external skill scans ($HOME/.claude/skills, $HOME/.agents/skills) find
-    // only the filtered set. Everything else the run reads from HOME (git
-    // config/credentials, opencode's data dir and per-agent session DB,
-    // package caches) is carried over by symlink inside that home — see
-    // prepareOpenCodeIsolatedSkillsHome. This deliberately overrides a
-    // configured config.env.HOME: isolation cannot be satisfied by pointing
-    // the child at a shared home.
     preparedRuntimeConfig.env.HOME = isolatedSkillsHome;
     const configuredHome = asString(parseObject(config.env).HOME, "");
     if (configuredHome) {
@@ -921,32 +940,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
-      executionTarget,
-      asNumber(config.timeoutSec, 0),
-    );
-    const graceSec = asNumber(config.graceSec, 20);
-    // One deadline, shared by the child's env and the prompt's wrap-up guidance —
-    // two independently computed values would drift by the spawn latency between
-    // them and quietly contradict each other. Derived from the EFFECTIVE timeout,
-    // which a remote execution target may have capped below the configured one.
-    const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
-    Object.assign(preparedRuntimeConfig.env, deadlineEnv);
-    await ensureAdapterExecutionTargetRuntimeCommandInstalled({
-      runId,
-      target: executionTarget,
-      installCommand: ctx.runtimeCommandSpec?.installCommand,
-    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
-      cwd,
-      env: runtimeEnv,
-      timeoutSec,
-      graceSec,
-      onLog,
-    });
-    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
-      installCommand: SANDBOX_INSTALL_COMMAND,
-      timeoutSec,
-    });
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
     let loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
       runtimeEnv,

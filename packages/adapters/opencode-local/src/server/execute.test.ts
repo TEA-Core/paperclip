@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock } = vi.hoisted(() => ({
+const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock, ensureRuntimeCommandInstalledMock } = vi.hoisted(() => ({
   runAdapterExecutionTargetProcessMock: vi.fn(),
   // Typed to match `ensureAdapterExecutionTargetCommandResolvable`. With a
   // bare `async () => {}` the recorded call tuple is `[]`, so `calls.at(-1)?.[3]`
@@ -15,11 +15,15 @@ const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock } = vi
     _env: NodeJS.ProcessEnv,
     _options?: { installCommand?: string | null; timeoutSec?: number | null },
   ) => {}),
+  ensureRuntimeCommandInstalledMock: vi.fn(async () => {}),
 }));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
-  adapterExecutionTargetIsRemote: () => false,
-  adapterExecutionTargetRemoteCwd: (_target: unknown, cwd: string) => cwd,
+  adapterExecutionTargetIsRemote: (target: unknown) => Boolean(target && typeof target === "object" && (target as { kind?: string }).kind === "remote"),
+  adapterExecutionTargetRemoteCwd: (target: unknown, cwd: string) =>
+    target && typeof target === "object" && typeof (target as { remoteCwd?: unknown }).remoteCwd === "string"
+      ? (target as { remoteCwd: string }).remoteCwd
+      : cwd,
   overrideAdapterExecutionTargetRemoteCwd: (target: unknown) => target,
   adapterExecutionTargetSessionIdentity: () => ({ kind: "local" }),
   adapterExecutionTargetSessionMatches: () => true,
@@ -27,7 +31,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   adapterExecutionTargetUsesPaperclipBridge: () => false,
   describeAdapterExecutionTarget: () => "local",
   ensureAdapterExecutionTargetCommandResolvable: ensureCommandResolvableMock,
-  ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(async () => {}),
+  ensureAdapterExecutionTargetRuntimeCommandInstalled: ensureRuntimeCommandInstalledMock,
   prepareAdapterExecutionTargetRuntime: vi.fn(async () => ({
     workspaceRemoteDir: null,
     restoreWorkspace: async () => {},
@@ -557,6 +561,55 @@ describe("execute — OpenCode V2 native MCP", () => {
       expect(result.exitCode).toBe(0);
       expect(getServers).toHaveBeenCalledTimes(1);
       expect(JSON.stringify({ logs, metadata, result })).not.toContain(token);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("prepares a remote runtime command before detecting V2 and projecting native MCP", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-v2-mcp-"));
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
+    let runtimeInstalled = false;
+    const events: string[] = [];
+    ensureRuntimeCommandInstalledMock.mockImplementationOnce(async () => {
+      events.push("install");
+      runtimeInstalled = true;
+    });
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, args: string[]) => {
+      if (args[0] === "--version") {
+        events.push("version");
+        return probeResult({
+          exitCode: runtimeInstalled ? 0 : 127,
+          stdout: runtimeInstalled ? "2.0.26\n" : "",
+        });
+      }
+      return probeResult({
+        stdout: JSON.stringify({ type: "text", sessionID: "remote-v2-mcp", part: { text: "done" } }),
+      });
+    });
+    const getServers = vi.fn(() => [{
+      name: "paperclip-assigned",
+      url: "https://paperclip.example/mcp",
+      token: "remote-runtime-mcp-secret",
+      connectionId: "connection-remote-1",
+    }]);
+
+    try {
+      await execute({
+        runId: "run-remote-v2-mcp",
+        agent: { id: "agent-remote-v2-mcp", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: "opencode", cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        executionTarget: { kind: "remote", transport: "sandbox", providerKey: "fixture", remoteCwd: "/remote/workspace" },
+        runtimeCommandSpec: { command: "opencode", detectCommand: "opencode", installCommand: "install-opencode" },
+        runtimeMcp: { getServers },
+        onLog: async () => {},
+      });
+      expect(events).toEqual(["install", "version"]);
+      expect(getServers).toHaveBeenCalledTimes(1);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1379,11 +1432,13 @@ describe("execute — per-agent opencode database", () => {
   });
 
   it("points the run at the agent's own database file", async () => {
-    await execute(makeCtx());
+    const metadata: Array<{ env?: Record<string, string> }> = [];
+    await execute(makeCtx({ onMeta: async (value) => { metadata.push(value); } }));
     const call = runAdapterExecutionTargetProcessMock.mock.calls.findLast(
       (entry) => entry[2] === "opencode",
     );
-    expect(call?.[4].env.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
+    expect(call?.[4]?.env?.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
+    expect(metadata.at(-1)?.env?.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
   });
 
   it("keeps an operator-configured OPENCODE_DB from adapterConfig.env", async () => {
