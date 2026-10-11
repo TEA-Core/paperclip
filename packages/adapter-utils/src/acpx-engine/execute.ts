@@ -41,6 +41,7 @@ import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import { deprioritizeForOom, reportOomMarkFailureOnce } from "../oom-priority.js";
 import { deprioritizeCpu, isAgentSpawnShim, reportCpuStepFailureOnce } from "../cpu-priority.js";
+import { applyPaperclipAgentTestPoolBound } from "../agent-test-pool.js";
 import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
 import {
   classifyWorkspaceRestoreFailure,
@@ -4692,12 +4693,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // argv removes it entirely. The spawn itself is byte-identical to the
           // fork's fallback: same command, args and options.
           spawnAgent: ({ command, args, options }) => {
+            const spawnEnv = applyPaperclipAgentTestPoolBound(
+              options.env ?? {},
+              !prepared.processSessionBridge,
+            );
             assertSpawnEnvelopeWithinLimits({
               command,
               args: [...args],
-              env: options.env ?? {},
+              env: spawnEnv,
             });
-            const child = spawn(command, args, options);
+            const child = spawn(command, args, { ...options, env: spawnEnv });
             // Agent runs share the Paperclip server's memory cgroup, so a runaway
             // agent workload competes with the control plane for the kernel's OOM
             // choice. `oom_score_adj` is inherited across fork and exec, so marking
