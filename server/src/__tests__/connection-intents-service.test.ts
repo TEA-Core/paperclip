@@ -208,6 +208,49 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     }
   });
 
+  it("denies supabase by default with its operator-seat reason without creating an interaction", async () => {
+    const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    try {
+      const service = connectionIntentService(db);
+      const search = await service.search(claims, "supabase");
+      const result = search.results[0]!;
+      expect(result).toMatchObject({ service: "supabase", state: "unavailable" });
+      expect(result.reason).toContain("agents get no Supabase connection");
+      expect(result.reason).toContain("prod reads are operator-seat");
+      expect(result.reason).toContain("ask in a comment");
+      await expect(service.request(claims, "supabase")).rejects.toMatchObject({
+        status: 422,
+        message: result.reason,
+      });
+      expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+      else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previous;
+    }
+  });
+
+  it("denies cloudflare by default with its operator-managed reason without creating an interaction", async () => {
+    const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+    try {
+      const service = connectionIntentService(db);
+      const search = await service.search(claims, "cloudflare");
+      const result = search.results[0]!;
+      expect(result).toMatchObject({ service: "cloudflare", state: "unavailable" });
+      expect(result.reason).toContain("Cloudflare is reserved for operator-managed sandbox execution");
+      expect(result.reason).toContain("no connection is needed");
+      await expect(service.request(claims, "cloudflare")).rejects.toMatchObject({
+        status: 422,
+        message: result.reason,
+      });
+      expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
+      else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previous;
+    }
+  });
+
   it("reads the denylist at call time and leaves other services unchanged", async () => {
     const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
     try {
@@ -221,8 +264,10 @@ describeEmbeddedPostgres("connectionIntentService", () => {
       ]);
       await expect(connectionIntentService(db).request(claims, "cloudflare")).rejects.toMatchObject({
         status: 422,
-        message: expect.stringContaining("cloudflare"),
       });
+      await expect(connectionIntentService(db).request(claims, "cloudflare")).rejects.toThrow(
+        "Cloudflare is reserved for operator-managed sandbox execution",
+      );
 
       process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "";
       const allowed = await connectionIntentService(db).search(claims, "cloudflare");
