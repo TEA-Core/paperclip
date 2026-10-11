@@ -4190,6 +4190,56 @@ export function issueRoutes(
     opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueExecutionStageWakeup =
     opts.executionStageWakeupEnqueue ?? heartbeat.wakeup;
+  let decisions: ReturnType<typeof serviceIndex.decisionService> | undefined;
+  const getDecisions = () => {
+    decisions ??= serviceIndex.decisionService(db, {
+      wakeOriginAgent: async () => undefined,
+    });
+    return decisions;
+  };
+
+  async function recordDelegationCycleAttention(input: {
+    req: Request;
+    parent: Awaited<ReturnType<typeof svc.getById>>;
+    assigneeAgentId: string;
+    assigneeAgentName: string | null;
+    ancestorIssueId: string;
+  }) {
+    if (
+      input.req.actor.type !== "agent" ||
+      !input.req.actor.agentId ||
+      !input.parent
+    ) return;
+    try {
+      const runId = input.req.actor.runId?.trim() || await resolveSelfDeclaredRunIdForIssue(
+        input.req.actor.agentId,
+        input.parent.checkoutRunId ?? input.parent.executionRunId,
+      );
+      if (!runId) return;
+      await getDecisions().create({
+        companyId: input.parent.companyId,
+        actor: input.req.actor,
+        agentId: input.req.actor.agentId,
+        runId,
+        title: `Delegation cycle requires board attention: ${input.parent.identifier ?? input.parent.id}`,
+        body: `Agent ${input.assigneeAgentName ?? input.assigneeAgentId} was refused from creating a child of ${input.parent.identifier ?? input.parent.id} because it created open ancestor ${input.ancestorIssueId}.`,
+        ruleKey: "delegation_cycle",
+        idempotencyKey: `delegation-cycle:${input.parent.id}:${input.assigneeAgentId}`,
+        options: [{ id: "review", label: "Review delegation cycle", effects: [] }],
+        metadata: {
+          kind: "delegation_cycle",
+          parentIssueId: input.parent.id,
+          assigneeAgentId: input.assigneeAgentId,
+          ancestorIssueId: input.ancestorIssueId,
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, parentIssueId: input.parent.id, assigneeAgentId: input.assigneeAgentId },
+        "failed to record delegation cycle board attention",
+      );
+    }
+  }
 
   async function postAuthFailureComment(
     issueSvc: ReturnType<typeof issueService>,
@@ -9448,6 +9498,35 @@ export function issueRoutes(
         assigneeAgentId: input.assigneeAgentId,
       },
     );
+  }
+
+  async function assertNoAgentDelegationCycleAndRecord(input: {
+    req: Request;
+    parent: Awaited<ReturnType<typeof svc.getById>>;
+    assigneeAgentId: string | null | undefined;
+    assigneeAgentName: string | null;
+  }) {
+    try {
+      await assertNoAgentDelegationCycle({
+        actorType: input.req.actor.type,
+        parentIssueId: input.parent?.id ?? null,
+        assigneeAgentId: input.assigneeAgentId,
+      });
+    } catch (err) {
+      const details = err instanceof HttpError && err.details && typeof err.details === "object"
+        ? err.details as { code?: string; ancestorIssueId?: string; assigneeAgentId?: string }
+        : null;
+      if (details?.code === "delegation_cycle" && input.parent && details.ancestorIssueId && details.assigneeAgentId) {
+        await recordDelegationCycleAttention({
+          req: input.req,
+          parent: input.parent,
+          assigneeAgentId: details.assigneeAgentId,
+          assigneeAgentName: input.assigneeAgentName,
+          ancestorIssueId: details.ancestorIssueId,
+        });
+      }
+      throw err;
+    }
   }
 
   async function normalizeIssueAssigneeAgentReference(
@@ -14935,11 +15014,11 @@ export function issueRoutes(
           rawCreateBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
-      await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
-        parentIssueId:
-          typeof effectiveParentId === "string" ? effectiveParentId : null,
+      await assertNoAgentDelegationCycleAndRecord({
+        req,
+        parent: createParent,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        assigneeAgentName: normalizedAssigneeAgentRef.name,
       });
       const actor = getActorInfo(req);
       const requestsWorkspaceInheritanceFromRun =
@@ -15810,10 +15889,11 @@ export function issueRoutes(
           sanitizedBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
-      await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
-        parentIssueId: parent.id,
+      await assertNoAgentDelegationCycleAndRecord({
+        req,
+        parent,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        assigneeAgentName: normalizedAssigneeAgentRef.name,
       });
       const createBody = {
         ...sanitizedBody,
