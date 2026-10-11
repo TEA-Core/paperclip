@@ -1,5 +1,10 @@
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
-import { checkReleaseDiff, parseNameStatusDiff } from "../../../scripts/check-skills-releases-immutable.mjs";
+
+const require = createRequire(import.meta.url);
+const { checkReleaseDiff, parseNameStatusDiff } = require(
+  "../../../scripts/check-skills-releases-immutable.mjs",
+) as typeof import("../../../scripts/check-skills-releases-immutable.mjs");
 
 const baseManifest = [
   { id: "v0", dir: "v0", releaseName: "V0" },
