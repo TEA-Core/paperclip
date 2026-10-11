@@ -2,9 +2,25 @@ import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 
 const require = createRequire(import.meta.url);
+
+type Release = { id: string; dir: string; releaseName: string };
+type Pinned = Record<string, Record<string, string>>;
+type ChangedFile = { status: string; oldPath?: string; path: string };
+type CheckReleaseDiffInput = {
+  baseManifest: Release[];
+  headManifest: Release[];
+  basePinned: Pinned;
+  headPinned: Pinned;
+  changedFiles: ChangedFile[];
+  addedLines?: string[];
+};
+
 const { checkReleaseDiff, parseNameStatusDiff } = require(
   "../../../scripts/check-skills-releases-immutable.mjs",
-) as typeof import("../../../scripts/check-skills-releases-immutable.mjs");
+) as {
+  checkReleaseDiff: (input: CheckReleaseDiffInput) => string[];
+  parseNameStatusDiff: (text: string) => ChangedFile[];
+};
 
 const baseManifest = [
   { id: "v0", dir: "v0", releaseName: "V0" },
