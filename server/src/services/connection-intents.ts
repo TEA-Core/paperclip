@@ -74,12 +74,20 @@ function availableToolConnectionMethods(
 function denylistedServiceReason(serviceSlug: string) {
   const configured = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
   const denylist = configured === undefined
-    ? new Set(["github"])
+    ? new Set(["github", "supabase", "cloudflare"])
     : new Set(configured.split(",").map((slug) => slug.trim().toLocaleLowerCase()).filter(Boolean));
-  if (!denylist.has(serviceSlug.toLocaleLowerCase())) return null;
-  return serviceSlug.toLocaleLowerCase() === "github"
-    ? "The platform already provides github to this run through gh and GH_TOKEN; no connection is needed."
-    : `The platform already provides ${serviceSlug} to this run; no connection is needed.`;
+  const normalizedServiceSlug = serviceSlug.toLocaleLowerCase();
+  if (!denylist.has(normalizedServiceSlug)) return null;
+  if (normalizedServiceSlug === "github") {
+    return "The platform already provides github to this run through gh and GH_TOKEN; no connection is needed.";
+  }
+  if (normalizedServiceSlug === "supabase") {
+    return "agents get no Supabase connection; prod reads are operator-seat, so ask in a comment instead. No connection is needed.";
+  }
+  if (normalizedServiceSlug === "cloudflare") {
+    return "Cloudflare is reserved for operator-managed sandbox execution; no connection is needed.";
+  }
+  return `The platform already provides ${serviceSlug} to this run; no connection is needed.`;
 }
 
 export function connectionIntentService(db: Db) {
