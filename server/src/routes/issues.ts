@@ -184,7 +184,6 @@ import {
   clampIssueListLimit,
   documentService,
   documentAnnotationService,
-  decisionService,
   logActivity,
   logActivityInTransaction,
   publishActivity,
@@ -4168,9 +4167,6 @@ export function issueRoutes(
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
-  const decisions = decisionService(db, {
-    wakeOriginAgent: async () => undefined,
-  });
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -4194,6 +4190,13 @@ export function issueRoutes(
     opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueExecutionStageWakeup =
     opts.executionStageWakeupEnqueue ?? heartbeat.wakeup;
+  let decisions: ReturnType<typeof serviceIndex.decisionService> | undefined;
+  const getDecisions = () => {
+    decisions ??= serviceIndex.decisionService(db, {
+      wakeOriginAgent: async () => undefined,
+    });
+    return decisions;
+  };
 
   async function recordDelegationCycleAttention(input: {
     req: Request;
@@ -4213,7 +4216,7 @@ export function issueRoutes(
         input.parent.checkoutRunId ?? input.parent.executionRunId,
       );
       if (!runId) return;
-      await decisions.create({
+      await getDecisions().create({
         companyId: input.parent.companyId,
         actor: input.req.actor,
         agentId: input.req.actor.agentId,
