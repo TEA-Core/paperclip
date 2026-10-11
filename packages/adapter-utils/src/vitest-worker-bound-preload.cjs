@@ -2,31 +2,22 @@ const MAX_WORKERS = 4;
 
 const originalArgv = process.argv;
 const maxWorkersFlag = "--maxWorkers";
-const maxWorkersEquals = /^--maxWorkers=(\d+)$/u;
+const maxWorkersValue = /^\d+(?:\.\d+)?%?$/u;
 const isVitestEntry = originalArgv.some((argument) =>
   argument === "vitest" || /(?:^|[/\\])vitest(?:\.m?js)?$/u.test(argument),
 );
 
 if (isVitestEntry) {
-  const argv = [...originalArgv];
-  let foundMaxWorkers = false;
-  for (let index = 0; index < argv.length; index += 1) {
-    const argument = argv[index];
-    const equalsMatch = maxWorkersEquals.exec(argument);
-    if (equalsMatch) {
-      const requested = Number.parseInt(equalsMatch[1], 10);
-      argv[index] = `--maxWorkers=${Math.min(requested, MAX_WORKERS)}`;
-      foundMaxWorkers = true;
+  const argv = [];
+  for (let index = 0; index < originalArgv.length; index += 1) {
+    const argument = originalArgv[index];
+    if (argument === maxWorkersFlag) {
+      if (maxWorkersValue.test(originalArgv[index + 1] ?? "")) index += 1;
       continue;
     }
-    if (argument === maxWorkersFlag) {
-      const requested = Number.parseInt(argv[index + 1] ?? String(MAX_WORKERS), 10);
-      argv[index + 1] = String(Math.min(requested, MAX_WORKERS));
-      foundMaxWorkers = true;
-    }
+    if (argument.startsWith(`${maxWorkersFlag}=`)) continue;
+    argv.push(argument);
   }
-  if (!foundMaxWorkers) {
-    argv.splice(2, 0, `${maxWorkersFlag}=${MAX_WORKERS}`);
-  }
+  argv.splice(2, 0, `${maxWorkersFlag}=${MAX_WORKERS}`);
   process.argv = argv;
 }

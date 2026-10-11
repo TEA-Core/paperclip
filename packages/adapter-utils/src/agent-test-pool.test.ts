@@ -36,20 +36,34 @@ describe("applyPaperclipAgentTestPoolBound", () => {
 });
 
 describe("vitest-worker-bound-preload", () => {
-  it("limits vitest's maxWorkers flag in a child process", () => {
+  const readArgv = (...arguments_: string[]) => {
     const result = spawnSync(process.execPath, [
       "--require",
       PAPERCLIP_AGENT_TEST_POOL_PRELOAD_PATH,
       "--eval",
       "process.stdout.write(JSON.stringify(process.argv))",
       "/tmp/vitest",
-      "--maxWorkers=12",
+      ...arguments_,
     ], { encoding: "utf8" });
 
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toContain(
+    return JSON.parse(result.stdout) as string[];
+  };
+
+  it.each([
+    ["numeric equals", ["--maxWorkers=12"]],
+    ["percentage equals", ["--maxWorkers=50%"]],
+    ["numeric split", ["--maxWorkers", "12"]],
+    ["percentage split", ["--maxWorkers", "50%"]],
+  ])("normalizes %s", (_label, arguments_) => {
+    const argv = readArgv(...arguments_);
+
+    expect(argv).toContain(
       `--maxWorkers=${PAPERCLIP_AGENT_TEST_POOL_MAX_WORKERS}`,
     );
-    expect(JSON.parse(result.stdout)).not.toContain("--maxWorkers=12");
+    expect(argv).not.toContain("--maxWorkers=12");
+    expect(argv).not.toContain("--maxWorkers=50%");
+    expect(argv).not.toContain("12");
+    expect(argv).not.toContain("50%");
   });
 });
