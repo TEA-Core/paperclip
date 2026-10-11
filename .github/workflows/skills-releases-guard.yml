@@ -1,0 +1,42 @@
+name: Skills releases guard
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  merge_group:
+    branches:
+      - main
+      - 'fold/**'
+
+permissions:
+  contents: read
+
+jobs:
+  immutable:
+    name: Skills releases immutable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          fetch-depth: 0
+
+      - name: Save base-branch checker
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: git show "$BASE_SHA:scripts/check-skills-releases-immutable.mjs" > "$RUNNER_TEMP/check-skills-releases-immutable.mjs"
+
+      - name: Checkout pull request or merge queue tree
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          fetch-depth: 0
+
+      - name: Check immutable releases
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: node "$RUNNER_TEMP/check-skills-releases-immutable.mjs" < <(git diff "$GITHUB_BASE_SHA...$GITHUB_HEAD_SHA")
