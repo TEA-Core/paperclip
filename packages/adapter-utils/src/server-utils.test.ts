@@ -69,6 +69,7 @@ import {
 } from "./server-utils.js";
 import { DEFAULT_AGENT_OOM_SCORE_ADJ } from "./oom-priority.js";
 import { resolveAgentNice } from "./cpu-priority.js";
+import { PAPERCLIP_AGENT_TEST_POOL_PRELOAD_PATH } from "./agent-test-pool.js";
 
 // Field 19 of /proc/<pid>/stat is the nice value. The comm field (2) may contain
 // spaces and parentheses, so count from the LAST ')'.
@@ -1579,6 +1580,42 @@ describe("runChildProcess", () => {
   // in runChildProcess (server-utils.ts:~3057). The source-glob guard does not scan
   // server-utils.ts, so this test is the only fixture that fails when the choke
   // point is reverted to ...process.env.
+  it("adds the bounded test-pool preload to the spawned child env", async () => {
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const mockedSpawn = vi.mocked(spawn);
+    mockedSpawn.mockImplementationOnce((_command, _args, options) => {
+      capturedEnv = options?.env;
+      const child = new EventEmitter() as any;
+      child.pid = 99999;
+      child.killed = false;
+      child.exitCode = null;
+      child.signalCode = null;
+      child.stdout = new Readable({ read() { this.push(null); } });
+      child.stderr = new Readable({ read() { this.push(null); } });
+      child.kill = vi.fn();
+      setImmediate(() => {
+        child.exitCode = 0;
+        child.emit("close", 0, null);
+      });
+      return child;
+    });
+
+    await runChildProcess(
+      randomUUID(),
+      "echo",
+      ["hello"],
+      {
+        cwd: "/tmp",
+        env: {},
+        timeoutSec: 1,
+        graceSec: 0,
+        onLog: async () => {},
+      },
+    );
+
+    expect(capturedEnv?.NODE_OPTIONS).toContain(`--require=${PAPERCLIP_AGENT_TEST_POOL_PRELOAD_PATH}`);
+  });
+
   it("strips sensitive env vars from spawned child process env", async () => {
     const origEnv = { ...process.env };
 

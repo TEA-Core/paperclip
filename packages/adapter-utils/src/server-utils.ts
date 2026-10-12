@@ -14,6 +14,7 @@ import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { deprioritizeForOom, reportOomMarkFailureOnce } from "./oom-priority.js";
 import { deprioritizeCpu, isAgentSpawnShim, reportCpuStepFailureOnce } from "./cpu-priority.js";
+import { applyPaperclipAgentTestPoolBound } from "./agent-test-pool.js";
 import {
   formatOomKillNotice,
   readCgroupOomKillCount,
@@ -5414,7 +5415,10 @@ export async function runChildProcess(
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then(async (target) => {
-        const childEnv = { ...mergedEnv, ...target.env };
+        const childEnv = applyPaperclipAgentTestPoolBound(
+          { ...mergedEnv, ...target.env },
+          !opts.remoteExecution,
+        );
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
