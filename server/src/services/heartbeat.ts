@@ -23811,10 +23811,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // credential.helper=), which would break the fork's credential helper and gh
       // wrapper wiring (I4/I5). Upstream #13005 removed the projection; sandbox-class
       // runs take the managed broker launcher below.
+      const workspacePreparationOnly = runOptions.workspacePreparationOnly === true;
       const forkHostGitHub = forkForcesHostGitHub(
         selectedEnvironmentForConfig?.driver ?? "local",
       );
-      const githubSelection = forkHostGitHub
+      const githubSelection = workspacePreparationOnly || forkHostGitHub
         ? { configured: false as const }
         : await resolveManagedGitHubIdentitySelection(
         db,
@@ -23826,6 +23827,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       );
       const useHostGitHub =
+        workspacePreparationOnly ||
         forkHostGitHub ||
         (
         !githubSelection.configured &&
@@ -23833,39 +23835,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
         ));
-      const aiBinding = agent.runtimeConfig?.aiConnection ? aiConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
-      const { resolvedConfig, secretKeys, secretManifest } =
-        await resolveExecutionRunAdapterConfig({
-          managedAiCredentials: Boolean(aiBinding),
-          managedGitHubCredentials: !useHostGitHub,
-          companyId: agent.companyId,
-          agentId: agent.id,
-          adapterType: agent.adapterType,
-          issueId,
-          heartbeatRunId: run.id,
-          environmentId: selectedEnvironmentForConfig?.id ?? null,
-          environmentEnv: aiBinding ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
-          environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
-          projectId: projectContext?.id ?? null,
-          routineId: routineEnvContext.routineId,
-          responsibleUserId,
-          executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
-          projectEnv: aiBinding ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
-          routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
-          secretsSvc,
-          trustPreset,
-          // Fold 2c D5: the PAT binding is a host-mode requirement. A managed run strips
-          // GH_TOKEN/GITHUB_TOKEN bindings and, with no projection (D6), could never satisfy it.
-          requiredScopedEnvBinding: pushCredentialBindingRequired && useHostGitHub
-            ? {
-                keys: [...PUSH_CAPABILITY_ENV_KEYS],
-                consumerScopes: ["agent", "project"],
-                reason: "push_write_credential_missing",
-                remediation:
-                  "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
-              }
-            : undefined,
-        });
+      const aiBinding = !workspacePreparationOnly && agent.runtimeConfig?.aiConnection
+        ? aiConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection)
+        : undefined;
+      const adapterConfigResolution = workspacePreparationOnly
+        ? {
+            resolvedConfig: mergedConfig,
+            secretKeys: new Set<string>(),
+            secretManifest: [],
+          }
+        : await resolveExecutionRunAdapterConfig({
+            managedAiCredentials: Boolean(aiBinding),
+            managedGitHubCredentials: !useHostGitHub,
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            issueId,
+            heartbeatRunId: run.id,
+            environmentId: selectedEnvironmentForConfig?.id ?? null,
+            environmentEnv: aiBinding ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
+            environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
+            projectId: projectContext?.id ?? null,
+            routineId: routineEnvContext.routineId,
+            responsibleUserId,
+            executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
+            projectEnv: aiBinding ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
+            routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
+            secretsSvc,
+            trustPreset,
+            // Fold 2c D5: the PAT binding is a host-mode requirement. A managed run strips
+            // GH_TOKEN/GITHUB_TOKEN bindings and, with no projection (D6), could never satisfy it.
+            requiredScopedEnvBinding: pushCredentialBindingRequired && useHostGitHub
+              ? {
+                  keys: [...PUSH_CAPABILITY_ENV_KEYS],
+                  consumerScopes: ["agent", "project"],
+                  reason: "push_write_credential_missing",
+                  remediation:
+                    "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+                }
+              : undefined,
+          });
+      const { resolvedConfig, secretKeys, secretManifest } = adapterConfigResolution;
       if (aiBinding) {
         try {
           managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
