@@ -16928,4 +16928,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("self_declared_run_expired");
     expect(run?.error).toContain("Work session expired: no keepalive within 15 minutes");
   });
+
+  it("reports non-minute self-declared TTLs exactly in expiry messages", async () => {
+    const selfDeclaredRunTtlMs = 90 * 1000;
+    const expiredAt = new Date(Date.now() - 3 * 60 * 1000);
+    const { runId } = await seedRunFixture({
+      invocationSource: "self_declared",
+      updatedAt: expiredAt,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({
+      staleThresholdMs: 5 * 60 * 1000,
+      selfDeclaredRunTtlMs,
+    });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.error).toContain("Work session expired: no keepalive within 90 seconds");
+  });
 });

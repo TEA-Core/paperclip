@@ -21644,8 +21644,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : dispatchUnlaunched
           ? "dispatch_unlaunched"
           : "process_lost";
+      const ttlSeconds = Math.round(selfDeclaredRunTtlMs / 1000);
+      const ttlDescription =
+        ttlSeconds % 60 === 0
+          ? `${ttlSeconds / 60} minutes`
+          : `${ttlSeconds} seconds`;
       let baseMessage = selfDeclaredRunExpired
-        ? `Work session expired: no keepalive within ${Math.round(selfDeclaredRunTtlMs / 60_000)} minutes`
+        ? `Work session expired: no keepalive within ${ttlDescription}`
         : dispatchUnlaunched
           ? buildDispatchUnlaunchedMessage(run.agentId, adapterType, dispatchUnlaunchedGraceMs)
           : stillborn
