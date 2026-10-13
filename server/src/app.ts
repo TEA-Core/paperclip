@@ -526,6 +526,7 @@ export async function createApp(
     chatWebhookPublicBaseUrl?: string;
     authReady: boolean;
     companyDeletionEnabled: boolean;
+    selfDeclaredRunTtlMs?: number;
     announcements?: { enabled: boolean; feedUrl: string };
     instanceId?: string;
     hostVersion?: string;
@@ -836,7 +837,9 @@ export async function createApp(
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   api.use(dispatchQuiesceRoutes(db));
-  api.use(workSessionRoutes(db));
+  api.use(
+    workSessionRoutes(db, { selfDeclaredRunTtlMs: opts.selfDeclaredRunTtlMs }),
+  );
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }

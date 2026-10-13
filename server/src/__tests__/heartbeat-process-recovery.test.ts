@@ -16889,8 +16889,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBeNull();
   });
 
-  it("reaps a self-declared run that has outlived its TTL during the periodic sweep", async () => {
-    const expiredAt = new Date(Date.now() - 20 * 60 * 1000);
+  it("uses the configured TTL in self-declared expiry messages", async () => {
+    const selfDeclaredRunTtlMs = 2 * 60 * 1000;
+    const expiredAt = new Date(Date.now() - 3 * 60 * 1000);
     const { runId } = await seedRunFixture({
       invocationSource: "self_declared",
       updatedAt: expiredAt,
@@ -16899,7 +16900,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const result = await heartbeat.reapOrphanedRuns({
       staleThresholdMs: 5 * 60 * 1000,
-      selfDeclaredRunTtlMs: 15 * 60 * 1000,
+      selfDeclaredRunTtlMs,
     });
     expect(result.reaped).toBe(1);
     expect(result.runIds).toEqual([runId]);
@@ -16907,7 +16908,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const run = await heartbeat.getRun(runId);
     expect(run?.status).toBe("failed");
     expect(run?.errorCode).toBe("self_declared_run_expired");
-    expect(run?.error).toContain("Work session expired: no keepalive within 15 minutes");
+    expect(run?.error).toContain("Work session expired: no keepalive within 2 minutes");
   });
 
   it("reaps a self-declared run that has outlived its TTL at startup (staleThresholdMs = 0)", async () => {

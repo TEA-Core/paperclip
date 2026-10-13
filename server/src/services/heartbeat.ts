@@ -21645,7 +21645,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "dispatch_unlaunched"
           : "process_lost";
       let baseMessage = selfDeclaredRunExpired
-        ? "Work session expired: no keepalive within 15 minutes"
+        ? `Work session expired: no keepalive within ${Math.round(selfDeclaredRunTtlMs / 60_000)} minutes`
         : dispatchUnlaunched
           ? buildDispatchUnlaunchedMessage(run.agentId, adapterType, dispatchUnlaunchedGraceMs)
           : stillborn
@@ -23827,8 +23827,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       );
       const useHostGitHub =
-        workspacePreparationOnly ||
         forkHostGitHub ||
+        workspacePreparationOnly ||
         (
         !githubSelection.configured &&
         trustPreset.kind === "standard" &&

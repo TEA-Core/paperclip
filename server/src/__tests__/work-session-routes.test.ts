@@ -150,7 +150,7 @@ describeEmbeddedPostgres("work-session routes", () => {
     return { companyId, agentId, issueId, identifier };
   }
 
-  function createApp(agentId: string, companyId: string) {
+  function createApp(agentId: string, companyId: string, selfDeclaredRunTtlMs?: number) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -162,7 +162,7 @@ describeEmbeddedPostgres("work-session routes", () => {
       };
       next();
     });
-    app.use("/api", workSessionRoutes(db));
+    app.use("/api", workSessionRoutes(db, { selfDeclaredRunTtlMs }));
     app.use(errorHandler);
     return app;
   }
@@ -371,9 +371,10 @@ describeEmbeddedPostgres("work-session routes", () => {
     expect(res.body.error).toBe("Agent is not assigned to this issue");
   });
 
-  it("keepalive bumps updatedAt and returns expiresAt", async () => {
+  it("keepalive uses the configured TTL for expiresAt", async () => {
     const fixture = await seedExternalPullAgent();
-    const app = createApp(fixture.agentId, fixture.companyId);
+    const selfDeclaredRunTtlMs = 2 * 60 * 1000;
+    const app = createApp(fixture.agentId, fixture.companyId, selfDeclaredRunTtlMs);
 
     const openRes = await request(app).post(
       `/api/issues/${fixture.issueId}/work-session`,
@@ -389,6 +390,12 @@ describeEmbeddedPostgres("work-session routes", () => {
     expect(hbRes.status).toBe(200);
     expect(hbRes.body.runId).toBe(runId);
     expect(hbRes.body.expiresAt).toBeTruthy();
+    expect(new Date(hbRes.body.expiresAt).getTime()).toBeGreaterThanOrEqual(
+      Date.now() + selfDeclaredRunTtlMs - 1000,
+    );
+    expect(new Date(hbRes.body.expiresAt).getTime()).toBeLessThanOrEqual(
+      Date.now() + selfDeclaredRunTtlMs + 1000,
+    );
 
     const run = await db
       .select()

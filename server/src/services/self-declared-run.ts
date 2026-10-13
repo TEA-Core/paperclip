@@ -36,8 +36,13 @@ export interface SelfDeclaredRunCloseResult {
 
 import { DEFAULT_SELF_DECLARED_RUN_TTL_MS } from "./run-stillborn.js";
 
-export function selfDeclaredRunService(db: Db) {
+export function selfDeclaredRunService(
+  db: Db,
+  opts?: { selfDeclaredRunTtlMs?: number },
+) {
   const heartbeat = heartbeatService(db);
+  const selfDeclaredRunTtlMs =
+    opts?.selfDeclaredRunTtlMs ?? DEFAULT_SELF_DECLARED_RUN_TTL_MS;
 
   async function getAgentById(agentId: string) {
     return db
@@ -254,7 +259,7 @@ export function selfDeclaredRunService(db: Db) {
       .set({ updatedAt: now })
       .where(eq(heartbeatRuns.id, runId));
 
-    const expiresAt = new Date(now.getTime() + DEFAULT_SELF_DECLARED_RUN_TTL_MS);
+    const expiresAt = new Date(now.getTime() + selfDeclaredRunTtlMs);
 
     return {
       runId: run.id,
