@@ -395,8 +395,12 @@ describeEmbeddedPostgres("work-session routes", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0]);
+    expect(run).toBeDefined();
+    if (!run) throw new Error("Expected heartbeat run");
+    expect(run.startedAt).not.toBeNull();
+    if (!run.startedAt) throw new Error("Expected heartbeat run start time");
     expect(new Date(run.updatedAt).getTime()).toBeGreaterThan(
-      new Date(openRes.body.runId ? run.startedAt : 0).getTime(),
+      new Date(run.startedAt).getTime(),
     );
   });
 
@@ -473,13 +477,12 @@ describeEmbeddedPostgres("work-session routes", () => {
     );
     expect(openRes.status).toBe(201);
 
-    const closeRes = await request(app).post(
-      `/api/issues/${fixture.issueId}/work-session/close`,
-      {
+    const closeRes = await request(app)
+      .post(`/api/issues/${fixture.issueId}/work-session/close`)
+      .send({
         runId: openRes.body.runId,
         outcome: "bogus",
-      },
-    );
+      });
     expect(closeRes.status).toBe(400);
   });
 

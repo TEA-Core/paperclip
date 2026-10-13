@@ -359,9 +359,9 @@ type LatestIssueRun =
       | "errorCode"
       | "contextSnapshot"
       | "livenessState"
-      | "startedAt"
-      | "createdAt"
     > & {
+      startedAt?: Date | null;
+      createdAt?: Date | null;
       resultJson?: unknown;
     })
   | null;
@@ -2332,6 +2332,7 @@ export function recoveryService(
     if (issue.status !== "todo" || latestRun?.status !== "succeeded")
       return false;
     const runBeganAt = latestRun.startedAt ?? latestRun.createdAt;
+    if (!runBeganAt) return false;
 
     return db
       .select({ id: issueRecoveryActions.id })

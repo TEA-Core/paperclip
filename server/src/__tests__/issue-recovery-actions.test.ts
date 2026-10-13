@@ -1595,6 +1595,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "self_declared_run_expired",
       contextSnapshot: { issueId: sourceIssue.id },
       livenessState: "needs_followup",
+      startedAt: new Date(),
+      createdAt: new Date(),
     } as const);
     const firstRun = makeRun();
     const secondRun = makeRun();
@@ -2690,7 +2692,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
     const { companyId, managerId, coderId, sourceIssue, prefix } = await seedCompany();
     await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = vi.fn(async (_agentId: string, _options?: Record<string, unknown>) => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     const firstLatestRun = {
       id: randomUUID(),
