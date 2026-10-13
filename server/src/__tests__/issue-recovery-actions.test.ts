@@ -1584,6 +1584,60 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     ).toBe(true);
   });
 
+  it("posts one recovery notice per failed run ID while reusing the source-scoped action", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const makeRun = () => ({
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Work session expired: no keepalive within 15 minutes",
+      errorCode: "self_declared_run_expired",
+      contextSnapshot: { issueId: sourceIssue.id },
+      livenessState: "needs_followup",
+    } as const);
+    const firstRun = makeRun();
+    const secondRun = makeRun();
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: firstRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: firstRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: secondRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actions).toHaveLength(1);
+
+    const notices = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      );
+    expect(notices.map((notice) => notice.metadata?.sourceRunId).sort()).toEqual(
+      [firstRun.id, secondRun.id].sort(),
+    );
+  });
+
   it("blocks with an empty blocker set when escalating stranded assigned work, because the recovery action owns the wake", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);

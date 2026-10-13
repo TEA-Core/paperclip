@@ -279,6 +279,44 @@ describeEmbeddedPostgres("work-session routes", () => {
     });
   });
 
+  it("matching assignee can recover its own blocked expired self-declared session", async () => {
+    const fixture = await seedExternalPullAgent();
+    const expiredRunId = randomUUID();
+    const expiredAt = new Date(Date.now() - 16 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: expiredRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      invocationSource: "self_declared",
+      status: "failed",
+      errorCode: "self_declared_run_expired",
+      error: "Work session expired: no keepalive within 15 minutes",
+      startedAt: expiredAt,
+      updatedAt: expiredAt,
+      finishedAt: expiredAt,
+      contextSnapshot: { issueId: fixture.issueId },
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, fixture.issueId));
+
+    const app = createApp(fixture.agentId, fixture.companyId);
+    const res = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.runId).not.toBe(expiredRunId);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId))
+      .then((rows) => rows[0]);
+    expect(issue.status).toBe("in_progress");
+    expect(issue.executionRunId).toBe(res.body.runId);
+  });
+
   it("run is never queued", async () => {
     const fixture = await seedExternalPullAgent();
     const app = createApp(fixture.agentId, fixture.companyId);

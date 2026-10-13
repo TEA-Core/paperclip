@@ -5402,12 +5402,16 @@ export function recoveryService(
         : null,
     });
 
+    const isSelfDeclaredRunExpiry =
+      input.latestRun?.errorCode === "self_declared_run_expired";
     const shouldPostEscalationComment =
       recoveryAction.attemptCount === 1 ||
       input.recoveryCause === "workspace_validation_failed" ||
-      input.recoveryCause === "configuration_incomplete";
+      input.recoveryCause === "configuration_incomplete" ||
+      isSelfDeclaredRunExpiry;
     if (shouldPostEscalationComment) {
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
+      const sourceRunId = input.latestRun?.id ?? null;
 
       const hasEscalationComment = await db
         .select({
@@ -5425,13 +5429,21 @@ export function recoveryService(
         .orderBy(desc(issueComments.createdAt))
         .limit(50)
         .then((rows) =>
-          rows.some(
-            (row) =>
+          rows.some((row) => {
+            if (
+              isSelfDeclaredRunExpiry &&
+              sourceRunId &&
+              row.metadata?.sourceRunId
+            ) {
+              return row.metadata.sourceRunId === sourceRunId;
+            }
+            return (
               noticeMetadataReferencesRecoveryAction(
                 row.metadata,
                 recoveryAction.id,
-              ) || (row.body ?? "").includes(escalationCommentMarker),
-          ),
+              ) || (row.body ?? "").includes(escalationCommentMarker)
+            );
+          }),
         );
 
       if (!hasEscalationComment) {

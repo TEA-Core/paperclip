@@ -21636,12 +21636,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // own `dispatch_unlaunched` code is registered with every one of those consumers so the
       // recovery evidence names a launch failure instead of a lost in-flight process. Host-restart
       // evidence, when present, still wins and keeps `process_lost`.
-      const reapErrorCode = dispatchUnlaunched ? "dispatch_unlaunched" : "process_lost";
-      let baseMessage = dispatchUnlaunched
-        ? buildDispatchUnlaunchedMessage(run.agentId, adapterType, dispatchUnlaunchedGraceMs)
-        : stillborn
-          ? buildStillbornRunMessage(run, stillbornTtlMs)
-          : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const selfDeclaredRunExpired =
+        run.invocationSource === "self_declared" &&
+        isSelfDeclaredRunExpired(run, now, selfDeclaredRunTtlMs);
+      const reapErrorCode = selfDeclaredRunExpired
+        ? "self_declared_run_expired"
+        : dispatchUnlaunched
+          ? "dispatch_unlaunched"
+          : "process_lost";
+      let baseMessage = selfDeclaredRunExpired
+        ? "Work session expired: no keepalive within 15 minutes"
+        : dispatchUnlaunched
+          ? buildDispatchUnlaunchedMessage(run.agentId, adapterType, dispatchUnlaunchedGraceMs)
+          : stillborn
+            ? buildStillbornRunMessage(run, stillbornTtlMs)
+            : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
       if (hostRestartMarker) baseMessage = buildHostRestartMessage(hostRestartMarker);
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
         ? {
