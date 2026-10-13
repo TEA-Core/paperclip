@@ -42,6 +42,18 @@ describe("heartbeat stop metadata", () => {
     });
   });
 
+  it("records self-declared expiry separately from process loss", () => {
+    expect(
+      buildHeartbeatRunStopMetadata({
+        adapterType: "external_pull",
+        adapterConfig: {},
+        outcome: "failed",
+        errorCode: "self_declared_run_expired",
+        errorMessage: "Work session expired: no keepalive within 15 minutes",
+      }).stopReason,
+    ).toBe("self_declared_run_expired");
+  });
+
   it("distinguishes budget cancellation from manual cancellation", () => {
     expect(
       buildHeartbeatRunStopMetadata({

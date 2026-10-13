@@ -1584,6 +1584,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     ).toBe(true);
   });
 
+  it("posts one recovery notice per failed run ID while reusing the source-scoped action", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const makeRun = () => ({
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Work session expired: no keepalive within 15 minutes",
+      errorCode: "self_declared_run_expired",
+      contextSnapshot: { issueId: sourceIssue.id },
+      livenessState: "needs_followup",
+      startedAt: new Date(),
+      createdAt: new Date(),
+    } as const);
+    const firstRun = makeRun();
+    const secondRun = makeRun();
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: firstRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: firstRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: secondRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actions).toHaveLength(1);
+
+    const notices = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      );
+    expect(notices.map((notice) => notice.metadata?.sourceRunId).sort()).toEqual(
+      [firstRun.id, secondRun.id].sort(),
+    );
+  });
+
   it("blocks with an empty blocker set when escalating stranded assigned work, because the recovery action owns the wake", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
@@ -2636,7 +2692,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
     const { companyId, managerId, coderId, sourceIssue, prefix } = await seedCompany();
     await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = vi.fn(async (_agentId: string, _options?: Record<string, unknown>) => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     const firstLatestRun = {
       id: randomUUID(),
@@ -2984,12 +3040,98 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(afterSecond?.status).toBe("blocked");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
-    expect(comments).toHaveLength(1);
-    // Dedupe for structured notices is metadata-based: the short body no longer
-    // carries the `Recovery action: \`id\`` marker line.
-    expect(comments[0]?.body).not.toContain("Recovery action:");
-    expect(noticeMetadataReferencesRecoveryAction(comments[0]?.metadata, actionRows[0]!.id)).toBe(true);
-    expect(comments[0]?.presentation).toMatchObject({ kind: "system_notice", tone: "danger" });
+    const notices = comments.filter((comment) =>
+      noticeMetadataReferencesRecoveryAction(comment.metadata, actionRows[0]!.id),
+    );
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.body).not.toContain("Recovery action:");
+    expect(notices[0]?.presentation).toMatchObject({ kind: "system_notice", tone: "danger" });
+  });
+
+  it("deduplicates recovery notices across concurrent sweeps for one source run", async () => {
+    const { sourceIssue, coderId } = await seedCompany();
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Work session expired: no keepalive within 15 minutes",
+      errorCode: "self_declared_run_expired",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+    const firstRecovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const secondRecovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    await firstRecovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    await Promise.all([
+      firstRecovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      }),
+      secondRecovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      }),
+    ]);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssue.id));
+    expect(comments.filter((comment) => comment.metadata?.sourceRunId === latestRun.id)).toHaveLength(1);
+  });
+
+  it("deduplicates a recovery notice after more than 50 newer system comments", async () => {
+    const { companyId, sourceIssue, coderId } = await seedCompany();
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Work session expired: no keepalive within 15 minutes",
+      errorCode: "self_declared_run_expired",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    await db.insert(issueComments).values(
+      Array.from({ length: 51 }, (_, index) => ({
+        companyId,
+        issueId: sourceIssue.id,
+        authorType: "system" as const,
+        body: `Newer system comment ${index + 1}`,
+        createdAt: new Date(Date.now() + index + 1),
+      })),
+    );
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssue.id));
+    expect(comments.filter((comment) => comment.metadata?.sourceRunId === latestRun.id)).toHaveLength(1);
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {

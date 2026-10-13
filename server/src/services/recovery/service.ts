@@ -359,9 +359,9 @@ type LatestIssueRun =
       | "errorCode"
       | "contextSnapshot"
       | "livenessState"
-      | "startedAt"
-      | "createdAt"
     > & {
+      startedAt?: Date | null;
+      createdAt?: Date | null;
       resultJson?: unknown;
     })
   | null;
@@ -2332,6 +2332,7 @@ export function recoveryService(
     if (issue.status !== "todo" || latestRun?.status !== "succeeded")
       return false;
     const runBeganAt = latestRun.startedAt ?? latestRun.createdAt;
+    if (!runBeganAt) return false;
 
     return db
       .select({ id: issueRecoveryActions.id })
@@ -5402,63 +5403,55 @@ export function recoveryService(
         : null,
     });
 
+    const isSelfDeclaredRunExpiry =
+      input.latestRun?.errorCode === "self_declared_run_expired";
     const shouldPostEscalationComment =
       recoveryAction.attemptCount === 1 ||
       input.recoveryCause === "workspace_validation_failed" ||
-      input.recoveryCause === "configuration_incomplete";
+      input.recoveryCause === "configuration_incomplete" ||
+      isSelfDeclaredRunExpiry;
     if (shouldPostEscalationComment) {
+      const commentNotice = notice ?? escalationNotice;
+      const sourceRunId = isSelfDeclaredRunExpiry ? input.latestRun?.id ?? null : null;
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
 
-      const hasEscalationComment = await db
-        .select({
-          id: issueComments.id,
-          body: issueComments.body,
-          metadata: issueComments.metadata,
-        })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.issueId, input.issue.id),
-            eq(issueComments.authorType, "system"),
-          ),
-        )
-        .orderBy(desc(issueComments.createdAt))
-        .limit(50)
-        .then((rows) =>
-          rows.some(
-            (row) =>
-              noticeMetadataReferencesRecoveryAction(
-                row.metadata,
-                recoveryAction.id,
-              ) || (row.body ?? "").includes(escalationCommentMarker),
-          ),
-        );
+      await db.transaction(async (tx) => {
+        const lockKey = [
+          "paperclip:recovery-notice",
+          input.issue.companyId,
+          input.issue.id,
+          sourceRunId ?? recoveryAction.id,
+        ].join(":");
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
 
-      if (!hasEscalationComment) {
-        if (notice) {
-          await issuesSvc.addComment(
-            input.issue.id,
-            notice.body,
-            {},
-            {
-              authorType: "system",
-              presentation: notice.presentation,
-              metadata: notice.metadata,
-            },
-          );
-        } else {
-          await issuesSvc.addComment(
-            input.issue.id,
-            escalationNotice.body,
-            {},
-            {
-              authorType: "system",
-              presentation: escalationNotice.presentation,
-              metadata: escalationNotice.metadata,
-            },
-          );
-        }
-      }
+        const hasEscalationComment = await tx
+          .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, input.issue.companyId),
+              eq(issueComments.issueId, input.issue.id),
+              eq(issueComments.authorType, "system"),
+              ...(sourceRunId
+                ? [sql`${issueComments.metadata}->>'sourceRunId' = ${sourceRunId}`]
+                : []),
+            ),
+          )
+          .then((rows) => rows.some((row) =>
+            sourceRunId
+              ? row.metadata?.sourceRunId === sourceRunId
+              : noticeMetadataReferencesRecoveryAction(row.metadata, recoveryAction.id) ||
+                (row.body ?? "").includes(escalationCommentMarker),
+          ));
+
+        if (hasEscalationComment) return;
+
+        await issuesSvc.addComment(input.issue.id, commentNotice.body, {}, {
+          authorType: "system",
+          presentation: commentNotice.presentation,
+          metadata: commentNotice.metadata,
+        }, tx);
+      });
     }
 
     await logActivity(db, {

@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -36,8 +36,13 @@ export interface SelfDeclaredRunCloseResult {
 
 import { DEFAULT_SELF_DECLARED_RUN_TTL_MS } from "./run-stillborn.js";
 
-export function selfDeclaredRunService(db: Db) {
+export function selfDeclaredRunService(
+  db: Db,
+  opts?: { selfDeclaredRunTtlMs?: number },
+) {
   const heartbeat = heartbeatService(db);
+  const selfDeclaredRunTtlMs =
+    opts?.selfDeclaredRunTtlMs ?? DEFAULT_SELF_DECLARED_RUN_TTL_MS;
 
   async function getAgentById(agentId: string) {
     return db
@@ -81,6 +86,29 @@ export function selfDeclaredRunService(db: Db) {
     }
 
     const now = new Date();
+    const latestSelfDeclaredRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.invocationSource, "self_declared"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const canRecoverExpiredSession =
+      issue.status === "blocked" &&
+      issue.executionRunId === null &&
+      latestSelfDeclaredRun?.status === "failed" &&
+      latestSelfDeclaredRun.errorCode === "self_declared_run_expired" &&
+      latestSelfDeclaredRun.agentId === agentId;
+    const allowedStatuses = canRecoverExpiredSession
+      ? (["todo", "in_progress", "blocked"] as const)
+      : (["todo", "in_progress"] as const);
 
     const updated = await db
       .update(issues)
@@ -94,7 +122,7 @@ export function selfDeclaredRunService(db: Db) {
       .where(
         and(
           eq(issues.id, issueId),
-          inArray(issues.status, ["todo", "in_progress"]),
+          inArray(issues.status, allowedStatuses),
           or(
             isNull(issues.assigneeAgentId),
             eq(issues.assigneeAgentId, agentId),
@@ -231,7 +259,7 @@ export function selfDeclaredRunService(db: Db) {
       .set({ updatedAt: now })
       .where(eq(heartbeatRuns.id, runId));
 
-    const expiresAt = new Date(now.getTime() + DEFAULT_SELF_DECLARED_RUN_TTL_MS);
+    const expiresAt = new Date(now.getTime() + selfDeclaredRunTtlMs);
 
     return {
       runId: run.id,
