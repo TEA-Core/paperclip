@@ -21111,6 +21111,7 @@ export function issueRoutes(
           policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
           executionState: parseIssueExecutionState(issue.executionState),
         });
+      let escalationCertifiedDelivery: Record<string, unknown> | null = null;
       if (reviewEscalationCompletesLadder) {
         const closeOutcome = await evaluateDoneTransitionGuards({
           issue,
@@ -21134,11 +21135,20 @@ export function issueRoutes(
           actor: { agentId: actor.agentId, userId: actor.actorType === "user" ? actor.actorId : null },
           commentBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
         });
+        if (projected.decision && projected.patch.executionState) {
+          projected.patch.executionState = { ...projected.patch.executionState, lastDecisionId: randomUUID() };
+        }
         await preflightTerminalApproval(issue, projected.patch, projected.decision);
         const projectedState = projected.patch.executionState as Record<string, unknown> | undefined;
         if (projected.decision && projectedState) {
+          const { finalDelivery, ...projectedApprovalStatus } =
+            (projectedState.approvalStatus as Record<string, unknown> | undefined) ?? {};
+          escalationCertifiedDelivery = (finalDelivery as Record<string, unknown> | undefined) ?? null;
           // The escalation helper carries raw approvalStatus through its decision transaction.
-          issue.executionState = { ...issue.executionState, approvalStatus: projectedState.approvalStatus };
+          issue.executionState = {
+            ...issue.executionState,
+            approvalStatus: projectedState.approvalStatus === undefined ? undefined : projectedApprovalStatus,
+          };
         }
       }
       const { interaction, createdIssues, continuationIssue } =
@@ -21186,8 +21196,20 @@ export function issueRoutes(
           // a hook failure never rejects the escalation (ADR-073 D3).
           // closingTransition mirrors the other doors: true when the escalation
           // closed the card (final stage), false on the non-final hand-back.
+          const escalationState = (escalationResolution.issue.executionState ?? {}) as Record<string, unknown>;
           await runApprovalMergeArming({
-            issue: escalationResolution.issue,
+            issue: escalationCertifiedDelivery
+              ? {
+                  ...escalationResolution.issue,
+                  executionState: {
+                    ...escalationState,
+                    approvalStatus: {
+                      ...(escalationState.approvalStatus as Record<string, unknown> | undefined),
+                      finalDelivery: { ...escalationCertifiedDelivery, decisionId: escalationResolution.decisionId },
+                    },
+                  },
+                }
+              : escalationResolution.issue,
             decision: {
               stageId: escalationResolution.stageId,
               stageType: escalationResolution.stageType,

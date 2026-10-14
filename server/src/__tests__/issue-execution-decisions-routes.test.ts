@@ -526,6 +526,24 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }]);
   });
 
+  it("preserves the reviewed anchor and stamps nothing when an escalation accept races a content push", async () => {
+    const fixture = await pendingDelivery();
+    const interaction = await seedEscalation(fixture);
+    fixture.moveHead();
+    const response = await request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+    expect(response.status).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      approvalStatus: {
+        approvedHeadSha: fixture.pr.head.sha,
+        publishSkipped: expect.objectContaining({ reason: expect.stringContaining("head_moved") }),
+      },
+    });
+    expect(fixture.writes).toEqual([]);
+  });
+
   it("answers an escalation accept from a non-participant without a server error", async () => {
     const fixture = await pendingDelivery({ draft: true });
     const interaction = await seedEscalation(fixture);
