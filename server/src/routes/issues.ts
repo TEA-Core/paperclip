@@ -4317,15 +4317,60 @@ export function issueRoutes(
   }
 
   // SUP-19860: only a genuine terminal approval owes a repo-delivery verdict.
-  // Attach certification to the decision patch, so rollback also rolls back the anchor.
+  // The verdict is resolved without any row lock (inline for doors outside a
+  // transaction, via prefetchFinalDelivery before the lock for the others) and
+  // attached to the decision patch, so rollback also rolls back the anchor.
+  type FinalDeliveryResolution =
+    | { repoBacked: false }
+    | { repoBacked: true; deliveryOwnerIssueId: string; verdict: DecisionHeadResolution };
+  type FinalDeliveryPrefetch = {
+    status: string;
+    updatedAtMs: number;
+    resolution: FinalDeliveryResolution;
+  };
+  type FinalDeliveryIssue = Pick<typeof issueRows.$inferSelect,
+    "id" | "companyId" | "projectId" | "projectWorkspaceId" | "executionWorkspaceId" |
+    "executionPolicy" | "executionState" | "identifier" | "issueNumber">;
+  const FINAL_DELIVERY_PREFLIGHT_TIMEOUT_MS = 20_000;
+
+  async function resolveFinalDeliveryResolution(issue: FinalDeliveryIssue): Promise<FinalDeliveryResolution> {
+    const context = await resolveIssueRepoContext(db, issue);
+    if (!context?.repoUrl) return { repoBacked: false };
+    const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+    const deliveryOwnerIssueId = ownership.ownerIssueId ?? issue.id;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let verdict: DecisionHeadResolution;
+    try {
+      verdict = await Promise.race([
+        preflightFinalDelivery(db, issue.companyId, issue.id, issue.identifier ?? `SUP-${issue.issueNumber}`),
+        new Promise<DecisionHeadResolution>((resolve) => {
+          timer = setTimeout(
+            () => resolve({ kind: "unresolvable", reason: "head_unverifiable: final delivery preflight timed out" }),
+            FINAL_DELIVERY_PREFLIGHT_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch (error) {
+      verdict = { kind: "unresolvable", reason: `head_unverifiable: ${error instanceof Error ? error.message : String(error)}` };
+    } finally {
+      clearTimeout(timer);
+    }
+    return { repoBacked: true, deliveryOwnerIssueId, verdict };
+  }
+
+  async function prefetchFinalDelivery(
+    issue: FinalDeliveryIssue & { status: string; updatedAt: Date },
+  ): Promise<FinalDeliveryPrefetch> {
+    const snapshot = { status: issue.status, updatedAtMs: new Date(issue.updatedAt).getTime() };
+    return { ...snapshot, resolution: await resolveFinalDeliveryResolution(issue) };
+  }
+
   async function preflightTerminalApproval(
-    issue: Pick<typeof issueRows.$inferSelect,
-      "id" | "companyId" | "projectId" | "projectWorkspaceId" | "executionWorkspaceId" |
-      "executionPolicy" | "executionState" | "identifier" | "issueNumber">,
+    issue: FinalDeliveryIssue & { status?: string; updatedAt?: Date },
     patch: Record<string, unknown>,
     decision: MergeArmingDecision | null | undefined,
     policy: Parameters<typeof ladderIsTerminallyApproved>[0] = issue.executionPolicy,
-    overrideAccepted = false,
+    options: { overrideAccepted?: boolean; locked?: FinalDeliveryPrefetch | null } = {},
   ): Promise<void> {
     const rawPatchState = patch.executionState as Record<string, unknown> | undefined;
     const priorApprovalStatus = rawPatchState?.approvalStatus as Record<string, unknown> | undefined;
@@ -4333,19 +4378,30 @@ export function issueRoutes(
       const { finalDelivery: _stale, ...rest } = priorApprovalStatus;
       patch.executionState = { ...rawPatchState, approvalStatus: rest };
     }
-    const state = patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined;
+    const state = patch.executionState as
+      | { completedStageIds?: string[]; lastDecisionOutcome?: string | null; lastDecisionId?: string | null }
+      | undefined;
     if (!shouldPublishApprovalStatus(decision) || !ladderIsTerminallyApproved(policy, state)) return;
-    const context = await resolveIssueRepoContext(db, issue);
-    if (!context?.repoUrl) return; // Existing repository-free doc/gate close.
-    if (overrideAccepted) return;
-    const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
-    const deliveryOwnerIssueId = ownership.ownerIssueId ?? issue.id;
-    let verdict: DecisionHeadResolution;
-    try {
-      verdict = await preflightFinalDelivery(db, issue.companyId, issue.id, issue.identifier ?? `SUP-${issue.issueNumber}`);
-    } catch (error) {
-      verdict = { kind: "unresolvable", reason: `head_unverifiable: ${error instanceof Error ? error.message : String(error)}` };
+    if (options.overrideAccepted) return;
+    let resolution: FinalDeliveryResolution;
+    if (options.locked === undefined) {
+      resolution = await resolveFinalDeliveryResolution(issue);
+    } else {
+      const prefetched = options.locked;
+      if (
+        !prefetched ||
+        prefetched.status !== issue.status ||
+        prefetched.updatedAtMs !== new Date(issue.updatedAt as Date).getTime()
+      ) {
+        throw conflict("Card changed while the final delivery preflight ran; retry the final verdict", {
+          code: "approval_final_delivery_preflight_stale",
+          reason: "head_moved: card changed during final delivery preflight",
+        });
+      }
+      resolution = prefetched.resolution;
     }
+    if (!resolution.repoBacked) return; // Existing repository-free doc/gate close.
+    const { verdict, deliveryOwnerIssueId } = resolution;
     if (verdict.kind !== "resolved") {
       const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
@@ -4354,11 +4410,14 @@ export function issueRoutes(
     }
     const rawState = patch.executionState as Record<string, unknown>;
     const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
+    const decisionId = state?.lastDecisionId;
     patch.executionState = {
       ...rawState,
       approvalStatus: {
         ...prior, approvedHeadSha: verdict.headSha,
-        finalDelivery: { ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName },
+        ...(decisionId
+          ? { finalDelivery: { ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId } }
+          : {}),
       },
     };
   }
@@ -4560,9 +4619,15 @@ export function issueRoutes(
       // reason (ADR-091 D4: cannot verify -> refuse), never a fallback to the
       // live head.
       const approvalStatus = candidate.executionState?.approvalStatus as {
-        finalDelivery?: { owner: string; repo: string; number: number; headSha: string; displayName: string };
+        finalDelivery?: {
+          owner: string; repo: string; number: number; headSha: string; displayName: string; decisionId?: string;
+        };
       } | undefined;
-      const certified = approvalStatus?.finalDelivery;
+      const lastDecisionId = candidate.executionState?.lastDecisionId;
+      const certified =
+        approvalStatus?.finalDelivery?.decisionId && approvalStatus.finalDelivery.decisionId === lastDecisionId
+          ? approvalStatus.finalDelivery
+          : undefined;
       const decisionHead: DecisionHeadResolution = certified
         ? { kind: "resolved", headSha: certified.headSha, displayName: certified.displayName, pr: certified }
         : await resolveApprovalDecisionHead(db, issue.companyId, issue.id, issueIdentifier, closingTransition);
@@ -11236,6 +11301,7 @@ export function issueRoutes(
       previousStatus: string;
     };
     let outcome: BoardDecisionTransactionResult | null = null;
+    const finalDeliveryPrefetch = decision === "approved" ? await prefetchFinalDelivery(issue) : null;
 
     try {
       outcome = await db.transaction(async (tx) => {
@@ -11333,15 +11399,18 @@ export function issueRoutes(
           throw err;
         }
 
-        await preflightTerminalApproval(lockedIssue, result.patch, result.decision, lockedPolicy);
         const rawExecutionState = result.patch.executionState;
         if (!rawExecutionState || typeof rawExecutionState !== "object") {
           throw new Error("Board stage decision patch is missing executionState");
         }
-        const nextExecutionState = {
+        result.patch.executionState = {
           ...(rawExecutionState as Record<string, unknown>),
           lastDecisionId: decisionId,
         };
+        await preflightTerminalApproval(lockedIssue, result.patch, result.decision, lockedPolicy, {
+          locked: finalDeliveryPrefetch,
+        });
+        const nextExecutionState = result.patch.executionState as Record<string, unknown>;
 
         const updated = await svc.update(
           id,
@@ -12231,6 +12300,8 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
+      const finalDeliveryPrefetch =
+        sourceIssueStatus === "done" && existing.status !== "done" ? await prefetchFinalDelivery(existing) : null;
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
@@ -12506,7 +12577,22 @@ export function issueRoutes(
               allowBoardOverride: req.actor.type === "board",
               commentBody: resolutionNote ?? null,
             });
-            await preflightTerminalApproval(lockedIssue, transition.patch, transition.decision, executionPolicy);
+            const recoveryDecisionId = transition.decision ? randomUUID() : null;
+            if (recoveryDecisionId) {
+              const transitionState = transition.patch.executionState;
+              if (!transitionState || typeof transitionState !== "object") {
+                throw new Error(
+                  "Execution policy decision patch is missing executionState",
+                );
+              }
+              transition.patch.executionState = {
+                ...transitionState,
+                lastDecisionId: recoveryDecisionId,
+              };
+            }
+            await preflightTerminalApproval(lockedIssue, transition.patch, transition.decision, executionPolicy, {
+              locked: finalDeliveryPrefetch,
+            });
             Object.assign(updateFields, transition.patch);
             await assertInReviewReviewPath({
               existing: lockedIssue,
@@ -12516,21 +12602,8 @@ export function issueRoutes(
               actorAgentId: actor.agentId,
               actorRunId: actor.runId,
             });
-            if (transition.decision) {
-              const decisionId = randomUUID();
-              const nextExecutionState = updateFields.executionState;
-              if (
-                !nextExecutionState ||
-                typeof nextExecutionState !== "object"
-              ) {
-                throw new Error(
-                  "Execution policy decision patch is missing executionState",
-                );
-              }
-              updateFields.executionState = {
-                ...nextExecutionState,
-                lastDecisionId: decisionId,
-              };
+            if (transition.decision && recoveryDecisionId) {
+              const decisionId = recoveryDecisionId;
               // SUP-17163: remember the recorded decision so the post-commit
               // merge-arming hook can stamp/arm on an approved outcome.
               recordedRecoveryDecision = {
@@ -17973,9 +18046,11 @@ export function issueRoutes(
         res.status(outcome.status).json(outcome.body);
         return;
       }
-      await preflightTerminalApproval(
-        existing, updateFields, transition.decision, nextExecutionPolicy, outcome.overrideAccepted === true,
-      );
+      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
+        overrideAccepted: outcome.overrideAccepted === true,
+      });
+    } else if (transition.decision) {
+      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy);
     }
 
     if (assigneeWillChange && existing.assigneeAgentId) {
@@ -22756,8 +22831,6 @@ export function issueRoutes(
           return;
         }
       }
-      await preflightTerminalApproval(currentIssue, transition.patch, transition.decision, currentExecutionPolicy);
-
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -22769,6 +22842,7 @@ export function issueRoutes(
           lastDecisionId: decisionId,
         };
       }
+      await preflightTerminalApproval(currentIssue, transition.patch, transition.decision, currentExecutionPolicy);
 
       issueBeforeCommentDecision = currentIssue;
       const updatePatch = {
