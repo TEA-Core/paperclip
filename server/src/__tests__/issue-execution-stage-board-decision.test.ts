@@ -947,8 +947,21 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
           .post(`/api/issues/${issueId}/execution-stage/board-decision`)
           .send({ decision: "approved", comment: "board: concurrent B" }),
       ]);
-      expect(first.status, JSON.stringify(first.body)).toBe(200);
-      expect(second.status, JSON.stringify(second.body)).toBe(200);
+      // The loser waits on the row lock and re-reads the winner's committed
+      // state. Its terminal-approval delivery preflight began against the
+      // pre-commit card, so it may instead be told to retry the final verdict
+      // (SUP-19860); the retry must then land on the NEXT undecided stage.
+      for (const response of [first, second]) {
+        if (response.status === 409) {
+          expect(response.body.code, JSON.stringify(response.body)).toBe("approval_final_delivery_preflight_stale");
+          const retry = await request(app)
+            .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+            .send({ decision: "approved", comment: "board: concurrent retry" });
+          expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+        } else {
+          expect(response.status, JSON.stringify(response.body)).toBe(200);
+        }
+      }
     } finally {
       await db.execute(sql.raw(`
         DROP TRIGGER IF EXISTS paperclip_test_pause_board_decision ON issue_execution_decisions;
