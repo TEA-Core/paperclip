@@ -199,6 +199,8 @@ import {
   recordApprovalAnchor,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
+  preflightFinalDelivery,
+  type DecisionHeadResolution,
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
   shouldPublishApprovalStatus,
@@ -4314,6 +4316,50 @@ export function issueRoutes(
     await issueSvc.addComment(issueId, lines.join("\n"), {}, { authorType: "system" });
   }
 
+  // SUP-19860: only a genuine terminal approval owes a repo-delivery verdict.
+  // Attach certification to the decision patch, so rollback also rolls back the anchor.
+  async function preflightTerminalApproval(
+    issue: Pick<typeof issueRows.$inferSelect,
+      "id" | "companyId" | "projectId" | "projectWorkspaceId" | "executionWorkspaceId" |
+      "executionPolicy" | "executionState" | "identifier" | "issueNumber">,
+    patch: Record<string, unknown>,
+    decision: MergeArmingDecision | null | undefined,
+    policy: Parameters<typeof ladderIsTerminallyApproved>[0] = issue.executionPolicy,
+    override: DoneTransitionOverride | null = null,
+  ): Promise<void> {
+    const state = patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined;
+    if (!shouldPublishApprovalStatus(decision) || !ladderIsTerminallyApproved(policy, state)) return;
+    const context = await resolveIssueRepoContext(db, issue);
+    if (!context?.repoUrl) return; // Existing repository-free doc/gate close.
+    if (override) {
+      const guard = await evaluateDoneTransitionGuard(db, issue, override, true);
+      if (guard.allowed && guard.reason === `Override accepted: ${override.disposition}`) return;
+    }
+    const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+    const deliveryOwnerIssueId = ownership.ownerIssueId ?? issue.id;
+    let verdict: DecisionHeadResolution;
+    try {
+      verdict = await preflightFinalDelivery(db, issue.companyId, issue.id, issue.identifier ?? `SUP-${issue.issueNumber}`);
+    } catch (error) {
+      verdict = { kind: "unresolvable", reason: `head_unverifiable: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (verdict.kind !== "resolved") {
+      const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
+      throw conflict("Final repository delivery preflight refused; stage remains pending", {
+        code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
+      });
+    }
+    const rawState = patch.executionState as Record<string, unknown>;
+    const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
+    patch.executionState = {
+      ...rawState,
+      approvalStatus: {
+        ...prior, approvedHeadSha: verdict.headSha,
+        finalDelivery: { ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName },
+      },
+    };
+  }
+
   // SUP-13904 / SUP-17163: shared post-transition merge-arming hook, run by every
   // door that records an approved review decision:
   //   1. the PATCH status path (a board/agent review approval landing `done`),
@@ -4510,13 +4556,13 @@ export function issueRoutes(
       // unresolvable decision-time head is a refusal with a named skipped
       // reason (ADR-091 D4: cannot verify -> refuse), never a fallback to the
       // live head.
-      const decisionHead = await resolveApprovalDecisionHead(
-        db,
-        issue.companyId,
-        issue.id,
-        issueIdentifier,
-        closingTransition,
-      );
+      const approvalStatus = candidate.executionState?.approvalStatus as {
+        finalDelivery?: { owner: string; repo: string; number: number; headSha: string; displayName: string };
+      } | undefined;
+      const certified = approvalStatus?.finalDelivery;
+      const decisionHead: DecisionHeadResolution = certified
+        ? { kind: "resolved", headSha: certified.headSha, displayName: certified.displayName, pr: certified }
+        : await resolveApprovalDecisionHead(db, issue.companyId, issue.id, issueIdentifier, closingTransition);
       let statusOutcome: ArmingOutcome;
       if (decisionHead.kind === "resolved") {
         // SUP-16081 (comment a78bf2d2): write the approval anchor durably
@@ -4544,8 +4590,9 @@ export function issueRoutes(
           issue.id,
           issueIdentifier,
           {
-            closingTransition,
+            closingTransition: certified ? true : closingTransition,
             expectedHeadSha: decisionHead.headSha,
+            expectedPr: certified,
             enforceDeliveryIdentity: true,
           },
         );
@@ -11281,6 +11328,7 @@ export function issueRoutes(
           throw err;
         }
 
+        await preflightTerminalApproval(lockedIssue, result.patch, result.decision, lockedPolicy);
         const rawExecutionState = result.patch.executionState;
         if (!rawExecutionState || typeof rawExecutionState !== "object") {
           throw new Error("Board stage decision patch is missing executionState");
@@ -12453,6 +12501,7 @@ export function issueRoutes(
               allowBoardOverride: req.actor.type === "board",
               commentBody: resolutionNote ?? null,
             });
+            await preflightTerminalApproval(lockedIssue, transition.patch, transition.decision, executionPolicy);
             Object.assign(updateFields, transition.patch);
             await assertInReviewReviewPath({
               existing: lockedIssue,
@@ -17919,6 +17968,7 @@ export function issueRoutes(
         res.status(outcome.status).json(outcome.body);
         return;
       }
+      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, override);
     }
 
     if (assigneeWillChange && existing.assigneeAgentId) {
@@ -20969,6 +21019,16 @@ export function issueRoutes(
           res.status(closeOutcome.status).json(closeOutcome.body);
           return;
         }
+        const projected = applyIssueExecutionPolicyTransition({
+          issue, policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+          requestedStatus: "done", requestedAssigneePatch: {},
+          actor: { agentId: actor.agentId, userId: actor.actorType === "user" ? actor.actorId : null },
+          commentBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
+        });
+        await preflightTerminalApproval(issue, projected.patch, projected.decision);
+        const projectedState = projected.patch.executionState as Record<string, unknown>;
+        // The escalation helper carries raw approvalStatus through its decision transaction.
+        issue.executionState = { ...issue.executionState, approvalStatus: projectedState.approvalStatus };
       }
       const { interaction, createdIssues, continuationIssue } =
         await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
@@ -22687,6 +22747,7 @@ export function issueRoutes(
           return;
         }
       }
+      await preflightTerminalApproval(currentIssue, transition.patch, transition.decision, currentExecutionPolicy);
 
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
