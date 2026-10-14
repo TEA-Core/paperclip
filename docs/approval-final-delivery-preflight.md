@@ -31,6 +31,8 @@ pnpm typecheck
 
 The root stable runner currently rejects the card's positional `pnpm test:run -- <file>` spelling; it is not an alias for Vitest's filename filter. Sandbox verification should inspect actual HTTP responses, persisted execution state/decision rows, and outbound status transport, not mock-returned expected execution state. Production/live exercise remains owner-gated.
 
+The existing refusal suites also assert that a preflight 409 leaves the issue and decision rows unchanged, creates no comment, and sends no approval status. An ambiguity refusal replaces approval-time `pendingCandidates`/`skipReason` with candidate identities and the named owner/remedy in the refusal details. There is no successor certification timestamp: `approvalStatus` stays absent and `lastDecisionId`/`lastDecisionOutcome` stay null. The board-race regression requires one first-stage winner, no losing-request effects before retry, one decision/comment/audit per stage, and final state and wake targets equal to a sequential two-stage control. Existing system diagnostics are counted separately so duplicate comments cannot hide behind the retry.
+
 ## Rollback
 
 Revert preflight commit + redeploy prior Paperclip build. Keep genuine pending decisions/anchors; no DB rewrite, no fabricated approval; owner handles stranded deliveries individually.

@@ -377,6 +377,9 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       preCompleted: 1,
     });
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    const beforeIssue = await db.select().from(issues).where(eq(issues.id, issueId));
+    const beforeDecisions = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
 
     mockResolveApprovalDecisionHead.mockResolvedValue({
       kind: "unresolvable",
@@ -387,7 +390,11 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     const res = await approveCurrentStage(identifier);
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.code).toBe("approval_final_delivery_preflight");
-    expect(await statusOf(issueId)).not.toBe("done");
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issues).where(eq(issues.id, issueId))).toEqual(beforeIssue);
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).toEqual(beforeDecisions);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
 
     expect(mockPublishApprovalStatus).not.toHaveBeenCalled();
     expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(0);

@@ -13,6 +13,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueLabels,
+  issueExecutionDecisions,
   issues,
   labels,
   projectWorkspaces,
@@ -1222,6 +1223,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     });
 
     certifiedDelivery.useRealPreflight = true;
+    const beforeIssue = await db.select().from(issues).where(eq(issues.id, issueId));
+    const beforeDecisions = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
 
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
@@ -1231,7 +1235,13 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.code).toBe("approval_final_delivery_preflight");
-    expect(res.body.details.reason).toMatch(/ambiguous/);
+    // Candidate certification is now a refusal diagnostic, not an approved
+    // pendingCandidates record. No decision/certification timestamp may land.
+    expect(res.body.details.reason).toMatch(/^ambiguous:/);
+    expect(res.body.details.reason).toContain("TEA-Core/paperclip#42");
+    expect(res.body.details.reason).toContain("TEA-Core/paperclip#43");
+    expect(res.body.details.deliveryOwnerIssueId).toBe(issueId);
+    expect(res.body.details.remedy).toContain(issueId);
     expect(await statusOf(issueId)).toBe("in_review");
 
     const statusCalls = mockGhFetch.mock.calls.filter(
@@ -1243,6 +1253,13 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .from(issues)
       .where(eq(issues.id, issueId));
     expect((stateRows[0]?.executionState as Record<string, any> | null)?.approvalStatus).toBeUndefined();
+    expect(stateRows[0]?.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(await db.select().from(issues).where(eq(issues.id, issueId))).toEqual(beforeIssue);
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).toEqual(beforeDecisions);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
   });
 
   it("PATCH: a decision-carrying close refused by mechanism D carries the mechanism's own remedy, not merge-first (ADR-103 M3)", async () => {
