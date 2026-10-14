@@ -4326,6 +4326,7 @@ export function issueRoutes(
   type FinalDeliveryPrefetch = {
     status: string;
     updatedAtMs: number;
+    binding: string;
     resolution: FinalDeliveryResolution;
   };
   type FinalDeliveryIssue = Pick<typeof issueRows.$inferSelect,
@@ -4358,11 +4359,26 @@ export function issueRoutes(
     return { repoBacked: true, deliveryOwnerIssueId, verdict };
   }
 
+  async function readFinalDeliveryBinding(dbLike: Db, issue: FinalDeliveryIssue): Promise<string> {
+    const context = await resolveIssueRepoContext(dbLike, issue);
+    const ownership = await resolveCardDeliveryBranchOwnership(dbLike, issue.companyId, issue.id);
+    const state = issue.executionState as { delivery?: unknown } | null;
+    return JSON.stringify({
+      projectId: issue.projectId,
+      projectWorkspaceId: issue.projectWorkspaceId,
+      executionWorkspaceId: issue.executionWorkspaceId,
+      context,
+      ownership,
+      delivery: state?.delivery ?? null,
+    });
+  }
+
   async function prefetchFinalDelivery(
     issue: FinalDeliveryIssue & { status: string; updatedAt: Date },
   ): Promise<FinalDeliveryPrefetch> {
     const snapshot = { status: issue.status, updatedAtMs: new Date(issue.updatedAt).getTime() };
-    return { ...snapshot, resolution: await resolveFinalDeliveryResolution(issue) };
+    const binding = await readFinalDeliveryBinding(db, issue);
+    return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(issue) };
   }
 
   async function preflightTerminalApproval(
@@ -4370,7 +4386,7 @@ export function issueRoutes(
     patch: Record<string, unknown>,
     decision: MergeArmingDecision | null | undefined,
     policy: Parameters<typeof ladderIsTerminallyApproved>[0] = issue.executionPolicy,
-    options: { overrideAccepted?: boolean; locked?: FinalDeliveryPrefetch | null } = {},
+    options: { overrideAccepted?: boolean; locked?: { prefetch: FinalDeliveryPrefetch | null; tx: Db } } = {},
   ): Promise<void> {
     const rawPatchState = patch.executionState as Record<string, unknown> | undefined;
     const priorApprovalStatus = rawPatchState?.approvalStatus as Record<string, unknown> | undefined;
@@ -4387,15 +4403,26 @@ export function issueRoutes(
     if (options.locked === undefined) {
       resolution = await resolveFinalDeliveryResolution(issue);
     } else {
-      const prefetched = options.locked;
+      const { prefetch: prefetched, tx } = options.locked;
+      const lockedBinding = prefetched ? await readFinalDeliveryBinding(tx, issue) : null;
+      const certifiedPr = prefetched?.resolution.repoBacked && prefetched.resolution.verdict.kind === "resolved"
+        ? prefetched.resolution.verdict.pr
+        : null;
+      const lockedRepo = lockedBinding
+        ? parseRepoUrl((JSON.parse(lockedBinding) as { context: { repoUrl: string | null } | null }).context?.repoUrl ?? null)
+        : null;
       if (
         !prefetched ||
         prefetched.status !== issue.status ||
-        prefetched.updatedAtMs !== new Date(issue.updatedAt as Date).getTime()
+        prefetched.updatedAtMs !== new Date(issue.updatedAt as Date).getTime() ||
+        prefetched.binding !== lockedBinding ||
+        (certifiedPr &&
+          (lockedRepo?.owner.toLowerCase() !== certifiedPr.owner.toLowerCase() ||
+            lockedRepo?.repo.toLowerCase() !== certifiedPr.repo.toLowerCase()))
       ) {
-        throw conflict("Card changed while the final delivery preflight ran; retry the final verdict", {
+        throw conflict("Card or delivery binding changed while the final delivery preflight ran; retry the final verdict", {
           code: "approval_final_delivery_preflight_stale",
-          reason: "head_moved: card changed during final delivery preflight",
+          reason: "head_moved: card or delivery binding changed during final delivery preflight",
         });
       }
       resolution = prefetched.resolution;
@@ -11408,7 +11435,7 @@ export function issueRoutes(
           lastDecisionId: decisionId,
         };
         await preflightTerminalApproval(lockedIssue, result.patch, result.decision, lockedPolicy, {
-          locked: finalDeliveryPrefetch,
+          locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
         });
         const nextExecutionState = result.patch.executionState as Record<string, unknown>;
 
@@ -12591,7 +12618,7 @@ export function issueRoutes(
               };
             }
             await preflightTerminalApproval(lockedIssue, transition.patch, transition.decision, executionPolicy, {
-              locked: finalDeliveryPrefetch,
+              locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
             });
             Object.assign(updateFields, transition.patch);
             await assertInReviewReviewPath({

@@ -431,6 +431,37 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }
   });
 
+  it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
+    const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+    process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+    try {
+      const fixture = await pendingDelivery({ holdPull: true });
+      const before = await fixture.read();
+      const decision = request(createApp(db, boardActor(fixture.company)))
+        .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Independent final approval." })
+        .then((response) => response);
+      await fixture.pullReached;
+      await db.update(executionWorkspaces)
+        .set({ branchName: "SUP-1-rebound-delivery" })
+        .where(eq(executionWorkspaces.id, before.executionWorkspaceId!));
+      fixture.releasePull();
+      const response = await decision;
+      expect(response.status).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight_stale", reason: expect.stringContaining("head_moved"),
+      });
+      const stored = await fixture.read();
+      expect(stored.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+      expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
+    }
+  });
+
   it.each([{ draft: true }, { missing: true }])("keeps a pending approval comment unrecorded on a refused final delivery: %j", async (options) => {
     const fixture = await pendingDelivery(options);
     const comment = (body: string) => request(createApp(db, boardActor(fixture.company)))
