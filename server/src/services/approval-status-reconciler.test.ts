@@ -3185,6 +3185,108 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     });
   });
 
+  describe("draft-cached mention anchored on publishedHeadSha only", () => {
+    it.each([
+      ["approvedHeadSha absent", {}],
+      ["approvedHeadSha empty", { approvedHeadSha: "" }],
+    ])("re-publishes a cached draft mention when the live PR is ready on the same head (%s)", async (_label, extra) => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT, ...extra },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId, { draft: true });
+
+      installRoutes([
+        { url: PR_URL, body: { ...OPEN_PR_BODY, draft: false } },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+      ]);
+
+      const first = await runApprovalStatusReconcilerTick(db);
+
+      expect(first.scanned).toBe(1);
+      expect(first.republished).toBe(1);
+      expect(first.failed).toBe(0);
+      expect(postStatusCalls()).toHaveLength(1);
+      expect(postStatusBodies()[0]).toMatchObject({ state: "success", context: PAPERCLIP_APPROVED });
+
+      installRoutes([
+        { url: PR_URL, body: { ...OPEN_PR_BODY, draft: false } },
+        {
+          url: COMBINED_STATUS_URL,
+          body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        },
+      ]);
+
+      const second = await runApprovalStatusReconcilerTick(db);
+
+      expect(second.scanned).toBe(1);
+      expect(second.republished).toBe(0);
+      expect(second.skipped["already-success"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(1);
+    });
+
+    it("refuses to publish or arm when the live PR is still a draft", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId, { draft: true });
+
+      installRoutes([{ url: PR_URL, body: { ...OPEN_PR_BODY, draft: true } }]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["live-draft"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+    });
+
+    it.each([
+      ["absent", {}],
+      ["empty", { approvedHeadSha: "", publishedHeadSha: "" }],
+    ])("does not select a cached draft mention when neither head anchor is set (%s)", async (_label, approvalStatus) => {
+      const issueId = await insertIssue({ executionState: approvedState({ approvalStatus }) });
+      await insertDecision(issueId);
+      await insertMention(issueId, { draft: true });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(0);
+      expect(summary.republished).toBe(0);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it.each(["closed", "merged"])(
+      "does not select a %s cached mention even with an anchor and a workspace",
+      async (state) => {
+        const issueId = await insertIssue({
+          executionState: approvedState({
+            approvalStatus: { publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT },
+          }),
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId, { state, draft: true });
+        await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.scanned).toBe(0);
+        expect(summary.republished).toBe(0);
+        expect(postStatusCalls()).toHaveLength(0);
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      },
+    );
+  });
+
   describe("first publish anchored on approvedHeadSha (SUP-14715 D-B)", () => {
     it("recovers a cached draft mention when the live PR is ready and the certified head is unchanged", async () => {
       const issueId = await insertIssue({
