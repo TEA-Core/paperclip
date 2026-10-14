@@ -857,6 +857,7 @@ async function findApprovalCandidates(
                and (
                  ${externalObjects.data} ->> 'draft' is distinct from 'true'
                  or nullif(${issues.executionState} -> 'approvalStatus' ->> 'approvedHeadSha', '') is not null
+                 or nullif(${issues.executionState} -> 'approvalStatus' ->> 'publishedHeadSha', '') is not null
                )
 
           ))
@@ -2703,11 +2704,8 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     };
   }
 
-  const cachedApprovedHeadSha = (row.executionState as { approvalStatus?: { approvedHeadSha?: unknown } } | null)?.approvalStatus
-    ?.approvedHeadSha;
-  const hasApprovedHeadSha = typeof cachedApprovedHeadSha === "string" && cachedApprovedHeadSha.length > 0;
   const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id, {
-    includeDrafts: hasApprovedHeadSha,
+    includeDrafts: readApprovedHead(row.executionState) !== null,
   });
   const openPrs = linked.filter((pr) => pr.cachedState === "open");
   // SUP-14911: an object whose last refresh failed with a terminal auth error
