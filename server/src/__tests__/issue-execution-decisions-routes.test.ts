@@ -232,7 +232,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 
-  async function pendingDelivery({ draft = false, missing = false, mid = false, repo = true, unmentioned = false } = {}) {
+  async function pendingDelivery({ draft = false, missing = false, mid = false, repo = true, unmentioned = false, staleCertified = false } = {}) {
     const company = await seedCompany(db);
     await db.insert(companyMemberships).values({
       companyId: company.id, principalType: "user", principalId: "board-user", status: "active", membershipRole: "owner",
@@ -266,6 +266,12 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         currentStageType: "review", currentParticipant: { type: "user", userId: "board-user" },
         returnAssignee: { type: "agent", agentId: author.id }, completedStageIds: [],
         skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        ...(staleCertified ? {
+          approvalStatus: {
+            approvedHeadSha: "c".repeat(40),
+            finalDelivery: { owner: "TEA-Core", repo: "paperclip", number: 42, headSha: "c".repeat(40), displayName: identifier },
+          },
+        } : {}),
       },
     }).where(eq(issues.id, issue.id));
     const pr = {
@@ -311,8 +317,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     return {
       company, issue, stageId, writes, pr,
       moveHead: () => { moveAfterPreflight = true; },
-      approve: () => request(createApp(db, boardActor(company))).patch(`/api/issues/${issue.id}`)
-        .send({ status: "done", comment: "Independent final review approved." }),
+      approve: (extra: Record<string, unknown> = {}) => request(createApp(db, boardActor(company))).patch(`/api/issues/${issue.id}`)
+        .send({ status: "done", comment: "Independent final review approved.", ...extra }),
       read: async () => (await db.select().from(issues).where(eq(issues.id, issue.id)))[0]!,
     };
   }
@@ -347,6 +353,23 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(stored.status).toBe("done");
     expect(stored.executionState).toMatchObject({
       completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+      approvalStatus: { approvedHeadSha: fixture.pr.head.sha, publishedHeadSha: fixture.pr.head.sha },
+    });
+    expect(fixture.writes).toEqual([{
+      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+    }]);
+  });
+
+  it("does not stamp from a prior-cycle certification when the override path skips the preflight", async () => {
+    const fixture = await pendingDelivery({ staleCertified: true });
+    const response = await fixture.approve({
+      doneTransitionOverride: { disposition: "merged-elsewhere", reason: "Delivered via sibling card." },
+    });
+    expect(response.status).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.executionState?.approvalStatus).not.toHaveProperty("finalDelivery");
+    expect(stored.executionState).toMatchObject({
       approvalStatus: { approvedHeadSha: fixture.pr.head.sha, publishedHeadSha: fixture.pr.head.sha },
     });
     expect(fixture.writes).toEqual([{

@@ -12,7 +12,7 @@ The check runs on the PATCH verdict, board stage-decision, auto-approval comment
 
 ## Certification and publication
 
-The decision transaction persists `executionState.approvalStatus.approvedHeadSha` and `finalDelivery` (`owner`, `repo`, `number`, `headSha`, `displayName`) from the preflight. Credentials are never persisted in that anchor. The post-commit hook uses this certification instead of certifying a later live head. Publication remains delivery-identity-gated and pinned to both the reviewed SHA and repo/PR identity.
+The decision transaction persists `executionState.approvalStatus.approvedHeadSha` and `finalDelivery` (`owner`, `repo`, `number`, `headSha`, `displayName`) from the preflight. Credentials are never persisted in that anchor. The post-commit hook uses this certification instead of certifying a later live head. Every decision patch clears any prior-cycle `finalDelivery` first, so the hook only trusts a certification written by the current decision; a terminal approval that skips the preflight (sanctioned override accepted, repository-free) re-resolves the live head instead. Publication remains delivery-identity-gated and pinned to both the reviewed SHA and repo/PR identity.
 
 If the head moves between preflight and publication, the publisher returns `status:skipped:head_moved`, writes no status on the new head, and suppresses merge arming. The original approved-head anchor survives for the reconciler's existing Guard A content-identity check. Changed content needs fresh review; pending, cancelled, skipped, or incomplete ladders are not approval.
 

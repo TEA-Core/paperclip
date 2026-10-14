@@ -4325,16 +4325,19 @@ export function issueRoutes(
     patch: Record<string, unknown>,
     decision: MergeArmingDecision | null | undefined,
     policy: Parameters<typeof ladderIsTerminallyApproved>[0] = issue.executionPolicy,
-    override: DoneTransitionOverride | null = null,
+    overrideAccepted = false,
   ): Promise<void> {
+    const rawPatchState = patch.executionState as Record<string, unknown> | undefined;
+    const priorApprovalStatus = rawPatchState?.approvalStatus as Record<string, unknown> | undefined;
+    if (priorApprovalStatus && "finalDelivery" in priorApprovalStatus) {
+      const { finalDelivery: _stale, ...rest } = priorApprovalStatus;
+      patch.executionState = { ...rawPatchState, approvalStatus: rest };
+    }
     const state = patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined;
     if (!shouldPublishApprovalStatus(decision) || !ladderIsTerminallyApproved(policy, state)) return;
     const context = await resolveIssueRepoContext(db, issue);
     if (!context?.repoUrl) return; // Existing repository-free doc/gate close.
-    if (override) {
-      const guard = await evaluateDoneTransitionGuard(db, issue, override, true);
-      if (guard.allowed && guard.reason === `Override accepted: ${override.disposition}`) return;
-    }
+    if (overrideAccepted) return;
     const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
     const deliveryOwnerIssueId = ownership.ownerIssueId ?? issue.id;
     let verdict: DecisionHeadResolution;
@@ -4843,7 +4846,7 @@ export function issueRoutes(
   }
 
   type DoneTransitionGuardOutcome =
-    | { ok: true }
+    | { ok: true; overrideAccepted?: boolean }
     | { ok: false; status: number; body: Record<string, unknown> };
 
   // Single evaluator for BOTH done-transition guards, shared by every route that can
@@ -4882,6 +4885,8 @@ export function issueRoutes(
     const { issue, override, commentBody, runId, decisionCarried, boardActor, caller } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
+    const overrideAccepted =
+      !!override && guardResult.allowed && guardResult.reason === `Override accepted: ${override.disposition}`;
     if (guardResult.skipped || guardResult.skipReason) {
       void writeAuditLog(
         db,
@@ -4989,7 +4994,7 @@ export function issueRoutes(
         skipReason: "board_actor_bypass",
         decisionCarried,
       });
-      return { ok: true };
+      return { ok: true, overrideAccepted };
     }
 
     const tierResult = await evaluateDoneTierDeclaration(
@@ -5049,7 +5054,7 @@ export function issueRoutes(
         decisionCarried,
       });
     }
-    return { ok: true };
+    return { ok: true, overrideAccepted };
   }
 
   // Every route that can resolve a blocker routes its dependent wake through these
@@ -17968,7 +17973,9 @@ export function issueRoutes(
         res.status(outcome.status).json(outcome.body);
         return;
       }
-      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, override);
+      await preflightTerminalApproval(
+        existing, updateFields, transition.decision, nextExecutionPolicy, outcome.overrideAccepted === true,
+      );
     }
 
     if (assigneeWillChange && existing.assigneeAgentId) {
@@ -21026,9 +21033,11 @@ export function issueRoutes(
           commentBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
         });
         await preflightTerminalApproval(issue, projected.patch, projected.decision);
-        const projectedState = projected.patch.executionState as Record<string, unknown>;
-        // The escalation helper carries raw approvalStatus through its decision transaction.
-        issue.executionState = { ...issue.executionState, approvalStatus: projectedState.approvalStatus };
+        const projectedState = projected.patch.executionState as Record<string, unknown> | undefined;
+        if (projected.decision && projectedState) {
+          // The escalation helper carries raw approvalStatus through its decision transaction.
+          issue.executionState = { ...issue.executionState, approvalStatus: projectedState.approvalStatus };
+        }
       }
       const { interaction, createdIssues, continuationIssue } =
         await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
