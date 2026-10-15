@@ -3186,6 +3186,102 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   });
 
   describe("first publish anchored on approvedHeadSha (SUP-14715 D-B)", () => {
+    it("recovers a cached draft mention when the live PR is ready and the certified head is unchanged", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: NEW_HEAD, approvedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId, { draft: true });
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: { ...OPEN_PR_BODY, draft: false } },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+      ]);
+
+      const first = await runApprovalStatusReconcilerTick(db);
+
+      expect(first.scanned).toBe(1);
+      expect(first.republished).toBe(1);
+      expect(first.failed).toBe(0);
+      expect(postStatusCalls()).toHaveLength(1);
+
+      installRoutes([
+        { url: PR_URL, body: { ...OPEN_PR_BODY, draft: false } },
+        {
+          url: COMBINED_STATUS_URL,
+          body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        },
+      ]);
+
+      const second = await runApprovalStatusReconcilerTick(db);
+
+      expect(second.scanned).toBe(1);
+      expect(second.republished).toBe(0);
+      expect(second.skipped["already-success"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(1);
+    });
+
+    it("refuses to publish when the live PR is still a draft", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: NEW_HEAD, approvedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId, { draft: true });
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([{ url: PR_URL, body: { ...OPEN_PR_BODY, draft: true } }]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["live-draft"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("refuses a live draft that appears after the reconciler precheck", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: NEW_HEAD, approvedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId, { draft: true });
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      let pullReads = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === PR_URL) {
+          pullReads += 1;
+          const body = pullReads === 1 ? { ...OPEN_PR_BODY, draft: false } : { ...OPEN_PR_BODY, draft: true };
+          return { ok: true, status: 200, json: async () => body } as unknown as Response;
+        }
+        if (url === COMBINED_STATUS_URL) {
+          return { ok: true, status: 200, json: async () => ({ state: "pending", statuses: [] }) } as unknown as Response;
+        }
+        if (url === POST_STATUS_URL && init?.method === "POST") {
+          return { ok: true, status: 201, json: async () => ({ id: 12348 }) } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(pullReads).toBe(2);
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["publish:skipped"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+    });
+
     it("certifies a first publish when the live head still equals approvedHeadSha and the card delivered its own PR", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
