@@ -1892,7 +1892,9 @@ export async function publishApprovalStatus(
     // SUP-13313: an empty cached open-PR set means "the PR I know about is
     // stale", not "this issue has no PR". Ask GitHub for open, non-draft PRs
     // that carry the issue identifier before giving up.
-    const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+    const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId, {
+      includeDrafts: options?.includeDrafts === true,
+    });
 
     // SUP-14917: the shared live workspace re-resolve (formerly inlined here).
     // It returns the matches + a terminal failure as data, so this publisher maps
