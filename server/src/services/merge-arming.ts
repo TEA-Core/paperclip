@@ -3159,13 +3159,13 @@ async function fetchPullRequestHeadShaOnce(
   try {
     response = await ghFetch(url, { headers });
   } catch {
-    return { ok: false, status: 0, message: "network_error", headSha: null, headRef: null, open: null, draft: null };
+    return { ok: false, status: 0, message: "network_error", headSha: null, headRef: null, open: null, draft: null, merged: null };
   }
 
   if (!response.ok) {
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     const message = body?.message as string | undefined;
-    return { ok: false, status: response.status, message: message ?? null, headSha: null, headRef: null, open: null, draft: null };
+    return { ok: false, status: response.status, message: message ?? null, headSha: null, headRef: null, open: null, draft: null, merged: null };
   }
 
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
