@@ -3200,12 +3200,13 @@ async function fetchPullRequestHeadShaOnce(
   return {
     ok: false,
     status: response.status,
-    message: "head.sha missing from response",
-    headSha: null,
-    headRef: null,
-    open: null,
-    draft: null,
-  };
+      message: "head.sha missing from response",
+      headSha: null,
+      headRef: null,
+      open: null,
+      draft: null,
+      merged: null,
+    };
 }
 
 /**
