@@ -3114,8 +3114,8 @@ export interface HeadShaFailure extends GitHubFetchResult {
   state?: null;
   headRef: null;
   open: null;
-  draft?: false;
-  merged?: false;
+  draft: null;
+  merged: null;
 }
 
 export type HeadShaResult = HeadShaSuccess | HeadShaFailure;
