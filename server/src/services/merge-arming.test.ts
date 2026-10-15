@@ -580,8 +580,8 @@ function openPrsListItem(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function prHeadBody(sha: string) {
-  return { state: "open", merged: false, head: { ref: "SUP-42-branch", sha } };
+function prHeadBody(sha: string, headRef = "SUP-42-branch") {
+  return { state: "open", merged: false, head: { ref: headRef, sha } };
 }
 
 function installRoutes(
@@ -694,6 +694,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
        */
       sharedWorkspaceOwnerUnrelated?: boolean;
       branchName?: string;
+      delivery?: Record<string, unknown>;
     } = {},
   ) {
     const issueId = randomUUID();
@@ -749,8 +750,10 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       identifier: overrides.identifier ?? "SUP-42",
       projectId,
       executionWorkspaceId,
+      ...(overrides.delivery ? { executionState: { delivery: overrides.delivery } } : {}),
       ...(ancestorParentId ? { parentId: ancestorParentId } : {}),
     });
+
     return issueId;
   }
 
@@ -1386,6 +1389,34 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(result.headSha).toBe(APPROVED_HEAD);
         expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
       }
+    });
+
+    it("publishes only the bound PR head when a cited PR shares the branch", async () => {
+      const issueId = await insertIssue({
+        delivery: {
+          repo: { owner: OWNER, repo: REPO },
+          prNumber: 42,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/42`,
+          branch: "SUP-42-branch",
+          headSha: APPROVED_HEAD,
+        },
+      });
+      await insertMention(issueId);
+      await insertMention(issueId, { number: 43 });
+      installRoutes([
+        { url: PR_URL, body: prHeadBody(APPROVED_HEAD) },
+        { url: `${PR_URL.slice(0, -2)}43`, body: prHeadBody(LIVE_HEAD) },
+        { url: POST_STATUS_URL(APPROVED_HEAD), body: {} },
+      ]);
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        enforceDeliveryIdentity: true,
+        expectedHeadSha: APPROVED_HEAD,
+      });
+
+      expect(outcome.kind).toBe("armed");
+      expect(outcome.headSha).toBe(APPROVED_HEAD);
+      expect(postStatusShas()).toEqual([APPROVED_HEAD]);
     });
 
     it("refuses with a named skipped reason when no linked PR exists", async () => {
