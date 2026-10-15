@@ -3178,6 +3178,7 @@ async function fetchPullRequestHeadShaOnce(
       headRef: null,
       open: null,
       draft: null,
+      merged: null,
     };
   }
 
