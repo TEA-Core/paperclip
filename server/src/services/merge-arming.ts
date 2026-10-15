@@ -1267,6 +1267,7 @@ export interface PublishApprovalStatusOptions {
    * re-publish — leave this unset so their delegated write is unchanged.
    */
   enforceDeliveryIdentity?: boolean;
+  includeDrafts?: boolean;
 }
 
 /**
@@ -1854,7 +1855,9 @@ export async function publishApprovalStatus(
   issueIdentifier: string,
   options?: PublishApprovalStatusOptions,
 ): Promise<ArmingOutcome> {
-  const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
+  const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId, {
+    includeDrafts: options?.includeDrafts === true,
+  });
 
   // ADR-091 D1 (SUP-14676): delivery-identity gate. A mention row is created by
   // prose — a bare PR URL in the card's title/description/comment/document — so
@@ -1979,6 +1982,13 @@ export async function publishApprovalStatus(
       }
 
       const headSha = headShaResult.headSha;
+      if (headShaResult.merged || (headShaResult.state !== null && headShaResult.state !== "open") || headShaResult.draft) {
+        return {
+          kind: "skipped",
+          message: `status:skipped:pr-not-eligible: ${pr.displayName} is ${headShaResult.draft ? "a draft" : headShaResult.merged ? "merged" : `state=${headShaResult.state}`}; not re-stamped`,
+          headSha,
+        };
+      }
       if (options?.expectedHeadSha && headSha !== options.expectedHeadSha) {
         return {
           kind: "skipped",
@@ -2112,6 +2122,13 @@ export async function publishApprovalStatus(
     }
 
     const headSha = headShaResult.headSha;
+    if (headShaResult.merged || headShaResult.state !== null && headShaResult.state !== "open" || headShaResult.draft) {
+      return {
+        kind: "skipped",
+        message: `status:skipped:pr-not-eligible: ${pr.displayName} is ${headShaResult.draft ? "a draft" : headShaResult.merged ? "merged" : `state=${headShaResult.state}`}; not re-stamped`,
+        headSha,
+      };
+    }
     if (options?.expectedHeadSha && headSha !== options.expectedHeadSha) {
       return {
         kind: "skipped",
@@ -2889,11 +2906,17 @@ async function fetchHeadCommitStatuses(
 export interface HeadShaSuccess extends GitHubFetchResult {
   ok: true;
   headSha: string;
+  state: string | null;
+  draft: boolean;
+  merged: boolean;
 }
 
 export interface HeadShaFailure extends GitHubFetchResult {
   ok: false;
   headSha: null;
+  state?: null;
+  draft?: false;
+  merged?: false;
 }
 
 export type HeadShaResult = HeadShaSuccess | HeadShaFailure;
@@ -2952,7 +2975,15 @@ async function fetchPullRequestHeadShaOnce(
   const head = body.head as Record<string, unknown> | undefined;
   const sha = head?.sha as string | undefined;
   if (typeof sha === "string" && sha.length > 0) {
-    return { ok: true, status: response.status, message: null, headSha: sha };
+    return {
+      ok: true,
+      status: response.status,
+      message: null,
+      headSha: sha,
+      state: typeof body.state === "string" ? body.state : null,
+      draft: body.draft === true,
+      merged: body.merged === true,
+    };
   }
   return { ok: false, status: response.status, message: "head.sha missing from response", headSha: null };
 }
