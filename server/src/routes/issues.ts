@@ -455,6 +455,9 @@ const deliveryIdentitySchema = z.object({
   }).strict(),
   branch: z.string().trim().min(1),
   headSha: z.string().trim().min(1),
+  prNumber: z.number().int().positive().optional(),
+  prUrl: z.string().url().optional(),
+  sourceIssueId: z.string().uuid().optional(),
 }).strict();
 const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema.extend({
   interrupt: z.boolean().optional(),

@@ -1475,6 +1475,14 @@ export async function resolveCardDeliveryBranchOwnership(
  * hard-coded true, so a borrowed (carrier) record routes to the identifier-prefix
  * predicate exactly like the fallback path.
  */
+interface DeliveryBinding {
+  branch: string;
+  prNumber: number;
+  prUrl: string;
+  headSha: string;
+  sourceIssueId?: string;
+}
+
 async function resolveDeliveryIdentity(
   db: Db,
   companyId: string,
@@ -1482,6 +1490,7 @@ async function resolveDeliveryIdentity(
 ): Promise<{
    branch: string | null;
    repo: { owner: string; repo: string } | null;
+   binding?: DeliveryBinding;
    recordedUnusable?: string;
    /**
     * ADR-091 D1 (SUP-14783): false ONLY when the execution-workspace row backing
@@ -1543,6 +1552,13 @@ async function resolveDeliveryIdentity(
     const record = delivery as Record<string, unknown>;
     const branch = typeof record.branch === "string" && record.branch.length > 0 ? record.branch : null;
     const headSha = typeof record.headSha === "string" && record.headSha.length > 0 ? record.headSha : null;
+    const prNumber = typeof record.prNumber === "number" && Number.isInteger(record.prNumber) && record.prNumber > 0
+      ? record.prNumber
+      : null;
+    const prUrl = typeof record.prUrl === "string" && record.prUrl.length > 0 ? record.prUrl : null;
+    const sourceIssueId = typeof record.sourceIssueId === "string" && record.sourceIssueId.length > 0
+      ? record.sourceIssueId
+      : undefined;
     const recordedRepoRaw = record.repo;
     const recordedRepo =
       recordedRepoRaw !== undefined &&
@@ -1573,6 +1589,17 @@ async function resolveDeliveryIdentity(
         branchIsOwn: true,
         identifier,
       };
+    }
+    if (prNumber !== null || prUrl !== null || sourceIssueId !== undefined) {
+      if (prNumber === null || prUrl === null) {
+        return {
+          branch: null,
+          repo: null,
+          recordedUnusable: "recorded delivery identity has incomplete PR binding",
+          branchIsOwn: true,
+          identifier,
+        };
+      }
     }
     if (recordedRepo === null) {
       return {
@@ -1649,7 +1676,13 @@ async function resolveDeliveryIdentity(
     // A legitimate carrier record (the owner's branch) routes to the identifier-prefix
     // predicate exactly like the fallback path; only the card's own branch uses the
     // exact-branch predicate.
-    return { branch, repo: projectRepo, branchIsOwn: branchOwnership.branchIsOwn, identifier };
+    return {
+      branch,
+      repo: projectRepo,
+      binding: prNumber !== null && prUrl !== null ? { branch, prNumber, prUrl, headSha, sourceIssueId } : undefined,
+      branchIsOwn: branchOwnership.branchIsOwn,
+      identifier,
+    };
   }
 
   // ADR-091 D1 (SUP-15909): even with no recorded identity the card arms on its
@@ -1673,6 +1706,78 @@ async function resolveDeliveryIdentity(
     branchIsOwn: branchOwnership.branchIsOwn,
     identifier,
   };
+}
+
+function deliveryBindingValidationError(
+  binding: DeliveryBinding,
+  repo: { owner: string; repo: string },
+  issueId: string,
+): string | null {
+  if (binding.sourceIssueId && binding.sourceIssueId !== issueId) {
+    return "recorded delivery identity source issue does not match this card";
+  }
+  const expectedUrl = `https://github.com/${repo.owner}/${repo.repo}/pull/${binding.prNumber}`;
+  if (binding.prUrl !== expectedUrl) {
+    return "recorded delivery identity PR URL does not match its PR number";
+  }
+  return null;
+}
+
+async function resolveExactBoundPullRequest(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  binding: DeliveryBinding,
+  repo: { owner: string; repo: string },
+): Promise<{ pr: LinkedPullRequest | null; reason?: string }> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, repo.owner, repo.repo);
+  if (candidates.length === 0) {
+    return { pr: null, reason: "recorded delivery identity PR cannot be verified without a GitHub token" };
+  }
+  const cached = (await resolveLinkedPullRequests(db, companyId, issueId, { includeDrafts: true }))
+    .find((pr) => pr.owner.toLowerCase() === repo.owner.toLowerCase()
+      && pr.repo.toLowerCase() === repo.repo.toLowerCase()
+      && pr.number === binding.prNumber);
+  for (const candidate of candidates) {
+    const result = await fetchPullRequestHeadSha(candidate.token, repo.owner, repo.repo, binding.prNumber);
+    if (!result.ok) {
+      if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
+      return { pr: null, reason: `recorded delivery identity PR open-state verification failed: HTTP ${result.status}` };
+    }
+    if (result.open !== true || result.draft === true) {
+      return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
+    }
+    if (result.headRef !== binding.branch) {
+      return {
+        pr: null,
+        reason: `recorded delivery identity branch ${binding.branch} does not match the bound PR's live branch ${result.headRef ?? "(unreadable)"}`,
+      };
+    }
+    if (result.headSha !== binding.headSha) {
+      return {
+        pr: null,
+        reason: `recorded delivery identity head SHA ${binding.headSha} does not match the bound PR's current head ${result.headSha}`,
+      };
+    }
+    return {
+      pr: {
+        id: "",
+        owner: repo.owner,
+        repo: repo.repo,
+        number: binding.prNumber,
+        headRefName: result.headRef,
+        title: null,
+        displayName: `${repo.owner}/${repo.repo}#${binding.prNumber}`,
+        cachedState: "open",
+        lastErrorCode: null,
+        reviewDecision: null,
+        draft: result.draft,
+        nodeId: cached?.nodeId ?? null,
+      },
+    };
+  }
+
+  return { pr: null, reason: "recorded delivery identity PR open-state verification failed" };
 }
 
 /**
@@ -1817,11 +1922,45 @@ export type DeliveryNarrow<T> =
     };
 
 export async function narrowToDelivered<
-  T extends { owner: string; repo: string; headRefName: string | null; displayName: string },
+  T extends {
+    id?: string;
+    number: number;
+    owner: string;
+    repo: string;
+    headRefName: string | null;
+    displayName: string;
+    cachedState?: string | null;
+  },
 >(db: Db, companyId: string, issueId: string, candidates: T[]): Promise<DeliveryNarrow<T>> {
-  const { branch, repo, recordedUnusable, branchIsOwn, identifier } = await resolveDeliveryIdentity(db, companyId, issueId);
+  const { branch, repo, binding, recordedUnusable, branchIsOwn, identifier } = await resolveDeliveryIdentity(db, companyId, issueId);
   if (recordedUnusable) return { outcome: "identity-unresolved", branch: null, recordedUnusable };
   if (!branch || !repo) return { outcome: "identity-unresolved", branch };
+  if (binding) {
+    if (binding.sourceIssueId && binding.sourceIssueId !== issueId) {
+      return {
+        outcome: "identity-unresolved",
+        branch,
+        recordedUnusable: "recorded delivery identity source issue does not match this card",
+      };
+    }
+    const expectedUrl = `https://github.com/${repo.owner}/${repo.repo}/pull/${binding.prNumber}`;
+    if (binding.prUrl !== expectedUrl) {
+      return {
+        outcome: "identity-unresolved",
+        branch,
+        recordedUnusable: "recorded delivery identity PR URL does not match its PR number",
+      };
+    }
+    const live = await resolveExactBoundPullRequest(db, companyId, issueId, binding, repo);
+    if (!live.pr) {
+      return {
+        outcome: "identity-unresolved",
+        branch,
+        recordedUnusable: live.reason ?? "recorded delivery identity PR cannot be verified",
+      };
+    }
+    return { outcome: "narrowed", delivered: [live.pr as unknown as T], deliveryBranch: branch };
+  }
   // ADR-091 D1 (SUP-14783): a `shared_workspace` row belongs to the parent
   // issue and carries exactly one branch_name, so for every OTHER issue on that
   // row the exact-branch check compares against a sibling's branch and is
@@ -1855,9 +1994,20 @@ export async function publishApprovalStatus(
   issueIdentifier: string,
   options?: PublishApprovalStatusOptions,
 ): Promise<ArmingOutcome> {
+  const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId, {
     includeDrafts: options?.includeDrafts === true,
   });
+  let boundPR: LinkedPullRequest | null = null;
+  if (deliveryIdentity.binding && deliveryIdentity.repo) {
+    const bindingError = deliveryBindingValidationError(deliveryIdentity.binding, deliveryIdentity.repo, issueId);
+    if (bindingError) return deliveryIdentityUnresolvedOutcome(deliveryIdentity.branch, bindingError);
+    boundPR = linkedPRs.find((pr) => pr.number === deliveryIdentity.binding?.prNumber) ?? null;
+    const exact = await resolveExactBoundPullRequest(db, companyId, issueId, deliveryIdentity.binding, deliveryIdentity.repo);
+    if (!exact.pr) return deliveryIdentityUnresolvedOutcome(deliveryIdentity.branch, exact.reason);
+    boundPR = { ...exact.pr, nodeId: boundPR?.nodeId ?? null };
+  }
+  const authorizingLinkedPRs = boundPR ? [boundPR] : linkedPRs;
 
   // ADR-091 D1 (SUP-14676): delivery-identity gate. A mention row is created by
   // prose — a bare PR URL in the card's title/description/comment/document — so
@@ -1868,7 +2018,10 @@ export async function publishApprovalStatus(
   // candidates BEFORE the length arithmetic. Opt-in: the approval-status
   // reconciler's Guard A re-publish certifies the head by content identity and
   // leaves enforceDeliveryIdentity unset.
-  let authorizingPRs = linkedPRs;
+  let authorizingPRs = authorizingLinkedPRs;
+  if (deliveryIdentity.recordedUnusable) {
+    return deliveryIdentityUnresolvedOutcome(null, deliveryIdentity.recordedUnusable);
+  }
   if (options?.enforceDeliveryIdentity && linkedPRs.length > 0) {
     const narrowed = await narrowToDelivered(db, companyId, issueId, linkedPRs);
     // ADR-091 D4: fail closed when the card's delivery identity cannot be
@@ -1888,7 +2041,7 @@ export async function publishApprovalStatus(
     authorizingPRs = narrowed.delivered;
   }
 
-  if (linkedPRs.length === 0) {
+  if (authorizingLinkedPRs.length === 0) {
     // SUP-13313: an empty cached open-PR set means "the PR I know about is
     // stale", not "this issue has no PR". Ask GitHub for open, non-draft PRs
     // that carry the issue identifier before giving up.
@@ -1990,6 +2143,12 @@ export async function publishApprovalStatus(
           message: `status:skipped:pr-not-eligible: ${pr.displayName} is ${headShaResult.draft ? "a draft" : headShaResult.merged ? "merged" : `state=${headShaResult.state}`}; not re-stamped`,
           headSha,
         };
+      }
+      if (deliveryIdentity.binding && headSha !== deliveryIdentity.binding.headSha) {
+        return deliveryIdentityUnresolvedOutcome(
+          deliveryIdentity.branch,
+          `recorded delivery identity head SHA ${deliveryIdentity.binding.headSha} does not match the bound PR's current head ${headSha}`,
+        );
       }
       if (options?.expectedHeadSha && headSha !== options.expectedHeadSha) {
         return {
@@ -2131,6 +2290,12 @@ export async function publishApprovalStatus(
         headSha,
       };
     }
+    if (deliveryIdentity.binding && headSha !== deliveryIdentity.binding.headSha) {
+      return deliveryIdentityUnresolvedOutcome(
+        deliveryIdentity.branch,
+        `recorded delivery identity head SHA ${deliveryIdentity.binding.headSha} does not match the bound PR's current head ${headSha}`,
+      );
+    }
     if (options?.expectedHeadSha && headSha !== options.expectedHeadSha) {
       return {
         kind: "skipped",
@@ -2250,6 +2415,38 @@ export async function resolveApprovalDecisionHead(
   issueIdentifier: string,
   closingTransition: boolean,
 ): Promise<DecisionHeadResolution> {
+  const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
+  if (deliveryIdentity.binding && deliveryIdentity.repo) {
+    const bindingError = deliveryBindingValidationError(deliveryIdentity.binding, deliveryIdentity.repo, issueId);
+    if (bindingError) {
+      return unresolvableFromNarrowing({
+        outcome: "identity-unresolved",
+        branch: deliveryIdentity.branch,
+        recordedUnusable: bindingError,
+      });
+    }
+    const exact = await resolveExactBoundPullRequest(db, companyId, issueId, deliveryIdentity.binding, deliveryIdentity.repo);
+    if (!exact.pr) {
+      return unresolvableFromNarrowing({
+        outcome: "identity-unresolved",
+        branch: deliveryIdentity.branch,
+        recordedUnusable: exact.reason ?? "recorded delivery identity PR cannot be verified",
+      });
+    }
+    return {
+      kind: "resolved",
+      headSha: deliveryIdentity.binding.headSha,
+      displayName: exact.pr.displayName,
+    };
+  }
+  if (deliveryIdentity.recordedUnusable) {
+    return unresolvableFromNarrowing({
+      outcome: "identity-unresolved",
+      branch: null,
+      recordedUnusable: deliveryIdentity.recordedUnusable,
+    });
+  }
+
   // SUP-16667: resolve the card's linked PRs with drafts INCLUDED so a head that
   // is only unresolvable because it is a draft is refused with its own named
   // reason (`head_draft`) instead of the misleading `no-pr` — which reads as a
@@ -2258,9 +2455,7 @@ export async function resolveApprovalDecisionHead(
   // EXCLUDED from the authorizing set below: arming a draft is wrong (GitHub
   // refuses auto-merge on a draft), so every arming decision is unchanged and
   // only the refusal vocabulary is sharpened.
-  const linkedPRsWithDrafts = await resolveLinkedPullRequests(db, companyId, issueId, {
-    includeDrafts: true,
-  });
+  const linkedPRsWithDrafts = await resolveLinkedPullRequests(db, companyId, issueId, { includeDrafts: true });
   const draftLinkedPRs = linkedPRsWithDrafts.filter((pr) => pr.draft === true);
   const linkedPRs = linkedPRsWithDrafts.filter((pr) => pr.draft !== true);
 
@@ -2294,9 +2489,8 @@ export async function resolveApprovalDecisionHead(
   if (authorizingPRs.length === 1) {
     const pr = authorizingPRs[0]!;
     const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
-    return head.ok
-      ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
-      : { kind: "unresolvable", reason: head.reason };
+    if (!head.ok) return { kind: "unresolvable", reason: head.reason };
+    return { kind: "resolved", headSha: head.headSha, displayName: pr.displayName };
   }
 
   // Zero cached linked PRs: mirror publishApprovalStatus's live re-resolve so
@@ -2352,9 +2546,8 @@ export async function resolveApprovalDecisionHead(
   if (authorizingMatched.length === 1) {
     const pr = authorizingMatched[0]!;
     const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
-    return head.ok
-      ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
-      : { kind: "unresolvable", reason: head.reason };
+    if (!head.ok) return { kind: "unresolvable", reason: head.reason };
+    return { kind: "resolved", headSha: head.headSha, displayName: pr.displayName };
   }
   // SUP-16667: the only unresolved candidate is an open DRAFT. That is not
   // "no PR" — the link exists and the PR is live; it simply cannot be armed
@@ -2909,6 +3102,8 @@ export interface HeadShaSuccess extends GitHubFetchResult {
   ok: true;
   headSha: string;
   state: string | null;
+  headRef: string | null;
+  open: boolean;
   draft: boolean;
   merged: boolean;
 }
@@ -2917,8 +3112,10 @@ export interface HeadShaFailure extends GitHubFetchResult {
   ok: false;
   headSha: null;
   state?: null;
-  draft?: false;
-  merged?: false;
+  headRef: null;
+  open: null;
+  draft: null;
+  merged: null;
 }
 
 export type HeadShaResult = HeadShaSuccess | HeadShaFailure;
@@ -2962,20 +3159,32 @@ async function fetchPullRequestHeadShaOnce(
   try {
     response = await ghFetch(url, { headers });
   } catch {
-    return { ok: false, status: 0, message: "network_error", headSha: null };
+    return { ok: false, status: 0, message: "network_error", headSha: null, headRef: null, open: null, draft: null, merged: null };
   }
 
   if (!response.ok) {
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     const message = body?.message as string | undefined;
-    return { ok: false, status: response.status, message: message ?? null, headSha: null };
+    return { ok: false, status: response.status, message: message ?? null, headSha: null, headRef: null, open: null, draft: null, merged: null };
   }
 
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-  if (!body) return { ok: false, status: response.status, message: "empty_response", headSha: null };
+  if (!body) {
+    return {
+      ok: false,
+      status: response.status,
+      message: "empty_response",
+      headSha: null,
+      headRef: null,
+      open: null,
+      draft: null,
+      merged: null,
+    };
+  }
 
   const head = body.head as Record<string, unknown> | undefined;
   const sha = head?.sha as string | undefined;
+  const ref = typeof head?.ref === "string" && head.ref.length > 0 ? head.ref : null;
   if (typeof sha === "string" && sha.length > 0) {
     return {
       ok: true,
@@ -2983,11 +3192,22 @@ async function fetchPullRequestHeadShaOnce(
       message: null,
       headSha: sha,
       state: typeof body.state === "string" ? body.state : null,
+      headRef: ref,
+      open: body.state === "open" && body.merged !== true,
       draft: body.draft === true,
       merged: body.merged === true,
     };
   }
-  return { ok: false, status: response.status, message: "head.sha missing from response", headSha: null };
+  return {
+    ok: false,
+    status: response.status,
+      message: "head.sha missing from response",
+      headSha: null,
+      headRef: null,
+      open: null,
+      draft: null,
+      merged: null,
+    };
 }
 
 /**
@@ -3510,6 +3730,36 @@ export async function armMergeOnApproval(
 ): Promise<ArmingOutcome> {
   if (decision.outcome !== "approved") {
     return { kind: "skipped", message: `skipped:not-approved: Decision outcome is "${decision.outcome}", not "approved"` };
+  }
+
+  const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
+  if (deliveryIdentity.recordedUnusable) {
+    return deliveryIdentityUnresolvedOutcome(null, deliveryIdentity.recordedUnusable);
+  }
+  if (deliveryIdentity.binding) {
+    if (certifiedPr && certifiedPr.number !== deliveryIdentity.binding.prNumber) {
+      return deliveryIdentityUnresolvedOutcome(
+        deliveryIdentity.branch,
+        "recorded delivery identity PR does not match the certified PR",
+      );
+    }
+    const candidates = certifiedPr ? [certifiedPr] : await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+    const narrowed = await narrowToDelivered(db, companyId, issueId, candidates);
+    if (narrowed.outcome === "identity-unresolved") {
+      return deliveryIdentityUnresolvedOutcome(narrowed.branch, narrowed.recordedUnusable);
+    }
+    if (narrowed.outcome === "not-delivered") {
+      return deliveryIdentityUnresolvedOutcome(
+        narrowed.deliveryBranch,
+        "recorded delivery identity PR is not the authorizing delivery",
+      );
+    }
+    if (!certifiedPr || narrowed.delivered[0]?.number !== deliveryIdentity.binding.prNumber) {
+      return deliveryIdentityUnresolvedOutcome(
+        narrowed.deliveryBranch,
+        "recorded delivery identity PR does not match the certified PR",
+      );
+    }
   }
 
   // SUP-15394: when the close hook hands over the PR that publishApprovalStatus
