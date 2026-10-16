@@ -16763,6 +16763,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const scheduleResult = await db.transaction(
       async (tx): Promise<ScheduledRetryTransactionResult> => {
+        if (retryReason === EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON && issueId) {
+          await tx.execute(
+            sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
+          );
+          const existingOccupiedRetry = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, run.companyId),
+                eq(heartbeatRuns.agentId, run.agentId),
+                eq(heartbeatRuns.scheduledRetryReason, retryReason),
+                inArray(heartbeatRuns.status, ["scheduled_retry", "queued"]),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              ),
+            )
+            .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+
+          if (existingOccupiedRetry) {
+            if (existingOccupiedRetry.wakeupRequestId) {
+              const existingWakeup = await tx
+                .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+                .from(agentWakeupRequests)
+                .where(eq(agentWakeupRequests.id, existingOccupiedRetry.wakeupRequestId))
+                .then((rows) => rows[0] ?? null);
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
+                  updatedAt: now,
+                })
+                .where(eq(agentWakeupRequests.id, existingOccupiedRetry.wakeupRequestId));
+            }
+            return {
+              outcome: "scheduled",
+              run: existingOccupiedRetry,
+              reusedExisting: true,
+            };
+          }
+        }
+
         // All automatic failure paths share the same predecessor claim. A
         // duplicate monitor, restart sweep or wake must reuse its successor.
         if (
@@ -17210,7 +17253,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
 
-        if (issueId) {
+        if (issueId && retryReason !== EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON) {
           await tx
             .update(issues)
             .set({

@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -472,6 +472,63 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
       .where(eq(executionWorkspaces.id, occupantWorkspace.executionWorkspaceId))
       .then((rows) => rows[0] ?? null);
     expect(workspaceRow).not.toBeNull();
+  }, 60_000);
+
+  it("coalesces concurrent occupancy cancellations into one non-holding successor", async () => {
+    const seeded = await seedSharedWorkspaceTargets(db, os.tmpdir());
+    const heartbeat = heartbeatService(db);
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const predecessorIds = [randomUUID(), randomUUID()];
+    await db.insert(heartbeatRuns).values(predecessorIds.map((id, index) => ({
+      id,
+      companyId: seeded.companyId,
+      agentId: seeded.contenderAgentId,
+      invocationSource: "automation",
+      status: "cancelled",
+      errorCode: "execution_workspace_occupied",
+      finishedAt: now,
+      contextSnapshot: { issueId: seeded.contenderIssueId },
+      createdAt: new Date(now.getTime() + index),
+      updatedAt: new Date(now.getTime() + index),
+    })));
+    await db.update(issues).set({
+      executionRunId: predecessorIds[0],
+      executionAgentNameKey: "contendercoder",
+      executionLockedAt: now,
+    }).where(eq(issues.id, seeded.contenderIssueId));
+
+    const options = {
+      now,
+      retryReason: "execution_workspace_occupied",
+      wakeReason: "execution_workspace_occupied_retry",
+      maxAttempts: 8,
+      delayMs: 300_000,
+    };
+    const [first, second] = await Promise.all(
+      predecessorIds.map((runId) => heartbeat.scheduleBoundedRetry(runId, options)),
+    );
+    expect(first.outcome).toBe("scheduled");
+    expect(second.outcome).toBe("scheduled");
+
+    const successors = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, seeded.companyId),
+      eq(heartbeatRuns.agentId, seeded.contenderAgentId),
+      eq(heartbeatRuns.scheduledRetryReason, "execution_workspace_occupied"),
+      inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+    )).orderBy(asc(heartbeatRuns.createdAt));
+    expect(successors).toHaveLength(1);
+    expect(successors[0]).toMatchObject({ scheduledRetryAttempt: 1 });
+    expect(successors[0]?.scheduledRetryAt).toEqual(new Date(now.getTime() + 300_000));
+    const [issue] = await db.select({
+      executionRunId: issues.executionRunId,
+      executionAgentNameKey: issues.executionAgentNameKey,
+      executionLockedAt: issues.executionLockedAt,
+    }).from(issues).where(eq(issues.id, seeded.contenderIssueId));
+    expect(issue).toMatchObject({
+      executionRunId: predecessorIds[0],
+      executionAgentNameKey: "contendercoder",
+      executionLockedAt: now,
+    });
   }, 60_000);
 
   it("reuses the same workspace once the occupant releases it", async () => {

@@ -58,6 +58,8 @@ import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
+  EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON,
+  EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   MAX_TURN_CONTINUATION_RETRY_REASON,
@@ -264,6 +266,71 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, children[0]!.id));
     await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0, retryReason: "execution_review_participant_recovery" });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(1);
+  });
+
+  it("coalesces concurrent occupied-workspace retries without assigning ownership to the scheduled successor", async () => {
+    const runId = randomUUID(), secondRunId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      status: "cancelled",
+      errorCode: EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON,
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "cancelled",
+      error: "workspace occupied",
+      errorCode: EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON,
+      finishedAt: now,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: new Date(now.getTime() + 1),
+      createdAt: new Date(now.getTime() + 1),
+    });
+    await db.insert(projects).values({ id: randomUUID(), companyId, name: "Retry project", status: "active" });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId: (await db.select({ id: projects.id }).from(projects).where(eq(projects.companyId, companyId)).limit(1))[0]!.id,
+      title: "Occupied workspace retry",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: now,
+    });
+
+    const retryOptions = {
+      now,
+      retryReason: EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON,
+      wakeReason: EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON,
+      maxAttempts: 3,
+      delayMs: 60_000,
+    };
+    const [first, second] = await Promise.all([
+      heartbeat.scheduleBoundedRetry(runId, retryOptions),
+      heartbeat.scheduleBoundedRetry(runId, retryOptions),
+    ]);
+
+    expect(first.outcome).toBe("scheduled");
+    expect(second.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
+    expect(first.run.id).toBe(second.run.id);
+    expect(first.run.scheduledRetryAttempt).toBe(1);
+    expect(first.run.scheduledRetryAt).toEqual(new Date(now.getTime() + 60_000));
+
+    const successors = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.agentId, agentId),
+      eq(heartbeatRuns.scheduledRetryReason, EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON),
+      inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+    ));
+    expect(successors).toHaveLength(1);
+    const [issue] = await db.select({ executionRunId: issues.executionRunId, executionAgentNameKey: issues.executionAgentNameKey, executionLockedAt: issues.executionLockedAt }).from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ executionRunId: runId, executionAgentNameKey: "codexcoder", executionLockedAt: now });
   });
 
   it.each([
