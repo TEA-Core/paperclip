@@ -17213,6 +17213,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (issueId) {
           const transfersIssueExecutionOwnership =
             retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+            retryReason === WORKSPACE_BUSY_RETRY_REASON ||
             retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
             retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
           await tx
