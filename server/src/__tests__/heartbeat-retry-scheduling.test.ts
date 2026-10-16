@@ -1266,7 +1266,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.executionRunId).toBe(scheduled.run.id);
   });
 
   it("coalesces duplicate accepted interaction continuation infra retry schedules", async () => {
@@ -1440,7 +1440,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: null,
+      executionRunId: scheduled.run.id,
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
       executionWorkspaceSettings: { mode: "isolated_workspace" },
@@ -1632,7 +1632,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: null,
+      executionRunId: scheduled.run.id,
       executionWorkspaceId: foreignWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
@@ -1760,7 +1760,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: null,
+      executionRunId: scheduled.run.id,
       executionWorkspaceId: currentWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
