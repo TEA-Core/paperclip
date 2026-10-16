@@ -1431,6 +1431,29 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(postStatusShas()).toEqual([APPROVED_HEAD]);
     });
 
+    it("carries the exactly-bound PR identity and bound reviewed SHA through the resolved head", async () => {
+      const issueId = await insertIssue({
+        delivery: {
+          repo: { owner: OWNER, repo: REPO },
+          prNumber: 42,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/42`,
+          branch: "SUP-42-branch",
+          headSha: APPROVED_HEAD,
+        },
+      });
+      await insertMention(issueId);
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result).toEqual({
+        kind: "resolved",
+        headSha: APPROVED_HEAD,
+        displayName: `${OWNER}/${REPO}#42`,
+        pr: { owner: OWNER, repo: REPO, number: 42 },
+      });
+    });
+
     it("refuses with a named skipped reason when no linked PR exists", async () => {
       const issueId = await insertIssue();
       // No mention rows; closingTransition=false keeps the zero-mention path off
