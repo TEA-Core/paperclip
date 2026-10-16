@@ -603,6 +603,34 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, checkoutRunId))
       .then((rows) => rows[0] ?? null);
     expect(adapterDispatch?.status).toBe("running");
+
+    await db.update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: now, updatedAt: now })
+      .where(eq(heartbeatRuns.id, checkoutRunId));
+    await db.update(issues).set({ checkoutRunId: null, updatedAt: now }).where(eq(issues.id, issueId));
+    claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
+    await heartbeat.promoteDueScheduledRetries(now);
+    await heartbeat.resumeQueuedRuns();
+    await claimRetryExecution.started.promise;
+
+    const resumedRetry = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(resumedRetry?.status).toBe("running");
+    expect(claimRetryDispatches).toBe(dispatchesBeforeClaim + 1);
+
+    const resumedIssue = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(resumedIssue?.checkoutRunId).toBeNull();
+    expect(resumedIssue?.executionRunId).toBe(scheduled.run.id);
+
+    claimRetryExecution.release.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
   it("binds a promoted retry to the issue and retires queued retry siblings atomically", async () => {
