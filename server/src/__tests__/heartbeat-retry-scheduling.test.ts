@@ -576,6 +576,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       updatedAt: new Date(scheduled.run.createdAt.getTime() + 1),
     });
     await db.update(agentWakeupRequests).set({ runId: siblingRunId }).where(eq(agentWakeupRequests.id, siblingWakeupId));
+    await db.update(issues).set({ executionRunId: siblingRunId }).where(eq(issues.id, issueId));
 
     await heartbeat.promoteDueScheduledRetries(now);
     claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
