@@ -17211,13 +17211,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (issueId) {
+          const transfersIssueExecutionOwnership =
+            retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+            retryReason === AI_CONNECTION_BUSY_RETRY_REASON;
           await tx
             .update(issues)
             .set({
-              executionRunId: scheduledRun.id,
+              executionRunId: transfersIssueExecutionOwnership
+                ? sql`case when ${issues.executionRunId} = ${run.id} then ${scheduledRun.id} else ${issues.executionRunId} end`
+                : sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
+              executionAgentNameKey: transfersIssueExecutionOwnership
+                ? sql`case when ${issues.executionRunId} = ${run.id} then ${normalizeAgentNameKey(agent.name)} else ${issues.executionAgentNameKey} end`
+                : sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
+              executionLockedAt: transfersIssueExecutionOwnership
+                ? sql`case when ${issues.executionRunId} = ${run.id} then ${now.toISOString()}::timestamptz else ${issues.executionLockedAt} end`
+                : sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
               checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
-              executionAgentNameKey: normalizeAgentNameKey(agent.name),
-              executionLockedAt: now,
               ...(detachWorkspaceFromIssue
                 ? {
                     executionWorkspaceId: null,
@@ -19148,6 +19157,323 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
         stage: "claim",
       });
+    const atomicClaim =
+      issueId && run.scheduledRetryReason
+        ? await db.transaction(async (tx) => {
+            const lockedIssue = await tx
+              .select()
+              .from(issues)
+              .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+              .for("update")
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            const lockedWake = run.wakeupRequestId
+              ? await tx
+                  .select()
+                  .from(agentWakeupRequests)
+                  .where(and(
+                    eq(agentWakeupRequests.id, run.wakeupRequestId),
+                    eq(agentWakeupRequests.companyId, run.companyId),
+                    eq(agentWakeupRequests.agentId, run.agentId),
+                  ))
+                  .for("update")
+                  .limit(1)
+                  .then((rows) => rows[0] ?? null)
+              : null;
+            const lockedRun = await tx
+              .select()
+              .from(heartbeatRuns)
+              .where(and(
+                eq(heartbeatRuns.id, run.id),
+                eq(heartbeatRuns.companyId, run.companyId),
+                eq(heartbeatRuns.agentId, run.agentId),
+              ))
+              .for("update")
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (
+              !lockedIssue ||
+              !lockedRun ||
+              lockedRun.status !== "queued" ||
+              (run.wakeupRequestId &&
+                (!lockedWake || lockedWake.status !== "queued" || lockedWake.runId !== run.id))
+            ) {
+              return { kind: "stale" as const, run: null };
+            }
+
+            const holder = await tx
+              .select({
+                id: heartbeatRuns.id,
+                status: heartbeatRuns.status,
+                startedAt: heartbeatRuns.startedAt,
+              })
+              .from(heartbeatRuns)
+              .where(and(
+                eq(heartbeatRuns.companyId, run.companyId),
+                eq(heartbeatRuns.agentId, run.agentId),
+                eq(heartbeatRuns.status, "running"),
+                ne(heartbeatRuns.id, run.id),
+                sql`(
+                  ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+                  or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}
+                )`,
+              ))
+              .orderBy(asc(heartbeatRuns.startedAt), asc(heartbeatRuns.id))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (holder) return { kind: "deferred" as const, run: null, holder };
+            if (lockedIssue.executionRunId) {
+              const issueHolder = await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  startedAt: heartbeatRuns.startedAt,
+                })
+                .from(heartbeatRuns)
+                .where(and(
+                  eq(heartbeatRuns.companyId, run.companyId),
+                  eq(heartbeatRuns.id, lockedIssue.executionRunId),
+                  eq(heartbeatRuns.status, "running"),
+                ))
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+              if (issueHolder) return { kind: "deferred" as const, run: null, holder: issueHolder };
+            }
+            if (lockedIssue.checkoutRunId) {
+              const checkoutHolder = await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  startedAt: heartbeatRuns.startedAt,
+                })
+                .from(heartbeatRuns)
+                .where(and(
+                  eq(heartbeatRuns.companyId, run.companyId),
+                  eq(heartbeatRuns.id, lockedIssue.checkoutRunId),
+                  eq(heartbeatRuns.status, "running"),
+                ))
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+              if (checkoutHolder) return { kind: "deferred" as const, run: null, holder: checkoutHolder };
+            }
+
+            let claimedContextSnapshot = withHostBootIdInRunContext(
+              parseObject(lockedRun.contextSnapshot),
+              hostBootId,
+            );
+            let liveQueuedCommentIds: string[] | null = null;
+            if (queuedCommentIds.length > 0 && lockedWake) {
+              const authoritativeIds = queuedCommentIdsFromWakePayload(lockedWake.payload);
+              if (authoritativeIds.length > 0) {
+                const commentRows = await tx
+                  .select({ id: issueComments.id, deletedAt: issueComments.deletedAt })
+                  .from(issueComments)
+                  .where(and(
+                    eq(issueComments.companyId, run.companyId),
+                    eq(issueComments.issueId, issueId),
+                    inArray(issueComments.id, authoritativeIds),
+                  ));
+                liveQueuedCommentIds = authoritativeIds.filter((commentId) => {
+                  const comment = commentRows.find((row) => row.id === commentId);
+                  return Boolean(comment && !comment.deletedAt);
+                });
+                if (liveQueuedCommentIds.length === 0) {
+                  const reason = "Queued messages were discarded before dispatch";
+                  const [cancelled] = await tx
+                    .update(heartbeatRuns)
+                    .set({
+                      status: "cancelled",
+                      finishedAt: claimedAt,
+                      error: reason,
+                      errorCode: "queued_comment_discarded",
+                      updatedAt: claimedAt,
+                    })
+                    .where(and(
+                      eq(heartbeatRuns.id, lockedRun.id),
+                      eq(heartbeatRuns.status, "queued"),
+                    ))
+                    .returning();
+                  await tx
+                    .update(agentWakeupRequests)
+                    .set({
+                      status: "cancelled",
+                      finishedAt: claimedAt,
+                      error: reason,
+                      updatedAt: claimedAt,
+                    })
+                    .where(eq(agentWakeupRequests.id, lockedWake.id));
+                  await tx
+                    .update(issues)
+                    .set({
+                      executionRunId: null,
+                      executionAgentNameKey: null,
+                      executionLockedAt: null,
+                      updatedAt: claimedAt,
+                    })
+                    .where(and(
+                      eq(issues.id, issueId),
+                      eq(issues.companyId, run.companyId),
+                      eq(issues.executionRunId, run.id),
+                    ));
+                  return { kind: "cancelled" as const, run: cancelled ?? lockedRun };
+                }
+                claimedContextSnapshot = withQueuedCommentIdsInRunContext(
+                  claimedContextSnapshot,
+                  liveQueuedCommentIds,
+                );
+              }
+            }
+
+            const [claimedRun] = await tx
+              .update(heartbeatRuns)
+              .set({
+                status: "running",
+                runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                ...legacyControllerClaim(run.runtimeMode),
+                responsibleUserId,
+                startedAt: lockedRun.startedAt ?? claimedAt,
+                contextSnapshot: claimedContextSnapshot,
+                updatedAt: claimedAt,
+              })
+              .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+              .returning();
+            if (!claimedRun) return { kind: "stale" as const, run: null };
+
+            if (lockedWake) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "claimed",
+                  claimedAt,
+                  ...(liveQueuedCommentIds
+                    ? { payload: withQueuedCommentIdsInWakePayload(lockedWake.payload, liveQueuedCommentIds) }
+                    : {}),
+                  updatedAt: claimedAt,
+                })
+                .where(eq(agentWakeupRequests.id, lockedWake.id));
+            }
+
+            const bindsIssueExecution =
+              readNonEmptyString(context.wakeReason) !== "source_scoped_recovery_action" &&
+              lockedIssue.assigneeAgentId === run.agentId;
+            if (bindsIssueExecution) {
+              const [boundIssue] = await tx
+                .update(issues)
+                .set({
+                  executionRunId: claimedRun.id,
+                  executionAgentNameKey: normalizeAgentNameKey(agent.name),
+                  executionLockedAt: claimedAt,
+                  updatedAt: claimedAt,
+                })
+                .where(and(
+                  eq(issues.id, issueId),
+                  eq(issues.companyId, run.companyId),
+                  eq(issues.assigneeAgentId, run.agentId),
+                ))
+                .returning({ id: issues.id });
+              if (!boundIssue) throw new Error("Queued run issue ownership binding failed");
+            }
+
+            const retryReason = claimedRun.scheduledRetryReason;
+            if (retryReason && claimedRun.retryOfRunId) {
+              const siblings = await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  wakeupRequestId: heartbeatRuns.wakeupRequestId,
+                  resultJson: heartbeatRuns.resultJson,
+                })
+                .from(heartbeatRuns)
+                .where(and(
+                  eq(heartbeatRuns.companyId, run.companyId),
+                  eq(heartbeatRuns.agentId, run.agentId),
+                  eq(heartbeatRuns.scheduledRetryReason, retryReason),
+                  inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+                  ne(heartbeatRuns.id, claimedRun.id),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+                ))
+                .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+                .for("update");
+              const supersededReason = "retry_superseded_by_winner";
+              for (const sibling of siblings) {
+                await tx
+                  .update(heartbeatRuns)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: claimedAt,
+                    errorCode: supersededReason,
+                    error: `Retry superseded by winning run ${claimedRun.id}`,
+                    resultJson: {
+                      ...parseObject(sibling.resultJson),
+                      supersededReason,
+                      supersededByRunId: claimedRun.id,
+                    },
+                    updatedAt: claimedAt,
+                  })
+                  .where(and(
+                    eq(heartbeatRuns.id, sibling.id),
+                    inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+                  ));
+                if (sibling.wakeupRequestId) {
+                  const siblingWake = await tx
+                    .select({ payload: agentWakeupRequests.payload })
+                    .from(agentWakeupRequests)
+                    .where(eq(agentWakeupRequests.id, sibling.wakeupRequestId))
+                    .for("update")
+                    .limit(1)
+                    .then((rows) => rows[0] ?? null);
+                  if (siblingWake) {
+                    await tx
+                      .update(agentWakeupRequests)
+                      .set({
+                        status: "cancelled",
+                        finishedAt: claimedAt,
+                        error: `Retry superseded by winning run ${claimedRun.id}`,
+                        payload: {
+                          ...parseObject(siblingWake.payload),
+                          supersededReason,
+                          supersededByRunId: claimedRun.id,
+                        },
+                        updatedAt: claimedAt,
+                      })
+                      .where(eq(agentWakeupRequests.id, sibling.wakeupRequestId));
+                  }
+                }
+              }
+            }
+
+            return { kind: "claimed" as const, run: claimedRun };
+          })
+        : null;
+    if (atomicClaim?.kind === "deferred") {
+      await recordConcurrentRunDeferral(run, issueId!, atomicClaim.holder);
+      return null;
+    }
+    if (atomicClaim?.kind === "cancelled") {
+      await appendRunEvent(atomicClaim.run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: atomicClaim.run.error ?? "Queued messages were discarded before dispatch",
+      });
+      publishLiveEvent({
+        companyId: atomicClaim.run.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: atomicClaim.run.id,
+          agentId: atomicClaim.run.agentId,
+          status: atomicClaim.run.status,
+          invocationSource: atomicClaim.run.invocationSource,
+          triggerDetail: atomicClaim.run.triggerDetail,
+          error: atomicClaim.run.error ?? null,
+          errorCode: atomicClaim.run.errorCode ?? null,
+          startedAt: atomicClaim.run.startedAt ? new Date(atomicClaim.run.startedAt).toISOString() : null,
+          finishedAt: atomicClaim.run.finishedAt ? new Date(atomicClaim.run.finishedAt).toISOString() : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(atomicClaim.run);
+      void emitAgentTaskRun(db, atomicClaim.run);
+      return null;
+    }
     const queuedCommentClaim =
       issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
@@ -19472,9 +19798,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       void emitAgentTaskRun(db, queuedCommentClaim.run);
       return null;
     }
-    const claimed = queuedCommentClaim
-      ? queuedCommentClaim.run
-      : await withChatControlRecoveryGate(run, "claim", async (tx) =>
+    const claimed = atomicClaim?.kind === "claimed"
+      ? atomicClaim.run
+      : queuedCommentClaim
+        ? queuedCommentClaim.run
+        : await withChatControlRecoveryGate(run, "claim", async (tx) =>
           tx
             .update(heartbeatRuns)
             .set({
@@ -19520,6 +19848,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
     publishRunLifecyclePluginEvent(claimed);
+
+    if (atomicClaim?.kind === "claimed") return claimed;
 
     await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
 
