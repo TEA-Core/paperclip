@@ -2588,6 +2588,7 @@ export async function resolveApprovalDecisionHead(
       kind: "resolved",
       headSha: deliveryIdentity.binding.headSha,
       displayName: exact.pr.displayName,
+      pr: { owner: exact.pr.owner, repo: exact.pr.repo, number: exact.pr.number },
     };
   }
   if (deliveryIdentity.recordedUnusable) {
