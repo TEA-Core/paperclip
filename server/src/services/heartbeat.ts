@@ -19230,6 +19230,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .then((rows) => rows[0] ?? null);
               if (issueHolder) return { kind: "deferred" as const, run: null, holder: issueHolder };
             }
+            if (lockedIssue.checkoutRunId) {
+              const checkoutHolder = await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  startedAt: heartbeatRuns.startedAt,
+                })
+                .from(heartbeatRuns)
+                .where(and(
+                  eq(heartbeatRuns.companyId, run.companyId),
+                  eq(heartbeatRuns.id, lockedIssue.checkoutRunId),
+                  eq(heartbeatRuns.status, "running"),
+                ))
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+              if (checkoutHolder) return { kind: "deferred" as const, run: null, holder: checkoutHolder };
+            }
 
             const [claimedRun] = await tx
               .update(heartbeatRuns)
