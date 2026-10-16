@@ -698,7 +698,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toEqual({ executionRunId: null, executionLockedAt: null });
-    });
+  });
 
   it("retires queued and scheduled task-only retry siblings atomically", async () => {
     const companyId = randomUUID();
