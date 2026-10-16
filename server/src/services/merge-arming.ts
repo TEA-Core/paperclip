@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import { z } from "zod";
 import { and, eq, ilike, sql, type SQL } from "drizzle-orm";
 import {
   externalObjectMentions,
@@ -1243,6 +1244,8 @@ export interface PublishApprovalStatusOptions {
    * stamped.
    */
   expectedHeadSha?: string;
+  /** Final preflight identity; a same-SHA sibling is not approval. */
+  expectedPr?: { owner: string; repo: string; number: number };
   /**
    * SUP-13831: the zero-mention-row live-discovery fallback (derive the repo
    * pair from the issue's own workspace context and ask GitHub for open PRs)
@@ -2115,6 +2118,9 @@ export async function publishApprovalStatus(
 
     if (matched.length === 1) {
       const pr = matched[0]!;
+      if (options?.expectedPr && !samePullRequest(pr, options.expectedPr)) {
+        return { kind: "skipped", message: "status:skipped:delivery_moved: resolved PR differs from final preflight" };
+      }
       const headShaResult = await fetchPullRequestHeadSha(pr.candidate.token, pr.owner, pr.repo, pr.number);
       if (!headShaResult.ok) {
         const { status, message } = headShaResult;
@@ -2234,6 +2240,9 @@ export async function publishApprovalStatus(
   }
 
   const pr = authorizingPRs[0]!;
+  if (options?.expectedPr && !samePullRequest(pr, options.expectedPr)) {
+    return { kind: "skipped", message: "status:skipped:delivery_moved: resolved PR differs from final preflight" };
+  }
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
   if (candidates.length === 0) {
     const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
@@ -2326,7 +2335,7 @@ export async function publishApprovalStatus(
 }
 
 export type DecisionHeadResolution =
-  | { kind: "resolved"; headSha: string; displayName: string }
+  | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
   | {
       kind: "unresolvable";
       reason: string;
@@ -2489,8 +2498,9 @@ export async function resolveApprovalDecisionHead(
   if (authorizingPRs.length === 1) {
     const pr = authorizingPRs[0]!;
     const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
-    if (!head.ok) return { kind: "unresolvable", reason: head.reason };
-    return { kind: "resolved", headSha: head.headSha, displayName: pr.displayName };
+    return head.ok
+      ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName, pr: { owner: pr.owner, repo: pr.repo, number: pr.number } }
+      : { kind: "unresolvable", reason: head.reason };
   }
 
   // Zero cached linked PRs: mirror publishApprovalStatus's live re-resolve so
@@ -2546,8 +2556,9 @@ export async function resolveApprovalDecisionHead(
   if (authorizingMatched.length === 1) {
     const pr = authorizingMatched[0]!;
     const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
-    if (!head.ok) return { kind: "unresolvable", reason: head.reason };
-    return { kind: "resolved", headSha: head.headSha, displayName: pr.displayName };
+    return head.ok
+      ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName, pr: { owner: pr.owner, repo: pr.repo, number: pr.number } }
+      : { kind: "unresolvable", reason: head.reason };
   }
   // SUP-16667: the only unresolved candidate is an open DRAFT. That is not
   // "no PR" — the link exists and the PR is live; it simply cannot be armed
@@ -2587,6 +2598,58 @@ export async function resolveApprovalDecisionHead(
     reason: "no-pr: no open linked PR resolvable at decision time",
     pendingCandidates: noPrAnchor ? [noPrAnchor] : undefined,
   };
+}
+
+function samePullRequest(
+  left: { owner: string; repo: string; number: number },
+  right: { owner: string; repo: string; number: number },
+): boolean {
+  return left.owner.toLowerCase() === right.owner.toLowerCase() &&
+    left.repo.toLowerCase() === right.repo.toLowerCase() && left.number === right.number;
+}
+
+const finalDeliveryLiveSchema = z.object({
+  state: z.string(), draft: z.boolean(), merged: z.boolean(), title: z.string(),
+  head: z.object({ sha: z.string().min(1), ref: z.string(), repo: z.object({ full_name: z.string() }) }),
+});
+
+/** Read-only final-stage certification; no approval or status writes. */
+export async function preflightFinalDelivery(
+  db: Db, companyId: string, issueId: string, identifier: string,
+): Promise<DecisionHeadResolution> {
+  const resolved = await resolveApprovalDecisionHead(db, companyId, issueId, identifier, true);
+  if (resolved.kind !== "resolved") return resolved;
+  const { pr } = resolved;
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+  for (const candidate of candidates) {
+    const response = await ghFetch(
+      `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}`,
+      { headers: { authorization: `Bearer ${candidate.token}`, accept: "application/vnd.github+json" } },
+    );
+    if (response.status === 401 || response.status === 403) continue;
+    if (!response.ok) return { kind: "unresolvable", reason: `head_unverifiable: HTTP ${response.status}` };
+    const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
+    if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
+    const live = parsed.data;
+    if (live.state !== "open" || live.merged !== false) {
+      return { kind: "unresolvable", reason: "head_not_open: delivery must be OPEN and unmerged" };
+    }
+    if (live.draft !== false) {
+      return { kind: "unresolvable", reason: "head_draft: promote the owner PR out of draft, then submit a fresh final review" };
+    }
+    if (live.head?.sha !== resolved.headSha) {
+      return { kind: "unresolvable", reason: "head_moved: delivery changed during final preflight; review the new head" };
+    }
+    const narrowed = await narrowToDelivered(db, companyId, issueId, [{
+      ...pr, headRefName: live.head.ref, displayName: resolved.displayName,
+    }]);
+    if (live.head.repo?.full_name?.toLowerCase() !== `${pr.owner}/${pr.repo}`.toLowerCase() ||
+        narrowed.outcome !== "narrowed") {
+      return { kind: "unresolvable", reason: "not_delivered: live PR is not the owner's recorded repo delivery" };
+    }
+    return resolved;
+  }
+  return { kind: "unresolvable", reason: "head_unverifiable: no credential can verify the live delivery" };
 }
 
 /**
