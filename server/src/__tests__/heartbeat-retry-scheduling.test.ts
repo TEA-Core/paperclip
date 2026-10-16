@@ -626,7 +626,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(resumedIssue?.checkoutRunId).toBeNull();
+    expect(resumedIssue?.checkoutRunId).toBe(scheduled.run.id);
     expect(resumedIssue?.executionRunId).toBe(scheduled.run.id);
 
     claimRetryExecution.release.resolve();
