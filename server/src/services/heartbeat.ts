@@ -19150,7 +19150,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stage: "claim",
       });
     const atomicClaim =
-      (issueId || retryTaskKey) && run.scheduledRetryReason
+      issueId && queuedCommentIds.length === 0 && run.scheduledRetryReason
         ? await db.transaction(async (tx) => {
             if (retryTaskKey && !issueId) {
               await tx.execute(
@@ -19459,6 +19459,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(issues.id, issueId),
                   eq(issues.companyId, run.companyId),
                   eq(issues.assigneeAgentId, run.agentId),
+                  or(
+                    isNull(issues.executionRunId),
+                    eq(issues.executionRunId, run.id),
+                    eq(issues.executionRunId, claimedRun.id),
+                  ),
                 ))
                 .returning({ id: issues.id });
               if (!boundIssue) throw new Error("Queued run issue ownership binding failed");

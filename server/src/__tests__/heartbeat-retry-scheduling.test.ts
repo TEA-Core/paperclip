@@ -118,7 +118,6 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         claimRetryDispatches += 1;
         claimRetryExecution?.started.resolve();
         await claimRetryExecution?.release.promise;
-
         return {
           exitCode: 0,
           signal: null,
