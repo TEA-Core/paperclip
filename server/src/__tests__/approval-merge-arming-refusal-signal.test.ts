@@ -56,6 +56,16 @@ vi.mock("../services/merge-arming.js", async (importOriginal) => {
     ...orig,
     armMergeOnApproval: mockArmMergeOnApproval,
     resolveApprovalDecisionHead: mockResolveApprovalDecisionHead,
+    // The final-stage preflight certifies the same controlled delivery the
+    // resolver fixture pins; an unresolvable fixture is a preflight refusal.
+    preflightFinalDelivery: async () => {
+      const resolved = await mockResolveApprovalDecisionHead();
+      if (resolved?.kind !== "resolved") return resolved;
+      return {
+        ...resolved,
+        pr: { owner: "TEA-Core", repo: "paperclip", number: Number(/#(\d+)$/.exec(resolved.displayName)?.[1]) },
+      };
+    },
     publishApprovalStatus: mockPublishApprovalStatus,
   };
 });
@@ -320,13 +330,22 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
       });
   }
 
-  it("head_unresolvable on a CLOSING transition: card still closes done AND a first-class refusal signal is recorded (AC#1)", async () => {
+  it("a publish refusal on a CLOSING transition: card still closes done AND a first-class refusal signal is recorded (AC#1)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueClosing("DSIG1");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
+    // The preflight certifies the delivery; the head then moves before the
+    // delegated publish, which refuses (an unresolvable delivery would have been
+    // refused before the decision, SUP-19860).
     mockResolveApprovalDecisionHead.mockResolvedValue({
-      kind: "unresolvable",
-      reason: "no-pr: no open linked PR resolvable at decision time",
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#364",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({
+      kind: "skipped",
+      message: "status:skipped:head_moved: live head differs from the certified head",
+      headSha: null,
     });
     mockArmMergeOnApproval.mockResolvedValue({ kind: "skipped", message: "skipped: must-not-run" });
 
@@ -345,7 +364,7 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
       headSha: null,
     });
     expect(signals[0]!.details?.refusalReason).toEqual(
-      expect.stringContaining("status:skipped:head_unresolvable:"),
+      expect.stringContaining("status:skipped:head_moved:"),
     );
 
     // armMergeOnApproval is never reached on a refusal.
@@ -524,10 +543,15 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueClosing("DSIG3");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
-    // A genuine hook failure (the decision-head resolution rejects) is NOT a
+    // A genuine hook failure (the delegated publish rejects) is NOT a
     // principled refusal: the hook's catch swallows it, the transition is
     // unaffected, and no refusal signal is raised.
-    mockResolveApprovalDecisionHead.mockRejectedValue(new Error("github 500 during head resolution"));
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#364",
+    });
+    mockPublishApprovalStatus.mockRejectedValue(new Error("github 500 during status publish"));
 
     const res = await approveClosingStage(identifier);
     expect(res.status, JSON.stringify(res.body)).toBe(200);

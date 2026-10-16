@@ -121,6 +121,17 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./merge-arming.js")>();
   return {
     ...actual,
+    // Guard-outcome fixtures certify their controlled delivery before exercising
+    // post-commit failures. Real preflight behavior is covered by the route suite.
+    preflightFinalDelivery: (...args: Parameters<typeof actual.preflightFinalDelivery>) =>
+      guardRouteControl.active
+        ? Promise.resolve({
+            kind: "resolved" as const,
+            headSha: guardRouteControl.headSha,
+            displayName: "TEA-Core/paperclip#448",
+            pr: { owner: "TEA-Core", repo: "paperclip", number: 448 },
+          })
+        : actual.preflightFinalDelivery(...args),
     resolveApprovalDecisionHead: (
       ...args: Parameters<typeof actual.resolveApprovalDecisionHead>
     ) =>
@@ -129,6 +140,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
             kind: "resolved" as const,
             headSha: guardRouteControl.headSha,
             displayName: "TEA-Core/paperclip#448",
+            pr: { owner: "TEA-Core", repo: "paperclip", number: 448 },
           })
         : actual.resolveApprovalDecisionHead(...args),
     publishApprovalStatus: (

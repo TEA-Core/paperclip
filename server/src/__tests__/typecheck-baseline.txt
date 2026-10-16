@@ -61,8 +61,8 @@ server/src/__tests__/ai-connections.test.ts(79,28): TS2339
 server/src/__tests__/ai-connections.test.ts(80,28): TS2339
 server/src/__tests__/ai-legacy-compatibility.test.ts(104,22): TS2339
 server/src/__tests__/ai-legacy-compatibility.test.ts(42,161): TS2353
-server/src/__tests__/approval-merge-arming-refusal-signal.test.ts(72,3): TS2322
-server/src/__tests__/approval-merge-arming-refusal.test.ts(73,3): TS2322
+server/src/__tests__/approval-merge-arming-refusal-signal.test.ts(82,3): TS2322
+server/src/__tests__/approval-merge-arming-refusal.test.ts(83,3): TS2322
 server/src/__tests__/authz-company-access.test.ts(106,38): TS2740
 server/src/__tests__/authz-company-access.test.ts(122,38): TS2740
 server/src/__tests__/authz-company-access.test.ts(124,27): TS2740
