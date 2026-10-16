@@ -19256,7 +19256,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .where(eq(agentWakeupRequests.id, lockedWake.id));
             }
 
-            if (readNonEmptyString(context.wakeReason) !== "source_scoped_recovery_action") {
+            const bindsIssueExecution =
+              readNonEmptyString(context.wakeReason) !== "source_scoped_recovery_action" &&
+              lockedIssue.assigneeAgentId === run.agentId;
+            if (bindsIssueExecution) {
               const [boundIssue] = await tx
                 .update(issues)
                 .set({
