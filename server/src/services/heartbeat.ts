@@ -17214,10 +17214,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await tx
             .update(issues)
             .set({
-              executionRunId: scheduledRun.id,
+              executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
+              executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
+              executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
               checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
-              executionAgentNameKey: normalizeAgentNameKey(agent.name),
-              executionLockedAt: now,
               ...(detachWorkspaceFromIssue
                 ? {
                     executionWorkspaceId: null,
@@ -19149,7 +19149,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stage: "claim",
       });
     const atomicClaim =
-      issueId && queuedCommentIds.length === 0 && run.scheduledRetryReason
+      issueId && run.scheduledRetryReason
         ? await db.transaction(async (tx) => {
             const lockedIssue = await tx
               .select()
@@ -19248,6 +19248,73 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               if (checkoutHolder) return { kind: "deferred" as const, run: null, holder: checkoutHolder };
             }
 
+            let claimedContextSnapshot = withHostBootIdInRunContext(
+              parseObject(lockedRun.contextSnapshot),
+              hostBootId,
+            );
+            let liveQueuedCommentIds: string[] | null = null;
+            if (queuedCommentIds.length > 0 && lockedWake) {
+              const authoritativeIds = queuedCommentIdsFromWakePayload(lockedWake.payload);
+              if (authoritativeIds.length > 0) {
+                const commentRows = await tx
+                  .select({ id: issueComments.id, deletedAt: issueComments.deletedAt })
+                  .from(issueComments)
+                  .where(and(
+                    eq(issueComments.companyId, run.companyId),
+                    eq(issueComments.issueId, issueId),
+                    inArray(issueComments.id, authoritativeIds),
+                  ));
+                liveQueuedCommentIds = authoritativeIds.filter((commentId) => {
+                  const comment = commentRows.find((row) => row.id === commentId);
+                  return Boolean(comment && !comment.deletedAt);
+                });
+                if (liveQueuedCommentIds.length === 0) {
+                  const reason = "Queued messages were discarded before dispatch";
+                  const [cancelled] = await tx
+                    .update(heartbeatRuns)
+                    .set({
+                      status: "cancelled",
+                      finishedAt: claimedAt,
+                      error: reason,
+                      errorCode: "queued_comment_discarded",
+                      updatedAt: claimedAt,
+                    })
+                    .where(and(
+                      eq(heartbeatRuns.id, lockedRun.id),
+                      eq(heartbeatRuns.status, "queued"),
+                    ))
+                    .returning();
+                  await tx
+                    .update(agentWakeupRequests)
+                    .set({
+                      status: "cancelled",
+                      finishedAt: claimedAt,
+                      error: reason,
+                      updatedAt: claimedAt,
+                    })
+                    .where(eq(agentWakeupRequests.id, lockedWake.id));
+                  await tx
+                    .update(issues)
+                    .set({
+                      executionRunId: null,
+                      executionAgentNameKey: null,
+                      executionLockedAt: null,
+                      updatedAt: claimedAt,
+                    })
+                    .where(and(
+                      eq(issues.id, issueId),
+                      eq(issues.companyId, run.companyId),
+                      eq(issues.executionRunId, run.id),
+                    ));
+                  return { kind: "cancelled" as const, run: cancelled ?? lockedRun };
+                }
+                claimedContextSnapshot = withQueuedCommentIdsInRunContext(
+                  claimedContextSnapshot,
+                  liveQueuedCommentIds,
+                );
+              }
+            }
+
             const [claimedRun] = await tx
               .update(heartbeatRuns)
               .set({
@@ -19256,10 +19323,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ...legacyControllerClaim(run.runtimeMode),
                 responsibleUserId,
                 startedAt: lockedRun.startedAt ?? claimedAt,
-                contextSnapshot: withHostBootIdInRunContext(
-                  parseObject(lockedRun.contextSnapshot),
-                  hostBootId,
-                ),
+                contextSnapshot: claimedContextSnapshot,
                 updatedAt: claimedAt,
               })
               .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
@@ -19269,7 +19333,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             if (lockedWake) {
               await tx
                 .update(agentWakeupRequests)
-                .set({ status: "claimed", claimedAt, updatedAt: claimedAt })
+                .set({
+                  status: "claimed",
+                  claimedAt,
+                  ...(liveQueuedCommentIds
+                    ? { payload: withQueuedCommentIdsInWakePayload(lockedWake.payload, liveQueuedCommentIds) }
+                    : {}),
+                  updatedAt: claimedAt,
+                })
                 .where(eq(agentWakeupRequests.id, lockedWake.id));
             }
 
@@ -19366,6 +19437,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     if (atomicClaim?.kind === "deferred") {
       await recordConcurrentRunDeferral(run, issueId!, atomicClaim.holder);
+      return null;
+    }
+    if (atomicClaim?.kind === "cancelled") {
+      await appendRunEvent(atomicClaim.run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: atomicClaim.run.error ?? "Queued messages were discarded before dispatch",
+      });
+      publishLiveEvent({
+        companyId: atomicClaim.run.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: atomicClaim.run.id,
+          agentId: atomicClaim.run.agentId,
+          status: atomicClaim.run.status,
+          invocationSource: atomicClaim.run.invocationSource,
+          triggerDetail: atomicClaim.run.triggerDetail,
+          error: atomicClaim.run.error ?? null,
+          errorCode: atomicClaim.run.errorCode ?? null,
+          startedAt: atomicClaim.run.startedAt ? new Date(atomicClaim.run.startedAt).toISOString() : null,
+          finishedAt: atomicClaim.run.finishedAt ? new Date(atomicClaim.run.finishedAt).toISOString() : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(atomicClaim.run);
+      void emitAgentTaskRun(db, atomicClaim.run);
       return null;
     }
     const queuedCommentClaim =

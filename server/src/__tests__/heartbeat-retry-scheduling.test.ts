@@ -633,6 +633,72 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
+  it("leaves the issue execution pointer unset until a scheduled retry is claimed", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Preclaim Retry Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: CLAIM_RETRY_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "workspace occupied",
+      errorCode: "execution_workspace_occupied",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: now,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry preclaim pointer",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      retryReason: "transient_failure",
+      wakeReason: "transient_failure_retry",
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId, executionLockedAt: issues.executionLockedAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toEqual({ executionRunId: null, executionLockedAt: null });
+  });
+
   it("binds a promoted retry to the issue and retires queued retry siblings atomically", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -690,6 +756,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
+
+    const prePromotionIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(prePromotionIssue?.executionRunId).toBeNull();
 
     const siblingWakeupId = randomUUID();
     const siblingRunId = randomUUID();
@@ -1193,7 +1266,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(scheduled.run.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("coalesces duplicate accepted interaction continuation infra retry schedules", async () => {
@@ -1367,7 +1440,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
       executionWorkspaceSettings: { mode: "isolated_workspace" },
@@ -1559,7 +1632,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: foreignWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
@@ -1687,7 +1760,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: currentWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
