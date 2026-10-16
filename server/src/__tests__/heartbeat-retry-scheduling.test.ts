@@ -70,6 +70,17 @@ const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const CLAIM_RETRY_TEST_ADAPTER = "claim_retry_test";
+let claimRetryExecution: { started: ReturnType<typeof deferred<void>>; release: ReturnType<typeof deferred<void>> } | null = null;
+let claimRetryDispatches = 0;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -97,9 +108,33 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
+    claimRetryDispatches = 0;
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-retry-scheduling-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
+    registerServerAdapter({
+      type: CLAIM_RETRY_TEST_ADAPTER,
+      execute: async () => {
+        claimRetryDispatches += 1;
+        claimRetryExecution?.started.resolve();
+        await claimRetryExecution?.release.promise;
+
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          summary: "Claim retry test run.",
+          provider: "test",
+          model: "test-model",
+        };
+      },
+      testEnvironment: async () => ({
+        adapterType: CLAIM_RETRY_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
     registerServerAdapter({
       type: PROVIDER_QUOTA_TEST_ADAPTER,
       execute: async () => ({
@@ -127,6 +162,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   }, 20_000);
 
   afterEach(async () => {
+    claimRetryExecution?.release.resolve();
+    claimRetryExecution = null;
     // Await every in-flight background heartbeat run to quiescence before the
     // cleanup deletes. heartbeat.invoke claims a run and dispatches its
     // execution fire-and-forget, and that run can schedule a follow-up retry
@@ -139,6 +176,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
   afterAll(async () => {
+    unregisterServerAdapter(CLAIM_RETRY_TEST_ADAPTER);
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
@@ -420,13 +458,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "failed",
       error: "Maximum turns reached",
       errorCode: "adapter_failed",
-      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        stopReason: "max_turns_exhausted",
+      },
       finishedAt: now,
       scheduledRetryAttempt: input?.scheduledRetryAttempt ?? 0,
       scheduledRetryReason: input?.scheduledRetryAttempt ? MAX_TURN_CONTINUATION_RETRY_REASON : null,
-      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
-        stopReason: "max_turns_exhausted",
-      },
       contextSnapshot: {
         issueId,
         wakeReason: "issue_assigned",
@@ -452,6 +490,334 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     return { companyId, agentId, issueId, runId, now };
   }
+
+  it("defers a promoted retry when a foreign live checkout holder owns the issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const holderAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const checkoutRunId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "Retry Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: CLAIM_RETRY_TEST_ADAPTER,
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: holderAgentId,
+        companyId,
+        name: "Checkout Holder",
+        role: "engineer",
+        status: "active",
+        adapterType: CLAIM_RETRY_TEST_ADAPTER,
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: sourceRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "failed",
+        error: "workspace occupied",
+        errorCode: "execution_workspace_occupied",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        finishedAt: now,
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        updatedAt: now,
+        createdAt: now,
+      },
+      {
+        id: checkoutRunId,
+        companyId,
+        agentId: holderAgentId,
+        invocationSource: "assignment",
+        status: "running",
+        startedAt: new Date(now.getTime() - 1_000),
+        contextSnapshot: { issueId, taskId: issueId },
+        updatedAt: now,
+        createdAt: now,
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checkout holder fences retry",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      checkoutRunId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      retryReason: "transient_failure",
+      wakeReason: "transient_failure_retry",
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const dispatchesBeforeClaim = claimRetryDispatches;
+    await heartbeat.promoteDueScheduledRetries(now);
+    await heartbeat.resumeQueuedRuns();
+
+    const retry = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retry?.status).toBe("queued");
+    expect(claimRetryDispatches).toBe(dispatchesBeforeClaim);
+
+    const issue = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toEqual({ checkoutRunId, executionRunId: null });
+
+    const adapterDispatch = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, checkoutRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(adapterDispatch?.status).toBe("running");
+
+    await db.update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: now, updatedAt: now })
+      .where(eq(heartbeatRuns.id, checkoutRunId));
+    await db.update(issues).set({ checkoutRunId: null, updatedAt: now }).where(eq(issues.id, issueId));
+    claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
+    await heartbeat.promoteDueScheduledRetries(now);
+    await heartbeat.resumeQueuedRuns();
+    await claimRetryExecution.started.promise;
+
+    const resumedRetry = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(resumedRetry?.status).toBe("running");
+    expect(claimRetryDispatches).toBe(dispatchesBeforeClaim + 1);
+
+    const resumedIssue = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(resumedIssue?.checkoutRunId).toBe(scheduled.run.id);
+    expect(resumedIssue?.executionRunId).toBe(scheduled.run.id);
+
+    claimRetryExecution.release.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it("leaves the issue execution pointer unset until a scheduled retry is claimed", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Preclaim Retry Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: CLAIM_RETRY_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "workspace occupied",
+      errorCode: "execution_workspace_occupied",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: now,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry preclaim pointer",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      retryReason: "transient_failure",
+      wakeReason: "transient_failure_retry",
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId, executionLockedAt: issues.executionLockedAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toEqual({ executionRunId: null, executionLockedAt: null });
+  });
+
+  it("binds a promoted retry to the issue and retires queued retry siblings atomically", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claim Retry Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: CLAIM_RETRY_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "workspace occupied",
+      errorCode: "execution_workspace_occupied",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: now,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry claim owner",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      retryReason: "transient_failure",
+      wakeReason: "transient_failure_retry",
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const prePromotionIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(prePromotionIssue?.executionRunId).toBeNull();
+
+    const siblingWakeupId = randomUUID();
+    const siblingRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: siblingWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "transient_failure_retry",
+      payload: { issueId, retryReason: "transient_failure", retryOfRunId: sourceRunId },
+      status: "queued",
+      requestedByActorType: "system",
+      createdAt: new Date(scheduled.run.createdAt.getTime() + 1),
+      updatedAt: new Date(scheduled.run.createdAt.getTime() + 1),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: siblingRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: siblingWakeupId,
+      retryOfRunId: sourceRunId,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "transient_failure_retry", retryReason: "transient_failure" },
+      createdAt: new Date(scheduled.run.createdAt.getTime() + 1),
+      updatedAt: new Date(scheduled.run.createdAt.getTime() + 1),
+    });
+    await db.update(agentWakeupRequests).set({ runId: siblingRunId }).where(eq(agentWakeupRequests.id, siblingWakeupId));
+    await db.update(issues).set({ executionRunId: siblingRunId }).where(eq(issues.id, issueId));
+
+    await heartbeat.promoteDueScheduledRetries(now);
+    claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
+    await heartbeat.resumeQueuedRuns();
+    await claimRetryExecution.started.promise;
+
+    const winner = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, scheduled.run.id)).then((rows) => rows[0] ?? null);
+    const issue = await db.select({ executionRunId: issues.executionRunId, executionAgentNameKey: issues.executionAgentNameKey, executionLockedAt: issues.executionLockedAt }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(winner).toEqual({ status: "running" });
+    expect(issue).toMatchObject({ executionRunId: scheduled.run.id, executionAgentNameKey: "claim retry agent" });
+    expect(issue?.executionLockedAt).not.toBeNull();
+
+    const sibling = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, siblingRunId)).then((rows) => rows[0] ?? null);
+    expect(sibling).toMatchObject({ status: "cancelled", errorCode: "retry_superseded_by_winner" });
+    expect(sibling?.resultJson).toMatchObject({ supersededReason: "retry_superseded_by_winner", supersededByRunId: scheduled.run.id });
+    const siblingWakeup = await db.select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, siblingWakeupId)).then((rows) => rows[0] ?? null);
+    expect(siblingWakeup?.status).toBe("cancelled");
+    expect(siblingWakeup?.payload).toMatchObject({ supersededReason: "retry_superseded_by_winner", supersededByRunId: scheduled.run.id });
+
+    claimRetryExecution?.release.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 
   // Fork divergence (source-scoped owner wake kept, slice 2c): upstream #13237 (b1efd65ed) expects
   // exactly three runs because upstream #11961 (f572e0867) deleted
@@ -900,7 +1266,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(scheduled.run.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("coalesces duplicate accepted interaction continuation infra retry schedules", async () => {
@@ -1074,7 +1440,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
       executionWorkspaceSettings: { mode: "isolated_workspace" },
@@ -1266,7 +1632,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: foreignWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
@@ -1394,7 +1760,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: currentWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
