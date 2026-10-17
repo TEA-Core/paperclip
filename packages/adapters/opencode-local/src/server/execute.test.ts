@@ -179,6 +179,41 @@ describe("buildOpenCodeRunArgs", () => {
     ]);
   });
 
+  it("restores V1 config-driven unattended permission approval", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+        autoApprovePermissions: true,
+      }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--dir",
+      "/workspaces/SUP-9238",
+      "--model",
+      "router/coder",
+      "--auto",
+    ]);
+
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+        autoApprovePermissions: false,
+      }),
+    ).not.toContain("--auto");
+  });
+
   it("uses standalone V2 syntax without changing the V1 vector", () => {
     expect(
       buildOpenCodeRunArgs({
@@ -1487,6 +1522,8 @@ describe("resolveOpenCodeDatabaseFile", () => {
 });
 
 describe("execute — per-agent opencode database", () => {
+  let inheritedDatabase: string | undefined;
+
   function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
     return {
       runId: "run-db",

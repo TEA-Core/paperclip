@@ -699,7 +699,6 @@ export function buildOpenCodeRunArgs(input: {
   extraArgs: string[];
   printLogs: boolean;
   resumeSessionId: string | null;
-  openCodeV2?: boolean;
   autoApprovePermissions?: boolean;
 }): string[] {
   const isV2 = input.cliVersion === OPENCODE_V2_CLI_VERSION;
@@ -1361,7 +1360,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         extraArgs,
         printLogs,
         resumeSessionId,
-        openCodeV2,
         autoApprovePermissions: asBoolean(config.dangerouslySkipPermissions, true),
       });
 
