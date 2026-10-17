@@ -7,6 +7,8 @@ import {
   describeOpenCodeDatabaseGrowthTrip,
   measureOpenCodeDatabaseBytes,
   measureOpenCodeSessionBytes,
+  measureOpenCodeV2SessionBytes,
+  readOpenCodeV2SessionState,
   readOpenCodeSessionIdFromChunk,
   resolveOpenCodeDataDir,
   resolveOpenCodeDatabaseGrowthLimitBytes,
@@ -433,6 +435,83 @@ describe("measureOpenCodeSessionBytes", () => {
   it("returns null for an empty session id", async () => {
     const databasePath = await makeOpenCodeDatabase();
     expect(await measureOpenCodeSessionBytes(databasePath, "  ")).toBeNull();
+  });
+});
+
+describe("measureOpenCodeV2SessionBytes", () => {
+  it("sums every requested-session message while using completed assistant messages for the final text", async () => {
+    const databasePath = await makeTempDir().then((dir) => path.join(dir, "v2.db"));
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(databasePath);
+    db.exec(`
+      CREATE TABLE session_v2 (id text PRIMARY KEY, directory text);
+      CREATE TABLE session_message (
+         id text PRIMARY KEY,
+         session_id text NOT NULL,
+         type text NOT NULL,
+         seq integer NOT NULL,
+         data text NOT NULL
+      );
+       INSERT INTO session_v2 VALUES ('ses_v2', '/workspaces/v2');
+        INSERT INTO session_message VALUES
+          ('m1', 'ses_v2', 'assistant', 1, '{"type":"assistant","time":{"completed":1},"content":[{"type":"text","text":"hello"}]}'),
+          ('m2', 'ses_v2', 'user', 2, '{"type":"user","parts":["ignored"]}'),
+          ('m3', 'ses_sibling', 'assistant', 1, '{"type":"assistant","time":{"completed":1},"content":[{"type":"text","text":"sibling"}]}'),
+          ('m4', 'ses_missing', 'assistant', 1, '{"type":"assistant","time":{"completed":1},"content":[{"type":"text","text":"orphan"}]}');
+
+    `);
+    db.close();
+
+    const state = await readOpenCodeV2SessionState(databasePath, "ses_v2");
+    expect(state).toEqual({
+      ok: true,
+      state: {
+        exists: true,
+        cwd: "/workspaces/v2",
+        messageCount: 2,
+        transcriptBytes: expect.any(Number),
+        finalMessage: "hello",
+      },
+    });
+    expect(await measureOpenCodeV2SessionBytes(databasePath, "ses_v2")).toBe(
+      Buffer.byteLength('{"type":"assistant","time":{"completed":1},"content":[{"type":"text","text":"hello"}]}', "utf8") +
+        Buffer.byteLength('{"type":"user","parts":["ignored"]}', "utf8"),
+    );
+  });
+
+  it("does not report orphaned messages for an absent V2 session", async () => {
+    const databasePath = await makeTempDir().then((dir) => path.join(dir, "v2-empty.db"));
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(databasePath);
+    db.exec(`
+      CREATE TABLE session_v2 (id text PRIMARY KEY, directory text);
+      CREATE TABLE session_message (
+        id text PRIMARY KEY,
+        session_id text NOT NULL,
+        type text NOT NULL,
+        seq integer NOT NULL,
+        data text NOT NULL
+      );
+      INSERT INTO session_message VALUES
+        ('orphan', 'ses_missing', 'assistant', 1, '{"type":"assistant","time":{"completed":1},"content":[{"type":"text","text":"orphan"}]}');
+    `);
+    db.close();
+
+    await expect(readOpenCodeV2SessionState(databasePath, "ses_missing")).resolves.toEqual({
+      ok: true,
+      state: {
+        exists: false,
+        cwd: null,
+        messageCount: 0,
+        transcriptBytes: 0,
+        finalMessage: null,
+      },
+    });
+  });
+
+  it("returns null when the V2 schema cannot be read", async () => {
+    const dir = await makeTempDir();
+    expect(await measureOpenCodeV2SessionBytes(path.join(dir, "missing.db"), "ses_v2")).toBeNull();
   });
 });
 

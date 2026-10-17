@@ -13,8 +13,13 @@ const TIMED_OUT_STDOUT = [
   // No terminal result: the process was SIGTERMed while the next turn was in flight.
 ].join("\n");
 
-const { runChildProcess, ensureCommandResolvable, resolveCommandForLogs } = vi.hoisted(() => ({
-  runChildProcess: vi.fn(async () => ({
+const {
+  runAdapterExecutionTargetProcess,
+  ensureCommandResolvable,
+  resolveCommandForLogs,
+  runChildProcess,
+} = vi.hoisted(() => ({
+  runAdapterExecutionTargetProcess: vi.fn(async () => ({
     exitCode: null,
     signal: "SIGTERM",
     timedOut: true,
@@ -25,7 +30,23 @@ const { runChildProcess, ensureCommandResolvable, resolveCommandForLogs } = vi.h
   })),
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "opencode"),
+  runChildProcess: vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "2.0.26\n",
+    stderr: "",
+    pid: 123,
+    startedAt: new Date().toISOString(),
+  })),
 }));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
+    "@paperclipai/adapter-utils/execution-target",
+  );
+  return { ...actual, runAdapterExecutionTargetProcess };
+});
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
   const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
@@ -120,15 +141,15 @@ describe("opencode timeout handling", () => {
     cleanupDirs.push(rootDir);
     expect(result.timedOut).toBe(true);
 
-    const call = (runChildProcess.mock.calls as unknown as unknown[][]).find(
-      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    const call = (runAdapterExecutionTargetProcess.mock.calls as unknown as unknown[][]).find(
+      (entry) => Array.isArray(entry[3]) && entry[3].includes("run"),
     ) as
-      | [string, string, string[], { env: Record<string, string>; stdin?: string }]
+      | [string, unknown, string, string[], { env: Record<string, string>; stdin?: string }]
       | undefined;
-    expect(call?.[3].env.PAPERCLIP_RUN_TIMEOUT_SEC).toBe("5400");
-    expect(Number(call?.[3].env.PAPERCLIP_RUN_DEADLINE_EPOCH)).toBeGreaterThan(Date.now() / 1000);
-    expect(call?.[3].stdin).toContain("Run time budget");
-    expect(call?.[3].stdin).toContain("PAPERCLIP_RUN_DEADLINE_EPOCH");
+    expect(call?.[4].env.PAPERCLIP_RUN_TIMEOUT_SEC).toBe("5400");
+    expect(Number(call?.[4].env.PAPERCLIP_RUN_DEADLINE_EPOCH)).toBeGreaterThan(Date.now() / 1000);
+    expect(call?.[4].stdin).toContain("Run time budget");
+    expect(call?.[4].stdin).toContain("PAPERCLIP_RUN_DEADLINE_EPOCH");
   });
 
   it("says nothing about a deadline when the run is unbounded", async () => {
@@ -136,12 +157,12 @@ describe("opencode timeout handling", () => {
     cleanupDirs.push(rootDir);
     expect(result.timedOut).toBe(true);
 
-    const call = (runChildProcess.mock.calls as unknown as unknown[][]).find(
-      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    const call = (runAdapterExecutionTargetProcess.mock.calls as unknown as unknown[][]).find(
+      (entry) => Array.isArray(entry[3]) && entry[3].includes("run"),
     ) as
-      | [string, string, string[], { env: Record<string, string>; stdin?: string }]
+      | [string, unknown, string, string[], { env: Record<string, string>; stdin?: string }]
       | undefined;
-    expect(call?.[3].env.PAPERCLIP_RUN_DEADLINE_EPOCH).toBeUndefined();
-    expect(call?.[3].stdin).not.toContain("Run time budget");
+    expect(call?.[4].env.PAPERCLIP_RUN_DEADLINE_EPOCH).toBeUndefined();
+    expect(call?.[4].stdin).not.toContain("Run time budget");
   });
 });
