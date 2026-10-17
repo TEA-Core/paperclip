@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -13,6 +14,15 @@ import {
   issueExecutionDecisions,
   issues,
   projects,
+  executionWorkspaces,
+  externalObjects,
+  externalObjectMentions,
+  activityLog,
+  companyMemberships,
+  agentWakeupRequests,
+  issueComments,
+  issueRecoveryActions,
+  issueThreadInteractions,
 } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -22,6 +32,24 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import type * as GitHubFetch from "../services/github-fetch.js";
+import type * as GitHubCredential from "../services/github-credential.js";
+
+const github = vi.hoisted(() => vi.fn<typeof fetch>());
+vi.mock("../services/github-fetch.js", async (original) => ({
+  ...await original<typeof GitHubFetch>(),
+  ghFetch: github,
+}));
+vi.mock("../services/github-credential.js", async (original) => {
+  const actual = await original<typeof GitHubCredential>();
+  const credential = { token: "sandbox-token", scope: "company", secretName: "sandbox" };
+  return {
+    ...actual,
+    resolveGitHubToken: async () => credential,
+    resolveGitHubTokenForRepo: async () => credential,
+    resolveGitHubTokenCandidatesForRepo: async () => [credential],
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -168,9 +196,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   const previousAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+  const previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-exec-decisions-redaction-${randomUUID()}`);
 
   beforeAll(async () => {
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
@@ -179,10 +209,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
   }, 20_000);
 
   afterEach(async () => {
+    github.mockReset();
+    await db.delete(activityLog);
+    await db.delete(companyMemberships);
+    await db.delete(externalObjectMentions);
+    await db.delete(externalObjects);
+    await db.delete(issueThreadInteractions);
+    await db.delete(issueRecoveryActions);
+    await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
+    await db.delete(executionWorkspaces);
     await db.delete(projects);
     await db.delete(companies);
   });
@@ -193,7 +233,404 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
     if (previousAllowKeyGeneration === undefined) delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
     else process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = previousAllowKeyGeneration;
+    if (previousSchedulingSuppression === undefined) delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    else process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
     rmSync(secretsTmpDir, { recursive: true, force: true });
+  });
+
+  async function pendingDelivery({ draft = false, missing = false, mid = false, repo = true, unmentioned = false, staleCertified = false, holdPull = false } = {}) {
+    const company = await seedCompany(db);
+    await db.insert(companyMemberships).values({
+      companyId: company.id, principalType: "user", principalId: "board-user", status: "active", membershipRole: "owner",
+    });
+    const author = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Delivery");
+    const stageId = randomUUID();
+    const stages = [{ id: stageId, type: "review", participants: [{ type: "user", userId: "board-user" }] }];
+    if (mid) stages.push({ id: randomUUID(), type: "approval", participants: [{ type: "user", userId: "board-user" }] });
+    const issue = await seedIssue(db, {
+      companyId: company.id, projectId: project.id, title: "Final delivery",
+      status: "in_review", executionPolicy: { mode: "normal", stages },
+    });
+    const identifier = `${company.issuePrefix}-1`;
+    const branch = `${identifier}-delivery`;
+    let workspaceId: string | null = null;
+    if (repo) {
+      const [workspace] = await db.insert(executionWorkspaces).values({
+        companyId: company.id, projectId: project.id, sourceIssueId: issue.id,
+        mode: "isolated_workspace", strategyType: "git_worktree", name: branch,
+        status: "active", cwd: "/tmp/as02-no-local-repo", repoUrl: "https://github.com/TEA-Core/paperclip",
+        baseRef: "main", branchName: branch, providerType: "git_worktree",
+      }).returning();
+      workspaceId = workspace!.id;
+    }
+    await db.update(issues).set({
+      identifier, issueNumber: 1, createdByAgentId: author.id, assigneeUserId: "board-user",
+      executionWorkspaceId: workspaceId,
+      executionState: {
+        status: "pending", currentStageId: stageId, currentStageIndex: 0,
+        currentStageType: "review", currentParticipant: { type: "user", userId: "board-user" },
+        returnAssignee: { type: "agent", agentId: author.id }, completedStageIds: [],
+        skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        ...(staleCertified ? {
+          approvalStatus: {
+            approvedHeadSha: "c".repeat(40),
+            finalDelivery: {
+              owner: "TEA-Core", repo: "paperclip", number: 42, headSha: "a".repeat(40), displayName: identifier,
+              decisionId: randomUUID(),
+            },
+          },
+        } : {}),
+      },
+    }).where(eq(issues.id, issue.id));
+    const pr = {
+      number: 42, state: "open", draft, merged: false, node_id: "sandbox-pr",
+      title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
+    };
+    if (repo && !missing && !unmentioned) {
+      const [object] = await db.insert(externalObjects).values({
+        companyId: company.id, providerKey: "github", objectType: "pull_request",
+        externalId: "TEA-Core/paperclip#pull/42", displayKey: "42", displayTitle: identifier,
+        sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/42",
+        canonicalIdentityHash: randomUUID(), data: pr,
+      }).returning();
+      await db.insert(externalObjectMentions).values({
+        companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
+        objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
+        matchedTextRedacted: "delivery", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
+        canonicalIdentityHash: object!.canonicalIdentityHash, canonicalIdentity: {},
+      });
+    }
+    const writes: Array<{ url: string; body: unknown }> = [];
+    const calls: string[] = [];
+    let moveAfterPreflight = false;
+    let releasePull!: () => void;
+    let pullHeld!: () => void;
+    const pullGate = new Promise<void>((resolve) => { releasePull = resolve; });
+    const pullReached = new Promise<void>((resolve) => { pullHeld = resolve; });
+    let pullHolds = holdPull;
+    github.mockImplementation(async (input, init) => {
+      const url = String(input);
+      calls.push(`${init?.method ?? "GET"} ${url}`);
+      if (pullHolds && url.includes("/pulls/42")) {
+        pullHolds = false;
+        pullHeld();
+        await pullGate;
+      }
+      if (init?.method === "POST" && url.endsWith("/graphql")) {
+        return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+      }
+      if (init?.method === "POST") {
+        writes.push({ url, body: JSON.parse(String(init.body)) });
+        return Response.json({ id: 1 });
+      }
+      if (url.includes("/pulls/42")) {
+        const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
+        const head = moveAfterPreflight && stored!.executionState?.lastDecisionOutcome === "approved"
+          ? { ...pr.head, sha: "b".repeat(40) } : pr.head;
+        return Response.json({ ...pr, head });
+      }
+      if (url.includes("/pulls?")) return Response.json(missing ? [] : [pr]);
+      if (url.includes("/compare/")) return Response.json({ ahead_by: 1 });
+      if (url.includes("/git/ref/")) return Response.json({ object: { sha: pr.head.sha } });
+      throw new Error(`Unexpected sandbox request: ${url}`);
+    });
+    return {
+      company, issue, stageId, writes, pr, calls, author,
+      pullReached, releasePull,
+      moveHead: () => { moveAfterPreflight = true; },
+      approve: (extra: Record<string, unknown> = {}) => request(createApp(db, boardActor(company))).patch(`/api/issues/${issue.id}`)
+        .send({ status: "done", comment: "Independent final review approved.", ...extra }),
+      read: async () => (await db.select().from(issues).where(eq(issues.id, issue.id)))[0]!,
+    };
+  }
+
+  it("refuses final draft delivery without completing or recording an approval", async () => {
+    const fixture = await pendingDelivery({ draft: true });
+    const response = await fixture.approve();
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ details: { code: "approval_final_delivery_preflight", reason: expect.stringContaining("head_draft") } });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("names the delivery owner and leaves missing delivery pending", async () => {
+    const fixture = await pendingDelivery({ missing: true });
+    const response = await fixture.approve();
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ deliveryOwnerIssueId: fixture.issue.id });
+    expect(response.body.details.remedy).toContain(fixture.issue.id);
+    expect((await fixture.read()).executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("publishes the independently approved ready delivery head", async () => {
+    const fixture = await pendingDelivery();
+    expect((await fixture.approve()).status).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+      approvalStatus: { approvedHeadSha: fixture.pr.head.sha, publishedHeadSha: fixture.pr.head.sha },
+    });
+    expect(fixture.writes).toEqual([{
+      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+    }]);
+  });
+
+  it("re-resolves the head instead of trusting a same-head certification from a prior decision", async () => {
+    const baseline = await pendingDelivery();
+    const override = { doneTransitionOverride: { disposition: "merged-elsewhere", reason: "Delivered via sibling card." } };
+    expect((await baseline.approve(override)).status).toBe(200);
+    const resolverCalls = (calls: string[]) => calls.filter((call) => call.startsWith("GET") && call.endsWith("/pulls/42")).length;
+    expect(resolverCalls(baseline.calls)).toBe(2);
+
+    const stale = await pendingDelivery({ staleCertified: true });
+    expect((await stale.approve(override)).status).toBe(200);
+    expect(resolverCalls(stale.calls)).toBe(resolverCalls(baseline.calls));
+    expect(stale.writes).toEqual(baseline.writes.map((write) => ({
+      ...write, url: write.url, body: expect.objectContaining({ state: "success" }),
+    })));
+    expect((await stale.read()).executionState?.approvalStatus).not.toHaveProperty("finalDelivery");
+  });
+
+  it("does not hold the issue row while the final delivery preflight awaits GitHub", async () => {
+    const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+    process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+    try {
+      const fixture = await pendingDelivery({ holdPull: true });
+      const app = createApp(db, boardActor(fixture.company));
+      const decision = request(app)
+        .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Independent final approval." })
+        .then((response) => response);
+      await fixture.pullReached;
+      const concurrent = await Promise.race([
+        request(app).patch(`/api/issues/${fixture.issue.id}`).send({ title: "Renamed while preflight awaits" }),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 5_000)),
+      ]);
+      expect(concurrent).not.toBe("blocked");
+      expect((concurrent as { status: number }).status).toBe(200);
+      fixture.releasePull();
+      const response = await decision;
+      expect(response.status).toBe(409);
+      expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+      const stored = await fixture.read();
+      expect(stored.title).toBe("Renamed while preflight awaits");
+      expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
+    }
+  });
+
+  it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
+    const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+    process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+    try {
+      const fixture = await pendingDelivery({ holdPull: true });
+      const before = await fixture.read();
+      const decision = request(createApp(db, boardActor(fixture.company)))
+        .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Independent final approval." })
+        .then((response) => response);
+      await fixture.pullReached;
+      await db.update(executionWorkspaces)
+        .set({ branchName: "SUP-1-rebound-delivery" })
+        .where(eq(executionWorkspaces.id, before.executionWorkspaceId!));
+      fixture.releasePull();
+      const response = await decision;
+      expect(response.status).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight_stale", reason: expect.stringContaining("head_moved"),
+      });
+      const stored = await fixture.read();
+      expect(stored.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+      expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
+    }
+  });
+
+  it.each([{ draft: true }, { missing: true }])("keeps a pending approval comment unrecorded on a refused final delivery: %j", async (options) => {
+    const fixture = await pendingDelivery(options);
+    const comment = (body: string) => request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/comments`).send({ body });
+    const refused = await comment("## Review: APPROVED\n\nIndependent final review.");
+    expect(refused.status).toBe(409);
+    expect(refused.body.details).toMatchObject({ code: "approval_final_delivery_preflight" });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id))).toEqual([]);
+    expect((await fixture.read()).executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("stamps the certified head when the approval comment lands on a ready final delivery", async () => {
+    const fixture = await pendingDelivery();
+    const response = await request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/comments`)
+      .send({ body: "## Review: APPROVED\n\nIndependent final review." });
+    expect(response.status).toBe(201);
+    expect((await fixture.read()).status).toBe("done");
+    expect(fixture.writes).toEqual([{
+      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+    }]);
+  });
+
+  async function seedEscalation(fixture: Awaited<ReturnType<typeof pendingDelivery>>) {
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId: fixture.company.id, issueId: fixture.issue.id, kind: "request_confirmation", status: "pending",
+      createdByUserId: "board-user", addresseeUserId: "board-user", continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only",
+      idempotencyKey: `review-escalation:${fixture.issue.id}:${fixture.stageId}:3:0123456789abcdef`,
+      payload: { version: 1, prompt: "Approve this review, or request further changes (round cap reached)." },
+    }).returning();
+    return interaction!;
+  }
+
+  it.each([{ draft: true }, { missing: true }])("leaves an escalation confirmation pending on a refused final delivery: %j", async (options) => {
+    const fixture = await pendingDelivery(options);
+    const interaction = await seedEscalation(fixture);
+    const response = await request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight" });
+    const [stored] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
+    expect(stored!.status).toBe("pending");
+    expect((await fixture.read()).executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("closes an escalation accept on a ready final delivery and stamps the certified head", async () => {
+    const fixture = await pendingDelivery();
+    const interaction = await seedEscalation(fixture);
+    const response = await request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+    expect(response.status).toBe(200);
+    expect((await fixture.read()).status).toBe("done");
+    expect(fixture.writes).toEqual([{
+      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+    }]);
+  });
+
+  it("preserves the reviewed anchor and stamps nothing when an escalation accept races a content push", async () => {
+    const fixture = await pendingDelivery();
+    const interaction = await seedEscalation(fixture);
+    fixture.moveHead();
+    const response = await request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+    expect(response.status).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      approvalStatus: {
+        approvedHeadSha: fixture.pr.head.sha,
+        publishSkipped: expect.objectContaining({ reason: expect.stringContaining("head_moved") }),
+      },
+    });
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("answers an escalation accept from a non-participant without a server error", async () => {
+    const fixture = await pendingDelivery({ draft: true });
+    const interaction = await seedEscalation(fixture);
+    const outsider = { ...boardActor(fixture.company), userId: "other-board-user", isInstanceAdmin: false };
+    const response = await request(createApp(db, outsider as Express.Request["actor"]))
+      .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+    expect(response.status).toBeLessThan(500);
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  async function recoverFinalReview(fixture: Awaited<ReturnType<typeof pendingDelivery>>) {
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId: fixture.company.id, sourceIssueId: fixture.issue.id, kind: "stranded_assigned_issue",
+      status: "active", ownerType: "board", cause: "stranded_assigned_issue", fingerprint: "recovery:final-review",
+      nextAction: "Complete the final review.",
+    }).returning();
+    return request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/recovery-actions/resolve`)
+      .send({ actionId: action!.id, outcome: "restored", sourceIssueStatus: "done", resolutionNote: "Final review approved." });
+  }
+
+  it.each([{ draft: true }, { missing: true }])("refuses a recovery-resolution approval on a refused final delivery: %j", async (options) => {
+    const fixture = await pendingDelivery(options);
+    const response = await recoverFinalReview(fixture);
+    expect(response.status).toBe(409);
+    expect(response.body.details ?? response.body).toMatchObject({ code: "approval_final_delivery_preflight" });
+    expect((await fixture.read()).status).toBe("in_review");
+    expect((await fixture.read()).executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("stamps the certified head when a recovery resolution approves a ready final delivery", async () => {
+    const fixture = await pendingDelivery();
+    const response = await recoverFinalReview(fixture);
+    expect(response.status).toBe(200);
+    expect((await fixture.read()).status).toBe("done");
+    expect(fixture.writes).toEqual([{
+      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+    }]);
+  });
+
+  it("preserves the reviewed anchor and refuses a content push after preflight", async () => {
+    const fixture = await pendingDelivery();
+    fixture.moveHead();
+    expect((await fixture.approve()).status).toBe(200);
+    expect((await fixture.read()).executionState).toMatchObject({
+      approvalStatus: {
+        approvedHeadSha: fixture.pr.head.sha,
+        publishSkipped: expect.objectContaining({ reason: expect.stringContaining("head_moved") }),
+      },
+    });
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it.each([{ mid: true, draft: true }, { repo: false }])("keeps lawful earlier-stage and non-repo approvals: %j", async (options) => {
+    const fixture = await pendingDelivery(options);
+    expect((await fixture.approve()).status).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe(options.mid ? "in_review" : "done");
+    expect(stored.executionState).toMatchObject({ completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved" });
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("publishes a terminal board verdict for an uncached ready owner PR", async () => {
+    const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+    process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+    try {
+      const fixture = await pendingDelivery({ unmentioned: true });
+      const response = await request(createApp(db, boardActor(fixture.company)))
+        .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Independent final approval." });
+      expect(response.status).toBe(200);
+      expect((await fixture.read()).executionState).toMatchObject({
+        lastDecisionOutcome: "approved",
+        approvalStatus: { approvedHeadSha: fixture.pr.head.sha, publishedHeadSha: fixture.pr.head.sha },
+      });
+      expect(fixture.writes).toEqual([{
+        url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+        body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+      }]);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
+    }
   });
 
   it("returns every decision for a 3-stage ladder, ordered createdAt ascending, with the ten contract fields", async () => {

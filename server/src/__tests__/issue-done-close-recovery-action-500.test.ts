@@ -41,6 +41,22 @@ const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
 
+// This suite pins the done-close error handling, not the final-stage delivery
+// preflight (SUP-19860, covered by issue-execution-decisions-routes.test.ts), so
+// the preflight certifies the card's controlled carrier PR.
+vi.mock("../services/merge-arming.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/merge-arming.js")>();
+  return {
+    ...actual,
+    preflightFinalDelivery: async () => ({
+      kind: "resolved" as const,
+      headSha: "a".repeat(40),
+      displayName: "TEA-Core/paperclip#42",
+      pr: { owner: "TEA-Core", repo: "paperclip", number: 42 },
+    }),
+  };
+});
+
 vi.mock("../services/secrets.js", () => ({
   secretService: () => ({
     getByName: mockGetByName,

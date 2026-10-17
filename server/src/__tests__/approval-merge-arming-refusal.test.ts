@@ -48,6 +48,16 @@ vi.mock("../services/merge-arming.js", async (importOriginal) => {
     ...orig,
     armMergeOnApproval: mockArmMergeOnApproval,
     resolveApprovalDecisionHead: mockResolveApprovalDecisionHead,
+    // The final-stage preflight certifies the same controlled delivery the
+    // resolver fixture pins; an unresolvable fixture is a preflight refusal.
+    preflightFinalDelivery: async () => {
+      const resolved = await mockResolveApprovalDecisionHead();
+      if (resolved?.kind !== "resolved") return resolved;
+      return {
+        ...resolved,
+        pr: { owner: "TEA-Core", repo: "paperclip", number: Number(/#(\d+)$/.exec(resolved.displayName)?.[1]) },
+      };
+    },
     publishApprovalStatus: mockPublishApprovalStatus,
   };
 });
@@ -360,16 +370,17 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       });
   }
 
-  it("head_unresolvable refusal: armMergeOnApproval is never reached; the refusal comment is still posted", async () => {
-    // Terminal ladder (final stage pending, prior stage pre-completed) so the
-    // SUP-15459 terminality gate passes and the hook reaches head resolution.
+  it("unresolvable delivery at the final stage is refused before the decision lands (SUP-19860)", async () => {
+    // Terminal ladder (final stage pending, prior stage pre-completed): the
+    // final-delivery preflight runs before the decision commits.
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF1", {
       preCompleted: 1,
     });
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    const beforeIssue = await db.select().from(issues).where(eq(issues.id, issueId));
+    const beforeDecisions = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
 
-    // The decision-time head cannot be resolved -> the hook builds the
-    // head_unresolvable statusOutcome and must stop there.
     mockResolveApprovalDecisionHead.mockResolvedValue({
       kind: "unresolvable",
       reason: "no-pr: no open linked PR resolvable at decision time",
@@ -377,13 +388,17 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     mockArmMergeOnApproval.mockResolvedValue({ kind: "skipped", message: "skipped: must-not-run" });
 
     const res = await approveCurrentStage(identifier);
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(await statusOf(issueId)).toBe("done");
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("approval_final_delivery_preflight");
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issues).where(eq(issues.id, issueId))).toEqual(beforeIssue);
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).toEqual(beforeDecisions);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
 
+    expect(mockPublishApprovalStatus).not.toHaveBeenCalled();
     expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(0);
-    const comments = await mergeArmingComments(issueId);
-    expect(comments).toHaveLength(1);
-    expect(comments[0]!.body).toContain("status:skipped:head_unresolvable:");
+    expect(await mergeArmingComments(issueId)).toHaveLength(0);
   });
 
   it("publishApprovalStatus skipped:not_delivered: armMergeOnApproval is never reached; exactly one [Merge-arming] comment", async () => {

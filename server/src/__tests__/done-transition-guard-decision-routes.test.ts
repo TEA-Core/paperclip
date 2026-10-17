@@ -13,6 +13,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueLabels,
+  issueExecutionDecisions,
   issues,
   labels,
   projectWorkspaces,
@@ -31,6 +32,27 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
+// These fixtures exercise the done-transition guards on decision-carrying doors.
+// The final-stage delivery preflight (SUP-19860) is covered by the route suite
+// in issue-execution-decisions-routes.test.ts, so here it certifies the card's
+// controlled carrier PR and the guard outcomes stay the subject under test.
+const certifiedDelivery = vi.hoisted(() => ({ headSha: "a".repeat(40), number: 42, useRealPreflight: false }));
+
+vi.mock("../services/merge-arming.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/merge-arming.js")>();
+  return {
+    ...actual,
+    preflightFinalDelivery: async (...args: Parameters<typeof actual.preflightFinalDelivery>) =>
+      certifiedDelivery.useRealPreflight
+        ? actual.preflightFinalDelivery(...args)
+        : {
+            kind: "resolved" as const,
+            headSha: certifiedDelivery.headSha,
+            displayName: `TEA-Core/paperclip#${certifiedDelivery.number}`,
+            pr: { owner: "TEA-Core", repo: "paperclip", number: certifiedDelivery.number },
+          },
+  };
+});
 
 vi.mock("../services/secrets.js", () => ({
   secretService: () => ({
@@ -99,6 +121,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
   beforeEach(() => {
     mockGhFetch.mockReset();
+    certifiedDelivery.headSha = "a".repeat(40);
+    certifiedDelivery.useRealPreflight = false;
     mockGetByName.mockReset();
     mockResolveSecretValue.mockReset();
   });
@@ -1083,6 +1107,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const branchName = `${identifier}-test-branch`;
     const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
+    certifiedDelivery.headSha = headSha;
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
@@ -1140,15 +1165,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(typeof approvalStatus?.publishedAt).toBe("string");
   });
 
-  it("POST comment: an ambiguous two-PR approval persists pendingCandidates instead of discarding the certification (SUP-14602)", async () => {
-    // The card is approved while two linked PRs are open. The producer skips
-    // as ambiguous and publishes nothing. Before SUP-14602 the transition
-    // persisted NO approvalStatus at all — the card was structurally
-    // unrecoverable: the approval-status reconciler failed closed on
-    // guard-a:no-approved-head on every tick (the live SUP-14549/PR #3408
-    // incident, which cost a hand-built carrier PR). The skipped path must
-    // persist one approval-time head per candidate PR so the reconciler can
-    // re-run the unmodified Guard A once the ambiguity resolves.
+  it("POST comment: an ambiguous two-PR approval is refused before the decision lands (SUP-14602, SUP-19860)", async () => {
+    // The card is approved while two linked PRs are open. A terminal approval
+    // owes one unambiguous owner delivery, so the real final-delivery preflight
+    // refuses: the card stays pending and nothing is stamped. Before the
+    // preflight the transition closed and persisted pendingCandidates for the
+    // reconciler instead.
     // Prefix "S14602A": the identifier (`S14602A-1`) is the match needle the
     // producer searches in the live PR list; companies.issue_prefix is unique
     // per test database, so the prefix must not collide with "SUP" (used by
@@ -1200,37 +1222,44 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       return new Response(JSON.stringify({}), { status: 404 });
     });
 
+    certifiedDelivery.useRealPreflight = true;
+    const beforeIssue = await db.select().from(issues).where(eq(issues.id, issueId));
+    const beforeDecisions = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
         body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
       });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(201);
-    expect(await statusOf(issueId)).toBe("done");
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("approval_final_delivery_preflight");
+    // Candidate certification is now a refusal diagnostic, not an approved
+    // pendingCandidates record. No decision/certification timestamp may land.
+    expect(res.body.details.reason).toMatch(/^ambiguous:/);
+    expect(res.body.details.reason).toContain("TEA-Core/paperclip#42");
+    expect(res.body.details.reason).toContain("TEA-Core/paperclip#43");
+    expect(res.body.details.deliveryOwnerIssueId).toBe(issueId);
+    expect(res.body.details.remedy).toContain(issueId);
+    expect(await statusOf(issueId)).toBe("in_review");
 
-    // The ambiguous skip publishes nothing: zero commit-status writes.
     const statusCalls = mockGhFetch.mock.calls.filter(
       ([url, init]) => String(url).includes("/statuses/") && (init as RequestInit | undefined)?.method === "POST",
     );
     expect(statusCalls.length).toBe(0);
-
-    // Guard A persistence on the skipped:ambiguous path: one approval-time
-    // head per candidate PR, plus the skip reason and certification time.
     const stateRows = await db
       .select({ executionState: issues.executionState })
       .from(issues)
       .where(eq(issues.id, issueId));
-    const approvalStatus = (stateRows[0]?.executionState as Record<string, any> | null)?.approvalStatus;
-    expect(approvalStatus?.pendingCandidates).toEqual([
-      { owner: "TEA-Core", repo: "paperclip", number: 42, headShaAtApproval: headSha42 },
-      { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: headSha43 },
-    ]);
-    expect(typeof approvalStatus?.skipReason).toBe("string");
-    expect(approvalStatus.skipReason).toMatch(/^status:skipped:head_unresolvable:.*ambiguous/);
-    expect(typeof approvalStatus?.certifiedAt).toBe("string");
-    // publishedHeadSha must still mean "published" — nothing was published.
-    expect(approvalStatus?.publishedHeadSha).toBeUndefined();
+    expect((stateRows[0]?.executionState as Record<string, any> | null)?.approvalStatus).toBeUndefined();
+    expect(stateRows[0]?.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(await db.select().from(issues).where(eq(issues.id, issueId))).toEqual(beforeIssue);
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).toEqual(beforeDecisions);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
   });
 
   it("PATCH: a decision-carrying close refused by mechanism D carries the mechanism's own remedy, not merge-first (ADR-103 M3)", async () => {

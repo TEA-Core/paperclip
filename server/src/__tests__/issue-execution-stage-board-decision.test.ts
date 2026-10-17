@@ -922,6 +922,69 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
   it("serializes concurrent board decisions so each targets a distinct stage", async () => {
     const { companyId, issueId } = await seedIssue({ twoStages: true });
     currentActor = boardActor(companyId);
+    const wakes: string[] = [];
+    const localApp = createApp({
+      executionStageWakeupEnqueue: async (agentId: string) => {
+        wakes.push(agentId);
+        return { id: "race-wakeup" } as any;
+      },
+    });
+    const [initial] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const controlIssueId = "77777777-7777-4777-8777-777777777777";
+    await db.insert(issues).values({
+      id: controlIssueId, companyId, identifier: "SUP-15805-2", issueNumber: 2,
+      title: initial!.title, status: initial!.status, priority: initial!.priority,
+      assigneeAgentId: initial!.assigneeAgentId, assigneeUserId: initial!.assigneeUserId,
+      createdByUserId: initial!.createdByUserId,
+      executionPolicy: initial!.executionPolicy, executionState: initial!.executionState,
+    });
+    async function readOutcome(targetIssueId: string) {
+      const [row] = await db.select().from(issues).where(eq(issues.id, targetIssueId));
+      const decisions = await db.select().from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, targetIssueId));
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId));
+      const activities = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, targetIssueId), eq(activityLog.action, "issue.board_stage_override"),
+      ));
+      expect(decisions.map((decision) => decision.stageId).sort()).toEqual([STAGE_ID, SECOND_STAGE_ID]);
+      expect(decisions.map((decision) => decision.outcome)).toEqual(["approved", "approved"]);
+      // Each successful decision writes its board comment and one existing
+      // merge-arming diagnostic, even on this repository-free fixture.
+      expect(comments).toHaveLength(4);
+      expect(activities).toHaveLength(2);
+      const auditCommentIds = new Set(activities.map((activity) =>
+        (activity.details as Record<string, unknown>).commentId));
+      const boardComments = comments.filter((comment) => auditCommentIds.has(comment.id));
+      expect(boardComments).toHaveLength(2);
+      expect(new Set(boardComments.map((comment) => comment.body)))
+        .toEqual(new Set(decisions.map((decision) => decision.body)));
+      expect(auditCommentIds).toEqual(new Set(boardComments.map((comment) => comment.id)));
+      const diagnostics = comments.filter((comment) => !auditCommentIds.has(comment.id));
+      expect(diagnostics).toHaveLength(2);
+      expect(diagnostics.map((comment) => comment.authorUserId)).toEqual([null, null]);
+      expect(diagnostics.map((comment) => comment.authorAgentId)).toEqual([null, null]);
+      const state = row!.executionState as Record<string, unknown>;
+      expect(state.lastDecisionId).toBe(decisions.find((decision) => decision.stageId === SECOND_STAGE_ID)!.id);
+      return {
+        status: row!.status, assigneeAgentId: row!.assigneeAgentId, assigneeUserId: row!.assigneeUserId,
+        commentCount: comments.length,
+        executionState: {
+          status: state.status, currentStageId: state.currentStageId, currentStageIndex: state.currentStageIndex,
+          currentStageType: state.currentStageType, currentParticipant: state.currentParticipant,
+          returnAssignee: state.returnAssignee, completedStageIds: state.completedStageIds,
+          skippedStageIds: state.skippedStageIds, lastDecisionOutcome: state.lastDecisionOutcome,
+        },
+      };
+    }
+    for (const stageId of [STAGE_ID, SECOND_STAGE_ID]) {
+      const response = await request(localApp).post(`/api/issues/${controlIssueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: `board: sequential ${stageId}` });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.stageId).toBe(stageId);
+    }
+    const sequentialOutcome = await readOutcome(controlIssueId);
+    expect(wakes).toHaveLength(2);
+    const sequentialWakes = wakes.splice(0);
     const advisoryLockKey = 917460186;
     await db.execute(sql.raw(`
       CREATE OR REPLACE FUNCTION paperclip_test_pause_board_decision()
@@ -940,15 +1003,41 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     `));
     try {
       const [first, second] = await Promise.all([
-        request(app)
+        request(localApp)
           .post(`/api/issues/${issueId}/execution-stage/board-decision`)
           .send({ decision: "approved", comment: "board: concurrent A" }),
-        request(app)
+        request(localApp)
           .post(`/api/issues/${issueId}/execution-stage/board-decision`)
           .send({ decision: "approved", comment: "board: concurrent B" }),
       ]);
-      expect(first.status, JSON.stringify(first.body)).toBe(200);
-      expect(second.status, JSON.stringify(second.body)).toBe(200);
+      expect([first, second].filter((response) => response.status === 200 && response.body.stageId === STAGE_ID))
+        .toHaveLength(1);
+      const successes = [first, second].filter((response) => response.status === 200);
+      // The loser waits on the row lock and re-reads the winner's committed
+      // state. Its terminal-approval delivery preflight began against the
+      // pre-commit card, so it may instead be told to retry the final verdict
+      // (SUP-19860); the retry must then land on the NEXT undecided stage.
+      for (const response of [first, second]) {
+        if (response.status === 409) {
+          expect(response.body.code, JSON.stringify(response.body)).toBe("approval_final_delivery_preflight_stale");
+          // The losing request must not add a decision, comment, audit, or wake.
+          expect(await db.select().from(issueExecutionDecisions)
+            .where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(1);
+          expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(2);
+          expect(await db.select().from(activityLog).where(and(
+            eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_override"),
+          ))).toHaveLength(1);
+          expect(wakes).toHaveLength(1);
+          const retry = await request(localApp)
+            .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+            .send({ decision: "approved", comment: "board: concurrent retry" });
+          expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+          successes.push(retry);
+        } else {
+          expect(response.status, JSON.stringify(response.body)).toBe(200);
+        }
+      }
+      expect(successes.map((response) => response.body.stageId).sort()).toEqual([STAGE_ID, SECOND_STAGE_ID]);
     } finally {
       await db.execute(sql.raw(`
         DROP TRIGGER IF EXISTS paperclip_test_pause_board_decision ON issue_execution_decisions;
@@ -966,6 +1055,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .where(eq(issueExecutionDecisions.issueId, issueId));
     expect(decisions).toHaveLength(2);
     expect(new Set(decisions.map((decision) => decision.stageId)).size).toBe(2);
+    expect(await readOutcome(issueId)).toEqual(sequentialOutcome);
+    expect(wakes).toEqual(sequentialWakes);
   });
 
   it("409s with self_approval when the return assignee is an agent but the board user is the delivery author", async () => {
