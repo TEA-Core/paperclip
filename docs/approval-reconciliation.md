@@ -4,7 +4,7 @@ The approval-status reconciler repairs terminally approved cards whose `papercli
 
 ## Candidate admission
 
-A candidate must have a terminal approved ladder and a persisted approval anchor. Linked GitHub pull requests are normally admitted only when their cached snapshot is open and non-draft. A cached `draft: true` snapshot is also admitted when `executionState.approvalStatus.approvedHeadSha` is a non-empty string. That exception is only a reachability recovery path: cached metadata is not authoritative for the current PR state.
+A candidate must have a terminal approved ladder and a persisted approval anchor. Linked GitHub pull requests are normally admitted only when their cached snapshot is open and non-draft. A cached `draft: true` snapshot is also admitted when `executionState.approvalStatus.approvedHeadSha` or `executionState.approvalStatus.publishedHeadSha` is a non-empty string. That exception is only a reachability recovery path: cached metadata is not authoritative for the current PR state.
 
 ## Live validation
 
