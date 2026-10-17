@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock, ensureRuntimeCommandInstalledMock } = vi.hoisted(() => ({
+const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock } = vi.hoisted(() => ({
   runAdapterExecutionTargetProcessMock: vi.fn(),
   // Typed to match `ensureAdapterExecutionTargetCommandResolvable`. With a
   // bare `async () => {}` the recorded call tuple is `[]`, so `calls.at(-1)?.[3]`
@@ -15,15 +15,11 @@ const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock, ensur
     _env: NodeJS.ProcessEnv,
     _options?: { installCommand?: string | null; timeoutSec?: number | null },
   ) => {}),
-  ensureRuntimeCommandInstalledMock: vi.fn(async () => {}),
 }));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
-  adapterExecutionTargetIsRemote: (target: unknown) => Boolean(target && typeof target === "object" && (target as { kind?: string }).kind === "remote"),
-  adapterExecutionTargetRemoteCwd: (target: unknown, cwd: string) =>
-    target && typeof target === "object" && typeof (target as { remoteCwd?: unknown }).remoteCwd === "string"
-      ? (target as { remoteCwd: string }).remoteCwd
-      : cwd,
+  adapterExecutionTargetIsRemote: () => false,
+  adapterExecutionTargetRemoteCwd: (_target: unknown, cwd: string) => cwd,
   overrideAdapterExecutionTargetRemoteCwd: (target: unknown) => target,
   adapterExecutionTargetSessionIdentity: () => ({ kind: "local" }),
   adapterExecutionTargetSessionMatches: () => true,
@@ -31,7 +27,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   adapterExecutionTargetUsesPaperclipBridge: () => false,
   describeAdapterExecutionTarget: () => "local",
   ensureAdapterExecutionTargetCommandResolvable: ensureCommandResolvableMock,
-  ensureAdapterExecutionTargetRuntimeCommandInstalled: ensureRuntimeCommandInstalledMock,
+  ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(async () => {}),
   prepareAdapterExecutionTargetRuntime: vi.fn(async () => ({
     workspaceRemoteDir: null,
     restoreWorkspace: async () => {},
@@ -78,6 +74,7 @@ vi.mock("./models.js", async (importOriginal) => {
   return {
     ...actual,
     ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
+    verifyOpenCodeCliVersion: vi.fn(async () => {}),
   };
 });
 
@@ -127,30 +124,6 @@ describe("buildOpenCodeRunArgs", () => {
     ).toEqual(["run", "--format", "json"]);
   });
 
-  it("folds the V2 variant into the model and uses --auto", () => {
-    expect(
-      buildOpenCodeRunArgs({
-        dir: "/workspaces/SUP-19259",
-        model: "router/coder",
-        variant: "high",
-        extraArgs: [],
-        printLogs: false,
-        resumeSessionId: null,
-        openCodeV2: true,
-        autoApprovePermissions: true,
-      }),
-    ).toEqual([
-      "--standalone",
-      "run",
-      "--format",
-      "json",
-      "--model",
-      "router/coder#high",
-      "--auto",
-    ]);
-  });
-
-
   it("keeps resume, variant and caller-supplied args alongside --dir", () => {
     expect(
       buildOpenCodeRunArgs({
@@ -174,6 +147,91 @@ describe("buildOpenCodeRunArgs", () => {
       "router/coder",
       "--variant",
       "high",
+      "--auto",
+    ]);
+  });
+
+  it("restores V1 config-driven unattended permission approval", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+        autoApprovePermissions: true,
+      }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--dir",
+      "/workspaces/SUP-9238",
+      "--model",
+      "router/coder",
+      "--auto",
+    ]);
+
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+        autoApprovePermissions: false,
+      }),
+    ).not.toContain("--auto");
+  });
+
+  it("uses standalone V2 syntax without changing the V1 vector", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: ["--auto"],
+        printLogs: true,
+        resumeSessionId: "ses_123",
+      }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--print-logs",
+      "--dir",
+      "/workspaces/SUP-9238",
+      "--session",
+      "ses_123",
+      "--model",
+      "router/coder",
+      "--variant",
+      "high",
+      "--auto",
+    ]);
+
+    expect(
+      buildOpenCodeRunArgs({
+        cliVersion: "2.0.26",
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: ["--auto"],
+        printLogs: true,
+        resumeSessionId: "ses_123",
+      }),
+    ).toEqual([
+      "run",
+      "--standalone",
+      "--format",
+      "json",
+      "--print-logs",
+      "--session",
+      "ses_123",
+      "--model",
+      "router/coder#high",
       "--auto",
     ]);
   });
@@ -443,6 +501,29 @@ describe("OpenCode local chat policy", () => {
   });
 });
 
+describe("execute — cliVersion validation", () => {
+  it("rejects unsupported versions before probing or launching", async () => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+    await expect(
+      execute({
+        runId: "run-unsupported-version",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "OpenCode",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { cliVersion: "2.0.25", model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow("Unsupported OpenCode CLI version: 2.0.25");
+    expect(runAdapterExecutionTargetProcessMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("execute — OpenRouter credentials", () => {
   it("passes an OpenRouter key and complete model to OpenCode without logging the key", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-openrouter-"));
@@ -508,137 +589,6 @@ describe("execute — OpenRouter credentials", () => {
       expect((executionCall[4] as { env: Record<string, string> }).env.OPENROUTER_API_KEY).toBe(apiKey);
       expect(JSON.stringify({ logs, metadata, result })).not.toContain(apiKey);
       expect(JSON.stringify(metadata)).toContain('"OPENROUTER_API_KEY":"***REDACTED***"');
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("execute — OpenCode V2 native MCP", () => {
-  it("projects runtime MCP servers into the staged native config before the first prompt", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-mcp-"));
-    const workspace = path.join(root, "workspace");
-    const commandPath = path.join(root, "opencode");
-    const token = "runtime-mcp-secret";
-    await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.0.26\\n'; fi\n", "utf8");
-    await fs.chmod(commandPath, 0o755);
-    runAdapterExecutionTargetProcessMock.mockReset();
-    runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, _args: string[], options: { env?: Record<string, string> }) => {
-      const configPath = path.join(options.env?.XDG_CONFIG_HOME ?? "", "opencode", "opencode.json");
-      const runtimeConfig = JSON.parse(await fs.readFile(configPath, "utf8")) as { mcp?: { servers?: Record<string, unknown> } };
-      expect(runtimeConfig.mcp?.servers?.["paperclip-assigned"]).toMatchObject({
-         type: "remote",
-         url: "https://paperclip.example/mcp",
-         codemode: false,
-         headers: { Authorization: `Bearer ${token}` },
-      });
-      return probeResult({
-        stdout: JSON.stringify({ type: "text", sessionID: "session-v2-mcp", part: { text: "done" } }),
-      });
-    });
-    const getServers = vi.fn(() => [{
-      name: "paperclip-assigned",
-      url: "https://paperclip.example/mcp",
-      token,
-      connectionId: "connection-1",
-    }]);
-    const logs: string[] = [];
-    const metadata: unknown[] = [];
-
-    try {
-      const result = await execute({
-        runId: "run-v2-mcp",
-        agent: { id: "agent-v2-mcp", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-        config: { command: commandPath, cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
-        context: {},
-        runtimeMcp: { getServers },
-        onLog: async (_stream, chunk) => { logs.push(chunk); },
-        onMeta: async (value) => { metadata.push(value); },
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(getServers).toHaveBeenCalledTimes(1);
-      expect(JSON.stringify({ logs, metadata, result })).not.toContain(token);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("prepares a remote runtime command before detecting V2 and projecting native MCP", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-v2-mcp-"));
-    const workspace = path.join(root, "workspace");
-    await fs.mkdir(workspace, { recursive: true });
-    let runtimeInstalled = false;
-    const events: string[] = [];
-    ensureRuntimeCommandInstalledMock.mockImplementationOnce(async () => {
-      events.push("install");
-      runtimeInstalled = true;
-    });
-    runAdapterExecutionTargetProcessMock.mockReset();
-    runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, args: string[]) => {
-      if (args[0] === "--version") {
-        events.push("version");
-        return probeResult({
-          exitCode: runtimeInstalled ? 0 : 127,
-          stdout: runtimeInstalled ? "2.0.26\n" : "",
-        });
-      }
-      return probeResult({
-        stdout: JSON.stringify({ type: "text", sessionID: "remote-v2-mcp", part: { text: "done" } }),
-      });
-    });
-    const getServers = vi.fn(() => [{
-      name: "paperclip-assigned",
-      url: "https://paperclip.example/mcp",
-      token: "remote-runtime-mcp-secret",
-      connectionId: "connection-remote-1",
-    }]);
-
-    try {
-      await execute({
-        runId: "run-remote-v2-mcp",
-        agent: { id: "agent-remote-v2-mcp", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-        config: { command: "opencode", cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
-        context: {},
-        executionTarget: { kind: "remote", transport: "sandbox", providerKey: "fixture", remoteCwd: "/remote/workspace" },
-        runtimeCommandSpec: { command: "opencode", detectCommand: "opencode", installCommand: "install-opencode" },
-        runtimeMcp: { getServers },
-        onLog: async () => {},
-      });
-      expect(events).toEqual(["install", "version"]);
-      expect(getServers).toHaveBeenCalledTimes(1);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("does not fetch runtime MCP servers for OpenCode V1", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v1-mcp-"));
-    const workspace = path.join(root, "workspace");
-    const commandPath = path.join(root, "opencode");
-    await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\n", "utf8");
-    await fs.chmod(commandPath, 0o755);
-    runAdapterExecutionTargetProcessMock.mockReset();
-    runAdapterExecutionTargetProcessMock.mockResolvedValue(probeResult({
-      stdout: JSON.stringify({ type: "text", sessionID: "session-v1-mcp", part: { text: "done" } }),
-    }));
-    const getServers = vi.fn(() => []);
-
-    try {
-      await execute({
-        runId: "run-v1-mcp",
-        agent: { id: "agent-v1-mcp", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-        config: { command: commandPath, cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
-        context: {},
-        runtimeMcp: { getServers },
-        onLog: async () => {},
-      });
-      expect(getServers).not.toHaveBeenCalled();
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -723,25 +673,46 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     runAdapterExecutionTargetProcessMock.mockReset();
   });
 
-  it("proceeds when the remote probe exits non-zero (e.g. a transient `Unexpected error`)", async () => {
+  it("proceeds when the V1 remote probe exits non-zero (e.g. a transient `Unexpected error`)", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
   });
 
-  it("proceeds when the remote probe times out", async () => {
+  it("rejects when the V2 remote probe exits non-zero", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery failed");
+  });
+
+  it("proceeds when the V1 remote probe times out", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
   });
 
-  it("proceeds when the remote probe returns no models", async () => {
+  it("rejects when the V2 remote probe times out", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery failed");
+  });
+
+  it("proceeds when the V1 remote probe returns no models", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
     await expect(
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).resolves.toBeUndefined();
+  });
+
+  it("rejects when the V2 remote probe returns no models", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+    ).rejects.toThrow("OpenCode V2 model discovery returned no models");
   });
 
   it("still rejects when the probe succeeds but the configured model is absent (guard retained)", async () => {
@@ -1392,6 +1363,8 @@ describe("resolveOpenCodeDatabaseFile", () => {
 });
 
 describe("execute — per-agent opencode database", () => {
+  let inheritedDatabase: string | undefined;
+
   function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
     return {
       runId: "run-db",
@@ -1410,11 +1383,10 @@ describe("execute — per-agent opencode database", () => {
     } as AdapterExecutionContext;
   }
 
-  let inheritedDatabase: string | undefined;
-
   beforeEach(() => {
     inheritedDatabase = process.env.OPENCODE_DB;
     delete process.env.OPENCODE_DB;
+    delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
       exitCode: 0,
@@ -1429,6 +1401,7 @@ describe("execute — per-agent opencode database", () => {
     vi.restoreAllMocks();
     if (inheritedDatabase === undefined) delete process.env.OPENCODE_DB;
     else process.env.OPENCODE_DB = inheritedDatabase;
+    delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
   });
 
   it("points the run at the agent's own database file", async () => {
@@ -1458,7 +1431,6 @@ describe("execute — per-agent opencode database", () => {
 describe("execute — opencode database growth guard", () => {
   const TRANSIENT_STDERR = "Failed to execute statement / Unexpected server error";
   const cleanupPaths = new Set<string>();
-  let inheritedDatabase: string | undefined;
 
   async function makeDataHome() {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-guard-"));
@@ -1509,15 +1481,11 @@ describe("execute — opencode database growth guard", () => {
   }
 
   beforeEach(() => {
-    inheritedDatabase = process.env.OPENCODE_DB;
-    delete process.env.OPENCODE_DB;
     runAdapterExecutionTargetProcessMock.mockReset();
   });
 
   afterEach(async () => {
     vi.restoreAllMocks();
-    if (inheritedDatabase === undefined) delete process.env.OPENCODE_DB;
-    else process.env.OPENCODE_DB = inheritedDatabase;
     await Promise.all(
       [...cleanupPaths].map(async (filepath) => {
         await fs.rm(filepath, { recursive: true, force: true });

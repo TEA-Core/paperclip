@@ -83,6 +83,7 @@ Core fields:
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config that allows \`external_directory\` access without interactive prompts; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
+- cliVersion (string, optional): exact opt-in OpenCode CLI version; 2.0.26 enables V2 arguments and standalone execution
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
 - skillIsolation (string, optional): "shared" (default) or "desired-only". "shared"
@@ -107,6 +108,7 @@ Notes:
   \`opencode models\` to list available options in provider/model format.
 - Paperclip requires an explicit \`model\` value for \`opencode_local\` agents.
 - Runs are executed with: opencode run --format json ...
+- Opt-in V2 runs use: opencode run --standalone --format json ...
 - Sessions are resumed with --session when stored session cwd matches current cwd.
 - The adapter sets OPENCODE_DISABLE_PROJECT_CONFIG=true to prevent OpenCode from \
   writing an opencode.json config file into the project working directory. Model \
