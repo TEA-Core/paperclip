@@ -13,6 +13,7 @@ const ownerAgentId = "33333333-3333-4333-8333-333333333333";
 const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
+let lastAcceptedPlanIssues: Record<string, unknown>[] = [];
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -36,6 +37,7 @@ const mockIssueService = vi.hoisted(() => ({
   removeAttachment: vi.fn(),
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
+  findOpenAncestorCreatedByAgent: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -85,7 +87,7 @@ const mockStorageService = vi.hoisted(() => ({
   deleteObject: vi.fn(),
 }));
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
-  getById: vi.fn(async () => null),
+  getById: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   closePinnedWorkspaceForReprovision: vi.fn(async () => ({ outcome: "archived", workspace: null })),
   assessReprovisionClose: vi.fn(async () => ({
     proceed: true,
@@ -106,12 +108,12 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
-  getActiveForIssue: vi.fn(async () => null),
+  getActiveForIssue: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   listActiveForIssues: vi.fn(async () => new Map()),
-  resolveActiveForIssue: vi.fn(async () => null),
+  resolveActiveForIssue: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
 }));
 const mockTaskWatchdogService = vi.hoisted(() => ({
-  getActiveForIssue: vi.fn(async () => null),
+  getActiveForIssue: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   revalidateMutationScope: vi.fn(async () => ({
     allowed: true,
     classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
@@ -129,7 +131,7 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
-  getRun: vi.fn(async () => null),
+  getRun: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
@@ -358,12 +360,18 @@ function createRunContextDb(
         companyId,
         agentId: runAgentOrRows,
         agentCompanyId: companyId,
+        status: "running",
         contextSnapshot,
       }];
   const firstRun = runRows[0] ?? {};
   const runAgentId = typeof firstRun.agentId === "string" ? firstRun.agentId : ownerAgentId;
   const runAgentCompanyId = typeof firstRun.agentCompanyId === "string" ? firstRun.agentCompanyId : companyId;
-  const rowsForSelection = async (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
+  const rowsForSelection = async (
+    selection: Record<string, unknown>,
+    chatBindingQuery = false,
+    settledRecoveryQuery = false,
+    runIdentityParams: unknown[] | null = null,
+  ) => {
     if (chatBindingQuery) return chatBindings;
     // An unknown selector has no settled recovery receipt. Returning the
     // generic issue fixture here would invent an unrelated replay row.
@@ -375,6 +383,15 @@ function createRunContextDb(
     }
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
+    if (runIdentityParams) {
+      const [selectedRunId, selectedCompanyId, selectedAgentId, selectedStatus] = runIdentityParams;
+      return runRows.filter((row) =>
+        row.id === selectedRunId &&
+        row.companyId === selectedCompanyId &&
+        row.agentId === selectedAgentId &&
+        row.status === selectedStatus,
+      );
+    }
     if (keys.length === 0) {
       const issue = await mockIssueService.getById(issueId);
       return issue ? [issue] : [];
@@ -382,28 +399,55 @@ function createRunContextDb(
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
   const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
+    let runIdentityParams: unknown[] | null = null;
+    const isRunIdentityQuery =
+      Object.keys(selection).includes("agentId") &&
+      Object.keys(selection).includes("companyId") &&
+      Object.keys(selection).includes("status");
     const whereResult = {
       orderBy: vi.fn(async () => []),
       limit: vi.fn(() => ({
-        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(
+          selection,
+          chatBindingQuery,
+          settledRecoveryQuery,
+          isRunIdentityQuery ? runIdentityParams : null,
+        )),
       })),
       for: vi.fn(() => ({
-        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(
+          selection,
+          chatBindingQuery,
+          settledRecoveryQuery,
+          isRunIdentityQuery ? runIdentityParams : null,
+        )),
       })),
-      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(
+        selection,
+        chatBindingQuery,
+        settledRecoveryQuery,
+        isRunIdentityQuery ? runIdentityParams : null,
+      )),
     };
     const query = {
       innerJoin: vi.fn(() => query),
       where: vi.fn((condition: SQL) => {
-        if (chatBindingQuery) chatBindingQueries.push(new PgDialect().sqlToQuery(condition));
+        const compiled = new PgDialect().sqlToQuery(condition);
+        if (chatBindingQuery) chatBindingQueries.push(compiled);
+        if (isRunIdentityQuery) runIdentityParams = compiled.params;
         return whereResult;
       }),
     };
     return query;
   };
-  const dbStub = {
+  const dbStub: {
+    chatBindingQueries: ReturnType<PgDialect["sqlToQuery"]>[];
+    transaction: (callback: (tx: unknown) => Promise<unknown>) => Promise<unknown>;
+    select: ReturnType<typeof vi.fn>;
+    insert: ReturnType<typeof vi.fn>;
+  } = {
     chatBindingQueries,
-    transaction: async (callback: (tx: typeof dbStub) => Promise<unknown>) => callback(dbStub),
+    transaction: async (callback) => callback(dbStub),
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn((table: Parameters<typeof getTableName>[0]) =>
         buildQuery(selection, getTableName(table) === "chat_conversations", getTableName(table) === "issue_recovery_actions")),
@@ -423,6 +467,7 @@ async function createApp(
     typeof actor.agentId === "string" ? actor.agentId : ownerAgentId,
     typeof actor.runId === "string" ? actor.runId : ownerRunId,
   );
+  mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
   const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
     "../middleware/index.js",
   );
@@ -534,7 +579,9 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
     mockIssueService.decomposeAcceptedPlan.mockReset();
+    lastAcceptedPlanIssues = [];
     mockIssueService.getAttachmentById.mockReset();
+
     mockIssueService.getByIdentifier.mockReset();
     mockIssueService.getById.mockReset();
     mockIssueService.getByIdForUpdate.mockReset();
@@ -704,6 +751,16 @@ describe("agent issue mutation checkout ownership", () => {
     }));
     mockIssueService.decomposeAcceptedPlan.mockImplementation(async (_sourceIssueId: string, input: Record<string, unknown>) => {
       const children = input.children as Record<string, unknown>[];
+      lastAcceptedPlanIssues = children.map((child) => ({
+        ...makeIssue({
+          id: child.id,
+          parentId: issueId,
+          status: child.status,
+          assigneeAgentId: child.assigneeAgentId ?? null,
+        }),
+        ...child,
+        companyId,
+      }));
       return {
         decomposition: {
           id: "decomposition-1",
@@ -1720,6 +1777,171 @@ describe("agent issue mutation checkout ownership", () => {
       companyId,
       expect.not.objectContaining({
         inheritExecutionWorkspaceFromIssueId: expect.anything(),
+      }),
+    );
+  });
+
+  it("suppresses the assignment wake when a live creator self-assigns a root issue", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({}, [{
+        id: ownerRunId,
+        companyId,
+        agentId: ownerAgentId,
+        agentCompanyId: companyId,
+        status: "running",
+        contextSnapshot: { issueId },
+      }]),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Self-assigned root", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    expect(res.body.code).not.toBe("orphaned_duplicate_run");
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({ assigneeAgentId: ownerAgentId }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(res.body);
+    const mutation = await request(app)
+      .patch(`/api/issues/${res.body.id}`)
+      .send({ title: "First creator mutation" });
+
+    expect(mutation.status, JSON.stringify(mutation.body)).toBe(200);
+    expect(mutation.body?.details?.code).not.toBe("orphaned_duplicate_run");
+  });
+
+  it("suppresses the assignment wake when a live creator self-assigns a child issue", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({}, [{
+        id: ownerRunId,
+        companyId,
+        agentId: ownerAgentId,
+        agentCompanyId: companyId,
+        status: "running",
+        contextSnapshot: { issueId },
+      }]),
+    );
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/children`)
+      .send({ title: "Self-assigned child", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    expect(res.body.code).not.toBe("orphaned_duplicate_run");
+    expect(mockIssueService.createChild).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ assigneeAgentId: ownerAgentId }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(res.body);
+    const mutation = await request(app)
+      .patch(`/api/issues/${res.body.id}`)
+      .send({ title: "First creator mutation" });
+
+    expect(mutation.status, JSON.stringify(mutation.body)).toBe(200);
+    expect(mutation.body?.details?.code).not.toBe("orphaned_duplicate_run");
+  });
+
+  it("suppresses assignment wakes for live creator self-assigned accepted-plan children", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({}, [{
+        id: ownerRunId,
+        companyId,
+        agentId: ownerAgentId,
+        agentCompanyId: companyId,
+        status: "running",
+        contextSnapshot: { issueId },
+      }]),
+    );
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/accepted-plan-decompositions`)
+      .send({
+        acceptedPlanRevisionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        children: [{ title: "Self-assigned plan child", assigneeAgentId: ownerAgentId }],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.code).not.toBe("orphaned_duplicate_run");
+    expect(lastAcceptedPlanIssues).toEqual([
+      expect.objectContaining({
+        assigneeAgentId: ownerAgentId,
+        checkoutRunId: null,
+        executionRunId: null,
+      }),
+    ]);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    const child = lastAcceptedPlanIssues[0];
+    mockIssueService.getById.mockResolvedValue(child);
+    const mutation = await request(app)
+      .patch(`/api/issues/${child.id}`)
+      .send({ title: "First creator mutation" });
+
+    expect(mutation.status, JSON.stringify(mutation.body)).toBe(200);
+    expect(mutation.body?.details?.code).not.toBe("orphaned_duplicate_run");
+  });
+
+  it("retains assignment wake dispatch for a non-running creator row", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({}, [{
+        id: ownerRunId,
+        companyId,
+        agentId: ownerAgentId,
+        agentCompanyId: companyId,
+        status: "succeeded",
+        contextSnapshot: { issueId },
+      }]),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Self-assigned after stopped run", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ownerAgentId,
+      expect.objectContaining({
+        reason: "issue_assigned",
+        requestedByActorType: "agent",
+        requestedByActorId: ownerAgentId,
+      }),
+    );
+  });
+
+  it("retains normal assignment wake dispatch for a peer-created child", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    const app = await createApp(peerActor());
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/children`)
+      .send({ title: "Peer-created assigned child", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ownerAgentId,
+      expect.objectContaining({
+        reason: "issue_assigned",
+        requestedByActorType: "agent",
+        requestedByActorId: peerAgentId,
       }),
     );
   });
@@ -3263,7 +3485,7 @@ describe("agent issue mutation checkout ownership", () => {
       ]);
       const order: string[] = [];
       const transaction = db.transaction;
-      db.transaction = async (callback) => {
+      db.transaction = async (callback: (tx: unknown) => Promise<unknown>) => {
         order.push("begin");
         try {
           const result = await transaction(callback);
@@ -3985,7 +4207,7 @@ describe("agent issue mutation checkout ownership", () => {
     it("preserves normal accepted-plan decomposition parallel wakeups outside watchdog context", async () => {
       mockAgentService.resolveByReference.mockImplementation(async (_companyId: string, reference: string) => ({
         ambiguous: false,
-        agent: reference === ownerAgentId ? makeAgent(ownerAgentId) : null,
+        agent: reference === peerAgentId ? makeAgent(peerAgentId) : null,
       }));
       const app = await createApp(ownerActor());
       const res = await request(app)
@@ -3993,8 +4215,8 @@ describe("agent issue mutation checkout ownership", () => {
         .send({
           acceptedPlanRevisionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
           children: [
-            { title: "Implement backend", assigneeAgentId: ownerAgentId },
-            { title: "Implement frontend", assigneeAgentId: ownerAgentId },
+            { title: "Implement backend", assigneeAgentId: peerAgentId },
+            { title: "Implement frontend", assigneeAgentId: peerAgentId },
           ],
         });
 
@@ -4008,14 +4230,14 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2);
       expect(mockHeartbeatService.wakeup).toHaveBeenNthCalledWith(
         1,
-        ownerAgentId,
+        peerAgentId,
         expect.objectContaining({
           payload: expect.objectContaining({ issueId: children[0]?.id }),
         }),
       );
       expect(mockHeartbeatService.wakeup).toHaveBeenNthCalledWith(
         2,
-        ownerAgentId,
+        peerAgentId,
         expect.objectContaining({
           payload: expect.objectContaining({ issueId: children[1]?.id }),
         }),
