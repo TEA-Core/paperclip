@@ -17211,23 +17211,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (issueId) {
-          const transfersIssueExecutionOwnership =
-            retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
-            retryReason === WORKSPACE_BUSY_RETRY_REASON ||
-            retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
-            retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
           await tx
             .update(issues)
             .set({
-              executionRunId: transfersIssueExecutionOwnership
-                ? sql`case when ${issues.executionRunId} = ${run.id} then ${scheduledRun.id} else ${issues.executionRunId} end`
-                : sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
-              executionAgentNameKey: transfersIssueExecutionOwnership
-                ? sql`case when ${issues.executionRunId} = ${run.id} then ${normalizeAgentNameKey(agent.name)} else ${issues.executionAgentNameKey} end`
-                : sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
-              executionLockedAt: transfersIssueExecutionOwnership
-                ? sql`case when ${issues.executionRunId} = ${run.id} then ${now.toISOString()}::timestamptz else ${issues.executionLockedAt} end`
-                : sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
+              executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
+              executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
+              executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
               checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
               ...(detachWorkspaceFromIssue
                 ? {
@@ -17473,9 +17462,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   // Terminal handling for a WorkspaceBusyDeferral thrown by the pre-dispatch
   // gate: cancel the run (contention is not a failure), schedule a
-  // workspace_busy retry, and leave the agent idle. The issue execution lock
-  // transfers to the scheduled retry run inside scheduleBoundedRetryForRun, so
-  // the issue keeps an active execution path and recovery leaves it alone.
+  // workspace_busy retry, and leave the agent idle. The retry claims the issue
+  // execution lock only when it is promoted and admitted for dispatch.
   // Deferral has no attempt ceiling — the retry keeps rescheduling while a
   // live holder exists, and holder staleness (not a counter) is what prevents
   // waiting on a zombie. If no retry could be scheduled (agent no longer
@@ -19263,6 +19251,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               parseObject(lockedRun.contextSnapshot),
               hostBootId,
             );
+            if (lockedRun.invocationSource === "automation") {
+              const admission = readChatControlRecoveryAdmission(lockedRun);
+              if (admission === "invalid") return { kind: "stale" as const, run: null };
+              const proof = await readChatControlRecoveryStop(
+                tx as unknown as Db,
+                {
+                  companyId: lockedRun.companyId,
+                  issueId,
+                  agentId: lockedRun.agentId,
+                  sourceRunId: lockedRun.id,
+                },
+                true,
+              );
+              if (proof.kind === "unresolved") return { kind: "stale" as const, run: null };
+              if (proof.kind === "stopped") {
+                const error =
+                  "Automatic continuation stopped by the committed chat conversation close. Send a fresh request in chat or on the Board.";
+                const [cancelled] = await tx
+                  .update(heartbeatRuns)
+                  .set({
+                    status: "cancelled",
+                    errorCode: CHAT_CONTROL_RECOVERY_STOP_CODE,
+                    error,
+                    finishedAt: claimedAt,
+                    resultJson: {
+                      ...parseObject(lockedRun.resultJson),
+                      automaticRecovery: {
+                        code: CHAT_CONTROL_RECOVERY_STOP_CODE,
+                        providerDispatched: false,
+                        sourceRunId: proof.sourceRunId,
+                        conversationId: proof.conversationId,
+                        publicationId: proof.publicationId,
+                      },
+                    },
+                    updatedAt: claimedAt,
+                  })
+                  .where(and(
+                    eq(heartbeatRuns.id, lockedRun.id),
+                    eq(heartbeatRuns.status, "queued"),
+                  ))
+                  .returning();
+                if (!cancelled) return { kind: "stale" as const, run: null };
+                if (lockedWake) {
+                  await tx
+                    .update(agentWakeupRequests)
+                    .set({
+                      status: "skipped",
+                      error,
+                      finishedAt: claimedAt,
+                      updatedAt: claimedAt,
+                    })
+                    .where(eq(agentWakeupRequests.id, lockedWake.id));
+                }
+                return { kind: "cancelled" as const, run: cancelled };
+              }
+              await tx
+                .update(heartbeatRuns)
+                .set({
+                  runnerProfileJson: {
+                    ...parseObject(lockedRun.runnerProfileJson),
+                    [CHAT_CONTROL_RECOVERY_ADMISSION_KEY]:
+                      chatControlRecoveryAdmission(
+                        lockedRun,
+                        admission === "admitted" ? "admitted" : "required",
+                      ),
+                  },
+                  updatedAt: claimedAt,
+                })
+                .where(eq(heartbeatRuns.id, lockedRun.id));
+            }
             let liveQueuedCommentIds: string[] | null = null;
             if (queuedCommentIds.length > 0 && lockedWake) {
               const authoritativeIds = queuedCommentIdsFromWakePayload(lockedWake.payload);
@@ -19389,9 +19447,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(heartbeatRuns.companyId, run.companyId),
                   eq(heartbeatRuns.agentId, run.agentId),
                   eq(heartbeatRuns.scheduledRetryReason, retryReason),
+                  eq(heartbeatRuns.retryOfRunId, claimedRun.retryOfRunId),
                   inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
                   ne(heartbeatRuns.id, claimedRun.id),
-                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+                  sql`(
+                    ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+                    or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}
+                  )`,
                 ))
                 .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
                 .for("update");
@@ -19450,6 +19512,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await recordConcurrentRunDeferral(run, issueId!, atomicClaim.holder);
       return null;
     }
+    if (atomicClaim?.kind === "stale") return null;
     if (atomicClaim?.kind === "cancelled") {
       await appendRunEvent(atomicClaim.run, {
         eventType: "lifecycle",
@@ -19878,8 +19941,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(issues.id, claimedIssueId),
               eq(issues.companyId, claimed.companyId),
-              // Mention/context runs can touch an issue, but only the current assignee
-              // owns the issue execution lock shown as the active run.
               eq(issues.assigneeAgentId, claimed.agentId),
               claimed.scheduledRetryReason === "native_safe_replacement"
                 ? or(
@@ -19894,13 +19955,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           );
       } catch (error) {
-        // SUP-17429: if a sibling routine-execution execution activated its
-        // slot between the guard read above and this stamp, the write hits the
-        // `issues_open_routine_execution_uq` partial index. The heartbeatRuns
-        // claim and wakeup claim already committed above, so release them back
-        // to "queued" and return no executable run. Dispatching without the
-        // issue execution lock would violate the issue-lock invariant. Every
-        // other error rethrows so a genuine failure stays fatal.
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
           logger.error(
             {
@@ -19917,7 +19971,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         throw error;
       }
     }
-
     return claimed;
   }
 
