@@ -7548,12 +7548,14 @@ export function recoveryService(
           ? [idempotencyKey]
           : [
               idempotencyKey,
-              ...(readiness?.blockerIssueIds ?? []).map((blockerIssueId) =>
-                buildIssueBlockersResolvedWakeIdempotencyKey({
-                  dependentIssueId: candidate.id,
-                  resolvedBlockerIssueId: blockerIssueId,
-                })
-              ),
+              ...(resolvedBlockerIssueId
+                ? [
+                    buildIssueBlockersResolvedWakeIdempotencyKey({
+                      dependentIssueId: candidate.id,
+                      resolvedBlockerIssueId,
+                    }),
+                  ]
+                : []),
             ];
         const existingWake = zeroBlockerHeal
           ? await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
