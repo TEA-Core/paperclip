@@ -35,12 +35,16 @@ const mockIssueService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
-  getRun: vi.fn(async () => null),
+  getRun: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
 
 const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn(async () => null));
+const mockDelegationCycleAttention = vi.hoisted(() => ({
+  create: vi.fn(async (input: Record<string, unknown>) => input),
+}));
+const mockDecisionService = vi.hoisted(() => vi.fn(() => mockDelegationCycleAttention));
 
 vi.mock("../services/cross-issue-influence-limit.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../services/cross-issue-influence-limit.js")>(),
@@ -119,6 +123,7 @@ vi.mock("../services/index.js", () => ({
     listActiveForIssues: vi.fn(async () => new Map()),
   }),
   issueService: () => mockIssueService,
+  decisionService: mockDecisionService,
   issueThreadInteractionService: () => ({
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
@@ -213,6 +218,8 @@ describe("issue assignee invokability guard", () => {
     mockHeartbeatService.wakeup.mockClear();
     mockObserveCrossIssueInfluence.mockClear();
     mockObserveCrossIssueInfluence.mockResolvedValue(null);
+    mockHeartbeatService.getRun.mockReset();
+    mockHeartbeatService.getRun.mockResolvedValue(null);
   });
 
   it("refuses an agent assigning an issue to a paused agent", async () => {
@@ -282,6 +289,65 @@ describe("agent delegation cycle guard", () => {
     mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
+    mockDelegationCycleAttention.create.mockReset();
+    mockDelegationCycleAttention.create.mockImplementation(async (input: Record<string, unknown>) => input);
+  });
+
+  it("records attention when the agent token omits run id but the parent owns a self-declared run", async () => {
+    const parent = makeIssue({ checkoutRunId: AGENT_RUN_ID });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: AGENT_RUN_ID,
+      agentId: AGENT_ACTOR_ID,
+      status: "running",
+      invocationSource: "self_declared",
+    });
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp({ ...agentActor(), runId: undefined }))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Hand it back",
+        description: "Bounce",
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(409);
+    expect(mockDelegationCycleAttention.create).toHaveBeenCalledTimes(1);
+    expect(mockDelegationCycleAttention.create).toHaveBeenCalledWith(expect.objectContaining({
+      runId: AGENT_RUN_ID,
+    }));
+  });
+
+  it("keeps the delegation refusal when recording board attention fails", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+    mockDelegationCycleAttention.create.mockRejectedValue(new Error("decision store unavailable"));
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Hand it back",
+        description: "Bounce",
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
   });
 
   it("refuses an agent child assigned to the creator of an open ancestor", async () => {
@@ -308,6 +374,87 @@ describe("agent delegation cycle guard", () => {
     expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(parent.id, IDLE_AGENT_ID);
+    expect(mockDelegationCycleAttention.create).toHaveBeenCalledWith(expect.objectContaining({
+      title: expect.stringContaining(parent.identifier),
+      body: expect.stringContaining(IDLE_AGENT_ID),
+      idempotencyKey: expect.stringContaining(`${parent.id}:${IDLE_AGENT_ID}`),
+    }));
+
+    expect(mockDelegationCycleAttention.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("records attention for the generic issue creation route", async () => {
+    const parent = makeIssue({ parentId: null });
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(agentActor()))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Hand it back",
+        description: "Bounce",
+        parentId: parent.id,
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(409);
+    expect(mockDelegationCycleAttention.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the same attention key for repeated delegation refusals", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const body = {
+      title: "Hand it back",
+      description: "Bounce",
+      assigneeAgentId: IDLE_AGENT_ID,
+    };
+    const first = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send(body);
+    const second = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send(body);
+
+    expect(first.status).toBe(409);
+    expect(second.status).toBe(409);
+    expect(mockDelegationCycleAttention.create).toHaveBeenCalledTimes(2);
+    expect(mockDelegationCycleAttention.create.mock.calls[0]?.[0].idempotencyKey)
+      .toBe(mockDelegationCycleAttention.create.mock.calls[1]?.[0].idempotencyKey);
+  });
+
+  it("does not record attention when the child is allowed", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.createChild.mockResolvedValue({
+      issue: makeIssue({ id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", parentId: parent.id, assigneeAgentId: IDLE_AGENT_ID }),
+      parentBlockerAdded: false,
+    });
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Legit subtask",
+        description: "Fine",
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockDelegationCycleAttention.create).not.toHaveBeenCalled();
   });
 
   it("allows the same child when no open ancestor was created by the assignee", async () => {

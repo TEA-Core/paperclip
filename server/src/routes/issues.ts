@@ -455,6 +455,9 @@ const deliveryIdentitySchema = z.object({
   }).strict(),
   branch: z.string().trim().min(1),
   headSha: z.string().trim().min(1),
+  prNumber: z.number().int().positive().optional(),
+  prUrl: z.string().url().optional(),
+  sourceIssueId: z.string().uuid().optional(),
 }).strict();
 const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema.extend({
   interrupt: z.boolean().optional(),
@@ -4190,6 +4193,56 @@ export function issueRoutes(
     opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueExecutionStageWakeup =
     opts.executionStageWakeupEnqueue ?? heartbeat.wakeup;
+  let decisions: ReturnType<typeof serviceIndex.decisionService> | undefined;
+  const getDecisions = () => {
+    decisions ??= serviceIndex.decisionService(db, {
+      wakeOriginAgent: async () => undefined,
+    });
+    return decisions;
+  };
+
+  async function recordDelegationCycleAttention(input: {
+    req: Request;
+    parent: Awaited<ReturnType<typeof svc.getById>>;
+    assigneeAgentId: string;
+    assigneeAgentName: string | null;
+    ancestorIssueId: string;
+  }) {
+    if (
+      input.req.actor.type !== "agent" ||
+      !input.req.actor.agentId ||
+      !input.parent
+    ) return;
+    try {
+      const runId = input.req.actor.runId?.trim() || await resolveSelfDeclaredRunIdForIssue(
+        input.req.actor.agentId,
+        input.parent.checkoutRunId ?? input.parent.executionRunId,
+      );
+      if (!runId) return;
+      await getDecisions().create({
+        companyId: input.parent.companyId,
+        actor: input.req.actor,
+        agentId: input.req.actor.agentId,
+        runId,
+        title: `Delegation cycle requires board attention: ${input.parent.identifier ?? input.parent.id}`,
+        body: `Agent ${input.assigneeAgentName ?? input.assigneeAgentId} was refused from creating a child of ${input.parent.identifier ?? input.parent.id} because it created open ancestor ${input.ancestorIssueId}.`,
+        ruleKey: "delegation_cycle",
+        idempotencyKey: `delegation-cycle:${input.parent.id}:${input.assigneeAgentId}`,
+        options: [{ id: "review", label: "Review delegation cycle", effects: [] }],
+        metadata: {
+          kind: "delegation_cycle",
+          parentIssueId: input.parent.id,
+          assigneeAgentId: input.assigneeAgentId,
+          ancestorIssueId: input.ancestorIssueId,
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, parentIssueId: input.parent.id, assigneeAgentId: input.assigneeAgentId },
+        "failed to record delegation cycle board attention",
+      );
+    }
+  }
 
   async function postAuthFailureComment(
     issueSvc: ReturnType<typeof issueService>,
@@ -4775,11 +4828,21 @@ export function issueRoutes(
     // countable in the ghost-PASS census. The delivery guard still applies in full.
     boardActor: boolean;
     // Board ruling 2026-10-02 (F1): the writer, so a mechanism D refusal can name
-    // the caller's seat and give it a seat-specific next action. Optional: a door
-    // that passes none keeps the seat-blind body.
+    // the caller's seat and give it a seat-specific next action. Optional: a
+    // door that passes none keeps the seat-blind body.
     caller?: RefusalCaller;
+    persistRefusalComment?: boolean;
   }): Promise<DoneTransitionGuardOutcome> {
-    const { issue, override, commentBody, runId, decisionCarried, boardActor, caller } = input;
+    const {
+      issue,
+      override,
+      commentBody,
+      runId,
+      decisionCarried,
+      boardActor,
+      caller,
+      persistRefusalComment = true,
+    } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
     if (guardResult.skipped || guardResult.skipReason) {
@@ -4797,7 +4860,11 @@ export function issueRoutes(
           decisionCarried,
         },
       );
-      if (guardResult.skipped && guardResult.skipReason?.startsWith("auth_failed:")) {
+      if (
+        persistRefusalComment &&
+        guardResult.skipped &&
+        guardResult.skipReason?.startsWith("auth_failed:")
+      ) {
         void postAuthFailureComment(svc, issue.id, guardResult.skipReason).catch((err) => {
           logger.warn({ err, issueId: issue.id }, "failed to post auth-failure done-guard comment");
         });
@@ -4843,14 +4910,16 @@ export function issueRoutes(
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 409 with no thread-readable code/remedy (SUP-15878 precedent).
-      await postTerminalStatusRefusalComment(svc, issue.id, {
-        httpStatus: 409,
-        code: "done_transition_missing_delivery",
-        error: refusalError,
-        remedy: refusalRemedy,
-        runId,
-        callerSeat,
-      });
+      if (persistRefusalComment) {
+        await postTerminalStatusRefusalComment(svc, issue.id, {
+          httpStatus: 409,
+          code: "done_transition_missing_delivery",
+          error: refusalError,
+          remedy: refusalRemedy,
+          runId,
+          callerSeat,
+        });
+      }
       return {
         ok: false,
         status: 409,
@@ -4922,13 +4991,15 @@ export function issueRoutes(
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 422 with no thread-readable code/remedy (SUP-15878 precedent).
-      await postTerminalStatusRefusalComment(svc, issue.id, {
-        httpStatus: 422,
-        code: "done_transition_missing_tier_declaration",
-        error: tierResult.reason,
-        remedy,
-        runId,
-      });
+      if (persistRefusalComment) {
+        await postTerminalStatusRefusalComment(svc, issue.id, {
+          httpStatus: 422,
+          code: "done_transition_missing_tier_declaration",
+          error: tierResult.reason,
+          remedy,
+          runId,
+        });
+      }
       return {
         ok: false,
         status: 422,
@@ -9448,6 +9519,35 @@ export function issueRoutes(
         assigneeAgentId: input.assigneeAgentId,
       },
     );
+  }
+
+  async function assertNoAgentDelegationCycleAndRecord(input: {
+    req: Request;
+    parent: Awaited<ReturnType<typeof svc.getById>>;
+    assigneeAgentId: string | null | undefined;
+    assigneeAgentName: string | null;
+  }) {
+    try {
+      await assertNoAgentDelegationCycle({
+        actorType: input.req.actor.type,
+        parentIssueId: input.parent?.id ?? null,
+        assigneeAgentId: input.assigneeAgentId,
+      });
+    } catch (err) {
+      const details = err instanceof HttpError && err.details && typeof err.details === "object"
+        ? err.details as { code?: string; ancestorIssueId?: string; assigneeAgentId?: string }
+        : null;
+      if (details?.code === "delegation_cycle" && input.parent && details.ancestorIssueId && details.assigneeAgentId) {
+        await recordDelegationCycleAttention({
+          req: input.req,
+          parent: input.parent,
+          assigneeAgentId: details.assigneeAgentId,
+          assigneeAgentName: input.assigneeAgentName,
+          ancestorIssueId: details.ancestorIssueId,
+        });
+      }
+      throw err;
+    }
   }
 
   async function normalizeIssueAssigneeAgentReference(
@@ -14935,11 +15035,11 @@ export function issueRoutes(
           rawCreateBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
-      await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
-        parentIssueId:
-          typeof effectiveParentId === "string" ? effectiveParentId : null,
+      await assertNoAgentDelegationCycleAndRecord({
+        req,
+        parent: createParent,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        assigneeAgentName: normalizedAssigneeAgentRef.name,
       });
       const actor = getActorInfo(req);
       const requestsWorkspaceInheritanceFromRun =
@@ -15097,6 +15197,7 @@ export function issueRoutes(
           boardActor: req.actor.type === "board",
         },
       });
+
       await assertExecutionPolicyAgentReferencesResolve({
         companyId,
         executionPolicy: normalizedExecutionPolicy,
@@ -15113,6 +15214,33 @@ export function issueRoutes(
         Boolean(executionPolicy?.monitor),
       );
       const issueId = randomUUID();
+      if (createBody.status === "done") {
+        const outcome = await evaluateDoneTransitionGuards({
+          issue: {
+            id: issueId,
+            identifier: null,
+            companyId,
+            projectId: createBody.projectId ?? null,
+            projectWorkspaceId: createBody.projectWorkspaceId ?? null,
+            executionWorkspaceId: createBody.executionWorkspaceId ?? null,
+            parentId: createBody.parentId ?? null,
+            createdByAgentId: actor.agentId ?? null,
+            executionPolicy,
+            executionState: null,
+          },
+          override: null,
+          commentBody: null,
+          runId: actor.runId ?? null,
+          decisionCarried: false,
+          boardActor: req.actor.type === "board",
+          caller: createRefusalCaller(req),
+          persistRefusalComment: false,
+        });
+        if (!outcome.ok) {
+          res.status(outcome.status).json(outcome.body);
+          return;
+        }
+      }
       const sourceTrust = await sourceTrustForActorWrite(
         {
           id: issueId,
@@ -15810,10 +15938,11 @@ export function issueRoutes(
           sanitizedBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
-      await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
-        parentIssueId: parent.id,
+      await assertNoAgentDelegationCycleAndRecord({
+        req,
+        parent,
         assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+        assigneeAgentName: normalizedAssigneeAgentRef.name,
       });
       const createBody = {
         ...sanitizedBody,

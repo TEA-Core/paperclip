@@ -13,9 +13,12 @@ const closeBodySchema = z.object({
   summary: z.string().optional(),
 }).strict();
 
-export function workSessionRoutes(db: Db) {
+export function workSessionRoutes(
+  db: Db,
+  opts?: { selfDeclaredRunTtlMs?: number },
+) {
   const router = Router();
-  const svc = selfDeclaredRunService(db);
+  const svc = selfDeclaredRunService(db, opts);
 
   router.post("/issues/:issueId/work-session", async (req, res) => {
     const issueId = req.params.issueId as string;

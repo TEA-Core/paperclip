@@ -2,7 +2,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { PAPERCLIP_AGENT_TEST_POOL_PRELOAD_PATH } from "../agent-test-pool.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawn: vi.fn().mockImplementation(actual.spawn),
+  };
+});
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterExecutionContext, AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import {
@@ -642,8 +651,8 @@ describe("shared ACPX engine runtime behavior", () => {
   type SpawnAgentProbe = (input: {
     command: string;
     args: readonly string[];
-    options: { env?: Record<string, string | undefined> };
-  }) => { kill?: () => void };
+    options: { env?: Record<string, string | undefined>; stdio?: unknown };
+  }) => { kill?: () => void; stdout?: AsyncIterable<Buffer> };
   const readSpawnAgent = (runtimeOptions: Record<string, unknown>[]): SpawnAgentProbe => {
     const spawnAgent = runtimeOptions[0]?.spawnAgent;
     expect(typeof spawnAgent).toBe("function");
@@ -716,6 +725,35 @@ describe("shared ACPX engine runtime behavior", () => {
       }
     },
   );
+
+  it("passes the bounded test-pool preload to ACPX child spawn", async () => {
+    const { runtimeOptions } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(await makeTempRoot(), "state"),
+    });
+    const spawnAgent = readSpawnAgent(runtimeOptions);
+    vi.mocked(spawn).mockClear();
+    const child = spawnAgent({
+      command: process.execPath,
+      args: ["--eval", "setTimeout(() => {}, 2000)"],
+      options: { env: { PATH: process.env.PATH ?? "" } },
+    });
+    try {
+      expect(child).toBeDefined();
+      expect(vi.mocked(spawn)).toHaveBeenCalledWith(
+        process.execPath,
+        ["--eval", "setTimeout(() => {}, 2000)"],
+        expect.objectContaining({
+          env: expect.objectContaining({
+            NODE_OPTIONS: `--require=${PAPERCLIP_AGENT_TEST_POOL_PRELOAD_PATH}`,
+          }),
+        }),
+      );
+    } finally {
+      child.kill?.();
+    }
+  });
 
   it("runs the launch guard on acpx's final resolved argv inside the host spawnAgent callback", async () => {
     // The configured `agentCommand` is not the launched envelope: acpx tokenizes

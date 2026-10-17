@@ -822,6 +822,49 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
     previous_install_fingerprint="$(cat "$install_fingerprint_path")"
   fi
 
+  # SUP-19074: any process at the agent uid can read the environment of any
+  # other (/proc/<pid>/environ needs only the same uid), and this script's
+  # environment is a copy of the server's, secrets master key included. So the
+  # two shim calls below never inherit it: the drop-uid probe gets PATH alone,
+  # and the install gets this allowlist, each entry something the install needs:
+  #   PATH, HOME                  find pnpm, node, corepack and the toolchain;
+  #                               HOME locates .npmrc and the default caches
+  #   NODE_ENV, CI                what pnpm installs and whether it may prompt
+  #   npm_config_*, NPM_CONFIG_*  pnpm settings (store dir, registry, proxy),
+  #                               minus the two parent-instance origin flags
+  #                               that sanitizeRuntimeServiceBaseEnv drops too
+  #   COREPACK_*                  which pnpm corepack runs and where it caches
+  #   PNPM_HOME, XDG_*_HOME       pnpm derives its store path from these; a
+  #                               different store makes pnpm prompt to purge
+  #                               node_modules, which hangs without a tty
+  #   *_PROXY, *_proxy            registry access through an egress proxy
+  #   NODE_EXTRA_CA_CERTS,        TLS trust for the registry and git-hosted
+  #   SSL_CERT_FILE, SSL_CERT_DIR dependencies behind a private CA
+  #   LANG, LC_*                  locale for native builds (node-gyp)
+  #   PAPERCLIP_WORKSPACE_*       the workspace this install is for (no secret)
+  # NODE_OPTIONS is set explicitly at the call. Everything else stays out: every
+  # other PAPERCLIP_* (master key, signing secrets, API URL and keys), server
+  # credentials (GH_TOKEN, DATABASE_URL, provider keys), the server's GIT_*
+  # config, and TMPDIR, which the setuid shim's libc drops anyway.
+  build_agent_install_env() {
+    local name
+    agent_install_env=()
+    while IFS= read -r name; do
+      case "$name" in
+        npm_config_tailscale_auth | npm_config_authenticated_private) ;;
+        PATH | HOME | NODE_ENV | CI | LANG | LC_* | \
+          npm_config_* | NPM_CONFIG_* | COREPACK_* | PNPM_HOME | \
+          XDG_DATA_HOME | XDG_CACHE_HOME | XDG_CONFIG_HOME | XDG_STATE_HOME | \
+          HTTP_PROXY | HTTPS_PROXY | NO_PROXY | ALL_PROXY | \
+          http_proxy | https_proxy | no_proxy | all_proxy | \
+          NODE_EXTRA_CA_CERTS | SSL_CERT_FILE | SSL_CERT_DIR | \
+          PAPERCLIP_WORKSPACE_*)
+          agent_install_env+=("$name=${!name-}")
+          ;;
+      esac
+    done < <(compgen -e)
+  }
+
   # SUP-16336: the worktree's node_modules is consumed by the agent uid (M1:
   # 1001), but provisioning has run pnpm install at the server uid (1000),
   # leaving bin targets owned by 1000 that the agent's pnpm install cannot
@@ -834,7 +877,7 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
   pnpm_install_uid="$current_provision_uid"
   use_agent_shim=0
   if [[ -x "$agent_spawn_shim" ]]; then
-    shim_drop_uid="$("$agent_spawn_shim" id -u 2>/dev/null || true)"
+    shim_drop_uid="$(env -i PATH="$PATH" "$agent_spawn_shim" id -u 2>/dev/null || true)"
     if [[ -n "$shim_drop_uid" && "$shim_drop_uid" != "$current_provision_uid" ]]; then
       use_agent_shim=1
       pnpm_install_uid="$shim_drop_uid"
@@ -948,8 +991,11 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
         # SUP-16336: when use_agent_shim is set, run pnpm through the agent
         # setuid shim so node_modules is materialized owned by the agent uid
         # that will later chmod its bins; otherwise run pnpm at the current uid.
+        # SUP-19074: the shim install starts from build_agent_install_env only.
         if [[ "$use_agent_shim" -eq 1 ]]; then
-          NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" "$agent_spawn_shim" pnpm install --prod=false "$@"
+          build_agent_install_env
+          env -i ${agent_install_env[@]+"${agent_install_env[@]}"} \
+            NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" "$agent_spawn_shim" pnpm install --prod=false "$@"
         else
           NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" pnpm install --prod=false "$@"
         fi

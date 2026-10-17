@@ -267,6 +267,14 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
         lastDecisionOutcome: "approved",
         monitor: null,
         changesRequestedCount: 0,
+        delivery: {
+          repo: { owner: OWNER, repo: REPO },
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+          branch: DELIVERY_BRANCH,
+          headSha: HEAD_SHA,
+          sourceIssueId: issueId,
+        },
       },
     });
     await db

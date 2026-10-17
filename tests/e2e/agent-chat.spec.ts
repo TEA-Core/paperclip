@@ -367,19 +367,25 @@ test("Stop then queued /new resets unpause the conversation without losing histo
     const runs = await json(
       await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
     );
+    const resetCommentIds = (
+      await json(await request.get(`/api/issues/${issue.id}/comments`))
+    )
+      .filter((comment: any) => comment.body === "/new")
+      .map((comment: any) => comment.id);
+    expect(resetCommentIds).toHaveLength(2);
     const detailed = await Promise.all(
       runs.map((run: any) =>
         request.get(`/api/heartbeat-runs/${run.id}`).then(json),
       ),
     );
+    const resetRuns = detailed.filter(
+      (run) => run.contextSnapshot?.conversationReset,
+    );
+    expect(resetRuns).toHaveLength(2);
     expect(
-      detailed.filter((run) => run.contextSnapshot?.conversationReset),
-    ).toHaveLength(2);
-    expect(
-      detailed
-        .filter((run) => run.contextSnapshot?.conversationReset)
-        .every((run) => !run.sessionIdAfter),
-    ).toBe(true);
+      new Set(resetRuns.map((run) => run.contextSnapshot?.wakeCommentId)),
+    ).toEqual(new Set(resetCommentIds));
+    expect(resetRuns.every((run) => !run.sessionIdAfter)).toBe(true);
   } finally {
     await f.restore();
   }

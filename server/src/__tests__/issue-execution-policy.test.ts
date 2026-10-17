@@ -4003,6 +4003,7 @@ describe("review round circuit breaker", () => {
     expect(result.patch.assigneeAgentId).toBe(coderAgentId);
     expect(result.patch.executionState).toMatchObject({
       status: "changes_requested",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
       changesRequestedCount: 0,
     });
     // A human resetting the round is not an escalation: no signal.

@@ -91,6 +91,7 @@ import {
 } from "./db-guard.js";
 import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+import { probeOpenCodeCliVersion, usesOpenCodeV2Cli } from "./version.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
 import {

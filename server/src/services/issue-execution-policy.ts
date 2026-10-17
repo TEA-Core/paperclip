@@ -1617,7 +1617,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         }
         patch.status = "in_progress";
         Object.assign(patch, patchForPrincipal(returnAssignee));
-        patch.executionState = buildChangesRequestedState(existingState!, activeStage, returnAssignee, nextRounds);
+        const nextState = buildChangesRequestedState(existingState!, activeStage, returnAssignee, nextRounds);
+        const participant = selectStageParticipant(activeStage, { exclude: returnAssignee });
+        if (!participant) {
+          throw unprocessable(
+            `No eligible ${activeStage.type} participant is configured for this issue (stage ${activeStage.id}); the return assignee is excluded from participant selection`,
+          );
+        }
+        patch.executionState = { ...nextState, currentParticipant: participant };
         return {
           patch,
           decision,

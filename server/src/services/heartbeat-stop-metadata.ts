@@ -17,6 +17,7 @@ export type HeartbeatRunStopReason =
   | "paused"
   | "max_turns_exhausted"
   | "process_lost"
+  | "self_declared_run_expired"
   | "dispatch_unlaunched"
   | "unmanaged_background_task_stopped"
   | "adapter_failed";
@@ -100,6 +101,7 @@ export function inferHeartbeatRunStopReason(input: {
   if (input.outcome === "timed_out") return "timeout";
   if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
+  if (input.outcome === "failed" && input.errorCode === "self_declared_run_expired") return "self_declared_run_expired";
   if (input.outcome === "failed" && input.errorCode === DISPATCH_UNLAUNCHED_ERROR_CODE) return "dispatch_unlaunched";
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();

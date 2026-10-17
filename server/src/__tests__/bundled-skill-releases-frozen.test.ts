@@ -73,7 +73,10 @@ const registry = JSON.parse(readFileSync(path.join(releasesRoot, "releases.json"
 
 describe("bundled skill releases are frozen", () => {
   it("pins every release listed in releases.json", () => {
-    expect(registry.map((release) => release.id).sort()).toEqual(Object.keys(PINNED_RELEASE_FILES).sort());
+    expect(
+      registry.map((release) => release.id).sort(),
+      "a new release needs a pin block; existing releases are immutable",
+    ).toEqual(Object.keys(PINNED_RELEASE_FILES).sort());
   });
 
   it.each(Object.keys(PINNED_RELEASE_FILES))("release %s is byte-identical to its seeded snapshot", (releaseId) => {

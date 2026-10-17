@@ -851,10 +851,14 @@ async function findApprovalCandidates(
             where ${externalObjectMentions.companyId} = ${issues.companyId}
               and ${externalObjectMentions.sourceIssueId} = ${issues.id}
               and ${externalObjectMentions.objectType} = 'pull_request'
-              and ${externalObjects.providerKey} = 'github'
-              and (${externalObjects.data} ->> 'state' = 'open'
-                or ${externalObjects.data} ->> 'state' is null)
-              and ${externalObjects.data} ->> 'draft' is distinct from 'true'
+               and ${externalObjects.providerKey} = 'github'
+               and (${externalObjects.data} ->> 'state' = 'open'
+                 or ${externalObjects.data} ->> 'state' is null)
+               and (
+                 ${externalObjects.data} ->> 'draft' is distinct from 'true'
+                 or nullif(${issues.executionState} -> 'approvalStatus' ->> 'approvedHeadSha', '') is not null
+               )
+
           ))
           or (
             (
@@ -2699,7 +2703,12 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     };
   }
 
-  const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id);
+  const cachedApprovedHeadSha = (row.executionState as { approvalStatus?: { approvedHeadSha?: unknown } } | null)?.approvalStatus
+    ?.approvedHeadSha;
+  const hasApprovedHeadSha = typeof cachedApprovedHeadSha === "string" && cachedApprovedHeadSha.length > 0;
+  const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id, {
+    includeDrafts: hasApprovedHeadSha,
+  });
   const openPrs = linked.filter((pr) => pr.cachedState === "open");
   // SUP-14911: an object whose last refresh failed with a terminal auth error
   // (the repo does not exist or has no App installation) will never hydrate.
@@ -2797,6 +2806,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   }
   if (typeof prBody?.state === "string" && prBody.state !== "open") {
     return { kind: "skipped", reason: "pr-closed", detail: `pr-closed: ${target.displayName} state=${prBody.state}` };
+  }
+  if (prBody?.draft === true) {
+    return { kind: "skipped", reason: "live-draft", detail: `live-draft: ${target.displayName} is still a draft` };
   }
 
   // Idempotency pre-check: read the head's combined status. A 404 means the
@@ -2974,8 +2986,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
   }
 
-  const publishOptions: { expectedHeadSha: string; enforceDeliveryIdentity?: boolean } = {
+  const publishOptions: { expectedHeadSha: string; enforceDeliveryIdentity?: boolean; includeDrafts?: boolean } = {
     expectedHeadSha: headSha,
+    includeDrafts: true,
   };
   // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1
   // delivery-identity gate never successfully ran for this head — the arming

@@ -3249,6 +3249,7 @@ describe("issue execution policy routes", () => {
         currentStageId: stageId,
         currentStageType: "review",
         returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
         lastDecisionOutcome: "changes_requested",
         changesRequestedCount: 0,
       });

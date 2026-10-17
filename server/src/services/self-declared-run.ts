@@ -1,15 +1,13 @@
-import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   heartbeatRuns,
   issues,
-  projects,
 } from "@paperclipai/db";
 import { isExternalPullAgent } from "./agent-work-delivery.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
-import { executionWorkspaceService } from "./execution-workspaces.js";
 import { forbidden, notFound, conflict } from "../errors.js";
 import { asString, parseObject } from "../adapters/utils.js";
 
@@ -38,8 +36,13 @@ export interface SelfDeclaredRunCloseResult {
 
 import { DEFAULT_SELF_DECLARED_RUN_TTL_MS } from "./run-stillborn.js";
 
-export function selfDeclaredRunService(db: Db) {
+export function selfDeclaredRunService(
+  db: Db,
+  opts?: { selfDeclaredRunTtlMs?: number },
+) {
   const heartbeat = heartbeatService(db);
+  const selfDeclaredRunTtlMs =
+    opts?.selfDeclaredRunTtlMs ?? DEFAULT_SELF_DECLARED_RUN_TTL_MS;
 
   async function getAgentById(agentId: string) {
     return db
@@ -59,102 +62,6 @@ export function selfDeclaredRunService(db: Db) {
 
   async function getRun(runId: string) {
     return heartbeat.getRun(runId);
-  }
-
-  async function getProjectById(projectId: string) {
-    return db
-      .select()
-      .from(projects)
-      .where(eq(projects.id, projectId))
-      .then((rows) => rows[0] ?? null);
-  }
-
-  function resolveProjectWorkspacePolicy(projectRow: { executionWorkspacePolicy: unknown } | null): { mode: string; strategyType: string; baseRef: string | null } {
-    const policy = parseObject(projectRow?.executionWorkspacePolicy);
-    const strategy = parseObject(policy?.workspaceStrategy);
-    return {
-      mode: asString(policy.defaultMode, "isolated_workspace"),
-      strategyType: asString(strategy.type, "git_worktree"),
-      baseRef: asString(strategy.baseRef, "") || null,
-    };
-  }
-
-  async function provisionIssueExecutionWorkspace(
-    issueId: string,
-    runId: string,
-    agentId: string,
-    companyId: string,
-  ): Promise<{
-    strategy: string | null;
-    cwd: string | null;
-    branchName: string | null;
-    worktreePath: string | null;
-    executionWorkspaceId: string | null;
-  }> {
-    const issueRow = await getIssueById(issueId);
-    if (!issueRow) throw notFound("Issue not found");
-
-    const projectRow = issueRow.projectId
-      ? await getProjectById(issueRow.projectId)
-      : null;
-    const { mode, strategyType, baseRef } = resolveProjectWorkspacePolicy(projectRow);
-
-    const ews = executionWorkspaceService(db);
-    const existingWorkspaceId = issueRow.executionWorkspaceId;
-    let workspace = existingWorkspaceId
-      ? await ews.getById(existingWorkspaceId)
-      : null;
-
-    if (workspace) {
-      const now = new Date();
-      await ews.update(workspace.id, {
-        lastUsedAt: now,
-        baseRef: baseRef ?? workspace.baseRef,
-      });
-    } else {
-      const now = new Date();
-      const branchName = `self-declared-${runId.slice(0, 8)}`;
-      const created = await ews.create({
-        companyId,
-        projectId: issueRow.projectId ?? "",
-        sourceIssueId: issueId,
-        mode,
-        strategyType,
-        name: branchName,
-        status: "active",
-        baseRef: baseRef ?? null,
-        branchName,
-        cwd: null,
-        lastUsedAt: now,
-        openedAt: now,
-      });
-
-      if (created) {
-        await db
-          .update(issues)
-          .set({ executionWorkspaceId: created.id, updatedAt: now })
-          .where(eq(issues.id, issueId));
-        workspace = created;
-      }
-    }
-
-    if (!workspace) {
-      return {
-        strategy: null,
-        cwd: null,
-        branchName: null,
-        worktreePath: null,
-        executionWorkspaceId: null,
-      };
-    }
-
-    return {
-      strategy: workspace.strategyType,
-      cwd: workspace.cwd,
-      branchName: workspace.branchName,
-      worktreePath: workspace.providerRef ?? null,
-      executionWorkspaceId: workspace.id,
-    };
   }
 
   async function openSelfDeclaredRun(
@@ -179,6 +86,29 @@ export function selfDeclaredRunService(db: Db) {
     }
 
     const now = new Date();
+    const latestSelfDeclaredRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.invocationSource, "self_declared"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const canRecoverExpiredSession =
+      issue.status === "blocked" &&
+      issue.executionRunId === null &&
+      latestSelfDeclaredRun?.status === "failed" &&
+      latestSelfDeclaredRun.errorCode === "self_declared_run_expired" &&
+      latestSelfDeclaredRun.agentId === agentId;
+    const allowedStatuses = canRecoverExpiredSession
+      ? (["todo", "in_progress", "blocked"] as const)
+      : (["todo", "in_progress"] as const);
 
     const updated = await db
       .update(issues)
@@ -192,7 +122,7 @@ export function selfDeclaredRunService(db: Db) {
       .where(
         and(
           eq(issues.id, issueId),
-          inArray(issues.status, ["todo", "in_progress"]),
+          inArray(issues.status, allowedStatuses),
           or(
             isNull(issues.assigneeAgentId),
             eq(issues.assigneeAgentId, agentId),
@@ -253,12 +183,8 @@ export function selfDeclaredRunService(db: Db) {
       })
       .where(eq(issues.id, issueId));
 
-    const workspace = await provisionIssueExecutionWorkspace(
-      issueId,
-      run.id,
-      agentId,
-      agent.companyId,
-    );
+    const workspace = await heartbeat.prepareWorkspaceForSelfDeclaredRun(run.id);
+    if (!workspace) throw conflict("Failed to provision self-declared workspace");
 
     if (workspace.executionWorkspaceId) {
       await db
@@ -333,7 +259,7 @@ export function selfDeclaredRunService(db: Db) {
       .set({ updatedAt: now })
       .where(eq(heartbeatRuns.id, runId));
 
-    const expiresAt = new Date(now.getTime() + DEFAULT_SELF_DECLARED_RUN_TTL_MS);
+    const expiresAt = new Date(now.getTime() + selfDeclaredRunTtlMs);
 
     return {
       runId: run.id,

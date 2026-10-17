@@ -1347,6 +1347,8 @@ describe("execute — per-agent opencode database", () => {
   }
 
   beforeEach(() => {
+    inheritedDatabase = process.env.OPENCODE_DB;
+    delete process.env.OPENCODE_DB;
     delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
@@ -1360,14 +1362,19 @@ describe("execute — per-agent opencode database", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    delete process.env.OPENCODE_DB;
+    if (inheritedDatabase === undefined) delete process.env.OPENCODE_DB;
+    else process.env.OPENCODE_DB = inheritedDatabase;
     delete process.env.PAPERCLIP_OPENCODE_SHARED_DB;
   });
 
   it("points the run at the agent's own database file", async () => {
-    expect(resolveOpenCodeDatabaseFile({ agentId: "agent-1", env: {}, processEnv: {} })).toBe(
-      "opencode-agent-agent-1.db",
+    const metadata: Array<{ env?: Record<string, string> }> = [];
+    await execute(makeCtx({ onMeta: async (value) => { metadata.push(value); } }));
+    const call = runAdapterExecutionTargetProcessMock.mock.calls.findLast(
+      (entry) => entry[2] === "opencode",
     );
+    expect(call?.[4]?.env?.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
+    expect(metadata.at(-1)?.env?.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
   });
 
   it("keeps an operator-configured OPENCODE_DB from adapterConfig.env", async () => {

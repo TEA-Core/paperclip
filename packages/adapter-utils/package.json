@@ -38,7 +38,7 @@
     "acpx"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp src/vitest-worker-bound-preload.cjs dist/vitest-worker-bound-preload.cjs",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit"
   },

@@ -1530,8 +1530,8 @@ server/src/__tests__/unfinalizable-workspace-barrier.test.ts(464,76): TS2554
 server/src/__tests__/unfinalizable-workspace-barrier.test.ts(489,76): TS2554
 server/src/__tests__/unfinalizable-workspace-barrier.test.ts(526,76): TS2554
 server/src/__tests__/unfinalizable-workspace-barrier.test.ts(584,76): TS2554
-server/src/__tests__/work-session-routes.test.ts(289,16): TS2769
-server/src/__tests__/work-session-routes.test.ts(368,7): TS2554
+server/src/__tests__/work-session-routes.test.ts(361,16): TS2769
+server/src/__tests__/work-session-routes.test.ts(440,7): TS2554
 server/src/__tests__/workspace-instance-cleanup.test.ts(49,34): TS2554
 server/src/__tests__/workspace-login-handoff-issuer.test.ts(135,33): TS2493
 server/src/__tests__/workspace-login-handoff-issuer.test.ts(135,37): TS2339

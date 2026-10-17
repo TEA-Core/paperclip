@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import express from "express";
 import request from "supertest";
@@ -7,13 +11,16 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issues,
   projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
 import { workSessionRoutes } from "../routes/work-sessions.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -27,6 +34,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported
 describeEmbeddedPostgres("work-session routes", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
+  let workspaceRoot: string;
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase(
@@ -34,13 +42,18 @@ describeEmbeddedPostgres("work-session routes", () => {
     );
     stopDb = started.cleanup;
     db = createDb(started.connectionString);
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-work-session-routes-"));
   });
 
   afterAll(async () => {
     await stopDb?.();
+    await rm(workspaceRoot, { recursive: true, force: true });
   });
 
-  async function seedExternalPullAgent() {
+  async function seedExternalPullAgent(options: {
+    repository?: { cwd: string; repoUrl?: string };
+    executionWorkspacePolicy?: Record<string, unknown>;
+  } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -59,6 +72,7 @@ describeEmbeddedPostgres("work-session routes", () => {
       companyId,
       name: "Work session project",
       status: "active",
+      executionWorkspacePolicy: options.executionWorkspacePolicy,
     });
 
     await db.insert(agents).values({
@@ -136,7 +150,7 @@ describeEmbeddedPostgres("work-session routes", () => {
     return { companyId, agentId, issueId, identifier };
   }
 
-  function createApp(agentId: string, companyId: string) {
+  function createApp(agentId: string, companyId: string, selfDeclaredRunTtlMs?: number) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -148,7 +162,7 @@ describeEmbeddedPostgres("work-session routes", () => {
       };
       next();
     });
-    app.use("/api", workSessionRoutes(db));
+    app.use("/api", workSessionRoutes(db, { selfDeclaredRunTtlMs }));
     app.use(errorHandler);
     return app;
   }
@@ -198,6 +212,102 @@ describeEmbeddedPostgres("work-session routes", () => {
     expect(run.invocationSource).toBe("self_declared");
     expect(run.agentId).toBe(fixture.agentId);
 
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId))
+      .then((rows) => rows[0]);
+    expect(issue.status).toBe("in_progress");
+    expect(issue.executionRunId).toBe(res.body.runId);
+  });
+
+  it("fresh self-declared sessions provision a real canonical execution workspace", async () => {
+    const repositoryCwd = path.join(workspaceRoot, "repository");
+    await mkdir(repositoryCwd, { recursive: true });
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: repositoryCwd, stdio: "ignore" });
+    git("init", "-b", "main");
+    await writeFile(path.join(repositoryCwd, "README.md"), "work session");
+    git("add", ".");
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed");
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    const fixture = await seedExternalPullAgent({
+      executionWorkspacePolicy: {
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId: fixture.companyId,
+      projectId: (await db
+        .select({ projectId: issues.projectId })
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId))
+        .then((rows) => rows[0]!)).projectId!,
+      name: "Primary repository",
+      cwd: repositoryCwd,
+      sourceType: "local_path",
+      isPrimary: true,
+    });
+
+    const app = createApp(fixture.agentId, fixture.companyId);
+    const res = await request(app).post(`/api/issues/${fixture.issueId}/work-session`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.workspace.strategy).toBe("git_worktree");
+    expect(res.body.workspace.cwd).toBeTruthy();
+    expect(res.body.workspace.branchName).toBe(`${fixture.identifier}-work-session-test-issue`);
+    expect(res.body.workspace.branchName).not.toMatch(/^self-declared-/);
+    expect(res.body.workspace.worktreePath).toBe(res.body.workspace.cwd);
+    await expect(access(res.body.workspace.cwd)).resolves.toBeUndefined();
+
+    const workspace = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, res.body.workspace.executionWorkspaceId))
+      .then((rows) => rows[0]);
+    expect(workspace).toMatchObject({
+      id: res.body.workspace.executionWorkspaceId,
+      cwd: res.body.workspace.cwd,
+      branchName: res.body.workspace.branchName,
+      providerRef: res.body.workspace.worktreePath,
+    });
+  });
+
+  it("matching assignee can recover its own blocked expired self-declared session", async () => {
+    const fixture = await seedExternalPullAgent();
+    const expiredRunId = randomUUID();
+    const expiredAt = new Date(Date.now() - 16 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: expiredRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      invocationSource: "self_declared",
+      status: "failed",
+      errorCode: "self_declared_run_expired",
+      error: "Work session expired: no keepalive within 15 minutes",
+      startedAt: expiredAt,
+      updatedAt: expiredAt,
+      finishedAt: expiredAt,
+      contextSnapshot: { issueId: fixture.issueId },
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, fixture.issueId));
+
+    const app = createApp(fixture.agentId, fixture.companyId);
+    const res = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.runId).not.toBe(expiredRunId);
     const issue = await db
       .select()
       .from(issues)
@@ -261,9 +371,10 @@ describeEmbeddedPostgres("work-session routes", () => {
     expect(res.body.error).toBe("Agent is not assigned to this issue");
   });
 
-  it("keepalive bumps updatedAt and returns expiresAt", async () => {
+  it("keepalive uses the configured TTL for expiresAt", async () => {
     const fixture = await seedExternalPullAgent();
-    const app = createApp(fixture.agentId, fixture.companyId);
+    const selfDeclaredRunTtlMs = 2 * 60 * 1000;
+    const app = createApp(fixture.agentId, fixture.companyId, selfDeclaredRunTtlMs);
 
     const openRes = await request(app).post(
       `/api/issues/${fixture.issueId}/work-session`,
@@ -279,14 +390,24 @@ describeEmbeddedPostgres("work-session routes", () => {
     expect(hbRes.status).toBe(200);
     expect(hbRes.body.runId).toBe(runId);
     expect(hbRes.body.expiresAt).toBeTruthy();
+    expect(new Date(hbRes.body.expiresAt).getTime()).toBeGreaterThanOrEqual(
+      Date.now() + selfDeclaredRunTtlMs - 1000,
+    );
+    expect(new Date(hbRes.body.expiresAt).getTime()).toBeLessThanOrEqual(
+      Date.now() + selfDeclaredRunTtlMs + 1000,
+    );
 
     const run = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0]);
+    expect(run).toBeDefined();
+    if (!run) throw new Error("Expected heartbeat run");
+    expect(run.startedAt).not.toBeNull();
+    if (!run.startedAt) throw new Error("Expected heartbeat run start time");
     expect(new Date(run.updatedAt).getTime()).toBeGreaterThan(
-      new Date(openRes.body.runId ? run.startedAt : 0).getTime(),
+      new Date(run.startedAt).getTime(),
     );
   });
 
@@ -363,13 +484,12 @@ describeEmbeddedPostgres("work-session routes", () => {
     );
     expect(openRes.status).toBe(201);
 
-    const closeRes = await request(app).post(
-      `/api/issues/${fixture.issueId}/work-session/close`,
-      {
+    const closeRes = await request(app)
+      .post(`/api/issues/${fixture.issueId}/work-session/close`)
+      .send({
         runId: openRes.body.runId,
         outcome: "bogus",
-      },
-    );
+      });
     expect(closeRes.status).toBe(400);
   });
 
