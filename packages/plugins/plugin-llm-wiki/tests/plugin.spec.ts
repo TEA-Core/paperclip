@@ -1556,7 +1556,7 @@ Duplicate headings receive stable suffixes.
       contents,
     });
     const pageWrite = harness.dbExecutes.slice(writesBefore).find((execute) => execute.sql.includes("wiki_pages"));
-    expect(pageWrite?.params?.[7]).toBe(JSON.stringify(["wiki/concepts/target.md", "wiki/entities/other.md"]));
+    expect(pageWrite?.params?.[7]).toBe(JSON.stringify(["index.md", "wiki/concepts/target.md", "wiki/entities/other.md"]));
   });
 
   it("reindexes backlinks from current registered page bytes without revisions", async () => {
