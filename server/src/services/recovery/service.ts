@@ -7643,7 +7643,12 @@ export function recoveryService(
             and(
               eq(agentWakeupRequests.companyId, companyId),
               inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys),
-              inArray(agentWakeupRequests.status, ["completed","failed","timed_out"]),
+              inArray(agentWakeupRequests.status, ["completed", "failed", "timed_out"]),
+              ...(resolvedBlockerIssueId
+                ? [
+                    sql`${agentWakeupRequests.payload} ->> 'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
+                  ]
+                : []),
             ),
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
@@ -7715,6 +7720,11 @@ export function recoveryService(
                 eq(agentWakeupRequests.companyId, companyId),
                 eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON),
                 sql`${agentWakeupRequests.payload} ->> 'issueId' = ${candidate.id}`,
+                ...(resolvedBlockerIssueId
+                  ? [
+                      sql`${agentWakeupRequests.payload} ->> 'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
+                    ]
+                  : []),
                 gte(agentWakeupRequests.requestedAt, since),
               ),
             )
