@@ -7116,6 +7116,14 @@ async function assertIssueExecutionPolicyAgentReferencesResolve(
   );
 }
 
+
+// Checkout by the active participant of a pending review/approval stage must not
+// reopen the card: the card stays in_review (lock taken, status untouched). Flipping
+// it to in_progress orphans the stage (status in_progress + pending stage), which
+// the stranded-issue reconciler then parks blocked and the zero-blocker heal
+// re-wakes, looping the participant.
+const checkoutStatusSql = (agentId: string) => sql`CASE WHEN ${issues.status} = 'in_review' AND ${issues.executionState}->>'status' = 'pending' AND ${issues.executionState}->'currentParticipant'->>'agentId' = ${agentId} THEN 'in_review' ELSE 'in_progress' END`;
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -12636,7 +12644,7 @@ export function issueService(db: Db) {
           assigneeUserId: null,
           checkoutRunId,
           executionRunId: checkoutRunId,
-          status: "in_progress",
+          status: checkoutStatusSql(agentId) as unknown as string,
           startedAt: now,
           // A card that is opened (or re-opened) into in_progress must never carry
           // a completion timestamp; clear any stale one so no row is ever
@@ -12765,7 +12773,7 @@ export function issueService(db: Db) {
             executionRunId: checkoutRunId,
             executionAgentNameKey: null,
             executionLockedAt: now,
-            status: "in_progress",
+            status: checkoutStatusSql(agentId),
             // Re-opening into in_progress clears any stale completion timestamp.
             completedAt: null,
             updatedAt: now,
