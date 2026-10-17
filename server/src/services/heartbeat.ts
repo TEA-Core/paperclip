@@ -19923,6 +19923,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const claimedContext = parseObject(claimed.contextSnapshot);
     const claimedIssueId = readNonEmptyString(claimedContext.issueId);
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
+    if (
+      claimedIssueId &&
+      claimedWakeReason !== "source_scoped_recovery_action"
+    ) {
+      const claimedAgent = await getAgent(claimed.agentId);
+      try {
+        await db
+          .update(issues)
+          .set({
+            executionRunId: claimed.id,
+            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, claimedIssueId),
+              eq(issues.companyId, claimed.companyId),
+              eq(issues.assigneeAgentId, claimed.agentId),
+              claimed.scheduledRetryReason === "native_safe_replacement"
+                ? or(
+                    isNull(issues.checkoutRunId),
+                    eq(issues.checkoutRunId, claimed.id),
+                  )
+                : undefined,
+              or(
+                isNull(issues.executionRunId),
+                eq(issues.executionRunId, claimed.id),
+              ),
+            ),
+          );
+      } catch (error) {
+        if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+          logger.error(
+            {
+              runId: claimed.id,
+              issueId: claimedIssueId,
+              companyId: claimed.companyId,
+              err: error,
+            },
+            "claimQueuedRun: routine-execution open-slot collision on lazy execution-lock stamp; releasing run and skipping candidate",
+          );
+          await releaseRunClaimedJustBeforeSuppression(claimed.id);
+          return null;
+        }
+        throw error;
+      }
+    }
     return claimed;
   }
 
