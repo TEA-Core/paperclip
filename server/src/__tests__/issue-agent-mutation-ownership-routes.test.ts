@@ -87,7 +87,7 @@ const mockStorageService = vi.hoisted(() => ({
   deleteObject: vi.fn(),
 }));
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
-  getById: vi.fn(async () => null),
+  getById: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   closePinnedWorkspaceForReprovision: vi.fn(async () => ({ outcome: "archived", workspace: null })),
   assessReprovisionClose: vi.fn(async () => ({
     proceed: true,
@@ -108,12 +108,12 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
-  getActiveForIssue: vi.fn(async () => null),
+  getActiveForIssue: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   listActiveForIssues: vi.fn(async () => new Map()),
-  resolveActiveForIssue: vi.fn(async () => null),
+  resolveActiveForIssue: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
 }));
 const mockTaskWatchdogService = vi.hoisted(() => ({
-  getActiveForIssue: vi.fn(async () => null),
+  getActiveForIssue: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   revalidateMutationScope: vi.fn(async () => ({
     allowed: true,
     classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
@@ -131,7 +131,7 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
-  getRun: vi.fn(async () => null),
+  getRun: vi.fn<() => Promise<Record<string, unknown> | null>>(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
@@ -440,9 +440,14 @@ function createRunContextDb(
     };
     return query;
   };
-  const dbStub = {
+  const dbStub: {
+    chatBindingQueries: ReturnType<PgDialect["sqlToQuery"]>[];
+    transaction: (callback: (tx: unknown) => Promise<unknown>) => Promise<unknown>;
+    select: ReturnType<typeof vi.fn>;
+    insert: ReturnType<typeof vi.fn>;
+  } = {
     chatBindingQueries,
-    transaction: async (callback: (tx: typeof dbStub) => Promise<unknown>) => callback(dbStub),
+    transaction: async (callback) => callback(dbStub),
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn((table: Parameters<typeof getTableName>[0]) =>
         buildQuery(selection, getTableName(table) === "chat_conversations", getTableName(table) === "issue_recovery_actions")),
@@ -3480,7 +3485,7 @@ describe("agent issue mutation checkout ownership", () => {
       ]);
       const order: string[] = [];
       const transaction = db.transaction;
-      db.transaction = async (callback) => {
+      db.transaction = async (callback: (tx: unknown) => Promise<unknown>) => {
         order.push("begin");
         try {
           const result = await transaction(callback);
