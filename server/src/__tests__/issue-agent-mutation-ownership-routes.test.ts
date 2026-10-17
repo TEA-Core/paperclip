@@ -1801,10 +1801,15 @@ describe("agent issue mutation checkout ownership", () => {
       companyId,
       expect.objectContaining({ assigneeAgentId: ownerAgentId }),
     );
-    expect(mockIssueService.create.mock.calls.at(-1)?.[1]).toEqual(
-      expect.not.objectContaining({ checkoutRunId: expect.anything(), executionRunId: expect.anything() }),
-    );
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(res.body);
+    const mutation = await request(app)
+      .patch(`/api/issues/${res.body.id}`)
+      .send({ title: "First creator mutation" });
+
+    expect(mutation.status, JSON.stringify(mutation.body)).toBe(200);
+    expect(mutation.body?.details?.code).not.toBe("orphaned_duplicate_run");
   });
 
   it("suppresses the assignment wake when a live creator self-assigns a child issue", async () => {
@@ -1833,10 +1838,15 @@ describe("agent issue mutation checkout ownership", () => {
       issueId,
       expect.objectContaining({ assigneeAgentId: ownerAgentId }),
     );
-    expect(mockIssueService.createChild.mock.calls.at(-1)?.[1]).toEqual(
-      expect.objectContaining({ checkoutRunId: null, executionRunId: null }),
-    );
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(res.body);
+    const mutation = await request(app)
+      .patch(`/api/issues/${res.body.id}`)
+      .send({ title: "First creator mutation" });
+
+    expect(mutation.status, JSON.stringify(mutation.body)).toBe(200);
+    expect(mutation.body?.details?.code).not.toBe("orphaned_duplicate_run");
   });
 
   it("suppresses assignment wakes for live creator self-assigned accepted-plan children", async () => {
