@@ -50,6 +50,7 @@ import {
   stringifyPaperclipWakePayloadForEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  runChildProcess,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueIdentifierFromContext,
@@ -71,6 +72,8 @@ import {
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
+  OPENCODE_V2_CLI_VERSION,
+  verifyOpenCodeCliVersion,
   parseOpenCodeModelsOutput,
   requireOpenCodeModelId,
 } from "./models.js";
@@ -89,6 +92,7 @@ import {
 } from "./db-guard.js";
 import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+import { probeOpenCodeCliVersion, usesOpenCodeV2Cli } from "./version.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
 import {
@@ -97,7 +101,6 @@ import {
   resolveOpenCodeSkillsHome,
 } from "./skills.js";
 import { formatOpenCodeSkillExposureLine } from "./exposure-line.js";
-import { probeOpenCodeCliVersion, usesOpenCodeV2Cli } from "./version.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -327,9 +330,48 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
 
+export async function verifyRemoteOpenCodeCliVersion(input: {
+  runId: string;
+  executionTarget: NonNullable<AdapterExecutionContext["executionTarget"]>;
+  cliVersion?: unknown;
+  command: string;
+  cwd: string;
+  env: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+}) {
+  const expectedVersion = asString(input.cliVersion, "").trim();
+  if (!expectedVersion) return;
+  const probe = await runAdapterExecutionTargetProcess(
+    input.runId,
+    input.executionTarget,
+    input.command,
+    ["--version"],
+    {
+      cwd: input.cwd,
+      env: input.env,
+      timeoutSec: Math.min(input.timeoutSec > 0 ? input.timeoutSec : 10, 10),
+      graceSec: input.graceSec,
+      onLog: async () => {},
+    },
+  );
+  if (probe.timedOut || (probe.exitCode ?? 1) !== 0) {
+    const detail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
+    throw new Error(`OpenCode CLI version probe failed for ${input.command}${detail ? `: ${detail}` : "."}`);
+  }
+  const match = /(?:^|\s)v?(\d+\.\d+\.\d+)(?:\s|$)/i.exec(`${probe.stdout}\n${probe.stderr}`);
+  const actualVersion = match?.[1] ?? null;
+  if (actualVersion !== expectedVersion) {
+    throw new Error(
+      `OpenCode CLI version mismatch: expected ${expectedVersion}, received ${actualVersion ?? "unknown"}.`,
+    );
+  }
+}
+
 export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   runId: string;
   executionTarget: NonNullable<AdapterExecutionContext["executionTarget"]>;
+  cliVersion?: unknown;
   command: string;
   model: string;
   cwd: string;
@@ -338,6 +380,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   graceSec: number;
 }) {
   const model = requireOpenCodeModelId(input.model);
+  const isV2 = asString(input.cliVersion, "").trim() === OPENCODE_V2_CLI_VERSION;
 
   // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
   // provider/model at run time (e.g. gateway-routed models that never appear in
@@ -360,7 +403,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
     input.runId,
     input.executionTarget,
     input.command,
-    ["models"],
+    ["models", ...(isV2 ? ["--standalone"] : [])],
     {
       cwd: input.cwd,
       env: input.env,
@@ -370,12 +413,9 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
     },
   );
 
-  // The remote availability probe is a best-effort pre-flight guard, not a gate.
-  // If `opencode models` itself cannot run on the target — timeout, transient CLI
-  // error, provider hiccup — do NOT abort the run. The real invocation is
-  // authoritative, so a probe that can't execute must never be fatal. (Previously
-  // these threw and crashed runs mid-flight, losing the agent's work + disposition.)
   if (probe.timedOut) {
+    const message = `Remote OpenCode model discovery timed out after ${probeTimeoutSec}s.`;
+    if (isV2) throw new Error(`OpenCode V2 model discovery failed for "${model}": ${message}`);
     console.warn(
       `[opencode-local] Remote model availability probe for "${model}" timed out after ${probeTimeoutSec}s; proceeding with the configured model.`,
     );
@@ -384,6 +424,8 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
 
   if ((probe.exitCode ?? 1) !== 0) {
     const detail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
+    const message = `Remote \`opencode models\` failed${detail ? `: ${detail}` : "."}`;
+    if (isV2) throw new Error(`OpenCode V2 model discovery failed for "${model}": ${message}`);
     console.warn(
       `[opencode-local] Remote \`opencode models\` could not run for "${model}"${
         detail ? ` (${detail})` : ""
@@ -394,6 +436,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
 
   const models = parseOpenCodeModelsOutput(probe.stdout);
   if (models.length === 0) {
+    if (isV2) throw new Error(`OpenCode V2 model discovery returned no models for "${model}".`);
     console.warn(
       `[opencode-local] Remote \`opencode models\` returned no models; proceeding with the configured model "${model}".`,
     );
@@ -650,27 +693,23 @@ export function resolveOpenCodeSessionResume(input: {
 // passing --dir as well pins the run directory explicitly instead of relying on
 // that env side channel alone.
 export function buildOpenCodeRunArgs(input: {
+  cliVersion?: string;
   dir: string;
   model: string;
   variant: string;
   extraArgs: string[];
   printLogs: boolean;
   resumeSessionId: string | null;
-  openCodeV2?: boolean;
   autoApprovePermissions?: boolean;
 }): string[] {
-  const args = input.openCodeV2
-    ? ["--standalone", "run", "--format", "json"]
-    : ["run", "--format", "json"];
+  const isV2 = input.cliVersion === OPENCODE_V2_CLI_VERSION;
+  const args = isV2 ? ["run", "--standalone", "--format", "json"] : ["run", "--format", "json"];
   if (input.printLogs) args.push("--print-logs");
-  if (input.dir && !input.openCodeV2) args.push("--dir", input.dir);
+  if (!isV2 && input.dir) args.push("--dir", input.dir);
   if (input.resumeSessionId) args.push("--session", input.resumeSessionId);
-  const model = input.openCodeV2 && input.variant
-    ? `${input.model}#${input.variant}`
-    : input.model;
-  if (model) args.push("--model", model);
-  if (!input.openCodeV2 && input.variant) args.push("--variant", input.variant);
-  if (input.autoApprovePermissions) args.push("--auto");
+  if (input.model) args.push("--model", input.variant && isV2 ? `${input.model}#${input.variant}` : input.model);
+  if (input.variant && !isV2) args.push("--variant", input.variant);
+  if (!isV2 && input.autoApprovePermissions) args.push("--auto");
   if (input.extraArgs.length > 0) args.push(...input.extraArgs);
   return args;
 }
@@ -690,6 +729,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "opencode");
+  const cliVersion = asString(config.cliVersion, "").trim();
+  if (cliVersion && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+    throw new Error(
+      `Unsupported OpenCode CLI version: ${cliVersion}. Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`,
+    );
+  }
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
 
@@ -880,52 +925,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void onLog("stderr", `paperclip-gh-wrapper: ${message}\n`);
     },
   });
-  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
-    executionTarget,
-    asNumber(config.timeoutSec, 0),
-  );
-  const graceSec = asNumber(config.graceSec, 20);
-  const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
-  Object.assign(env, deadlineEnv);
-  const initialRuntimeEnv = Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
-  await ensureAdapterExecutionTargetRuntimeCommandInstalled({
-    runId,
-    target: executionTarget,
-    installCommand: ctx.runtimeCommandSpec?.installCommand,
-    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
-    cwd,
-    env: initialRuntimeEnv,
-    timeoutSec,
-    graceSec,
-    onLog,
-  });
-  await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, initialRuntimeEnv, {
-    installCommand: SANDBOX_INSTALL_COMMAND,
-    timeoutSec,
-  });
-  const cliVersion = await probeOpenCodeCliVersion({
-    runId: `${runId}:opencode-version`,
-    command,
-    target: executionTarget,
-    cwd: effectiveExecutionCwd,
-    env: initialRuntimeEnv,
-    timeoutSec,
-    graceSec,
-  });
-  const openCodeV2 = usesOpenCodeV2Cli(cliVersion);
-  const runtimeMcpServers = openCodeV2 ? await ctx.runtimeMcp?.getServers() ?? [] : [];
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
-    env,
-    config,
-    openCodeV2,
-    runtimeMcpServers,
-  });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  if (openCodeDatabaseFile) {
+    preparedRuntimeConfig.env.OPENCODE_DB = openCodeDatabaseFile;
+  }
   const localRuntimeConfigHome = preparedRuntimeConfig.runtimeConfigHome;
   if (isolatedSkillsHome) {
+    // desired-only: repoint the child's HOME at the per-run home so opencode's
+    // external skill scans ($HOME/.claude/skills, $HOME/.agents/skills) find
+    // only the filtered set. Everything else the run reads from HOME (git
+    // config/credentials, opencode's data dir and per-agent session DB,
+    // package caches) is carried over by symlink inside that home — see
+    // prepareOpenCodeIsolatedSkillsHome. This deliberately overrides a
+    // configured config.env.HOME: isolation cannot be satisfied by pointing
+    // the child at a shared home.
     preparedRuntimeConfig.env.HOME = isolatedSkillsHome;
     const configuredHome = asString(parseObject(config.env).HOME, "");
     if (configuredHome) {
@@ -940,14 +953,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
-    let loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
+    const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
+      executionTarget,
+      asNumber(config.timeoutSec, 0),
+    );
+    const graceSec = asNumber(config.graceSec, 20);
+    // One deadline, shared by the child's env and the prompt's wrap-up guidance —
+    // two independently computed values would drift by the spawn latency between
+    // them and quietly contradict each other. Derived from the EFFECTIVE timeout,
+    // which a remote execution target may have capped below the configured one.
+    const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
+    Object.assign(preparedRuntimeConfig.env, deadlineEnv);
+    await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+      runId,
+      target: executionTarget,
+      installCommand: ctx.runtimeCommandSpec?.installCommand,
+      detectCommand: ctx.runtimeCommandSpec?.detectCommand,
+      cwd,
+      env: runtimeEnv,
+      timeoutSec,
+      graceSec,
+      onLog,
+    });
+     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
+       installCommand: SANDBOX_INSTALL_COMMAND,
+       timeoutSec,
+     });
+     if (cliVersion === OPENCODE_V2_CLI_VERSION && !executionTargetIsRemote) {
+       await verifyOpenCodeCliVersion({ cliVersion, command, cwd, env: runtimeEnv });
+     }
+     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
+     let loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
       runtimeEnv,
       includeRuntimeKeys: ["HOME"],
       resolvedCommand,
     });
     if (!executionTargetIsRemote) {
       await ensureOpenCodeModelConfiguredAndAvailable({
+        cliVersion,
         model,
         command,
         cwd,
@@ -1045,9 +1088,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
         );
       }
+      if (cliVersion === OPENCODE_V2_CLI_VERSION) {
+        await verifyRemoteOpenCodeCliVersion({
+          runId,
+          executionTarget,
+          cliVersion,
+          command,
+          cwd,
+          env: preparedRuntimeConfig.env,
+          timeoutSec,
+          graceSec,
+        });
+      }
       await ensureRemoteOpenCodeModelConfiguredAndAvailable({
         runId,
         executionTarget,
+        cliVersion,
         command,
         model,
         cwd,
@@ -1274,13 +1330,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const buildArgs = (resumeSessionId: string | null) =>
       buildOpenCodeRunArgs({
+        cliVersion,
         dir: effectiveExecutionCwd,
         model,
         variant,
         extraArgs,
         printLogs,
         resumeSessionId,
-        openCodeV2,
         autoApprovePermissions: asBoolean(config.dangerouslySkipPermissions, true),
       });
 
