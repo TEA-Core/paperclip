@@ -490,7 +490,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
         runId: randomUUID(),
         createdAt: longAgo,
         updatedAt: longAgo,
-
+        payload: null,
       })),
     );
 
