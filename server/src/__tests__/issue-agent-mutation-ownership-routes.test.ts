@@ -1881,6 +1881,15 @@ describe("agent issue mutation checkout ownership", () => {
       }),
     ]);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    const child = lastAcceptedPlanIssues[0];
+    mockIssueService.getById.mockResolvedValue(child);
+    const mutation = await request(app)
+      .patch(`/api/issues/${child.id}`)
+      .send({ title: "First creator mutation" });
+
+    expect(mutation.status, JSON.stringify(mutation.body)).toBe(200);
+    expect(mutation.body?.details?.code).not.toBe("orphaned_duplicate_run");
   });
 
   it("retains assignment wake dispatch for a non-running creator row", async () => {

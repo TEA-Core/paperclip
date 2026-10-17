@@ -390,6 +390,19 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
     });
   });
 
+  it("rejects explicit done status without a done-tier declaration", async () => {
+    const companyId = await seedCompany("NPD");
+    const agentId = await seedAgent(companyId);
+    currentActor = agentActor(companyId, agentId);
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Done without evidence", status: "done" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ code: "done_transition_missing_tier_declaration" });
+  });
+
   it("still returns 201 and persists the issue when the audit insert fails for an agent top-level create", async () => {
     const companyId = await seedCompany("NPF");
     const agentId = await seedAgent(companyId);

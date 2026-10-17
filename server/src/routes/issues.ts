@@ -4863,11 +4863,21 @@ export function issueRoutes(
     // countable in the ghost-PASS census. The delivery guard still applies in full.
     boardActor: boolean;
     // Board ruling 2026-10-02 (F1): the writer, so a mechanism D refusal can name
-    // the caller's seat and give it a seat-specific next action. Optional: a door
-    // that passes none keeps the seat-blind body.
+    // the caller's seat and give it a seat-specific next action. Optional: a
+    // door that passes none keeps the seat-blind body.
     caller?: RefusalCaller;
+    persistRefusalComment?: boolean;
   }): Promise<DoneTransitionGuardOutcome> {
-    const { issue, override, commentBody, runId, decisionCarried, boardActor, caller } = input;
+    const {
+      issue,
+      override,
+      commentBody,
+      runId,
+      decisionCarried,
+      boardActor,
+      caller,
+      persistRefusalComment = true,
+    } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
     if (guardResult.skipped || guardResult.skipReason) {
@@ -4885,7 +4895,11 @@ export function issueRoutes(
           decisionCarried,
         },
       );
-      if (guardResult.skipped && guardResult.skipReason?.startsWith("auth_failed:")) {
+      if (
+        persistRefusalComment &&
+        guardResult.skipped &&
+        guardResult.skipReason?.startsWith("auth_failed:")
+      ) {
         void postAuthFailureComment(svc, issue.id, guardResult.skipReason).catch((err) => {
           logger.warn({ err, issueId: issue.id }, "failed to post auth-failure done-guard comment");
         });
@@ -4931,14 +4945,16 @@ export function issueRoutes(
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 409 with no thread-readable code/remedy (SUP-15878 precedent).
-      await postTerminalStatusRefusalComment(svc, issue.id, {
-        httpStatus: 409,
-        code: "done_transition_missing_delivery",
-        error: refusalError,
-        remedy: refusalRemedy,
-        runId,
-        callerSeat,
-      });
+      if (persistRefusalComment) {
+        await postTerminalStatusRefusalComment(svc, issue.id, {
+          httpStatus: 409,
+          code: "done_transition_missing_delivery",
+          error: refusalError,
+          remedy: refusalRemedy,
+          runId,
+          callerSeat,
+        });
+      }
       return {
         ok: false,
         status: 409,
@@ -5010,13 +5026,15 @@ export function issueRoutes(
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 422 with no thread-readable code/remedy (SUP-15878 precedent).
-      await postTerminalStatusRefusalComment(svc, issue.id, {
-        httpStatus: 422,
-        code: "done_transition_missing_tier_declaration",
-        error: tierResult.reason,
-        remedy,
-        runId,
-      });
+      if (persistRefusalComment) {
+        await postTerminalStatusRefusalComment(svc, issue.id, {
+          httpStatus: 422,
+          code: "done_transition_missing_tier_declaration",
+          error: tierResult.reason,
+          remedy,
+          runId,
+        });
+      }
       return {
         ok: false,
         status: 422,
@@ -15214,6 +15232,7 @@ export function issueRoutes(
           boardActor: req.actor.type === "board",
         },
       });
+
       await assertExecutionPolicyAgentReferencesResolve({
         companyId,
         executionPolicy: normalizedExecutionPolicy,
@@ -15230,6 +15249,33 @@ export function issueRoutes(
         Boolean(executionPolicy?.monitor),
       );
       const issueId = randomUUID();
+      if (createBody.status === "done") {
+        const outcome = await evaluateDoneTransitionGuards({
+          issue: {
+            id: issueId,
+            identifier: null,
+            companyId,
+            projectId: createBody.projectId ?? null,
+            projectWorkspaceId: createBody.projectWorkspaceId ?? null,
+            executionWorkspaceId: createBody.executionWorkspaceId ?? null,
+            parentId: createBody.parentId ?? null,
+            createdByAgentId: actor.agentId ?? null,
+            executionPolicy,
+            executionState: null,
+          },
+          override: null,
+          commentBody: null,
+          runId: actor.runId ?? null,
+          decisionCarried: false,
+          boardActor: req.actor.type === "board",
+          caller: createRefusalCaller(req),
+          persistRefusalComment: false,
+        });
+        if (!outcome.ok) {
+          res.status(outcome.status).json(outcome.body);
+          return;
+        }
+      }
       const sourceTrust = await sourceTrustForActorWrite(
         {
           id: issueId,
