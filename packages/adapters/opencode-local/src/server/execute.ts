@@ -28,6 +28,7 @@ import {
 import {
   asString,
   asNumber,
+  asBoolean,
   asStringArray,
   parseObject,
   buildPaperclipEnv,
@@ -699,6 +700,7 @@ export function buildOpenCodeRunArgs(input: {
   extraArgs: string[];
   printLogs: boolean;
   resumeSessionId: string | null;
+  autoApprovePermissions?: boolean;
 }): string[] {
   const isV2 = input.cliVersion === OPENCODE_V2_CLI_VERSION;
   const args = isV2 ? ["run", "--standalone", "--format", "json"] : ["run", "--format", "json"];
@@ -707,6 +709,7 @@ export function buildOpenCodeRunArgs(input: {
   if (input.resumeSessionId) args.push("--session", input.resumeSessionId);
   if (input.model) args.push("--model", input.variant && isV2 ? `${input.model}#${input.variant}` : input.model);
   if (input.variant && !isV2) args.push("--variant", input.variant);
+  if (!isV2 && input.autoApprovePermissions) args.push("--auto");
   if (input.extraArgs.length > 0) args.push(...input.extraArgs);
   return args;
 }
@@ -1334,6 +1337,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         extraArgs,
         printLogs,
         resumeSessionId,
+        autoApprovePermissions: asBoolean(config.dangerouslySkipPermissions, true),
       });
 
     const runAttempt = async (resumeSessionId: string | null) => {
