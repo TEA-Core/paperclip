@@ -718,6 +718,7 @@ describe("LLM Wiki plugin scaffold", () => {
       "wiki_update_index",
       "wiki_list_backlinks",
       "wiki_list_pages",
+      "wiki_reindex_backlinks",
     ]);
     expect(manifest.ui?.slots?.map((slot) => slot.type)).toEqual([
       "sidebar",
@@ -1530,6 +1531,89 @@ Duplicate headings receive stable suffixes.
       wikiId: "default",
     });
     expect(pages.content).toBe("No pages indexed yet.");
+  });
+
+  it("reads exact page bytes and extracts Obsidian links", async () => {
+    const harness = createTestHarness({ manifest });
+    const contents = "# Index\n\n[[concepts/target|Target]] [[entities/other.md]] [[../unsafe]] [legacy](index.md)";
+    harness.ctx.localFolders.readText = async () => contents;
+
+    await plugin.definition.setup(harness.ctx);
+    const result = await harness.executeTool<{ content: string; data: { hash: string } }>("wiki_read_page", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+      path: "wiki/index.md",
+    });
+
+    expect(result.content).toBe(contents);
+    expect(result.data.hash).toBe(createHash("sha256").update(contents, "utf8").digest("hex"));
+
+    const writesBefore = harness.dbExecutes.length;
+    await harness.executeTool("wiki_write_page", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+      path: "wiki/index.md",
+      contents,
+    });
+    const pageWrite = harness.dbExecutes.slice(writesBefore).find((execute) => execute.sql.includes("wiki_pages"));
+    expect(pageWrite?.params?.[7]).toBe(JSON.stringify(["wiki/concepts/target.md", "wiki/entities/other.md"]));
+  });
+
+  it("reindexes backlinks from current registered page bytes without revisions", async () => {
+    const harness = createTestHarness({ manifest });
+    const contents = new Map([
+      ["wiki/index.md", "[[concepts/target]]"],
+      ["wiki/concepts/target.md", "# Target"],
+    ]);
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, path) => {
+      const value = contents.get(path);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string) => {
+      if (sql.includes("FROM") && sql.includes("wiki_pages") && sql.includes("ORDER BY path")) {
+        return [
+          { path: "wiki/concepts/target.md", title: "Target", page_type: "concepts" },
+          { path: "wiki/index.md", title: "Index", page_type: "index" },
+        ] as T[];
+      }
+      return [] as T[];
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    const result = await harness.executeTool<{ data: { updated: number } }>("wiki_reindex_backlinks", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+    });
+
+    expect(result.data.updated).toBe(2);
+    const backlinkUpdates = harness.dbExecutes.filter((execute) => execute.sql.includes("SET backlinks"));
+    expect(backlinkUpdates).toHaveLength(2);
+    expect(backlinkUpdates[0]?.params?.[3]).toBe(JSON.stringify([]));
+    expect(backlinkUpdates[1]?.params?.[3]).toBe(JSON.stringify(["wiki/concepts/target.md"]));
+    expect(harness.dbExecutes.filter((execute) => execute.sql.includes("wiki_page_revisions"))).toHaveLength(0);
+  });
+
+  it("lists every indexed page without the former 200-row cap", async () => {
+    const harness = createTestHarness({ manifest });
+    const rows = Array.from({ length: 201 }, (_, index) => ({
+      path: `wiki/concepts/page-${String(index).padStart(3, "0")}.md`,
+      title: null,
+      page_type: "concepts",
+    }));
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string) => {
+      if (sql.includes("SELECT path, title, page_type")) return rows as T[];
+      return [] as T[];
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    const result = await harness.executeTool<{ data: { pages: unknown[] } }>("wiki_list_pages", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+    });
+
+    expect(result.data.pages).toHaveLength(201);
+    expect(harness.dbQueries.find((query) => query.sql.includes("SELECT path, title, page_type"))?.sql).not.toContain("LIMIT 200");
   });
 
   it("filters stale page and raw source rows out of browse data", async () => {

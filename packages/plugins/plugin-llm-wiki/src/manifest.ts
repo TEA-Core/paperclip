@@ -472,6 +472,20 @@ const manifest: PaperclipPluginManifestV1 = {
         },
         required: ["companyId", "wikiId"]
       }
+    },
+    {
+      name: "wiki_reindex_backlinks",
+      displayName: "Reindex Wiki Backlinks",
+      description: "Recompute indexed backlinks from current wiki page bytes without rewriting page files or creating revisions.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          companyId: { type: "string" },
+          wikiId: { type: "string" },
+          spaceSlug: { type: "string" }
+        },
+        required: ["companyId", "wikiId"]
+      }
     }
   ],
   apiRoutes: [

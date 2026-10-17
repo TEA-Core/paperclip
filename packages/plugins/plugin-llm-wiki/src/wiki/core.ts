@@ -1659,20 +1659,57 @@ function inferPageType(path: string): string | null {
   return match?.[1] ?? (path === "index.md" || path === "wiki/index.md" ? "index" : path === "log.md" || path === "wiki/log.md" ? "log" : null);
 }
 
+function canonicalWikiLink(target: string): string | null {
+  const trimmed = target.split(/[?#]/)[0]?.trim();
+  if (!trimmed || trimmed.startsWith("/") || trimmed.includes("\\")) return null;
+  const path = trimmed.startsWith("wiki/") ? trimmed : `wiki/${trimmed}`;
+  const withExtension = path.endsWith(".md") ? path : `${path}.md`;
+  try {
+    return assertPagePath(withExtension);
+  } catch {
+    return null;
+  }
+}
+
 function extractWikiLinks(contents: string): string[] {
   const links = new Set<string>();
+  const addLink = (target: string | undefined) => {
+    const canonical = target ? canonicalWikiLink(target) : null;
+    if (canonical) links.add(canonical);
+  };
   const markdownLinkPattern = /\[[^\]]+\]\(([^)]+)\)/g;
-  for (const match of contents.matchAll(markdownLinkPattern)) {
-    const target = match[1]?.split("#")[0]?.trim();
-    if (target && (target.startsWith("wiki/") || target === "index.md" || target === "log.md" || target === "AGENTS.md" || target === "IDEA.md")) {
-      links.add(target);
+  for (const match of contents.matchAll(markdownLinkPattern)) addLink(match[1]);
+  const obsidianLinkPattern = /\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]/g;
+  for (const match of contents.matchAll(obsidianLinkPattern)) addLink(match[1]);
+  const wikiTokenPattern = /\bwiki\/[A-Za-z0-9._/-]+\.md\b/g;
+  for (const match of contents.matchAll(wikiTokenPattern)) addLink(match[0]);
+  return [...links].sort();
+}
+
+async function reindexBacklinks(ctx: PluginContext, input: SpaceInput) {
+  const wikiId = normalizeWikiId(input.wikiId);
+  const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
+  const rows = await ctx.db.query<{ path: string }>(
+    `SELECT path FROM ${tableName(ctx.db.namespace, "wiki_pages")}
+      WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path`,
+    [input.companyId, wikiId, space.id],
+  );
+  let updated = 0;
+  for (const row of rows) {
+    try {
+      const contents = await ctx.localFolders.readText(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, row.path));
+      await ctx.db.execute(
+        `UPDATE ${tableName(ctx.db.namespace, "wiki_pages")}
+            SET backlinks = $4::jsonb, updated_at = now()
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 AND path = $5`,
+        [input.companyId, wikiId, space.id, jsonArrayParam(extractWikiLinks(contents)), row.path],
+      );
+      updated += 1;
+    } catch {
+      continue;
     }
   }
-  const wikiTokenPattern = /\bwiki\/[A-Za-z0-9._/-]+\.md\b/g;
-  for (const match of contents.matchAll(wikiTokenPattern)) {
-    links.add(match[0]);
-  }
-  return [...links].sort();
+  return { status: "ok", companyId: input.companyId, wikiId, spaceSlug: space.slug, updated };
 }
 
 async function readCurrentWithHash(
@@ -4244,15 +4281,28 @@ export async function registerWikiTools(ctx: PluginContext) {
     const rows = await ctx.db.query<{ path: string; title: string | null }>(
       `SELECT path, title
          FROM ${tableName(ctx.db.namespace, "wiki_pages")}
-        WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4 AND backlinks ? $3
-        ORDER BY path
-        LIMIT 200`,
+         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4 AND backlinks ? $3
+         ORDER BY path`,
       [companyId, wikiId, path, space.id],
     );
     return {
       content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
       data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: rows },
     };
+  });
+
+  ctx.tools.register("wiki_reindex_backlinks", {
+    displayName: "Reindex Wiki Backlinks",
+    description: "Recompute indexed backlinks from current wiki page bytes without rewriting page files or creating revisions.",
+    parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_reindex_backlinks")?.parametersSchema ?? { type: "object" },
+  }, async (params: unknown): Promise<ToolResult> => {
+    const input = params as ToolParams;
+    const result = await reindexBacklinks(ctx, {
+      companyId: requireString(input.companyId, "companyId"),
+      wikiId: stringField(input.wikiId),
+      spaceSlug: stringField(input.spaceSlug),
+    });
+    return { content: `Reindexed backlinks for ${result.updated} pages.`, data: result };
   });
 
   ctx.tools.register("wiki_list_pages", {
@@ -4265,7 +4315,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const rows = await ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
-      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
+      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path`,
       [companyId, wikiId, space.id],
     );
     return {
