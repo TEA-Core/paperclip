@@ -1659,9 +1659,10 @@ function inferPageType(path: string): string | null {
   return match?.[1] ?? (path === "index.md" || path === "wiki/index.md" ? "index" : path === "log.md" || path === "wiki/log.md" ? "log" : null);
 }
 
-function canonicalWikiLink(target: string): string | null {
+function canonicalWikiLink(target: string, preserveRootPath = false): string | null {
   const trimmed = target.split(/[?#]/)[0]?.trim();
   if (!trimmed || trimmed.startsWith("/") || trimmed.includes("\\")) return null;
+  if (preserveRootPath && ["index.md", "log.md", "AGENTS.md", "IDEA.md"].includes(trimmed)) return trimmed;
   const path = trimmed.startsWith("wiki/") ? trimmed : `wiki/${trimmed}`;
   const withExtension = path.endsWith(".md") ? path : `${path}.md`;
   try {
@@ -1673,12 +1674,12 @@ function canonicalWikiLink(target: string): string | null {
 
 function extractWikiLinks(contents: string): string[] {
   const links = new Set<string>();
-  const addLink = (target: string | undefined) => {
-    const canonical = target ? canonicalWikiLink(target) : null;
+  const addLink = (target: string | undefined, preserveRootPath = false) => {
+    const canonical = target ? canonicalWikiLink(target, preserveRootPath) : null;
     if (canonical) links.add(canonical);
   };
   const markdownLinkPattern = /\[[^\]]+\]\(([^)]+)\)/g;
-  for (const match of contents.matchAll(markdownLinkPattern)) addLink(match[1]);
+  for (const match of contents.matchAll(markdownLinkPattern)) addLink(match[1], true);
   const obsidianLinkPattern = /\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]/g;
   for (const match of contents.matchAll(obsidianLinkPattern)) addLink(match[1]);
   const wikiTokenPattern = /\bwiki\/[A-Za-z0-9._/-]+\.md\b/g;
