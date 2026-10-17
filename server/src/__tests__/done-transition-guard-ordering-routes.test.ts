@@ -329,6 +329,33 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       );
   }
 
+  it("does not post auth-failure comments for a rejected create before the issue exists", async () => {
+    const { companyId, agentId, issueId } = await seedIssue("AUC");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+    mockEvaluateDoneTransitionGuard.mockResolvedValue({
+      allowed: false,
+      reason: "Delivery verification failed",
+      skipped: true,
+      skipReason: "auth_failed:compare:401:scope=repo:secretName=***REDACTED***",
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      aheadBy: null,
+      ladderUnsatisfied: false,
+      mechanism: "delivery",
+      remedy: "Refresh the GitHub credential",
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Create done after auth failure", status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mockAddComment).not.toHaveBeenCalled();
+  });
+
   it("Tier-0 409 (done_transition_missing_delivery) fires before tier declaration check on a branch-ahead/no-merged-PR issue with no declaration", async () => {
     const { companyId, agentId, issueId, identifier } = await seedIssue("ORD");
     currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
