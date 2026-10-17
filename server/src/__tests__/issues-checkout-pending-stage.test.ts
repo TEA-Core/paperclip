@@ -17,7 +17,7 @@ d("issue checkout by the pending-stage participant", () => {
   }, 30_000);
   afterAll(async () => { await tempDb?.cleanup(); });
 
-  it("keeps an in_review card with a pending approval stage in_review when its participant checks it out", async () => {
+  async function seedPendingStageCard() {
     const svc = issueService(db);
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix: `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
@@ -34,9 +34,22 @@ d("issue checkout by the pending-stage participant", () => {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: cto, status: "running", contextSnapshot: { issueId: issue.id } });
     const checkedOut = await svc.checkout(issue.id, cto, ["todo", "backlog", "blocked", "in_review", "in_progress"], runId);
+    return { svc, issue, cto, runId, checkedOut };
+  }
+
+  it("keeps an in_review card with a pending approval stage in_review when its participant checks it out", async () => {
+    const { issue, checkedOut } = await seedPendingStageCard();
     const persisted = await db.select({ status: issues.status, state: issues.executionState }).from(issues).where(eq(issues.id, issue.id)).then((r) => r[0]);
     expect(checkedOut.status).toBe("in_review");
     expect((persisted.state as { status?: string } | null)?.status).toBe("pending");
     expect(persisted.status).toBe("in_review");
+  }, 60_000);
+
+  it("still refuses a release by a different live run while the in_review checkout is held", async () => {
+    const { svc, issue, cto, runId } = await seedPendingStageCard();
+    await expect(svc.release(issue.id, cto, randomUUID())).rejects.toThrow(/Only checkout run can release issue/);
+    const released = await svc.release(issue.id, cto, runId);
+    expect(released?.status).toBe("in_review");
+    expect(released?.checkoutRunId).toBeNull();
   }, 60_000);
 });

@@ -13043,7 +13043,7 @@ export function issueService(db: Db) {
         }
         if (
           actorAgentId &&
-          existing.status === "in_progress" &&
+          (existing.status === "in_progress" || existing.status === "in_review") &&
           existing.assigneeAgentId === actorAgentId &&
           existing.checkoutRunId &&
           !sameRunLock(existing.checkoutRunId, actorRunId ?? null)
