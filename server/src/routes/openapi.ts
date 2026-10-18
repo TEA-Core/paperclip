@@ -1419,6 +1419,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
+  "POST /api/issues/{id}/delivery-receipt-recovery",
   "POST /api/issues/{id}/merge-arming/republish",
   "POST /api/issues/{id}/execution-stage/board-decision",
   "GET /api/companies/{companyId}/tools/gallery",
@@ -7562,6 +7563,35 @@ registry.registerPath({
   summary: "Force-release an issue (admin)",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/delivery-receipt-recovery",
+  tags: ["issues"],
+  summary: "Recover an existing GitHub pull request delivery receipt",
+  description:
+    "Board-only recovery for an existing open, non-draft GitHub pull request. The request is bound to the exact repository, delivery branch, pull request number, and head SHA, and is idempotent by idempotencyKey. This endpoint creates a receipt only; it never writes a GitHub status.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({
+      owner: z.string().trim().min(1),
+      repo: z.string().trim().min(1),
+      pullRequestNumber: z.number().int().positive(),
+      headSha: z.string().regex(/^[0-9a-f]{40,64}$/),
+      reason: z.string().trim().min(1),
+      idempotencyKey: z.string().trim().min(1).max(255),
+    }).strict()),
+  },
+  responses: {
+    201: r.ok(),
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({

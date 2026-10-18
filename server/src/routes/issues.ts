@@ -215,6 +215,10 @@ import {
 } from "../services/approval-status-reconciler.js";
 import { prDeliveryService } from "../services/pr-delivery.js";
 import {
+  normalizeDeliveryReceiptRecoveryInput,
+  recoverDeliveryReceipt,
+} from "../services/delivery-receipt-recovery.js";
+import {
   runnerGoalService,
   RunnerGoalActionError,
   RunnerGoalConflictError,
@@ -283,6 +287,7 @@ import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
+  assertBoardOrgAccess,
   assertCompanyAccess,
   getAccessibleResource,
   getActorInfo,
@@ -4547,6 +4552,7 @@ export function issueRoutes(
             closingTransition,
             expectedHeadSha: decisionHead.headSha,
             enforceDeliveryIdentity: true,
+            requireDeliveryReceipt: true,
           },
         );
       } else {
@@ -10799,6 +10805,83 @@ export function issueRoutes(
   // decision-time head, delivery-identity enforced — instead of a human
   // hand-writing the status, which would manufacture a fake approval. Board-only;
   // an agent caller is refused before any GitHub read or write.
+  router.post("/issues/:id/delivery-receipt-recovery", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue) return;
+    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
+      const userId = req.actor.userId?.trim();
+      const membership = userId
+        ? await access.getMembership(issue.companyId, "user", userId)
+        : null;
+      const role = membership?.status === "active" ? membership.membershipRole : null;
+      if (role !== "owner" && role !== "admin") {
+        throw forbidden("Company owner or admin required to recover a delivery receipt");
+      }
+    }
+    if (issue.status === "done" || issue.status === "cancelled") {
+      res.status(409).json({ error: "Terminal issues cannot recover delivery receipts" });
+      return;
+    }
+    const state = (issue.executionState ?? {}) as Record<string, unknown>;
+    if (state.lastDecisionOutcome !== "approved") {
+      res.status(409).json({ error: "Delivery receipt recovery requires an approved decision" });
+      return;
+    }
+    const candidate: CandidateRow = {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdByAgentId: issue.createdByAgentId,
+      createdByUserId: issue.createdByUserId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      executionState: state,
+      executionPolicy: issue.executionPolicy,
+    };
+    const integrity = await evaluateStageIntegrity(db, candidate);
+    if (integrity) {
+      res.status(409).json({ error: integrity.detail, reason: integrity.reason });
+      return;
+    }
+    const ladderPolicy = issue.executionPolicy as { stages?: Array<{ id: string }> } | null;
+    const ladderState = state as {
+      completedStageIds?: string[];
+      lastDecisionOutcome?: string | null;
+    };
+    if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) {
+      res.status(409).json({ error: "Delivery receipt recovery requires a terminally approved ladder" });
+      return;
+    }
+    let recovery;
+    try {
+      recovery = normalizeDeliveryReceiptRecoveryInput(req.body ?? {});
+    } catch (error) {
+      throw badRequest(error instanceof Error ? error.message : "Invalid delivery receipt recovery request");
+    }
+    const context = await resolveIssueRepoContext(db, issue);
+    const projectRepo = context?.repoUrl ? parseRepoUrl(context.repoUrl) : null;
+    if (!projectRepo) {
+      res.status(409).json({ error: "Project repository is not resolvable" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    const result = await recoverDeliveryReceipt({
+      db,
+      companyId: issue.companyId,
+      issueId: issue.id,
+      sourceRunId: actor.runId,
+      actor,
+      recovery,
+      deliveryBranch: context?.branch ?? null,
+      projectRepo,
+    });
+    res.status(result.replayed ? 200 : 201).json({
+      receipt: result.receipt,
+      replayed: result.replayed,
+    });
+  });
+
   router.post("/issues/:id/merge-arming/republish", async (req, res) => {
     // Gate 1: board-only. Agent actors are refused here (403) before any GitHub
     // read or write — the very agents whose card may have skipped must not be able
@@ -10960,6 +11043,7 @@ export function issueRoutes(
         closingTransition: true,
         expectedHeadSha: decisionHead.headSha,
         enforceDeliveryIdentity: true,
+        requireDeliveryReceipt: true,
       },
     );
 

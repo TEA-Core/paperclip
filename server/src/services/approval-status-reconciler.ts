@@ -2869,8 +2869,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
    // (approvedHead === null) both certify by content identity without the gate.
    // A SUP-14747 backfill recovers a never-published anchor, so it too is a
    // first publish that enforces the gate.
-   let enforceDeliveryIdentity = approvedHead ? approvedHead.firstPublish : false;
-   let backfilledDetail: string | undefined;
+  let enforceDeliveryIdentity = approvedHead ? approvedHead.firstPublish : false;
+  let requireDeliveryReceipt = approvedHead ? approvedHead.firstPublish : false;
+  let backfilledDetail: string | undefined;
    if (approvedHeadSha === null) {
      // SUP-14602: no published head, but the approval-time certification may
      // have survived the skipped:ambiguous transition as pending candidates.
@@ -2884,17 +2885,19 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
        // refusal the card is left exactly as found for re-review.
        const backfill = await backfillPreDBApprovalAnchor(db, row, target, headSha);
        if (backfill.kind === "backfilled") {
-         approvedHeadSha = backfill.anchorHeadSha;
-         enforceDeliveryIdentity = true;
-         backfilledDetail = backfill.detail;
+          approvedHeadSha = backfill.anchorHeadSha;
+          enforceDeliveryIdentity = true;
+          requireDeliveryReceipt = true;
+          backfilledDetail = backfill.detail;
        } else {
          return { kind: "skipped", reason: backfill.reason, detail: backfill.detail };
        }
      } else {
        const selection = await selectOpenPendingCandidate(db, row, pending, target);
-       if ("anchor" in selection) {
-         approvedHeadSha = selection.anchor;
-       } else {
+        if ("anchor" in selection) {
+          approvedHeadSha = selection.anchor;
+          requireDeliveryReceipt = true;
+        } else {
          return { kind: "skipped", reason: selection.reason, detail: selection.detail };
        }
      }
@@ -2984,7 +2987,12 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
   }
 
-  const publishOptions: { expectedHeadSha: string; enforceDeliveryIdentity?: boolean; includeDrafts?: boolean } = {
+  const publishOptions: {
+    expectedHeadSha: string;
+    enforceDeliveryIdentity?: boolean;
+    includeDrafts?: boolean;
+    requireDeliveryReceipt?: boolean;
+  } = {
     expectedHeadSha: headSha,
     includeDrafts: true,
   };
@@ -2998,6 +3006,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // gate unset.
   if (enforceDeliveryIdentity) {
     publishOptions.enforceDeliveryIdentity = true;
+  }
+  if (requireDeliveryReceipt) {
+    publishOptions.requireDeliveryReceipt = true;
   }
   const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", publishOptions);
   if (outcome.kind === "armed") {

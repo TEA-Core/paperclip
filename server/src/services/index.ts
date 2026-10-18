@@ -253,6 +253,14 @@ export {
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { armMergeOnApproval, publishApprovalStatus, shouldPublishApprovalStatus, type ArmingOutcome, type MergeArmingDecision } from "./merge-arming.js";
 export {
+  claimDeliveryReceipt,
+  claimDeliveryReceiptForPublication,
+  consumeDeliveryReceipt,
+  invalidateDeliveryReceipt,
+  normalizeDeliveryReceiptRecoveryInput,
+  recoverDeliveryReceipt,
+} from "./delivery-receipt-recovery.js";
+export {
   runApprovalStatusReconcilerTick,
   startApprovalStatusReconciler,
   type ApprovalStatusReconcilerSchedule,
