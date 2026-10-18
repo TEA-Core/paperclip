@@ -2073,6 +2073,13 @@
       "when": 1790566653000,
       "tag": "0297_activity_log_board_api_key_id",
       "breakpoints": true
+    },
+    {
+      "idx": 296,
+      "version": "7",
+      "when": 1792306695236,
+      "tag": "0298_issue_delivery_receipts",
+      "breakpoints": true
     }
   ]
 }
