@@ -72,7 +72,7 @@ function twoPluginDispatcher(): PluginToolDispatcher {
     executeTool: async () => ({
       pluginId: "plugin-a",
       toolName: "alpha",
-      result: { ok: true },
+      result: { data: { ok: true } },
     }),
     registerPluginTools: () => {},
     unregisterPluginTools: () => {},
