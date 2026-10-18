@@ -228,13 +228,22 @@ export function validateToolContent(input: {
   const sensitiveMode = input.sensitiveMode ?? "redact";
   const promptInjectionMode = input.promptInjectionMode ?? (input.direction === "result" ? "block" : "ignore");
   const redactedValue = isPlainObject(input.value) ? redactEventPayload(input.value) : input.value;
-  const redactedSummary = summarizeToolValue(redactedValue);
   const findings: string[] = [];
+  const redactedSummary = summarizeToolValue(redactedValue);
 
   if (redactedSummary.redactedFields?.length) {
     findings.push("sensitive_value");
     if (sensitiveMode === "block") {
       throw new ToolContentValidationError("Tool content contains sensitive values", "sensitive_value_blocked", findings);
+    }
+    if (input.direction === "result" && isPlainObject(redactedValue)) {
+      Object.assign(redactedValue, {
+        redacted: true,
+        redactedFields: [...new Set([...(Array.isArray(redactedValue.redactedFields) ? redactedValue.redactedFields : []), ...findings])],
+      });
+      if (isPlainObject(redactedValue.data) && typeof redactedValue.content === "string" && typeof redactedValue.data.hash === "string") {
+        redactedValue.data.hash = createHash("sha256").update(redactedValue.content, "utf8").digest("hex");
+      }
     }
   }
 
@@ -252,7 +261,7 @@ export function validateToolContent(input: {
 
   return {
     value: redactedValue,
-    summary: redactedSummary,
+    summary: summarizeToolValue(redactedValue),
     findings,
   };
 }

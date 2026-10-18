@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   canonicalToolArguments,
@@ -69,6 +70,40 @@ describe("tool content guards", () => {
     expect(result.summary.summary).toContain("***REDACTED***");
     expect(result.summary.summary).not.toContain("sk-secret-value");
     expect(result.findings).toContain("sensitive_value");
+  });
+
+  it("marks redacted result bodies so read-modify-write callers cannot trust stale hashes", () => {
+    const result = validateToolContent({
+      value: { content: "Authorization: Bearer raw-secret", data: { hash: "on-disk-hash" } },
+      direction: "result",
+    });
+
+    expect(result.value).toMatchObject({ redacted: true, redactedFields: ["sensitive_value"] });
+    expect(result.value).not.toMatchObject({ content: expect.stringContaining("raw-secret") });
+    expect(result.value).toMatchObject({
+      data: {
+        hash: createHash("sha256").update("Authorization: ***REDACTED***").digest("hex"),
+      },
+    });
+    expect(result.summary.sha256).toHaveLength(64);
+  });
+
+  it("summarizes the returned redacted body rather than the stale plugin hash", () => {
+    const result = validateToolContent({
+      value: { content: "Authorization: Bearer raw-secret", data: { hash: "on-disk-hash" } },
+      direction: "result",
+    });
+
+    expect(result.summary.sha256).toBe(
+      createHash("sha256")
+        .update(JSON.stringify({
+          content: "Authorization: ***REDACTED***",
+          data: { hash: createHash("sha256").update("Authorization: ***REDACTED***").digest("hex") },
+          redacted: true,
+          redactedFields: ["sensitive_value"],
+        }))
+        .digest("hex"),
+    );
   });
 
   it("blocks prompt injection in tool results before returning to the agent", () => {
