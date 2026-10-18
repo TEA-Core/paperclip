@@ -47,6 +47,8 @@ export { issueRecoveryActions } from "./issue_recovery_actions.js";
 export { issueReferenceMentions } from "./issue_reference_mentions.js";
 export { externalObjects } from "./external_objects.js";
 export { externalObjectMentions } from "./external_object_mentions.js";
+export { issueDeliveryReceipts, ISSUE_DELIVERY_RECEIPT_STATES, ISSUE_DELIVERY_RECEIPT_PROVIDERS, ISSUE_DELIVERY_RECEIPT_ACTOR_TYPES } from "./issue_delivery_receipts.js";
+export { issueDeliveryReceiptLinks } from "./issue_delivery_receipt_links.js";
 export { connectionEventDeliveries } from "./connection_event_deliveries.js";
 export {
   chatEndpoints,
