@@ -54,6 +54,13 @@ function twoPluginDispatcher(): PluginToolDispatcher {
         pluginId: "plugin-a",
       },
       {
+        name: "wiki_append_log",
+        displayName: "Append Wiki Log (unscoped)",
+        description: "A mutating unscoped tool.",
+        parametersSchema: { type: "object" },
+        pluginId: "plugin-a",
+      },
+      {
         name: "c.d:beta",
         displayName: "C Beta",
         description: "A tool from plugin c.d.",
@@ -69,7 +76,7 @@ function twoPluginDispatcher(): PluginToolDispatcher {
     }),
     registerPluginTools: () => {},
     unregisterPluginTools: () => {},
-    toolCount: () => 3,
+    toolCount: () => 4,
     getRegistry: () => {
       throw new Error("not implemented");
     },
@@ -143,6 +150,12 @@ async function allowBothPluginTools(db: TestDb, companyId: string) {
     policyType: "allow",
     selectors: { toolName: "a.b:wiki_append_log" },
   });
+  await db.insert(toolPolicies).values({
+    companyId,
+    name: "Allow wiki_append_log",
+    policyType: "allow",
+    selectors: { toolName: "wiki_append_log" },
+  });
 }
 
 describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
@@ -189,9 +202,15 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       runId: run.id,
     });
 
-    const tool = (await gateway.listToolsForSession(session.token)).find((entry) => entry.name === "a.b:wiki_append_log");
-
-    expect(tool).toMatchObject({ providerType: "paperclip_plugin", risk: "write" });
+    const tools = await gateway.listToolsForSession(session.token);
+    expect(tools.find((entry) => entry.name === "a.b:wiki_append_log")).toMatchObject({
+      providerType: "paperclip_plugin",
+      risk: "write",
+    });
+    expect(tools.find((entry) => entry.name === "wiki_append_log")).toMatchObject({
+      providerType: "paperclip_plugin",
+      risk: "write",
+    });
   });
 
   it("scopes the session listing to the agent's pluginTools allowlist", async () => {
