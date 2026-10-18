@@ -1,8 +1,10 @@
 import type { Db } from "@paperclipai/db";
-import { and, eq, ilike, sql, type SQL } from "drizzle-orm";
+import { and, eq, ilike, inArray, sql, type SQL } from "drizzle-orm";
 import {
   externalObjectMentions,
   externalObjects,
+  issueDeliveryReceiptLinks,
+  issueDeliveryReceipts,
   issues,
   executionWorkspaces,
   projectWorkspaces,
@@ -16,6 +18,12 @@ import {
 } from "./github-credential.js";
 import { inheritedExecutionWorkspaceBranchExempt } from "./execution-workspace-policy.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
+import {
+  claimDeliveryReceiptForPublication,
+  consumeDeliveryReceipt,
+  invalidateDeliveryReceipt,
+  type DeliveryReceiptClaim,
+} from "./delivery-receipt-recovery.js";
 
 export {
   isGitHubTokenResolution,
@@ -1234,6 +1242,92 @@ export async function markPullRequestReadyForReview(
   }
 }
 
+type DeliveryReceiptPublicationContext = {
+  claim: DeliveryReceiptClaim;
+};
+
+async function claimReceiptForPublication(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: LinkedPullRequest,
+  headSha: string,
+  required: boolean,
+): Promise<DeliveryReceiptPublicationContext | ArmingOutcome | null> {
+  const receipts = await db
+    .select({ id: issueDeliveryReceipts.id, headSha: issueDeliveryReceipts.headSha })
+    .from(issueDeliveryReceipts)
+    .innerJoin(
+      issueDeliveryReceiptLinks,
+      and(
+        eq(issueDeliveryReceiptLinks.companyId, issueDeliveryReceipts.companyId),
+        eq(issueDeliveryReceiptLinks.receiptId, issueDeliveryReceipts.id),
+        eq(issueDeliveryReceiptLinks.sourceIssueId, issueDeliveryReceipts.sourceIssueId),
+        eq(issueDeliveryReceiptLinks.headSha, issueDeliveryReceipts.headSha),
+      ),
+    )
+    .where(and(
+      eq(issueDeliveryReceipts.companyId, companyId),
+      eq(issueDeliveryReceipts.sourceIssueId, issueId),
+      eq(issueDeliveryReceipts.provider, "github"),
+      eq(issueDeliveryReceipts.owner, pr.owner),
+      eq(issueDeliveryReceipts.repo, pr.repo),
+      eq(issueDeliveryReceipts.pullRequestNumber, pr.number),
+      eq(issueDeliveryReceiptLinks.provider, "github"),
+      eq(issueDeliveryReceiptLinks.owner, pr.owner),
+      eq(issueDeliveryReceiptLinks.repo, pr.repo),
+      eq(issueDeliveryReceiptLinks.pullRequestNumber, pr.number),
+    ));
+  if (receipts.length === 0) {
+    return required
+      ? {
+          kind: "skipped",
+          message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board-authorized receipt for head ${headSha.slice(0, 7)}`,
+          headSha,
+        }
+      : null;
+  }
+  if (!receipts.some((receipt) => receipt.headSha === headSha)) {
+    await db
+      .update(issueDeliveryReceipts)
+      .set({ state: "invalidated", invalidatedAt: new Date(), updatedAt: new Date() })
+      .where(and(
+        eq(issueDeliveryReceipts.companyId, companyId),
+        inArray(issueDeliveryReceipts.id, receipts.map((receipt) => receipt.id)),
+        eq(issueDeliveryReceipts.state, "ready"),
+      ));
+    return {
+      kind: "skipped",
+      message: `status:skipped:delivery-receipt-head_mismatch: ${pr.displayName} is not authorized for head ${headSha.slice(0, 7)}`,
+      headSha,
+    };
+  }
+  const lookup = await claimDeliveryReceiptForPublication(db, {
+    companyId,
+    issueId,
+    owner: pr.owner,
+    repo: pr.repo,
+    pullRequestNumber: pr.number,
+    headSha,
+  });
+  if (lookup.kind === "claimed") {
+    return { claim: lookup.claim };
+  }
+  if (lookup.kind === "missing" && !required) return null;
+  if (lookup.kind === "missing") {
+    return {
+      kind: "skipped",
+      message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board-authorized receipt for head ${headSha.slice(0, 7)}`,
+      headSha,
+    };
+  }
+  return {
+    kind: "skipped",
+    message: `status:skipped:delivery-receipt-${lookup.reason}: ${pr.displayName} is not authorized for head ${headSha.slice(0, 7)}`,
+    headSha,
+  };
+}
+
 export interface PublishApprovalStatusOptions {
   /**
    * SUP-13714 TOCTOU pin. When set, the live head re-resolved just before the
@@ -1268,6 +1362,7 @@ export interface PublishApprovalStatusOptions {
    */
   enforceDeliveryIdentity?: boolean;
   includeDrafts?: boolean;
+  requireDeliveryReceipt?: boolean;
 }
 
 /**
@@ -2157,6 +2252,28 @@ export async function publishApprovalStatus(
           headSha,
         };
       }
+      const receipt = await claimReceiptForPublication(
+        db,
+        companyId,
+        issueId,
+        {
+          id: "",
+          owner: pr.owner,
+          repo: pr.repo,
+          number: pr.number,
+          nodeId: null,
+          headRefName: pr.headRefName,
+          title: pr.title,
+          displayName: pr.displayName,
+          cachedState: "open",
+          lastErrorCode: null,
+          reviewDecision: null,
+          draft: pr.draft,
+        },
+        headSha,
+        options?.requireDeliveryReceipt === true,
+      );
+      if (receipt && "kind" in receipt) return receipt;
       // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
       // recording a failure; a deterministic refusal returns after one attempt.
       const result = await writeCommitStatusWithRetry(
@@ -2167,6 +2284,13 @@ export async function publishApprovalStatus(
         issueIdentifier,
       );
       if (result.success) {
+        if (receipt) {
+          const consumed = await consumeDeliveryReceipt(db, receipt.claim);
+          if (!consumed) {
+            await invalidateDeliveryReceipt(db, receipt.claim);
+            return { kind: "failed", message: "status:failed:delivery-receipt-consume: receipt could not be consumed after status publication" };
+          }
+        }
         return {
           kind: "armed",
           message: `status:published (live re-resolve): paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
@@ -2191,6 +2315,7 @@ export async function publishApprovalStatus(
         };
       }
 
+      if (receipt) await invalidateDeliveryReceipt(db, receipt.claim);
       const safeError = result.error ?? "unknown_error";
       const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
       return { kind: "failed", message: `status:failed:${truncated}` };
@@ -2303,10 +2428,26 @@ export async function publishApprovalStatus(
         headSha,
       };
     }
+    const receipt = await claimReceiptForPublication(
+      db,
+      companyId,
+      issueId,
+      pr,
+      headSha,
+      options?.requireDeliveryReceipt === true,
+    );
+    if (receipt && "kind" in receipt) return receipt;
     // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
     // recording a failure; a deterministic refusal returns after one attempt.
     const result = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier);
     if (result.success) {
+      if (receipt) {
+        const consumed = await consumeDeliveryReceipt(db, receipt.claim);
+        if (!consumed) {
+          await invalidateDeliveryReceipt(db, receipt.claim);
+          return { kind: "failed", message: "status:failed:delivery-receipt-consume: receipt could not be consumed after status publication" };
+        }
+      }
       return {
         kind: "armed",
         message: `status:published: paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
@@ -2317,6 +2458,7 @@ export async function publishApprovalStatus(
       };
     }
 
+    if (receipt) await invalidateDeliveryReceipt(db, receipt.claim);
     const safeError = result.error ?? "unknown_error";
     const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
     return { kind: "failed", message: `status:failed:${truncated}` };
