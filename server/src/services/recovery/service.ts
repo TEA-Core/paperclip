@@ -7548,12 +7548,14 @@ export function recoveryService(
           ? [idempotencyKey]
           : [
               idempotencyKey,
-              ...(readiness?.blockerIssueIds ?? []).map((blockerIssueId) =>
-                buildIssueBlockersResolvedWakeIdempotencyKey({
-                  dependentIssueId: candidate.id,
-                  resolvedBlockerIssueId: blockerIssueId,
-                })
-              ),
+              ...(resolvedBlockerIssueId
+                ? [
+                    buildIssueBlockersResolvedWakeIdempotencyKey({
+                      dependentIssueId: candidate.id,
+                      resolvedBlockerIssueId,
+                    }),
+                  ]
+                : []),
             ];
         const existingWake = zeroBlockerHeal
           ? await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
@@ -7636,14 +7638,31 @@ export function recoveryService(
           }
         }
 
+        const legacyWakeKeys = idempotencyKeys.slice(1);
+        const stateWakeKeys = idempotencyKeys.slice(0, 1);
+        const wakeKeyPredicate = resolvedBlockerIssueId
+          ? or(
+              ...(legacyWakeKeys.length > 0
+                ? [inArray(agentWakeupRequests.idempotencyKey, legacyWakeKeys)]
+                : []),
+              ...(stateWakeKeys.length > 0
+                ? [
+                    and(
+                      inArray(agentWakeupRequests.idempotencyKey, stateWakeKeys),
+                      sql`${agentWakeupRequests.payload} ->> 'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
+                    ),
+                  ]
+                : []),
+            )
+          : inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys);
         const consumedWakes = idempotencyKeys.length > 0 ? await db
           .select({ count: count() })
           .from(agentWakeupRequests)
           .where(
             and(
               eq(agentWakeupRequests.companyId, companyId),
-              inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys),
-              inArray(agentWakeupRequests.status, ["completed","failed","timed_out"]),
+              inArray(agentWakeupRequests.status, ["completed", "failed", "timed_out"]),
+              wakeKeyPredicate,
             ),
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
@@ -7714,7 +7733,7 @@ export function recoveryService(
               and(
                 eq(agentWakeupRequests.companyId, companyId),
                 eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON),
-                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${candidate.id}`,
+                wakeKeyPredicate,
                 gte(agentWakeupRequests.requestedAt, since),
               ),
             )

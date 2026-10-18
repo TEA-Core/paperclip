@@ -1489,6 +1489,88 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     },
   );
 
+  it("counts the re-arm cap per resolved blocker instead of across all blockers", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const secondBlockerIssueId = randomUUID();
+    const windowMs = 6 * 60 * 60 * 1000;
+    const withinWindow = new Date(Date.now() - 30 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: secondBlockerIssueId,
+      companyId,
+      title: "Synthetic second completed blocker",
+      status: "done",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: "R-MULTI-3",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: secondBlockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    const readiness = await issueService(db).getDependencyReadiness(blockedIssueId);
+    const resolvedBlockerIssueId = readiness.blockerIssueIds[0];
+    const priorBlockerIssueId = readiness.blockerIssueIds[1];
+    expect(resolvedBlockerIssueId).toBeTruthy();
+    expect(priorBlockerIssueId).toBeTruthy();
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: priorBlockerIssueId,
+        blockerIssueIds: readiness.blockerIssueIds,
+      },
+      status: "completed",
+      idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${priorBlockerIssueId}`,
+      createdAt: withinWindow,
+      updatedAt: withinWindow,
+      finishedAt: withinWindow,
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      now: new Date(),
+      rearmWindowMs: windowMs,
+      rearmMaxCount: 1,
+    });
+
+    expect(result).toMatchObject({
+      healed: 1,
+      reArmCapEscalated: 0,
+      issueIds: [blockedIssueId],
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+
+    const wakes = await db
+      .select({
+        payload: agentWakeupRequests.payload,
+        status: agentWakeupRequests.status,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+        ),
+      );
+    expect(wakes).toHaveLength(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          resolvedBlockerIssueId,
+        }),
+      }),
+    );
+  });
+
   it("enforces the re-arm cap and suppresses further wakes once consumed count reaches the limit", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
