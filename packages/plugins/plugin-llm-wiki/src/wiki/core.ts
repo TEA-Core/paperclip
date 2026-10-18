@@ -4200,7 +4200,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     } catch {
       current = "# Log\n\nAppend-only chronological record of wiki operations.\n";
     }
-    const next = `${current.trimEnd()}\n\n- ${new Date().toISOString()} ${entry}\n`;
+    const next = `${current.trimEnd()}\n\n${entry}\n- logged: ${new Date().toISOString()}\n`;
     await ctx.localFolders.writeTextAtomic(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, "wiki/log.md"), next);
     await upsertPageMetadata(ctx, {
       companyId,

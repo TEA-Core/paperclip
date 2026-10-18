@@ -672,6 +672,9 @@ function summarizeResult(result: unknown): Record<string, unknown> {
 
 function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
   const lower = toolName.toLowerCase();
+  if (lower === "wiki_append_log" || lower.endsWith(":wiki_append_log")) {
+    return "write";
+  }
   if (
     /\b(delete|destroy|remove|drop|truncate|wipe|purge)\b|(^|[:._-])(delete|destroy|remove|drop|truncate|wipe|purge)([:._-]|$)/.test(
       lower,

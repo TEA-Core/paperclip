@@ -47,6 +47,13 @@ function twoPluginDispatcher(): PluginToolDispatcher {
         pluginId: "plugin-a",
       },
       {
+        name: "a.b:wiki_append_log",
+        displayName: "Append Wiki Log",
+        description: "A mutating tool from plugin a.b.",
+        parametersSchema: { type: "object" },
+        pluginId: "plugin-a",
+      },
+      {
         name: "c.d:beta",
         displayName: "C Beta",
         description: "A tool from plugin c.d.",
@@ -62,7 +69,7 @@ function twoPluginDispatcher(): PluginToolDispatcher {
     }),
     registerPluginTools: () => {},
     unregisterPluginTools: () => {},
-    toolCount: () => 2,
+    toolCount: () => 3,
     getRegistry: () => {
       throw new Error("not implemented");
     },
@@ -130,6 +137,12 @@ async function allowBothPluginTools(db: TestDb, companyId: string) {
     policyType: "allow",
     selectors: { toolName: "c.d:beta" },
   });
+  await db.insert(toolPolicies).values({
+    companyId,
+    name: "Allow a.b:wiki_append_log",
+    policyType: "allow",
+    selectors: { toolName: "a.b:wiki_append_log" },
+  });
 }
 
 describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
@@ -164,6 +177,21 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("publishes wiki_append_log as a write-risk plugin tool", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    const tool = (await gateway.listToolsForSession(session.token)).find((entry) => entry.name === "a.b:wiki_append_log");
+
+    expect(tool).toMatchObject({ providerType: "paperclip_plugin", risk: "write" });
   });
 
   it("scopes the session listing to the agent's pluginTools allowlist", async () => {
