@@ -10,6 +10,8 @@ import {
   externalObjectMentions,
   externalObjects,
   issueComments,
+  issueDeliveryReceiptLinks,
+  issueDeliveryReceipts,
   issueExecutionDecisions,
   issues,
   projects,
@@ -135,7 +137,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const GITHUB_TOKEN = "ghp_test_token_value";
-const NEW_HEAD = "new0000000000000000000000000000000000000002";
+const NEW_HEAD = "a000000000000000000000000000000000000002";
 const APPROVED_HEAD = "approved00000000000000000000000000000000001";
 const MOVED_HEAD = "moved0000000000000000000000000000000000000004";
 const APPROVED_AT = "2026-08-20T00:00:00Z";
@@ -491,6 +493,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     // SUP-15211: the reconciler's approvalStatus writes now emit an activity_log
     // row; clear it first so the company delete isn't blocked by the FK.
     await db.delete(activityLog);
+    await db.delete(issueDeliveryReceiptLinks);
+    await db.delete(issueDeliveryReceipts);
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
@@ -528,6 +532,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   afterEach(async () => {
     // SUP-15211: clear audit rows first (they FK-reference the company).
     await db.delete(activityLog);
+    await db.delete(issueDeliveryReceiptLinks);
+    await db.delete(issueDeliveryReceipts);
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
@@ -634,6 +640,91 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
    * seeded branch/repo match the cached mention's head ref and TEA-Core/paperclip
    * so the linked PR is "delivered by the card".
    */
+  async function seedAuthorizedDeliveryReceipt(
+    issueId: string,
+    headSha: string,
+    branchName: string,
+    pullRequestNumber = 42,
+    owner = "TEA-Core",
+  ) {
+    const receiptOwner = owner.toLowerCase();
+    const receiptOwners = [...new Set([owner, receiptOwner])];
+    for (const [index, receiptOwnerVariant] of receiptOwners.entries()) {
+      const [externalObject] = await db
+        .insert(externalObjects)
+        .values({
+          companyId,
+          providerKey: "github",
+          objectType: "pull_request",
+          externalId: `${receiptOwnerVariant}/paperclip#pull/${pullRequestNumber}`,
+          data: {
+            state: "open",
+            draft: false,
+            node_id: `fixture-pr-${pullRequestNumber}-${index}`,
+            head: { ref: branchName, sha: headSha },
+            title: `Fix thing (SUP-${pullRequestNumber})`,
+          },
+        })
+        .onConflictDoUpdate({
+          target: [
+            externalObjects.companyId,
+            externalObjects.providerKey,
+            externalObjects.objectType,
+            externalObjects.externalId,
+          ],
+          set: {
+            data: {
+              state: "open",
+              draft: false,
+              node_id: `fixture-pr-${pullRequestNumber}-${index}`,
+              head: { ref: branchName, sha: headSha },
+              title: `Fix thing (SUP-${pullRequestNumber})`,
+            },
+          },
+        })
+        .returning({ id: externalObjects.id });
+      if (index === 0) {
+        await db.insert(externalObjectMentions).values({
+          companyId,
+          sourceIssueId: issueId,
+          sourceKind: "comment",
+          objectId: externalObject!.id,
+          objectType: "pull_request",
+          providerKey: "github",
+        });
+      }
+      const receiptId = randomUUID();
+      await db.insert(issueDeliveryReceipts).values({
+        id: receiptId,
+        companyId,
+        sourceIssueId: issueId,
+        provider: "github",
+        owner: receiptOwnerVariant,
+        repo: "paperclip",
+        pullRequestNumber,
+        headSha,
+        branchName,
+        sourceDeliveryRecord: { fixture: true },
+        recoveryReason: "authorized test publication",
+        authorizedByActorType: "user",
+        authorizedByActorId: USER_REVIEWER,
+        idempotencyKey: `fixture-${issueId}-${headSha}-${index}`,
+        state: "ready",
+      });
+      await db.insert(issueDeliveryReceiptLinks).values({
+        companyId,
+        receiptId,
+        sourceIssueId: issueId,
+        externalObjectId: externalObject!.id,
+        provider: "github",
+        owner: receiptOwnerVariant,
+        repo: "paperclip",
+        pullRequestNumber,
+        headSha,
+      });
+    }
+  }
+
   async function seedDeliveryIdentity(issueId: string, branch: string, repoUrl: string) {
     const [projectRow] = await db
       .insert(projects)
@@ -2559,6 +2650,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         await insertDecision(issueId);
         await insertMention(issueId, { number: 42, state: "open" });
         await insertMention(issueId, { number: 43, state: "closed" });
+        await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
         installRoutes([
           { url: PR_URL, body: OPEN_PR_BODY },
@@ -2595,6 +2687,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         await insertDecision(issueId);
         await insertMention(issueId, { number: 42, state: "open" });
         await insertMention(issueId, { number: 43, state: "closed" });
+        await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
         installRoutes([
           { url: PR_URL, body: OPEN_PR_BODY },
@@ -2767,6 +2860,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         await insertDecision(issueId);
         await insertMention(issueId, { number: 42, state: "open" });
         await insertMention(issueId, { number: 43, state: "closed" });
+        await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
         installRoutes([
           { url: PR_URL, body: OPEN_PR_BODY },
@@ -2786,6 +2880,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         await insertDecision(issueId);
         await insertMention(issueId, { number: 42, state: "open" });
         await insertMention(issueId, { number: 43, state: "closed" });
+        await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
         installRoutes([
           { url: PR_URL, body: OPEN_PR_BODY },
@@ -3046,6 +3141,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId);
       await insertMention(issueId);
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -3297,6 +3393,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId);
       await insertMention(issueId, { draft: true });
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: { ...OPEN_PR_BODY, draft: false } },
@@ -3395,6 +3492,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       // The card's delivery identity matches the linked PR (branch + repo), so
       // the first publish's delivery-identity gate passes.
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -3492,6 +3590,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       // The card's delivery identity matches the linked PR, so the first
       // publish's ADR-091 D1 delivery-identity gate passes.
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -4554,6 +4653,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId);
       await insertMention(issueId);
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -4597,6 +4697,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId, { createdAt: new Date(PR448_APPROVAL_AT) });
       await insertMention(issueId);
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -4659,6 +4760,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId, { createdAt: new Date(PR448_APPROVAL_MS) });
       await insertMention(issueId);
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, PR448_HEAD_SHA, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: PR448_PR_BODY },
@@ -4712,6 +4814,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId);
       await insertMention(issueId);
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -5138,6 +5241,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId); // first approval at APPROVED_AT (2026-08-20T00:00:00Z)
       await insertMention(issueId);
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -5206,6 +5310,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId);
       await insertMention(issueId);
       await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
