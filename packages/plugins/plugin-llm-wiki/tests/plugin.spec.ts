@@ -1532,6 +1532,35 @@ Duplicate headings receive stable suffixes.
     expect(pages.content).toBe("No pages indexed yet.");
   });
 
+  it("preserves caller-supplied log headings at column zero", async () => {
+    const harness = createTestHarness({ manifest });
+    const files = new Map<string, string>([["wiki/log.md", "# Log\n\nAppend-only chronological record of wiki operations.\n"]]);
+    const writes: Array<{ path: string; contents: string }> = [];
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const contents = files.get(relativePath);
+      if (contents == null) throw new Error(`missing ${relativePath}`);
+      return contents;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      writes.push({ path: relativePath, contents });
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.executeTool("wiki_append_log", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+      entry: "## [2026-10-18] lint | append-tool regression probe",
+    });
+
+    const log = files.get("wiki/log.md") ?? "";
+    expect(writes).toHaveLength(1);
+    expect(log).toContain("\n\n## [2026-10-18] lint | append-tool regression probe\n");
+    expect(log.split("\n").some((line) => line.startsWith("- ") && line.includes("## [2026-10-18]"))).toBe(false);
+    expect(log.split("\n").some((line) => line.startsWith("- logged: "))).toBe(true);
+  });
+
   it("filters stale page and raw source rows out of browse data", async () => {
     const harness = createTestHarness({ manifest });
     const files = new Map<string, string>([
