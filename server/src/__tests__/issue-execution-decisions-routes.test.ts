@@ -23,6 +23,8 @@ import {
   issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
+  issueDeliveryReceipts,
+  issueDeliveryReceiptLinks,
 } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -210,6 +212,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
   afterEach(async () => {
     github.mockReset();
+    await db.delete(issueDeliveryReceiptLinks);
+    await db.delete(issueDeliveryReceipts);
     await db.delete(activityLog);
     await db.delete(companyMemberships);
     await db.delete(externalObjectMentions);
@@ -287,18 +291,35 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       number: 42, state: "open", draft, merged: false, node_id: "sandbox-pr",
       title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
     };
-    if (repo && !missing && !unmentioned) {
+    if (repo && !missing) {
       const [object] = await db.insert(externalObjects).values({
         companyId: company.id, providerKey: "github", objectType: "pull_request",
         externalId: "TEA-Core/paperclip#pull/42", displayKey: "42", displayTitle: identifier,
         sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/42",
         canonicalIdentityHash: randomUUID(), data: pr,
       }).returning();
-      await db.insert(externalObjectMentions).values({
-        companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
-        objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
-        matchedTextRedacted: "delivery", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
-        canonicalIdentityHash: object!.canonicalIdentityHash, canonicalIdentity: {},
+      if (!unmentioned) {
+        await db.insert(externalObjectMentions).values({
+          companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
+          objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
+          matchedTextRedacted: "delivery", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
+          canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
+        });
+      }
+      await db.insert(issueDeliveryReceipts).values({
+        companyId: company.id, sourceIssueId: issue.id, provider: "github",
+        owner: "tea-core", repo: "paperclip", pullRequestNumber: pr.number,
+        headSha: pr.head.sha, branchName: branch, sourceDeliveryRecord: { fixture: true },
+        recoveryReason: "authorized test publication", authorizedByActorType: "user",
+        authorizedByActorId: "board-user", idempotencyKey: `fixture-${issue.id}-${pr.head.sha}`, state: "ready",
+      });
+      const [receipt] = await db.select({ id: issueDeliveryReceipts.id })
+        .from(issueDeliveryReceipts)
+        .where(eq(issueDeliveryReceipts.sourceIssueId, issue.id));
+      await db.insert(issueDeliveryReceiptLinks).values({
+        companyId: company.id, receiptId: receipt!.id, sourceIssueId: issue.id,
+        externalObjectId: object!.id, provider: "github", owner: "tea-core", repo: "paperclip",
+        pullRequestNumber: pr.number, headSha: pr.head.sha,
       });
     }
     const writes: Array<{ url: string; body: unknown }> = [];
