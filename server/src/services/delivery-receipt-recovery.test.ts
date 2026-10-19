@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { canonicalizeExternalObjectUrl } from "@paperclipai/shared/external-objects-server";
 import {
+  buildRecoveredExternalObjectIdentity,
   claimDeliveryReceipt,
   claimDeliveryReceiptForPublication,
   consumeDeliveryReceipt,
@@ -19,6 +21,16 @@ function updateDb(returning: unknown[]) {
 }
 
 describe("delivery receipt recovery", () => {
+  it("uses the shared canonical URL and identity hash for recovered PR objects", () => {
+    const url = "https://github.com/TEA-Core/paperclip/pull/579";
+    const canonical = canonicalizeExternalObjectUrl(url)!;
+    expect(buildRecoveredExternalObjectIdentity({ owner: "TEA-Core", repo: "paperclip", pullRequestNumber: 579 })).toEqual({
+      sanitizedCanonicalUrl: canonical.sanitizedCanonicalUrl,
+      canonicalIdentityHash: canonical.canonicalIdentityHash,
+      canonicalIdentity: canonical.canonicalIdentity,
+    });
+  });
+
   it("normalizes exact recovery coordinates and rejects non-canonical input", () => {
     expect(normalizeDeliveryReceiptRecoveryInput({
       owner: "TEA-Core",
