@@ -752,7 +752,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 1 (landed, not liveness-probed): delivery guard skipped, no credentials. Liveness unverified.",
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip — delivery guard skipped, no credentials. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -800,7 +800,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       ],
       [
         "T1",
-        "Closed at Tier 1 (landed, not liveness-probed): delivery guard skipped on auth failure. Liveness unverified.",
+        "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — delivery guard skipped on auth failure. Liveness unverified.",
       ],
     ] as const) {
       const { companyId, reviewerAgentId, issueId, identifier } =
@@ -863,7 +863,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip — nothing to land. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);

@@ -5229,7 +5229,7 @@ describe("evaluateDoneTierDeclaration", () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
-        "Closed at Tier 1 (landed, not liveness-probed): production probe unavailable. Liveness unverified.",
+        "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — production probe unavailable. Liveness unverified.",
         null,
         () => Promise.resolve([]),
       );
@@ -5261,6 +5261,50 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(false);
       expect(result.tier).toBe(null);
     });
+
+    it.each([
+      [
+        "a bare head SHA",
+        "Closed at Tier 1 (landed, not liveness-probed): scoped fix present on carrier head 9cfc4855. Liveness unverified.",
+        "landed-at-tip",
+      ],
+      [
+        "a delegated landing without its backstop",
+        "Closed at Tier 1 (landed, not liveness-probed): landing-delegated — PR #4103 still open at close. Liveness unverified.",
+        "done-close-landing-backstop",
+      ],
+      [
+        "a merged PR without the landed state token",
+        "Closed at Tier 1 (landed, not liveness-probed): PR #928 merged at abc1234. Liveness unverified.",
+        "landed-at-tip",
+      ],
+    ])("rejects Tier 1 with %s and names the missing token", async (_label, declaration, missingToken) => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        declaration,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain(missingToken);
+    });
+
+    it.each([
+      "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — PR #928 merged at abc1234, ancestor of origin/main; probe unavailable. Liveness unverified.",
+      "Closed at Tier 1 (landed, not liveness-probed): landing-delegated — PR #4103 still open; landing obligation transferred to done-close-landing-backstop. Liveness unverified.",
+    ])("accepts SUP-20292 Tier 1 form: %s", async (declaration) => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        declaration,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
   });
 
   describe("no accompanying comment — same-run comment lookup", () => {
@@ -5284,7 +5328,7 @@ describe("evaluateDoneTierDeclaration", () => {
         "run-1",
         () => Promise.resolve([
           mockComment(
-            "Closed at Tier 1 (landed, not liveness-probed): probe unavailable. Liveness unverified.",
+            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — probe unavailable. Liveness unverified.",
             "run-1",
           ),
         ]),

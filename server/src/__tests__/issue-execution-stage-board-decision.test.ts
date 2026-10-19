@@ -525,7 +525,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .send({
         status: "done",
         ...override,
-        comment: "Closed at Tier 1 (landed, not liveness-probed): before. Liveness unverified.",
+        comment: "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — before. Liveness unverified.",
       });
     expect(refused.status, JSON.stringify(refused.body)).not.toBe(200);
 
@@ -539,7 +539,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .send({
         status: "done",
         ...override,
-        comment: "Closed at Tier 1 (landed, not liveness-probed): after. Liveness unverified.",
+        comment: "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — after. Liveness unverified.",
       });
     expect(closed.status, JSON.stringify(closed.body)).toBe(200);
 

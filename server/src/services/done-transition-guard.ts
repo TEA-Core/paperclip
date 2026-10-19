@@ -524,6 +524,27 @@ type Tier1Parse =
   | { kind: "missing_suffix" }
   | { kind: "absent" };
 
+function validateTier1Reason(reason: string): string | null {
+  const hasLandedAtTip = /\blanded-at-tip\b/.test(reason);
+  const hasLandingDelegated = /\blanding-delegated\b/.test(reason);
+  if (!hasLandedAtTip && !hasLandingDelegated) {
+    return (
+      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip" ' +
+      'or "landing-delegated".'
+    );
+  }
+  if (hasLandingDelegated && !/\bPR #\d+\b/.test(reason)) {
+    return 'Tier 1 declaration using "landing-delegated" is missing PR #<N> in <reason>.';
+  }
+  if (hasLandingDelegated && !reason.includes("done-close-landing-backstop")) {
+    return (
+      'Tier 1 declaration using "landing-delegated" is missing "done-close-landing-backstop" ' +
+      "in <reason>."
+    );
+  }
+  return null;
+}
+
 function parseTier2Declaration(body: string): Tier2Parse {
   const lines = body.split(/\r?\n/);
   let notAtLineStart: string | null = null;
@@ -669,6 +690,16 @@ export async function evaluateDoneTierDeclaration(
           skipReason: null,
         };
       }
+      const tier1ValidationError = validateTier1Reason(tier1.reason);
+      if (tier1ValidationError) {
+        return {
+          allowed: false,
+          reason: tier1ValidationError,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
       return {
         allowed: true,
         reason: `Tier 1 declaration found: ${tier1.reason.slice(0, 200)}`,
@@ -763,6 +794,16 @@ export async function evaluateDoneTierDeclaration(
         reason:
           "Tier 1 declaration found in same-run comment but <reason> is empty. " +
           `Use: ${TIER1_FORM}`,
+        tier: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    const tier1ValidationError = validateTier1Reason(tier1.reason);
+    if (tier1ValidationError) {
+      return {
+        allowed: false,
+        reason: tier1ValidationError,
         tier: null,
         skipped: false,
         skipReason: null,

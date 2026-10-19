@@ -407,7 +407,7 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       .send({
         status: "done",
         comment:
-          "Stage approved.\nClosed at Tier 1 (landed, not liveness-probed): review stage approved. Liveness unverified.\n\nkind: review\ndecision: approved",
+          "Stage approved.\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip — review stage approved. Liveness unverified.\n\nkind: review\ndecision: approved",
       });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(issueId)).toBe("done");

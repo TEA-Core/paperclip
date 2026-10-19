@@ -407,7 +407,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — guard skipped on auth failure. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -458,7 +458,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — guard skipped on auth failure. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -507,7 +507,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — guard skipped on auth failure. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -553,7 +553,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — guard skipped on auth failure. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -600,7 +600,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — guard skipped on auth failure. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -642,7 +642,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — nothing to land. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -668,7 +668,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         status: "done",
         doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): override path. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — override path. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -738,7 +738,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — nothing to land. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -798,7 +798,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — nothing to land. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -830,7 +830,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped, no token. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — guard skipped, no token. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -891,7 +891,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — nothing to land. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1268,7 +1268,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .send({
           status: "done",
           comment:
-            "Closed at Tier 1 (landed, not liveness-probed): docs-only change, no runtime surface. Liveness unverified.",
+            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip — docs-only change, no runtime surface. Liveness unverified.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
