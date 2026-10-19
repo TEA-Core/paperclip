@@ -10,8 +10,12 @@ import {
   companyMemberships,
   createDb,
   executionWorkspaces,
+  externalObjectMentions,
+  externalObjects,
   heartbeatRuns,
   issueComments,
+  issueDeliveryReceiptLinks,
+  issueDeliveryReceipts,
   issueLabels,
   issues,
   labels,
@@ -121,6 +125,70 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
    * implementer. `stageCount: 2` leaves a second stage pending so an approval of the
    * first stage advances to `in_review` instead of resolving to `done`.
    */
+  async function seedAuthorizedDeliveryReceipt(
+    companyId: string,
+    issueId: string,
+    headSha: string,
+    branchName: string,
+    pullRequestNumber: number,
+  ) {
+    for (const [index, owner] of ["TEA-Core", "tea-core"].entries()) {
+      const [externalObject] = await db
+        .insert(externalObjects)
+        .values({
+          companyId,
+          providerKey: "github",
+          objectType: "pull_request",
+          externalId: `${owner}/paperclip#pull/${pullRequestNumber}`,
+          data: {
+            state: "open",
+            draft: false,
+            node_id: `fixture-pr-${pullRequestNumber}-${index}`,
+            head: { ref: branchName },
+            title: "Fix the thing",
+          },
+        })
+        .returning({ id: externalObjects.id });
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "comment",
+        objectId: externalObject!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+      const receiptId = randomUUID();
+      await db.insert(issueDeliveryReceipts).values({
+        id: receiptId,
+        companyId,
+        sourceIssueId: issueId,
+        provider: "github",
+        owner,
+        repo: "paperclip",
+        pullRequestNumber,
+        headSha,
+        branchName,
+        sourceDeliveryRecord: { fixture: true },
+        recoveryReason: "authorized test publication",
+        authorizedByActorType: "user",
+        authorizedByActorId: "cloud-user-1",
+        idempotencyKey: `fixture-${issueId}-${headSha}-${index}`,
+        state: "ready",
+      });
+      await db.insert(issueDeliveryReceiptLinks).values({
+        companyId,
+        receiptId,
+        sourceIssueId: issueId,
+        externalObjectId: externalObject!.id,
+        provider: "github",
+        owner,
+        repo: "paperclip",
+        pullRequestNumber,
+        headSha,
+      });
+    }
+  }
+
   async function seedIssueAwaitingReview(issuePrefix: string, opts: { stageCount?: 1 | 2 } = {}) {
     const stageCount = opts.stageCount ?? 1;
     const companyId = randomUUID();
@@ -1083,6 +1151,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const branchName = `${identifier}-test-branch`;
     const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
+    await seedAuthorizedDeliveryReceipt(companyId, issueId, headSha, branchName, 42);
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
