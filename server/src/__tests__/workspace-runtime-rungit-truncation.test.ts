@@ -185,6 +185,21 @@ describe("single-worktree validation does not read the registry (SUP-20435)", ()
     },
     120_000,
   );
+
+  it("reports an unreadable registry as a structured worktree_list_failed validation failure", async () => {
+    const notARepo = trackTempDir(await mkdtemp(path.join(os.tmpdir(), "pc-rungit-norepo-")));
+    const error = await findRegisteredGitWorktreeByBranch(notARepo, "any-branch").catch((err) => err);
+    expect(error).toMatchObject({
+      name: "WorkspaceRuntimeValidationFailure",
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: {
+          reason: "git_worktree_registry_unreadable",
+          reasonCode: "worktree_list_failed",
+        },
+      },
+    });
+  });
 });
 
 describe("provisionExecutionWorktree serialization (SUP-20435)", () => {

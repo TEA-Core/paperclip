@@ -3424,7 +3424,23 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
 }
 
 export async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
-  const raw = await runGitMachineRead(["worktree", "list", "--porcelain"], repoRoot);
+  let raw: string;
+  try {
+    raw = await runGitMachineRead(["worktree", "list", "--porcelain"], repoRoot);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new WorkspaceRuntimeValidationFailure(
+      `git worktree registry read failed: ${detail}`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_registry_unreadable",
+          reasonCode: "worktree_list_failed",
+          branchName,
+          repoRoot: path.resolve(repoRoot),
+        },
+      },
+    );
+  }
 
   const expectedBranchRef = `refs/heads/${branchName}`;
   for (const entry of parseGitWorktreeListPorcelain(raw)) {
