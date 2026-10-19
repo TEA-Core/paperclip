@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, cp, mkdir as fsMkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir as fsMkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -195,8 +195,10 @@ describe("provisionExecutionWorktree serialization (SUP-20435)", () => {
     const sentinel = path.join(repoRoot, "provision-overlap");
     const started = path.join(repoRoot, "provision-started");
     const release = path.join(repoRoot, "provision-release");
+    const attempts = path.join(repoRoot, "provision-attempts");
     const script = [
       "#!/bin/sh",
+      "echo $$ >> \"$ATTEMPTS\"",
       "if [ -f \"$SENTINEL\" ]; then echo overlap >&2; exit 86; fi",
       "echo $$ > \"$SENTINEL\"",
       "echo $$ > \"$STARTED\"",
@@ -211,6 +213,7 @@ describe("provisionExecutionWorktree serialization (SUP-20435)", () => {
       `SENTINEL=${JSON.stringify(sentinel)}`,
       `STARTED=${JSON.stringify(started)}`,
       `RELEASE=${JSON.stringify(release)}`,
+      `ATTEMPTS=${JSON.stringify(attempts)}`,
       "sh ./scripts/provision.sh",
     ].join(" ");
     const realize = () => realizeExecutionWorkspace({
@@ -253,10 +256,23 @@ describe("provisionExecutionWorktree serialization (SUP-20435)", () => {
       }
     }
     const second = realize();
+    const countAttempts = async () => {
+      try {
+        return (await readFile(attempts, "utf8")).split("\n").filter(Boolean).length;
+      } catch {
+        return 0;
+      }
+    };
+    const holdStartedAt = Date.now();
+    while (Date.now() - holdStartedAt < 2_000 && (await countAttempts()) < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(await countAttempts()).toBe(1);
     await writeFile(release, "go\n", "utf8");
     const [left, right] = await Promise.all([first, second]);
     expect(left.cwd).toBe(right.cwd);
     expect(left.created).toBe(true);
     expect(right.created).toBe(false);
+    expect(await countAttempts()).toBe(2);
   }, 30_000);
 });

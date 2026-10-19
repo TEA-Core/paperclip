@@ -3493,7 +3493,7 @@ async function proveLinkedGitWorktreeRegistration(
     return { registered: false, failed: error instanceof Error ? error.message : String(error) };
   }
   if (!registeredGitdir) return { registered: false };
-  const registeredCheckout = path.resolve(path.dirname(registeredGitdir));
+  const registeredCheckout = path.resolve(resolvedGitDir, path.dirname(registeredGitdir));
   const expectedCheckout = await resolvePathForWorktreeComparison(worktreePath);
   if (await resolvePathForWorktreeComparison(registeredCheckout) !== expectedCheckout) {
     return { registered: false };
