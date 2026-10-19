@@ -1791,7 +1791,23 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     .then((output) => resolvePathForWorktreeComparison(output))
     .catch(() => null);
   const expectedPath = await resolvePathForWorktreeComparison(input.worktreePath);
-  const registeredWorktree = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  let registeredWorktree: GitWorktreeListEntry | null;
+  try {
+    registeredWorktree = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new WorkspaceRuntimeValidationFailure(
+      `git worktree registry read failed: ${detail}`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_registry_unreadable",
+          reasonCode: "worktree_list_failed",
+          worktreePath: path.resolve(input.worktreePath),
+          repoRoot: path.resolve(input.repoRoot),
+        },
+      },
+    );
+  }
   if (!resolvedTopLevel || resolvedTopLevel !== expectedPath || !registeredWorktree) {
     return buildWorktreeMetadataMissingEvidence({
       db: input.db ?? null,
@@ -1818,7 +1834,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const dirtyPathSample = sampleDirtyStatusPaths(statusLines);
   const cleanliness: GitWorktreeCleanliness =
     status === null ? "unknown" : status.trim().length > 0 ? "dirty" : "clean";
-  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  const registered = registeredWorktree;
   const inProgressOperation = await detectGitWorktreeInProgressOperation(input.worktreePath);
   const expectedHeadSha = await runGit(
     ["rev-parse", "--verify", `refs/heads/${input.expectedBranchName}^{commit}`],
@@ -3457,13 +3473,19 @@ async function proveLinkedGitWorktreeRegistration(
     return error instanceof Error ? error.message : String(error);
   });
   if (!absoluteGitDir || absoluteGitDir.includes("\n") || absoluteGitDir.startsWith("fatal:")) {
-    return { registered: false, failed: absoluteGitDir || "git rev-parse --absolute-git-dir failed" };
+    return {
+      registered: false,
+      failed: `git rev-parse --absolute-git-dir failed: ${absoluteGitDir || "no output"}`,
+    };
   }
   const commonDir = await runGit(["rev-parse", "--path-format=absolute", "--git-common-dir"], repoRoot).catch(
     (error: unknown) => (error instanceof Error ? error.message : String(error)),
   );
   if (!commonDir || commonDir.includes("\n") || commonDir.startsWith("fatal:")) {
-    return { registered: false, failed: commonDir || "git rev-parse --git-common-dir failed" };
+    return {
+      registered: false,
+      failed: `git rev-parse --git-common-dir failed: ${commonDir || "no output"}`,
+    };
   }
   if (!path.isAbsolute(absoluteGitDir) || !path.isAbsolute(commonDir)) {
     return {
@@ -3629,7 +3651,7 @@ export async function inspectManagedGitWorktreeBranch(input: {
     return {
       ...base,
       valid: false,
-      reason: `git worktree list failed: ${registration.failed}`,
+      reason: registration.failed,
       reasonCode: "worktree_list_failed",
       repoRoot,
     };
