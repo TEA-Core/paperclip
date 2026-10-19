@@ -1270,12 +1270,12 @@ async function claimReceiptForPublication(
       eq(issueDeliveryReceipts.companyId, companyId),
       eq(issueDeliveryReceipts.sourceIssueId, issueId),
       eq(issueDeliveryReceipts.provider, "github"),
-      eq(issueDeliveryReceipts.owner, pr.owner),
-      eq(issueDeliveryReceipts.repo, pr.repo),
+      eq(issueDeliveryReceipts.owner, pr.owner.toLowerCase()),
+      eq(issueDeliveryReceipts.repo, pr.repo.toLowerCase()),
       eq(issueDeliveryReceipts.pullRequestNumber, pr.number),
       eq(issueDeliveryReceiptLinks.provider, "github"),
-      eq(issueDeliveryReceiptLinks.owner, pr.owner),
-      eq(issueDeliveryReceiptLinks.repo, pr.repo),
+      eq(issueDeliveryReceiptLinks.owner, pr.owner.toLowerCase()),
+      eq(issueDeliveryReceiptLinks.repo, pr.repo.toLowerCase()),
       eq(issueDeliveryReceiptLinks.pullRequestNumber, pr.number),
     ));
   if (receipts.length === 0) {
