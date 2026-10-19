@@ -89,10 +89,10 @@ const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
 
-// Node reports a missing worktree cwd as `spawn <absolute-git> ENOENT`. The
-// live stuck rows use `/usr/bin/git`. Other hosts resolve a different absolute
-// git path, so the retry matches that message shape and nothing else.
-const STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON_PATTERN = String.raw`^${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} \| spawn \S+ ENOENT$`;
+// Node reports a missing worktree cwd as `spawn <git> ENOENT`. The git path can
+// contain spaces, so the match is not limited to a single non-space token. The
+// live stuck rows use `/usr/bin/git`.
+const STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON_PATTERN = String.raw`^${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} \| spawn .+ ENOENT$`;
 const stuckGitSpawnEnoentCleanupReasonPattern = new RegExp(
   STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON_PATTERN,
 );
@@ -436,13 +436,21 @@ function readServiceStates(value: unknown): ExecutionWorkspaceConfig["serviceSta
     : null;
 }
 
+function isAbsentFilesystemPath(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
 async function pathExists(value: string | null | undefined) {
   if (!value) return false;
   try {
     await fs.access(value);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (isAbsentFilesystemPath(error)) return false;
+    throw error;
   }
 }
 
@@ -873,7 +881,16 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     return { git: null, warnings, statusInspectionSucceeded: false };
   }
 
-  if (!(await pathExists(workspacePath))) {
+  let workspacePathExists = false;
+  try {
+    workspacePathExists = await pathExists(workspacePath);
+  } catch (error) {
+    warnings.push(
+      `Could not inspect git status for "${workspacePath}": ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { git: null, warnings, statusInspectionSucceeded: false };
+  }
+  if (!workspacePathExists) {
     warnings.push(`Workspace path "${workspacePath}" does not exist, so Paperclip cannot inspect git status before close.`);
     return {
       git: {

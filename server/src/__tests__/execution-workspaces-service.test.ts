@@ -5442,6 +5442,72 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(seeded.worktreePath);
   }, 20_000);
 
+  it("retries a stuck ENOENT row when the git path contains spaces", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await linkProjectRepo(seeded);
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: "issue_terminal | spawn /opt/My Git/bin/git ENOENT",
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+    expect(workspace?.status).toBe("archived");
+    expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(seeded.worktreePath);
+  }, 20_000);
+
+  it("does not treat an unreadable worktree path as already removed", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const jail = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-unreadable-"));
+    tempDirs.add(jail);
+    const hidden = path.join(jail, "worktree");
+    await fs.mkdir(hidden);
+    await fs.chmod(jail, 0o000);
+    try {
+      await db
+        .update(executionWorkspaces)
+        .set({ cwd: hidden, providerRef: hidden })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await svc.sweepTerminalWorkspaces();
+      const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedUndelivered: 1 });
+      expect(workspace?.status).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    } finally {
+      await fs.chmod(jail, 0o755);
+    }
+  }, 20_000);
+
+  it("treats ENOTDIR as an absent worktree instead of sticking cleanup_failed", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await linkProjectRepo(seeded);
+    const notADirectory = path.join(os.tmpdir(), `paperclip-not-a-dir-${randomUUID()}`);
+    tempDirs.add(notADirectory);
+    await fs.writeFile(notADirectory, "not a directory\n", "utf8");
+    const absent = path.join(notADirectory, "worktree");
+    await db
+      .update(executionWorkspaces)
+      .set({ cwd: absent, providerRef: absent })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+    expect(workspace?.status).toBe("archived");
+    expect(workspace?.cleanupReason).not.toContain("ENOENT");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
   it("does not retry a cleanup_failed row whose reason is not the spawn ENOENT message", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await db

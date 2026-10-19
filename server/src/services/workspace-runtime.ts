@@ -3471,7 +3471,19 @@ async function detectRemoteDefaultBranch(repoRoot: string): Promise<string | nul
 }
 
 async function directoryExists(value: string) {
-  return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
+  try {
+    return (await fs.stat(value)).isDirectory();
+  } catch (error) {
+    if (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function resolvePathForWorktreeComparison(value: string): Promise<string> {
