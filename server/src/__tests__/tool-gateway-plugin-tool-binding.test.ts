@@ -348,7 +348,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
       tool: "a.b:alpha",
       parameters: {},
-      runContext: { companyId: company.id, agentId: agent.id, runId: run.id },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
     })).resolves.toEqual({
       pluginId: "plugin-a",
       toolName: "alpha",
@@ -381,7 +381,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
       tool: "a.b:alpha",
       parameters: {},
-      runContext: { companyId: company.id, agentId: agent.id, runId: run.id },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
     });
 
     expect(result).toEqual({
@@ -397,8 +397,22 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       },
     });
     expect(result).toMatchObject({ pluginId: "plugin-a", toolName: "alpha", result: expect.any(Object) });
-    expect(createHash("sha256").update(result.result.content).digest("hex")).toBe(result.result.data.hash);
-    expect(result.result.content).not.toContain(secret);
+    const checkedResult = result as unknown as {
+      result: { content?: unknown; data?: unknown };
+    };
+    const content = checkedResult.result.content;
+    const data = checkedResult.result.data;
+    if (
+      typeof content !== "string" ||
+      typeof data !== "object" ||
+      data === null ||
+      !("hash" in data) ||
+      typeof data.hash !== "string"
+    ) {
+      throw new Error("Expected a plugin result with string content and hash data");
+    }
+    expect(createHash("sha256").update(content).digest("hex")).toBe(data.hash);
+    expect(content).not.toContain(secret);
   });
 
   it("denies executing an allowlist-excluded plugin tool by name via the plugin execute route", async () => {
