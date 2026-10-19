@@ -400,14 +400,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         },
       };
       const [externalObj] = await db.insert(externalObjects).values(obj).returning();
-      await db.insert(externalObjectMentions).values({
+      const mention: typeof externalObjectMentions.$inferInsert = {
         companyId,
         sourceIssueId: issueId,
-        sourceKind: "issue_comment",
+        sourceKind: "comment",
         objectId: externalObj!.id,
         objectType: "pull_request",
         providerKey: "github",
-      });
+      };
+      await db.insert(externalObjectMentions).values(mention);
       if (opts.deliveryReceipt) {
         const receiptId = randomUUID();
         await db.insert(issueDeliveryReceipts).values({
