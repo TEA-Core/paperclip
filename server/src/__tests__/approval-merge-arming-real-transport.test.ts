@@ -13,6 +13,8 @@ import {
   externalObjects,
   heartbeatRuns,
   issueComments,
+  issueDeliveryReceiptLinks,
+  issueDeliveryReceipts,
   issueExecutionDecisions,
   issues,
   projectWorkspaces,
@@ -53,7 +55,7 @@ const REPO = "paperclip";
 const PR_NUMBER = 676;
 const NODE_ID = "PR_node_676";
 const DELIVERY_BRANCH = "SUP-676-branch";
-const HEAD_SHA = "approved00000000000000000000000000000000001";
+const HEAD_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PR_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}`;
 const GRAPHQL_URL = "https://api.github.com/graphql";
 
@@ -319,7 +321,36 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       objectType: "pull_request",
       providerKey: "github",
     });
+    const receiptId = randomUUID();
+    await db.insert(issueDeliveryReceipts).values({
+      id: receiptId,
+      companyId,
+      sourceIssueId: issueId,
+      provider: "github",
+      owner: OWNER.toLowerCase(),
+      repo: REPO.toLowerCase(),
+      pullRequestNumber: PR_NUMBER,
+      headSha: HEAD_SHA,
+      branchName: DELIVERY_BRANCH,
+      sourceDeliveryRecord: { fixture: true },
+      recoveryReason: "authorized test publication",
+      authorizedByActorType: "user",
+      authorizedByActorId: "cloud-user-1",
+      idempotencyKey: `fixture-${issueId}-${HEAD_SHA}`,
+      state: "ready",
+    });
 
+    await db.insert(issueDeliveryReceiptLinks).values({
+      companyId,
+      receiptId,
+      sourceIssueId: issueId,
+      externalObjectId: externalObj!.id,
+      provider: "github",
+      owner: OWNER.toLowerCase(),
+      repo: REPO.toLowerCase(),
+      pullRequestNumber: PR_NUMBER,
+      headSha: HEAD_SHA,
+    });
     return { companyId, reviewerAgentId, issueId, identifier };
   }
 
