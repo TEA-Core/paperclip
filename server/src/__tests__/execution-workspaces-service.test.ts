@@ -5367,6 +5367,223 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect.stringContaining("the worktree is dirty"),
     ]));
   }, 20_000);
+
+  const STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON = "issue_terminal | spawn /usr/bin/git ENOENT";
+
+  async function linkProjectRepo(seeded: { companyId: string; projectId: string; executionWorkspaceId: string; repoRoot: string }) {
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      isPrimary: true,
+      cwd: seeded.repoRoot,
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ projectWorkspaceId })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+  }
+
+  async function workspaceRow(id: string) {
+    const [workspace] = await db
+      .select({
+        status: executionWorkspaces.status,
+        cleanupReason: executionWorkspaces.cleanupReason,
+        metadata: executionWorkspaces.metadata,
+        closedAt: executionWorkspaces.closedAt,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, id));
+    return workspace;
+  }
+
+  it("does not stick cleanup_failed when the worktree directory is already gone", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await linkProjectRepo(seeded);
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+    expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).toContain(seeded.worktreePath);
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+    expect(workspace?.status).toBe("archived");
+    expect(workspace?.cleanupReason).toBe("issue_terminal");
+    expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(seeded.worktreePath);
+  }, 20_000);
+
+  it("retries a cleanup_failed spawn ENOENT row and archives it without raising the generation", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await linkProjectRepo(seeded);
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupEligibleAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+        metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 3 },
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+    expect(workspace?.status).toBe("archived");
+    expect(workspace?.cleanupReason).toBe("issue_terminal");
+    expect(workspace?.metadata).toMatchObject({
+      [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 3,
+    });
+    expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(seeded.worktreePath);
+  }, 20_000);
+
+  it("does not retry a cleanup_failed row whose reason is not the spawn ENOENT message", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: "issue_terminal | git worktree changed after delivery was verified",
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ checked: 0, archived: 0, cleanupFailed: 0 });
+    expect(workspace?.status).toBe("cleanup_failed");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("does not remove an idle workspace whose source issue is still in progress", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "idle" })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db
+      .update(issues)
+      .set({ status: "in_progress" })
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedNonTerminalTree: 1 });
+    expect(workspace?.status).toBe("idle");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it.each(["blocked", "in_progress"] as const)(
+    "does not remove a worktree whose source issue is %s",
+    async (issueStatus) => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await db
+        .update(issues)
+        .set({ status: issueStatus })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      const sweep = await svc.sweepTerminalWorkspaces();
+      const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedNonTerminalTree: 1 });
+      expect(workspace?.status).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    },
+    20_000,
+  );
+
+  it("keeps a dirty worktree, including a stuck ENOENT row", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await fs.writeFile(path.join(seeded.worktreePath, "uncommitted.txt"), "not delivered\n", "utf8");
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedUndelivered: 1 });
+    expect(workspace?.status).toBe("cleanup_failed");
+    await expect(fs.readFile(path.join(seeded.worktreePath, "uncommitted.txt"), "utf8"))
+      .resolves.toBe("not delivered\n");
+  }, 20_000);
+
+  it("keeps an unmerged worktree, including a stuck ENOENT row", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db.insert(issueWorkProducts).values({
+      companyId: seeded.companyId,
+      issueId: seeded.sourceIssueId,
+      executionWorkspaceId: seeded.executionWorkspaceId,
+      type: "pull_request",
+      provider: "github",
+      title: "Open PR",
+      url: "https://github.com/paperclipai/paperclip/pull/20436",
+      status: "open",
+    });
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const workspace = await workspaceRow(seeded.executionWorkspaceId);
+
+    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedUndelivered: 1 });
+    expect(workspace?.status).toBe("cleanup_failed");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("does not retry a stuck ENOENT row during the cooldown or while a run is active", async () => {
+    const cooling = await seedTerminalWorkspace({ mergedPr: true });
+    await fs.rm(cooling.worktreePath, { recursive: true, force: true });
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+      })
+      .where(eq(executionWorkspaces.id, cooling.executionWorkspaceId));
+    const cooldownSweep = await executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 7,
+    }).sweepTerminalWorkspaces();
+    expect(cooldownSweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
+    expect((await workspaceRow(cooling.executionWorkspaceId))?.status).toBe("cleanup_failed");
+    expect(await readGit(cooling.repoRoot, ["worktree", "list", "--porcelain"])).toContain(cooling.worktreePath);
+
+    const running = await seedTerminalWorkspace({ mergedPr: true, activeRun: true });
+    await linkProjectRepo(running);
+    await fs.rm(running.worktreePath, { recursive: true, force: true });
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+      })
+      .where(eq(executionWorkspaces.id, running.executionWorkspaceId));
+    const activeRunSweep = await svc.sweepTerminalWorkspaces();
+    expect(activeRunSweep.skippedActiveRun).toBe(1);
+    expect(activeRunSweep.cleanupFailed).toBe(0);
+    expect((await workspaceRow(running.executionWorkspaceId))?.status).toBe("cleanup_failed");
+    expect(await readGit(running.repoRoot, ["worktree", "list", "--porcelain"])).toContain(running.worktreePath);
+  }, 20_000);
 });
 
 describeEmbeddedPostgres("detachIssuesFromClosedExecutionWorkspace", () => {

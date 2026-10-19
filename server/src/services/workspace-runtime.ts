@@ -6709,18 +6709,44 @@ async function preserveUncommittedWorktreeWork(input: {
   }
 }
 
+function isGitSpawnEnoent(error: unknown): error is { code: string } {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === "ENOENT";
+}
+
 export async function acquireGitWorktreeCleanupLock(worktreePath: string) {
-  const branchRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
-  const rawLocks = await Promise.all([
-    runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
-      .then((lockPath) => ({ kind: "index" as const, lockPath })),
-    runGit(["rev-parse", "--git-path", "HEAD.lock"], worktreePath)
-      .then((lockPath) => ({ kind: "head" as const, lockPath })),
-    ...(branchRef
-      ? [runGit(["rev-parse", "--git-path", `${branchRef}.lock`], worktreePath)
-          .then((lockPath) => ({ kind: "branch" as const, lockPath }))]
-      : []),
-  ]);
+  // A missing checkout has no index or ref lock to take. Spawning git with that
+  // cwd throws `spawn <git> ENOENT` even when the binary exists. Treat the
+  // checkout as already removed and let the caller prune the admin entry.
+  const releasedLock = {
+    releaseBranchRefLock: async () => {},
+    release: async () => {},
+  };
+  if (!(await directoryExists(worktreePath))) {
+    return releasedLock;
+  }
+  let branchRef: string | null;
+  let rawLocks: Array<{ kind: "index" | "head" | "branch"; lockPath: string }>;
+  try {
+    branchRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
+    rawLocks = await Promise.all([
+      runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
+        .then((lockPath) => ({ kind: "index" as const, lockPath })),
+      runGit(["rev-parse", "--git-path", "HEAD.lock"], worktreePath)
+        .then((lockPath) => ({ kind: "head" as const, lockPath })),
+      ...(branchRef
+        ? [runGit(["rev-parse", "--git-path", `${branchRef}.lock`], worktreePath)
+            .then((lockPath) => ({ kind: "branch" as const, lockPath }))]
+        : []),
+    ]);
+  } catch (error) {
+    if (isGitSpawnEnoent(error) && !(await directoryExists(worktreePath))) {
+      return releasedLock;
+    }
+    throw error;
+  }
   const locks = [...new Map(rawLocks.map(({ kind, lockPath }) => {
     const resolvedLockPath = path.isAbsolute(lockPath)
       ? lockPath
@@ -6833,6 +6859,24 @@ export async function removeGitWorktreeArtifact(input: {
     workspacePath: worktreePath,
     cleanupAction: "worktree_remove",
   };
+
+  if (!(await directoryExists(worktreePath))) {
+    if (!(await directoryExists(repoRoot))) return null;
+    try {
+      await input.assertSafeToCleanup?.();
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_cleanup",
+        args: ["worktree", "prune"],
+        cwd: repoRoot,
+        metadata: { ...metadata, cleanupAction: "worktree_prune" },
+        successMessage: `Pruned missing git worktree ${worktreePath}\n`,
+        failureLabel: "git worktree prune",
+      });
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
 
   if (!(await directoryExists(repoRoot))) {
     try {
@@ -7017,6 +7061,19 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         });
         if (worktreeRemoveWarning) warnings.push(worktreeRemoveWarning);
       }
+    } else if (repoRoot) {
+      const worktreePruneWarning = await removeGitWorktreeArtifact({
+        repoRoot,
+        worktreePath: workspacePath,
+        forceWorktreeRemoval: input.forceWorktreeRemoval,
+        recorder: input.recorder,
+        assertSafeToCleanup: input.assertSafeToCleanup,
+        metadata: {
+          workspaceId: input.workspace.id,
+          branchName: input.workspace.branchName,
+        },
+      });
+      if (worktreePruneWarning) warnings.push(worktreePruneWarning);
     }
     if (branchCreatedByRuntime && input.workspace.branchName) {
       if (!repoRoot) {

@@ -89,6 +89,18 @@ const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
 
+// Node reports a missing worktree cwd as `spawn <absolute-git> ENOENT`. The
+// live stuck rows use `/usr/bin/git`. Other hosts resolve a different absolute
+// git path, so the retry matches that message shape and nothing else.
+const STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON_PATTERN = String.raw`^${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} \| spawn \S+ ENOENT$`;
+const stuckGitSpawnEnoentCleanupReasonPattern = new RegExp(
+  STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON_PATTERN,
+);
+
+export function isStuckGitSpawnEnoentCleanupReason(reason: string | null | undefined): boolean {
+  return typeof reason === "string" && stuckGitSpawnEnoentCleanupReasonPattern.test(reason);
+}
+
 // The reopen-failure reason kept on the row when a rebuild does not finish. The
 // value is sanitized: it never contains a repository URL, a host path, or git
 // output.
@@ -1620,6 +1632,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    if (workspacePath && !(await pathExists(workspacePath))) {
+      // The checkout is already gone. There is no HEAD left to re-verify, and
+      // spawning git with that cwd is the ENOENT that stuck these rows. A
+      // directory that still exists stays fail-closed below. The caller prunes
+      // the leftover admin entry from the repo root.
+      return;
+    }
     if (!workspacePath || !expectedHeadSha) {
       throw new Error("Refusing terminal workspace cleanup because the expected git HEAD is unknown");
     }
@@ -1964,6 +1983,33 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           .update(executionWorkspaces)
           .set({
             status: "cleanup_failed",
+            cleanupReason: input.cleanupReason,
+            updatedAt: now(),
+          })
+          .where(eq(executionWorkspaces.id, input.workspaceId));
+        return true;
+      },
+    });
+  }
+
+  // A stuck spawn-ENOENT row is already closed. The retry must not raise the
+  // lifecycle generation: the fence above belongs to the failed archive. Promote
+  // back to archived only while that generation and cleanup_failed are current.
+  async function markStuckEnoentCleanupArchived(input: {
+    workspaceId: string;
+    capturedGeneration: number;
+    cleanupReason: string;
+  }): Promise<boolean> {
+    return fenceLifecycleGenerationWrite<boolean>({
+      workspaceId: input.workspaceId,
+      expectedGeneration: input.capturedGeneration,
+      isWriteTarget: (fresh) => fresh.status === "cleanup_failed",
+      onSkip: () => false,
+      write: async ({ tx }) => {
+        await tx
+          .update(executionWorkspaces)
+          .set({
+            status: "archived",
             cleanupReason: input.cleanupReason,
             updatedAt: now(),
           })
@@ -2834,11 +2880,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       terminalSweepInProgress = true;
       try {
-      const baseCandidateFilter = and(
+      const openCandidateFilter = and(
         inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
         isNull(executionWorkspaces.closedAt),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
+      // A missing worktree cwd used to throw `spawn <git> ENOENT` after the
+      // row was already closed, and this sweep never reselected `cleanup_failed`.
+      // Retry only that reason. Every gate below still applies, and the cleanup
+      // uses the generation already on the row instead of raising a new one.
+      const stuckEnoentRetryFilter = and(
+        eq(executionWorkspaces.status, "cleanup_failed"),
+        sql<boolean>`${executionWorkspaces.cleanupReason} ~ ${STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON_PATTERN}`,
+        sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
+      );
+      const baseCandidateFilter = or(openCandidateFilter, stuckEnoentRetryFilter);
       // Continue the scan after the previous sweep's last row. The keyset
       // predicate uses the same (updatedAt, id) order as the query, so each
       // sweep advances past the rows it already inspected instead of re-reading
@@ -3008,6 +3064,74 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         if (await workspaceHasActiveRun(workspace)) {
           result.skippedActiveRun += 1;
+          continue;
+        }
+        if (
+          workspace.status === "cleanup_failed"
+          && isStuckGitSpawnEnoentCleanupReason(workspace.cleanupReason)
+        ) {
+          result.eligible += 1;
+          const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
+            workspace.metadata as Record<string, unknown> | null,
+          );
+          try {
+            const cleanup = await cleanupTerminalWorkspace(
+              workspace,
+              assessment.workspaceHeadSha,
+              capturedGeneration,
+            );
+            if (cleanup.skippedReopened) {
+              result.skippedReopened += 1;
+              continue;
+            }
+            if (!cleanup.cleaned) {
+              result.cleanupFailed += 1;
+              continue;
+            }
+            const promoted = await markStuckEnoentCleanupArchived({
+              workspaceId: workspace.id,
+              capturedGeneration,
+              cleanupReason: cleanup.warnings.length > 0
+                ? [ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON, ...cleanup.warnings].join(" | ")
+                : ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
+            });
+            if (!promoted) {
+              result.skippedReopened += 1;
+              continue;
+            }
+            await logActivity(db, {
+              companyId: workspace.companyId,
+              actorType: "system",
+              actorId: "workspace_terminality_reaper",
+              action: "execution_workspace.issue_terminal_archived",
+              entityType: "execution_workspace",
+              entityId: workspace.id,
+              details: {
+                sourceIssueId: workspace.sourceIssueId,
+                deliveryState: assessment.deliveryState,
+                cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
+                retriedStuckSpawnEnoent: true,
+              },
+            });
+            result.archived += 1;
+          } catch (error) {
+            result.cleanupFailed += 1;
+            const failure = error instanceof Error ? error.message : String(error);
+            await markTerminalCleanupFailedFenced({
+              workspaceId: workspace.id,
+              capturedGeneration,
+              cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${failure}`,
+            });
+            await logActivity(db, {
+              companyId: workspace.companyId,
+              actorType: "system",
+              actorId: "workspace_terminality_reaper",
+              action: "execution_workspace.issue_terminal_cleanup_failed",
+              entityType: "execution_workspace",
+              entityId: workspace.id,
+              details: { sourceIssueId: workspace.sourceIssueId, failure },
+            });
+          }
           continue;
         }
         result.eligible += 1;
