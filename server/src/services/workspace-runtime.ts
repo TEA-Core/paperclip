@@ -3485,30 +3485,32 @@ async function proveLinkedGitWorktreeRegistration(
   repoRoot: string,
   worktreePath: string,
 ): Promise<LinkedGitWorktreeRegistration> {
-  const absoluteGitDir = await runGit(["rev-parse", "--absolute-git-dir"], worktreePath).catch((error: unknown) => {
-    return error instanceof Error ? error.message : String(error);
-  });
-  if (!absoluteGitDir || absoluteGitDir.includes("\n") || absoluteGitDir.startsWith("fatal:")) {
-    return {
-      registered: false,
-      failed: `git rev-parse --absolute-git-dir failed: ${absoluteGitDir || "no output"}`,
-    };
-  }
-  const commonDir = await runGit(["rev-parse", "--path-format=absolute", "--git-common-dir"], repoRoot).catch(
-    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  const readAbsoluteGitPath = async (args: string[], cwd: string) => {
+    try {
+      const value = await runGit(args, cwd);
+      if (!value || value.includes("\n") || !path.isAbsolute(value)) {
+        return {
+          ok: false as const,
+          failed: `git ${args.join(" ")} returned an unusable path: ${value || "no output"}`,
+        };
+      }
+      return { ok: true as const, value };
+    } catch (error) {
+      return {
+        ok: false as const,
+        failed: `git ${args.join(" ")} failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  };
+  const gitDirRead = await readAbsoluteGitPath(["rev-parse", "--absolute-git-dir"], worktreePath);
+  if (!gitDirRead.ok) return { registered: false, failed: gitDirRead.failed };
+  const commonDirRead = await readAbsoluteGitPath(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    repoRoot,
   );
-  if (!commonDir || commonDir.includes("\n") || commonDir.startsWith("fatal:")) {
-    return {
-      registered: false,
-      failed: `git rev-parse --git-common-dir failed: ${commonDir || "no output"}`,
-    };
-  }
-  if (!path.isAbsolute(absoluteGitDir) || !path.isAbsolute(commonDir)) {
-    return {
-      registered: false,
-      failed: `git rev-parse returned a non-absolute path: ${absoluteGitDir}`,
-    };
-  }
+  if (!commonDirRead.ok) return { registered: false, failed: commonDirRead.failed };
+  const absoluteGitDir = gitDirRead.value;
+  const commonDir = commonDirRead.value;
 
   const resolvedGitDir = path.resolve(absoluteGitDir);
   const worktreesAdmin = path.resolve(commonDir, "worktrees");
