@@ -7578,7 +7578,7 @@ registry.registerPath({
       owner: z.string().trim().min(1),
       repo: z.string().trim().min(1),
       pullRequestNumber: z.number().int().positive(),
-      headSha: z.string().regex(/^[0-9a-f]{40,64}$/),
+      headSha: z.string().regex(/^[0-9a-f]{40}$/),
       reason: z.string().trim().min(1),
       idempotencyKey: z.string().trim().min(1).max(255),
     }).strict()),

@@ -55,6 +55,17 @@ describe("delivery receipt recovery", () => {
       extra: true,
     } as any)).toThrow();
 
+    for (const headSha of ["a".repeat(39), "a".repeat(41), "a".repeat(64)]) {
+      expect(() => normalizeDeliveryReceiptRecoveryInput({
+        owner: "TEA-Core",
+        repo: "paperclip",
+        pullRequestNumber: 579,
+        headSha,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-579",
+      })).toThrow();
+    }
+
     expect(() => normalizeDeliveryReceiptRecoveryInput({
       owner: "TEA-Core",
       repo: "paperclip",
