@@ -340,6 +340,22 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
         )
       `;
 
+      for (const [length, headSha, receiptHeadSha] of [
+        [39, "a".repeat(39), "2".repeat(40)],
+        [41, "a".repeat(41), "3".repeat(40)],
+        [64, "a".repeat(64), "4".repeat(40)],
+      ] as const) {
+        const boundaryReceiptId = await insertReceipt(sql, {
+          companyId,
+          sourceIssueId: issueId,
+          idempotencyKey: `invalid-link-head-${length}`,
+          headSha: receiptHeadSha,
+        });
+        await expect(insertLinkRaw({ receiptId: boundaryReceiptId, externalObjectId: objectId, headSha })).rejects.toMatchObject({
+          code: "23514",
+        });
+      }
+
       // Missing receipt.
       await expect(
         insertLinkRaw({ receiptId: randomUUID(), externalObjectId: objectId, headSha: "c".repeat(40) }),
