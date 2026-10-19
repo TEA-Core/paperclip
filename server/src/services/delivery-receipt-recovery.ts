@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import {
   externalObjects,
@@ -11,6 +11,7 @@ import {
   resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenResolution,
 } from "./github-credential.js";
+import { canonicalizeExternalObjectUrl } from "@paperclipai/shared/external-objects-server";
 import { logActivityInTransaction } from "./activity-log.js";
 
 type RecoveryBody = {
@@ -77,10 +78,20 @@ export function normalizeDeliveryReceiptRecoveryInput(body: RecoveryBody): Deliv
   return { owner, repo, pullRequestNumber, headSha, reason, idempotencyKey };
 }
 
-function canonicalHash(owner: string, repo: string, number: number): string {
-  return createHash("sha256")
-    .update(JSON.stringify({ scheme: "https", host: "github.com", owner: owner.toLowerCase(), repo: repo.toLowerCase(), number, kind: "pull" }))
-    .digest("hex");
+export function buildRecoveredExternalObjectIdentity(input: {
+  owner: string;
+  repo: string;
+  pullRequestNumber: number;
+}) {
+  const canonical = canonicalizeExternalObjectUrl(
+    `https://github.com/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/pull/${input.pullRequestNumber}`,
+  );
+  if (!canonical) throw new Error("Unable to canonicalize the recovered PR URL");
+  return {
+    sanitizedCanonicalUrl: canonical.sanitizedCanonicalUrl,
+    canonicalIdentityHash: canonical.canonicalIdentityHash,
+    canonicalIdentity: canonical.canonicalIdentity,
+  };
 }
 
 async function readPullRequest(candidate: GitHubTokenResolution, input: DeliveryReceiptRecoveryInput) {
@@ -169,7 +180,7 @@ export async function recoverDeliveryReceipt(input: {
   if (input.deliveryBranch && live.branchName !== input.deliveryBranch) throw new Error("PR branch does not match the delivery branch");
   const now = new Date();
   const externalId = `${recovery.owner.toLowerCase()}/${recovery.repo.toLowerCase()}#pull/${recovery.pullRequestNumber}`;
-  const canonicalUrl = `https://github.com/${recovery.owner}/${recovery.repo}/pull/${recovery.pullRequestNumber}`;
+  const externalObjectIdentity = buildRecoveredExternalObjectIdentity(recovery);
   return db.transaction(async (tx) => {
     const prior = await tx
       .select()
@@ -190,8 +201,8 @@ export async function recoverDeliveryReceipt(input: {
       pluginId: null,
       objectType: "pull_request",
       externalId,
-      sanitizedCanonicalUrl: canonicalUrl,
-      canonicalIdentityHash: canonicalHash(recovery.owner, recovery.repo, recovery.pullRequestNumber),
+      sanitizedCanonicalUrl: externalObjectIdentity.sanitizedCanonicalUrl,
+      canonicalIdentityHash: externalObjectIdentity.canonicalIdentityHash,
       displayKey: `GitHub Pull Request`,
       iconKey: "github",
       displayTitle: `${recovery.owner}/${recovery.repo}#${recovery.pullRequestNumber}`,
