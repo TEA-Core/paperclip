@@ -216,6 +216,7 @@ function decideIssueStatus(facts: IssueStatusFacts): IssueStatusOutcome {
 
 type ExecutionLockFacts = {
   requiresExecutionLock: boolean;
+  allowVacantExecutionLock?: boolean;
   runId: string;
   issueExecutionRunId: string | null;
   issueCheckoutRunId?: string | null;
@@ -225,7 +226,11 @@ type ExecutionLockOutcome = "ok" | "lock_changed";
 
 /** Decides whether the issue's execution lock still belongs to this run. */
 function decideExecutionLock(facts: ExecutionLockFacts): ExecutionLockOutcome {
-  if (facts.requiresExecutionLock && facts.issueExecutionRunId !== facts.runId) {
+  if (
+    facts.requiresExecutionLock &&
+    !(facts.allowVacantExecutionLock && facts.issueExecutionRunId === null) &&
+    facts.issueExecutionRunId !== facts.runId
+  ) {
     return "lock_changed";
   }
   return "ok";
@@ -411,6 +416,9 @@ export function decideScheduledRetryGate(
       (requiresInProgress ||
         (facts.retryReasonKind === "ai_connection_wait" && !facts.isNonAssigneeWorkspaceBusyRetry)) &&
       facts.enforceIssueExecutionLock,
+    allowVacantExecutionLock:
+      facts.retryReasonKind === "max_turn_continuation" &&
+      !facts.isNonAssigneeWorkspaceBusyRetry,
     runId: facts.runId,
     issueExecutionRunId: facts.issueExecutionRunId,
   });
@@ -656,6 +664,9 @@ export function decideQueuedRunStaleness(
     // A server-recorded non-assignee wake never held the task execution lock.
     requiresExecutionLock: requiresInProgress ||
       (facts.retryReasonKind === "ai_connection_wait" && !facts.isNonAssigneeWorkspaceBusyRetry),
+    allowVacantExecutionLock:
+      facts.retryReasonKind === "max_turn_continuation" &&
+      !facts.isNonAssigneeWorkspaceBusyRetry,
     runId: facts.runId,
     issueExecutionRunId: facts.issueExecutionRunId,
   });

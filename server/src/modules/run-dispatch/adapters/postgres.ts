@@ -297,9 +297,10 @@ export function createPostgresRunDispatchAdapter(
     const facts: ScheduledRetryFacts = {
       runId: input.runId,
       runAgentId: input.agentId,
-      issueId,
+       issueId,
        retryReasonKind,
-       enforceIssueExecutionLock: retryReasonKind === "ai_connection_wait",
+       enforceIssueExecutionLock:
+         retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
        isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
       budgetBlock: null,
       agentInvokable: true,
