@@ -13,6 +13,8 @@ import {
   externalObjectMentions,
   externalObjects,
   heartbeatRuns,
+  issueDeliveryReceiptLinks,
+  issueDeliveryReceipts,
   issueExecutionDecisions,
   issues,
   projectWorkspaces,
@@ -119,6 +121,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
 
+    await db.delete(issueDeliveryReceiptLinks);
+    await db.delete(issueDeliveryReceipts);
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
@@ -191,6 +195,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     sharedWorkspaceOwnedByParent?: boolean;
     /** Pre-seed executionState.approvalStatus.publishedHeadSha (idempotent path). */
     prePublishedHeadSha?: string | null;
+    deliveryReceipt?: boolean;
+
     /**
      * SUP-15459: append extra stages to the execution policy that are NOT in
      * completedStageIds — the mid-ladder shape (the ladder is still running, the
@@ -394,14 +400,46 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         },
       };
       const [externalObj] = await db.insert(externalObjects).values(obj).returning();
-      await db.insert(externalObjectMentions).values({
+      const mention: typeof externalObjectMentions.$inferInsert = {
         companyId,
         sourceIssueId: issueId,
-        sourceKind: "issue_comment",
+        sourceKind: "comment",
         objectId: externalObj!.id,
         objectType: "pull_request",
         providerKey: "github",
-      });
+      };
+      await db.insert(externalObjectMentions).values(mention);
+      if (opts.deliveryReceipt) {
+        const receiptId = randomUUID();
+        await db.insert(issueDeliveryReceipts).values({
+          id: receiptId,
+          companyId,
+          sourceIssueId: issueId,
+          provider: "github",
+          owner: opts.pr.owner.toLowerCase(),
+          repo: opts.pr.repo.toLowerCase(),
+          pullRequestNumber: opts.pr.number,
+          headSha: HEAD_SHA,
+          branchName: opts.pr.headRefName ?? DELIVERY_BRANCH,
+          sourceDeliveryRecord: { fixture: true },
+          recoveryReason: "authorized test publication",
+          authorizedByActorType: "user",
+          authorizedByActorId: USER_ID,
+          idempotencyKey: `fixture-${issueId}-${HEAD_SHA}`,
+          state: "ready",
+        });
+        await db.insert(issueDeliveryReceiptLinks).values({
+          companyId,
+          receiptId,
+          sourceIssueId: issueId,
+          externalObjectId: externalObj!.id,
+          provider: "github",
+          owner: opts.pr.owner.toLowerCase(),
+          repo: opts.pr.repo.toLowerCase(),
+          pullRequestNumber: opts.pr.number,
+          headSha: HEAD_SHA,
+        });
+      }
     }
 
     return { companyId, issueId, identifier, reviewerAgentId };
@@ -566,6 +604,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       pendingStageIds,
       completedStageIds: [STAGE_ID, ...pendingStageIds],
       pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      deliveryReceipt: true,
     });
     currentActor = boardActor(companyId);
 
@@ -638,6 +677,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
   it("re-publishes and persists the certified head when the card is approvable and delivered", async () => {
     const { companyId, issueId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      deliveryReceipt: true,
     });
     currentActor = boardActor(companyId);
 
@@ -701,6 +741,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
   it("is idempotent: a second invocation after arming answers already_published", async () => {
     const { companyId, issueId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      deliveryReceipt: true,
     });
     currentActor = boardActor(companyId);
 
@@ -731,6 +772,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       sharedWorkspaceOwnedByParent: true,
       deliveryBranch: "SUP-14668-parent-architecture-review",
       pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: "SUP-14748-1-real-delivery" },
+      deliveryReceipt: true,
     });
     currentActor = boardActor(companyId);
 
@@ -789,6 +831,8 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
   });
 
   beforeEach(async () => {
+    await db.delete(issueDeliveryReceiptLinks);
+    await db.delete(issueDeliveryReceipts);
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
