@@ -710,8 +710,9 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
       command: declared,
       expose: { ...LEGACY_HTTP_EXPOSE, tailscaleHttps: false },
       // This guest opens a second listener at appPort + 10000. An arbitrary
-      // ephemeral app port can overflow the valid TCP port range.
-      port: await findFreeExposureAppPort(RUNTIME_EXPOSURE_APP_PORT_MIN),
+      // ephemeral app port can overflow the valid TCP port range. Randomised
+      // start so parallel shards do not converge on 42000/52000.
+      port: await pickCollisionSafeExposureAppPort(),
     }));
 
     expect(calls).toEqual([]);
