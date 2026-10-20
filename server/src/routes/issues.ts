@@ -10286,11 +10286,37 @@ export function issueRoutes(
     const visible = (await actorCanReadCompanyScope(req, companyId))
       ? rows
       : await filterIssuesForActor(req, rows);
+    const issueIds = visible.map((issue) => issue.id);
+    const [handoffStates, recoveryActionByIssue] = await Promise.all([
+      listSuccessfulRunHandoffStates(db, companyId, issueIds),
+      recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
+    ]);
+    const actor = getActorInfo(req);
+    await Promise.all(
+      visible.map(async (issue) => {
+        const activeRecoveryAction = recoveryActionByIssue.get(issue.id) ?? null;
+        if (!activeRecoveryAction) return;
+        const revalidated = await revalidateActiveSourceRecoveryForRead({
+          issue,
+          trigger: "read_projection",
+          actor,
+          activeRecoveryAction,
+        });
+        if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
+        else recoveryActionByIssue.delete(issue.id);
+      }),
+    );
     const byKey = new Map(visible.map((issue) => [hasIds ? issue.id : issue.identifier, issue]));
     res.json({
       issues: keys.flatMap((key) => {
         const issue = byKey.get(key);
-        return issue ? [toCompactIssue(issue)] : [];
+        return issue
+          ? [toCompactIssue({
+              ...issue,
+              activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
+              successfulRunHandoff: handoffStates.get(issue.id) ?? null,
+            })]
+          : [];
       }),
       missing: keys.filter((key) => !byKey.has(key)),
     });

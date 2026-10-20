@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, issues, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { createCompanySearchRateLimiter } from "../services/company-search-rate-limit.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import type { StorageService } from "../storage/types.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -140,6 +141,58 @@ describePostgres("bounded bulk issue read", () => {
     expect(bulk.status, JSON.stringify(bulk.body)).toBe(200);
     expect(bulk.body.issues.map((row: { id: string }) => row.id)).toEqual([issueIds[0]]);
     expect(bulk.body.missing).toEqual([issueIds[1]]);
+  });
+
+  it("preserves active recovery and required handoff fields from the compact list", async () => {
+    const sourceRunId = randomUUID();
+    const recoveryAction = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId: issueIds[0],
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:bulk-route",
+      evidence: { sourceRunId },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueIds[0],
+      agentId,
+      runId: null,
+      details: {
+        sourceRunId,
+        detectedProgressSummary: "A successful run needs a disposition.",
+      },
+    });
+
+    const server = app(board());
+    const list = await request(server).get(`/api/companies/${companyId}/issues`)
+      .query({ view: "compact", limit: "20" });
+    const bulk = await request(server).get(`/api/companies/${companyId}/issues/bulk`)
+      .query({ ids: issueIds[0] });
+    expect(list.status, JSON.stringify(list.body)).toBe(200);
+    expect(bulk.status, JSON.stringify(bulk.body)).toBe(200);
+    const listedIssue = list.body.find((row: { id: string }) => row.id === issueIds[0]);
+    expect(listedIssue.activeRecoveryAction.id).toBe(recoveryAction.id);
+    expect(listedIssue.successfulRunHandoff).toMatchObject({
+      state: "required",
+      sourceRunId,
+    });
+    expect(bulk.body.issues[0].activeRecoveryAction).toMatchObject({
+      id: recoveryAction.id,
+      sourceIssueId: issueIds[0],
+    });
+    expect(bulk.body.issues[0].successfulRunHandoff).toMatchObject({
+      state: "required",
+      sourceRunId,
+    });
   });
 
   it("keeps SQL statement count flat when requesting more issue IDs", async () => {
