@@ -18359,6 +18359,18 @@ export function issueRoutes(
         interruptedRunId = cancelled.id;
       }
     }
+    if (finalDeliveryPrefetch && interruptedRunId) {
+      // Our own run cancellation bumped updatedAt; re-anchor it only while the
+      // certified status and delivery binding are unchanged.
+      const afterStop = await svc.getById(existing.id);
+      if (
+        afterStop &&
+        afterStop.status === finalDeliveryPrefetch.status &&
+        (await readFinalDeliveryBinding(db, afterStop)) === finalDeliveryPrefetch.binding
+      ) {
+        finalDeliveryPrefetch = { ...finalDeliveryPrefetch, updatedAtMs: new Date(afterStop.updatedAt).getTime() };
+      }
+    }
     const nextParentId = updateFields.parentId === undefined
       ? existing.parentId
       : updateFields.parentId as string | null;
@@ -21394,8 +21406,29 @@ export function issueRoutes(
       };
       // Terminal final-stage only: nonterminal accepts keep the three-argument call.
       const acceptArgs: [typeof issue, string, typeof req.body, typeof acceptActor] = [issue, interactionId, req.body, acceptActor];
+      const applyEscalationApproval = (dbLike: Db) => applyReviewEscalationDecision({
+        db: dbLike,
+        issue,
+        requestedStatus: "done",
+        decisionBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
+        actor: {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          runId: actor.runId,
+        },
+        // SUP-17552: a final-stage escalation approval closes the card (the
+        // guard above already allowed it); a non-final stage still only advances
+        // the pointer via the engine's `in_review` patch.
+        finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
+      });
+      const terminalEscalationResolution: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
       const { interaction, createdIssues, continuationIssue } = escalationApproval
         ? await interactionSvc.acceptInteraction(...acceptArgs, {
+            // The decision commits in the interaction's transaction, under the issue
+            // lock taken by the revalidation, so a stale verdict leaves both pending.
+            afterResolveInTransaction: async (tx) => {
+              terminalEscalationResolution.value = await applyEscalationApproval(tx as unknown as Db);
+            },
             beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
               const [lockedIssue] = await tx.select().from(issueRows)
                 .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
@@ -21418,21 +21451,9 @@ export function issueRoutes(
         interaction.status === "accepted" &&
         isReviewEscalationInteraction(current)
       ) {
-        const escalationResolution = await applyReviewEscalationDecision({
-          db,
-          issue,
-          requestedStatus: "done",
-          decisionBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
-          actor: {
-            agentId: actor.agentId,
-            userId: actor.actorType === "user" ? actor.actorId : null,
-            runId: actor.runId,
-          },
-          // SUP-17552: a final-stage escalation approval closes the card (the
-          // guard above already allowed it); a non-final stage still only advances
-          // the pointer via the engine's `in_review` patch.
-          finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
-        });
+        const escalationResolution = escalationApproval
+          ? terminalEscalationResolution.value
+          : await applyEscalationApproval(db);
         if (escalationResolution) {
           resolvedContinuationIssue = escalationResolution;
           // SUP-17163: accepting a review round-cap escalation records an
