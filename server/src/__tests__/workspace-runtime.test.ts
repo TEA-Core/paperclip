@@ -5456,6 +5456,46 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
+  it("returns a structured validation failure when the worktree registry cannot be read", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "SUP-20435-registry-unreadable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await runGit(repoRoot, ["worktree", "add", "-b", expectedBranch, worktreePath, "HEAD"]);
+    await runGit(worktreePath, ["checkout", "--detach"]);
+
+    const gitDir = path.join(repoRoot, ".git");
+    const hiddenGitDir = path.join(repoRoot, ".git-hidden-for-test");
+    await fs.rename(gitDir, hiddenGitDir);
+    await fs.writeFile(gitDir, "not a git directory\n", "utf8");
+    try {
+      await expect(ensureGitWorktreeBranchCoherent({
+        repoRoot,
+        worktreePath,
+        expectedBranchName: expectedBranch,
+        actualBranchName: "some-other-branch",
+        sourceIssue: {
+          id: "issue-registry",
+          identifier: "SUP-20435",
+          title: "Registry unreadable",
+        },
+      })).rejects.toMatchObject({
+        name: "WorkspaceRuntimeValidationFailure",
+        code: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "git_worktree_registry_unreadable",
+            reasonCode: "worktree_list_failed",
+            worktreePath,
+            repoRoot,
+          }),
+        },
+      });
+    } finally {
+      await fs.rm(gitDir, { force: true });
+      await fs.rename(hiddenGitDir, gitDir).catch(() => undefined);
+    }
+  }, 15_000);
+
   it("does not reuse a missing persisted local filesystem workspace", async () => {
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-base-"));
     const missingCwd = path.join(baseCwd, "missing-workspace");
