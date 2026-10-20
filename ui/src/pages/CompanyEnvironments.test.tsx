@@ -781,7 +781,11 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await openEnvironmentEditPage(container);
+    await flushReact();
+
+    await act(async () => {
+      click(findAction(container, "Edit"));
+    });
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
     });
@@ -818,7 +822,11 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await openEnvironmentEditPage(container);
+    await flushReact();
+
+    await act(async () => {
+      click(findAction(container, "Edit"));
+    });
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
     });
