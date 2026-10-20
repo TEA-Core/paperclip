@@ -1071,9 +1071,10 @@ The same company and per-issue read authorization as the regular issue routes
 applies; missing and unauthorized keys are indistinguishable. Bulk reads use
 ordinary list visibility (hidden, harness, and conversation issues are omitted;
 plugin-operation issues are included, matching `GET /issues/:issueId`)
-and do not hydrate ancestors, documents, workspaces, or work products. A key
-has a 30-request budget per minute (separate from search); exhausted requests
-return `429` with `Retry-After`. Invalid or over-cap requests return `400`.
+and do not hydrate ancestors, documents, workspaces, or work products. Within
+a company, each API key, board session, user identity, or agent identity has a 30-request
+budget per minute (separate from search); exhausted requests return `429`
+with `Retry-After`. Invalid or over-cap requests return `400`.
 Pollers should batch at most 50 identifiers per call instead of walking
 `GET /issues/:issueId` for status. This endpoint does not migrate clients.
 

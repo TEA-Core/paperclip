@@ -128,6 +128,26 @@ describePostgres("bounded bulk issue read", () => {
     expect((await request(app(board())).get(endpoint).query({ ids: issueIds[0] })).status).toBe(200);
   });
 
+  it("keeps budgets separate for board sessions of the same user", async () => {
+    const actor: Express.Request["actor"] = {
+      type: "board",
+      userId: "board-user",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+      source: "session",
+      isInstanceAdmin: true,
+    };
+    const server = app(actor);
+    const endpoint = `/api/companies/${companyId}/issues/bulk`;
+    for (const cookie of ["paperclip.session=first", "paperclip.session=second"]) {
+      for (const status of [200, 200, 429]) {
+        const response = await request(server).get(endpoint)
+          .set("Cookie", cookie).query({ ids: issueIds[0] });
+        expect(response.status).toBe(status);
+      }
+    }
+  });
+
   it("lets regular agents read but applies single-read authorization to restricted keys", async () => {
     const regular = await request(app(agent())).get(`/api/companies/${companyId}/issues/bulk`)
       .query({ ids: issueIds[0] });

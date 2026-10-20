@@ -10265,7 +10265,7 @@ export function issueRoutes(
       return;
     }
     const keys = [...new Set(hasIds ? requested.map((value) => value.toLowerCase()) : requested.map((value) => value.toUpperCase()))];
-    const actorId = req.actor.keyId ?? (req.actor.type === "agent" ? req.actor.agentId : req.actor.userId) ?? "board";
+    const actorId = issueListActorIdentity(req, companyId).key;
     const rateLimit = bulkIssueRateLimiter.consume({
       companyId,
       actorType: req.actor.type === "agent" ? "agent" : "board",
