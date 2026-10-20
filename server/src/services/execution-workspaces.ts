@@ -1777,7 +1777,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // snapshot.
   async function clearReopenPendingConsumptionUnderLock(
     workspaceId: string,
-    options: { expectedGeneration: number; requireStaleSinceBefore?: Date },
+    options: { expectedGeneration: number; requireStaleSinceBefore?: Date; requireNonTerminalSourceIssueId?: string },
   ): Promise<boolean> {
     return fenceLifecycleGenerationWrite<boolean>({
       workspaceId,
@@ -1796,6 +1796,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       },
       onSkip: () => false,
       write: async ({ tx, fresh }) => {
+        if (options.requireNonTerminalSourceIssueId) {
+          // Issue updates may take the issue row lock before a workspace lock.
+          // Do not wait on that row while holding the workspace lifecycle lock:
+          // skip this clear and retry on a later sweep instead of deadlocking.
+          const rows = Array.from(await tx.execute(
+            sql`select ${issues.status} from ${issues} where ${issues.id} = ${options.requireNonTerminalSourceIssueId} for share skip locked`,
+          ));
+          const source = rows[0] as { status?: string } | undefined;
+          if (!source?.status || TERMINAL_ISSUE_STATUSES.has(source.status)) return false;
+        }
         await tx
           .update(executionWorkspaces)
           .set({
@@ -2978,18 +2988,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         );
         if (!TERMINAL_ISSUE_STATUSES.has(workspace.sourceIssueStatus)) {
           if (reopenPending) {
-            // The joined status came from candidate selection. Re-read the same
-            // issue tree as assessDelivery before clearing a generation fence:
-            // the source may have returned to a terminal state meanwhile.
-            const issueTree = await listWorkspaceIssueTree(workspace);
-            const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId);
-            if (sourceIssue && !TERMINAL_ISSUE_STATUSES.has(sourceIssue.status)) {
-              await clearReopenPendingConsumptionUnderLock(workspace.id, {
-                expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
-                  workspace.metadata as Record<string, unknown> | null,
-                ),
-              });
-            }
+            // Candidate selection is a snapshot. Confirm the source is still
+            // non-terminal under the lifecycle lock before clearing its fence.
+            await clearReopenPendingConsumptionUnderLock(workspace.id, {
+              expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
+                workspace.metadata as Record<string, unknown> | null,
+              ),
+              requireNonTerminalSourceIssueId: workspace.sourceIssueId!,
+            });
           }
           result.skippedNonTerminalTree += 1;
           continue;

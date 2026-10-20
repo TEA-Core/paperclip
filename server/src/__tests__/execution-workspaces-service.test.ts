@@ -5622,6 +5622,85 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }
   });
 
+  it("keeps the reopen fence when the source turns terminal at the locked clear", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    await db.update(executionWorkspaces).set({
+      metadata: {
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date().toISOString(),
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const originalTransaction = db.transaction.bind(db);
+    const transaction = vi.spyOn(db, "transaction").mockImplementationOnce(((
+      callback: (tx: never) => Promise<unknown>,
+    ) => originalTransaction(async (tx) => {
+      // The candidate SELECT and any unlocked re-read saw an open source;
+      // the terminal close commits before the fenced write takes its locks.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+      return callback(tx as never);
+    })) as unknown as typeof db.transaction);
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      const sweep = await svc.sweepTerminalWorkspaces();
+      const [workspace] = await db.select({
+        status: executionWorkspaces.status,
+        metadata: executionWorkspaces.metadata,
+      }).from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(sweep).toMatchObject({ checked: 1, archived: 0, skippedNonTerminalTree: 1 });
+      expect(scan).not.toHaveBeenCalled();
+      expect(workspace?.status).toBe("active");
+      expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    } finally {
+      transaction.mockRestore();
+      scan.mockRestore();
+    }
+  });
+
+  it("does not wait on an issue writer while clearing a reopen fence", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    await db.update(executionWorkspaces).set({
+      metadata: {
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    let releaseWriter!: () => void;
+    const writerReleased = new Promise<void>((resolve) => { releaseWriter = resolve; });
+    let writerReady!: () => void;
+    const writerLocked = new Promise<void>((resolve) => { writerReady = resolve; });
+    const writer = db.transaction(async (tx) => {
+      await tx.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+      writerReady();
+      await writerReleased;
+    });
+    await writerLocked;
+    // Bounds a real PostgreSQL row-lock wait, which fake timers cannot advance;
+    // on success the sweep resolves immediately rather than waiting for this.
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const sweep = await Promise.race([
+        svc.sweepTerminalWorkspaces(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("reaper blocked on issue writer")), 5_000);
+        }),
+      ]);
+      expect(sweep).toMatchObject({ checked: 1, archived: 0, skippedNonTerminalTree: 1 });
+      const [workspace] = await db.select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
+    } finally {
+      clearTimeout(timeout);
+      releaseWriter();
+      await writer;
+    }
+  }, 20_000);
+
   it("does not remove an idle workspace whose source issue is still in progress", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await db
