@@ -40,6 +40,7 @@ import {
   normalizeAdapterManagedRuntimeServices,
   preserveUnpushedWorktreeCommits,
   pruneExpiredRescueRefs,
+  acquireGitWorktreeCleanupLock,
   removeGitWorktreeArtifact,
   resolveGitExecutable,
   prepareBaseRepoForWorkspace,
@@ -12602,6 +12603,30 @@ describe("terminal workspace cleanup git resolution (SUP-15059)", () => {
     expect(warning).toContain("removed git worktree");
     expect(warning).not.toContain("spawn git ENOENT");
     await expect(fs.stat(worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("treats a missing worktree path as already removed and prunes the admin entry", async () => {
+    const repoRoot = await createTempRepo("main");
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "sup-20436-missing");
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "-b", "sup-20436-missing"]);
+    await fs.rm(worktreePath, { recursive: true, force: true });
+    expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).toContain(worktreePath);
+
+    const lock = await acquireGitWorktreeCleanupLock(worktreePath);
+    await lock.releaseBranchRefLock();
+    await lock.release();
+
+    const warning = await removeGitWorktreeArtifact({
+      repoRoot,
+      worktreePath,
+      forceWorktreeRemoval: false,
+      metadata: { workspaceId: "ws-missing", branchName: "sup-20436-missing" },
+    });
+
+    expect(warning).toBeNull();
+    expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(worktreePath);
+    await fs.rm(repoRoot, { recursive: true, force: true });
   });
 });
 
