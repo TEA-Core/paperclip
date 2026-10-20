@@ -5572,6 +5572,56 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   }, 20_000);
 
+  it("keeps the reopen fence when the source turns terminal after candidate selection", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    await db.update(executionWorkspaces).set({
+      metadata: {
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date().toISOString(),
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const originalSelect = db.select.bind(db);
+    const select = vi.spyOn(db, "select").mockImplementationOnce(((fields: Record<string, unknown>) => {
+      const query = originalSelect(fields as never);
+      const originalFrom = query.from.bind(query);
+      Object.defineProperty(query, "from", {
+        value: (table: typeof executionWorkspaces) => {
+          const fromQuery = originalFrom(table);
+          const originalLimit = fromQuery.limit.bind(fromQuery);
+          // Commit the terminal transition after SQL returns the non-terminal
+          // candidate snapshot, but before the sweep decides whether to clear.
+          Object.defineProperty(fromQuery, "limit", {
+            value: (count: number) => Promise.resolve(originalLimit(count)).then(async (rows) => {
+              await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+              return rows;
+            }),
+          });
+          return fromQuery;
+        },
+      });
+      return query;
+    }) as unknown as typeof db.select);
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      const sweep = await svc.sweepTerminalWorkspaces();
+      const [workspace] = await db.select({
+        status: executionWorkspaces.status,
+        metadata: executionWorkspaces.metadata,
+      }).from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(sweep).toMatchObject({ checked: 1, archived: 0, skippedNonTerminalTree: 1 });
+      expect(scan).not.toHaveBeenCalled();
+      expect(workspace?.status).toBe("active");
+      expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    } finally {
+      select.mockRestore();
+      scan.mockRestore();
+    }
+  });
+
   it("does not remove an idle workspace whose source issue is still in progress", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await db

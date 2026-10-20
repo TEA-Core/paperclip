@@ -2978,11 +2978,18 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         );
         if (!TERMINAL_ISSUE_STATUSES.has(workspace.sourceIssueStatus)) {
           if (reopenPending) {
-            await clearReopenPendingConsumptionUnderLock(workspace.id, {
-              expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
-                workspace.metadata as Record<string, unknown> | null,
-              ),
-            });
+            // The joined status came from candidate selection. Re-read the same
+            // issue tree as assessDelivery before clearing a generation fence:
+            // the source may have returned to a terminal state meanwhile.
+            const issueTree = await listWorkspaceIssueTree(workspace);
+            const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId);
+            if (sourceIssue && !TERMINAL_ISSUE_STATUSES.has(sourceIssue.status)) {
+              await clearReopenPendingConsumptionUnderLock(workspace.id, {
+                expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
+                  workspace.metadata as Record<string, unknown> | null,
+                ),
+              });
+            }
           }
           result.skippedNonTerminalTree += 1;
           continue;
