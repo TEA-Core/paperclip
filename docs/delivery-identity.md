@@ -29,6 +29,21 @@ The operation remains unarmed when the binding is incomplete, malformed, cross-r
 
 Cross-repository delivery remains unsupported by design. A deliverable must be filed under a project bound to its destination repository; recovery requires a fresh correctly projected delivery and review.
 
+## Free-text merge constraints are non-binding
+
+Delivery identity answers one question: **which pull request may be armed**. It does not decide whether a card may be armed at all, and it never reads the card's prose.
+
+The approved policy (SUP-20293): a merge constraint written as free text — an issue description, a comment, a document, or any other prose, such as "do not enable auto-merge" or "wait for the board's merge word" — is **non-binding** for merge arming. Prose is not an actuator input: arming is keyed to delivery identity, pull-request ownership (the approving card named in the PR title or head branch), completed approval stages, and the company merge-arming setting. The card description is consulted only as a source of bare PR URLs when linking pull requests, and there is no per-card machine-readable merge opt-out field. A card whose description carries a contrary merge instruction is therefore still armed when its approval lands; that outcome follows the arming contract rather than deviating from it.
+
+## Manual merges use an explicit gate
+
+Work that must not be auto-merged cannot express that requirement in free text. The owner must establish an explicit path before final approval, using one of:
+
+- an **operator/human-gate workflow** — the approval or merge step is held by a human or board-operated process, so a card approval does not arm auto-merge; or
+- a **manual-merge card** — the card's deliverable is the merge action itself, performed by an operator after the required checks and review, instead of delivery of a pull request by an implementation card.
+
+Board authority over a landing is exercised through these explicit surfaces, never through prose attached to an implementation card.
+
 ## Authoritative flow
 
 `resolveDeliveryIdentity` reads the recorded identity. `resolveExactBoundPullRequest` verifies the exact live PR and head. `narrowToDelivered` restricts candidates to that verified PR, while `publishApprovalStatus` and `armMergeOnApproval` reject any mismatch before writing approval status or arming merge. The decision-time head resolver uses the same exact binding so the approving card and the actuator target cannot diverge.
