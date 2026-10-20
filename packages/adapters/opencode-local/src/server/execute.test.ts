@@ -137,7 +137,7 @@ describe("buildOpenCodeRunArgs", () => {
         extraArgs: [],
         printLogs: false,
         resumeSessionId: null,
-        openCodeV2: true,
+        cliVersion: "2.0.26",
         autoApprovePermissions: true,
       }),
     ).toEqual([
@@ -1541,8 +1541,6 @@ describe("execute — per-agent opencode database", () => {
       ...overrides,
     } as AdapterExecutionContext;
   }
-
-  let inheritedDatabase: string | undefined;
 
   beforeEach(() => {
     inheritedDatabase = process.env.OPENCODE_DB;

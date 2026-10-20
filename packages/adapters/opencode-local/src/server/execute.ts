@@ -728,10 +728,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "opencode");
-  const cliVersion = asString(config.cliVersion, "").trim();
-  if (cliVersion && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+  const configuredCliVersion = asString(config.cliVersion, "").trim();
+  if (configuredCliVersion && configuredCliVersion !== OPENCODE_V2_CLI_VERSION) {
     throw new Error(
-      `Unsupported OpenCode CLI version: ${cliVersion}. Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`,
+      `Unsupported OpenCode CLI version: ${configuredCliVersion}. Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`,
     );
   }
   const model = asString(config.model, "").trim();
@@ -951,7 +951,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     installCommand: SANDBOX_INSTALL_COMMAND,
     timeoutSec,
   });
-  const cliVersion = await probeOpenCodeCliVersion({
+  const detectedCliVersion = await probeOpenCodeCliVersion({
     runId: `${runId}:opencode-version`,
     command,
     target: executionTarget,
@@ -960,7 +960,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutSec,
     graceSec,
   });
-  const openCodeV2 = usesOpenCodeV2Cli(cliVersion);
+  const cliVersion = configuredCliVersion || detectedCliVersion?.version;
+  const openCodeV2 = usesOpenCodeV2Cli(detectedCliVersion);
   const runtimeMcpServers = openCodeV2 ? await ctx.runtimeMcp?.getServers() ?? [] : [];
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
     env,
