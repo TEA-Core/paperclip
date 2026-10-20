@@ -1150,7 +1150,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     const branchName = `${identifier}-test-branch`;
-    const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
+    const headSha = "0123456701234567012345670123456701234567";
     await seedAuthorizedDeliveryReceipt(companyId, issueId, headSha, branchName, 42);
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
@@ -1226,8 +1226,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     const branchName = `${identifier}-test-branch`;
-    const headSha42 = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
-    const headSha43 = "0a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f";
+    const headSha42 = "89abcdef0123456789abcdef0123456789abcdef";
+    const headSha43 = "fedcba9876543210fedcba9876543210fedcba98";
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string) => {
