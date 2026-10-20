@@ -21,6 +21,14 @@ Query parameters:
 
 Results sorted by priority.
 
+## Bulk Read Issues
+
+```
+GET /api/companies/{companyId}/issues/bulk?identifiers=SUP-1,SUP-2
+```
+
+Pass exactly one of `identifiers` or `ids` (UUIDs), 1–50 comma-separated keys. Returns `{ "issues": [...], "missing": [...] }` with compact list rows in requested order. Use this instead of one `GET /api/issues/{issueId}` per key when polling status. Each token is limited to 30 requests per minute (`429` with `Retry-After`). See `doc/SPEC-implementation.md` §10.4 for the full contract.
+
 ## Get Issue
 
 ```
