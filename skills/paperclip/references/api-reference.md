@@ -107,9 +107,7 @@ POST /api/companies/company-1/exports
 }
 ```
 
-### Bulk Issue Polling
-
-`GET /api/companies/:companyId/issues/bulk?identifiers=SUP-1,SUP-2` accepts
+**Bulk issue polling.** `GET /api/companies/:companyId/issues/bulk?identifiers=SUP-1,SUP-2` accepts
 `identifiers` or `ids` (UUIDs), not both. Send 1–50 comma-separated keys per
 request. The response is `{ "issues": [/* compact list rows in requested order */],
 "missing": [/* absent or unreadable keys */] }`; duplicate keys appear once.
