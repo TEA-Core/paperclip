@@ -149,6 +149,28 @@ type PrincipalGrantDecision = AuthorizationDecision & {
   grant?: NonNullable<AuthorizationDecision["grant"]>;
 };
 
+type PrincipalGrantInput = {
+  companyId: string;
+  principalType: PrincipalType;
+  principalId: string;
+  action: AuthorizationAction;
+  permissionKey: PermissionKey;
+  scope?: Record<string, unknown> | null;
+};
+
+type AuthorizationDecisionInput = {
+  actor: AuthorizationActor;
+  action: AuthorizationAction;
+  resource: AuthorizationResource;
+  scope?: Record<string, unknown> | null;
+};
+
+export interface AuthorizationService {
+  decide(input: AuthorizationDecisionInput): Promise<AuthorizationDecision>;
+  decidePrincipalGrant(input: PrincipalGrantInput): Promise<PrincipalGrantDecision>;
+  isManagerOf(companyId: string, managerAgentId: string, assigneeAgentId: string): Promise<boolean>;
+}
+
 function companyIdForResource(resource: AuthorizationResource) {
   return resource.companyId;
 }
@@ -587,7 +609,10 @@ export const ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE = false;
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-export function authorizationService(db: Db | DbTransaction, memoContext: AuthorizationMemoContext = {}) {
+function authorizationServiceWithMemo(
+  db: Db | DbTransaction,
+  memoContext: AuthorizationMemoContext,
+): AuthorizationService {
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
     if (
@@ -708,14 +733,7 @@ export function authorizationService(db: Db | DbTransaction, memoContext: Author
       .then((rows) => rows[0] ?? null);
   }
 
-  async function decidePrincipalGrant(input: {
-    companyId: string;
-    principalType: PrincipalType;
-    principalId: string;
-    action: AuthorizationAction;
-    permissionKey: PermissionKey;
-    scope?: Record<string, unknown> | null;
-  }): Promise<PrincipalGrantDecision> {
+  async function decidePrincipalGrant(input: PrincipalGrantInput): Promise<PrincipalGrantDecision> {
     const membership = await getActiveMembership(input.companyId, input.principalType, input.principalId);
     if (!membership) {
       return deny({
@@ -2500,12 +2518,7 @@ export function authorizationService(db: Db | DbTransaction, memoContext: Author
     return responsibleUserAuthzShadowMode() ? agentDecision : denied;
   }
 
-  async function decide(input: {
-    actor: AuthorizationActor;
-    action: AuthorizationAction;
-    resource: AuthorizationResource;
-    scope?: Record<string, unknown> | null;
-  }): Promise<AuthorizationDecision> {
+  async function decide(input: AuthorizationDecisionInput): Promise<AuthorizationDecision> {
     const agentDecision = await decideBase(input);
     return applyResponsibleUserIntersection(input, agentDecision);
   }
@@ -2514,5 +2527,26 @@ export function authorizationService(db: Db | DbTransaction, memoContext: Author
     decide,
     decidePrincipalGrant,
     isManagerOf,
+  };
+}
+
+/**
+ * A service can be retained by a route factory or background worker. Only an
+ * explicitly supplied context shares memo entries across decisions; otherwise
+ * each call gets its own context, including related loads within that decision.
+ */
+export function authorizationService(
+  db: Db | DbTransaction,
+  memoContext?: AuthorizationMemoContext,
+): AuthorizationService {
+  if (memoContext) return authorizationServiceWithMemo(db, memoContext);
+  return {
+    decide: (input) => authorizationServiceWithMemo(db, createAuthorizationMemoContext()).decide(input),
+    decidePrincipalGrant: (input) =>
+      authorizationServiceWithMemo(db, createAuthorizationMemoContext()).decidePrincipalGrant(input),
+    isManagerOf: (companyId, managerAgentId, assigneeAgentId) =>
+      authorizationServiceWithMemo(db, createAuthorizationMemoContext()).isManagerOf(
+        companyId, managerAgentId, assigneeAgentId,
+      ),
   };
 }

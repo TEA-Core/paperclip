@@ -233,6 +233,11 @@ The decisions desk stores queue membership, decide-by/snooze state, and retentio
 
 Malformed issue IDs in failed-run JSON snapshots cannot join UUID-backed issues. Queue reads exclude those entries without failing the rest of the company list.
 
+Authorization lookups for agent, issue, and run-policy rows share memo entries
+only when a caller passes an explicit, short-lived context for one list, request,
+decision, or transaction. Retained services without that context create one
+context per decision, so a later request observes changed authorization rows.
+
 Triage writes serialize on the company and attention-source identity so concurrent partial updates preserve both fields and produce monotonic history versions.
 
 `decision_retention` tracks the last observed source `activityAt`, Keep, reversible archive provenance, and monotonic source/archive versions. `decision_archive_notification_outbox` has a unique key over company, source identity, archive version, and immutable origin agent so repeated sweeps cannot enqueue duplicate notifications; delivery claims are retryable and coalesced per agent.
