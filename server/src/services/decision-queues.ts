@@ -30,6 +30,7 @@ import { notFound, unprocessable } from "../errors.js";
 import { logActivityInTransaction } from "./activity-log.js";
 import {
   authorizationService,
+  createAuthorizationMemoContext,
   type AuthorizationActor,
   type AuthorizationResource,
 } from "./authorization.js";
@@ -297,7 +298,7 @@ export async function canReadDecisionSource(
 ) {
   const source = await sourceIssueId(db, companyId, sourceKind, sourceId);
   if (!source.exists) return false;
-  const authz = authorizationService(db);
+  const authz = authorizationService(db, createAuthorizationMemoContext());
   if (source.issueId) {
     const resource = await loadIssueResource(db, companyId, source.issueId);
     if (!resource) return false;
@@ -453,11 +454,12 @@ async function readableQueueItems(
       authorizationContextLoaded: true,
     } },
   ]));
-  const authz = authorizationService(db);
+  const memoContext = createAuthorizationMemoContext();
+  const authz = authorizationService(db, memoContext);
   // Standard company visibility is uniform; actors without it still need
   // concrete issue/agent decisions (notably low-trust agent boundaries).
   // Policy-bearing issues also use the canonical per-resource evaluator.
-  const companyRead = (await authz.decide({ actor, action: "issue:read", resource: { type: "issue", companyId } })).allowed;
+  const companyRead = actor.type !== "agent" && (await authz.decide({ actor, action: "issue:read", resource: { type: "issue", companyId } })).allowed;
   const boardRead = actor.type === "board" && (await authz.decide({
     actor, action: "company_scope:read", resource: { type: "company", companyId },
   })).allowed;

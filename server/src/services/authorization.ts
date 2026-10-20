@@ -27,6 +27,7 @@ import {
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
+import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
@@ -485,6 +486,23 @@ type ResponsibleUserActorWithMemo = AuthorizationActor & {
   __responsibleUserSnapshotMemo?: Map<string, Promise<ResponsibleUserSnapshot>>;
 };
 
+export type AuthorizationMemoContext = object;
+
+export function createAuthorizationMemoContext(): AuthorizationMemoContext {
+  return {};
+}
+
+const memoizeAgent = createRequestPromiseMemo<AuthorizationMemoContext, AgentAuthorizationRow | null>({
+  shouldCache: (value) => value !== null,
+});
+const memoizeIssue = createRequestPromiseMemo<AuthorizationMemoContext, IssueAuthorizationRow | null>({
+  shouldCache: (value) => value !== null,
+});
+const memoizeRunPolicy = createRequestPromiseMemo<
+  AuthorizationMemoContext,
+  { companyId: string; executionPolicy: Record<string, unknown> } | null
+>();
+
 export function responsibleUserAuthzShadowMode() {
   const mode = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE?.trim().toLowerCase();
   const shadow = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW?.trim().toLowerCase();
@@ -569,7 +587,7 @@ export const ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE = false;
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-export function authorizationService(db: Db | DbTransaction) {
+export function authorizationService(db: Db | DbTransaction, memoContext: AuthorizationMemoContext = {}) {
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
     if (
@@ -760,12 +778,8 @@ export function authorizationService(db: Db | DbTransaction) {
     });
   }
 
-  const agentMemo = new Map<string, Promise<AgentAuthorizationRow | null>>();
-
   async function loadAgent(agentId: string): Promise<AgentAuthorizationRow | null> {
-    const cached = agentMemo.get(agentId);
-    if (cached) return cached;
-    const promise = db
+    return memoizeAgent(memoContext, agentId, () => db
       .select({
         id: agents.id,
         companyId: agents.companyId,
@@ -776,12 +790,7 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(agents)
       .where(eq(agents.id, agentId))
-      .then((rows) => rows[0] ?? null);
-    agentMemo.set(agentId, promise);
-    void promise.catch(() => {
-      if (agentMemo.get(agentId) === promise) agentMemo.delete(agentId);
-    });
-    return promise;
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
@@ -796,12 +805,8 @@ export function authorizationService(db: Db | DbTransaction) {
       .then((rows) => rows[0] ?? null);
   }
 
-  const issueMemo = new Map<string, Promise<IssueAuthorizationRow | null>>();
-
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
-    const cached = issueMemo.get(issueId);
-    if (cached) return cached;
-    const promise = db
+    return memoizeIssue(memoContext, issueId, () => db
       .select({
         id: issues.id,
         companyId: issues.companyId,
@@ -818,31 +823,28 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(issues)
       .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null);
-    issueMemo.set(issueId, promise);
-    void promise.catch(() => {
-      if (issueMemo.get(issueId) === promise) issueMemo.delete(issueId);
-    });
-    return promise;
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
-    const row = await db
-      .select({
-        id: heartbeatRuns.id,
-        companyId: heartbeatRuns.companyId,
-        agentId: heartbeatRuns.agentId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-      })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
-    const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
-    return isPlainRecord(context?.executionPolicy)
-      ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
-      : null;
+    return memoizeRunPolicy(memoContext, `${runId}:${companyId}:${agentId}`, async () => {
+      const row = await db
+        .select({
+          id: heartbeatRuns.id,
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
+      const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
+      return isPlainRecord(context?.executionPolicy)
+        ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
+        : null;
+    });
   }
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
