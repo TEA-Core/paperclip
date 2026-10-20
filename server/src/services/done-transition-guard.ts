@@ -1628,7 +1628,10 @@ export async function findMissingAdr072CloseLadderStages(
     // erase the finding. Reporting it regardless of the final cursor is what
     // keeps `support-QAE -> exec-CTO -> coder-LE -> exec-CTO` an ordering
     // violation instead of silently accepting the trailing exec-CTO.
-    if (matchedOutOfOrder.has(i)) {
+    if (
+      matchedOutOfOrder.has(i) &&
+      !(principalUrlKeys.has(ADR072_CLOSE_LADDER[i].agentUrlKey) && i < cursor)
+    ) {
       outOfOrderStageLabels.push(ADR072_CLOSE_LADDER[i].label);
       continue;
     }
