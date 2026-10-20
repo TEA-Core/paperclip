@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -72,7 +72,7 @@ if (!embeddedPostgresSupport.supported) {
  */
 
 const GITHUB_TOKEN = "ghp_test_token_value";
-const HEAD_SHA = "abc123def456789012345678901234567890abcd";
+const HEAD_SHA = "cc64bd51f6f9de495f82dad7e34a056e61209312";
 const OTHER_HEAD_SHA = "def456abc789012345678901234567890abc1234";
 const DELIVERY_BRANCH = "SUP-14748-delivery";
 const FOREIGN_BRANCH = "SUP-99999-other-card-branch";
@@ -156,6 +156,30 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       memberships: [{ companyId, membershipRole: "owner", status: "active" }],
       source: "cloud_tenant",
     } as unknown as Express.Request["actor"];
+  }
+
+  async function rejectActivityLogInserts() {
+    await db.execute(sql.raw(
+      "alter table activity_log add constraint merge_arming_republish_force_audit_failure check (false) not valid",
+    ));
+  }
+
+  async function allowActivityLogInserts() {
+    await db.execute(sql.raw(
+      "alter table activity_log drop constraint if exists merge_arming_republish_force_audit_failure",
+    ));
+  }
+
+  async function rejectRecoveredExternalObjectUpserts() {
+    await db.execute(sql.raw(
+      "alter table external_objects add constraint merge_arming_republish_force_external_object_failure check (false) not valid",
+    ));
+  }
+
+  async function allowRecoveredExternalObjectUpserts() {
+    await db.execute(sql.raw(
+      "alter table external_objects drop constraint if exists merge_arming_republish_force_external_object_failure",
+    ));
   }
 
   function agentActor(companyId: string, agentId: string): Express.Request["actor"] {
@@ -457,6 +481,437 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
+  it("rejects an agent caller on governed receipt recovery before any GitHub read or persistence", async () => {
+    const { companyId, issueId, reviewerAgentId } = await seedIssue();
+    currentActor = agentActor(companyId, reviewerAgentId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-agent-refused",
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockGhFetch).not.toHaveBeenCalled();
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
+  it("rejects a non-owner board caller on governed receipt recovery before any GitHub read", async () => {
+    const { companyId, issueId } = await seedIssue({ membershipRole: "operator" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-operator-refused",
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a recovery request for a different repository before any GitHub read", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: "other-owner",
+        repo: "other-repo",
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-wrong-repo",
+      });
+
+    expect(res.status).toBe(500);
+    expect(mockGhFetch).not.toHaveBeenCalled();
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
+  it("recovers an unchanged exact head and replays the same idempotency key without a second GitHub read", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+    const body = {
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 579,
+      headSha: HEAD_SHA,
+      reason: "restore approved publication",
+      idempotencyKey: "recover-exact-head",
+    };
+
+    const first = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send(body);
+    expect(first.status).toBe(201);
+    expect(first.body.replayed).toBe(false);
+    expect(first.body.receipt.state).toBe("ready");
+    expect(first.body.receipt.headSha).toBe(HEAD_SHA);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(1);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
+
+    const second = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send(body);
+    expect(second.status).toBe(200);
+    expect(second.body.replayed).toBe(true);
+    expect(second.body.receipt.id).toBe(first.body.receipt.id);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(1);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
+    const receiptRows = await db.select().from(issueDeliveryReceipts);
+    expect(receiptRows[0]?.state).toBe("ready");
+  });
+
+  it("publishes the recovered target head once and consumes its receipt exactly once", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: 579, headRefName: DELIVERY_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({
+        state: "open",
+        merged: false,
+        draft: false,
+        head: {
+          sha: HEAD_SHA,
+          ref: DELIVERY_BRANCH,
+          repo: { name: REPO, owner: { login: OWNER } },
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA }, html_url: `https://github.com/${OWNER}/${REPO}/pull/579` }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockImplementationOnce(async () => {
+        const [claimedReceipt] = await db.select().from(issueDeliveryReceipts);
+        expect(claimedReceipt?.state).toBe("claimed");
+        return createMockResponse({ id: 579 });
+      });
+
+    const recovered = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-then-publish",
+      });
+    expect(recovered.status).toBe(201);
+    expect(recovered.body.receipt.state).toBe("ready");
+
+    const published = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+    expect(published.status).toBe(200);
+    expect(published.body.outcome).toBe("armed");
+    expect(published.body.headSha).toBe(HEAD_SHA);
+    const statusWrites = mockGhFetch.mock.calls.filter(
+      (call) => typeof call[0] === "string" && (call[0] as string).includes("/statuses/"),
+    );
+    expect(statusWrites).toHaveLength(1);
+    expect(statusWrites[0]![0]).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`);
+    expect(statusWrites[0]![1]?.method).toBe("POST");
+    expect(JSON.parse(statusWrites[0]![1]!.body as string)).toMatchObject({
+      context: "paperclip/approved",
+      state: "success",
+    });
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.headSha).toBe(HEAD_SHA);
+    expect(receipt?.state).toBe("consumed");
+
+    const replay = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+    expect(replay.status).toBe(200);
+    expect(replay.body.outcome).toBe("already_published");
+    expect(mockGhFetch).toHaveBeenCalledTimes(4);
+    const [replayedReceipt] = await db.select().from(issueDeliveryReceipts);
+    expect(replayedReceipt?.state).toBe("consumed");
+  });
+
+  it("invalidates a recovered receipt when the exact-head status write fails", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const recovered = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: PR_NUMBER,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-then-fail-status",
+      });
+    expect(recovered.status).toBe(201);
+    expect(recovered.body.receipt.state).toBe("ready");
+
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ message: "forbidden" }, false, 403));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.outcome).toBe("failed");
+    expect(res.body.message).toContain("status:failed");
+    const statusWrites = mockGhFetch.mock.calls.filter(
+      (call) => typeof call[0] === "string" && (call[0] as string).includes("/statuses/"),
+    );
+    expect(statusWrites).toHaveLength(1);
+    expect(statusWrites[0]![0]).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`);
+    expect(statusWrites[0]![1]?.method).toBe("POST");
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.state).toBe("invalidated");
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    expect((row?.executionState as Record<string, unknown> | undefined)?.approvalStatus).toBeUndefined();
+  });
+
+  it.each([
+    ["closed", { state: "closed", merged: false, draft: false }],
+    ["merged", { state: "closed", merged: true, draft: false }],
+    ["draft", { state: "open", merged: false, draft: true }],
+  ])("refuses a %s PR recovery without writing a receipt", async (_label, pullRequest) => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      ...pullRequest,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: `recover-${_label}`,
+      });
+
+    expect(res.status).toBe(500);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(mockGhFetch.mock.calls.some(([url]) => typeof url === "string" && url.includes("/statuses/"))).toBe(false);
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
+  it.each([
+    ["head repository", { owner: "other-owner", repo: REPO, ref: DELIVERY_BRANCH }],
+    ["delivery branch", { owner: OWNER, repo: REPO, ref: FOREIGN_BRANCH }],
+  ])("refuses a recovery with a mismatched %s without persistence", async (_label, mismatch) => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: mismatch.ref ?? DELIVERY_BRANCH,
+        repo: { name: mismatch.repo, owner: { login: mismatch.owner } },
+      },
+    }));
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: `recover-mismatch-${_label}`,
+      });
+
+    expect(res.status).toBe(500);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
+  it("refuses a moved exact-head request with zero status writes and no receipt persistence", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: OTHER_HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-moved-head",
+      });
+
+    expect(res.status).toBe(500);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(mockGhFetch.mock.calls.some(([url]) => typeof url === "string" && url.includes("/statuses/"))).toBe(false);
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
+  it("rejects an external-object persistence failure before creating a receipt or link", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    await rejectRecoveredExternalObjectUpserts();
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    try {
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+        .send({
+          owner: OWNER,
+          repo: REPO,
+          pullRequestNumber: 579,
+          headSha: HEAD_SHA,
+          reason: "restore approved publication",
+          idempotencyKey: "recover-external-object-rollback",
+        });
+
+      expect(res.status).toBe(500);
+      expect(mockGhFetch.mock.calls.some(([url]) => typeof url === "string" && url.includes("/statuses/"))).toBe(false);
+      expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+      expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+      expect(await db.select().from(externalObjects)).toHaveLength(0);
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+    } finally {
+      await allowRecoveredExternalObjectUpserts();
+    }
+  });
+
+  it("rolls back the recovered receipt and link when its audit insert fails", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    await rejectActivityLogInserts();
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    try {
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+        .send({
+          owner: OWNER,
+          repo: REPO,
+          pullRequestNumber: 579,
+          headSha: HEAD_SHA,
+          reason: "restore approved publication",
+          idempotencyKey: "recover-audit-rollback",
+        });
+
+      expect(res.status).toBe(500);
+      expect(mockGhFetch.mock.calls.some(([url]) => typeof url === "string" && url.includes("/statuses/"))).toBe(false);
+      expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+      expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+      expect(await db.select().from(externalObjects)).toHaveLength(0);
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+    } finally {
+      await allowActivityLogInserts();
+    }
+  });
+
+  it("rejects a duplicate idempotency key with conflicting coordinates and performs no write", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+    const idempotencyKey = "recover-conflict";
+    const first = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 579,
+      headSha: HEAD_SHA,
+      reason: "restore approved publication",
+      idempotencyKey,
+    });
+    expect(first.status).toBe(201);
+
+    const second = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 580,
+      headSha: HEAD_SHA,
+      reason: "different recovery",
+      idempotencyKey,
+    });
+    expect(second.status).toBe(500);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(1);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
+  });
+
   it("rejects a board caller without owner/admin membership with 403", async () => {
     const { companyId, issueId } = await seedIssue({
       membershipRole: "operator",
@@ -622,7 +1077,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       (call) => typeof call[0] === "string" && (call[0] as string).includes("/statuses/"),
     );
     expect(statusWrites).toHaveLength(1);
-    expect(JSON.parse(statusWrites[0]![1]!.body as string).context).toBe("paperclip/approved");
+    expect(statusWrites[0]![0]).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`);
+    expect(statusWrites[0]![1]?.method).toBe("POST");
+    expect(JSON.parse(statusWrites[0]![1]!.body as string)).toMatchObject({
+      context: "paperclip/approved",
+      state: "success",
+    });
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.headSha).toBe(HEAD_SHA);
+    expect(receipt?.state).toBe("consumed");
   });
 
   it("answers 200 already_published when the stamp is already published, with no GitHub writes", async () => {
