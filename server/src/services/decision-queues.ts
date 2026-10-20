@@ -440,17 +440,20 @@ async function readableQueueItems(
     originId: issues.originId,
     status: issues.status,
     executionPolicy: issues.executionPolicy,
+    projectCompanyId: projects.companyId,
     projectExecutionWorkspacePolicy: projects.executionWorkspacePolicy,
   }).from(issues)
     .leftJoin(projects, and(eq(projects.id, issues.projectId), eq(projects.companyId, companyId)))
     .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds), isNull(issues.hiddenAt))) : [];
-  const resources = new Map(issueRows.map(({ executionPolicy, projectExecutionWorkspacePolicy, ...row }) => [
+  const resources = new Map(issueRows.map(({ executionPolicy, projectCompanyId, projectExecutionWorkspacePolicy, ...row }) => [
     row.id, { resource: {
       type: "issue" as const,
       issueId: row.id,
       ...row,
       executionPolicy,
-      projectExecutionWorkspacePolicy,
+      projectAuthorizationContext: projectCompanyId
+        ? { companyId: projectCompanyId, executionWorkspacePolicy: projectExecutionWorkspacePolicy }
+        : undefined,
       authorizationContextLoaded: true,
     } },
   ]));

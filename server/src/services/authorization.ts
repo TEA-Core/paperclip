@@ -95,7 +95,7 @@ export type AuthorizationResource =
       status?: string | null;
       createdByAgentId?: string | null;
       executionPolicy?: unknown;
-      projectExecutionWorkspacePolicy?: unknown;
+      projectAuthorizationContext?: { companyId: string; executionWorkspacePolicy: unknown };
       authorizationContextLoaded?: boolean;
     };
 
@@ -947,8 +947,8 @@ function authorizationServiceWithMemo(
           ? resource.projectId ?? null
           : null;
     const project = projectId
-      ? resource.type === "issue" && resource.projectExecutionWorkspacePolicy !== undefined
-        ? { id: projectId, companyId: resource.companyId, executionWorkspacePolicy: resource.projectExecutionWorkspacePolicy }
+      ? resource.type === "issue" && resource.projectAuthorizationContext
+        ? { id: projectId, ...resource.projectAuthorizationContext }
         : await loadProject(projectId)
       : null;
     return { issue, project };

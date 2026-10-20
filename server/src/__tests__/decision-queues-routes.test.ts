@@ -7,18 +7,26 @@ import {
   activityLog,
   agents,
   approvals,
+  budgetIncidents,
+  budgetPolicies,
   companies,
   createDb,
   decisionQueueItems,
   decisionQueues,
   decisionTriage,
   decisionTriageEvents,
+  decisions,
   heartbeatRuns,
+  invites,
+  issueApprovals,
+  issueRecoveryActions,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
+  joinRequests,
+  projects,
 } from "@paperclipai/db";
-import type { AttentionItem } from "@paperclipai/shared";
+import { ATTENTION_SOURCE_KINDS, type AttentionItem, type AttentionSourceKind } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -51,12 +59,20 @@ describeEmbeddedPostgres("decision queue routes", () => {
     await db.delete(decisionQueueItems);
     await db.delete(decisionTriage);
     await db.delete(decisionQueues);
+    await db.delete(issueApprovals);
+    await db.delete(issueRecoveryActions);
+    await db.delete(decisions);
+    await db.delete(budgetIncidents);
+    await db.delete(budgetPolicies);
+    await db.delete(joinRequests);
+    await db.delete(invites);
     await db.delete(activityLog);
     await db.delete(issueThreadInteractions);
     await db.delete(issueWorkProducts);
     await db.delete(approvals);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -403,6 +419,82 @@ describeEmbeddedPostgres("decision queue routes", () => {
         .toEqual(expected.sort());
       expect((await service.list(companyId, actor))[0]?.itemCount).toBe(expected.length);
     }
+  });
+
+  it("matches canonical source visibility when the issue points to a foreign project", async () => {
+    const { companyId, agentId, issueId, interactionId, approvalId } = await seed();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Foreign Project Co", issuePrefix: "FPC" });
+    const [foreignProject] = await db.insert(projects).values({
+      companyId: otherCompanyId, name: "Foreign project",
+    }).returning();
+    await db.update(issues).set({ projectId: foreignProject!.id }).where(eq(issues.id, issueId));
+    await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
+
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "failed", contextSnapshot: { issueId },
+    }).returning();
+    const [decision] = await db.insert(decisions).values({
+      companyId, originAgentId: agentId, originIssueId: issueId, originRunId: run!.id,
+      title: "Foreign issue decision", body: "Check access", options: [],
+      expiresAt: new Date("2030-01-01T00:00:00.000Z"), signedSpec: "test", targetSnapshots: {},
+    }).returning();
+    const [recovery] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "missing_disposition",
+      cause: "review_path_lost", fingerprint: randomUUID(), nextAction: "Inspect",
+    }).returning();
+    const [invite] = await db.insert(invites).values({
+      companyId, tokenHash: randomUUID(), expiresAt: new Date("2030-01-01T00:00:00.000Z"),
+    }).returning();
+    const [join] = await db.insert(joinRequests).values({
+      companyId, inviteId: invite!.id, requestType: "human", requestIp: "127.0.0.1",
+    }).returning();
+    const [policy] = await db.insert(budgetPolicies).values({
+      companyId, scopeType: "company", scopeId: companyId, windowKind: "monthly",
+    }).returning();
+    const [incident] = await db.insert(budgetIncidents).values({
+      companyId, policyId: policy!.id, scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "monthly",
+      windowStart: new Date("2026-10-01T00:00:00.000Z"),
+      windowEnd: new Date("2026-11-01T00:00:00.000Z"),
+      thresholdType: "warning", amountLimit: 100, amountObserved: 100,
+    }).returning();
+    const sourceIds: Record<AttentionSourceKind, string> = {
+      approval: approvalId,
+      decision: decision!.id,
+      issue_thread_interaction: interactionId,
+      join_request: join!.id,
+      recovery_action: recovery!.id,
+      productivity_review: issueId,
+      blocker_attention: issueId,
+      review: issueId,
+      failed_run: run!.id,
+      budget_alert: incident!.id,
+      agent_error_alert: agentId,
+    };
+    const [queue] = await db.insert(decisionQueues).values({
+      companyId, key: "foreign-project", title: "Foreign project", createdByType: "system",
+    }).returning();
+    await db.insert(decisionQueueItems).values(ATTENTION_SOURCE_KINDS.map((sourceKind) => ({
+      companyId, queueId: queue!.id, sourceKind, sourceId: sourceIds[sourceKind], addedByType: "system" as const,
+    })));
+
+    const actor = agentActor(companyId, agentId);
+    for (const sourceKind of ATTENTION_SOURCE_KINDS) {
+      expect(await canReadDecisionSource(db, actor, companyId, sourceKind, sourceIds[sourceKind]))
+        .toBe(sourceKind === "agent_error_alert");
+    }
+    const service = decisionQueueService(db);
+    const visible = (await service.listItems(companyId, "foreign-project", actor))
+      .map((item) => ({ sourceKind: item.sourceKind, sourceId: item.sourceId }));
+    expect(visible).toEqual([{ sourceKind: "agent_error_alert", sourceId: agentId }]);
+    expect((await service.list(companyId, actor))[0]?.itemCount).toBe(1);
+    const response = await request(app(actor))
+      .get(`/api/companies/${companyId}/decision-queues/foreign-project/items`)
+      .expect(200);
+    expect(response.body.map((item: { sourceKind: string; sourceId: string }) => ({
+      sourceKind: item.sourceKind, sourceId: item.sourceId,
+    }))).toEqual(visible);
   });
 
   it("matches concrete issue and agent authorization for standard and low-trust actors", async () => {
