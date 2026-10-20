@@ -134,7 +134,7 @@ describeEmbeddedPostgres("decision queue routes", () => {
     };
   }
 
-  function agentActor(companyId: string, agentId: string) {
+  function agentActor(companyId: string, agentId: string, runId: string | null = null): AuthorizationActor {
     return {
       type: "agent",
       source: "agent_key",
@@ -142,7 +142,14 @@ describeEmbeddedPostgres("decision queue routes", () => {
       agentId,
       keyId: null,
       keyScope: { kind: "standard" },
-      runId: null,
+      runId,
+    };
+  }
+
+  function agentJwtActor(companyId: string, agentId: string, runId: string): AuthorizationActor {
+    return {
+      ...agentActor(companyId, agentId, runId),
+      source: "agent_jwt",
     };
   }
 
@@ -267,6 +274,12 @@ describeEmbeddedPostgres("decision queue routes", () => {
 
   it("keeps list query count flat and matches source-by-source visibility", async () => {
     const { companyId, agentId, issueId, approvalId } = await seed();
+    const [heartbeatRun] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: { executionPolicy: {} },
+    }).returning();
     const otherAgentId = randomUUID();
     await db.insert(agents).values({
       id: otherAgentId, companyId, name: "Second", role: "engineer", status: "idle",
@@ -280,14 +293,18 @@ describeEmbeddedPostgres("decision queue routes", () => {
     ]).returning();
     const actorCases = [
       boardActor(companyId),
-      agentActor(companyId, agentId),
+      agentJwtActor(companyId, agentId, heartbeatRun.id),
       { type: "board", source: "session", userId: "unaffiliated", companyIds: [], isInstanceAdmin: false },
-    ] as const;
-    const countedDb = { count: 0 };
+    ];
+    const countedDb = { count: 0, heartbeatRunSelects: 0 };
     const instrumented = new Proxy(db, {
       get(target, key) {
         if (key === "select") return (...args: Parameters<typeof db.select>) => {
           countedDb.count++;
+          const selection = args[0] as Record<string, unknown> | undefined;
+          if (selection && "contextSnapshot" in selection && "agentId" in selection) {
+            countedDb.heartbeatRunSelects++;
+          }
           return target.select(...args);
         };
         if (key === "execute") return (...args: Parameters<typeof db.execute>) => {
@@ -317,6 +334,7 @@ describeEmbeddedPostgres("decision queue routes", () => {
       ]);
       for (const actor of actorCases) {
         countedDb.count = 0;
+        countedDb.heartbeatRunSelects = 0;
         const expected = await Promise.all(sourceIds.map((id) =>
           canReadDecisionSource(instrumented, actor, companyId, "review", id)));
         const oldQueryCount = countedDb.count;
@@ -330,8 +348,10 @@ describeEmbeddedPostgres("decision queue routes", () => {
           }
         }
         countedDb.count = 0;
+        countedDb.heartbeatRunSelects = 0;
         const listed = await service.list(companyId, actor);
         const queryCount = countedDb.count;
+        if (actor.type === "agent") expect(countedDb.heartbeatRunSelects).toBeLessThanOrEqual(1);
         expect(listed.find((queue) => queue.key === "one")?.itemCount).toBe(expected.filter(Boolean).length);
         expect(listed.find((queue) => queue.key === "two")?.itemCount).toBe(otherExpected.length);
         const actorName = actor.type === "agent" ? "agent" : actor.source === "local_implicit" ? "board" : "restricted";
