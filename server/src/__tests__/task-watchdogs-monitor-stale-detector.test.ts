@@ -114,6 +114,7 @@ describe("detectFiredNeverRearmedMonitor", () => {
 describeEmbeddedPostgres("detectStaleIssueMonitors", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let seedIssueCounter = 0;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-task-watchdogs-monitor-stale-");
@@ -161,14 +162,16 @@ describeEmbeddedPostgres("detectStaleIssueMonitors", () => {
 
   async function seedIssue(companyId: string, overrides: Partial<typeof issues.$inferInsert> = {}) {
     const id = overrides.id ?? randomUUID();
+    // Sequential, not random: random numbers collide on the unique (company, issue number) index.
+    const nextNumber = ++seedIssueCounter;
     await db.insert(issues).values({
       id,
       companyId,
       title: overrides.title ?? "Watched issue",
       status: overrides.status ?? "in_progress",
       priority: overrides.priority ?? "medium",
-      identifier: overrides.identifier ?? `WDOG-${Math.floor(Math.random() * 10_000)}`,
-      issueNumber: overrides.issueNumber ?? Math.floor(Math.random() * 10_000),
+      identifier: overrides.identifier ?? `WDOG-${nextNumber}`,
+      issueNumber: overrides.issueNumber ?? nextNumber,
       parentId: overrides.parentId,
       assigneeAgentId: overrides.assigneeAgentId,
       monitorLastTriggeredAt: overrides.monitorLastTriggeredAt,
