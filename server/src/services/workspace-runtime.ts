@@ -278,6 +278,13 @@ const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const runtimeProvisionByWorkspace = new Map<string, Promise<void>>();
+/**
+ * In-process lock for `provisionExecutionWorktree`, keyed by the resolved
+ * worktree path. Two agents woken onto one issue both install into the same
+ * checkout; without this they race `pnpm install` (`ERR_PNPM_ENOTEMPTY`).
+ * Held only across the provision command, never across the agent run.
+ */
+const executionWorktreeProvisionByPath = new Map<string, Promise<void>>();
 const runtimeControlStartByOwner = new Map<string, Promise<void>>();
 const runtimeReplacementClaimsByReuseKey = new Map<string, number>();
 const quarantinedRuntimeExposurePorts = new Set<number>();
@@ -549,6 +556,7 @@ export async function resetRuntimeServicesForTests(
   runtimeServicesByReuseKey.clear();
   runtimeServiceLeasesByRun.clear();
   runtimeProvisionByWorkspace.clear();
+  executionWorktreeProvisionByPath.clear();
   runtimeControlStartByOwner.clear();
   runtimeReplacementClaimsByReuseKey.clear();
   quarantinedRuntimeExposurePorts.clear();
@@ -1037,6 +1045,35 @@ async function runGitPathListing(
     return { paths: [], complete: false };
   }
   return { paths: parseNulSeparatedPaths(result.stdout), complete: true };
+}
+
+/**
+ * A machine-read git command whose whole stdout is the answer.
+ *
+ * Same hazard as `runGitPathListing`: the global 256 KiB cap keeps the LAST
+ * bytes, so a truncated `git worktree list` is a plausible partial registry.
+ * Callers that decide "is this branch already checked out?" must not treat
+ * that partial as complete. The cap stays the machine-read ceiling already
+ * used for path listings; the global 256 KiB cap is unchanged. A truncated,
+ * failed, or unreadable result throws. It is never returned as a partial
+ * string and never collapsed to "not found".
+ */
+async function runGitMachineRead(args: string[], cwd: string): Promise<string> {
+  const proc = await executeProcess({
+    command: "git",
+    args,
+    cwd,
+    maxStdoutBytes: BASE_REPO_PATH_LISTING_MAX_BYTES,
+  });
+  if (proc.code !== 0) {
+    throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+  }
+  if (proc.stdoutTruncated) {
+    throw new Error(
+      `git ${args.join(" ")} output was truncated to the last ${BASE_REPO_PATH_LISTING_MAX_BYTES} bytes of ${proc.stdoutBytes}; refusing to return a partial result`,
+    );
+  }
+  return proc.stdout.trim();
 }
 
 async function runExpensiveGitStatus(input: {
@@ -1754,7 +1791,23 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     .then((output) => resolvePathForWorktreeComparison(output))
     .catch(() => null);
   const expectedPath = await resolvePathForWorktreeComparison(input.worktreePath);
-  const registeredWorktree = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  let registeredWorktree: GitWorktreeListEntry | null;
+  try {
+    registeredWorktree = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new WorkspaceRuntimeValidationFailure(
+      `git worktree registry read failed: ${detail}`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_registry_unreadable",
+          reasonCode: "worktree_list_failed",
+          worktreePath: path.resolve(input.worktreePath),
+          repoRoot: path.resolve(input.repoRoot),
+        },
+      },
+    );
+  }
   if (!resolvedTopLevel || resolvedTopLevel !== expectedPath || !registeredWorktree) {
     return buildWorktreeMetadataMissingEvidence({
       db: input.db ?? null,
@@ -1781,7 +1834,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const dirtyPathSample = sampleDirtyStatusPaths(statusLines);
   const cleanliness: GitWorktreeCleanliness =
     status === null ? "unknown" : status.trim().length > 0 ? "dirty" : "clean";
-  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  const registered = registeredWorktree;
   const inProgressOperation = await detectGitWorktreeInProgressOperation(input.worktreePath);
   const expectedHeadSha = await runGit(
     ["rev-parse", "--verify", `refs/heads/${input.expectedBranchName}^{commit}`],
@@ -3370,9 +3423,24 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
   return path.dirname(path.resolve(checkoutRoot, commonDir));
 }
 
-async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
+export async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
+  let raw: string;
+  try {
+    raw = await runGitMachineRead(["worktree", "list", "--porcelain"], repoRoot);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new WorkspaceRuntimeValidationFailure(
+      `git worktree registry read failed: ${detail}`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_registry_unreadable",
+          reasonCode: "worktree_list_failed",
+          branchName,
+          repoRoot: path.resolve(repoRoot),
+        },
+      },
+    );
+  }
 
   const expectedBranchRef = `refs/heads/${branchName}`;
   for (const entry of parseGitWorktreeListPorcelain(raw)) {
@@ -3384,8 +3452,7 @@ async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: s
 }
 
 async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
+  const raw = await runGitMachineRead(["worktree", "list", "--porcelain"], repoRoot);
 
   const expectedPath = await resolvePathForWorktreeComparison(worktreePath);
   for (const entry of parseGitWorktreeListPorcelain(raw)) {
@@ -3394,6 +3461,84 @@ async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: s
     }
   }
   return null;
+}
+
+type LinkedGitWorktreeRegistration =
+  | { registered: true }
+  | { registered: false }
+  | { registered: false; failed: string };
+
+/**
+ * Prove one path is a registered linked checkout of `repoRoot` without reading
+ * `git worktree list`.
+ *
+ * A linked worktree's gitdir lives under the owning repo's `worktrees` admin
+ * directory, and that admin directory's `gitdir` file points back at the
+ * checkout. Both directions are required: `--absolute-git-dir` alone accepts a
+ * copied directory that still names a live admin entry, and a gitdir file that
+ * does not resolve back to this path is not this path's registration.
+ *
+ * Output is a few hundred bytes. A path that cannot be proven registered is
+ * not registered. A git failure is a list failure, not a silent absence.
+ */
+async function proveLinkedGitWorktreeRegistration(
+  repoRoot: string,
+  worktreePath: string,
+): Promise<LinkedGitWorktreeRegistration> {
+  const readAbsoluteGitPath = async (args: string[], cwd: string) => {
+    try {
+      const value = await runGit(args, cwd);
+      if (!value || value.includes("\n") || !path.isAbsolute(value)) {
+        return {
+          ok: false as const,
+          failed: `git ${args.join(" ")} returned an unusable path: ${value || "no output"}`,
+        };
+      }
+      return { ok: true as const, value };
+    } catch (error) {
+      return {
+        ok: false as const,
+        failed: `git ${args.join(" ")} failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  };
+  const gitDirRead = await readAbsoluteGitPath(["rev-parse", "--absolute-git-dir"], worktreePath);
+  if (!gitDirRead.ok) return { registered: false, failed: gitDirRead.failed };
+  const commonDirRead = await readAbsoluteGitPath(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    repoRoot,
+  );
+  if (!commonDirRead.ok) return { registered: false, failed: commonDirRead.failed };
+  const absoluteGitDir = gitDirRead.value;
+  const commonDir = commonDirRead.value;
+
+  const resolvedGitDir = path.resolve(absoluteGitDir);
+  const worktreesAdmin = path.resolve(commonDir, "worktrees");
+  const relativeAdmin = path.relative(worktreesAdmin, resolvedGitDir);
+  if (
+    !relativeAdmin
+    || relativeAdmin === ".."
+    || relativeAdmin.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relativeAdmin)
+  ) {
+    return { registered: false };
+  }
+
+  let registeredGitdir: string;
+  try {
+    registeredGitdir = (await fs.readFile(path.join(resolvedGitDir, "gitdir"), "utf8")).trim();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { registered: false };
+    return { registered: false, failed: error instanceof Error ? error.message : String(error) };
+  }
+  if (!registeredGitdir) return { registered: false };
+  const registeredCheckout = path.resolve(resolvedGitDir, path.dirname(registeredGitdir));
+  const expectedCheckout = await resolvePathForWorktreeComparison(worktreePath);
+  if (await resolvePathForWorktreeComparison(registeredCheckout) !== expectedCheckout) {
+    return { registered: false };
+  }
+  return { registered: true };
 }
 
 async function isGitCheckout(cwd: string): Promise<boolean> {
@@ -3471,24 +3616,24 @@ async function detectRemoteDefaultBranch(repoRoot: string): Promise<string | nul
 }
 
 async function directoryExists(value: string) {
-  return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
+  try {
+    return (await fs.stat(value)).isDirectory();
+  } catch (error) {
+    if (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
-}
-
-async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
-  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
-  const paths = new Set<string>();
-  for (const line of output.split("\n")) {
-    if (!line.startsWith("worktree ")) continue;
-    const worktree = line.slice("worktree ".length).trim();
-    if (!worktree) continue;
-    paths.add(await resolvePathForWorktreeComparison(worktree));
-  }
-  return paths;
 }
 
 export async function inspectManagedGitWorktreeBranch(input: {
@@ -3527,23 +3672,21 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
-  let listedWorktrees: Set<string>;
-  try {
-    listedWorktrees = await listLinkedGitWorktreePaths(repoRoot);
-  } catch (error) {
-    // A failed `git worktree list` (e.g. a `safe.directory` / dubious-ownership
-    // refusal, or repoRoot not being a usable git checkout) is a different defect
-    // from a path that is simply absent from a successful listing. Reporting it as
-    // `not_registered` asserts a fact we never established and misleads triage.
+  const registration = await proveLinkedGitWorktreeRegistration(repoRoot, worktreePath);
+  if ("failed" in registration) {
+    // A failed registration proof (dubious ownership, repoRoot not a usable
+    // checkout) is a different defect from a path that is simply not a
+    // registered linked worktree. Reporting it as `not_registered` asserts a
+    // fact we never established and misleads triage.
     return {
       ...base,
       valid: false,
-      reason: `git worktree list failed: ${error instanceof Error ? error.message : String(error)}`,
+      reason: registration.failed,
       reasonCode: "worktree_list_failed",
       repoRoot,
     };
   }
-  if (!listedWorktrees.has(worktreePath)) {
+  if (!registration.registered) {
     return {
       ...base,
       valid: false,
@@ -4092,47 +4235,63 @@ async function provisionExecutionWorktree(input: {
   created: boolean;
   recorder?: WorkspaceOperationRecorder | null;
 }) {
-  await assertWorktreeWritableByProcessUser(input.worktreePath);
-  const provisionCommand = resolveWorkspaceProvisionCommand(input.strategy, input.repoRoot);
-  if (!provisionCommand) return;
-
-  const env = buildWorkspaceCommandEnv({
-    base: input.base,
-    repoRoot: input.repoRoot,
-    worktreePath: input.worktreePath,
-    branchName: input.branchName,
-    issue: input.issue,
-    agent: input.agent,
-    created: input.created,
+  const worktreeKey = await resolvePathForWorktreeComparison(input.worktreePath);
+  const previous = executionWorktreeProvisionByPath.get(worktreeKey) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
   });
-  const runProvisionCommand = async (command: string, lockfileMismatchRetry: boolean) => {
-    const resolvedCommand = resolveRepoManagedWorkspaceCommand(command, input.repoRoot);
-    await recordWorkspaceCommandOperation(input.recorder, {
-      phase: "workspace_provision",
-      command,
-      resolvedCommand,
-      cwd: input.worktreePath,
-      env,
-      label: `Execution workspace provision command "${command}"`,
-      metadata: {
-        repoRoot: input.repoRoot,
-        worktreePath: input.worktreePath,
-        branchName: input.branchName,
-        created: input.created,
-        resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
-        ...(lockfileMismatchRetry ? { lockfileMismatchRetry: true, originalCommand: provisionCommand } : {}),
-      },
-      successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
-    });
-  };
-
+  const queued = previous.then(() => current, () => current);
+  executionWorktreeProvisionByPath.set(worktreeKey, queued);
+  await previous.catch(() => undefined);
   try {
-    await runProvisionCommand(provisionCommand, false);
-  } catch (error) {
-    const failureOutput = error instanceof Error ? error.message : String(error);
-    const retryCommand = resolvePnpmLockfileMismatchRetryCommand(provisionCommand, failureOutput);
-    if (!retryCommand) throw error;
-    await runProvisionCommand(retryCommand, true);
+    await assertWorktreeWritableByProcessUser(input.worktreePath);
+    const provisionCommand = resolveWorkspaceProvisionCommand(input.strategy, input.repoRoot);
+    if (!provisionCommand) return;
+
+    const env = buildWorkspaceCommandEnv({
+      base: input.base,
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      branchName: input.branchName,
+      issue: input.issue,
+      agent: input.agent,
+      created: input.created,
+    });
+    const runProvisionCommand = async (command: string, lockfileMismatchRetry: boolean) => {
+      const resolvedCommand = resolveRepoManagedWorkspaceCommand(command, input.repoRoot);
+      await recordWorkspaceCommandOperation(input.recorder, {
+        phase: "workspace_provision",
+        command,
+        resolvedCommand,
+        cwd: input.worktreePath,
+        env,
+        label: `Execution workspace provision command "${command}"`,
+        metadata: {
+          repoRoot: input.repoRoot,
+          worktreePath: input.worktreePath,
+          branchName: input.branchName,
+          created: input.created,
+          resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
+          ...(lockfileMismatchRetry ? { lockfileMismatchRetry: true, originalCommand: provisionCommand } : {}),
+        },
+        successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+      });
+    };
+
+    try {
+      await runProvisionCommand(provisionCommand, false);
+    } catch (error) {
+      const failureOutput = error instanceof Error ? error.message : String(error);
+      const retryCommand = resolvePnpmLockfileMismatchRetryCommand(provisionCommand, failureOutput);
+      if (!retryCommand) throw error;
+      await runProvisionCommand(retryCommand, true);
+    }
+  } finally {
+    release();
+    if (executionWorktreeProvisionByPath.get(worktreeKey) === queued) {
+      executionWorktreeProvisionByPath.delete(worktreeKey);
+    }
   }
 }
 
@@ -6709,18 +6868,44 @@ async function preserveUncommittedWorktreeWork(input: {
   }
 }
 
+function isGitSpawnEnoent(error: unknown): error is { code: string } {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === "ENOENT";
+}
+
 export async function acquireGitWorktreeCleanupLock(worktreePath: string) {
-  const branchRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
-  const rawLocks = await Promise.all([
-    runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
-      .then((lockPath) => ({ kind: "index" as const, lockPath })),
-    runGit(["rev-parse", "--git-path", "HEAD.lock"], worktreePath)
-      .then((lockPath) => ({ kind: "head" as const, lockPath })),
-    ...(branchRef
-      ? [runGit(["rev-parse", "--git-path", `${branchRef}.lock`], worktreePath)
-          .then((lockPath) => ({ kind: "branch" as const, lockPath }))]
-      : []),
-  ]);
+  // A missing checkout has no index or ref lock to take. Spawning git with that
+  // cwd throws `spawn <git> ENOENT` even when the binary exists. Treat the
+  // checkout as already removed and let the caller prune the admin entry.
+  const releasedLock = {
+    releaseBranchRefLock: async () => {},
+    release: async () => {},
+  };
+  if (!(await directoryExists(worktreePath))) {
+    return releasedLock;
+  }
+  let branchRef: string | null;
+  let rawLocks: Array<{ kind: "index" | "head" | "branch"; lockPath: string }>;
+  try {
+    branchRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
+    rawLocks = await Promise.all([
+      runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
+        .then((lockPath) => ({ kind: "index" as const, lockPath })),
+      runGit(["rev-parse", "--git-path", "HEAD.lock"], worktreePath)
+        .then((lockPath) => ({ kind: "head" as const, lockPath })),
+      ...(branchRef
+        ? [runGit(["rev-parse", "--git-path", `${branchRef}.lock`], worktreePath)
+            .then((lockPath) => ({ kind: "branch" as const, lockPath }))]
+        : []),
+    ]);
+  } catch (error) {
+    if (isGitSpawnEnoent(error) && !(await directoryExists(worktreePath))) {
+      return releasedLock;
+    }
+    throw error;
+  }
   const locks = [...new Map(rawLocks.map(({ kind, lockPath }) => {
     const resolvedLockPath = path.isAbsolute(lockPath)
       ? lockPath
@@ -6833,6 +7018,24 @@ export async function removeGitWorktreeArtifact(input: {
     workspacePath: worktreePath,
     cleanupAction: "worktree_remove",
   };
+
+  if (!(await directoryExists(worktreePath))) {
+    if (!(await directoryExists(repoRoot))) return null;
+    try {
+      await input.assertSafeToCleanup?.();
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_cleanup",
+        args: ["worktree", "prune"],
+        cwd: repoRoot,
+        metadata: { ...metadata, cleanupAction: "worktree_prune" },
+        successMessage: `Pruned missing git worktree ${worktreePath}\n`,
+        failureLabel: "git worktree prune",
+      });
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
 
   if (!(await directoryExists(repoRoot))) {
     try {
@@ -7017,6 +7220,19 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         });
         if (worktreeRemoveWarning) warnings.push(worktreeRemoveWarning);
       }
+    } else if (repoRoot) {
+      const worktreePruneWarning = await removeGitWorktreeArtifact({
+        repoRoot,
+        worktreePath: workspacePath,
+        forceWorktreeRemoval: input.forceWorktreeRemoval,
+        recorder: input.recorder,
+        assertSafeToCleanup: input.assertSafeToCleanup,
+        metadata: {
+          workspaceId: input.workspace.id,
+          branchName: input.workspace.branchName,
+        },
+      });
+      if (worktreePruneWarning) warnings.push(worktreePruneWarning);
     }
     if (branchCreatedByRuntime && input.workspace.branchName) {
       if (!repoRoot) {

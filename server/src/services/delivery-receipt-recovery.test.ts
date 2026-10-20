@@ -116,6 +116,87 @@ describe("delivery receipt recovery", () => {
     expect(db.update).not.toHaveBeenCalled();
   });
 
+  it.each(["claimed", "consumed", "invalidated"] as const)("refuses a %s receipt without claiming it again", async (state) => {
+    const db = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ headSha: "a".repeat(40), state }]),
+          }),
+        }),
+      }),
+      update: updateDb([]).update,
+    } as any;
+    const result = await claimDeliveryReceiptForPublication(db, {
+      companyId: "company-1",
+      issueId: "issue-1",
+      owner: "TEA-Core",
+      repo: "paperclip",
+      pullRequestNumber: 579,
+      headSha: "a".repeat(40),
+    });
+    expect(result).toEqual({ kind: "blocked", reason: "state_unavailable" });
+  });
+
+  it("treats a receipt link with different coordinates as missing", async () => {
+    const db = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      }),
+      update: vi.fn(),
+    } as any;
+    const result = await claimDeliveryReceiptForPublication(db, {
+      companyId: "company-1",
+      issueId: "issue-1",
+      owner: "TEA-Core",
+      repo: "paperclip",
+      pullRequestNumber: 579,
+      headSha: "a".repeat(40),
+    });
+    expect(result).toEqual({ kind: "missing" });
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it("allows only one of two concurrent publication claims", async () => {
+    const claim = { id: "receipt-1", headSha: "a".repeat(40) };
+    const candidates = [{ headSha: claim.headSha, state: "ready" }];
+    let updateCount = 0;
+    const db = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue(candidates),
+          }),
+        }),
+      }),
+      update: vi.fn().mockImplementation(() => ({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue(updateCount++ === 0 ? [claim] : []),
+          }),
+        }),
+      })),
+    } as any;
+    const input = {
+      companyId: "company-1",
+      issueId: "issue-1",
+      owner: "TEA-Core",
+      repo: "paperclip",
+      pullRequestNumber: 579,
+      headSha: claim.headSha,
+    };
+    const results = await Promise.all([
+      claimDeliveryReceiptForPublication(db, input),
+      claimDeliveryReceiptForPublication(db, input),
+    ]);
+    expect(results.filter((result) => result.kind === "claimed")).toHaveLength(1);
+    expect(results.filter((result) => result.kind === "blocked")).toEqual([{ kind: "blocked", reason: "state_unavailable" }]);
+  });
+
   it("consumes and invalidates only the matching claimed token", async () => {
     const claim: DeliveryReceiptClaim = { receiptId: "receipt-1", claimToken: "00000000-0000-0000-0000-000000000001", headSha: "a".repeat(40) };
     expect(await consumeDeliveryReceipt(updateDb([{ id: claim.receiptId }]), claim)).toBe(true);

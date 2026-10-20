@@ -40,6 +40,7 @@ import {
   normalizeAdapterManagedRuntimeServices,
   preserveUnpushedWorktreeCommits,
   pruneExpiredRescueRefs,
+  acquireGitWorktreeCleanupLock,
   removeGitWorktreeArtifact,
   resolveGitExecutable,
   prepareBaseRepoForWorkspace,
@@ -5453,6 +5454,46 @@ describe("realizeExecutionWorkspace", () => {
         }),
       },
     });
+  }, 15_000);
+
+  it("returns a structured validation failure when the worktree registry cannot be read", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "SUP-20435-registry-unreadable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await runGit(repoRoot, ["worktree", "add", "-b", expectedBranch, worktreePath, "HEAD"]);
+    await runGit(worktreePath, ["checkout", "--detach"]);
+
+    const gitDir = path.join(repoRoot, ".git");
+    const hiddenGitDir = path.join(repoRoot, ".git-hidden-for-test");
+    await fs.rename(gitDir, hiddenGitDir);
+    await fs.writeFile(gitDir, "not a git directory\n", "utf8");
+    try {
+      await expect(ensureGitWorktreeBranchCoherent({
+        repoRoot,
+        worktreePath,
+        expectedBranchName: expectedBranch,
+        actualBranchName: "some-other-branch",
+        sourceIssue: {
+          id: "issue-registry",
+          identifier: "SUP-20435",
+          title: "Registry unreadable",
+        },
+      })).rejects.toMatchObject({
+        name: "WorkspaceRuntimeValidationFailure",
+        code: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "git_worktree_registry_unreadable",
+            reasonCode: "worktree_list_failed",
+            worktreePath,
+            repoRoot,
+          }),
+        },
+      });
+    } finally {
+      await fs.rm(gitDir, { force: true });
+      await fs.rename(hiddenGitDir, gitDir).catch(() => undefined);
+    }
   }, 15_000);
 
   it("does not reuse a missing persisted local filesystem workspace", async () => {
@@ -12562,6 +12603,30 @@ describe("terminal workspace cleanup git resolution (SUP-15059)", () => {
     expect(warning).toContain("removed git worktree");
     expect(warning).not.toContain("spawn git ENOENT");
     await expect(fs.stat(worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("treats a missing worktree path as already removed and prunes the admin entry", async () => {
+    const repoRoot = await createTempRepo("main");
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "sup-20436-missing");
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "-b", "sup-20436-missing"]);
+    await fs.rm(worktreePath, { recursive: true, force: true });
+    expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).toContain(worktreePath);
+
+    const lock = await acquireGitWorktreeCleanupLock(worktreePath);
+    await lock.releaseBranchRefLock();
+    await lock.release();
+
+    const warning = await removeGitWorktreeArtifact({
+      repoRoot,
+      worktreePath,
+      forceWorktreeRemoval: false,
+      metadata: { workspaceId: "ws-missing", branchName: "sup-20436-missing" },
+    });
+
+    expect(warning).toBeNull();
+    expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(worktreePath);
+    await fs.rm(repoRoot, { recursive: true, force: true });
   });
 });
 

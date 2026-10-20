@@ -521,7 +521,8 @@ describeEmbeddedPostgres("company import transfer routes", () => {
     expect(accepted.status).toBe(202);
     const statusUrl = accepted.body.statusUrl as string;
     let job: Record<string, any> | undefined;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
       const polled = await request(app).get(statusUrl);
       job = polled.body.job;
       if (job?.status === "succeeded" || job?.status === "failed") break;
@@ -582,7 +583,8 @@ describeEmbeddedPostgres("company import transfer routes", () => {
 
     releaseImport!();
     let job: Record<string, any> | undefined;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
       const polled = await request(app).get(accepted.body.statusUrl as string);
       job = polled.body.job;
       if (job?.status === "succeeded" || job?.status === "failed") break;

@@ -4184,8 +4184,8 @@ export function issueRoutes(
     comment: { companyId: string; createdByRunId?: string | null },
     assigneeAgentId: string | null | undefined,
   ) => {
-    // Legacy adapters can authenticate through the board while still stamping
-    // the real source run on the comment. Treat that durable provenance as the
+    // Legacy adapters can authenticate through the board while still stamping the
+    // real source run on the comment. Treat that durable provenance as the
     // author identity for wake routing.
     if (!comment.createdByRunId || !assigneeAgentId) return false;
     const sourceRun = await heartbeat.getRun(comment.createdByRunId);
@@ -4193,6 +4193,41 @@ export function issueRoutes(
       sourceRun?.companyId === comment.companyId &&
       sourceRun.agentId === assigneeAgentId
     );
+  };
+  const shouldSuppressCreatorSelfAssignmentWake = async (
+    companyId: string,
+    actor: ReturnType<typeof getActorInfo>,
+    assigneeAgentId: string | null | undefined,
+  ) => {
+    if (
+      actor.actorType !== "agent" ||
+      !actor.agentId ||
+      !actor.runId ||
+      assigneeAgentId !== actor.agentId
+    ) {
+      return false;
+    }
+    try {
+      const run = await db
+        .select({
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, actor.runId),
+            eq(heartbeatRuns.companyId, companyId),
+            eq(heartbeatRuns.agentId, actor.agentId),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      return run !== null;
+    } catch {
+      return false;
+    }
   };
   const enqueueStalledReviewDecisionWakeup =
     opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
@@ -15734,7 +15769,14 @@ export function issueRoutes(
       // token should be spent until the user types: the greeting is posted above
       // (deterministic, no LLM) and the user's first comment wakes the assignee
       // through the normal comment path. Every other create path keeps its wake.
-      if (!isOnboardingFirstTask) {
+      if (
+        !isOnboardingFirstTask &&
+        !(await shouldSuppressCreatorSelfAssignmentWake(
+          companyId,
+          actor,
+          issue.assigneeAgentId,
+        ))
+      ) {
         void queueIssueAssignmentWakeup({
           heartbeat,
           issue,
@@ -16386,7 +16428,14 @@ export function issueRoutes(
         });
       }
 
-      if (!serializationContext || !currentSerializedChild) {
+      if (
+        (!serializationContext || !currentSerializedChild) &&
+        !(await shouldSuppressCreatorSelfAssignmentWake(
+          parent.companyId,
+          actor,
+          issue.assigneeAgentId,
+        ))
+      ) {
         void queueIssueAssignmentWakeup({
           heartbeat,
           issue,
@@ -16679,7 +16728,14 @@ export function issueRoutes(
           });
         }
 
-        if (!serializedBlockedChildIds.has(issue.id)) {
+        if (
+          !serializedBlockedChildIds.has(issue.id) &&
+          !(await shouldSuppressCreatorSelfAssignmentWake(
+            sourceIssue.companyId,
+            actor,
+            issue.assigneeAgentId,
+          ))
+        ) {
           void queueIssueAssignmentWakeup({
             heartbeat,
             issue,

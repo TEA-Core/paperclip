@@ -35,10 +35,10 @@ afterAll(async () => {
 });
 
 describe("inspectManagedGitWorktreeBranch worktree-list triage (SUP-17380)", () => {
-  it("reports worktree_list_failed — not not_registered — when `git worktree list` rejects", async () => {
-    // A directory that exists but is not a git checkout: `git worktree list --porcelain`
-    // exits non-zero with `cwd` here, so `listLinkedGitWorktreePaths` rejects. This is the
-    // same shape as a `safe.directory` / dubious-ownership refusal observed in production.
+  it("reports worktree_list_failed — not not_registered — when the registration proof cannot run", async () => {
+    // A directory that exists but is not a git checkout. The proof runs
+    // `git rev-parse` here, not `git worktree list`. The error must name that
+    // command and must not be described as a list failure.
     const notAGitRepo = trackTempDir(await mkdtemp(path.join(os.tmpdir(), "pc-wt-notrepo-")));
     const result = await inspectManagedGitWorktreeBranch({
       worktreePath: notAGitRepo,
@@ -48,9 +48,9 @@ describe("inspectManagedGitWorktreeBranch worktree-list triage (SUP-17380)", () 
     expect(result.valid).toBe(false);
     expect(result.reasonCode).toBe("worktree_list_failed");
     expect(result.reasonCode).not.toBe("not_registered");
-    // The swallowed git error must surface, not be discarded into a false "not registered".
-    expect(result.reason).toMatch(/git worktree list failed:/i);
+    expect(result.reason).toMatch(/rev-parse/i);
     expect(result.reason).toMatch(/fatal|not a git repository/i);
+    expect(result.reason).not.toMatch(/git worktree list failed/i);
     expect(result.reason).not.toMatch(/not registered/i);
   });
 

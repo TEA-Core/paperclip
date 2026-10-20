@@ -36,6 +36,7 @@ const mockIssueService = vi.hoisted(() => ({
   removeAttachment: vi.fn(),
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
+  findOpenAncestorCreatedByAgent: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -358,6 +359,7 @@ function createRunContextDb(
         companyId,
         agentId: runAgentOrRows,
         agentCompanyId: companyId,
+        status: "running",
         contextSnapshot,
       }];
   const firstRun = runRows[0] ?? {};
@@ -423,6 +425,7 @@ async function createApp(
     typeof actor.agentId === "string" ? actor.agentId : ownerAgentId,
     typeof actor.runId === "string" ? actor.runId : ownerRunId,
   );
+  mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
   const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
     "../middleware/index.js",
   );
@@ -1722,6 +1725,47 @@ describe("agent issue mutation checkout ownership", () => {
         inheritExecutionWorkspaceFromIssueId: expect.anything(),
       }),
     );
+  });
+
+  it("suppresses the assignment wake when a live creator self-assigns a root issue", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Self-assigned root", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("suppresses the assignment wake when a live creator self-assigns a child issue", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/children`)
+      .send({ title: "Self-assigned child", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("suppresses assignment wakes for live creator self-assigned accepted-plan children", async () => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/accepted-plan-decompositions`)
+      .send({
+        acceptedPlanRevisionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        children: [{ title: "Self-assigned plan child", assigneeAgentId: ownerAgentId }],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("authorizes child creation through the parent read path", async () => {
@@ -3985,7 +4029,7 @@ describe("agent issue mutation checkout ownership", () => {
     it("preserves normal accepted-plan decomposition parallel wakeups outside watchdog context", async () => {
       mockAgentService.resolveByReference.mockImplementation(async (_companyId: string, reference: string) => ({
         ambiguous: false,
-        agent: reference === ownerAgentId ? makeAgent(ownerAgentId) : null,
+        agent: reference === peerAgentId ? makeAgent(peerAgentId) : null,
       }));
       const app = await createApp(ownerActor());
       const res = await request(app)
@@ -3993,8 +4037,8 @@ describe("agent issue mutation checkout ownership", () => {
         .send({
           acceptedPlanRevisionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
           children: [
-            { title: "Implement backend", assigneeAgentId: ownerAgentId },
-            { title: "Implement frontend", assigneeAgentId: ownerAgentId },
+            { title: "Implement backend", assigneeAgentId: peerAgentId },
+            { title: "Implement frontend", assigneeAgentId: peerAgentId },
           ],
         });
 
@@ -4008,14 +4052,14 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2);
       expect(mockHeartbeatService.wakeup).toHaveBeenNthCalledWith(
         1,
-        ownerAgentId,
+        peerAgentId,
         expect.objectContaining({
           payload: expect.objectContaining({ issueId: children[0]?.id }),
         }),
       );
       expect(mockHeartbeatService.wakeup).toHaveBeenNthCalledWith(
         2,
-        ownerAgentId,
+        peerAgentId,
         expect.objectContaining({
           payload: expect.objectContaining({ issueId: children[1]?.id }),
         }),

@@ -299,6 +299,11 @@ Invariants:
 - `external_run_id` text null
 - `context_snapshot` jsonb null
 
+`GET /api/issues/:id/runs` returns at most the 100 newest runs linked by
+`context_snapshot.issueId` or issue activity. It orders by run creation time
+descending and summarizes usage/result fields after selecting the matching run
+IDs; older runs are not included in this thread response.
+
 ## 7.9 `cost_events`
 
 - `id` uuid pk
@@ -1162,7 +1167,10 @@ The current app also exposes V1-supporting surfaces for:
 - execution workspaces, project workspaces, workspace runtime services, and workspace operations. Workspace reads
   derive `deliveryState` as `merged_via_pr | merged_by_ancestry | unmerged | unknown`; terminal issue trees with a
   merged delivery and no active checkout run become cleanup-eligible with reason `issue_terminal` and are archived
-  through the workspace cleanup path. Reopening the source issue records activity but does not restore that workspace.
+  through the workspace cleanup path. A worktree directory that is already gone counts as removed: cleanup prunes the
+  leftover git admin entry from the repo root and archives the workspace instead of leaving it in `cleanup_failed`.
+  The sweep also retries `cleanup_failed` rows whose reason is `issue_terminal | spawn <git> ENOENT` under the same
+  safety gates. Reopening the source issue records activity but does not restore that workspace.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
 - routines and scheduled/API/webhook triggers
 - plugin installation, configuration, state, jobs, logs, webhooks, and plugin database namespace migration

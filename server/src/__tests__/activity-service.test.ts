@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 import {
   activityLog,
   agents,
@@ -13,6 +15,7 @@ import {
   issueDocuments,
   issues,
 } from "@paperclipai/db";
+import * as schema from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -712,5 +715,85 @@ describeEmbeddedPostgres("activity service", () => {
       livenessReason: "Run described runnable future work without concrete action evidence",
       lastUsefulActionAt: null,
     });
+  });
+  it("uses indexed sources and preserves the old mixed-link order within the 100-run page", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Coder", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    const base = Date.parse("2026-04-18T20:00:00.000Z");
+    const relevant = Array.from({ length: 105 }, (_, index) => ({
+      id: randomUUID(), companyId, agentId, invocationSource: "assignment" as const,
+      status: "running" as const, livenessState: "advanced" as const,
+      createdAt: new Date(base + index * 1000),
+      contextSnapshot: index % 3 === 0 ? { issueId } : { issueId: randomUUID() },
+    }));
+    const unrelated = Array.from({ length: 1600 }, (_, index) => ({
+      id: randomUUID(), companyId, agentId, invocationSource: "assignment" as const,
+      status: "running" as const, livenessState: "advanced" as const,
+      createdAt: new Date(base - index * 1000 - 1000),
+      contextSnapshot: { issueId: randomUUID() },
+    }));
+    for (let index = 0; index < unrelated.length; index += 200) {
+      await db.insert(heartbeatRuns).values(unrelated.slice(index, index + 200));
+    }
+    await db.insert(heartbeatRuns).values(relevant);
+    await db.insert(activityLog).values(relevant.flatMap((run, index) =>
+      index % 3 === 0 ? [] : Array.from({ length: index === 104 ? 105 : 1 }, () => ({
+        companyId, entityType: "issue", entityId: issueId, runId: run.id,
+        actorType: "system" as const, actorId: "test", action: "run.linked",
+      })),
+    ));
+    for (let index = 0; index < unrelated.length; index += 200) {
+      await db.insert(activityLog).values(unrelated.slice(index, index + 200).map((run) => ({
+        companyId, entityType: "issue", entityId: randomUUID(), runId: run.id,
+        actorType: "system", actorId: "test", action: "run.linked",
+      })));
+    }
+    await db.execute(sql`analyze ${heartbeatRuns}`);
+    await db.execute(sql`analyze ${activityLog}`);
+
+    const oldRows = await db.execute<{ id: string }>(sql`
+      select r.id from heartbeat_runs r
+      where r.company_id = ${companyId} and (
+        r.context_snapshot ->> 'issueId' = ${issueId}
+        or exists (select 1 from activity_log a where a.company_id = ${companyId}
+          and a.entity_type = 'issue' and a.entity_id = ${issueId} and a.run_id = r.id)
+      )
+      order by r.created_at desc limit 100
+    `);
+    const actual = await activityService(db).runsForIssue(companyId, issueId);
+    expect(actual.map((row) => row.runId)).toEqual(oldRows.map((row) => row.id));
+    expect(actual).toHaveLength(100);
+
+    const logged: Array<{ query: string; params: unknown[] }> = [];
+    const loggedDb = drizzle(db.$client, {
+      schema,
+      logger: { logQuery: (query, params) => { logged.push({ query, params }); } },
+    });
+    const loggedActual = await activityService(loggedDb).runsForIssue(companyId, issueId);
+    expect(loggedActual.map((row) => row.runId)).toEqual(actual.map((row) => row.runId));
+
+    const sources = logged.filter(({ query }) =>
+      !query.includes("liveness_state") &&
+      (query.startsWith('select "id", "created_at" from "heartbeat_runs"') || query.trimStart().startsWith("with linked_ids")));
+    expect(sources).toHaveLength(2);
+    const plans = await Promise.all(sources.map(async ({ query, params }) => {
+      const rows = await db.$client.unsafe(`explain ${query}`, params as never[]);
+      return rows.map((row) => String(row["QUERY PLAN"]));
+    }));
+    const plan = plans.flat().join("\n");
+    expect(plan).toContain("heartbeat_runs_company_ctx_issue_created_idx");
+    expect(plan).toContain("activity_log_entity_type_id_idx");
+    expect(plan).toMatch(/Index Scan.*heartbeat_runs_pkey/);
+    expect(plan).not.toMatch(/Seq Scan on heartbeat_runs/);
   });
 });
