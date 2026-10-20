@@ -111,7 +111,7 @@ export async function prepareConversationTurn(
 ) {
   const context = { ...(run.contextSnapshot ?? {}) };
   const issueId = typeof context.issueId === "string" ? context.issueId : null;
-  if (!issueId) return { context, reset: false, conversation: false };
+  if (!issueId) return { context, reset: false, duplicateReset: false, conversation: false };
   let publication: ActivityPublication | null = null;
   const result = await db.transaction(async (tx) => {
     const [issue] = await tx
@@ -120,7 +120,7 @@ export async function prepareConversationTurn(
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
       .for("update");
     if (!isConversation(issue))
-      return { context, reset: false, conversation: false };
+      return { context, reset: false, duplicateReset: false, conversation: false };
     const commentId =
       typeof context.wakeCommentId === "string"
         ? context.wakeCommentId
@@ -139,6 +139,14 @@ export async function prepareConversationTurn(
             ),
           )
       : [];
+    // An already-stamped /new was consumed. A later run must not reset again.
+    if (
+      comment?.authorUserId &&
+      isConversationReset(comment.body) &&
+      comment.conversationSessionGeneration != null
+    ) {
+      return { context, reset: false, duplicateReset: true, conversation: true };
+    }
     const reset = Boolean(
       comment && comment.authorUserId && isConversationReset(comment.body),
     );
@@ -151,7 +159,7 @@ export async function prepareConversationTurn(
         "Conversation session changed; this older turn cannot resume",
       );
     }
-    // The boundary lives on the command comment. A crash/retry reuses it instead of resetting twice.
+    // The boundary lives on the command comment. Only the first run for that /new stamps it.
     if (reset && comment && comment.conversationSessionGeneration == null) {
       generation += 1;
       await tx
@@ -215,7 +223,7 @@ export async function prepareConversationTurn(
       .update(heartbeatRuns)
       .set({ contextSnapshot: next })
       .where(eq(heartbeatRuns.id, run.id));
-    return { context: next, reset, conversation: true };
+    return { context: next, reset, duplicateReset: false, conversation: true };
   });
   if (publication) publishActivity(publication);
   return result;

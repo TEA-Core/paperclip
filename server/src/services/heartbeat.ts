@@ -23163,6 +23163,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const preparedConversation = await prepareConversationTurn(db, run);
       run = { ...run, contextSnapshot: preparedConversation.context };
+      if (preparedConversation.duplicateReset) {
+        await setRunStatus(run.id, "cancelled", { finishedAt: new Date(), error: "Conversation reset already applied", errorCode: "conversation_reset_already_applied" });
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: new Date() });
+        await releaseIssueExecutionAndPromote((await getRun(run.id))!, { suppressImmediateRecovery: true });
+        await finalizeAgentStatus(agent.id, "cancelled");
+        return;
+      }
       if (preparedConversation.reset) {
         const contextSnapshot = { ...preparedConversation.context, conversationReset: true };
         await setRunStatus(run.id, "succeeded", { finishedAt: new Date(), contextSnapshot, resultJson: { conversationReset: true }, issueCommentStatus: "not_applicable" });
