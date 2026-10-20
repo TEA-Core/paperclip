@@ -1528,11 +1528,12 @@ transcript reads from their retained offsets. A queued live-event invalidation
 that flushes after the tab hides marks data stale without starting a refetch.
 The developer-server health poll also stops in hidden tabs.
 
-Workspace detail responses share concurrent Git inspections and reuse their
-results for up to five seconds after completion. The cache holds at most 256
-entries. Close-readiness checks, the terminal-workspace reaper, and the final
-cleanup validation still inspect Git afresh. A display result never authorizes
-worktree removal.
+Issue and workspace detail reads load persisted workspace state and runtime
+services without Git inspection; their `deliveryState` is `unknown`. The
+close-readiness route, terminal-workspace reaper, and final cleanup validation
+inspect Git afresh. The reaper selects terminal source issues in SQL before
+inspecting Git; a non-terminal source with a pending reopen fence is visited
+only to clear that fence, never to inspect or remove its worktree.
 
 The connection-health sweep selects only due IDs in SQL before applying its
 limit. Legacy `paperclip_plugin` placeholder connections are excluded: their

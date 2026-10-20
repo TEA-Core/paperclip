@@ -1,10 +1,9 @@
-import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -274,10 +273,6 @@ export type ExecutionWorkspaceServiceOptions = {
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
   workspaceReaperCooldownDays?: number;
-  inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
-    git: ExecutionWorkspaceCloseGitReadiness | null;
-    warnings: string[];
-  }>;
 };
 
 export function deriveExecutionWorkspaceDeliveryState(input: {
@@ -1431,12 +1426,7 @@ type WorkspaceOverviewIssueRow = WorkspaceOverviewLinkedIssue & {
   executionWorkspaceId: string;
 };
 
-const inspectGitForDisplay = createWorkspaceGitInspectionCache(inspectGitCloseReadiness);
-
 export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServiceOptions = {}) {
-  const inspectDisplay = opts.inspectGitCloseReadiness
-    ? createWorkspaceGitInspectionCache(opts.inspectGitCloseReadiness)
-    : inspectGitForDisplay;
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const now = opts.now ?? (() => new Date());
   // The reaper waits this long after an issue tree becomes terminal before it
@@ -1679,11 +1669,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
   }
 
-  async function hydrateWorkspace(row: ExecutionWorkspaceRow, runtimeServices: WorkspaceRuntimeService[] = []) {
-    const workspace = toExecutionWorkspace(row, runtimeServices);
-    const { git } = await inspectDisplay(workspace);
-    const assessment = await assessDelivery(row, git);
-    return toExecutionWorkspace(row, runtimeServices, assessment.deliveryState);
+  function hydrateWorkspace(row: ExecutionWorkspaceRow, runtimeServices: WorkspaceRuntimeService[] = []) {
+    // Reads expose persisted state; only the close-readiness endpoint inspects git.
+    return toExecutionWorkspace(row, runtimeServices);
   }
 
   async function workspaceHasActiveRun(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">) {
@@ -2938,10 +2926,25 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             ),
           )
         : undefined;
-      const scanFilter = and(baseCandidateFilter, boundaryFilter, cursorFilter);
+      // Keep pending-reopen rows in the rotation so the old generation fence
+      // can be cleared after a source issue reopens, without inspecting git.
+      const sourceTerminal = inArray(issues.status, ["done", "cancelled"]);
+      const scanFilter = and(
+        baseCandidateFilter,
+        boundaryFilter,
+        cursorFilter,
+        or(
+          sourceTerminal,
+          sql<boolean>`${executionWorkspaces.metadata}->>${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY} = 'true'`,
+        ),
+      );
       const candidates = await db
-        .select()
+        .select({ ...getTableColumns(executionWorkspaces), sourceIssueStatus: issues.status })
         .from(executionWorkspaces)
+        .innerJoin(issues, and(
+          eq(issues.id, executionWorkspaces.sourceIssueId),
+          eq(issues.companyId, executionWorkspaces.companyId),
+        ))
         .where(scanFilter)
         .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
         .limit(limit);
@@ -2970,6 +2973,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
 
       for (const workspace of candidates) {
+        const reopenPending = metadataHasReopenPendingConsumption(
+          workspace.metadata as Record<string, unknown> | null,
+        );
+        if (!TERMINAL_ISSUE_STATUSES.has(workspace.sourceIssueStatus)) {
+          if (reopenPending) {
+            await clearReopenPendingConsumptionUnderLock(workspace.id, {
+              expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
+                workspace.metadata as Record<string, unknown> | null,
+              ),
+            });
+          }
+          result.skippedNonTerminalTree += 1;
+          continue;
+        }
         const executionWorkspace = toExecutionWorkspace(workspace);
         const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
         if (!statusInspectionSucceeded) {
@@ -2977,16 +2994,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         const assessment = await assessDelivery(workspace, git);
-        const reopenPending = metadataHasReopenPendingConsumption(
-          workspace.metadata as Record<string, unknown> | null,
-        );
         if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
           if (reopenPending) {
-            // The source issue left the terminal state, so the reopen transition
-            // committed. Clear the reopen-pending flag under the lifecycle lock so
-            // a later terminal cycle can archive the workspace again. Pass the
-            // generation from this snapshot, so the clear skips a newer reopen that
-            // raised the generation and installed its own fence after this read.
             await clearReopenPendingConsumptionUnderLock(workspace.id, {
               expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
                 workspace.metadata as Record<string, unknown> | null,
