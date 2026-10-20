@@ -8,7 +8,7 @@ Before committing a terminal approved decision, the issue routes reuse the deliv
 
 A refusal returns HTTP 409 with `approval_final_delivery_preflight`, the underlying named reason, `deliveryOwnerIssueId`, and an actionable `remedy`. Draft delivery requires the owner to mark the PR ready and submit the final review again. Missing delivery requires that owner to provide the delivery receipt/PR. The stage stays pending: no approved decision, completion, approval stamp, or merge arm is committed.
 
-The board stage-decision and recovery-resolution doors resolve the delivery verdict (bounded by a 20 s timeout) before opening their transaction, so no row lock or pooled connection is held across GitHub I/O. Under the lock (reading through the transaction connection, no external wait) they compare the card's `status`/`updatedAt` and the delivery binding (repo context, delivery-branch ownership, recorded delivery identity, and that the certified PR still belongs to the card's repo) against the pre-read; a changed card is refused with HTTP 409 `approval_final_delivery_preflight_stale` and the caller retries.
+All five terminal approval doors resolve the delivery verdict (bounded by a 20 s timeout) before their write transaction or interaction acceptance, so no issue-row lock or pooled connection is held across GitHub I/O. Under the issue-row lock, each compares the card's `status`/`updatedAt` and the delivery binding (repo context, delivery-branch ownership, recorded delivery identity, and the certified PR's repo) against the pre-read through that transaction. PATCH and approval-comment auto-close check before persisting the decision; final escalation acceptance checks in the interaction service's transaction before accepting the interaction. A changed card or binding is refused with HTTP 409 `approval_final_delivery_preflight_stale`; the stage stays pending with no approved decision, receipt publication, or merge arm, and the caller retries.
 
 The check runs on the PATCH verdict, board stage-decision, auto-approval comment, recovery decision, and final escalation-accept routes. Repository-free doc/gate cards retain their existing close semantics. Sanctioned no-deliverable-head overrides remain subject to the existing done guard; they do not bypass ladder or tier requirements.
 
@@ -22,7 +22,7 @@ No ruleset, workflow, required context/app pin, override label, allowlist, or me
 
 ## Verification
 
-The execution-decisions route suite covers final draft and missing-delivery refusals, successful independent final approval, a post-preflight content push, mid-ladder advancement, and repository-free close. Run the scoped suite directly:
+The execution-decisions route suite covers final draft and missing-delivery refusals, successful independent final approval, a post-preflight content push, mid-ladder advancement, repository-free close, and deterministic status/`updatedAt` or delivery-binding races between the external preflight and each of the three terminal decision transactions. The race assertions check HTTP 409, pending stage, no decision or accepted interaction, unchanged delivery receipt, no approval publication, and no merge-arm request. Run the scoped suite directly:
 
 ```sh
 pnpm --filter @paperclipai/server exec vitest run src/__tests__/issue-execution-decisions-routes.test.ts
