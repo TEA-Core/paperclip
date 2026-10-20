@@ -718,7 +718,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    expect(getEnvironmentFormPage()).toBeNull();
+    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull());
   });
 
   it("opens the edit form on a standalone page with existing values and closes after save", async () => {
@@ -811,7 +811,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => click(findButton(document.body, "Cancel")));
     await flushReact();
 
-    expect(getEnvironmentFormPage()).toBeNull();
+    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull());
   });
 
   it("keeps unload and in-app link warnings after env var changes are staged into the form", async () => {
