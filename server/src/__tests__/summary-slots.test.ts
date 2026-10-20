@@ -1255,7 +1255,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       await issueService(db).update(generationIssueId, { status: "in_progress" });
       const reopened = await svc.getSlot(projectSelector(companyId, projectId));
       expect(reopened.slot).toMatchObject({
-        status: "failed",
+        status: "idle",
         generatingIssueId: null,
       });
       await db
@@ -1263,19 +1263,19 @@ describeEmbeddedPostgres("summary slot service", () => {
         .set({ checkoutRunId: resubmitRunId })
         .where(eq(issues.id, generationIssueId));
 
-      const reopenedWrite = await svc.write(
-        {
-          ...projectSelector(companyId, projectId),
-          markdown: "# Summary v3 after reopen",
-          baseRevisionId: second.revision.id,
-          generationIssueId,
-        },
-        { agentId: summarizerAgentId, runId: resubmitRunId },
-      );
-      expect(reopenedWrite.revision.revisionNumber).toBe(3);
-      expect(reopenedWrite.slot).toMatchObject({
-        status: "generating",
-        generatingIssueId,
+      await expect(
+        svc.write(
+          {
+            ...projectSelector(companyId, projectId),
+            markdown: "# Summary v3 after reopen",
+            baseRevisionId: second.revision.id,
+            generationIssueId,
+          },
+          { agentId: summarizerAgentId, runId: resubmitRunId },
+        ),
+      ).rejects.toMatchObject({
+        status: 403,
+        message: "Summary write is unavailable; ask a board operator to re-generate the summary",
       });
     });
 

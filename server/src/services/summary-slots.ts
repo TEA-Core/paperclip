@@ -819,7 +819,10 @@ export function summarySlotService(db: Db) {
     if (!generationIssueId) {
       throw forbidden("Summary writes must identify the active generation task");
     }
-    if (!slotRow?.generatingIssueId || slotRow.generatingIssueId !== generationIssueId) {
+    if (!slotRow?.generatingIssueId) {
+      throw forbidden("Summary write is unavailable; ask a board operator to re-generate the summary");
+    }
+    if (slotRow.generatingIssueId !== generationIssueId) {
       throw forbidden("Summary write does not match the active generation task");
     }
     const issueRef = await loadIssueRef(sel.companyId, generationIssueId);
