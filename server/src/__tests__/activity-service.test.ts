@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 import {
   activityLog,
   agents,
@@ -14,6 +15,7 @@ import {
   issueDocuments,
   issues,
 } from "@paperclipai/db";
+import * as schema from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -772,34 +774,23 @@ describeEmbeddedPostgres("activity service", () => {
     expect(actual.map((row) => row.runId)).toEqual(oldRows.map((row) => row.id));
     expect(actual).toHaveLength(100);
 
-    const oldPlan = await db.execute<{ "QUERY PLAN": string }>(sql`
-      explain select r.id from heartbeat_runs r
-      where r.company_id = ${companyId} and (
-        r.context_snapshot ->> 'issueId' = ${issueId}
-        or exists (select 1 from activity_log a where a.company_id = ${companyId}
-          and a.entity_type = 'issue' and a.entity_id = ${issueId} and a.run_id = r.id)
-      )
-      order by r.created_at desc
-    `);
-    expect(oldPlan.map((row) => row["QUERY PLAN"]).join("\n")).toContain("heartbeat_runs_company_created_at_desc_idx");
+    const logged: Array<{ query: string; params: unknown[] }> = [];
+    const loggedDb = drizzle(db.$client, {
+      schema,
+      logger: { logQuery: (query, params) => { logged.push({ query, params }); } },
+    });
+    const loggedActual = await activityService(loggedDb).runsForIssue(companyId, issueId);
+    expect(loggedActual.map((row) => row.runId)).toEqual(actual.map((row) => row.runId));
 
-    const contextPlan = await db.execute<{ "QUERY PLAN": string }>(sql`
-      explain select id from heartbeat_runs
-      where company_id = ${companyId} and context_snapshot ->> 'issueId' = ${issueId}
-      order by created_at desc limit 100
-    `);
-    const activityPlan = await db.execute<{ "QUERY PLAN": string }>(sql`
-      explain with linked_ids as materialized (
-        select distinct run_id from activity_log
-        where entity_type = 'issue' and entity_id = ${issueId}
-          and company_id = ${companyId} and run_id is not null
-      )
-      select r.id from linked_ids a cross join lateral (
-        select id, created_at from heartbeat_runs
-        where id = a.run_id and company_id = ${companyId} offset 0
-      ) r order by r.created_at desc limit 100
-    `);
-    const plan = [...contextPlan, ...activityPlan].map((row) => row["QUERY PLAN"]).join("\n");
+    const sources = logged.filter(({ query }) =>
+      !query.includes("liveness_state") &&
+      (query.startsWith('select "id", "created_at" from "heartbeat_runs"') || query.trimStart().startsWith("with linked_ids")));
+    expect(sources).toHaveLength(2);
+    const plans = await Promise.all(sources.map(async ({ query, params }) => {
+      const rows = await db.$client.unsafe(`explain ${query}`, params as never[]);
+      return rows.map((row) => String(row["QUERY PLAN"]));
+    }));
+    const plan = plans.flat().join("\n");
     expect(plan).toContain("heartbeat_runs_company_ctx_issue_created_idx");
     expect(plan).toContain("activity_log_entity_type_id_idx");
     expect(plan).toMatch(/Index Scan.*heartbeat_runs_pkey/);
