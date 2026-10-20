@@ -449,8 +449,9 @@ async function readableQueueItems(
       ) },
   ]));
   const authz = authorizationService(db);
-  // For standard company visibility, issue:read and agent:read are uniform.
-  // Policy-bearing issues still use the canonical per-resource evaluator.
+  // Standard company visibility is uniform; actors without it still need
+  // concrete issue/agent decisions (notably low-trust agent boundaries).
+  // Policy-bearing issues also use the canonical per-resource evaluator.
   const companyRead = (await authz.decide({ actor, action: "issue:read", resource: { type: "issue", companyId } })).allowed;
   const boardRead = actor.type === "board" && (await authz.decide({
     actor, action: "company_scope:read", resource: { type: "company", companyId },
@@ -463,6 +464,7 @@ async function readableQueueItems(
   // considered only its first match, never one queue item per association.
   const visited = new Set<string>();
   const scopedRead = new Map<string, Promise<boolean>>();
+  const agentScopedRead = new Map<string, Promise<boolean>>();
   for (const row of rows) {
     if (visited.has(row.item.id)) continue;
     visited.add(row.item.id);
@@ -471,7 +473,7 @@ async function readableQueueItems(
     if (issueId) {
       const match = resources.get(issueId);
       if (!match) continue;
-      if (actor.type === "agent" && match.scoped) {
+      if (actor.type === "agent" && (match.scoped || !companyRead)) {
         let decision = scopedRead.get(issueId);
         if (!decision) {
           decision = authz.decide({ actor, action: "issue:read", resource: match.resource }).then((value) => value.allowed);
@@ -480,7 +482,17 @@ async function readableQueueItems(
         if (!(await decision)) continue;
       } else if (!companyRead) continue;
     } else if (row.item.sourceKind === "agent_error_alert") {
-      if (!agentRead && !boardRead) continue;
+      if (actor.type === "agent" && !agentRead) {
+        const agentId = row.agentId!;
+        let decision = agentScopedRead.get(agentId);
+        if (!decision) {
+          decision = authz.decide({
+            actor, action: "agent:read", resource: { type: "agent", companyId, agentId },
+          }).then((value) => value.allowed);
+          agentScopedRead.set(agentId, decision);
+        }
+        if (!(await decision)) continue;
+      } else if (!agentRead && !boardRead) continue;
     } else if (row.item.sourceKind === "failed_run" && actor.type === "agent") {
       if (row.runAgentId !== actor.agentId) continue;
     } else if (!boardRead) continue;
