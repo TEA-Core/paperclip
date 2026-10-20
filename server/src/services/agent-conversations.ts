@@ -6,6 +6,7 @@ import {
 import type { NativeStatusDecision } from "./native-runtime/status-arbiter.js";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import {
+  activityLog,
   agentTaskSessions,
   agentWakeupRequests,
   heartbeatRuns,
@@ -143,10 +144,24 @@ export async function prepareConversationTurn(
     if (
       comment?.authorUserId &&
       isConversationReset(comment.body) &&
-      comment.conversationSessionGeneration != null &&
-      context.conversationSessionGeneration !== comment.conversationSessionGeneration
+      comment.conversationSessionGeneration != null
     ) {
-      return { context, reset: false, duplicateReset: true, conversation: true };
+      const [stamp] = await tx
+        .select({ runId: activityLog.runId })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, run.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issue.id),
+            eq(activityLog.action, "issue.conversation_session_started"),
+            sql`${activityLog.details}->>'boundaryCommentId' = ${comment.id}`,
+          ),
+        )
+        .limit(1);
+      if (stamp && stamp.runId !== run.id) {
+        return { context, reset: false, duplicateReset: true, conversation: true };
+      }
     }
     const reset = Boolean(
       comment && comment.authorUserId && isConversationReset(comment.body),

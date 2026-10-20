@@ -426,6 +426,18 @@ const support = await getEmbeddedPostgresTestSupport();
         await conversationReplay(db, companyId, issue.id, next.id),
       ).not.toContain("Following turn");
     });
+    it("refuses a different run for a consumed /new even when it carries the stamped generation", async () => {
+      const issue = await create();
+      const command = await issueService(db).addComment(issue.id, "/new", {
+        userId: "local-board",
+      });
+      expect((await prepareConversationTurn(db, await runFor(issue.id, command.id))).reset).toBe(true);
+      const other = await runFor(issue.id, command.id, { conversationSessionGeneration: 1 });
+      expect(await prepareConversationTurn(db, other)).toMatchObject({
+        reset: false,
+        duplicateReset: true,
+      });
+    });
     it("cancels a later run for an already-consumed /new without another reset snapshot", async () => {
       const issue = await create();
       const command = await issueService(db).addComment(issue.id, "/new", {
