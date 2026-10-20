@@ -412,7 +412,6 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     runtimeConfig?: Record<string, unknown>;
     adapterType?: string;
     issueStatus?: string;
-    adapterType?: string;
     agentName?: string;
   }) {
     const companyId = input?.companyId ?? randomUUID();

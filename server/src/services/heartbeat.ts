@@ -19157,7 +19157,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stage: "claim",
       });
     const atomicClaim =
-      issueId && run.scheduledRetryReason
+      (issueId || retryTaskKey) && run.scheduledRetryReason
         ? await db.transaction(async (tx) => {
             if (retryTaskKey && !issueId) {
               await tx.execute(
