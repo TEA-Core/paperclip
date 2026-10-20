@@ -93,6 +93,9 @@ export type AuthorizationResource =
       originId?: string | null;
       status?: string | null;
       createdByAgentId?: string | null;
+      executionPolicy?: unknown;
+      projectExecutionWorkspacePolicy?: unknown;
+      authorizationContextLoaded?: boolean;
     };
 
 export type AuthorizationDecision = {
@@ -757,8 +760,12 @@ export function authorizationService(db: Db | DbTransaction) {
     });
   }
 
+  const agentMemo = new Map<string, Promise<AgentAuthorizationRow | null>>();
+
   async function loadAgent(agentId: string): Promise<AgentAuthorizationRow | null> {
-    return db
+    const cached = agentMemo.get(agentId);
+    if (cached) return cached;
+    const promise = db
       .select({
         id: agents.id,
         companyId: agents.companyId,
@@ -770,6 +777,11 @@ export function authorizationService(db: Db | DbTransaction) {
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
+    agentMemo.set(agentId, promise);
+    void promise.catch(() => {
+      if (agentMemo.get(agentId) === promise) agentMemo.delete(agentId);
+    });
+    return promise;
   }
 
   async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
@@ -784,8 +796,12 @@ export function authorizationService(db: Db | DbTransaction) {
       .then((rows) => rows[0] ?? null);
   }
 
+  const issueMemo = new Map<string, Promise<IssueAuthorizationRow | null>>();
+
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
-    return db
+    const cached = issueMemo.get(issueId);
+    if (cached) return cached;
+    const promise = db
       .select({
         id: issues.id,
         companyId: issues.companyId,
@@ -803,6 +819,11 @@ export function authorizationService(db: Db | DbTransaction) {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
+    issueMemo.set(issueId, promise);
+    void promise.catch(() => {
+      if (issueMemo.get(issueId) === promise) issueMemo.delete(issueId);
+    });
+    return promise;
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
@@ -883,14 +904,33 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadResourceContext(resource: AuthorizationResource) {
-    const issue = resource.type === "issue" && resource.issueId ? await loadIssue(resource.issueId) : null;
+    const issue = resource.type === "issue" && resource.issueId && !resource.authorizationContextLoaded
+      ? await loadIssue(resource.issueId)
+      : resource.type === "issue" && resource.issueId
+        ? {
+            id: resource.issueId,
+            companyId: resource.companyId,
+            projectId: resource.projectId ?? null,
+            parentId: resource.parentIssueId ?? null,
+            assigneeAgentId: resource.assigneeAgentId ?? null,
+            assigneeUserId: resource.assigneeUserId ?? null,
+            executionPolicy: resource.executionPolicy,
+            originKind: resource.originKind ?? null,
+            originId: resource.originId ?? null,
+            status: resource.status ?? null,
+          }
+        : null;
     const projectId =
       resource.type === "issue"
         ? issue?.projectId ?? resource.projectId ?? null
         : resource.type === "project"
           ? resource.projectId ?? null
           : null;
-    const project = projectId ? await loadProject(projectId) : null;
+    const project = projectId
+      ? resource.type === "issue" && resource.projectExecutionWorkspacePolicy !== undefined
+        ? { id: projectId, companyId: resource.companyId, executionWorkspacePolicy: resource.projectExecutionWorkspacePolicy }
+        : await loadProject(projectId)
+      : null;
     return { issue, project };
   }
 
@@ -939,7 +979,7 @@ export function authorizationService(db: Db | DbTransaction) {
     boundary: LowTrustBoundaryWithCompany,
     resource: Extract<AuthorizationResource, { type: "issue" }>,
   ) {
-    const issue = resource.issueId ? await loadIssue(resource.issueId) : null;
+    const issue = resource.issueId && !resource.authorizationContextLoaded ? await loadIssue(resource.issueId) : null;
     const candidate = {
       companyId: resource.companyId,
       id: issue?.id ?? resource.issueId ?? null,
@@ -949,7 +989,7 @@ export function authorizationService(db: Db | DbTransaction) {
     if (candidate.id && boundary.rootIssueId) {
       return issueIdIsDescendantOf(candidate.id, boundary.rootIssueId, boundary.companyId);
     }
-    if (!resource.parentIssueId) return false;
+    if (!resource.parentIssueId || resource.parentIssueId === resource.issueId) return false;
     const parent = await loadIssue(resource.parentIssueId);
     if (!parent) return false;
     if (

@@ -439,16 +439,19 @@ async function readableQueueItems(
     originId: issues.originId,
     status: issues.status,
     executionPolicy: issues.executionPolicy,
-    projectPolicy: projects.executionWorkspacePolicy,
+    projectExecutionWorkspacePolicy: projects.executionWorkspacePolicy,
   }).from(issues)
     .leftJoin(projects, and(eq(projects.id, issues.projectId), eq(projects.companyId, companyId)))
     .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds), isNull(issues.hiddenAt))) : [];
-  const resources = new Map(issueRows.map(({ executionPolicy, projectPolicy, ...row }) => [
-    row.id, { resource: { type: "issue" as const, issueId: row.id, ...row },
-      scoped: Boolean(
-        (executionPolicy && ("trustPreset" in executionPolicy || "reviewPreset" in executionPolicy || "authorizationPolicy" in executionPolicy)) ||
-        (projectPolicy && ("trustPreset" in projectPolicy || "reviewPreset" in projectPolicy || "authorizationPolicy" in projectPolicy)),
-      ) },
+  const resources = new Map(issueRows.map(({ executionPolicy, projectExecutionWorkspacePolicy, ...row }) => [
+    row.id, { resource: {
+      type: "issue" as const,
+      issueId: row.id,
+      ...row,
+      executionPolicy,
+      projectExecutionWorkspacePolicy,
+      authorizationContextLoaded: true,
+    } },
   ]));
   const authz = authorizationService(db);
   // Standard company visibility is uniform; actors without it still need
@@ -457,9 +460,6 @@ async function readableQueueItems(
   const companyRead = (await authz.decide({ actor, action: "issue:read", resource: { type: "issue", companyId } })).allowed;
   const boardRead = actor.type === "board" && (await authz.decide({
     actor, action: "company_scope:read", resource: { type: "company", companyId },
-  })).allowed;
-  const agentRead = actor.type === "agent" && (await authz.decide({
-    actor, action: "agent:read", resource: { type: "agent", companyId },
   })).allowed;
   const result: typeof decisionQueueItems.$inferSelect[] = [];
   // An approval may have multiple linked issues; the single-source reader
@@ -475,7 +475,7 @@ async function readableQueueItems(
     if (issueId) {
       const match = resources.get(issueId);
       if (!match) continue;
-      if (actor.type === "agent" && (match.scoped || !companyRead)) {
+      if (actor.type === "agent") {
         let decision = scopedRead.get(issueId);
         if (!decision) {
           decision = authz.decide({ actor, action: "issue:read", resource: match.resource }).then((value) => value.allowed);
@@ -484,8 +484,9 @@ async function readableQueueItems(
         if (!(await decision)) continue;
       } else if (!companyRead) continue;
     } else if (row.item.sourceKind === "agent_error_alert") {
-      if (actor.type === "agent" && !agentRead) {
-        const agentId = row.agentId!;
+      if (!boardRead) {
+        if (actor.type !== "agent" || !row.agentId) continue;
+        const agentId = row.agentId;
         let decision = agentScopedRead.get(agentId);
         if (!decision) {
           decision = authz.decide({
@@ -494,7 +495,7 @@ async function readableQueueItems(
           agentScopedRead.set(agentId, decision);
         }
         if (!(await decision)) continue;
-      } else if (!agentRead && !boardRead) continue;
+      }
     } else if (row.item.sourceKind === "failed_run" && actor.type === "agent") {
       if (row.runAgentId !== actor.agentId) continue;
     } else if (!boardRead) continue;

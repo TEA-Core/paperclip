@@ -384,7 +384,7 @@ describeEmbeddedPostgres("decision queue routes", () => {
     }
   });
 
-  it("matches concrete issue and agent authorization for a low-trust actor", async () => {
+  it("matches concrete issue and agent authorization for standard and low-trust actors", async () => {
     const { companyId, agentId, issueId } = await seed();
     const otherIssueId = randomUUID();
     const otherAgentId = randomUUID();
@@ -414,19 +414,24 @@ describeEmbeddedPostgres("decision queue routes", () => {
     await db.insert(decisionQueueItems).values(sources.map((source) => ({
       companyId, queueId: queue.id, ...source, addedByType: "system" as const,
     })));
-    const actor = agentActor(companyId, agentId);
-    const expected: string[] = [];
-    for (const source of sources) {
-      if (await canReadDecisionSource(db, actor, companyId, source.sourceKind, source.sourceId)) {
-        expected.push(source.sourceId);
-      }
-    }
-    expect(expected.sort()).toEqual([issueId, agentId].sort());
     const service = decisionQueueService(db);
-    expect((await service.listItems(companyId, "low-trust", actor)).map((item) => item.sourceId).sort())
-      .toEqual(expected);
-    expect((await service.list(companyId, actor))[0]?.itemCount).toBe(expected.length);
-    await request(app(actor)).get(`/api/companies/${companyId}/decision-queues`).expect(403);
+    const standardActor = agentActor(companyId, otherAgentId);
+    const lowTrustActor = agentActor(companyId, agentId);
+    for (const actor of [standardActor, lowTrustActor]) {
+      const expected: string[] = [];
+      for (const source of sources) {
+        if (await canReadDecisionSource(db, actor, companyId, source.sourceKind, source.sourceId)) {
+          expected.push(source.sourceId);
+        }
+      }
+      expect(expected.sort()).toEqual((actor === standardActor
+        ? [issueId, otherIssueId, agentId, otherAgentId]
+        : [issueId, agentId]).sort());
+      expect((await service.listItems(companyId, "low-trust", actor)).map((item) => item.sourceId).sort())
+        .toEqual(expected);
+      expect((await service.list(companyId, actor))[0]?.itemCount).toBe(expected.length);
+    }
+    await request(app(lowTrustActor)).get(`/api/companies/${companyId}/decision-queues`).expect(403);
   });
 
   it("keeps failed-run owner and linked-issue visibility distinct", async () => {
