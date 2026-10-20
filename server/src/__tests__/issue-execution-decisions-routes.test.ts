@@ -5,11 +5,12 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
   issues,
@@ -34,6 +35,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import type * as GitHubFetch from "../services/github-fetch.js";
 import type * as GitHubCredential from "../services/github-credential.js";
 
@@ -223,6 +225,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
@@ -631,6 +634,103 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
     expect(await db.select().from(issueDeliveryReceipts)
       .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  async function withIssueTrigger(name: string, when: string, body: string, run: () => Promise<void>) {
+    await db.execute(sql.raw(`create or replace function ${name}() returns trigger language plpgsql as $$ begin ${body} end $$`));
+    await db.execute(sql.raw(`create trigger ${name} before update on issues for each row when (${when}) execute function ${name}()`));
+    try {
+      await run();
+    } finally {
+      await db.execute(sql.raw(`drop trigger if exists ${name} on issues`));
+      await db.execute(sql.raw(`drop function if exists ${name}()`));
+    }
+  }
+
+  async function holdAgentRun(fixture: Awaited<ReturnType<typeof pendingDelivery>>) {
+    const agentId = (await fixture.read()).createdByAgentId!;
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.company.id, agentId, status: "running",
+    }).returning();
+    await db.update(issues).set({
+      assigneeAgentId: agentId, assigneeUserId: null, executionRunId: run!.id, executionLockedAt: new Date(),
+    }).where(eq(issues.id, fixture.issue.id));
+    return run!;
+  }
+
+  const reassignToBoardUser = { assigneeAgentId: null, assigneeUserId: "board-user" };
+
+  it("approves a final PATCH whose own run cancellation bumps updatedAt", async () => {
+    const fixture = await pendingDelivery();
+    const run = await holdAgentRun(fixture);
+    const response = await fixture.approve(reassignToBoardUser);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionRunId).toBeNull();
+    const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(cancelled?.status).toBe("cancelled");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
+    expect(fixture.writes).toHaveLength(1);
+  });
+
+  it.each([
+    ["title", "NEW.title := 'Renamed while the run was cancelled';"],
+    ["execution policy", `NEW.execution_policy := NEW.execution_policy || '{"commentRequired": true}'::jsonb;`],
+    ["execution state", `NEW.execution_state := NEW.execution_state || '{"lastDecisionOutcome": "changes_requested"}'::jsonb;`],
+  ])("refuses a final PATCH when a concurrent %s change lands during its own run cancellation", async (_label, mutation) => {
+    const fixture = await pendingDelivery({ mergeArmingEnabled: true });
+    await holdAgentRun(fixture);
+    let response!: request.Response;
+    await withIssueTrigger(
+      "sup20467_concurrent_change",
+      "OLD.execution_run_id is not null and NEW.execution_run_id is null",
+      `${mutation} return NEW;`,
+      async () => { response = await fixture.approve(reassignToBoardUser); },
+    );
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState?.completedStageIds).toEqual([]);
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("publishes nothing and keeps the escalation pending when the accept transaction fails after the decision", async () => {
+    const fixture = await pendingDelivery({ mergeArmingEnabled: true });
+    const interaction = await seedEscalation(fixture);
+    const events: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(fixture.company.id, (event) => events.push(event));
+    let response!: request.Response;
+    try {
+      await withIssueTrigger(
+        "sup20467_fail_after_decision",
+        "OLD.status = 'done' and NEW.status = 'done'",
+        "raise exception 'forced failure after the escalation decision';",
+        async () => {
+          response = await request(createApp(db, boardActor(fixture.company)))
+            .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+        },
+      );
+    } finally {
+      unsubscribe();
+    }
+    expect(response.status).toBe(500);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    const [pending] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
+    expect(pending?.status).toBe("pending");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(events.filter((event) => {
+      const action = (event as { payload?: { action?: string } }).payload?.action ?? "";
+      return !action.startsWith("issue.done_");
+    })).toEqual([]);
     expect(fixture.writes).toEqual([]);
     expect(fixture.armCalls).toEqual([]);
   });

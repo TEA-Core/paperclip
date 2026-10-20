@@ -18359,17 +18359,17 @@ export function issueRoutes(
         interruptedRunId = cancelled.id;
       }
     }
-    if (finalDeliveryPrefetch && interruptedRunId) {
-      // Our own run cancellation bumped updatedAt; re-anchor it only while everything
-      // the transition was computed from is unchanged.
+    if (finalDeliveryPrefetch) {
+      // This request's own run-lock writes bump updatedAt and move the run links;
+      // re-anchor only while every other column and the delivery binding are unchanged.
       const afterStop = await svc.getById(existing.id);
+      const withoutRunRelease = (row: object) => {
+        const { updatedAt: _u, executionRunId: _r, executionAgentNameKey: _k, executionLockedAt: _l, checkoutRunId: _c, ...rest } = row as Record<string, unknown>;
+        return rest;
+      };
       if (
         afterStop &&
-        afterStop.status === existing.status &&
-        afterStop.assigneeAgentId === existing.assigneeAgentId &&
-        afterStop.assigneeUserId === existing.assigneeUserId &&
-        isDeepStrictEqual(afterStop.executionPolicy, existing.executionPolicy) &&
-        isDeepStrictEqual(afterStop.executionState, existing.executionState) &&
+        isDeepStrictEqual(withoutRunRelease(afterStop), withoutRunRelease(existing)) &&
         (await readFinalDeliveryBinding(db, afterStop)) === finalDeliveryPrefetch.binding
       ) {
         finalDeliveryPrefetch = { ...finalDeliveryPrefetch, updatedAtMs: new Date(afterStop.updatedAt).getTime() };
