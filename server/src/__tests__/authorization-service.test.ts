@@ -20,7 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { accessService } from "../services/access.js";
-import { authorizationService } from "../services/authorization.js";
+import { authorizationService, createAuthorizationMemoContext } from "../services/authorization.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -579,6 +579,54 @@ describeEmbeddedPostgres("authorization service", () => {
       allowed: false,
       reason: "deny_company_boundary",
     });
+  });
+
+  it("rechecks an agent's assignment eligibility across requests on a retained authorization service", async () => {
+    const company = await createCompany(db, "RetainedAuthzAssignment");
+    const actor = await createAgent(db, company.id);
+    const target = await createAgent(db, company.id);
+    const authz = authorizationService(db);
+    const decisionInput = {
+      actor: { type: "agent" as const, agentId: actor.id, companyId: company.id, source: "agent_key" as const },
+      action: "tasks:assign" as const,
+      resource: { type: "issue" as const, companyId: company.id, assigneeAgentId: target.id },
+      scope: { assigneeAgentId: target.id },
+    };
+
+    await expect(authz.decide(decisionInput)).resolves.toMatchObject({ allowed: true });
+
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, target.id));
+
+    await expect(authz.decide({ ...decisionInput, actor: { ...decisionInput.actor } })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_company_boundary",
+    });
+  });
+
+  it("shares memo entries within one explicitly supplied memo context", async () => {
+    const company = await createCompany(db, "ExplicitMemoScope");
+    const actor = await createAgent(db, company.id);
+    const target = await createAgent(db, company.id);
+    const memoContext = createAuthorizationMemoContext();
+    const decisionInput = {
+      actor: { type: "agent" as const, agentId: actor.id, companyId: company.id, source: "agent_key" as const },
+      action: "tasks:assign" as const,
+      resource: { type: "issue" as const, companyId: company.id, assigneeAgentId: target.id },
+      scope: { assigneeAgentId: target.id },
+    };
+
+    await expect(authorizationService(db, memoContext).decide(decisionInput)).resolves.toMatchObject({
+      allowed: true,
+    });
+
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, target.id));
+
+    await expect(authorizationService(db, memoContext).decide(decisionInput)).resolves.toMatchObject({
+      allowed: true,
+    });
+    await expect(
+      authorizationService(db, createAuthorizationMemoContext()).decide(decisionInput),
+    ).resolves.toMatchObject({ allowed: false, reason: "deny_company_boundary" });
   });
 
   // Fork policy (ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE): upstream #10804 allows
