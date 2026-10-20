@@ -2894,7 +2894,7 @@ describe("issue execution policy routes", () => {
 
     // Terminal final-stage accepts commit the decision inside acceptInteraction's
     // transaction hooks, so the mocked service must run them like the real one does.
-    function acceptRunningTransactionHooks(result: { interaction: unknown }) {
+    function acceptRunningTransactionHooks(result: { interaction: unknown; createdIssues: unknown[]; continuationIssue: unknown }) {
       mockIssueThreadInteractionService.acceptInteraction.mockImplementationOnce(
         async (_issue: unknown, _id: unknown, _body: unknown, _actor: unknown, hooks?: {
           beforeResolveInTransaction?: (tx: unknown) => Promise<void>;
