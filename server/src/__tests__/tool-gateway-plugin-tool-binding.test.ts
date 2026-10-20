@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -337,6 +337,82 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       tool: "c.d:beta",
       parameters: {},
     })).resolves.toMatchObject({ status: "completed", tool: "c.d:beta" });
+  });
+
+  it("preserves an unredacted plugin dispatch result", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+
+    await expect(gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:alpha",
+      parameters: {},
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    })).resolves.toEqual({
+      pluginId: "plugin-a",
+      toolName: "alpha",
+      result: { data: { ok: true } },
+    });
+  });
+
+  it("rehashes redacted content inside the production plugin dispatch envelope", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const secret = "plugin-result-secret";
+    const originalContent = `Authorization: Bearer ${secret}`;
+    const dispatcher = twoPluginDispatcher();
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: {
+        ...dispatcher,
+        executeTool: async (tool, parameters, runContext) => {
+          const result = await dispatcher.executeTool(tool, parameters, runContext);
+          return {
+            ...result,
+            result: {
+              content: originalContent,
+              data: { hash: createHash("sha256").update(originalContent).digest("hex") },
+            },
+          };
+        },
+      },
+    });
+    const result = await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:alpha",
+      parameters: {},
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    });
+
+    expect(result).toEqual({
+      pluginId: "plugin-a",
+      toolName: "alpha",
+      result: {
+        content: "Authorization: ***REDACTED***",
+        data: {
+          hash: createHash("sha256").update("Authorization: ***REDACTED***").digest("hex"),
+        },
+        redacted: true,
+        redactedFields: ["sensitive_value"],
+      },
+    });
+    expect(result).toMatchObject({ pluginId: "plugin-a", toolName: "alpha", result: expect.any(Object) });
+    const checkedResult = result as unknown as {
+      result: { content?: unknown; data?: unknown };
+    };
+    const content = checkedResult.result.content;
+    const data = checkedResult.result.data;
+    if (
+      typeof content !== "string" ||
+      typeof data !== "object" ||
+      data === null ||
+      !("hash" in data) ||
+      typeof data.hash !== "string"
+    ) {
+      throw new Error("Expected a plugin result with string content and hash data");
+    }
+    expect(createHash("sha256").update(content).digest("hex")).toBe(data.hash);
+    expect(content).not.toContain(secret);
   });
 
   it("denies executing an allowlist-excluded plugin tool by name via the plugin execute route", async () => {
