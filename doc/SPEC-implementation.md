@@ -1069,7 +1069,8 @@ with 1–50 entries. They return `{ "issues": [/* compact issue list rows, in
 requested order */], "missing": [/* unknown or unreadable requested keys */] }`.
 The same company and per-issue read authorization as the regular issue routes
 applies; missing and unauthorized keys are indistinguishable. Bulk reads use
-ordinary list visibility (hidden, harness, and conversation issues are omitted)
+ordinary list visibility (hidden, harness, and conversation issues are omitted;
+plugin-operation issues are included, matching `GET /issues/:issueId`)
 and do not hydrate ancestors, documents, workspaces, or work products. A key
 has a 30-request budget per minute (separate from search); exhausted requests
 return `429` with `Retry-After`. Invalid or over-cap requests return `400`.

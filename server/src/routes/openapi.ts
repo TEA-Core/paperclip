@@ -3858,7 +3858,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Read up to 50 issues by ID or identifier for pollers",
   description:
-    "Pass exactly one of `ids` or `identifiers` as 1–50 comma-separated keys. Returns `{ issues: CompactIssue[], missing: string[] }`, with issues in request order; unknown and unreadable keys both appear in missing. Uses list visibility and issue-read authorization without detail hydration. Each token has a 30-request-per-minute budget; 429 includes Retry-After.",
+    "Pass exactly one of `ids` or `identifiers` as 1–50 comma-separated keys. Returns `{ issues: CompactIssue[], missing: string[] }`, with issues in request order; unknown and unreadable keys both appear in missing. Uses list visibility (plugin-operation issues included) and issue-read authorization without detail hydration. Each token has a 30-request-per-minute budget; 429 includes Retry-After.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: z.object({
