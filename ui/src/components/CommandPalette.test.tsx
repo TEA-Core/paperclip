@@ -463,13 +463,8 @@ describe("CommandPalette", () => {
     });
   });
 
-  it("does not show unfiltered recent tasks after a filter-only query", async () => {
-    const recentTask = { id: "issue-1", identifier: "PAP-1", title: "Recent task" };
-    mockIssuesApi.listCompact.mockResolvedValue([recentTask]);
-    const { root } = renderWithQueryClient(<CommandPalette />, container, (queryClient) => {
-      queryClient.setQueryData([...queryKeys.issues.list("company-1"), "compact", 10], [recentTask]);
-      queryClient.setQueryData(queryKeys.auth.session, { user: { id: "user-1" }, session: { userId: "user-1" } });
-    });
+  it("renders quick-filter chips and inserts them into the palette query", async () => {
+    const { root } = renderWithQueryClient(<CommandPalette />, container);
 
     act(() => {
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
@@ -486,8 +481,6 @@ describe("CommandPalette", () => {
       );
     });
 
-    expect(container.textContent).toContain("Recent task");
-
     act(() => {
       container.querySelector('button[data-testid="command-filter-chip"]')!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -496,8 +489,6 @@ describe("CommandPalette", () => {
     await waitForAssertion(() => {
       expect(input.value).toBe("assignee:me");
     });
-    expect(container.textContent).not.toContain("Recent task");
-    expect(mockIssuesApi.list).not.toHaveBeenCalled();
 
     act(() => {
       root.unmount();

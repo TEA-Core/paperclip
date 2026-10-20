@@ -185,8 +185,8 @@ export function CommandPalette() {
   };
 
   const visibleIssues = useMemo(
-    () => (searchQuery.length > 0 ? searchedIssues : issues),
-    [issues, searchedIssues, searchQuery],
+    () => (quickSearchQuery.length > 0 ? searchedIssues : issues),
+    [issues, searchedIssues, quickSearchQuery],
   );
 
   // Client-side typeahead ranking over the already-loaded projects. cmdk ranks
