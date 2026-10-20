@@ -524,14 +524,12 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       WORKSPACE_BUSY_RETRY_WAKE_REASON,
     );
 
-    // The issue execution lock moved to the retry run, so the issue keeps an
-    // active execution path and stranded-issue recovery leaves it alone.
     const issueRow = await db
       .select({ executionRunId: issues.executionRunId })
       .from(issues)
       .where(eq(issues.id, fixture.issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issueRow?.executionRunId).toBe(retryRun!.id);
+    expect(issueRow?.executionRunId).toBeNull();
 
     const finishedAtMs = finishedRun?.finishedAt ? new Date(finishedRun.finishedAt).getTime() : 0;
     const dueAtMs = retryRun?.scheduledRetryAt ? new Date(retryRun.scheduledRetryAt).getTime() : 0;

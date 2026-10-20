@@ -4928,7 +4928,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue).toEqual({
       status: "in_progress",
-      executionRunId: retryRun?.id ?? null,
+      executionRunId: null,
     });
 
     const comments = await db
@@ -5126,7 +5126,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue).toEqual({
       status: "in_progress",
-      executionRunId: retryRun?.id ?? null,
+      executionRunId: null,
     });
 
     mockAdapterExecute.mockClear();
