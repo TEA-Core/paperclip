@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -156,6 +156,30 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       memberships: [{ companyId, membershipRole: "owner", status: "active" }],
       source: "cloud_tenant",
     } as unknown as Express.Request["actor"];
+  }
+
+  async function rejectActivityLogInserts() {
+    await db.execute(sql.raw(
+      "alter table activity_log add constraint merge_arming_republish_force_audit_failure check (false) not valid",
+    ));
+  }
+
+  async function allowActivityLogInserts() {
+    await db.execute(sql.raw(
+      "alter table activity_log drop constraint if exists merge_arming_republish_force_audit_failure",
+    ));
+  }
+
+  async function rejectRecoveredExternalObjectUpserts() {
+    await db.execute(sql.raw(
+      "alter table external_objects add constraint merge_arming_republish_force_external_object_failure check (false) not valid",
+    ));
+  }
+
+  async function allowRecoveredExternalObjectUpserts() {
+    await db.execute(sql.raw(
+      "alter table external_objects drop constraint if exists merge_arming_republish_force_external_object_failure",
+    ));
   }
 
   function agentActor(companyId: string, agentId: string): Express.Request["actor"] {
@@ -560,6 +584,120 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(receiptRows[0]?.state).toBe("ready");
   });
 
+  it("publishes the recovered target head once and consumes its receipt exactly once", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: 579, headRefName: DELIVERY_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({
+        state: "open",
+        merged: false,
+        draft: false,
+        head: {
+          sha: HEAD_SHA,
+          ref: DELIVERY_BRANCH,
+          repo: { name: REPO, owner: { login: OWNER } },
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA }, html_url: `https://github.com/${OWNER}/${REPO}/pull/579` }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockImplementationOnce(async () => {
+        const [claimedReceipt] = await db.select().from(issueDeliveryReceipts);
+        expect(claimedReceipt?.state).toBe("claimed");
+        return createMockResponse({ id: 579 });
+      });
+
+    const recovered = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: 579,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-then-publish",
+      });
+    expect(recovered.status).toBe(201);
+    expect(recovered.body.receipt.state).toBe("ready");
+
+    const published = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+    expect(published.status).toBe(200);
+    expect(published.body.outcome).toBe("armed");
+    expect(published.body.headSha).toBe(HEAD_SHA);
+    const statusWrites = mockGhFetch.mock.calls.filter(
+      (call) => typeof call[0] === "string" && (call[0] as string).includes("/statuses/"),
+    );
+    expect(statusWrites).toHaveLength(1);
+    expect(statusWrites[0]![0]).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`);
+    expect(statusWrites[0]![1]?.method).toBe("POST");
+    expect(JSON.parse(statusWrites[0]![1]!.body as string)).toMatchObject({
+      context: "paperclip/approved",
+      state: "success",
+    });
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.headSha).toBe(HEAD_SHA);
+    expect(receipt?.state).toBe("consumed");
+
+    const replay = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+    expect(replay.status).toBe(200);
+    expect(replay.body.outcome).toBe("already_published");
+    expect(mockGhFetch).toHaveBeenCalledTimes(4);
+    const [replayedReceipt] = await db.select().from(issueDeliveryReceipts);
+    expect(replayedReceipt?.state).toBe("consumed");
+  });
+
+  it("invalidates a recovered receipt when the exact-head status write fails", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const recovered = await request(app)
+      .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+      .send({
+        owner: OWNER,
+        repo: REPO,
+        pullRequestNumber: PR_NUMBER,
+        headSha: HEAD_SHA,
+        reason: "restore approved publication",
+        idempotencyKey: "recover-then-fail-status",
+      });
+    expect(recovered.status).toBe(201);
+    expect(recovered.body.receipt.state).toBe("ready");
+
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ message: "forbidden" }, false, 403));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.outcome).toBe("failed");
+    expect(res.body.message).toContain("status:failed");
+    const statusWrites = mockGhFetch.mock.calls.filter(
+      (call) => typeof call[0] === "string" && (call[0] as string).includes("/statuses/"),
+    );
+    expect(statusWrites).toHaveLength(1);
+    expect(statusWrites[0]![0]).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`);
+    expect(statusWrites[0]![1]?.method).toBe("POST");
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.state).toBe("invalidated");
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    expect((row?.executionState as Record<string, unknown> | undefined)?.approvalStatus).toBeUndefined();
+  });
+
   it.each([
     ["closed", { state: "closed", merged: false, draft: false }],
     ["merged", { state: "closed", merged: true, draft: false }],
@@ -658,6 +796,82 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch.mock.calls.some(([url]) => typeof url === "string" && url.includes("/statuses/"))).toBe(false);
     expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
     expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
+  it("rejects an external-object persistence failure before creating a receipt or link", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    await rejectRecoveredExternalObjectUpserts();
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    try {
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+        .send({
+          owner: OWNER,
+          repo: REPO,
+          pullRequestNumber: 579,
+          headSha: HEAD_SHA,
+          reason: "restore approved publication",
+          idempotencyKey: "recover-external-object-rollback",
+        });
+
+      expect(res.status).toBe(500);
+      expect(mockGhFetch.mock.calls.some(([url]) => typeof url === "string" && url.includes("/statuses/"))).toBe(false);
+      expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+      expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+      expect(await db.select().from(externalObjects)).toHaveLength(0);
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+    } finally {
+      await allowRecoveredExternalObjectUpserts();
+    }
+  });
+
+  it("rolls back the recovered receipt and link when its audit insert fails", async () => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    await rejectActivityLogInserts();
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    try {
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/delivery-receipt-recovery`)
+        .send({
+          owner: OWNER,
+          repo: REPO,
+          pullRequestNumber: 579,
+          headSha: HEAD_SHA,
+          reason: "restore approved publication",
+          idempotencyKey: "recover-audit-rollback",
+        });
+
+      expect(res.status).toBe(500);
+      expect(mockGhFetch.mock.calls.some(([url]) => typeof url === "string" && url.includes("/statuses/"))).toBe(false);
+      expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+      expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+      expect(await db.select().from(externalObjects)).toHaveLength(0);
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+    } finally {
+      await allowActivityLogInserts();
+    }
   });
 
   it("rejects a duplicate idempotency key with conflicting coordinates and performs no write", async () => {
@@ -864,6 +1078,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     );
     expect(statusWrites).toHaveLength(1);
     expect(statusWrites[0]![0]).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`);
+    expect(statusWrites[0]![1]?.method).toBe("POST");
     expect(JSON.parse(statusWrites[0]![1]!.body as string)).toMatchObject({
       context: "paperclip/approved",
       state: "success",
