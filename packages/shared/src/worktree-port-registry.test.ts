@@ -37,8 +37,11 @@ describe("worktree port registry lock", () => {
     const firstEntered = deferred();
     const releaseFirst = deferred();
     let secondEntered = false;
+    let ageAfterBackdating = 0;
 
     const first = withWorktreePortRegistryLock(homeDir, async () => {
+      // Let the heartbeat worker's initial lease touch land before backdating the lock.
+      await delay(100);
       fs.renameSync(path.join(lockPath, "owner.json"), path.join(lockPath, "owner.unavailable.json"));
       const backupOwnerPath = path.join(lockPath, "owner.backup.json");
       const owner = JSON.parse(fs.readFileSync(backupOwnerPath, "utf8"));
@@ -48,12 +51,13 @@ describe("worktree port registry lock", () => {
       })}\n`);
       const oldTimestamp = new Date(Date.now() - 10_000);
       fs.utimesSync(lockPath, oldTimestamp, oldTimestamp);
+      ageAfterBackdating = Date.now() - fs.statSync(lockPath).mtimeMs;
       firstEntered.resolve();
       await releaseFirst.promise;
     });
     await firstEntered.promise;
 
-    expect(Date.now() - fs.statSync(lockPath).mtimeMs).toBeGreaterThan(5_000);
+    expect(ageAfterBackdating).toBeGreaterThan(5_000);
 
     const second = withWorktreePortRegistryLock(homeDir, async () => {
       secondEntered = true;
