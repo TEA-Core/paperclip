@@ -139,11 +139,12 @@ export async function prepareConversationTurn(
             ),
           )
       : [];
-    // An already-stamped /new was consumed. A later run must not reset again.
+    // An already-stamped /new was consumed. Only the run that stamped it (a crash/retry) may reset again.
     if (
       comment?.authorUserId &&
       isConversationReset(comment.body) &&
-      comment.conversationSessionGeneration != null
+      comment.conversationSessionGeneration != null &&
+      context.conversationSessionGeneration !== comment.conversationSessionGeneration
     ) {
       return { context, reset: false, duplicateReset: true, conversation: true };
     }
@@ -159,7 +160,7 @@ export async function prepareConversationTurn(
         "Conversation session changed; this older turn cannot resume",
       );
     }
-    // The boundary lives on the command comment. Only the first run for that /new stamps it.
+    // The boundary lives on the command comment. A crash/retry reuses it instead of resetting twice.
     if (reset && comment && comment.conversationSessionGeneration == null) {
       generation += 1;
       await tx

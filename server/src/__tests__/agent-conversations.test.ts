@@ -351,7 +351,7 @@ const support = await getEmbeddedPostgresTestSupport();
             .where(eq(heartbeatRuns.id, resetRun.id))
         )[0]!,
       );
-      expect(retried).toMatchObject({ reset: false, duplicateReset: true });
+      expect(retried).toMatchObject({ reset: true, duplicateReset: false });
       const [current] = await db
         .select()
         .from(issues)
