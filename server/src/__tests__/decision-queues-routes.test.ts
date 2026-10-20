@@ -13,6 +13,7 @@ import {
   decisionQueues,
   decisionTriage,
   decisionTriageEvents,
+  heartbeatRuns,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
@@ -24,7 +25,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { decisionQueueRoutes } from "../routes/decision-queues.js";
-import { decisionQueueService } from "../services/decision-queues.js";
+import { canReadDecisionSource, decisionQueueService } from "../services/decision-queues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -53,6 +54,7 @@ describeEmbeddedPostgres("decision queue routes", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issueWorkProducts);
     await db.delete(approvals);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -261,6 +263,131 @@ describeEmbeddedPostgres("decision queue routes", () => {
       eq(decisionQueueItems.companyId, companyId),
       eq(decisionQueueItems.sourceKind, "approval"),
     ))).toHaveLength(0);
+  });
+
+  it("keeps list query count flat and matches source-by-source visibility", async () => {
+    const { companyId, agentId, issueId, approvalId } = await seed();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other Co", issuePrefix: "OTH" });
+    const [first, second] = await db.insert(decisionQueues).values([
+      { companyId, key: "one", title: "One", createdByType: "system" },
+      { companyId, key: "two", title: "Two", createdByType: "system" },
+    ]).returning();
+    const actorCases = [
+      boardActor(companyId),
+      agentActor(companyId, agentId),
+      { type: "board", source: "session", userId: "unaffiliated", companyIds: [], isInstanceAdmin: false },
+    ] as const;
+    const countedDb = { count: 0 };
+    const instrumented = new Proxy(db, {
+      get(target, key) {
+        if (key === "select") return (...args: Parameters<typeof db.select>) => {
+          countedDb.count++;
+          return target.select(...args);
+        };
+        if (key === "execute") return (...args: Parameters<typeof db.execute>) => {
+          countedDb.count++;
+          return target.execute(...args);
+        };
+        return Reflect.get(target, key);
+      },
+    });
+    const service = decisionQueueService(instrumented);
+    const measures = new Map<string, number>();
+    for (const size of [2, 32]) {
+      const newIssues = Array.from({ length: size - 1 }, (_, index) => ({
+        id: randomUUID(), companyId, identifier: `DQC-${size}-${index}`, title: `Decision ${index}`, status: "todo" as const,
+      }));
+      await db.insert(issues).values(newIssues);
+      const sourceIds = [issueId, ...newIssues.map((issue) => issue.id)];
+      await db.insert(decisionQueueItems).values([
+        ...sourceIds.map((sourceId) => ({ companyId, queueId: first.id, sourceKind: "review" as const, sourceId, addedByType: "system" as const })),
+        { companyId, queueId: second.id, sourceKind: "approval", sourceId: approvalId, addedByType: "system" },
+        { companyId, queueId: second.id, sourceKind: "review", sourceId: randomUUID(), addedByType: "system" },
+      ]);
+      for (const actor of actorCases) {
+        countedDb.count = 0;
+        const expected = await Promise.all(sourceIds.map((id) =>
+          canReadDecisionSource(instrumented, actor, companyId, "review", id)));
+        const oldQueryCount = countedDb.count;
+        if (actor.type === "board" && actor.source === "local_implicit") {
+          expect(oldQueryCount).toBeGreaterThan(size);
+        }
+        const approvalVisible = await canReadDecisionSource(db, actor, companyId, "approval", approvalId);
+        countedDb.count = 0;
+        const listed = await service.list(companyId, actor);
+        const queryCount = countedDb.count;
+        expect(listed.find((queue) => queue.key === "one")?.itemCount).toBe(expected.filter(Boolean).length);
+        expect(listed.find((queue) => queue.key === "two")?.itemCount).toBe(Number(approvalVisible));
+        const actorName = actor.type === "agent" ? "agent" : actor.source === "local_implicit" ? "board" : "restricted";
+        if (measures.has(actorName)) expect(queryCount).toBe(measures.get(actorName));
+        else measures.set(actorName, queryCount);
+        countedDb.count = 0;
+        const visible = await service.listItems(companyId, "one", actor);
+        expect(visible.map((item) => item.sourceId).sort()).toEqual(sourceIds.filter((_, index) => expected[index]).sort());
+        expect(countedDb.count).toBeLessThanOrEqual(queryCount + 1);
+      }
+      await db.delete(decisionQueueItems);
+    }
+    expect(measures.size).toBe(3);
+  });
+
+  it("respects issue policy boundaries, hidden sources, and other-company sources", async () => {
+    const { companyId, agentId } = await seed();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other Co", issuePrefix: "OTH" });
+    const allowedId = randomUUID();
+    const deniedId = randomUUID();
+    const hiddenId = randomUUID();
+    const foreignId = randomUUID();
+    await db.insert(issues).values([
+      { id: allowedId, companyId, identifier: "DQC-2", title: "Inside", status: "todo",
+        executionPolicy: { authorizationPolicy: { trustBoundary: { mode: "low_trust_review", issueIds: [allowedId] } } } },
+      { id: deniedId, companyId, identifier: "DQC-3", title: "Outside", status: "todo",
+        executionPolicy: { authorizationPolicy: { trustBoundary: { mode: "low_trust_review", issueIds: [allowedId] } } } },
+      { id: hiddenId, companyId, identifier: "DQC-4", title: "Hidden", status: "todo", hiddenAt: new Date() },
+      { id: foreignId, companyId: otherCompanyId, identifier: "OTH-1", title: "Foreign", status: "todo" },
+    ]);
+    const [queue] = await db.insert(decisionQueues).values({
+      companyId, key: "policy", title: "Policy", createdByType: "system",
+    }).returning();
+    const ids = [allowedId, deniedId, hiddenId, foreignId];
+    await db.insert(decisionQueueItems).values(ids.map((sourceId) => ({
+      companyId, queueId: queue.id, sourceKind: "review" as const, sourceId, addedByType: "system" as const,
+    })));
+    for (const actor of [boardActor(companyId), agentActor(companyId, agentId)]) {
+      const expected: string[] = [];
+      for (const id of ids) {
+        if (await canReadDecisionSource(db, actor, companyId, "review", id)) expected.push(id);
+      }
+      const service = decisionQueueService(db);
+      expect((await service.listItems(companyId, "policy", actor)).map((item) => item.sourceId).sort())
+        .toEqual(expected.sort());
+      expect((await service.list(companyId, actor))[0]?.itemCount).toBe(expected.length);
+    }
+  });
+
+  it("keeps failed-run owner and linked-issue visibility distinct", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const [ownerRun, linkedRun] = await db.insert(heartbeatRuns).values([
+      { companyId, agentId, status: "failed", contextSnapshot: { issueId: 42 } },
+      { companyId, agentId, status: "failed", contextSnapshot: { issueId } },
+    ]).returning();
+    const [queue] = await db.insert(decisionQueues).values({
+      companyId, key: "runs", title: "Runs", createdByType: "system",
+    }).returning();
+    await db.insert(decisionQueueItems).values([ownerRun.id, linkedRun.id].map((sourceId) => ({
+      companyId, queueId: queue.id, sourceKind: "failed_run" as const, sourceId, addedByType: "system" as const,
+    })));
+    for (const actor of [boardActor(companyId), agentActor(companyId, agentId)]) {
+      const expected: string[] = [];
+      for (const id of [ownerRun.id, linkedRun.id]) {
+        if (await canReadDecisionSource(db, actor, companyId, "failed_run", id)) expected.push(id);
+      }
+      const service = decisionQueueService(db);
+      expect((await service.listItems(companyId, "runs", actor)).map((item) => item.sourceId).sort())
+        .toEqual(expected.sort());
+    }
   });
 
   it("materializes data-backed starter queues from plan, question, and pull-request signals", async () => {
