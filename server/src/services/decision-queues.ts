@@ -34,6 +34,8 @@ import {
   type AuthorizationResource,
 } from "./authorization.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export type DecisionMutationActor = {
   actorType: "agent" | "user" | "system";
   actorId: string;
@@ -425,7 +427,7 @@ async function readableQueueItems(
       case "budget_alert": return row.budgetId ? null : undefined;
     }
   };
-  const issueIds = [...new Set(rows.map(issueIdFor).filter((id): id is string => typeof id === "string" && id.length > 0))];
+  const issueIds = [...new Set(rows.map(issueIdFor).filter((id): id is string => typeof id === "string" && UUID_RE.test(id)))];
   const issueRows = issueIds.length ? await db.select({
     id: issues.id,
     companyId: issues.companyId,

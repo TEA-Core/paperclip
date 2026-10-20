@@ -231,6 +231,8 @@ The decisions desk stores queue membership, decide-by/snooze state, and retentio
 
 `decision_triage_events` is append-only history for queue and triage changes. Current rows and history both carry server-derived user/agent, heartbeat run, API-key, and responsible-user attribution where applicable. Queue reads resolve source existence and issue visibility in company-scoped batches at read time; a sidecar row is never a visibility grant. Issue- or project-specific trust policies and low-trust agent boundaries still use the canonical authorization evaluator for each distinct concrete issue or agent source.
 
+Malformed issue IDs in failed-run JSON snapshots cannot join UUID-backed issues. Queue reads exclude those entries without failing the rest of the company list.
+
 Triage writes serialize on the company and attention-source identity so concurrent partial updates preserve both fields and produce monotonic history versions.
 
 `decision_retention` tracks the last observed source `activityAt`, Keep, reversible archive provenance, and monotonic source/archive versions. `decision_archive_notification_outbox` has a unique key over company, source identity, archive version, and immutable origin agent so repeated sweeps cannot enqueue duplicate notifications; delivery claims are retryable and coalesced per agent.
