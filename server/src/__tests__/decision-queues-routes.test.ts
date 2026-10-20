@@ -452,6 +452,27 @@ describeEmbeddedPostgres("decision queue routes", () => {
     }
   });
 
+  it("does not let malformed failed-run issue IDs break a queue list", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const runs = await db.insert(heartbeatRuns).values([
+      { companyId, agentId, status: "failed", contextSnapshot: { issueId } },
+      { companyId, agentId, status: "failed", contextSnapshot: { issueId: "not-a-uuid" } },
+      { companyId, agentId, status: "failed", contextSnapshot: { taskId: "also-not-a-uuid" } },
+    ]).returning();
+    const [queue] = await db.insert(decisionQueues).values({
+      companyId, key: "malformed-runs", title: "Malformed runs", createdByType: "system",
+    }).returning();
+    await db.insert(decisionQueueItems).values(runs.map(({ id }) => ({
+      companyId, queueId: queue.id, sourceKind: "failed_run" as const, sourceId: id, addedByType: "system" as const,
+    })));
+    for (const actor of [boardActor(companyId), agentActor(companyId, agentId)]) {
+      const listed = await request(app(actor)).get(`/api/companies/${companyId}/decision-queues`).expect(200);
+      expect(listed.body.find((item: { key: string }) => item.key === "malformed-runs")?.itemCount).toBe(1);
+      const items = await request(app(actor)).get(`/api/companies/${companyId}/decision-queues/malformed-runs/items`).expect(200);
+      expect(items.body.map((item: { sourceId: string }) => item.sourceId)).toEqual([runs[0]!.id]);
+    }
+  });
+
   it("materializes data-backed starter queues from plan, question, and pull-request signals", async () => {
     const { companyId, issueId, interactionId } = await seed();
     await db.insert(issueWorkProducts).values({
