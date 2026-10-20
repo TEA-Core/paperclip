@@ -128,7 +128,7 @@ describe("buildOpenCodeRunArgs", () => {
     ).toEqual(["run", "--format", "json"]);
   });
 
-  it("folds the V2 variant into the model and uses --auto", () => {
+  it("folds the V2 variant into the model and uses standalone syntax", () => {
     expect(
       buildOpenCodeRunArgs({
         dir: "/workspaces/SUP-19259",
@@ -141,13 +141,12 @@ describe("buildOpenCodeRunArgs", () => {
         autoApprovePermissions: true,
       }),
     ).toEqual([
-      "--standalone",
       "run",
+      "--standalone",
       "--format",
       "json",
       "--model",
       "router/coder#high",
-      "--auto",
     ]);
   });
 
@@ -563,13 +562,16 @@ describe("execute — OpenRouter credentials", () => {
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
     runAdapterExecutionTargetProcessMock.mockReset();
-    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({
-      stdout: JSON.stringify({
-        type: "text",
-        sessionID: "session-openrouter",
-        part: { text: "done" },
-      }),
-    }));
+    runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, args: string[]) => {
+      if (args[0] === "--version") return probeResult({ stdout: "1.17.9\n" });
+      return probeResult({
+        stdout: JSON.stringify({
+          type: "text",
+          sessionID: "session-openrouter",
+          part: { text: "done" },
+        }),
+      });
+    });
     const logs: string[] = [];
     const metadata: unknown[] = [];
 
@@ -717,7 +719,7 @@ describe("execute — OpenCode V2 native MCP", () => {
         runtimeMcp: { getServers },
         onLog: async () => {},
       });
-      expect(events).toEqual(["install", "version"]);
+      expect(events).toEqual(["install", "version", "version"]);
       expect(getServers).toHaveBeenCalledTimes(1);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
