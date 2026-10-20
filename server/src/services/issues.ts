@@ -1826,6 +1826,9 @@ export function parseStatusFilter(
 
 export interface IssueFilters {
   attention?: "blocked";
+  /** Explicit bounded lookup for bulk pollers; the route validates the cap. */
+  ids?: readonly string[];
+  identifiers?: readonly string[];
   status?: string | readonly string[];
   /**
    * Filter by assignee agent ID.
@@ -8511,6 +8514,8 @@ export function issueService(db: Db) {
         eq(issues.companyId, companyId),
         filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
       ];
+      if (filters?.ids) conditions.push(inArray(issues.id, [...filters.ids]));
+      if (filters?.identifiers) conditions.push(inArray(issues.identifier, [...filters.identifiers]));
       if (!filters?.q?.trim()) conditions.push(isNull(issues.conversationAgentId));
       if (filters?.afterId) conditions.push(gt(issues.id, filters.afterId));
       const assigneeAgentFilter = parseIssueAssigneeAgentFilter(filters?.assigneeAgentId);

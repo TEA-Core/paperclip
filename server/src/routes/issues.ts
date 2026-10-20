@@ -2526,6 +2526,8 @@ function summarizeIssueRelationForActivity(relation: {
 }
 
 const defaultCompanySearchRateLimiter = createCompanySearchRateLimiter();
+const defaultBulkIssueRateLimiter = createCompanySearchRateLimiter({ maxRequests: 30 });
+const BULK_ISSUE_MAX_ITEMS = 50;
 
 function companySearchRateLimitActor(req: Request, companyId: string) {
   if (req.actor.type === "agent") {
@@ -4130,6 +4132,7 @@ export function issueRoutes(
     };
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
+    bulkIssueRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
     recoveryActionEnqueueWakeup?: (
@@ -5238,6 +5241,7 @@ export function issueRoutes(
   };
   const searchRateLimiter =
     opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
+  const bulkIssueRateLimiter = opts.bulkIssueRateLimiter ?? defaultBulkIssueRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
   // SUP-17410: bind the agent resolver once so every executionPolicy write path
@@ -10231,6 +10235,64 @@ export function issueRoutes(
     }
     const result = await getSearchService().search(companyId, query);
     res.json(result);
+  });
+
+  // Explicit lookup uses the list's batched projection, not the single-issue detail hydrator.
+  router.get("/companies/:companyId/issues/bulk", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const hasIds = req.query.ids !== undefined;
+    const hasIdentifiers = req.query.identifiers !== undefined;
+    if (hasIds === hasIdentifiers) {
+      res.status(400).json({ error: "Supply exactly one of ids or identifiers" });
+      return;
+    }
+    const raw = hasIds ? req.query.ids : req.query.identifiers;
+    if (typeof raw !== "string") {
+      res.status(400).json({ error: "Bulk issue lookup requires a comma-separated string" });
+      return;
+    }
+    const requested = raw.split(",").map((value) => value.trim());
+    if (
+      requested.length > BULK_ISSUE_MAX_ITEMS ||
+      requested.some((value) =>
+        !value ||
+        value.length > 80 ||
+        (hasIds ? !isUuidLike(value) : !/^[A-Za-z][A-Za-z0-9_-]*-\d+$/.test(value))
+      )
+    ) {
+      res.status(400).json({ error: `Supply 1 to ${BULK_ISSUE_MAX_ITEMS} valid issue IDs or identifiers` });
+      return;
+    }
+    const keys = [...new Set(hasIds ? requested.map((value) => value.toLowerCase()) : requested.map((value) => value.toUpperCase()))];
+    const actorId = req.actor.keyId ?? (req.actor.type === "agent" ? req.actor.agentId : req.actor.userId) ?? "board";
+    const rateLimit = bulkIssueRateLimiter.consume({
+      companyId,
+      actorType: req.actor.type === "agent" ? "agent" : "board",
+      actorId,
+    });
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({ error: "Bulk issue request budget exceeded", retryAfterSeconds: rateLimit.retryAfterSeconds });
+      return;
+    }
+    const rows = await svc.list(companyId, {
+      ...(hasIds ? { ids: keys } : { identifiers: keys }),
+      limit: BULK_ISSUE_MAX_ITEMS,
+    });
+    const visible = (await actorCanReadCompanyScope(req, companyId))
+      ? rows
+      : await filterIssuesForActor(req, rows);
+    const byKey = new Map(visible.map((issue) => [hasIds ? issue.id : issue.identifier, issue]));
+    res.json({
+      issues: keys.flatMap((key) => {
+        const issue = byKey.get(key);
+        return issue ? [toCompactIssue(issue)] : [];
+      }),
+      missing: keys.filter((key) => !byKey.has(key)),
+    });
   });
 
   router.get("/companies/:companyId/issues", async (req, res) => {
