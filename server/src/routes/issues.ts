@@ -19,6 +19,7 @@ import {
   rejectSteeredIdentity,
 } from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -4416,12 +4417,9 @@ export function issueRoutes(
   async function prefetchFinalDelivery(
     issue: FinalDeliveryIssue & { status: string; updatedAt: Date },
   ): Promise<FinalDeliveryPrefetch> {
-    // Snapshot the current row, not the caller's request-start copy: earlier writes in
-    // the same request would otherwise read as a concurrent change at the locked recheck.
-    const current = (await svc.getById(issue.id)) ?? issue;
-    const snapshot = { status: current.status, updatedAtMs: new Date(current.updatedAt).getTime() };
-    const binding = await readFinalDeliveryBinding(db, current);
-    return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(current) };
+    const snapshot = { status: issue.status, updatedAtMs: new Date(issue.updatedAt).getTime() };
+    const binding = await readFinalDeliveryBinding(db, issue);
+    return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(issue) };
   }
 
   async function preflightTerminalApproval(
@@ -12468,7 +12466,9 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const finalDeliveryPrefetch =
-        sourceIssueStatus === "done" && existing.status !== "done" ? await prefetchFinalDelivery(existing) : null;
+        sourceIssueStatus === "done" && existing.status !== "done"
+          ? await prefetchFinalDelivery((await svc.getById(existing.id)) ?? existing)
+          : null;
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
@@ -18360,12 +18360,16 @@ export function issueRoutes(
       }
     }
     if (finalDeliveryPrefetch && interruptedRunId) {
-      // Our own run cancellation bumped updatedAt; re-anchor it only while the
-      // certified status and delivery binding are unchanged.
+      // Our own run cancellation bumped updatedAt; re-anchor it only while everything
+      // the transition was computed from is unchanged.
       const afterStop = await svc.getById(existing.id);
       if (
         afterStop &&
-        afterStop.status === finalDeliveryPrefetch.status &&
+        afterStop.status === existing.status &&
+        afterStop.assigneeAgentId === existing.assigneeAgentId &&
+        afterStop.assigneeUserId === existing.assigneeUserId &&
+        isDeepStrictEqual(afterStop.executionPolicy, existing.executionPolicy) &&
+        isDeepStrictEqual(afterStop.executionState, existing.executionState) &&
         (await readFinalDeliveryBinding(db, afterStop)) === finalDeliveryPrefetch.binding
       ) {
         finalDeliveryPrefetch = { ...finalDeliveryPrefetch, updatedAtMs: new Date(afterStop.updatedAt).getTime() };
@@ -21406,7 +21410,8 @@ export function issueRoutes(
       };
       // Terminal final-stage only: nonterminal accepts keep the three-argument call.
       const acceptArgs: [typeof issue, string, typeof req.body, typeof acceptActor] = [issue, interactionId, req.body, acceptActor];
-      const applyEscalationApproval = (dbLike: Db) => applyReviewEscalationDecision({
+      const deferredPostCommit = { activityPublications: [] as ActivityPublication[], postCommitActions: [] as IssuePostCommitAction[] };
+      const applyEscalationApproval = (dbLike: Db, deferred?: typeof deferredPostCommit) => applyReviewEscalationDecision({
         db: dbLike,
         issue,
         requestedStatus: "done",
@@ -21420,6 +21425,7 @@ export function issueRoutes(
         // guard above already allowed it); a non-final stage still only advances
         // the pointer via the engine's `in_review` patch.
         finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
+        ...(deferred ? { deferredPostCommit: deferred } : {}),
       });
       const terminalEscalationResolution: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
       const { interaction, createdIssues, continuationIssue } = escalationApproval
@@ -21427,7 +21433,7 @@ export function issueRoutes(
             // The decision commits in the interaction's transaction, under the issue
             // lock taken by the revalidation, so a stale verdict leaves both pending.
             afterResolveInTransaction: async (tx) => {
-              terminalEscalationResolution.value = await applyEscalationApproval(tx as unknown as Db);
+              terminalEscalationResolution.value = await applyEscalationApproval(tx as unknown as Db, deferredPostCommit);
             },
             beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
               const [lockedIssue] = await tx.select().from(issueRows)
@@ -21440,6 +21446,8 @@ export function issueRoutes(
             },
           })
         : await interactionSvc.acceptInteraction(...acceptArgs);
+      for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
+      await flushIssuePostCommitActions(deferredPostCommit.postCommitActions);
       let resolvedContinuationIssue = continuationIssue;
       // SUP-14919: accepting a review round-cap escalation resolves the stage as
       // a decision instead of vanishing. The interaction's own resolution leaves

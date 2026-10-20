@@ -71,6 +71,9 @@ export async function applyReviewEscalationDecision(args: {
   // the done-transition guard before choosing "done" — this helper only writes
   // the status, so a refused close must never reach it.
   finalStageDisposition?: "handback" | "done";
+  // When the caller owns an enclosing transaction that is still open, it passes its
+  // queues here and drains them itself after that transaction commits.
+  deferredPostCommit?: { activityPublications: ActivityPublication[]; postCommitActions: IssuePostCommitAction[] };
 }): Promise<{
   id: string;
   status: string;
@@ -156,8 +159,8 @@ export async function applyReviewEscalationDecision(args: {
   // update needs a post-commit queue: issue-service refuses a human completion in
   // an external transaction without one (issues.ts). Drain both queues only after
   // the transaction commits.
-  const activityPublications: ActivityPublication[] = [];
-  const postCommitActions: IssuePostCommitAction[] = [];
+  const activityPublications = args.deferredPostCommit?.activityPublications ?? [];
+  const postCommitActions = args.deferredPostCommit?.postCommitActions ?? [];
   const updatedIssue = await db.transaction(async (tx) => {
     await tx.insert(issueExecutionDecisions).values({
       id: decisionId,
@@ -179,8 +182,10 @@ export async function applyReviewEscalationDecision(args: {
       postCommitActions,
     );
   });
-  for (const publication of activityPublications) publishActivity(publication);
-  await executeIssuePostCommitActions(db, postCommitActions);
+  if (!args.deferredPostCommit) {
+    for (const publication of activityPublications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
+  }
   if (!updatedIssue) {
     throw new Error("Failed to update issue after review escalation decision");
   }
