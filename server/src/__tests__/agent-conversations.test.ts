@@ -492,6 +492,24 @@ const support = await getEmbeddedPostgresTestSupport();
       )).toHaveLength(1);
       expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.conversationSessionGeneration).toBe(1);
     });
+    it("stopping an in-flight /new turn as a board operator queues no recovery re-wake", async () => {
+      const issue = await create();
+      const command = await issueService(db).addComment(issue.id, "/new", { userId: "local-board" });
+      const run = await runFor(issue.id, command.id);
+      await db.update(issues).set({ status: "in_progress", executionRunId: run.id, executionAgentNameKey: "planner", executionLockedAt: new Date() }).where(eq(issues.id, issue.id));
+      const heartbeat = heartbeatService(db);
+      // Same options the board-only POST /heartbeat-runs/:runId/cancel route passes.
+      const stopped = await heartbeat.cancelRun(run.id, "Cancelled by a board operator", {
+        suppressImmediateRecovery: true,
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: "local-board" },
+      });
+      expect(stopped?.status).toBe("cancelled");
+      await heartbeat.drainActiveRunExecutions();
+      const others = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .filter((r) => r.id !== run.id && (r.contextSnapshot?.issueId === issue.id || r.retryOfRunId === run.id));
+      expect(others).toHaveLength(0);
+      expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.executionRunId).toBeNull();
+    });
     it("projects the resolved chat plan review into fresh and resumed prompts without replaying old reviews", async () => {
       const issue = await create();
       const { document } = await documentService(db).upsertIssueDocument({
