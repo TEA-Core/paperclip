@@ -2829,16 +2829,20 @@ describe("issue execution policy routes", () => {
     const returnAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
 
     function escalatedRoundCapIssue() {
-      return roundCapReviewIssue(
-        {
-          assigneeAgentId: null,
-          assigneeUserId: "board-user",
-        },
-        {
-          changesRequestedCount: 3,
-          currentParticipant: { type: "user", userId: "board-user" },
-        },
-      );
+      return {
+        ...roundCapReviewIssue(
+          {
+            assigneeAgentId: null,
+            assigneeUserId: "board-user",
+          },
+          {
+            changesRequestedCount: 3,
+            currentParticipant: { type: "user", userId: "board-user" },
+          },
+        ),
+        // The terminal accept door re-checks the certified updatedAt under the issue lock.
+        updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+      };
     }
 
     function pendingEscalationInteraction() {
@@ -2868,7 +2872,7 @@ describe("issue execution policy routes", () => {
       let insertedDecision: Record<string, unknown> | null = null;
       mockDb.transaction.mockImplementation(
         async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => {
-          await callback({
+          const tx: Record<string, unknown> = {
             select: mockDbSelect,
             insert: () => ({
               values: async (values: Record<string, unknown>) => {
@@ -2878,11 +2882,31 @@ describe("issue execution policy routes", () => {
             }),
             update: () => mockTxWriteChain([]),
             delete: () => mockTxWriteChain([]),
-          });
+          };
+          // The terminal escalation decision opens a nested transaction on the accept tx.
+          tx.transaction = (nested: (inner: Record<string, unknown>) => Promise<unknown>) => nested(tx);
+          await callback(tx);
           return "committed";
         },
       );
       return () => insertedDecision;
+    }
+
+    // Terminal final-stage accepts commit the decision inside acceptInteraction's
+    // transaction hooks, so the mocked service must run them like the real one does.
+    function acceptRunningTransactionHooks(result: { interaction: unknown }) {
+      mockIssueThreadInteractionService.acceptInteraction.mockImplementationOnce(
+        async (_issue: unknown, _id: unknown, _body: unknown, _actor: unknown, hooks?: {
+          beforeResolveInTransaction?: (tx: unknown) => Promise<void>;
+          afterResolveInTransaction?: (tx: unknown, resolved: unknown) => Promise<void>;
+        }) => {
+          await mockDb.transaction(async (tx) => {
+            await hooks?.beforeResolveInTransaction?.(tx);
+            await hooks?.afterResolveInTransaction?.(tx, result.interaction);
+          });
+          return result;
+        },
+      );
     }
 
     it("accepting the escalation on the final stage records an approved decision, completes the stage, and closes the card done", async () => {
@@ -2896,7 +2920,7 @@ describe("issue execution policy routes", () => {
         assigneeUserId: "board-user",
       } as any);
       mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
-      mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
+      acceptRunningTransactionHooks({
         interaction: {
           ...pending,
           status: "accepted",
@@ -2918,7 +2942,11 @@ describe("issue execution policy routes", () => {
             permissions: null,
           }]).then(onFulfilled, onRejected);
         const chain: Record<string, unknown> = {
-          for: () => ({ then: resolveDefault }),
+          // The terminal accept hook locks the issue row; every other select keeps the default row.
+          for: () => ({
+            then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+              Promise.resolve([issue]).then(onFulfilled, onRejected),
+          }),
           orderBy: () => chain,
           limit: () => chain,
           then: resolveDefault,
@@ -3001,7 +3029,7 @@ describe("issue execution policy routes", () => {
         assigneeUserId: "board-user",
       } as any);
       mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
-      mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
+      acceptRunningTransactionHooks({
         interaction: {
           ...pending,
           status: "accepted",
@@ -3021,7 +3049,11 @@ describe("issue execution policy routes", () => {
             permissions: null,
           }]).then(onFulfilled, onRejected);
         const chain: Record<string, unknown> = {
-          for: () => ({ then: resolveDefault }),
+          // The terminal accept hook locks the issue row; every other select keeps the default row.
+          for: () => ({
+            then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+              Promise.resolve([issue]).then(onFulfilled, onRejected),
+          }),
           orderBy: () => chain,
           limit: () => chain,
           then: resolveDefault,
