@@ -25,6 +25,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { decisionQueueRoutes } from "../routes/decision-queues.js";
+import type { AuthorizationActor } from "../services/authorization.js";
 import { canReadDecisionSource, decisionQueueService } from "../services/decision-queues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -124,7 +125,7 @@ describeEmbeddedPostgres("decision queue routes", () => {
     return testApp;
   }
 
-  function boardActor(companyId: string, userId = "board-user") {
+  function boardActor(companyId: string, userId = "board-user"): AuthorizationActor {
     return {
       type: "board",
       source: "local_implicit",
@@ -134,7 +135,7 @@ describeEmbeddedPostgres("decision queue routes", () => {
     };
   }
 
-  function agentActor(companyId: string, agentId: string) {
+  function agentActor(companyId: string, agentId: string): AuthorizationActor {
     return {
       type: "agent",
       source: "agent_key",
@@ -273,11 +274,11 @@ describeEmbeddedPostgres("decision queue routes", () => {
       { companyId, key: "one", title: "One", createdByType: "system" },
       { companyId, key: "two", title: "Two", createdByType: "system" },
     ]).returning();
-    const actorCases = [
+    const actorCases: AuthorizationActor[] = [
       boardActor(companyId),
       agentActor(companyId, agentId),
       { type: "board", source: "session", userId: "unaffiliated", companyIds: [], isInstanceAdmin: false },
-    ] as const;
+    ];
     const countedDb = { count: 0 };
     const instrumented = new Proxy(db, {
       get(target, key) {
