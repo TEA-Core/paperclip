@@ -369,8 +369,8 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
 
   // Fetch issues for name resolution
   const { data: issues } = useQuery({
-    queryKey: queryKeys.issues.list(selectedCompanyId ?? ""),
-    queryFn: () => issuesApi.list(selectedCompanyId!),
+    queryKey: [...queryKeys.issues.list(selectedCompanyId ?? ""), "compact", 50],
+    queryFn: () => issuesApi.listCompact(selectedCompanyId!, { limit: 50 }),
     enabled: !!selectedCompanyId,
   });
 
