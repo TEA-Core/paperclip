@@ -4416,9 +4416,12 @@ export function issueRoutes(
   async function prefetchFinalDelivery(
     issue: FinalDeliveryIssue & { status: string; updatedAt: Date },
   ): Promise<FinalDeliveryPrefetch> {
-    const snapshot = { status: issue.status, updatedAtMs: new Date(issue.updatedAt).getTime() };
-    const binding = await readFinalDeliveryBinding(db, issue);
-    return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(issue) };
+    // Snapshot the current row, not the caller's request-start copy: earlier writes in
+    // the same request would otherwise read as a concurrent change at the locked recheck.
+    const current = (await svc.getById(issue.id)) ?? issue;
+    const snapshot = { status: current.status, updatedAtMs: new Date(current.updatedAt).getTime() };
+    const binding = await readFinalDeliveryBinding(db, current);
+    return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(current) };
   }
 
   async function preflightTerminalApproval(
@@ -11393,6 +11396,33 @@ export function issueRoutes(
     }
   }
 
+  // Latest-durable-verdict approved stage ids, intersected with the policy's stages.
+  async function readApprovedStageIds(
+    dbLike: Db,
+    companyId: string,
+    issueId: string,
+    policy: NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>,
+  ): Promise<string[]> {
+    const policyStageIdSet = new Set(
+      policy.stages
+        .map((stage) => stage.id)
+        .filter((stageId): stageId is string => typeof stageId === "string" && stageId.length > 0),
+    );
+    const decidedRows = await dbLike
+      .select({
+        id: issueExecutionDecisions.id,
+        stageId: issueExecutionDecisions.stageId,
+        outcome: issueExecutionDecisions.outcome,
+        createdAt: issueExecutionDecisions.createdAt,
+      })
+      .from(issueExecutionDecisions)
+      .where(and(eq(issueExecutionDecisions.companyId, companyId), eq(issueExecutionDecisions.issueId, issueId)));
+    return Array.from(latestDecisionPerStage(decidedRows).values())
+      .filter((decision) => decision.outcome === "approved")
+      .filter((decision) => policyStageIdSet.has(decision.stageId))
+      .map((decision) => decision.stageId);
+  }
+
   router.post("/issues/:id/execution-stage/board-decision", async (req, res) => {
     // Gate 0 (strict, first): the endpoint is unreachable unless the operator
     // opted in. A disabled flag is a 404 BEFORE any read, membership check, or
@@ -11465,7 +11495,34 @@ export function issueRoutes(
       previousStatus: string;
     };
     let outcome: BoardDecisionTransactionResult | null = null;
-    const finalDeliveryPrefetch = decision === "approved" ? await prefetchFinalDelivery(issue) : null;
+    // Only a decision that completes the ladder owes the GitHub round-trip; the locked
+    // recheck refuses (409 stale) if the locked state turns out terminal after all.
+    let finalDeliveryPrefetch: FinalDeliveryPrefetch | null = null;
+    const projectedPolicy = decision === "approved" ? normalizeIssueExecutionPolicy(issue.executionPolicy) : null;
+    if (projectedPolicy && parseIssueExecutionState(issue.executionState)) {
+      try {
+        const projected = applyBoardStageDecision({
+          issue,
+          policy: projectedPolicy,
+          decision,
+          commentBody: comment,
+          decidedStageIds: await readApprovedStageIds(db, issue.companyId, id, projectedPolicy),
+          actorUserId: boardUserId,
+        });
+        if (
+          shouldPublishApprovalStatus(projected.decision) &&
+          ladderIsTerminallyApproved(
+            projectedPolicy,
+            projected.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
+          )
+        ) {
+          finalDeliveryPrefetch = await prefetchFinalDelivery(issue);
+        }
+      } catch (err) {
+        // Rejections (no undecided stage, self-approval) are raised by the locked recompute.
+        if (!(err instanceof BoardStageNoUndecidedStageError || err instanceof BoardStageSelfApprovalError)) throw err;
+      }
+    }
 
     try {
       outcome = await db.transaction(async (tx) => {
@@ -11519,29 +11576,7 @@ export function issueRoutes(
         // Guard B so the two cannot drift on ordering or tie-breaks; intersecting
         // with the locked policy's stage ids keeps any stray out-of-policy row from
         // poisoning the restored projection. One set feeds both consumers below.
-        const policyStageIdSet = new Set(
-          lockedPolicy.stages
-            .map((stage) => stage.id)
-            .filter((stageId): stageId is string => typeof stageId === "string" && stageId.length > 0),
-        );
-        const decidedRows = await tx
-          .select({
-            id: issueExecutionDecisions.id,
-            stageId: issueExecutionDecisions.stageId,
-            outcome: issueExecutionDecisions.outcome,
-            createdAt: issueExecutionDecisions.createdAt,
-          })
-          .from(issueExecutionDecisions)
-          .where(
-            and(
-              eq(issueExecutionDecisions.companyId, lockedIssue.companyId),
-              eq(issueExecutionDecisions.issueId, id),
-            ),
-          );
-        const decidedStageIds = Array.from(latestDecisionPerStage(decidedRows).values())
-          .filter((decision) => decision.outcome === "approved")
-          .filter((decision) => policyStageIdSet.has(decision.stageId))
-          .map((decision) => decision.stageId);
+        const decidedStageIds = await readApprovedStageIds(tx as unknown as Db, lockedIssue.companyId, id, lockedPolicy);
 
         let result: ReturnType<typeof applyBoardStageDecision>;
         try {
@@ -12464,8 +12499,32 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const finalDeliveryPrefetch =
-        sourceIssueStatus === "done" && existing.status !== "done" ? await prefetchFinalDelivery(existing) : null;
+      let finalDeliveryPrefetch: FinalDeliveryPrefetch | null = null;
+      if (sourceIssueStatus === "done" && existing.status !== "done") {
+        const closePolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+        const closeTransition = applyIssueExecutionPolicyTransition({
+          issue: existing,
+          policy: closePolicy,
+          previousPolicy: closePolicy,
+          requestedStatus: sourceIssueStatus,
+          requestedAssigneePatch: {},
+          actor: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+          allowBoardOverride: req.actor.type === "board",
+          commentBody: resolutionNote ?? null,
+        });
+        if (
+          shouldPublishApprovalStatus(closeTransition.decision) &&
+          ladderIsTerminallyApproved(
+            closePolicy,
+            closeTransition.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
+          )
+        ) {
+          finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+        }
+      }
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
@@ -21382,26 +21441,28 @@ export function issueRoutes(
           };
         }
       }
-      const { interaction, createdIssues, continuationIssue } =
-        await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
-          agentId: actor.agentId,
-          runId: actor.runId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-          resolverPolicyRestriction:
-            resolutionAuthorization.resolverPolicyRestriction,
-          suggestedTaskEffectsAuthorized,
-        }, {
-          beforeResolveInTransaction: async (tx) => {
-            if (!escalationApproval) return;
-            const [lockedIssue] = await tx.select().from(issueRows)
-              .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
-              .for("update");
-            if (!lockedIssue) throw notFound("Issue not found");
-            await preflightTerminalApproval(lockedIssue, escalationApproval.patch, escalationApproval.decision, lockedIssue.executionPolicy, {
-              locked: { prefetch: escalationApproval.prefetch, tx: tx as unknown as Db },
-            });
-          },
-        });
+      const acceptActor = {
+        agentId: actor.agentId,
+        runId: actor.runId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        resolverPolicyRestriction: resolutionAuthorization.resolverPolicyRestriction,
+        suggestedTaskEffectsAuthorized,
+      };
+      // Terminal final-stage only: nonterminal accepts keep the three-argument call.
+      const acceptArgs: [typeof issue, string, typeof req.body, typeof acceptActor] = [issue, interactionId, req.body, acceptActor];
+      const { interaction, createdIssues, continuationIssue } = escalationApproval
+        ? await interactionSvc.acceptInteraction(...acceptArgs, {
+            beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
+              const [lockedIssue] = await tx.select().from(issueRows)
+                .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
+                .for("update");
+              if (!lockedIssue) throw notFound("Issue not found");
+              await preflightTerminalApproval(lockedIssue, escalationApproval!.patch, escalationApproval!.decision, lockedIssue.executionPolicy, {
+                locked: { prefetch: escalationApproval!.prefetch, tx: tx as unknown as Db },
+              });
+            },
+          })
+        : await interactionSvc.acceptInteraction(...acceptArgs);
       let resolvedContinuationIssue = continuationIssue;
       // SUP-14919: accepting a review round-cap escalation resolves the stage as
       // a decision instead of vanishing. The interaction's own resolution leaves

@@ -322,6 +322,7 @@ function makeIssue(
     createdByUserId: "local-board",
     identifier: "PAP-580",
     title: "Comment reopen default",
+    updatedAt: new Date("2026-01-01T00:00:00.000Z"),
   };
 }
 
@@ -4537,7 +4538,7 @@ describe.sequential("issue comment reopen routes", () => {
           currentStatus: "todo",
           executionRunId: null,
           monitorNextCheckAt: null,
-          lastActivityAt: null,
+          lastActivityAt: "2026-01-01T00:00:00.000Z",
           settleWindowMs: 300000,
           settledWithinWindow: false,
           checkedDisjuncts: [
