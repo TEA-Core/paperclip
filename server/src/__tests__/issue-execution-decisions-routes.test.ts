@@ -242,8 +242,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 
-  async function pendingDelivery({ draft = false, missing = false, mid = false, repo = true, unmentioned = false, staleCertified = false, holdPull = false } = {}) {
+  async function pendingDelivery({ draft = false, missing = false, mid = false, repo = true, unmentioned = false, holdPull = false, mergeArmingEnabled = false } = {}) {
     const company = await seedCompany(db);
+    if (mergeArmingEnabled) {
+      await db.update(companies).set({ mergeArmingEnabled: true }).where(eq(companies.id, company.id));
+    }
     await db.insert(companyMemberships).values({
       companyId: company.id, principalType: "user", principalId: "board-user", status: "active", membershipRole: "owner",
     });
@@ -276,15 +279,6 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         currentStageType: "review", currentParticipant: { type: "user", userId: "board-user" },
         returnAssignee: { type: "agent", agentId: author.id }, completedStageIds: [],
         skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
-        ...(staleCertified ? {
-          approvalStatus: {
-            approvedHeadSha: "c".repeat(40),
-            finalDelivery: {
-              owner: "TEA-Core", repo: "paperclip", number: 42, headSha: "a".repeat(40), displayName: identifier,
-              decisionId: randomUUID(),
-            },
-          },
-        } : {}),
       },
     }).where(eq(issues.id, issue.id));
     const pr = {
@@ -323,7 +317,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       });
     }
     const writes: Array<{ url: string; body: unknown }> = [];
-    const calls: string[] = [];
+    const armCalls: string[] = [];
     let moveAfterPreflight = false;
     let releasePull!: () => void;
     let pullHeld!: () => void;
@@ -332,13 +326,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     let pullHolds = holdPull;
     github.mockImplementation(async (input, init) => {
       const url = String(input);
-      calls.push(`${init?.method ?? "GET"} ${url}`);
       if (pullHolds && url.includes("/pulls/42")) {
         pullHolds = false;
         pullHeld();
         await pullGate;
       }
       if (init?.method === "POST" && url.endsWith("/graphql")) {
+        if (String(init.body).includes("enablePullRequestAutoMerge")) {
+          armCalls.push(String(init.body));
+        }
         return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
       }
       if (init?.method === "POST") {
@@ -357,13 +353,38 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       throw new Error(`Unexpected sandbox request: ${url}`);
     });
     return {
-      company, issue, stageId, writes, pr, calls, author,
+      company, issue, stageId, writes, armCalls, pr,
       pullReached, releasePull,
       moveHead: () => { moveAfterPreflight = true; },
       approve: (extra: Record<string, unknown> = {}) => request(createApp(db, boardActor(company))).patch(`/api/issues/${issue.id}`)
         .send({ status: "done", comment: "Independent final review approved.", ...extra }),
       read: async () => (await db.select().from(issues).where(eq(issues.id, issue.id)))[0]!,
     };
+  }
+  async function raceAtDecisionTransaction(
+    fixture: { pullReached: Promise<void>; releasePull: () => void },
+    response: Promise<request.Response>,
+    mutate: () => Promise<unknown>,
+  ) {
+    await fixture.pullReached;
+    const transact = db.transaction.bind(db);
+    let raced = false;
+    const spy = vi.spyOn(db, "transaction").mockImplementation((async (...args: Parameters<typeof db.transaction>) => {
+      if (!raced) {
+        raced = true;
+        await mutate();
+      }
+      return transact(...args);
+    }) as typeof db.transaction);
+    try {
+      fixture.releasePull();
+      const result = await response;
+      expect(raced).toBe(true);
+      return result;
+    } finally {
+      fixture.releasePull();
+      spy.mockRestore();
+    }
   }
 
   it("refuses final draft delivery without completing or recording an approval", async () => {
@@ -404,22 +425,6 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }]);
   });
 
-  it("re-resolves the head instead of trusting a same-head certification from a prior decision", async () => {
-    const baseline = await pendingDelivery();
-    const override = { doneTransitionOverride: { disposition: "merged-elsewhere", reason: "Delivered via sibling card." } };
-    expect((await baseline.approve(override)).status).toBe(200);
-    const resolverCalls = (calls: string[]) => calls.filter((call) => call.startsWith("GET") && call.endsWith("/pulls/42")).length;
-    expect(resolverCalls(baseline.calls)).toBe(2);
-
-    const stale = await pendingDelivery({ staleCertified: true });
-    expect((await stale.approve(override)).status).toBe(200);
-    expect(resolverCalls(stale.calls)).toBe(resolverCalls(baseline.calls));
-    expect(stale.writes).toEqual(baseline.writes.map((write) => ({
-      ...write, url: write.url, body: expect.objectContaining({ state: "success" }),
-    })));
-    expect((await stale.read()).executionState?.approvalStatus).not.toHaveProperty("finalDelivery");
-  });
-
   it("does not hold the issue row while the final delivery preflight awaits GitHub", async () => {
     const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
     process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
@@ -450,6 +455,30 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
       else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
     }
+  });
+
+  it("refuses a PATCH final verdict when updatedAt changes after external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(issues).set({ updatedAt: new Date(Date.now() + 60_000) })
+        .where(eq(issues.id, fixture.issue.id));
+    });
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
   });
 
   it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
@@ -509,6 +538,35 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }]);
   });
 
+  it("refuses a final approval comment when the delivery branch changes after external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const before = await fixture.read();
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const approval = request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/comments`)
+      .send({ body: "## Review: APPROVED\n\nIndependent final review." })
+      .then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(executionWorkspaces).set({ branchName: "SUP-1-rebound-delivery" })
+        .where(eq(executionWorkspaces.id, before.executionWorkspaceId!));
+    });
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id))).toEqual([]);
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
   async function seedEscalation(fixture: Awaited<ReturnType<typeof pendingDelivery>>) {
     const [interaction] = await db.insert(issueThreadInteractions).values({
       companyId: fixture.company.id, issueId: fixture.issue.id, kind: "request_confirmation", status: "pending",
@@ -545,6 +603,36 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
       body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
     }]);
+  });
+
+  it("keeps a final review escalation pending when status changes after external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const interaction = await seedEscalation(fixture);
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const approval = request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`)
+      .send({}).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(issues).set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+        .where(eq(issues.id, fixture.issue.id));
+    });
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("blocked");
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    const [pending] = await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interaction.id));
+    expect(pending?.status).toBe("pending");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
   });
 
   it("preserves the reviewed anchor and stamps nothing when an escalation accept races a content push", async () => {

@@ -4391,7 +4391,7 @@ export function issueRoutes(
     patch: Record<string, unknown>,
     decision: MergeArmingDecision | null | undefined,
     policy: Parameters<typeof ladderIsTerminallyApproved>[0] = issue.executionPolicy,
-    options: { overrideAccepted?: boolean; locked?: { prefetch: FinalDeliveryPrefetch | null; tx: Db } } = {},
+    options: { overrideAccepted?: boolean; prefetched?: FinalDeliveryPrefetch | null; locked?: { prefetch: FinalDeliveryPrefetch | null; tx: Db } } = {},
   ): Promise<void> {
     const rawPatchState = patch.executionState as Record<string, unknown> | undefined;
     const priorApprovalStatus = rawPatchState?.approvalStatus as Record<string, unknown> | undefined;
@@ -4406,7 +4406,7 @@ export function issueRoutes(
     if (options.overrideAccepted) return;
     let resolution: FinalDeliveryResolution;
     if (options.locked === undefined) {
-      resolution = await resolveFinalDeliveryResolution(issue);
+      resolution = options.prefetched?.resolution ?? await resolveFinalDeliveryResolution(issue);
     } else {
       const { prefetch: prefetched, tx } = options.locked;
       const lockedBinding = prefetched ? await readFinalDeliveryBinding(tx, issue) : null;
@@ -18182,6 +18182,13 @@ export function issueRoutes(
     // The typed ladder-gap refusal (raised under the update lock below) replaces
     // the delivery guard's `done_transition_missing_delivery` catchall for
     // in-scope cards, so the guard is skipped only when the gap is present.
+    const terminalApprovalNeedsPreflight =
+      shouldPublishApprovalStatus(transition.decision) &&
+      ladderIsTerminallyApproved(
+        nextExecutionPolicy,
+        updateFields.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
+      );
+    let finalDeliveryPrefetch: FinalDeliveryPrefetch | null = null;
     if (isDoneRequest && !missingApprovalStageGap) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
@@ -18203,11 +18210,20 @@ export function issueRoutes(
         res.status(outcome.status).json(outcome.body);
         return;
       }
+      if (terminalApprovalNeedsPreflight && outcome.overrideAccepted !== true) {
+        finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+      }
       await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
         overrideAccepted: outcome.overrideAccepted === true,
+        prefetched: finalDeliveryPrefetch,
       });
     } else if (transition.decision) {
-      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy);
+      if (terminalApprovalNeedsPreflight) {
+        finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+      }
+      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
+        prefetched: finalDeliveryPrefetch,
+      });
     }
 
     if (assigneeWillChange && existing.assigneeAgentId) {
@@ -18663,6 +18679,17 @@ export function issueRoutes(
                 eq(executionWorkspaces.strategyType, "project_primary"),
                 isNull(executionWorkspaces.branchName),
               ));
+          }
+
+          // Revalidate the external certification against the locked row and
+          // delivery binding before persisting the final decision or its receipt.
+          if (finalDeliveryPrefetch) {
+            const lockedIssue = await svc.getByIdForUpdate(id, tx);
+            if (!lockedIssue) return null;
+            await preflightTerminalApproval(lockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
+              locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
+            });
+            issueUpdateData.executionState = updateFields.executionState;
           }
 
           const updated = await updateIssue(tx);
@@ -21241,6 +21268,11 @@ export function issueRoutes(
           policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
           executionState: parseIssueExecutionState(issue.executionState),
         });
+      let escalationApproval: {
+        prefetch: FinalDeliveryPrefetch;
+        patch: Record<string, unknown>;
+        decision: MergeArmingDecision | null | undefined;
+      } | null = null;
       let escalationCertifiedDelivery: Record<string, unknown> | null = null;
       if (reviewEscalationCompletesLadder) {
         const closeOutcome = await evaluateDoneTransitionGuards({
@@ -21268,7 +21300,20 @@ export function issueRoutes(
         if (projected.decision && projected.patch.executionState) {
           projected.patch.executionState = { ...projected.patch.executionState, lastDecisionId: randomUUID() };
         }
-        await preflightTerminalApproval(issue, projected.patch, projected.decision);
+        if (shouldPublishApprovalStatus(projected.decision) &&
+            ladderIsTerminallyApproved(
+              issue.executionPolicy,
+              projected.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
+            )) {
+          escalationApproval = {
+            prefetch: await prefetchFinalDelivery(issue),
+            patch: projected.patch,
+            decision: projected.decision,
+          };
+        }
+        await preflightTerminalApproval(issue, projected.patch, projected.decision, issue.executionPolicy, {
+          prefetched: escalationApproval?.prefetch,
+        });
         const projectedState = projected.patch.executionState as Record<string, unknown> | undefined;
         if (projected.decision && projectedState) {
           const { finalDelivery, ...projectedApprovalStatus } =
@@ -21289,6 +21334,17 @@ export function issueRoutes(
           resolverPolicyRestriction:
             resolutionAuthorization.resolverPolicyRestriction,
           suggestedTaskEffectsAuthorized,
+        }, {
+          beforeResolveInTransaction: async (tx) => {
+            if (!escalationApproval) return;
+            const [lockedIssue] = await tx.select().from(issueRows)
+              .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
+              .for("update");
+            if (!lockedIssue) throw notFound("Issue not found");
+            await preflightTerminalApproval(lockedIssue, escalationApproval.patch, escalationApproval.decision, lockedIssue.executionPolicy, {
+              locked: { prefetch: escalationApproval.prefetch, tx: tx as unknown as Db },
+            });
+          },
         });
       let resolvedContinuationIssue = continuationIssue;
       // SUP-14919: accepting a review round-cap escalation resolves the stage as
@@ -23021,7 +23077,17 @@ export function issueRoutes(
           lastDecisionId: decisionId,
         };
       }
-      await preflightTerminalApproval(currentIssue, transition.patch, transition.decision, currentExecutionPolicy);
+      const finalDeliveryPrefetch =
+        shouldPublishApprovalStatus(transition.decision) &&
+        ladderIsTerminallyApproved(
+          currentExecutionPolicy,
+          transition.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
+        )
+          ? await prefetchFinalDelivery(currentIssue)
+          : null;
+      await preflightTerminalApproval(currentIssue, transition.patch, transition.decision, currentExecutionPolicy, {
+        prefetched: finalDeliveryPrefetch,
+      });
 
       issueBeforeCommentDecision = currentIssue;
       const updatePatch = {
@@ -23046,6 +23112,14 @@ export function issueRoutes(
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
+          if (finalDeliveryPrefetch) {
+            const lockedIssue = await svc.getByIdForUpdate(id, tx);
+            if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+            await preflightTerminalApproval(lockedIssue, updatePatch, transition.decision, currentExecutionPolicy, {
+              locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
+            });
+          }
+
           const insertedComment = await svc.addComment(
             id,
             req.body.body,
