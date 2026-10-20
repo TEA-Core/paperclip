@@ -376,7 +376,10 @@ function createRunContextDb(
       return workspaceOwnerIssueId ? [{ sourceIssueId: workspaceOwnerIssueId }] : [];
     }
     if (keys.includes("contextSnapshot")) return runRows;
-    if (keys.includes("agentCompanyId")) return runRows;
+    if (
+      keys.includes("agentCompanyId") ||
+      (keys.includes("companyId") && keys.includes("agentId") && keys.includes("status"))
+    ) return runRows;
     if (keys.length === 0) {
       const issue = await mockIssueService.getById(issueId);
       return issue ? [issue] : [];
