@@ -19447,7 +19447,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(heartbeatRuns.companyId, run.companyId),
                   eq(heartbeatRuns.agentId, run.agentId),
                   eq(heartbeatRuns.scheduledRetryReason, retryReason),
-                  eq(heartbeatRuns.retryOfRunId, claimedRun.retryOfRunId),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
                   inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
                   ne(heartbeatRuns.id, claimedRun.id),
                   sql`(
@@ -20392,6 +20392,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON &&
+      issue.executionRunId !== null &&
       issue.executionRunId !== run.id
     ) {
       return {

@@ -410,6 +410,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     now?: Date;
     scheduledRetryAttempt?: number;
     runtimeConfig?: Record<string, unknown>;
+    adapterType?: string;
     issueStatus?: string;
   }) {
     const companyId = input?.companyId ?? randomUUID();
@@ -433,7 +434,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       name: "ClaudeCoder",
       role: "engineer",
       status: "active",
-      adapterType: "claude_local",
+      adapterType: input?.adapterType ?? "claude_local",
       adapterConfig: {},
       runtimeConfig: input?.runtimeConfig ?? {
         heartbeat: {
@@ -704,6 +705,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const agentId = randomUUID();
     const issueId = randomUUID();
     const sourceRunId = randomUUID();
+    const alternateSourceRunId = randomUUID();
     const now = new Date("2026-04-20T12:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
@@ -732,6 +734,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
       updatedAt: now,
       createdAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: alternateSourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "workspace occupied",
+      errorCode: "execution_workspace_occupied",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: now,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: new Date(now.getTime() + 1),
     });
     await db.insert(issues).values({
       id: issueId,
@@ -773,7 +789,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       source: "automation",
       triggerDetail: "system",
       reason: "transient_failure_retry",
-      payload: { issueId, retryReason: "transient_failure", retryOfRunId: sourceRunId },
+      payload: { issueId, retryReason: "transient_failure", retryOfRunId: alternateSourceRunId },
       status: "queued",
       requestedByActorType: "system",
       createdAt: new Date(scheduled.run.createdAt.getTime() + 1),
@@ -787,7 +803,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       triggerDetail: "system",
       status: "queued",
       wakeupRequestId: siblingWakeupId,
-      retryOfRunId: sourceRunId,
+      retryOfRunId: alternateSourceRunId,
       scheduledRetryAttempt: 1,
       scheduledRetryReason: "transient_failure",
       contextSnapshot: { issueId, taskId: issueId, wakeReason: "transient_failure_retry", retryReason: "transient_failure" },
@@ -1923,6 +1939,43 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       });
     },
   );
+
+  it("claims a max-turn continuation after its pre-claim execution pointer is vacant", async () => {
+    const { issueId, runId, now } = await seedMaxTurnFixture({ adapterType: CLAIM_RETRY_TEST_ADAPTER });
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+      wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+      maxAttempts: 2,
+      delayMs: 1_000,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
+    await heartbeat.resumeQueuedRuns();
+    await claimRetryExecution.started.promise;
+
+    await expect.poll(async () => {
+      const row = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+      return row?.status;
+    }).toBe("running");
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBe(scheduled.run.id);
+
+    claimRetryExecution.release.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 
   it("does not promote a duplicate max-turn continuation that does not own the issue lock", async () => {
     const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture();
