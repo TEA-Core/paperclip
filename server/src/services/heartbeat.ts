@@ -17044,6 +17044,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload: withRecoveryContext(
               {
                 ...(issueId ? { issueId } : {}),
+                ...(taskKey ? { taskKey } : {}),
                 retryOfRunId: run.id,
                 ...interactionContinuationPayload,
                 retryReason,
@@ -17228,7 +17229,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(
               and(
-                eq(issues.id, issueId),
+                eq(issues.id, issueId!),
                 eq(issues.companyId, run.companyId),
                 eq(issues.executionRunId, run.id),
               ),
@@ -18924,6 +18925,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const issueId = readNonEmptyString(context.issueId);
+    const retryTaskKey = runTaskKey(run);
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         run.companyId,
@@ -19148,15 +19150,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stage: "claim",
       });
     const atomicClaim =
-      issueId && run.scheduledRetryReason
+      (issueId || retryTaskKey) && run.scheduledRetryReason
         ? await db.transaction(async (tx) => {
-            const lockedIssue = await tx
-              .select()
-              .from(issues)
-              .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
-              .for("update")
-              .limit(1)
-              .then((rows) => rows[0] ?? null);
+            if (retryTaskKey && !issueId) {
+              await tx.execute(
+                sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-retry:${run.companyId}:${run.agentId}:${retryTaskKey}`}, 0))`,
+              );
+            }
+            const lockedIssue = issueId
+              ? await tx
+                  .select()
+                  .from(issues)
+                  .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+                  .for("update")
+                  .limit(1)
+                  .then((rows) => rows[0] ?? null)
+              : null;
             const lockedWake = run.wakeupRequestId
               ? await tx
                   .select()
@@ -19182,7 +19191,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .limit(1)
               .then((rows) => rows[0] ?? null);
             if (
-              !lockedIssue ||
+              (issueId && !lockedIssue) ||
               !lockedRun ||
               lockedRun.status !== "queued" ||
               (run.wakeupRequestId &&
@@ -19191,28 +19200,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               return { kind: "stale" as const, run: null };
             }
 
-            const holder = await tx
-              .select({
-                id: heartbeatRuns.id,
-                status: heartbeatRuns.status,
-                startedAt: heartbeatRuns.startedAt,
-              })
-              .from(heartbeatRuns)
-              .where(and(
-                eq(heartbeatRuns.companyId, run.companyId),
-                eq(heartbeatRuns.agentId, run.agentId),
-                eq(heartbeatRuns.status, "running"),
-                ne(heartbeatRuns.id, run.id),
-                sql`(
-                  ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
-                  or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}
-                )`,
-              ))
-              .orderBy(asc(heartbeatRuns.startedAt), asc(heartbeatRuns.id))
-              .limit(1)
-              .then((rows) => rows[0] ?? null);
+            const holder = issueId
+              ? await tx
+                  .select({
+                    id: heartbeatRuns.id,
+                    status: heartbeatRuns.status,
+                    startedAt: heartbeatRuns.startedAt,
+                  })
+                  .from(heartbeatRuns)
+                  .where(and(
+                    eq(heartbeatRuns.companyId, run.companyId),
+                    eq(heartbeatRuns.agentId, run.agentId),
+                    eq(heartbeatRuns.status, "running"),
+                    ne(heartbeatRuns.id, run.id),
+                    sql`(
+                      ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+                      or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}
+                    )`,
+                  ))
+                  .orderBy(asc(heartbeatRuns.startedAt), asc(heartbeatRuns.id))
+                  .limit(1)
+                  .then((rows) => rows[0] ?? null)
+              : retryTaskKey
+                ? await tx
+                    .select({
+                      id: heartbeatRuns.id,
+                      status: heartbeatRuns.status,
+                      startedAt: heartbeatRuns.startedAt,
+                    })
+                    .from(heartbeatRuns)
+                    .where(and(
+                      eq(heartbeatRuns.companyId, run.companyId),
+                      eq(heartbeatRuns.agentId, run.agentId),
+                      eq(heartbeatRuns.status, "running"),
+                      ne(heartbeatRuns.id, run.id),
+                      sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'taskKey', ${heartbeatRuns.contextSnapshot} ->> 'taskId', ${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${retryTaskKey}`,
+                    ))
+                    .orderBy(asc(heartbeatRuns.startedAt), asc(heartbeatRuns.id))
+                    .limit(1)
+                    .then((rows) => rows[0] ?? null)
+                : null;
             if (holder) return { kind: "deferred" as const, run: null, holder };
-            if (lockedIssue.executionRunId) {
+            if (lockedIssue?.executionRunId) {
               const issueHolder = await tx
                 .select({
                   id: heartbeatRuns.id,
@@ -19229,7 +19258,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .then((rows) => rows[0] ?? null);
               if (issueHolder) return { kind: "deferred" as const, run: null, holder: issueHolder };
             }
-            if (lockedIssue.checkoutRunId) {
+            if (lockedIssue?.checkoutRunId) {
               const checkoutHolder = await tx
                 .select({
                   id: heartbeatRuns.id,
@@ -19251,14 +19280,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               parseObject(lockedRun.contextSnapshot),
               hostBootId,
             );
-            if (lockedRun.invocationSource === "automation") {
+            if (lockedRun.invocationSource === "automation" && issueId) {
               const admission = readChatControlRecoveryAdmission(lockedRun);
               if (admission === "invalid") return { kind: "stale" as const, run: null };
               const proof = await readChatControlRecoveryStop(
                 tx as unknown as Db,
                 {
                   companyId: lockedRun.companyId,
-                  issueId,
+                  issueId: issueId!,
                   agentId: lockedRun.agentId,
                   sourceRunId: lockedRun.id,
                 },
@@ -19322,7 +19351,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .where(eq(heartbeatRuns.id, lockedRun.id));
             }
             let liveQueuedCommentIds: string[] | null = null;
-            if (queuedCommentIds.length > 0 && lockedWake) {
+            if (issueId && queuedCommentIds.length > 0 && lockedWake) {
               const authoritativeIds = queuedCommentIdsFromWakePayload(lockedWake.payload);
               if (authoritativeIds.length > 0) {
                 const commentRows = await tx
@@ -19330,7 +19359,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   .from(issueComments)
                   .where(and(
                     eq(issueComments.companyId, run.companyId),
-                    eq(issueComments.issueId, issueId),
+                    eq(issueComments.issueId, issueId!),
                     inArray(issueComments.id, authoritativeIds),
                   ));
                 liveQueuedCommentIds = authoritativeIds.filter((commentId) => {
@@ -19414,8 +19443,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
 
             const bindsIssueExecution =
+              issueId != null &&
               readNonEmptyString(context.wakeReason) !== "source_scoped_recovery_action" &&
-              lockedIssue.assigneeAgentId === run.agentId;
+              lockedIssue?.assigneeAgentId === run.agentId;
             if (bindsIssueExecution) {
               const [boundIssue] = await tx
                 .update(issues)
@@ -19435,7 +19465,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
 
             const retryReason = claimedRun.scheduledRetryReason;
-            if (retryReason && claimedRun.retryOfRunId) {
+            if (retryReason && claimedRun.retryOfRunId && (issueId || retryTaskKey)) {
+              const siblingTaskScope = issueId
+                ? sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId} or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId})`
+                : sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'taskKey', ${heartbeatRuns.contextSnapshot} ->> 'taskId', ${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${retryTaskKey}`;
               const siblings = await tx
                 .select({
                   id: heartbeatRuns.id,
@@ -19447,13 +19480,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(heartbeatRuns.companyId, run.companyId),
                   eq(heartbeatRuns.agentId, run.agentId),
                   eq(heartbeatRuns.scheduledRetryReason, retryReason),
-                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+                  siblingTaskScope,
                   inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
                   ne(heartbeatRuns.id, claimedRun.id),
-                  sql`(
-                    ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
-                    or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}
-                  )`,
                 ))
                 .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
                 .for("update");
@@ -19594,7 +19623,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 return { kind: "stale" as const, run: null };
               }
 
-              if (lockedRun.invocationSource === "automation") {
+              if (lockedRun.invocationSource === "automation" && issueId) {
                 const admission = readChatControlRecoveryAdmission(lockedRun);
                 if (admission === "invalid")
                   return { kind: "stale" as const, run: null };

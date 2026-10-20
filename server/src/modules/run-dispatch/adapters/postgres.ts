@@ -189,7 +189,11 @@ export function createPostgresRunDispatchAdapter(
         .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!hint) return onMissing();
-      const hintedIssueId = readNonEmptyString(parseObject(hint.contextSnapshot).issueId);
+      const hintedContext = parseObject(hint.contextSnapshot);
+      const hintedIssueId = readNonEmptyString(hintedContext.issueId);
+      const hintedTaskKey = readNonEmptyString(hintedContext.taskKey) ??
+        readNonEmptyString(hintedContext.taskId) ??
+        hintedIssueId;
 
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } =
         await db.transaction(async (tx) => {
@@ -200,6 +204,10 @@ export function createPostgresRunDispatchAdapter(
               .from(issues)
               .where(and(eq(issues.id, hintedIssueId), eq(issues.companyId, input.companyId)))
               .for("update");
+          } else if (hintedTaskKey) {
+            await typedTx.execute(
+              sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-retry:${input.companyId}:${hintedTaskKey}`}, 0))`,
+            );
           }
 
           const run = await typedTx
@@ -216,7 +224,10 @@ export function createPostgresRunDispatchAdapter(
           if (!run) return { kind: "missing" as const };
 
           const lockedIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-          if (lockedIssueId !== hintedIssueId) return { kind: "retry" as const };
+          const lockedTaskKey = readNonEmptyString(parseObject(run.contextSnapshot).taskKey) ??
+            readNonEmptyString(parseObject(run.contextSnapshot).taskId) ??
+            lockedIssueId;
+          if (lockedIssueId !== hintedIssueId || lockedTaskKey !== hintedTaskKey) return { kind: "retry" as const };
           return { kind: "value" as const, value: await operation(typedTx, run) };
         });
 

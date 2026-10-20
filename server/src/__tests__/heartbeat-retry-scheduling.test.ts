@@ -700,6 +700,137 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(issue).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 
+  it("retires queued and scheduled task-only retry siblings atomically", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const taskKey = randomUUID();
+    const sourceRunId = randomUUID();
+    const siblingSourceRunId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Task-only Retry Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: CLAIM_RETRY_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: sourceRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "failed",
+        error: "workspace occupied",
+        errorCode: "execution_workspace_occupied",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        finishedAt: now,
+        contextSnapshot: { taskKey, wakeReason: "task_assigned" },
+        updatedAt: now,
+        createdAt: now,
+      },
+      {
+        id: siblingSourceRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "failed",
+        error: "workspace occupied",
+        errorCode: "execution_workspace_occupied",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        finishedAt: now,
+        contextSnapshot: { taskKey, wakeReason: "task_assigned" },
+        updatedAt: now,
+        createdAt: new Date(now.getTime() + 1),
+      },
+    ]);
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      retryReason: "transient_failure",
+      wakeReason: "transient_failure_retry",
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const scheduledSibling = await heartbeat.scheduleBoundedRetry(siblingSourceRunId, {
+      now,
+      retryReason: "transient_failure",
+      wakeReason: "transient_failure_retry",
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+    expect(scheduledSibling.outcome).toBe("scheduled");
+    if (scheduledSibling.outcome !== "scheduled") return;
+
+    const queuedWakeupId = randomUUID();
+    const queuedSiblingId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "transient_failure_retry",
+      payload: { taskKey, retryReason: "transient_failure", retryOfRunId: siblingSourceRunId },
+      status: "queued",
+      requestedByActorType: "system",
+      createdAt: new Date(now.getTime() + 2),
+      updatedAt: new Date(now.getTime() + 2),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedSiblingId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      retryOfRunId: siblingSourceRunId,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: { taskKey, wakeReason: "transient_failure_retry", retryReason: "transient_failure" },
+      createdAt: new Date(now.getTime() + 2),
+      updatedAt: new Date(now.getTime() + 2),
+    });
+    await db.update(agentWakeupRequests).set({ runId: queuedSiblingId }).where(eq(agentWakeupRequests.id, queuedWakeupId));
+
+    await heartbeat.promoteDueScheduledRetries(now);
+    const promoted = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, scheduled.run.id)).then((rows) => rows[0] ?? null);
+    expect(promoted).toEqual({ status: "queued" });
+
+    claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
+    await heartbeat.resumeQueuedRuns();
+    await claimRetryExecution.started.promise;
+
+    const retryRunIds = [scheduled.run.id, scheduledSibling.run.id, queuedSiblingId];
+    const retryRuns = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson, wakeupRequestId: heartbeatRuns.wakeupRequestId }).from(heartbeatRuns).where(inArray(heartbeatRuns.id, retryRunIds));
+    const winner = retryRuns.find((retryRun) => retryRun.status === "running");
+    expect(winner).toBeDefined();
+    expect(retryRuns.filter((retryRun) => retryRun.status === "cancelled")).toHaveLength(2);
+    for (const sibling of retryRuns.filter((retryRun) => retryRun.id !== winner?.id)) {
+      expect(sibling).toMatchObject({ status: "cancelled", errorCode: "retry_superseded_by_winner" });
+      expect(sibling.resultJson).toMatchObject({ supersededReason: "retry_superseded_by_winner", supersededByRunId: winner?.id });
+    }
+    const wakeupIds = [queuedWakeupId, ...retryRuns.map((retryRun) => retryRun.wakeupRequestId)].filter((id): id is string => Boolean(id));
+    const wakeups = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, wakeupIds));
+    for (const wakeup of wakeups) {
+      if (wakeup.id === winner?.wakeupRequestId) continue;
+      expect(wakeup).toMatchObject({ status: "cancelled", payload: { supersededReason: "retry_superseded_by_winner", supersededByRunId: winner?.id } });
+    }
+
+    claimRetryExecution.release.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
   it("binds a promoted retry to the issue and retires queued retry siblings atomically", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
