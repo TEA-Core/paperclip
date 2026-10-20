@@ -10280,6 +10280,7 @@ export function issueRoutes(
     }
     const rows = await svc.list(companyId, {
       ...(hasIds ? { ids: keys } : { identifiers: keys }),
+      includePluginOperations: true,
       limit: BULK_ISSUE_MAX_ITEMS,
     });
     const visible = (await actorCanReadCompanyScope(req, companyId))

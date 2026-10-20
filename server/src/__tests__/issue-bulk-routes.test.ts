@@ -84,6 +84,24 @@ describePostgres("bounded bulk issue read", () => {
     expect(res.body.issues[0]).not.toHaveProperty("currentExecutionWorkspace");
   });
 
+  it("returns plugin-operation issues by explicit id or identifier like single read", async () => {
+    const pluginIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: pluginIssueId, companyId, identifier: "BK-100", issueNumber: 100,
+      title: "Plugin operation", status: "todo", priority: "medium",
+      originKind: "plugin:acme.sync:operation",
+    });
+    const single = await request(app(board())).get(`/api/issues/${pluginIssueId}`);
+    expect(single.status).toBe(200);
+    const endpoint = `/api/companies/${companyId}/issues/bulk`;
+    const byId = await request(app(board())).get(endpoint).query({ ids: pluginIssueId });
+    expect(byId.body.issues.map((row: { id: string }) => row.id)).toEqual([pluginIssueId]);
+    expect(byId.body.missing).toEqual([]);
+    const byIdentifier = await request(app(board())).get(endpoint).query({ identifiers: "BK-100" });
+    expect(byIdentifier.body.issues.map((row: { identifier: string }) => row.identifier)).toEqual(["BK-100"]);
+    expect(byIdentifier.body.missing).toEqual([]);
+  });
+
   it("enforces company boundaries and item cap before querying", async () => {
     const outsider = await request(app(board(randomUUID(), foreignCompanyId)))
       .get(`/api/companies/${companyId}/issues/bulk`).query({ ids: issueIds[0] });
