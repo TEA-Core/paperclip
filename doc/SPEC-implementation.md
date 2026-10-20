@@ -299,6 +299,11 @@ Invariants:
 - `external_run_id` text null
 - `context_snapshot` jsonb null
 
+`GET /api/issues/:id/runs` returns at most the 100 newest runs linked by
+`context_snapshot.issueId` or issue activity. It orders by run creation time
+descending and summarizes usage/result fields after selecting the matching run
+IDs; older runs are not included in this thread response.
+
 ## 7.9 `cost_events`
 
 - `id` uuid pk

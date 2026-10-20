@@ -45,6 +45,8 @@ export function normalizeActivityLimit(limit: number | undefined) {
   return Math.max(1, Math.min(MAX_ACTIVITY_LIMIT, Math.floor(limit ?? DEFAULT_ACTIVITY_LIMIT)));
 }
 
+const ISSUE_RUN_LIMIT = 100;
+
 export function activityService(db: Db) {
   const scheduledLivenessBackfills = new Set<string>();
   const issueIdAsText = sql<string>`${issues.id}::text`;
@@ -156,7 +158,57 @@ export function activityService(db: Db) {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
 
+  // The materialized activity ids and lateral OFFSET keep Postgres on the
+  // entity index and per-run primary key instead of hashing the whole runs table.
+  // Limit each indexed source independently: the top N of their union must be
+  // contained in the top N from each source. Never OR the two predicates on runs.
+  async function issueRunIds(companyId: string, issueId: string, limit: number, missingLiveness = false) {
+    const eligible = missingLiveness
+      ? and(isNull(heartbeatRuns.livenessState), sql`${heartbeatRuns.status} not in ('queued', 'running')`)
+      : undefined;
+    const [contextRuns, activityRuns] = await Promise.all([
+      db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          eligible,
+        ))
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(limit),
+      db.execute<{ id: string; createdAt: string }>(sql`
+        with linked_ids as materialized (
+          select distinct ${activityLog.runId} as run_id
+          from ${activityLog}
+          where ${activityLog.entityType} = 'issue'
+            and ${activityLog.entityId} = ${issueId}
+            and ${activityLog.companyId} = ${companyId}
+            and ${activityLog.runId} is not null
+        )
+        select r.id, r.created_at as "createdAt" from linked_ids a
+        cross join lateral (
+          select ${heartbeatRuns.id} as id, ${heartbeatRuns.createdAt} as created_at
+          from ${heartbeatRuns}
+          where ${heartbeatRuns.id} = a.run_id and ${heartbeatRuns.companyId} = ${companyId}
+            ${missingLiveness ? sql`and ${isNull(heartbeatRuns.livenessState)}
+              and ${heartbeatRuns.status} not in ('queued', 'running')` : sql``}
+          offset 0
+        ) r
+        order by r.created_at desc limit ${limit}
+      `),
+    ]);
+    return [...new Map([...contextRuns, ...activityRuns].map((run) => [
+      run.id,
+      { id: run.id, createdAt: run.createdAt instanceof Date ? run.createdAt.getTime() : Date.parse(run.createdAt) },
+    ])).values()]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, limit)
+      .map((run) => run.id);
+  }
+
   async function backfillMissingRunLivenessForIssue(companyId: string, issueId: string) {
+    const runIds = await issueRunIds(companyId, issueId, 20, true);
+    if (runIds.length === 0) return;
     const runs = await db
       .select({
         id: heartbeatRuns.id,
@@ -171,25 +223,7 @@ export function activityService(db: Db) {
         continuationAttempt: heartbeatRuns.continuationAttempt,
       })
       .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          isNull(heartbeatRuns.livenessState),
-          sql`${heartbeatRuns.status} not in ('queued', 'running')`,
-          or(
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-            sql`exists (
-              select 1
-              from ${activityLog}
-              where ${activityLog.companyId} = ${companyId}
-                and ${activityLog.entityType} = 'issue'
-                and ${activityLog.entityId} = ${issueId}
-                and ${activityLog.runId} = ${heartbeatRuns.id}
-            )`,
-          ),
-        ),
-      )
-      .limit(20);
+      .where(and(inArray(heartbeatRuns.id, runIds), isNull(heartbeatRuns.livenessState)));
 
     if (runs.length === 0) return;
 
@@ -203,6 +237,59 @@ export function activityService(db: Db) {
       .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
       .then((rows) => rows[0] ?? null);
 
+    // One grouped evidence read for the batch, rather than six round trips per run.
+    const evidenceRows = await db.execute<{
+      runId: string; kind: string; count: number; planCount: number; latestAt: Date | null;
+    }>(sql`
+      select ${issueComments.createdByRunId} as "runId", 'comments' as kind,
+        count(*)::int as count, 0::int as "planCount", max(${issueComments.createdAt}) as "latestAt"
+      from ${issueComments}
+      where ${issueComments.companyId} = ${companyId} and ${issueComments.issueId} = ${issueId}
+        and ${inArray(issueComments.createdByRunId, runIds)}
+      group by ${issueComments.createdByRunId}
+      union all
+      select ${documentRevisions.createdByRunId}, 'documents', count(*)::int,
+        count(*) filter (where ${issueDocuments.key} = 'plan')::int, max(${documentRevisions.createdAt})
+      from ${documentRevisions}
+      join ${issueDocuments} on ${documentRevisions.documentId} = ${issueDocuments.documentId}
+      where ${documentRevisions.companyId} = ${companyId}
+        and ${issueDocuments.companyId} = ${companyId} and ${issueDocuments.issueId} = ${issueId}
+        and ${issueDocuments.key} != ${ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY}
+        and ${inArray(documentRevisions.createdByRunId, runIds)}
+      group by ${documentRevisions.createdByRunId}
+      union all
+      select ${issueWorkProducts.createdByRunId}, 'products', count(*)::int, 0::int, max(${issueWorkProducts.createdAt})
+      from ${issueWorkProducts}
+      where ${issueWorkProducts.companyId} = ${companyId} and ${issueWorkProducts.issueId} = ${issueId}
+        and ${inArray(issueWorkProducts.createdByRunId, runIds)}
+      group by ${issueWorkProducts.createdByRunId}
+      union all
+      select ${workspaceOperations.heartbeatRunId}, 'workspace', count(*)::int, 0::int, max(${workspaceOperations.startedAt})
+      from ${workspaceOperations}
+      where ${workspaceOperations.companyId} = ${companyId}
+        and ${inArray(workspaceOperations.heartbeatRunId, runIds)}
+      group by ${workspaceOperations.heartbeatRunId}
+      union all
+      select ${activityLog.runId}, 'activity', count(*)::int, 0::int, max(${activityLog.createdAt})
+      from ${activityLog}
+      where ${activityLog.companyId} = ${companyId} and ${inArray(activityLog.runId, runIds)}
+      group by ${activityLog.runId}
+      union all
+      select ${heartbeatRunEvents.runId}, 'events',
+        count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))::int,
+        0::int,
+        max(${heartbeatRunEvents.createdAt}) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))
+      from ${heartbeatRunEvents}
+      where ${heartbeatRunEvents.companyId} = ${companyId} and ${inArray(heartbeatRunEvents.runId, runIds)}
+      group by ${heartbeatRunEvents.runId}
+    `);
+    const evidenceByRunId = new Map<string, Map<string, (typeof evidenceRows)[number]>>();
+    for (const row of evidenceRows) {
+      const byKind = evidenceByRunId.get(row.runId) ?? new Map();
+      byKind.set(row.kind, row);
+      evidenceByRunId.set(row.runId, byKind);
+    }
+
     for (const run of runs) {
       const context = asRecord(run.contextSnapshot);
       const continuationAttempt =
@@ -211,75 +298,13 @@ export function activityService(db: Db) {
         run.continuationAttempt ??
         0;
 
-      const [commentStats] = await db
-        .select({
-          count: sql<number>`count(*)::int`,
-          latestAt: sql<Date | null>`max(${issueComments.createdAt})`,
-        })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, companyId),
-            eq(issueComments.issueId, issueId),
-            eq(issueComments.createdByRunId, run.id),
-          ),
-        );
-
-      const [documentStats] = await db
-        .select({
-          count: sql<number>`count(*)::int`,
-          planCount: sql<number>`count(*) filter (where ${issueDocuments.key} = 'plan')::int`,
-          latestAt: sql<Date | null>`max(${documentRevisions.createdAt})`,
-        })
-        .from(documentRevisions)
-        .innerJoin(issueDocuments, eq(documentRevisions.documentId, issueDocuments.documentId))
-        .where(
-          and(
-            eq(documentRevisions.companyId, companyId),
-            eq(documentRevisions.createdByRunId, run.id),
-            eq(issueDocuments.companyId, companyId),
-            eq(issueDocuments.issueId, issueId),
-            sql`${issueDocuments.key} != ${ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY}`,
-          ),
-        );
-
-      const [workProductStats] = await db
-        .select({
-          count: sql<number>`count(*)::int`,
-          latestAt: sql<Date | null>`max(${issueWorkProducts.createdAt})`,
-        })
-        .from(issueWorkProducts)
-        .where(
-          and(
-            eq(issueWorkProducts.companyId, companyId),
-            eq(issueWorkProducts.issueId, issueId),
-            eq(issueWorkProducts.createdByRunId, run.id),
-          ),
-        );
-
-      const [workspaceOperationStats] = await db
-        .select({
-          count: sql<number>`count(*)::int`,
-          latestAt: sql<Date | null>`max(${workspaceOperations.startedAt})`,
-        })
-        .from(workspaceOperations)
-        .where(and(eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.heartbeatRunId, run.id)));
-
-      const [activityStats] = await db
-        .select({
-          count: sql<number>`count(*)::int`,
-          latestAt: sql<Date | null>`max(${activityLog.createdAt})`,
-        })
-        .from(activityLog)
-        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, run.id)));
-
-      const [eventStats] = await db
-        .select({
-          count: sql<number>`count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))::int`,
-          latestAt: sql<Date | null>`max(${heartbeatRunEvents.createdAt}) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))`,
-        })
-        .from(heartbeatRunEvents)
-        .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, run.id)));
+      const evidence = evidenceByRunId.get(run.id);
+      const commentStats = evidence?.get("comments");
+      const documentStats = evidence?.get("documents");
+      const workProductStats = evidence?.get("products");
+      const workspaceOperationStats = evidence?.get("workspace");
+      const activityStats = evidence?.get("activity");
+      const eventStats = evidence?.get("events");
 
       const classification = classifyRunLiveness({
         runStatus: run.status,
@@ -403,6 +428,8 @@ export function activityService(db: Db) {
 
     runsForIssue: async (companyId: string, issueId: string) => {
       scheduleRunLivenessBackfill(companyId, issueId);
+      const selectedIds = await issueRunIds(companyId, issueId, ISSUE_RUN_LIMIT);
+      if (selectedIds.length === 0) return [];
       const runs = await db
         .select({
           runId: heartbeatRuns.id,
@@ -441,22 +468,10 @@ export function activityService(db: Db) {
             eq(agents.companyId, heartbeatRuns.companyId),
           ),
         )
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, companyId),
-            or(
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-              sql`exists (
-                select 1
-                from ${activityLog}
-                where ${activityLog.companyId} = ${companyId}
-                  and ${activityLog.entityType} = 'issue'
-                  and ${activityLog.entityId} = ${issueId}
-                  and ${activityLog.runId} = ${heartbeatRuns.id}
-              )`,
-            ),
-          ),
-        )
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.id, selectedIds),
+        ))
         .orderBy(desc(heartbeatRuns.createdAt));
 
       if (runs.length === 0) return runs;
