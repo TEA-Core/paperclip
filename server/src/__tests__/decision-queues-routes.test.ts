@@ -267,6 +267,11 @@ describeEmbeddedPostgres("decision queue routes", () => {
 
   it("keeps list query count flat and matches source-by-source visibility", async () => {
     const { companyId, agentId, issueId, approvalId } = await seed();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId, companyId, name: "Second", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
     const otherCompanyId = randomUUID();
     await db.insert(companies).values({ id: otherCompanyId, name: "Other Co", issuePrefix: "OTH" });
     const [first, second] = await db.insert(decisionQueues).values([
@@ -300,9 +305,14 @@ describeEmbeddedPostgres("decision queue routes", () => {
       }));
       await db.insert(issues).values(newIssues);
       const sourceIds = [issueId, ...newIssues.map((issue) => issue.id)];
+      const otherSources = [
+        { sourceKind: "approval" as const, sourceId: approvalId },
+        { sourceKind: "agent_error_alert" as const, sourceId: agentId },
+        { sourceKind: "agent_error_alert" as const, sourceId: otherAgentId },
+      ];
       await db.insert(decisionQueueItems).values([
         ...sourceIds.map((sourceId) => ({ companyId, queueId: first.id, sourceKind: "review" as const, sourceId, addedByType: "system" as const })),
-        { companyId, queueId: second.id, sourceKind: "approval", sourceId: approvalId, addedByType: "system" },
+        ...otherSources.map((source) => ({ companyId, queueId: second.id, ...source, addedByType: "system" as const })),
         { companyId, queueId: second.id, sourceKind: "review", sourceId: randomUUID(), addedByType: "system" },
       ]);
       for (const actor of actorCases) {
@@ -313,12 +323,17 @@ describeEmbeddedPostgres("decision queue routes", () => {
         if (actor.type === "board" && actor.source === "local_implicit") {
           expect(oldQueryCount).toBeGreaterThan(size);
         }
-        const approvalVisible = await canReadDecisionSource(db, actor, companyId, "approval", approvalId);
+        const otherExpected: string[] = [];
+        for (const source of otherSources) {
+          if (await canReadDecisionSource(db, actor, companyId, source.sourceKind, source.sourceId)) {
+            otherExpected.push(source.sourceId);
+          }
+        }
         countedDb.count = 0;
         const listed = await service.list(companyId, actor);
         const queryCount = countedDb.count;
         expect(listed.find((queue) => queue.key === "one")?.itemCount).toBe(expected.filter(Boolean).length);
-        expect(listed.find((queue) => queue.key === "two")?.itemCount).toBe(Number(approvalVisible));
+        expect(listed.find((queue) => queue.key === "two")?.itemCount).toBe(otherExpected.length);
         const actorName = actor.type === "agent" ? "agent" : actor.source === "local_implicit" ? "board" : "restricted";
         if (measures.has(actorName)) expect(queryCount).toBe(measures.get(actorName));
         else measures.set(actorName, queryCount);
@@ -326,6 +341,8 @@ describeEmbeddedPostgres("decision queue routes", () => {
         const visible = await service.listItems(companyId, "one", actor);
         expect(visible.map((item) => item.sourceId).sort()).toEqual(sourceIds.filter((_, index) => expected[index]).sort());
         expect(countedDb.count).toBeLessThanOrEqual(queryCount + 1);
+        expect((await service.listItems(companyId, "two", actor)).map((item) => item.sourceId).sort())
+          .toEqual(otherExpected.sort());
       }
       await db.delete(decisionQueueItems);
     }
@@ -365,6 +382,51 @@ describeEmbeddedPostgres("decision queue routes", () => {
         .toEqual(expected.sort());
       expect((await service.list(companyId, actor))[0]?.itemCount).toBe(expected.length);
     }
+  });
+
+  it("matches concrete issue and agent authorization for a low-trust actor", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const otherIssueId = randomUUID();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId, companyId, name: "Unrelated", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.insert(issues).values({
+      id: otherIssueId, companyId, identifier: "DQC-2", title: "Outside", status: "todo",
+    });
+    await db.update(agents).set({ permissions: {
+      trustPreset: "low_trust_review",
+      authorizationPolicy: {
+        trustPreset: "low_trust_review",
+        trustBoundary: { mode: "low_trust_review", companyId, issueIds: [issueId], allowedAgentIds: [agentId] },
+      },
+    } }).where(eq(agents.id, agentId));
+    const [queue] = await db.insert(decisionQueues).values({
+      companyId, key: "low-trust", title: "Low trust", createdByType: "system",
+    }).returning();
+    const sources = [
+      { sourceKind: "review" as const, sourceId: issueId },
+      { sourceKind: "review" as const, sourceId: otherIssueId },
+      { sourceKind: "agent_error_alert" as const, sourceId: agentId },
+      { sourceKind: "agent_error_alert" as const, sourceId: otherAgentId },
+    ];
+    await db.insert(decisionQueueItems).values(sources.map((source) => ({
+      companyId, queueId: queue.id, ...source, addedByType: "system" as const,
+    })));
+    const actor = agentActor(companyId, agentId);
+    const expected: string[] = [];
+    for (const source of sources) {
+      if (await canReadDecisionSource(db, actor, companyId, source.sourceKind, source.sourceId)) {
+        expected.push(source.sourceId);
+      }
+    }
+    expect(expected.sort()).toEqual([issueId, agentId].sort());
+    const service = decisionQueueService(db);
+    expect((await service.listItems(companyId, "low-trust", actor)).map((item) => item.sourceId).sort())
+      .toEqual(expected);
+    expect((await service.list(companyId, actor))[0]?.itemCount).toBe(expected.length);
+    await request(app(actor)).get(`/api/companies/${companyId}/decision-queues`).expect(403);
   });
 
   it("keeps failed-run owner and linked-issue visibility distinct", async () => {
