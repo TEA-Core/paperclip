@@ -372,8 +372,12 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
 
   // Fetch issues for name resolution
   const { data: issues } = useQuery({
-    queryKey: [...queryKeys.issues.list(selectedCompanyId ?? ""), "compact", ISSUE_NAME_LOOKUP_LIMIT],
-    queryFn: () => issuesApi.listCompact(selectedCompanyId!, { limit: ISSUE_NAME_LOOKUP_LIMIT }),
+    queryKey: [...queryKeys.issues.list(selectedCompanyId ?? ""), "compact", ISSUE_NAME_LOOKUP_LIMIT, "updated"],
+    queryFn: () => issuesApi.listCompact(selectedCompanyId!, {
+      limit: ISSUE_NAME_LOOKUP_LIMIT,
+      sortField: "updated",
+      sortDir: "desc",
+    }),
     enabled: !!selectedCompanyId,
   });
 

@@ -106,7 +106,11 @@ describe("ActivityFeed", () => {
     });
 
     await waitForAssertion(() => {
-      expect(mockIssuesApi.listCompact).toHaveBeenCalledWith("company-1", { limit: 100 });
+      expect(mockIssuesApi.listCompact).toHaveBeenCalledWith("company-1", {
+        limit: 100,
+        sortField: "updated",
+        sortDir: "desc",
+      });
     });
     expect(mockIssuesApi.list).not.toHaveBeenCalled();
 

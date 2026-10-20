@@ -781,11 +781,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact();
-
-    await act(async () => {
-      click(findAction(container, "Edit"));
-    });
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
     });
