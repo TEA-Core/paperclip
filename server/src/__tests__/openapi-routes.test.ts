@@ -266,6 +266,22 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+  it("documents the bounded child conformance response shape", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/children/conformance"].get;
+    const schema = operation.responses["200"].content["application/json"].schema;
+    expect(schema.required).toEqual(["items", "nextCursor"]);
+    expect(schema.properties.items.items.required).toEqual([
+      "id",
+      "identifier",
+      "currentExecutionWorkspace",
+      "workProducts",
+    ]);
+    expect(schema.properties.items.items.properties.currentExecutionWorkspace.properties.deliveryState.enum)
+      .toEqual(["merged_via_pr", "merged_by_ancestry", "unmerged", "unknown"]);
+    expect(schema.properties.items.items.properties.workProducts.items.required).toContain("type");
+  });
+
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 

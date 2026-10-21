@@ -705,6 +705,43 @@ const IssuePatchExistingConflictSchema = registry.register(
   }),
 );
 
+const conformanceProjectionWorkProductSchema = z.object({
+  id: z.string().uuid(),
+  companyId: z.string().uuid(),
+  projectId: z.string().uuid().nullable(),
+  issueId: z.string().uuid(),
+  executionWorkspaceId: z.string().uuid().nullable(),
+  runtimeServiceId: z.string().uuid().nullable(),
+  type: z.string(),
+  provider: z.string(),
+  externalId: z.string().nullable(),
+  title: z.string(),
+  url: z.string().nullable(),
+  status: z.string(),
+  reviewState: z.string(),
+  isPrimary: z.boolean(),
+  healthStatus: z.enum(["unknown", "healthy", "unhealthy"]),
+  summary: z.string().nullable(),
+  metadata: z.record(z.string(), z.unknown()).nullable(),
+  sourceTrust: z.record(z.string(), z.unknown()).nullable().optional(),
+  createdByRunId: z.string().uuid().nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+
+const conformanceProjectionResponseSchema = z.object({
+  items: z.array(z.object({
+    id: z.string().uuid(),
+    identifier: z.string(),
+    currentExecutionWorkspace: z.object({
+      branchName: z.string().nullable(),
+      deliveryState: z.enum(["merged_via_pr", "merged_by_ancestry", "unmerged", "unknown"]),
+    }).nullable(),
+    workProducts: z.array(conformanceProjectionWorkProductSchema),
+  })),
+  nextCursor: z.string().nullable(),
+});
+
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.string(), z.unknown())) => ({
     description: "Success",
@@ -3978,7 +4015,7 @@ registry.registerPath({
       limit: z.coerce.number().int().positive().max(50).optional(),
     }),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+  responses: { 200: r.ok(conformanceProjectionResponseSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
