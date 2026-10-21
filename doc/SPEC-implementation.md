@@ -1179,13 +1179,17 @@ The current app also exposes V1-supporting surfaces for:
   `GET /companies/:companyId/search/extract`; extraction accepts a server-escaped literal `contains`, optional
   server-owned URL expansion, issue/comment/document scopes, status/date filters, issue-level pagination, a
   bounded `matchesPerIssue` override for machine consumers, and explicit issue/match truncation flags
-- execution workspaces, project workspaces, workspace runtime services, and workspace operations. Workspace reads
-  derive `deliveryState` as `merged_via_pr | merged_by_ancestry | unmerged | unknown`; terminal issue trees with a
-  merged delivery and no active checkout run become cleanup-eligible with reason `issue_terminal` and are archived
-  through the workspace cleanup path. A worktree directory that is already gone counts as removed: cleanup prunes the
-  leftover git admin entry from the repo root and archives the workspace instead of leaving it in `cleanup_failed`.
-  The sweep also retries `cleanup_failed` rows whose reason is `issue_terminal | spawn <git> ENOENT` under the same
-  safety gates. Reopening the source issue records activity but does not restore that workspace.
+- execution workspaces, project workspaces, workspace runtime services, and workspace operations. Issue and
+  workspace detail reads return persisted workspace state and runtime services with `deliveryState: unknown`;
+  they do not inspect Git. The dedicated close-readiness route derives `deliveryState` as
+  `merged_via_pr | merged_by_ancestry | unmerged | unknown` from a live scan. The terminal workspace
+  sweep selects terminal source issues in SQL before inspecting Git, and still requires a terminal
+  subtree, clean worktree, merged delivery, cooldown, and no active run. Eligible workspaces are
+  archived with reason `issue_terminal`. A worktree directory that is already gone counts as removed:
+  cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
+  of leaving it in `cleanup_failed`. The sweep also retries `cleanup_failed` rows whose reason is
+  `issue_terminal | spawn <git> ENOENT` under the same safety gates. Reopening the source issue
+  records activity but does not restore that workspace.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
 - routines and scheduled/API/webhook triggers
 - plugin installation, configuration, state, jobs, logs, webhooks, and plugin database namespace migration

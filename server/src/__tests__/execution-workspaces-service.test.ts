@@ -335,6 +335,27 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     tempDirs.clear();
   });
 
+  it("loads issue workspace details without scanning git, while close readiness still inspects it", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      const workspace = await svc.getById(seeded.executionWorkspaceId);
+      expect(workspace).toMatchObject({
+        id: seeded.executionWorkspaceId,
+        deliveryState: "unknown",
+        cwd: seeded.worktreePath,
+        runtimeServices: [],
+      });
+      expect(scan).not.toHaveBeenCalled();
+
+      const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+      expect(readiness?.deliveryState).toBe("merged_via_pr");
+      expect(scan).toHaveBeenCalled();
+    } finally {
+      scan.mockRestore();
+    }
+  });
+
   it("does not treat a descendant PR on the shared workspace as parent delivery evidence", async () => {
     const seeded = await seedTerminalWorkspace();
     const descendantIssueId = randomUUID();
@@ -741,11 +762,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(laterSweep).toMatchObject({ archived: 0 });
   }, 20_000);
 
-  it("archives an eligible workspace behind a full page of skipped candidates", async () => {
-    // Seed more skipped candidates than the sweep page holds, each older than
-    // the eligible workspace. A skipped candidate keeps its updatedAt, so a
-    // sweep that always reads the oldest page never reaches the eligible
-    // workspace. The reaper must rotate its scan window across sweeps.
+  it("archives an eligible workspace behind a full page of non-terminal subtrees", async () => {
+    // Terminal source issues with open descendants still occupy a page, so the
+    // cursor must rotate past them to reach eligible workspaces.
     const companyId = randomUUID();
     const projectId = randomUUID();
     const issuePrefix = `P${companyId.slice(0, 8).toUpperCase()}`;
@@ -761,8 +780,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Starved reaper",
       status: "in_progress",
     });
-    // Two open-issue workspaces that the reaper always skips. Their older
-    // updatedAt keeps them at the front of the ordered candidate set.
+    // Two terminal source issues with open children precede the eligible row.
     const skippedWorkspaceIds: string[] = [];
     for (let index = 0; index < 2; index += 1) {
       const workspaceId = randomUUID();
@@ -784,9 +802,18 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         companyId,
         projectId,
         title: `Open ${index}`,
-        status: "in_progress",
+        status: "done",
         priority: "medium",
         executionWorkspaceId: workspaceId,
+      });
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId,
+        projectId,
+        parentId: openIssueId,
+        title: `Open child ${index}`,
+        status: "todo",
+        priority: "medium",
       });
       await db
         .update(executionWorkspaces)
@@ -796,9 +823,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // The eligible workspace is newest, so it sorts after the whole skipped page.
     const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2020, 0, 9)) });
 
-    // A fresh service starts with an empty scan cursor, so each call inspects
-    // one row and advances. A single-row page never lands on the eligible
-    // workspace first.
+    // A fresh service starts with an empty scan cursor. A single-row page
+    // first hits a non-terminal subtree.
     const service = executionWorkspaceService(db, {
       workspaceReaperCooldownDays: 0,
     });
@@ -843,13 +869,19 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       workspaceReaperCooldownDays: 0,
     });
 
-    // An eligible ancestry workspace with an old updatedAt. Its source issue
-    // starts non-terminal, so the first sweeps skip it and pass the cursor.
+    // A terminal source with an open child is skipped by the subtree gate.
+    // Once its child completes, the cursor must eventually revisit it.
     const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2021, 0, 2)) });
-    await db
-      .update(issues)
-      .set({ status: "in_progress" })
-      .where(eq(issues.id, eligible.sourceIssueId));
+    const eligibleChildId = randomUUID();
+    await db.insert(issues).values({
+      id: eligibleChildId,
+      companyId: eligible.companyId,
+      projectId: eligible.projectId,
+      parentId: eligible.sourceIssueId,
+      title: "Pending child",
+      status: "todo",
+      priority: "medium",
+    });
 
     // One older skipped candidate. With a single-row page it sorts before the
     // eligible workspace, so the first sweep advances the cursor onto it.
@@ -871,19 +903,27 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       companyId: eligible.companyId,
       projectId: eligible.projectId,
       title: "Older open",
-      status: "in_progress",
+      status: "done",
       priority: "medium",
       executionWorkspaceId: olderSkippedId,
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: eligible.companyId,
+      projectId: eligible.projectId,
+      parentId: olderOpenIssueId,
+      title: "Older open child",
+      status: "todo",
+      priority: "medium",
     });
     await db
       .update(executionWorkspaces)
       .set({ sourceIssueId: olderOpenIssueId, updatedAt: new Date(Date.UTC(2021, 0, 1)) })
       .where(eq(executionWorkspaces.id, olderSkippedId));
 
-    // Sweep once per row so the cursor lands on the eligible workspace while it
-    // is still non-terminal.
-    await service.sweepTerminalWorkspaces(1); // reads olderSkipped
-    await service.sweepTerminalWorkspaces(1); // reads eligible, still non-terminal
+    // Advance past both terminal sources while their subtrees remain open.
+    await service.sweepTerminalWorkspaces(1);
+    await service.sweepTerminalWorkspaces(1);
 
     const [afterSkip] = await db
       .select({ status: executionWorkspaces.status })
@@ -896,7 +936,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await db
       .update(issues)
       .set({ status: "done" })
-      .where(eq(issues.id, eligible.sourceIssueId));
+      .where(eq(issues.id, eligibleChildId));
 
     // Drive continuous churn. Each sweep, advance the clock and add a newer
     // skipped candidate ahead of the cursor. Without the frozen bound the cursor
@@ -922,9 +962,18 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         companyId: eligible.companyId,
         projectId: eligible.projectId,
         title: `Churn ${attempt}`,
-        status: "in_progress",
+        status: "done",
         priority: "medium",
         executionWorkspaceId: churnId,
+      });
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId: eligible.companyId,
+        projectId: eligible.projectId,
+        parentId: churnIssueId,
+        title: `Churn child ${attempt}`,
+        status: "todo",
+        priority: "medium",
       });
       await db
         .update(executionWorkspaces)
@@ -4002,10 +4051,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       })),
     );
 
-    const inspectGitCloseReadiness = vi.fn(async () => {
-      throw new Error("collection inventory must not inspect git worktrees");
-    });
-    const inventoryService = executionWorkspaceService(db, { inspectGitCloseReadiness });
+    const inventoryService = executionWorkspaceService(db);
     const inventoryPromise = inventoryService.list(companyId);
     const healthResponsive = await Promise.race([
       db.execute(sql`select 1 as ok`).then(() => true),
@@ -4014,7 +4060,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const workspaces = await inventoryPromise;
 
     expect(healthResponsive).toBe(true);
-    expect(inspectGitCloseReadiness).not.toHaveBeenCalled();
     expect(workspaces).toHaveLength(workspaceCount);
     expect(workspaces.every((workspace) => workspace.deliveryState === "unknown")).toBe(true);
     expect(workspaces.reduce((count, workspace) => count + (workspace.runtimeServices?.length ?? 0), 0)).toBe(0);
@@ -5527,6 +5572,135 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   }, 20_000);
 
+  it("keeps the reopen fence when the source turns terminal after candidate selection", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    await db.update(executionWorkspaces).set({
+      metadata: {
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date().toISOString(),
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const originalSelect = db.select.bind(db);
+    const select = vi.spyOn(db, "select").mockImplementationOnce(((fields: Record<string, unknown>) => {
+      const query = originalSelect(fields as never);
+      const originalFrom = query.from.bind(query);
+      Object.defineProperty(query, "from", {
+        value: (table: typeof executionWorkspaces) => {
+          const fromQuery = originalFrom(table);
+          const originalLimit = fromQuery.limit.bind(fromQuery);
+          // Commit the terminal transition after SQL returns the non-terminal
+          // candidate snapshot, but before the sweep decides whether to clear.
+          Object.defineProperty(fromQuery, "limit", {
+            value: (count: number) => Promise.resolve(originalLimit(count)).then(async (rows) => {
+              await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+              return rows;
+            }),
+          });
+          return fromQuery;
+        },
+      });
+      return query;
+    }) as unknown as typeof db.select);
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      const sweep = await svc.sweepTerminalWorkspaces();
+      const [workspace] = await db.select({
+        status: executionWorkspaces.status,
+        metadata: executionWorkspaces.metadata,
+      }).from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(sweep).toMatchObject({ checked: 1, archived: 0, skippedNonTerminalTree: 1 });
+      expect(scan).not.toHaveBeenCalled();
+      expect(workspace?.status).toBe("active");
+      expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    } finally {
+      select.mockRestore();
+      scan.mockRestore();
+    }
+  });
+
+  it("keeps the reopen fence when the source turns terminal at the locked clear", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    await db.update(executionWorkspaces).set({
+      metadata: {
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date().toISOString(),
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const originalTransaction = db.transaction.bind(db);
+    const transaction = vi.spyOn(db, "transaction").mockImplementationOnce(((
+      callback: (tx: never) => Promise<unknown>,
+    ) => originalTransaction(async (tx) => {
+      // The candidate SELECT and any unlocked re-read saw an open source;
+      // the terminal close commits before the fenced write takes its locks.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+      return callback(tx as never);
+    })) as unknown as typeof db.transaction);
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      const sweep = await svc.sweepTerminalWorkspaces();
+      const [workspace] = await db.select({
+        status: executionWorkspaces.status,
+        metadata: executionWorkspaces.metadata,
+      }).from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(sweep).toMatchObject({ checked: 1, archived: 0, skippedNonTerminalTree: 1 });
+      expect(scan).not.toHaveBeenCalled();
+      expect(workspace?.status).toBe("active");
+      expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    } finally {
+      transaction.mockRestore();
+      scan.mockRestore();
+    }
+  });
+
+  it("does not wait on an issue writer while clearing a reopen fence", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    await db.update(executionWorkspaces).set({
+      metadata: {
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+        [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    let releaseWriter!: () => void;
+    const writerReleased = new Promise<void>((resolve) => { releaseWriter = resolve; });
+    let writerReady!: () => void;
+    const writerLocked = new Promise<void>((resolve) => { writerReady = resolve; });
+    const writer = db.transaction(async (tx) => {
+      await tx.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+      writerReady();
+      await writerReleased;
+    });
+    await writerLocked;
+    // Bounds a real PostgreSQL row-lock wait, which fake timers cannot advance;
+    // on success the sweep resolves immediately rather than waiting for this.
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const sweep = await Promise.race([
+        svc.sweepTerminalWorkspaces(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("reaper blocked on issue writer")), 5_000);
+        }),
+      ]);
+      expect(sweep).toMatchObject({ checked: 1, archived: 0, skippedNonTerminalTree: 1 });
+      const [workspace] = await db.select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
+    } finally {
+      clearTimeout(timeout);
+      releaseWriter();
+      await writer;
+    }
+  }, 20_000);
+
   it("does not remove an idle workspace whose source issue is still in progress", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await db
@@ -5541,7 +5715,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const sweep = await svc.sweepTerminalWorkspaces();
     const workspace = await workspaceRow(seeded.executionWorkspaceId);
 
-    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedNonTerminalTree: 1 });
+    expect(sweep).toMatchObject({ checked: 0, archived: 0, cleanupFailed: 0 });
     expect(workspace?.status).toBe("idle");
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   }, 20_000);
@@ -5555,10 +5729,13 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         .set({ status: issueStatus })
         .where(eq(issues.id, seeded.sourceIssueId));
 
+      const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
       const sweep = await svc.sweepTerminalWorkspaces();
       const workspace = await workspaceRow(seeded.executionWorkspaceId);
 
-      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedNonTerminalTree: 1 });
+      expect(sweep).toMatchObject({ checked: 0, archived: 0, cleanupFailed: 0 });
+      expect(scan).not.toHaveBeenCalled();
+      scan.mockRestore();
       expect(workspace?.status).toBe("active");
       await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
     },
