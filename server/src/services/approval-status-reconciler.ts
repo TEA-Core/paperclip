@@ -2704,6 +2704,15 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     };
   }
 
+  const approvalStatus = (row.executionState?.approvalStatus ?? {}) as Record<string, unknown>;
+  const finalDelivery = approvalStatus.finalDelivery as {
+    owner: string; repo: string; number: number; headSha: string; decisionId?: string;
+  } | undefined;
+  const certified =
+    finalDelivery?.decisionId && finalDelivery.decisionId === row.executionState?.lastDecisionId
+      ? finalDelivery
+      : undefined;
+
   const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id, {
     includeDrafts: readApprovedHead(row.executionState) !== null,
   });
@@ -2787,6 +2796,21 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     return { kind: "skipped", reason, detail: `${reason}: linked mentions: ${cached}` };
   }
 
+  // A newly selected delivery is not the PR the approving decision certified.
+  // Refuse before the already-success shortcut, which can otherwise auto-merge
+  // the new PR without ever reaching the publisher's expectedPr check.
+  if (certified && (
+    target.number !== certified.number ||
+    target.owner.toLowerCase() !== certified.owner.toLowerCase() ||
+    target.repo.toLowerCase() !== certified.repo.toLowerCase()
+  )) {
+    return {
+      kind: "skipped",
+      reason: "delivery_moved",
+      detail: `delivery_moved: ${target.displayName} differs from final preflight ${certified.owner}/${certified.repo}#${certified.number}`,
+    };
+  }
+
   const prRead = await ghReadJson(db, row.companyId, target.owner, target.repo, `/pulls/${target.number}`);
   if (!prRead.ok) {
     return {
@@ -2807,6 +2831,14 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   }
   if (prBody?.draft === true) {
     return { kind: "skipped", reason: "live-draft", detail: `live-draft: ${target.displayName} is still a draft` };
+  }
+
+  if (certified && headSha !== certified.headSha) {
+    return {
+      kind: "skipped",
+      reason: "head_moved",
+      detail: `head_moved: ${target.displayName} head differs from final preflight`,
+    };
   }
 
   // Idempotency pre-check: read the head's combined status. A 404 means the
@@ -2984,14 +3016,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
   }
 
-  const approvalStatus = (row.executionState?.approvalStatus ?? {}) as Record<string, unknown>;
-  const finalDelivery = approvalStatus.finalDelivery as {
-    owner: string; repo: string; number: number; headSha: string; decisionId?: string;
-  } | undefined;
-  const certified =
-    finalDelivery?.decisionId && finalDelivery.decisionId === row.executionState?.lastDecisionId
-      ? finalDelivery
-      : undefined;
   const publishOptions: {
     expectedHeadSha: string;
     expectedPr?: { owner: string; repo: string; number: number };

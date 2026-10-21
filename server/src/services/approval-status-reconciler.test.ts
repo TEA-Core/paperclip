@@ -752,11 +752,13 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
   describe("runApprovalStatusReconcilerTick", () => {
     it.each([
-      ["failed", false],
-      ["failed", true],
-      ["published", false],
-      ["published", true],
-    ] as const)("refuses retargeted PR recovery after %s first publish (receipt=%s)", async (outcome, receipt) => {
+      ["failed", false, false],
+      ["failed", true, false],
+      ["published", false, false],
+      ["published", true, false],
+      ["published", false, true],
+      ["published", true, true],
+    ] as const)("refuses retargeted PR recovery after %s first publish (receipt=%s, already stamped=%s)", async (outcome, receipt, alreadyStamped) => {
       const issueId = await insertIssue({
         executionState: approvedState({
           lastDecisionId: "decision-42",
@@ -781,9 +783,12 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const movedPrUrl = "https://api.github.com/repos/TEA-Core/paperclip/pulls/99";
       installRoutes([
         { url: movedPrUrl, body: { ...OPEN_PR_BODY, head: { ref: "some-branch-name", sha: NEW_HEAD } } },
-        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: COMBINED_STATUS_URL, body: alreadyStamped
+          ? { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] }
+          : { state: "pending", statuses: [] } },
         { url: APPROVED_DIFF_URL, body: { files: [{ filename: "a.ts", sha: "identical-blob", status: "modified" }] } },
         { url: LIVE_DIFF_URL, body: { files: [{ filename: "a.ts", sha: "identical-blob", status: "modified" }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -793,6 +798,37 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.skippedDetails.some((detail) => detail.includes("delivery_moved"))).toBe(true);
       expect(postStatusCalls()).toHaveLength(0);
       expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+    });
+
+    it("publishes and re-arms the decision-bound PR when the certified head is unchanged", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-42",
+          approvalStatus: {
+            approvedHeadSha: NEW_HEAD,
+            approvedAt: APPROVED_AT,
+            finalDelivery: {
+              owner: "TEA-Core", repo: "paperclip", number: 42, headSha: NEW_HEAD,
+              displayName: "TEA-Core/paperclip#42", decisionId: "decision-42",
+            },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      installRoutes([
+        { url: PR_URL, body: { ...OPEN_PR_BODY, head: { ref: "some-branch-name", sha: NEW_HEAD } } },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.republished).toBe(1);
+      expect(summary.rearmed).toBe(1);
+      expect(postStatusCalls()).toHaveLength(1);
+      expect(postStatusCalls()[0]![0]).toBe(POST_STATUS_URL);
     });
 
     it("republishes exactly once when the status is missing on the live head", async () => {
