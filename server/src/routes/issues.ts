@@ -202,6 +202,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { redactIssueCommentBody } from "../services/issues.js";
+import { toIssueWorkProduct } from "../services/work-products.js";
 import {
   armMergeOnApproval,
   parseRepoUrl,
@@ -12694,6 +12695,103 @@ export function issueRoutes(
     );
 
     res.json(response);
+  });
+
+  router.get("/issues/:id/children/conformance", async (req, res) => {
+    const parent = await getAccessibleResource(
+      req,
+      res,
+      getIssueById(req, req.params.id as string),
+      "Issue not found",
+    );
+    if (!parent) return;
+    if (!(await assertIssueReadAllowed(req, res, parent))) return;
+
+    const limitValue = Number(req.query.limit ?? 50);
+    const limit = Number.isInteger(limitValue) && limitValue > 0 && limitValue <= 50
+      ? limitValue
+      : null;
+    const cutoverAt = typeof req.query.cutoverAt === "string" && req.query.cutoverAt.length > 0
+      ? new Date(req.query.cutoverAt)
+      : null;
+    let cursor: { createdAt: Date; id: string } | null = null;
+    if (typeof req.query.cursor === "string") {
+      try {
+        const decoded = JSON.parse(Buffer.from(req.query.cursor, "base64url").toString("utf8"));
+        if (typeof decoded.id !== "string" || typeof decoded.createdAt !== "string") throw new Error("invalid cursor");
+        const createdAt = new Date(decoded.createdAt);
+        if (Number.isNaN(createdAt.getTime())) throw new Error("invalid cursor");
+        cursor = { id: decoded.id, createdAt };
+      } catch {
+        res.status(400).json({ error: "Invalid conformance projection cursor" });
+        return;
+      }
+    }
+    if (limit === null || (cutoverAt && Number.isNaN(cutoverAt.getTime()))) {
+      res.status(400).json({ error: "Invalid conformance projection bounds" });
+      return;
+    }
+
+    const childRows = await db
+      .select()
+      .from(issueRows)
+      .where(and(
+        eq(issueRows.companyId, parent.companyId),
+        eq(issueRows.parentId, parent.id),
+        cutoverAt ? gt(issueRows.createdAt, cutoverAt) : sql`true`,
+        cursor
+          ? sql`(${issueRows.createdAt}, ${issueRows.id}) > (${cursor.createdAt}, ${cursor.id}::uuid)`
+          : sql`true`,
+      ))
+      .orderBy(asc(issueRows.createdAt), asc(issueRows.id))
+      .limit(limit + 1);
+    const hasMore = childRows.length > limit;
+    const pageRows = childRows.slice(0, limit);
+    const visibleChildren = await filterIssuesForActor(req, pageRows);
+    const workspaceIds = visibleChildren
+      .map((child) => child.executionWorkspaceId)
+      .filter((id): id is string => Boolean(id));
+    const [workspaceRows, productRows] = await Promise.all([
+      workspaceIds.length > 0
+        ? db.select().from(executionWorkspaces).where(and(
+            eq(executionWorkspaces.companyId, parent.companyId),
+            inArray(executionWorkspaces.id, workspaceIds),
+          ))
+        : Promise.resolve([]),
+      visibleChildren.length > 0
+        ? db.select().from(issueWorkProducts).where(and(
+            eq(issueWorkProducts.companyId, parent.companyId),
+            inArray(issueWorkProducts.issueId, visibleChildren.map((child) => child.id)),
+            eq(issueWorkProducts.type, "pull_request"),
+          ))
+        : Promise.resolve([]),
+    ]);
+    const workspacesById = new Map(workspaceRows.map((workspace) => [workspace.id, workspace]));
+    const productsByIssueId = new Map<string, ReturnType<typeof toIssueWorkProduct>[]>();
+    for (const product of productRows) {
+      const list = productsByIssueId.get(product.issueId) ?? [];
+      list.push(toIssueWorkProduct(product));
+      productsByIssueId.set(product.issueId, list);
+    }
+    const items = visibleChildren.map((child) => {
+      const workspace = child.executionWorkspaceId ? workspacesById.get(child.executionWorkspaceId) : null;
+      const products = productsByIssueId.get(child.id) ?? [];
+      return {
+        id: child.id,
+        identifier: child.identifier,
+        currentExecutionWorkspace: workspace
+          ? { branchName: workspace.branchName ?? null, deliveryState: "unknown" }
+          : null,
+        workProducts: products,
+      };
+    });
+    const last = hasMore ? pageRows[pageRows.length - 1] : null;
+    res.json({
+      items,
+      nextCursor: last
+        ? Buffer.from(JSON.stringify({ createdAt: last.createdAt, id: last.id })).toString("base64url")
+        : null,
+    });
   });
 
   router.get("/issues/:id", async (req, res) => {
