@@ -597,8 +597,7 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     await page.getByTestId("task-chat-composer-input").click();
     await expect(star).toHaveCSS("opacity", "0");
     await star.focus();
-    await page.keyboard.press("Tab");
-    await page.keyboard.press("Shift+Tab");
+    await expect(star).toBeFocused();
     await expect(star).toHaveCSS("opacity", "1");
     await star.click();
     await page.goto(f.route);
