@@ -29,6 +29,9 @@ import { ListFilter, Layers, ChevronDown, ChevronRight, User, Settings } from "l
 import { AgentIcon } from "./AgentIconPicker";
 import { timeAgo } from "../lib/timeAgo";
 
+// Matches the server's default activity page so every listed event can resolve its issue name.
+const ISSUE_NAME_LOOKUP_LIMIT = 100;
+
 /* ------------------------------------------------------------------ */
 /*  Event Tier Classification                                          */
 /* ------------------------------------------------------------------ */
@@ -369,8 +372,12 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
 
   // Fetch issues for name resolution
   const { data: issues } = useQuery({
-    queryKey: queryKeys.issues.list(selectedCompanyId ?? ""),
-    queryFn: () => issuesApi.list(selectedCompanyId!),
+    queryKey: [...queryKeys.issues.list(selectedCompanyId ?? ""), "compact", ISSUE_NAME_LOOKUP_LIMIT, "updated"],
+    queryFn: () => issuesApi.listCompact(selectedCompanyId!, {
+      limit: ISSUE_NAME_LOOKUP_LIMIT,
+      sortField: "updated",
+      sortDir: "desc",
+    }),
     enabled: !!selectedCompanyId,
   });
 

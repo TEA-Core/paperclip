@@ -32,6 +32,7 @@ const sidebarState = vi.hoisted(() => ({
 
 const mockIssuesApi = vi.hoisted(() => ({
   list: vi.fn(),
+  listCompact: vi.fn(),
   listLabels: vi.fn(),
 }));
 
@@ -199,6 +200,7 @@ describe("CommandPalette", () => {
     dialogState.openNewAgent.mockReset();
     sidebarState.setSidebarOpen.mockReset();
     mockIssuesApi.list.mockReset();
+    mockIssuesApi.listCompact.mockReset();
     mockIssuesApi.listLabels.mockReset();
     mockAgentsApi.list.mockReset();
     mockProjectsApi.list.mockReset();
@@ -209,6 +211,7 @@ describe("CommandPalette", () => {
     locationState.location.search = "";
     locationState.location.hash = "";
     mockIssuesApi.list.mockResolvedValue([]);
+    mockIssuesApi.listCompact.mockResolvedValue([]);
     mockIssuesApi.listLabels.mockResolvedValue([]);
     mockAgentsApi.list.mockResolvedValue([]);
     mockProjectsApi.list.mockResolvedValue([]);
@@ -220,6 +223,36 @@ describe("CommandPalette", () => {
 
   afterEach(() => {
     container.remove();
+  });
+
+  it("loads ten compact tasks for the empty palette and still searches by query", async () => {
+    const recentTask = { id: "issue-1", identifier: "PAP-1", title: "Recent task" };
+    mockIssuesApi.listCompact.mockResolvedValue([recentTask]);
+    const { root } = renderWithQueryClient(<CommandPalette />, container, (queryClient) => {
+      queryClient.setQueryData([...queryKeys.issues.list("company-1"), "compact", 10], [recentTask]);
+    });
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
+    });
+
+    await waitForAssertion(() => {
+      expect(mockIssuesApi.listCompact).toHaveBeenCalledWith("company-1", { limit: 10 });
+      expect(container.textContent).toContain("Recent task");
+    });
+
+    act(() => {
+      container.querySelector('button[aria-label="Set query"]')!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await waitForAssertion(() => {
+      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
+        q: "pull/3303",
+        limit: 10,
+        includeRoutineExecutions: true,
+      });
+    });
+
+    act(() => root.unmount());
   });
 
   it("includes routine execution issues in search queries", async () => {

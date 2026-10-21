@@ -159,8 +159,8 @@ export function CommandPalette() {
   const quickSearchQuery = parsedQuery.query.trim();
 
   const { data: issues = [] } = useQuery({
-    queryKey: queryKeys.issues.list(selectedCompanyId!),
-    queryFn: () => issuesApi.list(selectedCompanyId!),
+    queryKey: [...queryKeys.issues.list(selectedCompanyId!), "compact", 10],
+    queryFn: () => issuesApi.listCompact(selectedCompanyId!, { limit: 10 }),
     enabled: !!selectedCompanyId && open && searchQuery.length === 0,
   });
 
