@@ -114,7 +114,7 @@ describePostgres("bounded bulk issue read", () => {
       id: conformanceWorkspaceId, companyId, projectId, sourceIssueId: conformanceChildId,
       mode: "isolated_workspace", strategyType: "git_worktree", name: "conformance-child",
       status: "active", branchName: "feature/conformance-child", providerType: "git_worktree",
-      metadata: { deliveryState: "merged_via_pr" },
+      metadata: { deliveryState: "merged_by_ancestry" },
     });
     await db.update(issues).set({ executionWorkspaceId: conformanceWorkspaceId }).where(eq(issues.id, conformanceChildId));
     await db.insert(issueWorkProducts).values({
@@ -267,18 +267,21 @@ describePostgres("bounded bulk issue read", () => {
   });
 
   it("projects only direct children with hydrated delivery state and PR products", async () => {
-    const response = await request(app(board())).get(
-      `/api/issues/${conformanceParentId}/children/conformance`,
-    );
+    const server = app(board());
+    const [response, detail] = await Promise.all([
+      request(server).get(`/api/issues/${conformanceParentId}/children/conformance`),
+      request(server).get(`/api/issues/${conformanceChildId}`),
+    ]);
 
     expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
     expect(response.body.items).toHaveLength(1);
     expect(response.body.items[0]).toMatchObject({
       id: conformanceChildId,
       identifier: "BK-201",
       currentExecutionWorkspace: {
         branchName: "feature/conformance-child",
-        deliveryState: "merged_via_pr",
+        deliveryState: detail.body.currentExecutionWorkspace.deliveryState,
       },
       workProducts: [{ type: "pull_request", title: "Conformance PR" }],
     });
