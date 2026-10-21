@@ -12711,43 +12711,58 @@ export function issueRoutes(
     const limit = Number.isInteger(limitValue) && limitValue > 0 && limitValue <= 50
       ? limitValue
       : null;
-    const cutoverAt = typeof req.query.cutoverAt === "string" && req.query.cutoverAt.length > 0
-      ? new Date(req.query.cutoverAt)
-      : null;
-    let cursor: { createdAt: Date; id: string } | null = null;
-    if (typeof req.query.cursor === "string") {
+    const cutoverAtValue = req.query.cutoverAt;
+    const cutoverAt = cutoverAtValue === undefined
+      ? null
+      : typeof cutoverAtValue === "string" && cutoverAtValue.length > 0
+        ? new Date(cutoverAtValue)
+        : null;
+    const hasRepeatedCutoverAt = Array.isArray(cutoverAtValue);
+    let cursor: { createdAt: string; id: string } | null = null;
+    if (req.query.cursor !== undefined) {
+      if (typeof req.query.cursor !== "string") {
+        res.status(400).json({ error: "Invalid conformance projection cursor" });
+        return;
+      }
       try {
         const decoded = JSON.parse(Buffer.from(req.query.cursor, "base64url").toString("utf8"));
-        if (typeof decoded.id !== "string" || typeof decoded.createdAt !== "string") throw new Error("invalid cursor");
+        if (
+          typeof decoded.id !== "string" ||
+          !z.string().uuid().safeParse(decoded.id).success ||
+          typeof decoded.createdAt !== "string"
+        ) throw new Error("invalid cursor");
         const createdAt = new Date(decoded.createdAt);
         if (Number.isNaN(createdAt.getTime())) throw new Error("invalid cursor");
-        cursor = { id: decoded.id, createdAt };
+        cursor = { id: decoded.id, createdAt: decoded.createdAt };
       } catch {
         res.status(400).json({ error: "Invalid conformance projection cursor" });
         return;
       }
     }
-    if (limit === null || (cutoverAt && Number.isNaN(cutoverAt.getTime()))) {
+    if (limit === null || hasRepeatedCutoverAt || (cutoverAtValue !== undefined && !cutoverAt) || (cutoverAt && Number.isNaN(cutoverAt.getTime()))) {
       res.status(400).json({ error: "Invalid conformance projection bounds" });
       return;
     }
 
     const childRows = await db
-      .select()
+      .select({
+        issue: issueRows,
+        createdAtText: sql<string>`${issueRows.createdAt}::text`,
+      })
       .from(issueRows)
       .where(and(
         eq(issueRows.companyId, parent.companyId),
         eq(issueRows.parentId, parent.id),
         cutoverAt ? gt(issueRows.createdAt, cutoverAt) : sql`true`,
         cursor
-          ? sql`(${issueRows.createdAt}, ${issueRows.id}) > (${cursor.createdAt}, ${cursor.id}::uuid)`
+          ? sql`(${issueRows.createdAt}, ${issueRows.id}) > (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`
           : sql`true`,
       ))
       .orderBy(asc(issueRows.createdAt), asc(issueRows.id))
       .limit(limit + 1);
     const hasMore = childRows.length > limit;
     const pageRows = childRows.slice(0, limit);
-    const visibleChildren = await filterIssuesForActor(req, pageRows);
+    const visibleChildren = await filterIssuesForActor(req, pageRows.map(({ issue }) => issue));
     const workspaceIds = visibleChildren
       .map((child) => child.executionWorkspaceId)
       .filter((id): id is string => Boolean(id));
@@ -12789,7 +12804,10 @@ export function issueRoutes(
     res.json({
       items,
       nextCursor: last
-        ? Buffer.from(JSON.stringify({ createdAt: last.createdAt, id: last.id })).toString("base64url")
+        ? Buffer.from(JSON.stringify({
+            createdAt: last.createdAtText,
+            id: last.issue.id,
+          })).toString("base64url")
         : null,
     });
   });

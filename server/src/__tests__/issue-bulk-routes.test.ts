@@ -285,16 +285,32 @@ describePostgres("bounded bulk issue read", () => {
   });
 
   it("rejects invalid conformance projection bounds", async () => {
+    const endpoint = `/api/issues/${conformanceParentId}/children/conformance`;
+    const invalidLimit = await request(app(board())).get(endpoint).query({ limit: "51" });
+    expect(invalidLimit.status, "limit").toBe(400);
+    const emptyCutover = await request(app(board())).get(endpoint).query({ cutoverAt: "" });
+    expect(emptyCutover.status, "empty cutoverAt").toBe(400);
+    const arrayCutover = await request(app(board())).get(
+      `${endpoint}?cutoverAt=${encodeURIComponent(conformanceChildCreatedAt.toISOString())}&cutoverAt=${encodeURIComponent(conformanceChildCreatedAt.toISOString())}`,
+    );
+    expect(arrayCutover.status, "array cutoverAt").toBe(400);
+  });
+
+  it("rejects malformed conformance cursors", async () => {
+    const cursor = Buffer.from(JSON.stringify({
+      createdAt: conformanceChildCreatedAt.toISOString(),
+      id: "not-a-uuid",
+    })).toString("base64url");
     const response = await request(app(board())).get(
       `/api/issues/${conformanceParentId}/children/conformance`,
-    ).query({ limit: "51" });
+    ).query({ cursor });
 
     expect(response.status).toBe(400);
   });
 
   it("applies cutover and cursor bounds to direct-child pages", async () => {
     const cursor = Buffer.from(JSON.stringify({
-      createdAt: conformanceChildCreatedAt.toISOString(),
+      createdAt: "2026-10-21T17:00:00.000000Z",
       id: conformanceChildId,
     })).toString("base64url");
     const response = await request(app(board())).get(
