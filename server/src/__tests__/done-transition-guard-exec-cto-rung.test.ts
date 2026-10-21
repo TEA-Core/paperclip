@@ -211,6 +211,7 @@ const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
 const coderLeId = "bbbbbbb2-0000-4000-8000-000000000002";
 const execCtoId = "ccccccc3-0000-4000-8000-000000000003";
 const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
+const supportReId = "eeeeeee5-0000-4000-8000-000000000005";
 const stage1 = "10000000-0000-4000-8000-000000000001";
 const stage2 = "20000000-0000-4000-8000-000000000002";
 const stage3 = "30000000-0000-4000-8000-000000000003";
@@ -561,6 +562,203 @@ describe("SUP-16532 ADR-072 close-ladder shape: ordered forward scan (ADR-102 M3
         }),
       }),
     );
+  });
+});
+
+describe("SUP-20529 Mechanism D re-seated rung ordering", () => {
+  const shape = {
+    stages: [
+      {
+        id: stage1,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [
+          { type: "agent", agentId: supportCrId },
+          { type: "agent", agentId: supportQaeId },
+        ],
+      },
+      {
+        id: stage2,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: supportQaeId }],
+      },
+      {
+        id: stage3,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: supportReId }],
+      },
+      {
+        id: "40000000-0000-4000-8000-000000000004",
+        type: "approval",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: execCtoId }],
+      },
+    ],
+  };
+  const allAgents = [
+    ...agents,
+    { id: supportCrId, name: "support-CR", role: "support" },
+    { id: supportReId, name: "support-RE", role: "support" },
+  ];
+  const decisions = [
+    {
+      id: "dec-20529-1",
+      stageId: stage1,
+      outcome: "approved",
+      actorAgentId: supportCrId,
+      actorUserId: null,
+      createdAt: new Date("2026-10-20T10:00:00Z"),
+    },
+    {
+      id: "dec-20529-2",
+      stageId: stage2,
+      outcome: "approved",
+      actorAgentId: supportQaeId,
+      actorUserId: null,
+      createdAt: new Date("2026-10-20T10:01:00Z"),
+    },
+    {
+      id: "dec-20529-3",
+      stageId: stage3,
+      outcome: "approved",
+      actorAgentId: supportReId,
+      actorUserId: null,
+      createdAt: new Date("2026-10-20T10:02:00Z"),
+    },
+    {
+      id: "dec-20529-4",
+      stageId: "40000000-0000-4000-8000-000000000004",
+      outcome: "approved",
+      actorAgentId: execCtoId,
+      actorUserId: null,
+      createdAt: new Date("2026-10-20T10:03:00Z"),
+    },
+  ];
+
+  beforeEach(() => {
+    vi.mocked(logActivity).mockClear();
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents: allAgents,
+      issueExecutionDecisions: decisions,
+    });
+  });
+
+  it("does not report the re-seated coder-LE rung out of order after a later in-order match", async () => {
+    const result = await findMissingAdr072CloseLadderStages(
+      mockDb,
+      "company-1",
+      "issue-1",
+      shape,
+      principalState(
+        [stage1, stage2, stage3, "40000000-0000-4000-8000-000000000004"],
+        coderLeId,
+      ),
+      null,
+    );
+    expect(result).toEqual({ missingStageLabels: [], outOfOrderStageLabels: [] });
+  });
+
+  it("allows the completed parent transition for the re-seated ladder", async () => {
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy: shape,
+        executionState: principalState(
+          [stage1, stage2, stage3, "40000000-0000-4000-8000-000000000004"],
+          coderLeId,
+        ),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(true);
+    expect(logActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+    );
+  });
+
+  it("keeps early independent approval out of order even after a later independent approval", async () => {
+    const finalStage = "40000000-0000-4000-8000-000000000004";
+    const approvalFirst = {
+      stages: [
+        { id: stage1, type: "approval", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage3, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: coderLeId }] },
+        { id: finalStage, type: "approval", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportReId }] },
+      ],
+    };
+    const executionState = principalState([stage1, stage2, stage3, finalStage], execCtoId);
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents: allAgents,
+      issueExecutionDecisions: [
+        { id: "dec-early-approval", stageId: stage1, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-10-20T10:00:00Z") },
+        { id: "dec-qae-review", stageId: stage2, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-10-20T10:01:00Z") },
+        { id: "dec-coder-review", stageId: stage3, outcome: "approved", actorAgentId: coderLeId, actorUserId: null, createdAt: new Date("2026-10-20T10:02:00Z") },
+        { id: "dec-late-approval", stageId: finalStage, outcome: "approved", actorAgentId: supportReId, actorUserId: null, createdAt: new Date("2026-10-20T10:03:00Z") },
+      ],
+    });
+
+    const shape = await findMissingAdr072CloseLadderStages(
+      mockDb, "company-1", "issue-1", approvalFirst, executionState, null,
+    );
+    expect(shape).toEqual({
+      missingStageLabels: [],
+      outOfOrderStageLabels: ["approval:exec-CTO"],
+    });
+
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      { ...issue, parentId: null, executionPolicy: approvalFirst, executionState },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+          ladderedChildCount: 2,
+        }),
+      }),
+    );
+  });
+
+  it("keeps an unmatched re-seated rung as a Mechanism D refusal", async () => {
+    const controlShape = {
+      stages: [
+        shape.stages[0],
+        shape.stages[3],
+      ],
+    };
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents: allAgents,
+      issueExecutionDecisions: [decisions[0], decisions[3]],
+    });
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      {
+        ...issue,
+        parentId: null,
+        executionPolicy: controlShape,
+        executionState: principalState(
+          [stage1, "40000000-0000-4000-8000-000000000004"],
+          coderLeId,
+        ),
+      },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("Mechanism D");
+    expect(result.reason).toContain("review:coder-LE");
   });
 });
 
