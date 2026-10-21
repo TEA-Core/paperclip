@@ -682,18 +682,22 @@ describe("issue validators", () => {
     expect(parsed.description).toBe("Line 1\n\nLine 2");
   });
 
-  it("normalizes escaped line breaks in thread summaries and documents", () => {
+  it("normalizes escaped line breaks in thread summaries", () => {
     const response = respondIssueThreadInteractionSchema.parse({
       answers: [],
       summaryMarkdown: "Summary\\n\\nNext action",
     });
-    const document = upsertIssueDocumentSchema.parse({
-      format: "markdown",
-      body: "# Plan\\n\\nShip it",
-    });
 
     expect(response.summaryMarkdown).toBe("Summary\n\nNext action");
-    expect(document.body).toBe("# Plan\n\nShip it");
+  });
+
+  it("preserves literal backslash escapes in issue documents", () => {
+    const document = upsertIssueDocumentSchema.parse({
+      format: "markdown",
+      body: String.raw`# Plan\n\nShip it\\t\[literal]`,
+    });
+
+    expect(document.body).toBe(String.raw`# Plan\n\nShip it\\t\[literal]`);
   });
 
   it("clamps oversized requestDepth values on create", () => {
