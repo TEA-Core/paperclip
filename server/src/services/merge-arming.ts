@@ -1253,6 +1253,7 @@ async function claimReceiptForPublication(
   issueId: string,
   pr: LinkedPullRequest,
   headSha: string,
+  requireDeliveryReceipt: boolean,
 ): Promise<DeliveryReceiptPublicationContext | ArmingOutcome | null> {
   const receipts = await db
     .select({ id: issueDeliveryReceipts.id, headSha: issueDeliveryReceipts.headSha })
@@ -1278,7 +1279,11 @@ async function claimReceiptForPublication(
       eq(issueDeliveryReceiptLinks.repo, pr.repo.toLowerCase()),
       eq(issueDeliveryReceiptLinks.pullRequestNumber, pr.number),
     ));
-  if (receipts.length === 0) return null;
+  if (receipts.length === 0) {
+    return requireDeliveryReceipt
+      ? { kind: "skipped", message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board delivery receipt for head ${headSha.slice(0, 7)}`, headSha }
+      : null;
+  }
   if (!receipts.some((receipt) => receipt.headSha === headSha)) {
     await db
       .update(issueDeliveryReceipts)
@@ -1305,7 +1310,11 @@ async function claimReceiptForPublication(
   if (lookup.kind === "claimed") {
     return { claim: lookup.claim };
   }
-  if (lookup.kind === "missing") return null;
+  if (lookup.kind === "missing") {
+    return requireDeliveryReceipt
+      ? { kind: "skipped", message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board delivery receipt for head ${headSha.slice(0, 7)}`, headSha }
+      : null;
+  }
   return {
     kind: "skipped",
     message: `status:skipped:delivery-receipt-${lookup.reason}: ${pr.displayName} is not authorized for head ${headSha.slice(0, 7)}`,
@@ -1349,6 +1358,34 @@ export interface PublishApprovalStatusOptions {
    */
   enforceDeliveryIdentity?: boolean;
   includeDrafts?: boolean;
+  /** Legacy or mismatched decision binding: require a board delivery receipt. */
+  requireDeliveryReceipt?: boolean;
+}
+
+/** Only the current decision's complete final preflight can replace a receipt. */
+export function readCertifiedFinalDelivery(executionState: Record<string, unknown> | null | undefined):
+  | { owner: string; repo: string; number: number; headSha: string; displayName: string; decisionId: string }
+  | undefined {
+  const delivery = (executionState?.approvalStatus as Record<string, unknown> | null | undefined)?.finalDelivery;
+  if (!delivery || typeof delivery !== "object") return undefined;
+  const fields = delivery as Record<string, unknown>;
+  if (
+    typeof executionState?.lastDecisionId !== "string" ||
+    fields.decisionId !== executionState.lastDecisionId ||
+    typeof fields.owner !== "string" || !fields.owner ||
+    typeof fields.repo !== "string" || !fields.repo ||
+    typeof fields.number !== "number" || !Number.isSafeInteger(fields.number) || fields.number <= 0 ||
+    typeof fields.headSha !== "string" || !fields.headSha
+  ) return undefined;
+  return {
+    owner: fields.owner,
+    repo: fields.repo,
+    number: fields.number,
+    headSha: fields.headSha,
+    displayName: typeof fields.displayName === "string" && fields.displayName
+      ? fields.displayName : `${fields.owner}/${fields.repo}#${fields.number}`,
+    decisionId: fields.decisionId,
+  };
 }
 
 /**
@@ -2260,6 +2297,7 @@ export async function publishApprovalStatus(
           draft: pr.draft,
         },
         headSha,
+        options?.requireDeliveryReceipt === true,
       );
       if (receipt && "kind" in receipt) return receipt;
       // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
@@ -2425,6 +2463,7 @@ export async function publishApprovalStatus(
       issueId,
       pr,
       headSha,
+      options?.requireDeliveryReceipt === true,
     );
     if (receipt && "kind" in receipt) return receipt;
     // SUP-16081 fix #2: retry the transient class (network/5xx/429) before

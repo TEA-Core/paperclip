@@ -758,7 +758,16 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const response = await request(createApp(db, boardActor(fixture.company)))
       .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
     expect(response.status).toBe(200);
-    expect((await fixture.read()).status).toBe("done");
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    const state = stored.executionState as Record<string, unknown>;
+    expect((state.approvalStatus as Record<string, unknown>).finalDelivery).toMatchObject({
+      owner: "TEA-Core",
+      repo: "paperclip",
+      number: fixture.pr.number,
+      headSha: fixture.pr.head.sha,
+      decisionId: state.lastDecisionId,
+    });
     expect(fixture.writes).toEqual([{
       url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
       body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),

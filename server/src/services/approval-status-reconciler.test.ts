@@ -633,6 +633,24 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     return externalObj;
   }
 
+  async function certifyIssue(issueId: string, headSha = NEW_HEAD, number = 42) {
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    const state = row!.executionState as Record<string, unknown>;
+    await db.update(issues).set({
+      executionState: {
+        ...state,
+        lastDecisionId: "decision-42",
+        approvalStatus: {
+          ...(state.approvalStatus as Record<string, unknown>),
+          finalDelivery: {
+            owner: "TEA-Core", repo: "paperclip", number, headSha,
+            displayName: `TEA-Core/paperclip#${number}`, decisionId: "decision-42",
+          },
+        },
+      },
+    }).where(eq(issues.id, issueId));
+  }
+
   /**
    * SUP-14715 D-B: give the card a resolvable delivery identity (its execution
    * workspace's branch + repo) so the ADR-091 D1 delivery-identity gate that a
@@ -800,6 +818,41 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
     });
 
+    it.each([
+      ["absent", false],
+      ["absent", true],
+      ["mismatched", false],
+      ["mismatched", true],
+    ] as const)("requires a receipt for %s decision binding before a healed stamp (receipt=%s)", async (binding, receipt) => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-new",
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT,
+            ...(binding === "mismatched" ? { finalDelivery: {
+              owner: "TEA-Core", repo: "paperclip", number: 42, headSha: NEW_HEAD,
+              displayName: "TEA-Core/paperclip#42", decisionId: "decision-old",
+            } } : {}),
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      if (receipt) await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
+      else await insertMention(issueId);
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.republished).toBe(receipt ? 1 : 0);
+      expect(summary.rearmed).toBe(receipt ? 1 : 0);
+      expect(postStatusCalls()).toHaveLength(receipt ? 1 : 0);
+      if (!receipt) expect(summary.skippedDetails.some((detail) => detail.includes("delivery-receipt-missing"))).toBe(true);
+    });
+
     it("publishes and re-arms the decision-bound PR when the certified head is unchanged", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
@@ -831,10 +884,47 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()[0]![0]).toBe(POST_STATUS_URL);
     });
 
+    it.each([false, true])("accepts a same-PR new head only after Guard A (already stamped=%s)", async (alreadyStamped) => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-42",
+          approvalStatus: {
+            publishedHeadSha: APPROVED_HEAD,
+            publishedAt: APPROVED_AT,
+            finalDelivery: {
+              owner: "TEA-Core", repo: "paperclip", number: 42, headSha: APPROVED_HEAD,
+              displayName: "TEA-Core/paperclip#42", decisionId: "decision-42",
+            },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      const sameBlob = { files: [{ filename: "a.ts", sha: "identical-blob", status: "modified" }] };
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: alreadyStamped
+          ? { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] }
+          : { state: "pending", statuses: [] } },
+        { url: APPROVED_DIFF_URL, body: sameBlob },
+        { url: LIVE_DIFF_URL, body: sameBlob },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.republished).toBe(alreadyStamped ? 0 : 1);
+      expect(summary.rearmed).toBe(1);
+      expect(postStatusCalls()).toHaveLength(alreadyStamped ? 0 : 1);
+      expect(mockGhFetch.mock.calls.map((call) => String(call[0]))).toContain(APPROVED_DIFF_URL);
+      expect(mockGhFetch.mock.calls.map((call) => String(call[0]))).toContain(LIVE_DIFF_URL);
+    });
+
     it("republishes exactly once when the status is missing on the live head", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);
       await insertMention(issueId);
+      await certifyIssue(issueId);
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -936,6 +1026,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     it("scans and evaluates the head of a zero-mention approved card via live workspace discovery (AC1)", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);
+      await certifyIssue(issueId);
       // NO external-object mention at all — the SUP-14737 / PR 455 shape. The card
       // still carries an approval anchor (approvedState().approvalStatus.publishedHeadSha)
       // and a delivery identity, so the widened candidate SQL now surfaces it.
@@ -1370,6 +1461,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       // admits it. The in-memory resolver picks the single open PR as the target.
       await insertMention(issueId, { state: "open", number: 42 });
       await insertMention(issueId, { state: "closed", number: 43 });
+      await certifyIssue(issueId);
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -1472,6 +1564,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId);
       await insertMention(issueId);
+      await certifyIssue(issueId, APPROVED_HEAD);
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -1782,6 +1875,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId);
       await insertMention(issueId);
+      await certifyIssue(issueId, APPROVED_HEAD);
 
       const ownDiff = [
         { filename: "server/src/a.ts", sha: "blobaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "modified" },
@@ -1812,6 +1906,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId);
       await insertMention(issueId);
+      await certifyIssue(issueId, APPROVED_HEAD);
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -2204,6 +2299,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorAgentId: AGENT_REVIEWER, actorUserId: null });
       await insertMention(issueId);
+      await certifyIssue(issueId);
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -2244,6 +2340,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorAgentId: AGENT_REVIEWER, actorUserId: null });
       await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorAgentId: AGENT_AUTHOR, actorUserId: null });
       await insertMention(issueId);
+      await certifyIssue(issueId);
 
       installRoutes([{ url: PR_URL, body: OPEN_PR_BODY }]);
       installRoutes([
@@ -3086,6 +3183,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId);
       await insertMention(issueId);
+      await certifyIssue(issueId);
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
@@ -3373,6 +3471,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId);
       await insertMention(issueId, { draft: true });
+      await certifyIssue(issueId);
 
       installRoutes([
         { url: PR_URL, body: { ...OPEN_PR_BODY, draft: false } },
@@ -6034,6 +6133,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     it("still selects and fetches a genuinely unhydrated PR with no error (negative test AC3)", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);
+      await certifyIssue(issueId, NEW_HEAD, 461);
       // Genuinely unhydrated: state=null, lastErrorCode=null (never attempted).
       const [phantom] = await db
         .insert(externalObjects)

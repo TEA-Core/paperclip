@@ -266,11 +266,14 @@ See `doc/project-repositories.md` for the API and UI contract.
 - `hidden_at` timestamptz null
 
 For a terminal approval, `execution_state.approvalStatus.finalDelivery` binds
-the approving decision to its certified pull request and head. Publish outcomes
-retain this binding, including failed first publishes. Board stamp recovery and
-the approval-status reconciler must publish against that same PR and head rather
-than a later delivery target. A delivery receipt is optional when no receipt row
-exists for the PR; an existing row must still authorize the published head.
+the approving decision to its certified pull request and head, including when
+the decision comes from a final-stage escalation. Publish outcomes retain this
+binding, including failed first publishes. Board stamp recovery and the
+approval-status reconciler may publish without a delivery receipt only when
+that binding matches the current decision and the same PR. Legacy or mismatched
+bindings require a board delivery receipt. An existing receipt for the PR must
+still authorize the published head. A later head on the certified PR may be
+re-stamped only after Guard A verifies unchanged content.
 
 Invariants:
 

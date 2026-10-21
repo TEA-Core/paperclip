@@ -198,6 +198,7 @@ import {
   parseRepoUrl,
   publishApprovalStatus,
   recordApprovalAnchor,
+  readCertifiedFinalDelivery,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   preflightFinalDelivery,
@@ -4689,16 +4690,7 @@ export function issueRoutes(
       // unresolvable decision-time head is a refusal with a named skipped
       // reason (ADR-091 D4: cannot verify -> refuse), never a fallback to the
       // live head.
-      const approvalStatus = candidate.executionState?.approvalStatus as {
-        finalDelivery?: {
-          owner: string; repo: string; number: number; headSha: string; displayName: string; decisionId?: string;
-        };
-      } | undefined;
-      const lastDecisionId = candidate.executionState?.lastDecisionId;
-      const certified =
-        approvalStatus?.finalDelivery?.decisionId && approvalStatus.finalDelivery.decisionId === lastDecisionId
-          ? approvalStatus.finalDelivery
-          : undefined;
+      const certified = readCertifiedFinalDelivery(candidate.executionState as Record<string, unknown> | undefined);
       const decisionHead: DecisionHeadResolution = certified
         ? { kind: "resolved", headSha: certified.headSha, displayName: certified.displayName, pr: certified }
         : await resolveApprovalDecisionHead(db, issue.companyId, issue.id, issueIdentifier, closingTransition);
@@ -4732,6 +4724,7 @@ export function issueRoutes(
             closingTransition: certified ? true : closingTransition,
             expectedHeadSha: decisionHead.headSha,
             expectedPr: certified,
+            requireDeliveryReceipt: !certified,
             enforceDeliveryIdentity: true,
           },
         );
@@ -11284,13 +11277,7 @@ export function issueRoutes(
 
     // The final preflight bound the approving decision to a specific PR/head.
     // Recovery must not silently replace it with a newly delivered PR.
-    const finalDelivery = approvalStatus?.finalDelivery as {
-      owner: string; repo: string; number: number; headSha: string; decisionId?: string;
-    } | undefined;
-    const certified =
-      finalDelivery?.decisionId && finalDelivery.decisionId === state.lastDecisionId
-        ? finalDelivery
-        : undefined;
+    const certified = readCertifiedFinalDelivery(state);
     const decisionHead = certified
       ? { kind: "resolved" as const, headSha: certified.headSha }
       : await resolveApprovalDecisionHead(db, issue.companyId, issue.id, identifier, true);
@@ -11314,6 +11301,7 @@ export function issueRoutes(
         closingTransition: true,
         expectedHeadSha: decisionHead.headSha,
         expectedPr: certified,
+        requireDeliveryReceipt: !certified,
         enforceDeliveryIdentity: true,
       },
     );
@@ -21563,6 +21551,20 @@ export function issueRoutes(
             // lock taken by the revalidation, so a stale verdict leaves both pending.
             afterResolveInTransaction: async (tx) => {
               terminalEscalationResolution.value = await applyEscalationApproval(tx as unknown as Db, deferredPostCommit);
+              if (terminalEscalationResolution.value && escalationCertifiedDelivery) {
+                const finalDelivery = {
+                  ...escalationCertifiedDelivery,
+                  decisionId: terminalEscalationResolution.value.decisionId,
+                };
+                await tx.update(issueRows).set({
+                  executionState: sql`jsonb_set(
+                    coalesce(${issueRows.executionState}, '{}'::jsonb),
+                    '{approvalStatus}',
+                    coalesce(${issueRows.executionState} -> 'approvalStatus', '{}'::jsonb)
+                      || jsonb_build_object('finalDelivery', ${JSON.stringify(finalDelivery)}::jsonb)
+                  )`,
+                }).where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+              }
             },
             beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
               const [lockedIssue] = await tx.select().from(issueRows)
