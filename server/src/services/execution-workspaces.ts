@@ -1584,7 +1584,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       && readNullableString(isRecord(product.metadata) ? product.metadata.mergedAt : null) !== null,
     );
     if (hasMergedMarker) return "merged_via_pr";
-    if (products.length > 0) return "unmerged";
     return "unknown";
   }
 

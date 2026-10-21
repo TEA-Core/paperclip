@@ -289,6 +289,8 @@ describePostgres("bounded bulk issue read", () => {
     expect(invalidLimit.status, "limit").toBe(400);
     const emptyCutover = await request(app(board())).get(endpoint).query({ cutoverAt: "" });
     expect(emptyCutover.status, "empty cutoverAt").toBe(400);
+    const invalidCutover = await request(app(board())).get(endpoint).query({ cutoverAt: "not-a-date" });
+    expect(invalidCutover.status, "invalid cutoverAt").toBe(400);
     const arrayCutover = await request(app(board())).get(
       `${endpoint}?cutoverAt=${encodeURIComponent(conformanceChildCreatedAt.toISOString())}&cutoverAt=${encodeURIComponent(conformanceChildCreatedAt.toISOString())}`,
     );
