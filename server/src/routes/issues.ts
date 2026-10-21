@@ -347,10 +347,7 @@ import {
   isBlockedWithoutBlockers,
 } from "../services/recovery/service.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
-import {
-  deriveExecutionWorkspaceDeliveryState,
-  STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS,
-} from "../services/execution-workspaces.js";
+import { STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS } from "../services/execution-workspaces.js";
 import { decisionTrainingService } from "../services/decision-training.js";
 import {
   ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
@@ -12361,13 +12358,7 @@ export function issueRoutes(
       .map((child) => child.executionWorkspaceId)
       .filter((id): id is string => Boolean(id));
     const visibleChildIds = visibleChildren.map((child) => child.id);
-    const [workspaceRows, productRows] = await Promise.all([
-      workspaceIds.length > 0
-        ? db.select().from(executionWorkspaces).where(and(
-            eq(executionWorkspaces.companyId, parent.companyId),
-            inArray(executionWorkspaces.id, workspaceIds),
-          ))
-        : Promise.resolve([]),
+    const [productRows, hydratedWorkspacesById] = await Promise.all([
       visibleChildren.length > 0
         ? db.select().from(issueWorkProducts).where(and(
             eq(issueWorkProducts.companyId, parent.companyId),
@@ -12375,43 +12366,26 @@ export function issueRoutes(
             eq(issueWorkProducts.type, "pull_request"),
           ))
         : Promise.resolve([]),
+      executionWorkspacesSvc.getByIds(parent.companyId, workspaceIds),
     ]);
-    const workspacesById = new Map(workspaceRows.map((workspace) => [workspace.id, workspace]));
     const productsByIssueId = new Map<string, ReturnType<typeof toIssueWorkProduct>[]>();
-    const deliveryProductsByIssueId = new Map<string, typeof productRows>();
     for (const product of productRows) {
       const list = productsByIssueId.get(product.issueId) ?? [];
       list.push(toIssueWorkProduct(product));
       productsByIssueId.set(product.issueId, list);
-      const deliveryProducts = deliveryProductsByIssueId.get(product.issueId) ?? [];
-      deliveryProducts.push(product);
-      deliveryProductsByIssueId.set(product.issueId, deliveryProducts);
     }
     const items = visibleChildren.map((child) => {
-      const workspace = child.executionWorkspaceId ? workspacesById.get(child.executionWorkspaceId) : null;
+      const workspace = child.executionWorkspaceId
+        ? hydratedWorkspacesById.get(child.executionWorkspaceId) ?? null
+        : null;
       const products = productsByIssueId.get(child.id) ?? [];
-      const deliveryProducts = deliveryProductsByIssueId.get(child.id) ?? [];
-      const hasMergedPullRequestProduct = deliveryProducts.some((product) =>
-        product.status === "merged"
-        && typeof product.metadata?.mergedAt === "string"
-        && product.metadata.mergedAt.trim().length > 0,
-      );
-      const hasUnmergedPullRequestProduct = deliveryProducts.some((product) =>
-        !(product.status === "merged"
-          && typeof product.metadata?.mergedAt === "string"
-          && product.metadata.mergedAt.trim().length > 0),
-      );
       return {
         id: child.id,
         identifier: child.identifier,
         currentExecutionWorkspace: workspace
           ? {
               branchName: workspace.branchName ?? null,
-              deliveryState: deriveExecutionWorkspaceDeliveryState({
-                hasMergedPullRequestProduct,
-                hasUnmergedPullRequestProduct,
-                aheadOfBase: false,
-              }),
+              deliveryState: workspace.deliveryState,
             }
           : null,
         workProducts: products,

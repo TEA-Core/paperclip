@@ -2609,6 +2609,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       );
     },
 
+    getByIds: async (companyId: string, ids: string[]) => {
+      if (ids.length === 0) return new Map<string, ExecutionWorkspace>();
+      const rows = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(and(eq(executionWorkspaces.companyId, companyId), inArray(executionWorkspaces.id, ids)));
+      const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, companyId, rows);
+      return new Map(
+        rows.map((row) => [
+          row.id,
+          hydrateWorkspace(row, (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService)),
+        ]),
+      );
+    },
+
     getCloseReadiness: async (id: string): Promise<ExecutionWorkspaceCloseReadiness | null> => {
       const workspace = await db
         .select()
