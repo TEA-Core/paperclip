@@ -1648,7 +1648,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       status: "succeeded",
       contextSnapshot,
     });
-    await addSelectedChatFinal({
+    const finalComment = await addSelectedChatFinal({
       agentId: endpoint.assignedAgentId,
       body: "Setup round trip complete",
       companyId: endpoint.companyId,
@@ -1656,22 +1656,54 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       runId,
     });
     await service.processPendingPublications();
-    for (let turn = 0; turn < 4; turn += 1) {
+    const followUpWhere = and(
+      eq(chatDeliveries.endpointId, endpointId),
+      sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${setupFollowUpMessageId}`,
+    );
+    await waitFor(async () => {
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
       const [followUp] = await db
-        .select({ id: chatDeliveries.id })
+        .select({ id: chatDeliveries.id, state: chatDeliveries.state })
         .from(chatDeliveries)
-        .where(
-          and(
-            eq(chatDeliveries.endpointId, endpointId),
-            sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${setupFollowUpMessageId}`,
-          ),
-        );
+        .where(followUpWhere);
       if (followUp) await service.processPendingDeliveries(25, followUp.id);
       await service.processPendingPublications();
-    }
+      const [settled] = await db
+        .select({ state: chatDeliveries.state })
+        .from(chatDeliveries)
+        .where(followUpWhere);
+      expect(
+        settled?.state,
+        "setup follow-up delivery never reached processed",
+      ).toBe("processed");
+      const [publication] = await db
+        .select({ state: chatPublications.state })
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.endpointId, endpointId),
+            eq(chatPublications.commentId, finalComment.id),
+          ),
+        );
+      expect(
+        publication?.state,
+        "setup final publication never reached published",
+      ).toBe("published");
+      const [settledEndpoint] = await db
+        .select({
+          lastEventAt: chatEndpoints.lastEventAt,
+          setup: chatEndpoints.setup,
+        })
+        .from(chatEndpoints)
+        .where(eq(chatEndpoints.id, endpointId));
+      const testStartedAt = Date.parse(settledEndpoint?.setup.testStartedAt ?? "");
+      expect(
+        settledEndpoint?.lastEventAt?.getTime() ?? Number.NaN,
+        "setup endpoint lastEventAt never reached testStartedAt",
+      ).toBeGreaterThanOrEqual(testStartedAt);
+    });
     const providerRuntime = fakeRuntime.endpoints.get(endpointId);
     if (providerRuntime) providerRuntime.posts.length = 0;
   }
