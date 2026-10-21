@@ -641,7 +641,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
               executionState: {
                 ...(stored.executionState ?? {}),
                 ...(change === "recorded PR identity"
-                  ? { delivery: { ...stored.executionState?.delivery, prNumber: 43 } }
+                  ? { delivery: { ...(stored.executionState?.delivery as Record<string, unknown>), prNumber: 43 } }
                   : { currentStageId: randomUUID() }),
               },
               updatedAt: new Date(Date.now() + 60_000),
