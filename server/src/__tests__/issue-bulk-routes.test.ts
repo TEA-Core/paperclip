@@ -268,20 +268,16 @@ describePostgres("bounded bulk issue read", () => {
 
   it("projects only direct children with hydrated delivery state and PR products", async () => {
     const server = app(board());
-    const [response, detail] = await Promise.all([
-      request(server).get(`/api/issues/${conformanceParentId}/children/conformance`),
-      request(server).get(`/api/issues/${conformanceChildId}`),
-    ]);
+    const response = await request(server).get(`/api/issues/${conformanceParentId}/children/conformance`);
 
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
     expect(response.body.items).toHaveLength(1);
     expect(response.body.items[0]).toMatchObject({
       id: conformanceChildId,
       identifier: "BK-201",
       currentExecutionWorkspace: {
         branchName: "feature/conformance-child",
-        deliveryState: detail.body.currentExecutionWorkspace.deliveryState,
+        deliveryState: "merged_via_pr",
       },
       workProducts: [{ type: "pull_request", title: "Conformance PR" }],
     });

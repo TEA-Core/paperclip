@@ -1576,6 +1576,18 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .limit(100);
   }
 
+  function deriveRecordedDeliveryState(
+    products: Array<{ status: string; metadata: unknown }>,
+  ): ExecutionWorkspaceDeliveryState {
+    const hasMergedMarker = products.some((product) =>
+      product.status === "merged"
+      && readNullableString(isRecord(product.metadata) ? product.metadata.mergedAt : null) !== null,
+    );
+    if (hasMergedMarker) return "merged_via_pr";
+    if (products.length > 0) return "unmerged";
+    return "unknown";
+  }
+
   async function assessDelivery(
     workspace: ExecutionWorkspaceRow,
     git: ExecutionWorkspaceCloseGitReadiness | null,
@@ -2615,11 +2627,34 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .select()
         .from(executionWorkspaces)
         .where(and(eq(executionWorkspaces.companyId, companyId), inArray(executionWorkspaces.id, ids)));
+      const sourceIssueIds = rows
+        .map((row) => row.sourceIssueId)
+        .filter((id): id is string => Boolean(id));
+      const products = sourceIssueIds.length > 0
+        ? await db
+          .select({ issueId: issueWorkProducts.issueId, status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+          .from(issueWorkProducts)
+          .where(and(
+            eq(issueWorkProducts.companyId, companyId),
+            eq(issueWorkProducts.type, "pull_request"),
+            inArray(issueWorkProducts.issueId, sourceIssueIds),
+          ))
+        : [];
+      const productsByIssueId = new Map<string, Array<{ status: string; metadata: unknown }>>();
+      for (const product of products) {
+        const issueProducts = productsByIssueId.get(product.issueId) ?? [];
+        issueProducts.push(product);
+        productsByIssueId.set(product.issueId, issueProducts);
+      }
       const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, companyId, rows);
       return new Map(
         rows.map((row) => [
           row.id,
-          hydrateWorkspace(row, (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService)),
+          toExecutionWorkspace(
+            row,
+            (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
+            deriveRecordedDeliveryState(productsByIssueId.get(row.sourceIssueId ?? "") ?? []),
+          ),
         ]),
       );
     },
