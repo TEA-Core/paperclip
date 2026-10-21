@@ -107,7 +107,13 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
         return {
           ok: true,
           status: 200,
-          json: async () => ({ state: "open", head: { ref: DELIVERY_BRANCH, sha: HEAD_SHA } }),
+          json: async () => ({
+            state: "open",
+            draft: false,
+            merged: false,
+            title: `SUP-676: the delivery`,
+            head: { ref: DELIVERY_BRANCH, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } },
+          }),
         } as unknown as Response;
       }
       if (url === `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`) {
