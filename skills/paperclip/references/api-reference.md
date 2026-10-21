@@ -107,6 +107,17 @@ POST /api/companies/company-1/exports
 }
 ```
 
+**Bulk issue polling.** `GET /api/companies/:companyId/issues/bulk?identifiers=SUP-1,SUP-2` accepts
+`identifiers` or `ids` (UUIDs), not both. Send 1–50 comma-separated keys per
+request. The response is `{ "issues": [/* compact list rows in requested order */],
+"missing": [/* absent or unreadable keys */] }`; duplicate keys appear once.
+List visibility and issue-read authorization apply. The projection includes
+`id`, `identifier`, `status`, `title`, `priority`, assignee IDs, and list fields,
+but not ancestors, issue documents, work products, or workspace hydration.
+Invalid requests return `400`; exceeding 30 requests per token per minute
+returns `429` and `Retry-After`. Batch pollers should use this route instead
+of calling `GET /api/issues/:id` for each key.
+
 ### Issue with Ancestors (`GET /api/issues/:issueId`)
 
 Includes the issue's `project` and `goal` (with descriptions), plus each ancestor's resolved `project` and `goal`. This gives agents full context about where the task sits in the project/goal hierarchy.

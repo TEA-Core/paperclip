@@ -3853,6 +3853,29 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/issues/bulk",
+  tags: ["issues"],
+  summary: "Read up to 50 issues by ID or identifier for pollers",
+  description:
+    "Pass exactly one of `ids` or `identifiers` as 1–50 comma-separated keys. Returns `{ issues: CompactIssue[], missing: string[] }`, with issues in request order; unknown and unreadable keys both appear in missing. Uses list visibility (plugin-operation issues included) and issue-read authorization without detail hydration. Each token has a 30-request-per-minute budget; 429 includes Retry-After.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      ids: z.string().optional(),
+      identifiers: z.string().optional(),
+    }),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    429: { description: "Per-token bulk read budget exceeded (Retry-After header)" },
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
