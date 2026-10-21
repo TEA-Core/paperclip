@@ -541,6 +541,52 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }]);
   });
 
+  it("closes a final approval comment after its requested run interruption", async () => {
+    const fixture = await pendingDelivery({ mergeArmingEnabled: true });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.company.id,
+      agentId: (await fixture.read()).createdByAgentId!,
+      status: "running",
+      contextSnapshot: { issueId: fixture.issue.id },
+    }).returning();
+    const beforeInterrupt = new Date(Date.now() - 60_000);
+    await db.update(issues).set({
+      executionRunId: run!.id,
+      checkoutRunId: run!.id,
+      executionLockedAt: beforeInterrupt,
+      updatedAt: beforeInterrupt,
+    }).where(eq(issues.id, fixture.issue.id));
+
+    let response!: request.Response;
+    await withIssueTrigger(
+      "comment_interrupt_updated_at",
+      "OLD.execution_run_id IS NOT NULL AND NEW.execution_run_id IS NULL",
+      "NEW.updated_at := clock_timestamp() + interval '1 minute'; return NEW;",
+      async () => {
+        response = await request(createApp(db, boardActor(fixture.company)))
+          .post(`/api/issues/${fixture.issue.id}/comments`)
+          .send({ body: "## Review: APPROVED\n\nIndependent final review.", interrupt: true });
+      },
+    );
+
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    const stored = await fixture.read();
+    expect(stored.updatedAt.getTime()).toBeGreaterThan(beforeInterrupt.getTime());
+    expect(stored.status).toBe("done");
+    expect(stored.executionRunId).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)))[0]?.status).toBe("cancelled");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([
+      expect.objectContaining({ issueId: fixture.issue.id, outcome: "approved" }),
+    ]);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id))).toEqual(
+      expect.arrayContaining([expect.objectContaining({ body: "## Review: APPROVED\n\nIndependent final review." })]),
+    );
+    expect(fixture.writes).toEqual([{
+      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+    }]);
+  });
+
   it("refuses a final approval comment when the delivery branch changes after external preflight", async () => {
     const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
     const before = await fixture.read();

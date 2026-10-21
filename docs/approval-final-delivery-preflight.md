@@ -12,6 +12,8 @@ All five terminal approval doors resolve the delivery verdict (bounded by a 20 s
 
 Agent mutation authorization can adopt a stale checkout into the request's live run before PATCH's first certificate. The pre-certificate guard permits only that exact run-link transition when the resulting issue timestamp equals its execution-lock timestamp; unrelated card or delivery changes still refuse. The locked guard compares the resulting certificate to the issue and binding at commit, including any later `updatedAt` change.
 
+An approval comment that interrupts an active run reloads the issue after cancellation releases the run links and may update `updatedAt`. It evaluates the review stage and certifies delivery from that post-interrupt row. A later change during the external preflight still fails the locked recheck.
+
 The check runs on the PATCH verdict, board stage-decision, auto-approval comment, recovery decision, and final escalation-accept routes. Repository-free doc/gate cards retain their existing close semantics. Sanctioned no-deliverable-head overrides remain subject to the existing done guard; they do not bypass ladder or tier requirements.
 
 ## Certification and publication

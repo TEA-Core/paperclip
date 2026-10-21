@@ -23138,6 +23138,11 @@ export function issueRoutes(
               operatorInterrupted: true,
             },
           });
+          // Cancellation may release run links and bump updatedAt. Certify the
+          // post-interrupt row; the locked preflight still catches later writes.
+          const afterInterrupt = await svc.getById(currentIssue.id);
+          if (!afterInterrupt) throw notFound("Issue not found");
+          currentIssue = afterInterrupt;
         }
       }
     }
