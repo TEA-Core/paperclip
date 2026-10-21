@@ -1622,15 +1622,17 @@ export async function findMissingAdr072CloseLadderStages(
   const missingStageLabels: string[] = [];
   const outOfOrderStageLabels: string[] = [];
   for (let i = 0; i < requirementCount; i += 1) {
-    // An out-of-order sighting is a permanent violation, not a transient one:
-    // once a requirement's only stage lands before an earlier-required stage,
-    // a later duplicate of that same requirement matching in order must NOT
-    // erase the finding. Reporting it regardless of the final cursor is what
-    // keeps `support-QAE -> exec-CTO -> coder-LE -> exec-CTO` an ordering
-    // violation instead of silently accepting the trailing exec-CTO.
+    // An out-of-order approval remains a violation even if a later duplicate
+    // matches in order: the approver signed before the Definition-of-Done reviews.
+    // Only a re-seated review rung seen early can be discharged by a later
+    // in-order match, so an earlier generic review does not poison that rung.
     if (
       matchedOutOfOrder.has(i) &&
-      !(principalUrlKeys.has(ADR072_CLOSE_LADDER[i].agentUrlKey) && i < cursor)
+      !(
+        ADR072_CLOSE_LADDER[i].stageType === "review" &&
+        principalUrlKeys.has(ADR072_CLOSE_LADDER[i].agentUrlKey) &&
+        i < cursor
+      )
     ) {
       outOfOrderStageLabels.push(ADR072_CLOSE_LADDER[i].label);
       continue;

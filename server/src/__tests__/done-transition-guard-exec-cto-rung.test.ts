@@ -682,6 +682,55 @@ describe("SUP-20529 Mechanism D re-seated rung ordering", () => {
     );
   });
 
+  it("keeps early independent approval out of order even after a later independent approval", async () => {
+    const finalStage = "40000000-0000-4000-8000-000000000004";
+    const approvalFirst = {
+      stages: [
+        { id: stage1, type: "approval", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage3, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: coderLeId }] },
+        { id: finalStage, type: "approval", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportReId }] },
+      ],
+    };
+    const executionState = principalState([stage1, stage2, stage3, finalStage], execCtoId);
+    setupDbMock({
+      issues: twoLadderedChildren,
+      agents: allAgents,
+      issueExecutionDecisions: [
+        { id: "dec-early-approval", stageId: stage1, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-10-20T10:00:00Z") },
+        { id: "dec-qae-review", stageId: stage2, outcome: "approved", actorAgentId: supportQaeId, actorUserId: null, createdAt: new Date("2026-10-20T10:01:00Z") },
+        { id: "dec-coder-review", stageId: stage3, outcome: "approved", actorAgentId: coderLeId, actorUserId: null, createdAt: new Date("2026-10-20T10:02:00Z") },
+        { id: "dec-late-approval", stageId: finalStage, outcome: "approved", actorAgentId: supportReId, actorUserId: null, createdAt: new Date("2026-10-20T10:03:00Z") },
+      ],
+    });
+
+    const shape = await findMissingAdr072CloseLadderStages(
+      mockDb, "company-1", "issue-1", approvalFirst, executionState, null,
+    );
+    expect(shape).toEqual({
+      missingStageLabels: [],
+      outOfOrderStageLabels: ["approval:exec-CTO"],
+    });
+
+    const result = await evaluateDoneTransitionGuard(
+      mockDb,
+      { ...issue, parentId: null, executionPolicy: approvalFirst, executionState },
+      null,
+    );
+    expect(result.allowed).toBe(false);
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.done_transition_ladder_shape_refused",
+        details: expect.objectContaining({
+          missingStageLabels: [],
+          outOfOrderStageLabels: ["approval:exec-CTO"],
+          ladderedChildCount: 2,
+        }),
+      }),
+    );
+  });
+
   it("keeps an unmatched re-seated rung as a Mechanism D refusal", async () => {
     const controlShape = {
       stages: [
