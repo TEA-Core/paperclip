@@ -34,6 +34,7 @@ import {
   fetchOpenPullRequests,
   isTransientHttpStatus,
   isTransientReadStatus,
+  ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
   publishApprovalStatus,
@@ -214,6 +215,12 @@ describe("ladderIsTerminallyApproved", () => {
     expect(
       ladderIsTerminallyApproved(phasedPolicy, { completedStageIds: [A], lastDecisionOutcome: "approved" }),
     ).toBe(true);
+  });
+
+  it("lists only incomplete pre-merge stages in refusal diagnostics", () => {
+    const phasedPolicy = { stages: [{ id: A }, { id: B, phase: "post_merge" as const }, { id: "stage-c" }] };
+    expect(ladderIncompleteStageIds(phasedPolicy, { completedStageIds: [A] })).toEqual(["stage-c"]);
+    expect(ladderIncompleteStageIds(phasedPolicy, { completedStageIds: [A, "stage-c"] })).toEqual([]);
   });
 
   it("still requires every explicit or implicit pre-merge stage", () => {

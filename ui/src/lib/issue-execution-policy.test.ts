@@ -37,6 +37,35 @@ describe("buildExecutionPolicy", () => {
     }
   });
 
+  it("preserves each existing stage's phase when reviewers/approvers are re-saved", () => {
+    const existingPolicy = {
+      mode: "normal" as const,
+      commentRequired: true,
+      stages: [
+        {
+          id: "00000000-0000-4000-8000-0000000000a1",
+          type: "review" as const,
+          approvalsNeeded: 1 as const,
+          phase: "post_merge" as const,
+          participants: [{ id: "00000000-0000-4000-8000-0000000000b1", type: "agent" as const, agentId: AGENT_ID, userId: null }],
+        },
+        {
+          id: "00000000-0000-4000-8000-0000000000a2",
+          type: "approval" as const,
+          approvalsNeeded: 1 as const,
+          participants: [{ id: "00000000-0000-4000-8000-0000000000b2", type: "user" as const, agentId: null, userId: "local-board" }],
+        },
+      ],
+    };
+    const policy = buildExecutionPolicy({
+      existingPolicy,
+      reviewerValues: [`agent:${AGENT_ID}`],
+      approverValues: ["user:local-board"],
+    });
+    expect(policy?.stages.map((stage) => stage.phase)).toEqual(["post_merge", undefined]);
+    expect(issueExecutionPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
   it("omits empty stages from the payload so the API's write boundary does not reject it", () => {
     const policy = buildExecutionPolicy({
       existingPolicy: null,

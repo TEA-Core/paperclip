@@ -92,6 +92,7 @@ export function buildExecutionPolicy(input: {
       id: existingReviewStage?.id ?? newId(),
       type: "review" as const,
       approvalsNeeded: 1 as const,
+      ...(existingReviewStage?.phase ? { phase: existingReviewStage.phase } : {}),
       participants: reviewParticipants,
     });
   }
@@ -103,6 +104,7 @@ export function buildExecutionPolicy(input: {
       id: existingApprovalStage?.id ?? newId(),
       type: "approval" as const,
       approvalsNeeded: 1 as const,
+      ...(existingApprovalStage?.phase ? { phase: existingApprovalStage.phase } : {}),
       participants: approvalParticipants,
     });
   }

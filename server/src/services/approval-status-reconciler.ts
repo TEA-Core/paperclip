@@ -17,6 +17,7 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { issueService } from "./issues.js";
 import {
   armMergeOnApproval,
+  ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   narrowToDelivered,
   postPullRequestComment,
@@ -2695,9 +2696,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     | { completedStageIds?: string[]; lastDecisionOutcome?: string | null }
     | null;
   if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) {
-    const policyStages = ladderPolicy?.stages ?? [];
-    const completedIds = ladderState?.completedStageIds ?? [];
-    const incompleteIds = policyStages.filter((s) => !completedIds.includes(s.id)).map((s) => s.id);
+    const incompleteIds = ladderIncompleteStageIds(ladderPolicy, ladderState);
     return {
       kind: "skipped",
       reason: "non-terminal-ladder",

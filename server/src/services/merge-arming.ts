@@ -72,10 +72,17 @@ export function ladderIsTerminallyApproved(
   policy: { stages?: Array<Pick<IssueExecutionStage, "id" | "phase">> } | null | undefined,
   state: { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | null | undefined,
 ): boolean {
-  const policyStages = policy?.stages ?? [];
+  return ladderIncompleteStageIds(policy, state).length === 0 && state?.lastDecisionOutcome === "approved";
+}
+
+export function ladderIncompleteStageIds(
+  policy: { stages?: Array<Pick<IssueExecutionStage, "id" | "phase">> } | null | undefined,
+  state: { completedStageIds?: string[] } | null | undefined,
+): string[] {
   const completedIds = state?.completedStageIds ?? [];
-  const allCompleted = policyStages.every((s) => s.phase === "post_merge" || completedIds.includes(s.id));
-  return allCompleted && state?.lastDecisionOutcome === "approved";
+  return (policy?.stages ?? [])
+    .filter((s) => s.phase !== "post_merge" && !completedIds.includes(s.id))
+    .map((s) => s.id);
 }
 
 export interface ArmingOutcome {
@@ -4073,12 +4080,9 @@ export async function armMergeOnApproval(
   // inline copy — the same check that gates the routes arming write and the
   // reconciler's delegated re-publish.
   if (!ladderIsTerminallyApproved(policy, state)) {
-    const policyStages = policy?.stages ?? [];
-    const completedIds = state?.completedStageIds ?? [];
-    const incompleteIds = policyStages.filter((s) => !completedIds.includes(s.id)).map((s) => s.id);
     return {
       kind: "skipped",
-      message: `skipped:owner-not-approved: incomplete review/approval stages: ${incompleteIds.join(", ")}`,
+      message: `skipped:owner-not-approved: incomplete review/approval stages: ${ladderIncompleteStageIds(policy, state).join(", ")}`,
     };
   }
 
