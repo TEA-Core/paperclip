@@ -148,6 +148,20 @@ configuration fails closed.
 | `PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION` | `0` | Allow auto-generating a master key when none exists |
 | `PAPERCLIP_SECRETS_STRICT_MODE` | `false` | Require secret refs for sensitive env vars |
 
+## Token Signing
+
+These are not independent keys. `PAPERCLIP_AGENT_JWT_SECRET` and `BETTER_AUTH_SECRET` are
+shared masters whose derived keys sign agent run JWTs, runtime-tools tokens, and board/user
+login sessions. Read [Rotation Blast Radius](rotation-blast-radius.md) before rotating
+either one.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_AGENT_JWT_SECRET` | (unset) | HMAC master for agent run JWTs and runtime-tools tokens. Falls back to `BETTER_AUTH_SECRET` when unset; when neither is set, JWT minting is unavailable. |
+| `PAPERCLIP_AGENT_JWT_TTL_SECONDS` | `172800` (48h) | Agent run JWT lifetime. Tokens are minted once at adapter spawn, so a rotation cannot refresh an already-running session. |
+| `BETTER_AUTH_SECRET` | (unset) | HMAC master for Better Auth login sessions. Falls back to `PAPERCLIP_AGENT_JWT_SECRET`, the reverse of the order above — set both to keep a JWT rotation from logging every board user out. |
+| `PAPERCLIP_GITHUB_MANAGED_EXECUTION` | (unset) | Opt-in for managed run-identity GitHub execution on local and SSH lanes, which stay in host mode otherwise (fold decision D1). On only when the value is exactly `on`. Leaving it on and then turning it off leaves `github_credentials` capabilities minted with a 30-day lifetime; see the rotation runbook. |
+
 ## Agent Runtime (Injected into agent processes)
 
 These are set automatically by the server when invoking agents:
