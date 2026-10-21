@@ -3969,7 +3969,7 @@ registry.registerPath({
   path: "/api/issues/{id}/children/conformance",
   tags: ["issues"],
   summary: "List bounded direct-child conformance projections",
-  description: "Returns at most 50 authorization-visible direct children, ordered by (createdAt,id). Optional cutoverAt includes only newer children; cursor is an opaque continuation token.",
+  description: "Returns a versioned bounded projection of at most 50 authorization-visible direct children, ordered by (createdAt,id). Each item contains only the child id/identifier, workspace branch and delivery state, and authorized pull-request work products. Optional cutoverAt includes only newer children; cursor is an opaque continuation token.",
   request: {
     params: z.object({ id: z.string() }),
     query: z.object({
