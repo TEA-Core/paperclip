@@ -1357,6 +1357,11 @@ export interface PublishApprovalStatusOptions {
   includeDrafts?: boolean;
   /** Legacy or mismatched decision binding: require a board delivery receipt. */
   requireDeliveryReceipt?: boolean;
+  /** Guard A or an authorized done-card delta review certifies this exact PR/head.
+   * Replaces only the stale head of an existing delivery binding, never its
+   * repository, branch, source card, or PR identity. Requires expectedHeadSha.
+   */
+  headCertification?: { owner: string; repo: string; number: number; headSha: string };
 }
 
 /** Only the current decision's complete final preflight can replace a receipt. */
@@ -2110,6 +2115,19 @@ export async function publishApprovalStatus(
   options?: PublishApprovalStatusOptions,
 ): Promise<ArmingOutcome> {
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
+  const certification = options?.headCertification;
+  if (certification) {
+    if (!options.expectedHeadSha || certification.headSha !== options.expectedHeadSha
+      || (deliveryIdentity.repo && (
+        certification.owner.toLowerCase() !== deliveryIdentity.repo.owner.toLowerCase()
+        || certification.repo.toLowerCase() !== deliveryIdentity.repo.repo.toLowerCase()))
+      || (deliveryIdentity.binding && certification.number !== deliveryIdentity.binding.prNumber)) {
+      return { kind: "skipped", message: "status:skipped:invalid-head-certification" };
+    }
+    if (deliveryIdentity.binding) {
+      deliveryIdentity.binding = { ...deliveryIdentity.binding, headSha: certification.headSha };
+    }
+  }
   const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId, {
     includeDrafts: options?.includeDrafts === true,
   });
@@ -2137,7 +2155,7 @@ export async function publishApprovalStatus(
   if (deliveryIdentity.recordedUnusable) {
     return deliveryIdentityUnresolvedOutcome(null, deliveryIdentity.recordedUnusable);
   }
-  if (options?.enforceDeliveryIdentity && linkedPRs.length > 0) {
+  if (options?.enforceDeliveryIdentity && linkedPRs.length > 0 && !boundPR) {
     const narrowed = await narrowToDelivered(db, companyId, issueId, linkedPRs);
     // ADR-091 D4: fail closed when the card's delivery identity cannot be
     // positively resolved — refuse to stamp on an unverified branch.
@@ -2154,6 +2172,12 @@ export async function publishApprovalStatus(
     }
 
     authorizingPRs = narrowed.delivered;
+  }
+  if (certification && authorizingPRs.length > 0 && (authorizingPRs.length !== 1
+    || authorizingPRs[0]!.number !== certification.number
+    || authorizingPRs[0]!.owner.toLowerCase() !== certification.owner.toLowerCase()
+    || authorizingPRs[0]!.repo.toLowerCase() !== certification.repo.toLowerCase())) {
+    return { kind: "skipped", message: "status:skipped:head-certification-pr-mismatch" };
   }
 
   if (authorizingLinkedPRs.length === 0) {
@@ -2205,6 +2229,12 @@ export async function publishApprovalStatus(
         );
       }
       matched = narrowed.delivered;
+    }
+    if (certification && matched.length > 0 && (matched.length !== 1
+      || matched[0]!.number !== certification.number
+      || matched[0]!.owner.toLowerCase() !== certification.owner.toLowerCase()
+      || matched[0]!.repo.toLowerCase() !== certification.repo.toLowerCase())) {
+      return { kind: "skipped", message: "status:skipped:head-certification-pr-mismatch" };
     }
 
     if (matched.length > 1) {
@@ -2275,7 +2305,7 @@ export async function publishApprovalStatus(
           headSha,
         };
       }
-      const receipt = await claimReceiptForPublication(
+      const receipt = certification ? null : await claimReceiptForPublication(
         db,
         companyId,
         issueId,
@@ -2454,7 +2484,7 @@ export async function publishApprovalStatus(
         headSha,
       };
     }
-    const receipt = await claimReceiptForPublication(
+    const receipt = certification ? null : await claimReceiptForPublication(
       db,
       companyId,
       issueId,

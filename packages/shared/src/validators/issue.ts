@@ -1057,6 +1057,13 @@ export type IssueExecutionWorkspaceSettings = z.infer<
   typeof issueExecutionWorkspaceSettingsSchema
 >;
 
+export const approveIssueHeadSchema = z.object({
+  approvedHeadSha: z.string().regex(/^[0-9a-f]{40}$/),
+  headSha: z.string().regex(/^[0-9a-f]{40}$/),
+  reason: z.string().trim().min(1).max(4000),
+}).strict();
+export type ApproveIssueHead = z.infer<typeof approveIssueHeadSchema>;
+
 export const stalledReviewDecisionSchema = z
   .object({
     action: z.enum(["approve", "request_changes", "send_back"]),

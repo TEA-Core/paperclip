@@ -1966,6 +1966,8 @@ export {
   issueBlockedInboxStateSchema,
   updateIssueSchema,
   updateIssueObjectSchema,
+  approveIssueHeadSchema,
+  type ApproveIssueHead,
   stripCreateOnlyIssueAttribution,
   ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS,
   stalledReviewDecisionSchema,

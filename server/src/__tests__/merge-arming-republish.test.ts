@@ -64,7 +64,7 @@ if (!embeddedPostgresSupport.supported) {
  *
  * The first publish can skip for reasons only a human understands (a hand-merged
  * PR, a closed PR, a coordinating card that merely cited a PR, a head that moved
- * between approval and publish). This route is the only sanctioned recovery: it
+ * between approval and publish). This mechanical first-publish recovery
  * re-runs publishApprovalStatus verbatim — pinned to the decision-time head,
  * delivery-identity enforced — instead of a human hand-writing the status, which
  * would manufacture a fake approval. Board owner/admin only; an agent caller is
@@ -478,6 +478,195 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
     return { companyId, issueId, identifier, reviewerAgentId };
   }
+
+  const REVIEWED_HEAD = "a".repeat(40);
+  const REVIEW_HEAD = "b".repeat(40);
+  const REVIEW_BASE = "d".repeat(40);
+
+  async function seedHeadReview() {
+    const fixture = await seedIssue({
+      prePublishedHeadSha: REVIEWED_HEAD,
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    await db.update(issues).set({
+      status: "done",
+      executionState: {
+        ...issue!.executionState,
+        delivery: {
+          branch: DELIVERY_BRANCH, headSha: REVIEWED_HEAD,
+          repo: { owner: OWNER, repo: REPO }, prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+          sourceIssueId: fixture.issueId,
+        },
+      },
+    }).where(eq(issues.id, fixture.issueId));
+    return fixture;
+  }
+
+  function installHeadReviewTransport(options: { moveAtPublish?: boolean; branch?: string } = {}) {
+    let reads = 0;
+    mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+        reads++;
+        return createMockResponse({
+          state: "open", merged: false, draft: false,
+          html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+          head: { sha: options.moveAtPublish && reads > 1 ? "c".repeat(40) : REVIEW_HEAD, ref: options.branch ?? DELIVERY_BRANCH },
+          base: { sha: REVIEW_BASE },
+        });
+      }
+      if (url.includes("/compare/")) {
+        return createMockResponse({ files: [{
+          filename: "config.txt", status: "modified",
+          sha: url.endsWith(REVIEWED_HEAD) ? "reviewed-blob" : "revised-blob",
+          additions: 1, deletions: 1,
+          patch: `@@ -1 +1 @@\n-original\n+${url.endsWith(REVIEWED_HEAD) ? "reviewed" : "revised"}`,
+        }] });
+      }
+      if (url.includes("/git/commits/")) {
+        const sha = url.split("/").at(-1)!;
+        return createMockResponse({ sha, tree: { sha: `tree-${sha}` } });
+      }
+      if (url.endsWith(`/statuses/${REVIEW_HEAD}`) && init?.method === "POST") return createMockResponse({ id: 991 });
+      throw new Error(`Unexpected head-review request: ${url}`);
+    });
+  }
+
+  it.each(["board", "reviewer", "user-reviewer"])("approves exactly the reviewed new head as %s without reopening a completed ladder (SUP-20624)", async (principal) => {
+    const { companyId, issueId, reviewerAgentId } = await seedHeadReview();
+    currentActor = principal === "board" ? boardActor(companyId) : agentActor(companyId, reviewerAgentId);
+    if (principal === "user-reviewer") {
+      currentActor = boardActor(companyId);
+      await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.companyId, companyId));
+      await db.update(issueExecutionDecisions).set({ actorAgentId: null, actorUserId: USER_ID }).where(eq(issueExecutionDecisions.issueId, issueId));
+    }
+    installHeadReviewTransport();
+    const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const decisionsBefore = await db.select().from(issueExecutionDecisions);
+
+    const preview = await request(app).get(`/api/issues/${issueId}/merge-arming/head-review`);
+    expect(preview.status).toBe(200);
+    expect(preview.body).toMatchObject({
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD,
+      delta: { equivalence: null, files: [{ filename: "config.txt", approved: { sha: "reviewed-blob" }, live: { sha: "revised-blob" } }] },
+    });
+    expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: preview.body.approvedHeadSha, headSha: preview.body.headSha,
+      reason: "Reviewed the post-ladder config correction",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ outcome: "armed", headSha: REVIEW_HEAD });
+    const writes = mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(writes.map(([url]) => url)).toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${REVIEW_HEAD}`]);
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.status).toBe("done");
+    expect(after!.executionPolicy).toEqual(before!.executionPolicy);
+    const { approvalStatus: beforeApproval, ...beforeLadder } = before!.executionState!;
+    const { approvalStatus: afterApproval, ...afterLadder } = after!.executionState!;
+    expect(afterLadder).toEqual(beforeLadder);
+    expect(afterApproval).toMatchObject({ publishedHeadSha: REVIEW_HEAD, approvedHeadSha: REVIEW_HEAD });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual(decisionsBefore);
+    const events = await db.select().from(activityLog);
+    expect(events.find((event) => event.action === "issue.approval_head_decision")).toMatchObject({
+      actorType: principal === "reviewer" ? "agent" : "user",
+      actorId: principal === "reviewer" ? reviewerAgentId : USER_ID,
+      details: { headSha: REVIEW_HEAD, approvedHeadSha: REVIEWED_HEAD, reason: "Reviewed the post-ladder config correction" },
+    });
+  });
+
+  it("reviews a new head from a certified but never-published approval (SUP-20624)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    await db.execute(sql`update ${issues} set execution_state = jsonb_set(execution_state, '{approvalStatus}',
+      ${JSON.stringify({ approvedHeadSha: REVIEWED_HEAD, publishedHeadSha: null })}::jsonb) where id = ${issueId}`);
+    installHeadReviewTransport();
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed the newly delivered head",
+    });
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ outcome: "armed", headSha: REVIEW_HEAD });
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: REVIEW_HEAD });
+  });
+
+  it("approves an unbound delivery without authorizing another cited repository (SUP-20624)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    await db.execute(sql`update ${issues} set execution_state = jsonb_set(execution_state, '{delivery}',
+      (execution_state -> 'delivery') - 'prNumber' - 'prUrl' - 'sourceIssueId') where id = ${issueId}`);
+    const [citation] = await db.insert(externalObjects).values({
+      companyId, providerKey: "github", objectType: "pull_request",
+      externalId: "TEA-Core/another-repo#pull/99",
+      data: { state: "open", draft: false, headRef: "SUP-99999-other-card-branch" },
+    }).returning();
+    await db.insert(externalObjectMentions).values({
+      companyId, sourceIssueId: issueId, sourceKind: "comment", objectId: citation!.id,
+      objectType: "pull_request", providerKey: "github",
+    });
+    installHeadReviewTransport();
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed this card's delivery only",
+    });
+    expect(response.status).toBe(200);
+    expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([url]) => url))
+      .toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${REVIEW_HEAD}`]);
+  });
+
+  it.each(["unrelated-agent", "author", "cross-company", "board-member"])("refuses %s head approval before GitHub access (SUP-20624)", async (principal) => {
+    const { companyId, issueId } = await seedHeadReview();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const returnAssignee = issue!.executionPolicy!.returnAssigneeAgentId as string;
+    currentActor = principal === "board-member"
+      ? boardActor(companyId)
+      : agentActor(principal === "cross-company" ? randomUUID() : companyId, principal === "author" ? returnAssignee : randomUUID());
+    if (principal === "board-member") {
+      await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.companyId, companyId));
+    }
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Not an authorized reviewer",
+    });
+    expect(response.status).toBe(principal === "cross-company" ? 404 : 403);
+    expect(mockGhFetch).not.toHaveBeenCalled();
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.executionState).toEqual(issue!.executionState);
+  });
+
+  it.each(["not-done", "incomplete-ladder", "stale-anchor", "stale-head", "moved-at-publish", "foreign-branch"])("refuses unsafe %s head approval without a status write (SUP-20624)", async (scenario) => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    if (scenario === "not-done") await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+    if (scenario === "incomplete-ladder") await db.execute(sql`update ${issues} set execution_state = jsonb_set(execution_state, '{completedStageIds}', '[]'::jsonb) where id = ${issueId}`);
+    installHeadReviewTransport({ moveAtPublish: scenario === "moved-at-publish", branch: scenario === "foreign-branch" ? FOREIGN_BRANCH : undefined });
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: scenario === "stale-anchor" ? "e".repeat(40) : REVIEWED_HEAD,
+      headSha: scenario === "stale-head" ? "c".repeat(40) : REVIEW_HEAD,
+      reason: "Reviewed delta",
+    });
+    expect(response.status).toBe(409);
+    expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: REVIEWED_HEAD });
+  });
+
+  it("does not stamp a new head if its approval decision cannot be audited (SUP-20624)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    installHeadReviewTransport();
+    await rejectActivityLogInserts();
+    try {
+      const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+        approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed delta",
+      });
+      expect(response.status).toBe(500);
+      expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    } finally {
+      await allowActivityLogInserts();
+    }
+  });
 
   it("rejects an agent caller with 403 before any GitHub read or write", async () => {
     const { companyId, issueId, reviewerAgentId } = await seedIssue({
