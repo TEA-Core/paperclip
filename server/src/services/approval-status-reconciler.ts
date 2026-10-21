@@ -2988,11 +2988,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     expectedHeadSha: string;
     enforceDeliveryIdentity?: boolean;
     includeDrafts?: boolean;
-    requireDeliveryReceipt?: boolean;
   } = {
     expectedHeadSha: headSha,
     includeDrafts: true,
-    requireDeliveryReceipt: false,
   };
   // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1
   // delivery-identity gate never successfully ran for this head — the arming

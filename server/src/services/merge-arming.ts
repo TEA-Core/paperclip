@@ -1253,7 +1253,6 @@ async function claimReceiptForPublication(
   issueId: string,
   pr: LinkedPullRequest,
   headSha: string,
-  required: boolean,
 ): Promise<DeliveryReceiptPublicationContext | ArmingOutcome | null> {
   const receipts = await db
     .select({ id: issueDeliveryReceipts.id, headSha: issueDeliveryReceipts.headSha })
@@ -1279,15 +1278,7 @@ async function claimReceiptForPublication(
       eq(issueDeliveryReceiptLinks.repo, pr.repo.toLowerCase()),
       eq(issueDeliveryReceiptLinks.pullRequestNumber, pr.number),
     ));
-  if (receipts.length === 0) {
-    return required
-      ? {
-          kind: "skipped",
-          message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board-authorized receipt for head ${headSha.slice(0, 7)}`,
-          headSha,
-        }
-      : null;
-  }
+  if (receipts.length === 0) return null;
   if (!receipts.some((receipt) => receipt.headSha === headSha)) {
     await db
       .update(issueDeliveryReceipts)
@@ -1314,14 +1305,7 @@ async function claimReceiptForPublication(
   if (lookup.kind === "claimed") {
     return { claim: lookup.claim };
   }
-  if (lookup.kind === "missing" && !required) return null;
-  if (lookup.kind === "missing") {
-    return {
-      kind: "skipped",
-      message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board-authorized receipt for head ${headSha.slice(0, 7)}`,
-      headSha,
-    };
-  }
+  if (lookup.kind === "missing") return null;
   return {
     kind: "skipped",
     message: `status:skipped:delivery-receipt-${lookup.reason}: ${pr.displayName} is not authorized for head ${headSha.slice(0, 7)}`,
@@ -1365,7 +1349,6 @@ export interface PublishApprovalStatusOptions {
    */
   enforceDeliveryIdentity?: boolean;
   includeDrafts?: boolean;
-  requireDeliveryReceipt?: boolean;
 }
 
 /**
@@ -2277,7 +2260,6 @@ export async function publishApprovalStatus(
           draft: pr.draft,
         },
         headSha,
-        options?.requireDeliveryReceipt === true,
       );
       if (receipt && "kind" in receipt) return receipt;
       // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
@@ -2443,7 +2425,6 @@ export async function publishApprovalStatus(
       issueId,
       pr,
       headSha,
-      options?.requireDeliveryReceipt === true,
     );
     if (receipt && "kind" in receipt) return receipt;
     // SUP-16081 fix #2: retry the transient class (network/5xx/429) before

@@ -4733,7 +4733,6 @@ export function issueRoutes(
             expectedHeadSha: decisionHead.headSha,
             expectedPr: certified,
             enforceDeliveryIdentity: true,
-            requireDeliveryReceipt: false,
           },
         );
       } else {
@@ -11312,7 +11311,6 @@ export function issueRoutes(
         closingTransition: true,
         expectedHeadSha: decisionHead.headSha,
         enforceDeliveryIdentity: true,
-        requireDeliveryReceipt: false,
       },
     );
 
