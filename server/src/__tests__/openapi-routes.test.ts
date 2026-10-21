@@ -1628,7 +1628,7 @@ describe("openapi auth parity (SUP-14798)", () => {
   function hasAgentBearerAuth(route: string): boolean {
     const [method, routePath] = splitAuthRoute(route);
     const security = operation(method, routePath)?.security ?? [];
-    return security.some((req) => AGENT_BEARER in req);
+    return security.some((req: Record<string, unknown>) => AGENT_BEARER in req);
   }
 
   it("reproduces the issue's 54 board + 7 instance-admin closure counts", () => {

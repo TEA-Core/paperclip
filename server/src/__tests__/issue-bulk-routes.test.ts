@@ -283,6 +283,18 @@ describePostgres("bounded bulk issue read", () => {
     });
   });
 
+  it("projects a recorded non-merged PR as unmerged", async () => {
+    await db.update(issueWorkProducts).set({
+      status: "open",
+      metadata: {},
+    }).where(eq(issueWorkProducts.issueId, conformanceChildId));
+
+    const response = await request(app(board())).get(`/api/issues/${conformanceParentId}/children/conformance`);
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.items[0].currentExecutionWorkspace.deliveryState).toBe("unmerged");
+  });
+
   it("rejects invalid conformance projection bounds", async () => {
     const endpoint = `/api/issues/${conformanceParentId}/children/conformance`;
     const invalidLimit = await request(app(board())).get(endpoint).query({ limit: "51" });
