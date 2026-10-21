@@ -6,6 +6,7 @@ import {
 import type { NativeStatusDecision } from "./native-runtime/status-arbiter.js";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import {
+  activityLog,
   agentTaskSessions,
   agentWakeupRequests,
   heartbeatRuns,
@@ -111,7 +112,7 @@ export async function prepareConversationTurn(
 ) {
   const context = { ...(run.contextSnapshot ?? {}) };
   const issueId = typeof context.issueId === "string" ? context.issueId : null;
-  if (!issueId) return { context, reset: false, conversation: false };
+  if (!issueId) return { context, reset: false, duplicateReset: false, conversation: false };
   let publication: ActivityPublication | null = null;
   const result = await db.transaction(async (tx) => {
     const [issue] = await tx
@@ -120,7 +121,7 @@ export async function prepareConversationTurn(
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
       .for("update");
     if (!isConversation(issue))
-      return { context, reset: false, conversation: false };
+      return { context, reset: false, duplicateReset: false, conversation: false };
     const commentId =
       typeof context.wakeCommentId === "string"
         ? context.wakeCommentId
@@ -139,6 +140,29 @@ export async function prepareConversationTurn(
             ),
           )
       : [];
+    // An already-stamped /new was consumed. Only the run that stamped it (a crash/retry) may reset again.
+    if (
+      comment?.authorUserId &&
+      isConversationReset(comment.body) &&
+      comment.conversationSessionGeneration != null
+    ) {
+      const [stamp] = await tx
+        .select({ runId: activityLog.runId })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, run.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issue.id),
+            eq(activityLog.action, "issue.conversation_session_started"),
+            sql`${activityLog.details}->>'boundaryCommentId' = ${comment.id}`,
+          ),
+        )
+        .limit(1);
+      if (stamp && stamp.runId !== run.id) {
+        return { context, reset: false, duplicateReset: true, conversation: true };
+      }
+    }
     const reset = Boolean(
       comment && comment.authorUserId && isConversationReset(comment.body),
     );
@@ -215,7 +239,7 @@ export async function prepareConversationTurn(
       .update(heartbeatRuns)
       .set({ contextSnapshot: next })
       .where(eq(heartbeatRuns.id, run.id));
-    return { context: next, reset, conversation: true };
+    return { context: next, reset, duplicateReset: false, conversation: true };
   });
   if (publication) publishActivity(publication);
   return result;

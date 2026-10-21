@@ -342,19 +342,16 @@ const support = await getEmbeddedPostgresTestSupport();
       });
       const resetRun = await runFor(issue.id, command.id);
       expect((await prepareConversationTurn(db, resetRun)).reset).toBe(true);
-      expect(
+      const retried = await prepareConversationTurn(
+        db,
         (
-          await prepareConversationTurn(
-            db,
-            (
-              await db
-                .select()
-                .from(heartbeatRuns)
-                .where(eq(heartbeatRuns.id, resetRun.id))
-            )[0]!,
-          )
-        ).reset,
-      ).toBe(true);
+          await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, resetRun.id))
+        )[0]!,
+      );
+      expect(retried).toMatchObject({ reset: true, duplicateReset: false });
       const [current] = await db
         .select()
         .from(issues)
@@ -428,6 +425,102 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(
         await conversationReplay(db, companyId, issue.id, next.id),
       ).not.toContain("Following turn");
+    });
+    it("refuses a different run for a consumed /new even when it carries the stamped generation", async () => {
+      const issue = await create();
+      const command = await issueService(db).addComment(issue.id, "/new", {
+        userId: "local-board",
+      });
+      expect((await prepareConversationTurn(db, await runFor(issue.id, command.id))).reset).toBe(true);
+      const other = await runFor(issue.id, command.id, { conversationSessionGeneration: 1 });
+      expect(await prepareConversationTurn(db, other)).toMatchObject({
+        reset: false,
+        duplicateReset: true,
+      });
+    });
+    it("cancels a later run for an already-consumed /new without another reset snapshot", async () => {
+      const issue = await create();
+      const command = await issueService(db).addComment(issue.id, "/new", {
+        userId: "local-board",
+      });
+      const first = await runFor(issue.id, command.id);
+      const prepared = await prepareConversationTurn(db, first);
+      expect(prepared).toMatchObject({ reset: true, duplicateReset: false });
+      await db.insert(agentTaskSessions).values({
+        companyId,
+        agentId,
+        adapterType: "process",
+        taskKey: issue.id,
+        sessionDisplayId: "post-reset-session",
+      });
+      const second = await runFor(issue.id, command.id);
+      const duplicatePrepared = await prepareConversationTurn(db, second);
+      expect(duplicatePrepared).toMatchObject({ reset: false, duplicateReset: true });
+      expect(
+        await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, issue.id)),
+      ).toHaveLength(1);
+      const [stamped] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(stamped.conversationSessionGeneration).toBe(1);
+      await db.update(heartbeatRuns).set({
+        status: "succeeded",
+        finishedAt: new Date(),
+        contextSnapshot: { ...prepared.context, conversationReset: true },
+        resultJson: { conversationReset: true },
+      }).where(eq(heartbeatRuns.id, first.id));
+      await db.update(heartbeatRuns).set({
+        status: "cancelled",
+        finishedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, second.id));
+      const heartbeat = heartbeatService(db);
+      const adopted = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "issue_commented",
+        idempotencyKey: `duplicate-reset:${command.id}:${randomUUID()}`,
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+        payload: { issueId: issue.id, commentId: command.id },
+        contextSnapshot: {
+          issueId: issue.id,
+          taskKey: issue.id,
+          commentId: command.id,
+          wakeCommentId: command.id,
+          wakeCommentIds: [command.id],
+          source: "issue.comment",
+        },
+      });
+      expect(adopted?.id).toBeTruthy();
+      await heartbeat.drainActiveRunExecutions();
+      const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, adopted!.id));
+      expect(row).toMatchObject({
+        status: "cancelled",
+        errorCode: "conversation_reset_already_applied",
+      });
+      expect(row.contextSnapshot?.conversationReset).not.toBe(true);
+      expect(row.resultJson?.conversationReset).not.toBe(true);
+      const resets = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(resets.filter((run) =>
+        run.contextSnapshot?.issueId === issue.id && run.contextSnapshot?.conversationReset === true,
+      )).toHaveLength(1);
+      expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.conversationSessionGeneration).toBe(1);
+    });
+    it("stopping an in-flight /new turn as a board operator queues no recovery re-wake", async () => {
+      const issue = await create();
+      const command = await issueService(db).addComment(issue.id, "/new", { userId: "local-board" });
+      const run = await runFor(issue.id, command.id);
+      await db.update(issues).set({ status: "in_progress", executionRunId: run.id, executionAgentNameKey: "planner", executionLockedAt: new Date() }).where(eq(issues.id, issue.id));
+      const heartbeat = heartbeatService(db);
+      // Same options the board-only POST /heartbeat-runs/:runId/cancel route passes.
+      const stopped = await heartbeat.cancelRun(run.id, "Cancelled by a board operator", {
+        suppressImmediateRecovery: true,
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: "local-board" },
+      });
+      expect(stopped?.status).toBe("cancelled");
+      await heartbeat.drainActiveRunExecutions();
+      const others = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .filter((r) => r.id !== run.id && (r.contextSnapshot?.issueId === issue.id || r.retryOfRunId === run.id));
+      expect(others).toHaveLength(0);
+      expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.executionRunId).toBeNull();
     });
     it("projects the resolved chat plan review into fresh and resumed prompts without replaying old reviews", async () => {
       const issue = await create();
