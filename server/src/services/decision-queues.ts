@@ -16,6 +16,7 @@ import {
   issueWorkProducts,
   issues,
   joinRequests,
+  projects,
 } from "@paperclipai/db";
 import type {
   AttentionItem,
@@ -29,9 +30,12 @@ import { notFound, unprocessable } from "../errors.js";
 import { logActivityInTransaction } from "./activity-log.js";
 import {
   authorizationService,
+  createAuthorizationMemoContext,
   type AuthorizationActor,
   type AuthorizationResource,
 } from "./authorization.js";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type DecisionMutationActor = {
   actorType: "agent" | "user" | "system";
@@ -294,7 +298,7 @@ export async function canReadDecisionSource(
 ) {
   const source = await sourceIssueId(db, companyId, sourceKind, sourceId);
   if (!source.exists) return false;
-  const authz = authorizationService(db);
+  const authz = authorizationService(db, createAuthorizationMemoContext());
   if (source.issueId) {
     const resource = await loadIssueResource(db, companyId, source.issueId);
     if (!resource) return false;
@@ -363,6 +367,148 @@ function itemIssueId(item: AttentionItem) {
   return typeof metadataIssueId === "string" ? metadataIssueId : null;
 }
 
+// Sidecar membership is not authority. Resolve every source against current
+// company-owned rows before checking its (possibly missing/hidden) issue.
+async function readableQueueItems(
+  db: Db,
+  companyId: string,
+  actor: AuthorizationActor,
+  queueId?: string,
+) {
+  // Cast the sidecar key, not the source primary keys: PostgreSQL can retain
+  // index lookups for each source table without trusting malformed sidecars.
+  const sourceUuid = sql<string | null>`case when ${decisionQueueItems.sourceId} ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then ${decisionQueueItems.sourceId}::uuid end`;
+  const rows = await db.select({
+    item: decisionQueueItems,
+    approvalId: approvals.id,
+    approvalIssueId: issueApprovals.issueId,
+    decisionId: decisions.id,
+    decisionIssueId: decisions.originIssueId,
+    interactionId: issueThreadInteractions.id,
+    interactionIssueId: issueThreadInteractions.issueId,
+    recoveryId: issueRecoveryActions.id,
+    recoveryIssueId: issueRecoveryActions.sourceIssueId,
+    runId: heartbeatRuns.id,
+    runAgentId: heartbeatRuns.agentId,
+    runIssueId: sql<string | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'issueId') = 'string' then ${heartbeatRuns.contextSnapshot}->>'issueId' end`,
+    runTaskId: sql<string | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'taskId') = 'string' then ${heartbeatRuns.contextSnapshot}->>'taskId' end`,
+    agentId: agents.id,
+    joinId: joinRequests.id,
+    budgetId: budgetIncidents.id,
+    directIssueId: issues.id,
+  }).from(decisionQueueItems)
+    .leftJoin(approvals, and(eq(decisionQueueItems.sourceKind, "approval"), eq(approvals.companyId, companyId), eq(approvals.id, sourceUuid)))
+    .leftJoin(issueApprovals, and(eq(issueApprovals.companyId, companyId), eq(issueApprovals.approvalId, approvals.id)))
+    .leftJoin(decisions, and(eq(decisionQueueItems.sourceKind, "decision"), eq(decisions.companyId, companyId), eq(decisions.id, sourceUuid)))
+    .leftJoin(issueThreadInteractions, and(eq(decisionQueueItems.sourceKind, "issue_thread_interaction"), eq(issueThreadInteractions.companyId, companyId), eq(issueThreadInteractions.id, sourceUuid)))
+    .leftJoin(issueRecoveryActions, and(eq(decisionQueueItems.sourceKind, "recovery_action"), eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.id, sourceUuid)))
+    .leftJoin(heartbeatRuns, and(eq(decisionQueueItems.sourceKind, "failed_run"), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, sourceUuid)))
+    .leftJoin(agents, and(eq(decisionQueueItems.sourceKind, "agent_error_alert"), eq(agents.companyId, companyId), eq(agents.id, sourceUuid)))
+    .leftJoin(joinRequests, and(eq(decisionQueueItems.sourceKind, "join_request"), eq(joinRequests.companyId, companyId), eq(joinRequests.id, sourceUuid)))
+    .leftJoin(budgetIncidents, and(eq(decisionQueueItems.sourceKind, "budget_alert"), eq(budgetIncidents.companyId, companyId), eq(budgetIncidents.id, sourceUuid)))
+    .leftJoin(issues, and(inArray(decisionQueueItems.sourceKind, ["productivity_review", "blocker_attention", "review"]), eq(issues.companyId, companyId), eq(issues.id, sourceUuid), isNull(issues.hiddenAt)))
+    .where(and(eq(decisionQueueItems.companyId, companyId), queueId ? eq(decisionQueueItems.queueId, queueId) : undefined))
+    .orderBy(desc(decisionQueueItems.createdAt), desc(decisionQueueItems.id));
+
+  if (rows.length === 0) return [];
+  const issueIdFor = (row: typeof rows[number]) => {
+    switch (row.item.sourceKind) {
+      case "approval": return row.approvalId ? row.approvalIssueId : undefined;
+      case "decision": return row.decisionId ? row.decisionIssueId : undefined;
+      case "issue_thread_interaction": return row.interactionId ? row.interactionIssueId : undefined;
+      case "recovery_action": return row.recoveryId ? row.recoveryIssueId : undefined;
+      case "failed_run":
+        if (!row.runId) return undefined;
+        return row.runIssueId ?? row.runTaskId;
+      case "productivity_review":
+      case "blocker_attention":
+      case "review": return row.directIssueId ?? undefined;
+      case "agent_error_alert": return row.agentId ? null : undefined;
+      case "join_request": return row.joinId ? null : undefined;
+      case "budget_alert": return row.budgetId ? null : undefined;
+    }
+  };
+  const issueIds = [...new Set(rows.map(issueIdFor).filter((id): id is string => typeof id === "string" && UUID_RE.test(id)))];
+  const issueRows = issueIds.length ? await db.select({
+    id: issues.id,
+    companyId: issues.companyId,
+    projectId: issues.projectId,
+    parentIssueId: issues.parentId,
+    assigneeAgentId: issues.assigneeAgentId,
+    assigneeUserId: issues.assigneeUserId,
+    originKind: issues.originKind,
+    originId: issues.originId,
+    status: issues.status,
+    executionPolicy: issues.executionPolicy,
+    projectCompanyId: projects.companyId,
+    projectExecutionWorkspacePolicy: projects.executionWorkspacePolicy,
+  }).from(issues)
+    .leftJoin(projects, and(eq(projects.id, issues.projectId), eq(projects.companyId, companyId)))
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds), isNull(issues.hiddenAt))) : [];
+  const resources = new Map(issueRows.map(({ executionPolicy, projectCompanyId, projectExecutionWorkspacePolicy, ...row }) => [
+    row.id, { resource: {
+      type: "issue" as const,
+      issueId: row.id,
+      ...row,
+      executionPolicy,
+      projectAuthorizationContext: projectCompanyId
+        ? { companyId: projectCompanyId, executionWorkspacePolicy: projectExecutionWorkspacePolicy }
+        : undefined,
+      authorizationContextLoaded: true,
+    } },
+  ]));
+  const memoContext = createAuthorizationMemoContext();
+  const authz = authorizationService(db, memoContext);
+  // Standard company visibility is uniform; actors without it still need
+  // concrete issue/agent decisions (notably low-trust agent boundaries).
+  // Policy-bearing issues also use the canonical per-resource evaluator.
+  const companyRead = actor.type !== "agent" && (await authz.decide({ actor, action: "issue:read", resource: { type: "issue", companyId } })).allowed;
+  const boardRead = actor.type === "board" && (await authz.decide({
+    actor, action: "company_scope:read", resource: { type: "company", companyId },
+  })).allowed;
+  const result: typeof decisionQueueItems.$inferSelect[] = [];
+  // An approval may have multiple linked issues; the single-source reader
+  // considered only its first match, never one queue item per association.
+  const visited = new Set<string>();
+  const scopedRead = new Map<string, Promise<boolean>>();
+  const agentScopedRead = new Map<string, Promise<boolean>>();
+  for (const row of rows) {
+    if (visited.has(row.item.id)) continue;
+    visited.add(row.item.id);
+    const issueId = issueIdFor(row);
+    if (issueId === undefined) continue;
+    if (issueId) {
+      const match = resources.get(issueId);
+      if (!match) continue;
+      if (actor.type === "agent") {
+        let decision = scopedRead.get(issueId);
+        if (!decision) {
+          decision = authz.decide({ actor, action: "issue:read", resource: match.resource }).then((value) => value.allowed);
+          scopedRead.set(issueId, decision);
+        }
+        if (!(await decision)) continue;
+      } else if (!companyRead) continue;
+    } else if (row.item.sourceKind === "agent_error_alert") {
+      if (!boardRead) {
+        if (actor.type !== "agent" || !row.agentId) continue;
+        const agentId = row.agentId;
+        let decision = agentScopedRead.get(agentId);
+        if (!decision) {
+          decision = authz.decide({
+            actor, action: "agent:read", resource: { type: "agent", companyId, agentId },
+          }).then((value) => value.allowed);
+          agentScopedRead.set(agentId, decision);
+        }
+        if (!(await decision)) continue;
+      }
+    } else if (row.item.sourceKind === "failed_run" && actor.type === "agent") {
+      if (row.runAgentId !== actor.agentId) continue;
+    } else if (!boardRead) continue;
+    result.push(row.item);
+  }
+  return result;
+}
+
 export function decisionQueueService(db: Db) {
   async function getQueue(companyId: string, key: string) {
     return db.select().from(decisionQueues)
@@ -371,16 +517,7 @@ export function decisionQueueService(db: Db) {
   }
 
   async function visibleItems(companyId: string, queueId: string, authActor: AuthorizationActor) {
-    const rows = await db.select().from(decisionQueueItems)
-      .where(and(eq(decisionQueueItems.companyId, companyId), eq(decisionQueueItems.queueId, queueId)))
-      .orderBy(desc(decisionQueueItems.createdAt), desc(decisionQueueItems.id));
-    const visible: DecisionQueueItem[] = [];
-    for (const row of rows) {
-      if (await canReadDecisionSource(db, authActor, companyId, row.sourceKind as AttentionSourceKind, row.sourceId)) {
-        visible.push(toQueueItem(row));
-      }
-    }
-    return visible;
+    return (await readableQueueItems(db, companyId, authActor, queueId)).map(toQueueItem);
   }
 
   return {
@@ -435,12 +572,10 @@ export function decisionQueueService(db: Db) {
       const rows = await db.select().from(decisionQueues)
         .where(eq(decisionQueues.companyId, companyId))
         .orderBy(desc(decisionQueues.updatedAt), desc(decisionQueues.id));
-      const result: DecisionQueue[] = [];
-      for (const row of rows) {
-        const items = await visibleItems(companyId, row.id, authActor);
-        result.push(toQueue(row, items.length));
-      }
-      return result;
+      const visible = await readableQueueItems(db, companyId, authActor);
+      const counts = new Map<string, number>();
+      for (const item of visible) counts.set(item.queueId, (counts.get(item.queueId) ?? 0) + 1);
+      return rows.map((row) => toQueue(row, counts.get(row.id) ?? 0));
     },
 
     update: async (input: {

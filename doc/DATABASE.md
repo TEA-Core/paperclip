@@ -229,7 +229,14 @@ This policy makes training exports self-describing while keeping the decision re
 
 The decisions desk stores queue membership, decide-by/snooze state, and retention state in `decision_queues`, `decision_queue_items`, `decision_triage`, and `decision_retention`. These sidecars use the stable attention identity `(source_kind, source_id)` so all attention source kinds can participate without copying source titles, bodies, projects, or other visibility-sensitive data.
 
-`decision_triage_events` is append-only history for queue and triage changes. Current rows and history both carry server-derived user/agent, heartbeat run, API-key, and responsible-user attribution where applicable. Queue reads must resolve and authorize their source rows at read time; a sidecar row is never a visibility grant.
+`decision_triage_events` is append-only history for queue and triage changes. Current rows and history both carry server-derived user/agent, heartbeat run, API-key, and responsible-user attribution where applicable. Queue reads resolve source existence and issue visibility in company-scoped batches at read time; a sidecar row is never a visibility grant. Issue- or project-specific trust policies and low-trust agent boundaries still use the canonical authorization evaluator for each distinct concrete issue or agent source.
+
+Malformed issue IDs in failed-run JSON snapshots cannot join UUID-backed issues. Queue reads exclude those entries without failing the rest of the company list.
+
+Authorization lookups for agent, issue, and run-policy rows share memo entries
+only when a caller passes an explicit, short-lived context for one list, request,
+decision, or transaction. Retained services without that context create one
+context per decision, so a later request observes changed authorization rows.
 
 Triage writes serialize on the company and attention-source identity so concurrent partial updates preserve both fields and produce monotonic history versions.
 

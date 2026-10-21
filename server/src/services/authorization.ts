@@ -27,6 +27,7 @@ import {
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
+import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
@@ -93,6 +94,9 @@ export type AuthorizationResource =
       originId?: string | null;
       status?: string | null;
       createdByAgentId?: string | null;
+      executionPolicy?: unknown;
+      projectAuthorizationContext?: { companyId: string; executionWorkspacePolicy: unknown };
+      authorizationContextLoaded?: boolean;
     };
 
 export type AuthorizationDecision = {
@@ -144,6 +148,28 @@ export type AuthorizationDecision = {
 type PrincipalGrantDecision = AuthorizationDecision & {
   grant?: NonNullable<AuthorizationDecision["grant"]>;
 };
+
+type PrincipalGrantInput = {
+  companyId: string;
+  principalType: PrincipalType;
+  principalId: string;
+  action: AuthorizationAction;
+  permissionKey: PermissionKey;
+  scope?: Record<string, unknown> | null;
+};
+
+type AuthorizationDecisionInput = {
+  actor: AuthorizationActor;
+  action: AuthorizationAction;
+  resource: AuthorizationResource;
+  scope?: Record<string, unknown> | null;
+};
+
+export interface AuthorizationService {
+  decide(input: AuthorizationDecisionInput): Promise<AuthorizationDecision>;
+  decidePrincipalGrant(input: PrincipalGrantInput): Promise<PrincipalGrantDecision>;
+  isManagerOf(companyId: string, managerAgentId: string, assigneeAgentId: string): Promise<boolean>;
+}
 
 function companyIdForResource(resource: AuthorizationResource) {
   return resource.companyId;
@@ -482,6 +508,23 @@ type ResponsibleUserActorWithMemo = AuthorizationActor & {
   __responsibleUserSnapshotMemo?: Map<string, Promise<ResponsibleUserSnapshot>>;
 };
 
+export type AuthorizationMemoContext = object;
+
+export function createAuthorizationMemoContext(): AuthorizationMemoContext {
+  return {};
+}
+
+const memoizeAgent = createRequestPromiseMemo<AuthorizationMemoContext, AgentAuthorizationRow | null>({
+  shouldCache: (value) => value !== null,
+});
+const memoizeIssue = createRequestPromiseMemo<AuthorizationMemoContext, IssueAuthorizationRow | null>({
+  shouldCache: (value) => value !== null,
+});
+const memoizeRunPolicy = createRequestPromiseMemo<
+  AuthorizationMemoContext,
+  { companyId: string; executionPolicy: Record<string, unknown> } | null
+>();
+
 export function responsibleUserAuthzShadowMode() {
   const mode = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE?.trim().toLowerCase();
   const shadow = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW?.trim().toLowerCase();
@@ -566,7 +609,10 @@ export const ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE = false;
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-export function authorizationService(db: Db | DbTransaction) {
+function authorizationServiceWithMemo(
+  db: Db | DbTransaction,
+  memoContext: AuthorizationMemoContext,
+): AuthorizationService {
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
     if (
@@ -687,14 +733,7 @@ export function authorizationService(db: Db | DbTransaction) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function decidePrincipalGrant(input: {
-    companyId: string;
-    principalType: PrincipalType;
-    principalId: string;
-    action: AuthorizationAction;
-    permissionKey: PermissionKey;
-    scope?: Record<string, unknown> | null;
-  }): Promise<PrincipalGrantDecision> {
+  async function decidePrincipalGrant(input: PrincipalGrantInput): Promise<PrincipalGrantDecision> {
     const membership = await getActiveMembership(input.companyId, input.principalType, input.principalId);
     if (!membership) {
       return deny({
@@ -758,7 +797,7 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadAgent(agentId: string): Promise<AgentAuthorizationRow | null> {
-    return db
+    return memoizeAgent(memoContext, agentId, () => db
       .select({
         id: agents.id,
         companyId: agents.companyId,
@@ -769,7 +808,7 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(agents)
       .where(eq(agents.id, agentId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
@@ -785,7 +824,7 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
-    return db
+    return memoizeIssue(memoContext, issueId, () => db
       .select({
         id: issues.id,
         companyId: issues.companyId,
@@ -802,26 +841,28 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(issues)
       .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
-    const row = await db
-      .select({
-        id: heartbeatRuns.id,
-        companyId: heartbeatRuns.companyId,
-        agentId: heartbeatRuns.agentId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-      })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
-    const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
-    return isPlainRecord(context?.executionPolicy)
-      ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
-      : null;
+    return memoizeRunPolicy(memoContext, `${runId}:${companyId}:${agentId}`, async () => {
+      const row = await db
+        .select({
+          id: heartbeatRuns.id,
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
+      const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
+      return isPlainRecord(context?.executionPolicy)
+        ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
+        : null;
+    });
   }
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
@@ -883,14 +924,33 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadResourceContext(resource: AuthorizationResource) {
-    const issue = resource.type === "issue" && resource.issueId ? await loadIssue(resource.issueId) : null;
+    const issue = resource.type === "issue" && resource.issueId && !resource.authorizationContextLoaded
+      ? await loadIssue(resource.issueId)
+      : resource.type === "issue" && resource.issueId
+        ? {
+            id: resource.issueId,
+            companyId: resource.companyId,
+            projectId: resource.projectId ?? null,
+            parentId: resource.parentIssueId ?? null,
+            assigneeAgentId: resource.assigneeAgentId ?? null,
+            assigneeUserId: resource.assigneeUserId ?? null,
+            executionPolicy: resource.executionPolicy,
+            originKind: resource.originKind ?? null,
+            originId: resource.originId ?? null,
+            status: resource.status ?? null,
+          }
+        : null;
     const projectId =
       resource.type === "issue"
         ? issue?.projectId ?? resource.projectId ?? null
         : resource.type === "project"
           ? resource.projectId ?? null
           : null;
-    const project = projectId ? await loadProject(projectId) : null;
+    const project = projectId
+      ? resource.type === "issue" && resource.projectAuthorizationContext
+        ? { id: projectId, ...resource.projectAuthorizationContext }
+        : await loadProject(projectId)
+      : null;
     return { issue, project };
   }
 
@@ -939,7 +999,7 @@ export function authorizationService(db: Db | DbTransaction) {
     boundary: LowTrustBoundaryWithCompany,
     resource: Extract<AuthorizationResource, { type: "issue" }>,
   ) {
-    const issue = resource.issueId ? await loadIssue(resource.issueId) : null;
+    const issue = resource.issueId && !resource.authorizationContextLoaded ? await loadIssue(resource.issueId) : null;
     const candidate = {
       companyId: resource.companyId,
       id: issue?.id ?? resource.issueId ?? null,
@@ -949,7 +1009,7 @@ export function authorizationService(db: Db | DbTransaction) {
     if (candidate.id && boundary.rootIssueId) {
       return issueIdIsDescendantOf(candidate.id, boundary.rootIssueId, boundary.companyId);
     }
-    if (!resource.parentIssueId) return false;
+    if (!resource.parentIssueId || resource.parentIssueId === resource.issueId) return false;
     const parent = await loadIssue(resource.parentIssueId);
     if (!parent) return false;
     if (
@@ -2458,12 +2518,7 @@ export function authorizationService(db: Db | DbTransaction) {
     return responsibleUserAuthzShadowMode() ? agentDecision : denied;
   }
 
-  async function decide(input: {
-    actor: AuthorizationActor;
-    action: AuthorizationAction;
-    resource: AuthorizationResource;
-    scope?: Record<string, unknown> | null;
-  }): Promise<AuthorizationDecision> {
+  async function decide(input: AuthorizationDecisionInput): Promise<AuthorizationDecision> {
     const agentDecision = await decideBase(input);
     return applyResponsibleUserIntersection(input, agentDecision);
   }
@@ -2472,5 +2527,26 @@ export function authorizationService(db: Db | DbTransaction) {
     decide,
     decidePrincipalGrant,
     isManagerOf,
+  };
+}
+
+/**
+ * A service can be retained by a route factory or background worker. Only an
+ * explicitly supplied context shares memo entries across decisions; otherwise
+ * each call gets its own context, including related loads within that decision.
+ */
+export function authorizationService(
+  db: Db | DbTransaction,
+  memoContext?: AuthorizationMemoContext,
+): AuthorizationService {
+  if (memoContext) return authorizationServiceWithMemo(db, memoContext);
+  return {
+    decide: (input) => authorizationServiceWithMemo(db, createAuthorizationMemoContext()).decide(input),
+    decidePrincipalGrant: (input) =>
+      authorizationServiceWithMemo(db, createAuthorizationMemoContext()).decidePrincipalGrant(input),
+    isManagerOf: (companyId, managerAgentId, assigneeAgentId) =>
+      authorizationServiceWithMemo(db, createAuthorizationMemoContext()).isManagerOf(
+        companyId, managerAgentId, assigneeAgentId,
+      ),
   };
 }
