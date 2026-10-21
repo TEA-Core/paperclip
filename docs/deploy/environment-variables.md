@@ -160,7 +160,7 @@ either one.
 | `PAPERCLIP_AGENT_JWT_SECRET` | (unset) | HMAC master for agent run JWTs and runtime-tools tokens. Falls back to `BETTER_AUTH_SECRET` when unset; when neither is set, JWT minting is unavailable. |
 | `PAPERCLIP_AGENT_JWT_TTL_SECONDS` | `172800` (48h) | Agent run JWT lifetime. Tokens are minted once at adapter spawn, so a rotation cannot refresh an already-running session. |
 | `BETTER_AUTH_SECRET` | (unset) | HMAC master for Better Auth login sessions. Falls back to `PAPERCLIP_AGENT_JWT_SECRET`, the reverse of the order above — set both to keep a JWT rotation from logging every board user out. |
-| `PAPERCLIP_GITHUB_MANAGED_EXECUTION` | (unset) | Opt-in for managed run-identity GitHub execution on local and SSH lanes, which stay in host mode otherwise (fold decision D1). On only when the value is exactly `on`. Leaving it on and then turning it off leaves `github_credentials` capabilities minted with a 30-day lifetime; see the rotation runbook. |
+| `PAPERCLIP_GITHUB_MANAGED_EXECUTION` | (unset) | Opt-in for managed run-identity GitHub execution on local and SSH lanes, which stay in host mode otherwise (fold decision D1). On only when the value is exactly `on`. Sandbox, plugin and Kubernetes drivers are managed regardless of this variable. Leaving it on and then turning it off leaves `github_credentials` capabilities minted with a 30-day lifetime; see the rotation runbook. |
 
 ## Agent Runtime (Injected into agent processes)
 

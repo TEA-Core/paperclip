@@ -66,25 +66,45 @@ is on **only** when the value, after trim and lowercasing, is exactly `on` — a
 value (`1`, `true`, `off`, empty, or unset) keeps local/SSH runs in host mode per fold
 decision D1. Production keeps the variable **unset**.
 
-Why a rotation is owed when you turn it back off: while the flag is on, a run can be minted
-a `github_credentials` runtime-tools capability whose `exp` is **30 days** (every other
-scope is 1 hour — `server/src/runtime-tools-token.ts`). Turning the flag off stops minting
-new capabilities; it does nothing to the ones already handed out. They stay
-signature-valid until `exp`. Per-use checks re-read the run identity and current credential
-policy, so a revoked or low-trust run stops getting credentials — but the token itself
-cannot be un-minted by configuration. **Key rotation is the only way to invalidate one
-early.**
+The flag is a **local/SSH gate only**. `forkForcesHostGitHub` forces host-mode credentials
+for the `local` and `ssh` drivers — and for an absent driver, which is local — while every
+other driver keeps upstream managed-execution semantics **regardless of this variable**.
+Sandbox, plugin and Kubernetes lanes are therefore managed whether or not the flag was ever
+set, so "the flag is unset" does not mean "no long-lived capability exists".
+
+Why a rotation is owed when a lane goes managed and then back to host: while a lane is
+managed, a run can be minted a `github_credentials` runtime-tools capability whose `exp` is
+**30 days** (every other scope is 1 hour — `server/src/runtime-tools-token.ts`). Turning
+the lane back to host mode stops minting new capabilities; it does nothing to the ones
+already handed out. They stay signature-valid until `exp`. Per-use checks re-read the run
+identity and current credential policy, so a revoked or low-trust run stops getting
+credentials — but the token itself cannot be un-minted by configuration. **Key rotation is
+the only way to invalidate one early.**
 
 ### Steps
 
-1. **Confirm the flag actually cycled.** If it was never `on` in the environment you are
-   rotating, no 30-day capability exists and no rotation is owed. Check the deployed env,
-   not your shell.
+1. **Establish whether a 30-day capability could still be outstanding.** There is no
+   registry to query. The token is a stateless bearer JWT minted once at adapter spawn and
+   injected into that run's environment as `PAPERCLIP_GITHUB_BROKER_TOKEN`; it is not
+   persisted (the recorded adapter invocation redacts that key), so exposure has to be
+   inferred from the **last 30 days of run history, across every driver class** — not from
+   the flag alone:
+   - **`local` / `ssh` lanes:** exposed only if the deployed environment had the flag
+     exactly `on` during that window. Check the deployed env, not your shell.
+   - **sandbox, plugin and Kubernetes lanes:** managed regardless of the flag. If any run
+     used one of those drivers in the window, assume a capability was minted.
+
+   Rotate unless you can show no run resolved to a managed lane anywhere in the window. A
+   flag that never cycled on an instance that only ever ran local/SSH work is the one case
+   where no rotation is owed.
 2. **Confirm you are in the safe row** of the table above. If not, decouple first.
-3. **Quiesce and drain.** Rotation means a restart, and a restart hard-kills in-flight
-   runs. Use the instance dispatch quiesce and wait for `inFlightRuns: 0` — see
+3. **Quiesce and drain the process you are about to stop.** Rotation means a restart, and a
+   restart hard-kills in-flight runs. Use the instance dispatch quiesce and wait for
+   `inFlightRuns: 0` — see
    [Dev-Plane Deploy & Restart Hygiene](dev-plane-restart-hygiene.md). Do **not** pause
-   agents to quiesce.
+   agents to quiesce. This quiesce is in-memory, carries a 90-minute TTL, and deliberately
+   does **not** survive the restart — a replaced container must come up dispatching — so
+   step 7 necessarily runs after dispatch has resumed.
 4. **Generate a new master** and deploy it to every replica, then restart:
 
    ```sh
@@ -101,8 +121,18 @@ early.**
      relying on managed GitHub credentials fails its git operation rather than falling back
      silently.
    - If your config was in row two or three, every board/user must sign in again.
-7. **Verify** with one benign dispatch per affected company before releasing the quiesce,
-   and check for auth-attributed run failures after the window.
+7. **Verify after the restart**, not before it. The swap already released the quiesce and
+   the replacement is dispatching, so do this on the new server: one benign dispatch per
+   affected company, then watch for auth-attributed run failures over the following window.
+   If verification fails, re-engage the quiesce **on the replacement**
+   (`POST /api/instance/dispatch-quiesce`) to stop new dispatch while you fix or roll back
+   the master, and release it once the dispatch proves out. If dispatch must not resume at
+   all across the swap, the only lever that outlives a restart is a boot-time suppression:
+   start the replacement with `PAPERCLIP_RESTORE_IN_PROGRESS=1` (or
+   `PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS=1` — `resolveHeartbeatSchedulingSuppression` in
+   `server/src/services/heartbeat.ts` then reports `database_restore_in_progress`). That
+   suppresses dispatch entirely, so the benign dispatch runs after you clear it; it holds
+   normal traffic back, it does not let you dispatch while suppressed.
 
 ## Runbook: skill edits and re-pins rotate every agent session
 
