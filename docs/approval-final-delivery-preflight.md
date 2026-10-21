@@ -1,6 +1,6 @@
 # Final approval delivery preflight
 
-SUP-19860 (AS-02) moves repository-delivery eligibility ahead of the terminal execution-stage decision. Earlier review/approval stages remain card-scoped: they advance normally and cannot publish `paperclip/approved` until every declared stage is genuinely completed and the final decision is approved.
+SUP-19860 (AS-02) moves repository-delivery eligibility ahead of the terminal execution-stage decision. Earlier review/approval stages remain card-scoped: they advance normally and cannot publish `paperclip/approved` until every pre-merge stage is genuinely completed and the last decision is approved (see `doc/execution-semantics.md` for stage `phase`).
 
 ## Producer contract
 
