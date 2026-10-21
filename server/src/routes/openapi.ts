@@ -7594,7 +7594,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Recover an existing GitHub pull request delivery receipt",
   description:
-    "Board-only recovery for an existing open, non-draft GitHub pull request. The request is bound to the exact repository, delivery branch, pull request number, and head SHA, and is idempotent by idempotencyKey. This endpoint creates a receipt only; it never writes a GitHub status.",
+    "Board-only recovery for an approved, terminal-ladder issue (including done, but not cancelled) with an existing open, non-draft GitHub pull request. The request is bound to the exact repository, delivery branch, pull request number, and head SHA, and is idempotent by idempotencyKey. A receipt is optional only when the current decision has a certified final-delivery PR binding; without that binding, publication requires a board receipt. An existing receipt for the PR must match the published head. This endpoint creates a receipt only; it never writes a GitHub status.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(z.object({

@@ -220,6 +220,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     /** Pre-seed executionState.approvalStatus.publishedHeadSha (idempotent path). */
     prePublishedHeadSha?: string | null;
     deliveryReceipt?: boolean;
+    certifiedDelivery?: boolean;
 
     /**
      * SUP-15459: append extra stages to the execution policy that are NOT in
@@ -341,7 +342,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       returnAssignee: null,
       completedStageIds: opts.completedStageIds ?? [STAGE_ID],
       skippedStageIds: opts.skippedStageIds ?? [],
-      lastDecisionId: null,
+      lastDecisionId: opts.certifiedDelivery ? "decision-42" : null,
       lastDecisionOutcome:
         opts.lastDecisionOutcome === undefined ? "approved" : opts.lastDecisionOutcome,
       monitor: null,
@@ -351,6 +352,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       executionState.approvalStatus = {
         publishedHeadSha: opts.prePublishedHeadSha,
         publishedAt: now.toISOString(),
+      };
+    }
+    if (opts.certifiedDelivery && opts.pr) {
+      executionState.approvalStatus = {
+        finalDelivery: {
+          owner: opts.pr.owner, repo: opts.pr.repo, number: opts.pr.number,
+          headSha: HEAD_SHA, displayName: `${opts.pr.owner}/${opts.pr.repo}#${opts.pr.number}`,
+          decisionId: "decision-42",
+        },
       };
     }
 
@@ -582,6 +592,36 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
     const receiptRows = await db.select().from(issueDeliveryReceipts);
     expect(receiptRows[0]?.state).toBe("ready");
+  });
+
+  it("recovers a receipt for a done card with an approved ladder and an open exact-head PR", async () => {
+    const { companyId, issueId } = await seedIssue();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 579,
+      headSha: HEAD_SHA,
+      reason: "restore approved publication on done card",
+      idempotencyKey: "recover-done-card",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.receipt.headSha).toBe(HEAD_SHA);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
   });
 
   it("publishes the recovered target head once and consumes its receipt exactly once", async () => {
@@ -1137,15 +1177,55 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
-  it("re-publishes and persists the certified head when the card is approvable and delivered", async () => {
+  it.each([
+    ["absent", false, 409],
+    ["absent", true, 200],
+    ["mismatched", false, 409],
+    ["mismatched", true, 200],
+  ] as const)("requires a board receipt for an %s decision binding (receipt=%s)", async (binding, deliveryReceipt, status) => {
     const { companyId, issueId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
-      deliveryReceipt: true,
+      deliveryReceipt,
+    });
+    currentActor = boardActor(companyId);
+    if (binding === "mismatched") {
+      const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+      await db.update(issues).set({
+        executionState: {
+          ...row!.executionState,
+          lastDecisionId: "decision-new",
+          approvalStatus: {
+            finalDelivery: {
+              owner: OWNER, repo: REPO, number: PR_NUMBER, headSha: HEAD_SHA,
+              decisionId: "decision-old",
+            },
+          },
+        },
+      }).where(eq(issues.id, issueId));
+    }
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }));
+    if (deliveryReceipt) mockGhFetch.mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+    expect(res.status).toBe(status);
+    if (!deliveryReceipt) {
+      expect(res.body.message).toContain("delivery-receipt-missing");
+    } else {
+      expect(res.body.outcome).toBe("armed");
+    }
+    expect(mockGhFetch.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(deliveryReceipt ? 1 : 0);
+  });
+
+  it("publishes a deliver-branch approval with no receipt row and persists the certified head", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      certifiedDelivery: true,
     });
     currentActor = boardActor(companyId);
 
     mockGhFetch
-      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}` }))
       .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
       .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
 
@@ -1155,14 +1235,16 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(res.body.outcome).toBe("armed");
     expect(res.body.headSha).toBe(HEAD_SHA);
     expect(res.body.message).toContain("paperclip/approved");
-    // resolve head (1) + publish fetch head (1) + write status (1)
-    expect(mockGhFetch).toHaveBeenCalledTimes(3);
-    const statusCall = mockGhFetch.mock.calls[2]!;
+    // Certified preflight pins PR/head, so publication needs one head read
+    // and one status write, but no receipt.
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    const statusCall = mockGhFetch.mock.calls[1]!;
     expect(statusCall[0]).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`);
     expect(statusCall[1]).toMatchObject({ method: "POST" });
     const body = JSON.parse(statusCall[1]!.body as string);
     expect(body.context).toBe("paperclip/approved");
     expect(body.state).toBe("success");
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
 
     // The certified head is persisted so Guard A / the enforcer can verify it.
     const [row] = await db
@@ -1171,6 +1253,87 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       .where(eq(issues.id, issueId));
     const approvalStatus = (row?.executionState ?? {})?.approvalStatus as Record<string, unknown> | undefined;
     expect(approvalStatus?.publishedHeadSha).toBe(HEAD_SHA);
+  });
+
+  it.each([false, true])("refuses a retargeted failed first publish without status writes (receipt=%s)", async (deliveryReceipt) => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: 99, headRefName: DELIVERY_BRANCH },
+      deliveryReceipt,
+    });
+    currentActor = boardActor(companyId);
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    await db.update(issues).set({
+      executionState: {
+        ...row!.executionState,
+        lastDecisionId: "decision-42",
+        approvalStatus: {
+          approvedHeadSha: OTHER_HEAD_SHA,
+          publishFailure: { reason: "status:failed:scope_missing", headSha: OTHER_HEAD_SHA },
+          finalDelivery: {
+            owner: OWNER, repo: REPO, number: 42, headSha: OTHER_HEAD_SHA,
+            displayName: `${OWNER}/${REPO}#42`, decisionId: "decision-42",
+          },
+        },
+      },
+    }).where(eq(issues.id, issueId));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.message).toContain("delivery_moved");
+    expect(mockGhFetch.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(0);
+    const [after] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    expect((after?.executionState?.approvalStatus as Record<string, unknown>).publishedHeadSha).toBeUndefined();
+  });
+
+  it("recovers a failed first publish on its certified PR/head without a receipt row", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    await db.update(issues).set({
+      executionState: {
+        ...row!.executionState,
+        lastDecisionId: "decision-42",
+        approvalStatus: {
+          approvedHeadSha: HEAD_SHA,
+          publishFailure: { reason: "status:failed:scope_missing", headSha: HEAD_SHA },
+          finalDelivery: {
+            owner: OWNER, repo: REPO, number: PR_NUMBER, headSha: HEAD_SHA,
+            displayName: `${OWNER}/${REPO}#${PR_NUMBER}`, decisionId: "decision-42",
+          },
+        },
+      },
+    }).where(eq(issues.id, issueId));
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe("armed");
+    expect(mockGhFetch.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(1);
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+  });
+
+  it("refuses publication when a receipt exists for the PR but its head differs", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      deliveryReceipt: true,
+    });
+    currentActor = boardActor(companyId);
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: OTHER_HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: OTHER_HEAD_SHA } }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.message).toContain("delivery-receipt-head_mismatch");
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.state).toBe("invalidated");
   });
 
   it("refuses with 409 head_moved when the head moves between resolve and publish, zero status writes", async () => {

@@ -1253,7 +1253,7 @@ async function claimReceiptForPublication(
   issueId: string,
   pr: LinkedPullRequest,
   headSha: string,
-  required: boolean,
+  requireDeliveryReceipt: boolean,
 ): Promise<DeliveryReceiptPublicationContext | ArmingOutcome | null> {
   const receipts = await db
     .select({ id: issueDeliveryReceipts.id, headSha: issueDeliveryReceipts.headSha })
@@ -1280,12 +1280,8 @@ async function claimReceiptForPublication(
       eq(issueDeliveryReceiptLinks.pullRequestNumber, pr.number),
     ));
   if (receipts.length === 0) {
-    return required
-      ? {
-          kind: "skipped",
-          message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board-authorized receipt for head ${headSha.slice(0, 7)}`,
-          headSha,
-        }
+    return requireDeliveryReceipt
+      ? { kind: "skipped", message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board delivery receipt for head ${headSha.slice(0, 7)}`, headSha }
       : null;
   }
   if (!receipts.some((receipt) => receipt.headSha === headSha)) {
@@ -1314,13 +1310,10 @@ async function claimReceiptForPublication(
   if (lookup.kind === "claimed") {
     return { claim: lookup.claim };
   }
-  if (lookup.kind === "missing" && !required) return null;
   if (lookup.kind === "missing") {
-    return {
-      kind: "skipped",
-      message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board-authorized receipt for head ${headSha.slice(0, 7)}`,
-      headSha,
-    };
+    return requireDeliveryReceipt
+      ? { kind: "skipped", message: `status:skipped:delivery-receipt-missing: ${pr.displayName} has no board delivery receipt for head ${headSha.slice(0, 7)}`, headSha }
+      : null;
   }
   return {
     kind: "skipped",
@@ -1365,7 +1358,34 @@ export interface PublishApprovalStatusOptions {
    */
   enforceDeliveryIdentity?: boolean;
   includeDrafts?: boolean;
+  /** Legacy or mismatched decision binding: require a board delivery receipt. */
   requireDeliveryReceipt?: boolean;
+}
+
+/** Only the current decision's complete final preflight can replace a receipt. */
+export function readCertifiedFinalDelivery(executionState: Record<string, unknown> | null | undefined):
+  | { owner: string; repo: string; number: number; headSha: string; displayName: string; decisionId: string }
+  | undefined {
+  const delivery = (executionState?.approvalStatus as Record<string, unknown> | null | undefined)?.finalDelivery;
+  if (!delivery || typeof delivery !== "object") return undefined;
+  const fields = delivery as Record<string, unknown>;
+  if (
+    typeof executionState?.lastDecisionId !== "string" ||
+    fields.decisionId !== executionState.lastDecisionId ||
+    typeof fields.owner !== "string" || !fields.owner ||
+    typeof fields.repo !== "string" || !fields.repo ||
+    typeof fields.number !== "number" || !Number.isSafeInteger(fields.number) || fields.number <= 0 ||
+    typeof fields.headSha !== "string" || !fields.headSha
+  ) return undefined;
+  return {
+    owner: fields.owner,
+    repo: fields.repo,
+    number: fields.number,
+    headSha: fields.headSha,
+    displayName: typeof fields.displayName === "string" && fields.displayName
+      ? fields.displayName : `${fields.owner}/${fields.repo}#${fields.number}`,
+    decisionId: fields.decisionId,
+  };
 }
 
 /**
@@ -3732,21 +3752,23 @@ export async function writeCommitStatusWithRetry(
  * inline block did. When the head resolved, the record is a FRESH object (a stale
  * `publishedHeadSha` from a prior cycle must not survive a new certification);
  * when it did not resolve, the record MERGES into any existing `approvalStatus`
- * so a prior `pendingCandidates` / `backfillRefusal` is preserved. `pendingCandidates`
-  * is only ever written when no head resolved — matching the prior inline block.
-  *
-  * SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
-  * record is written atomically against the LIVE `executionState.approvalStatus`
-  * subtree (`jsonb_set` on the root + a jsonb `||`/replace on the subtree), the
-  * same shape {@link recordApprovalAnchor} and the reconciler's
-  * `mergeApprovalStatus` use. The `baseExecutionState` argument is the route's
-  * client snapshot and is no longer read — rebuilding the whole column from it
-  * reverted every root key a concurrent writer committed after the snapshot.
-  *
-  * This helper only WRITES the card's durable record. It does not decide whether
-  * a stamp is published (that stays in {@link publishApprovalStatus} / the
-  * consume-contract) and it never itself re-stamps.
-  */
+ * so a prior `pendingCandidates` / `backfillRefusal` is preserved. The certified
+ * `finalDelivery` survives either outcome from the live subtree.
+ * `pendingCandidates` is only ever written when no head resolved — matching the
+ * prior inline block.
+ *
+ * SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
+ * record is written atomically against the LIVE `executionState.approvalStatus`
+ * subtree (`jsonb_set` on the root + a jsonb `||`/replace on the subtree), the
+ * same shape {@link recordApprovalAnchor} and the reconciler's
+ * `mergeApprovalStatus` use. The `baseExecutionState` argument is the route's
+ * client snapshot and is no longer read — rebuilding the whole column from it
+ * reverted every root key a concurrent writer committed after the snapshot.
+ *
+ * This helper only WRITES the card's durable record. It does not decide whether
+ * a stamp is published (that stays in {@link publishApprovalStatus} / the
+ * consume-contract) and it never itself re-stamps.
+ */
 export async function recordApprovalPublishOutcome(
   db: Db,
   issueId: string,
@@ -3815,7 +3837,14 @@ export async function recordApprovalPublishOutcome(
       approvedAt: nowIso,
       ...patch,
     };
-    approvalStatusExpr = sql`${JSON.stringify(freshSubtree)}::jsonb`;
+    // Freshen old publication fields without dropping the decision's certified
+    // PR identity. Read it from the live row so concurrent updates are not lost.
+    approvalStatusExpr = sql`(
+      case when coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) ? 'finalDelivery'
+        then jsonb_build_object('finalDelivery', ${issues.executionState} -> 'approvalStatus' -> 'finalDelivery')
+        else '{}'::jsonb end
+      || ${JSON.stringify(freshSubtree)}::jsonb
+    )`;
   } else {
     approvalStatusExpr = sql`(
       coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)

@@ -198,6 +198,7 @@ import {
   parseRepoUrl,
   publishApprovalStatus,
   recordApprovalAnchor,
+  readCertifiedFinalDelivery,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   preflightFinalDelivery,
@@ -4689,16 +4690,7 @@ export function issueRoutes(
       // unresolvable decision-time head is a refusal with a named skipped
       // reason (ADR-091 D4: cannot verify -> refuse), never a fallback to the
       // live head.
-      const approvalStatus = candidate.executionState?.approvalStatus as {
-        finalDelivery?: {
-          owner: string; repo: string; number: number; headSha: string; displayName: string; decisionId?: string;
-        };
-      } | undefined;
-      const lastDecisionId = candidate.executionState?.lastDecisionId;
-      const certified =
-        approvalStatus?.finalDelivery?.decisionId && approvalStatus.finalDelivery.decisionId === lastDecisionId
-          ? approvalStatus.finalDelivery
-          : undefined;
+      const certified = readCertifiedFinalDelivery(candidate.executionState as Record<string, unknown> | undefined);
       const decisionHead: DecisionHeadResolution = certified
         ? { kind: "resolved", headSha: certified.headSha, displayName: certified.displayName, pr: certified }
         : await resolveApprovalDecisionHead(db, issue.companyId, issue.id, issueIdentifier, closingTransition);
@@ -4732,8 +4724,8 @@ export function issueRoutes(
             closingTransition: certified ? true : closingTransition,
             expectedHeadSha: decisionHead.headSha,
             expectedPr: certified,
+            requireDeliveryReceipt: !certified,
             enforceDeliveryIdentity: true,
-            requireDeliveryReceipt: true,
           },
         );
       } else {
@@ -11088,8 +11080,8 @@ export function issueRoutes(
         throw forbidden("Company owner or admin required to recover a delivery receipt");
       }
     }
-    if (issue.status === "done" || issue.status === "cancelled") {
-      res.status(409).json({ error: "Terminal issues cannot recover delivery receipts" });
+    if (issue.status === "cancelled") {
+      res.status(409).json({ error: "Cancelled issues cannot recover delivery receipts" });
       return;
     }
     const state = (issue.executionState ?? {}) as Record<string, unknown>;
@@ -11283,15 +11275,12 @@ export function issueRoutes(
       return;
     }
 
-    // Resolve the decision-time head the way the decision-time arming did, so the
-    // publish is pinned to exactly the head the reviewer approved.
-    const decisionHead = await resolveApprovalDecisionHead(
-      db,
-      issue.companyId,
-      issue.id,
-      identifier,
-      true,
-    );
+    // The final preflight bound the approving decision to a specific PR/head.
+    // Recovery must not silently replace it with a newly delivered PR.
+    const certified = readCertifiedFinalDelivery(state);
+    const decisionHead = certified
+      ? { kind: "resolved" as const, headSha: certified.headSha }
+      : await resolveApprovalDecisionHead(db, issue.companyId, issue.id, identifier, true);
     if (decisionHead.kind !== "resolved") {
       res.status(409).json({
         outcome: "rejected",
@@ -11301,8 +11290,8 @@ export function issueRoutes(
       return;
     }
 
-    // Re-run the first publish, pinned to the resolved head, delivery-identity
-    // enforced (a cited-but-not-delivered PR is refused, never stamped).
+    // Re-run the first publish against the original approval-time PR/head.
+    // Historical cards without a final-delivery binding retain head resolution.
     const publishOutcome = await publishApprovalStatus(
       db,
       issue.companyId,
@@ -11311,8 +11300,9 @@ export function issueRoutes(
       {
         closingTransition: true,
         expectedHeadSha: decisionHead.headSha,
+        expectedPr: certified,
+        requireDeliveryReceipt: !certified,
         enforceDeliveryIdentity: true,
-        requireDeliveryReceipt: true,
       },
     );
 
@@ -21561,6 +21551,20 @@ export function issueRoutes(
             // lock taken by the revalidation, so a stale verdict leaves both pending.
             afterResolveInTransaction: async (tx) => {
               terminalEscalationResolution.value = await applyEscalationApproval(tx as unknown as Db, deferredPostCommit);
+              if (terminalEscalationResolution.value && escalationCertifiedDelivery) {
+                const finalDelivery = {
+                  ...escalationCertifiedDelivery,
+                  decisionId: terminalEscalationResolution.value.decisionId,
+                };
+                await tx.update(issueRows).set({
+                  executionState: sql`jsonb_set(
+                    coalesce(${issueRows.executionState}, '{}'::jsonb),
+                    '{approvalStatus}',
+                    coalesce(${issueRows.executionState} -> 'approvalStatus', '{}'::jsonb)
+                      || jsonb_build_object('finalDelivery', ${JSON.stringify(finalDelivery)}::jsonb)
+                  )`,
+                }).where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+              }
             },
             beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
               const [lockedIssue] = await tx.select().from(issueRows)

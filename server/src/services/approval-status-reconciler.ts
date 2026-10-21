@@ -21,6 +21,7 @@ import {
   narrowToDelivered,
   postPullRequestComment,
   publishApprovalStatus,
+  readCertifiedFinalDelivery,
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   type ApprovalCandidateAnchor,
@@ -2704,6 +2705,8 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     };
   }
 
+  const certified = readCertifiedFinalDelivery(row.executionState);
+
   const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id, {
     includeDrafts: readApprovedHead(row.executionState) !== null,
   });
@@ -2787,6 +2790,21 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     return { kind: "skipped", reason, detail: `${reason}: linked mentions: ${cached}` };
   }
 
+  // A newly selected delivery is not the PR the approving decision certified.
+  // Refuse before the already-success shortcut, which can otherwise auto-merge
+  // the new PR without ever reaching the publisher's expectedPr check.
+  if (certified && (
+    target.number !== certified.number ||
+    target.owner.toLowerCase() !== certified.owner.toLowerCase() ||
+    target.repo.toLowerCase() !== certified.repo.toLowerCase()
+  )) {
+    return {
+      kind: "skipped",
+      reason: "delivery_moved",
+      detail: `delivery_moved: ${target.displayName} differs from final preflight ${certified.owner}/${certified.repo}#${certified.number}`,
+    };
+  }
+
   const prRead = await ghReadJson(db, row.companyId, target.owner, target.repo, `/pulls/${target.number}`);
   if (!prRead.ok) {
     return {
@@ -2809,6 +2827,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     return { kind: "skipped", reason: "live-draft", detail: `live-draft: ${target.displayName} is still a draft` };
   }
 
+
   // Idempotency pre-check: read the head's combined status. A 404 means the
   // ref itself is not resolvable (the sha was just read from the live PR, so
   // this is not the "no statuses yet" case) — treat it as a failure, never as
@@ -2829,7 +2848,8 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
     ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
-  if (statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success")) {
+  const alreadyStamped = statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success");
+  if (alreadyStamped && (!certified || headSha === certified.headSha)) {
     // SUP-17274: the stamp is on the live head, but the decision-time arm may
     // have never succeeded (it failed, the first publish was refused before the
     // arm and the stamp was later healed, or the card was stamped before arming
@@ -2870,7 +2890,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
    // A SUP-14747 backfill recovers a never-published anchor, so it too is a
    // first publish that enforces the gate.
   let enforceDeliveryIdentity = approvedHead ? approvedHead.firstPublish : false;
-  let requireDeliveryReceipt = approvedHead ? approvedHead.firstPublish : false;
   let backfilledDetail: string | undefined;
    if (approvedHeadSha === null) {
      // SUP-14602: no published head, but the approval-time certification may
@@ -2887,7 +2906,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
        if (backfill.kind === "backfilled") {
           approvedHeadSha = backfill.anchorHeadSha;
           enforceDeliveryIdentity = true;
-          requireDeliveryReceipt = true;
           backfilledDetail = backfill.detail;
        } else {
          return { kind: "skipped", reason: backfill.reason, detail: backfill.detail };
@@ -2896,7 +2914,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
        const selection = await selectOpenPendingCandidate(db, row, pending, target);
         if ("anchor" in selection) {
           approvedHeadSha = selection.anchor;
-          requireDeliveryReceipt = true;
         } else {
          return { kind: "skipped", reason: selection.reason, detail: selection.detail };
        }
@@ -2987,13 +3004,28 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
   }
 
+  // A status on a changed head of the certified PR cannot bypass Guard A.
+  // Re-arm only after the same-substance comparison has accepted that head.
+  if (alreadyStamped) {
+    const rearm = await attemptRearmOnHealedStamp(db, row, headSha, target, { requireStamped: true });
+    return {
+      kind: "skipped",
+      reason: "already-success",
+      detail: `already-success: ${target.displayName} head ${headSha.slice(0, 7)} already carries ${PAPERCLIP_APPROVED_CONTEXT}=success`,
+      rearm,
+    };
+  }
+
   const publishOptions: {
     expectedHeadSha: string;
+    expectedPr?: { owner: string; repo: string; number: number };
     enforceDeliveryIdentity?: boolean;
     includeDrafts?: boolean;
     requireDeliveryReceipt?: boolean;
   } = {
     expectedHeadSha: headSha,
+    expectedPr: certified,
+    requireDeliveryReceipt: !certified,
     includeDrafts: true,
   };
   // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1
@@ -3006,9 +3038,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // gate unset.
   if (enforceDeliveryIdentity) {
     publishOptions.enforceDeliveryIdentity = true;
-  }
-  if (requireDeliveryReceipt) {
-    publishOptions.requireDeliveryReceipt = true;
   }
   const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", publishOptions);
   if (outcome.kind === "armed") {
