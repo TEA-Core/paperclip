@@ -399,6 +399,7 @@ export const issueExecutionStatePrincipalSchema = issueExecutionStageParticipant
 export const issueExecutionStageSchema = z.object({
   id: z.string().guid().optional(),
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
+  phase: z.enum(["pre_merge", "post_merge"]).optional().default("pre_merge"),
   approvalsNeeded: z.literal(1).optional().default(1),
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
 }).strict();

@@ -34,6 +34,7 @@ import {
   fetchOpenPullRequests,
   isTransientHttpStatus,
   isTransientReadStatus,
+  ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
   publishApprovalStatus,
@@ -206,6 +207,35 @@ describe("ladderIsTerminallyApproved", () => {
   it("is false when a policy stage is not yet completed (the mid-ladder shape)", () => {
     expect(
       ladderIsTerminallyApproved(policy, { completedStageIds: [A], lastDecisionOutcome: "approved" }),
+    ).toBe(false);
+  });
+
+  it("allows publication after pre-merge approval while a post-merge stage is pending", () => {
+    const phasedPolicy = { stages: [{ id: A }, { id: B, phase: "post_merge" as const }] };
+    expect(
+      ladderIsTerminallyApproved(phasedPolicy, { completedStageIds: [A], lastDecisionOutcome: "approved" }),
+    ).toBe(true);
+  });
+
+  it("lists only incomplete pre-merge stages in refusal diagnostics", () => {
+    const phasedPolicy = { stages: [{ id: A }, { id: B, phase: "post_merge" as const }, { id: "stage-c" }] };
+    expect(ladderIncompleteStageIds(phasedPolicy, { completedStageIds: [A] })).toEqual(["stage-c"]);
+    expect(ladderIncompleteStageIds(phasedPolicy, { completedStageIds: [A, "stage-c"] })).toEqual([]);
+  });
+
+  it("still requires every explicit or implicit pre-merge stage", () => {
+    const phasedPolicy = {
+      stages: [{ id: A, phase: "pre_merge" as const }, { id: B, phase: "post_merge" as const }, { id: "stage-c" }],
+    };
+    expect(
+      ladderIsTerminallyApproved(phasedPolicy, { completedStageIds: [A, B], lastDecisionOutcome: "approved" }),
+    ).toBe(false);
+  });
+
+  it("does not publish a phased ladder after changes are requested", () => {
+    const phasedPolicy = { stages: [{ id: A }, { id: B, phase: "post_merge" as const }] };
+    expect(
+      ladderIsTerminallyApproved(phasedPolicy, { completedStageIds: [A], lastDecisionOutcome: "changes_requested" }),
     ).toBe(false);
   });
 

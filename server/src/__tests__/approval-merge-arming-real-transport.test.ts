@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -87,7 +87,8 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
     mockGhFetch.mockReset();
     mockGetByName.mockReset();
     mockResolveSecretValue.mockReset();
@@ -145,7 +146,7 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     return { type: "agent", agentId, companyId, source: "agent_key", runId };
   }
 
-  async function seedFinalStageCard() {
+  async function seedFinalStageCard({ postMergeStage = false } = {}) {
     const companyId = randomUUID();
     const reviewerAgentId = randomUUID();
     const implementerAgentId = randomUUID();
@@ -155,6 +156,7 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
     const projectWorkspaceId = randomUUID();
     const firstStageId = randomUUID();
     const secondStageId = randomUUID();
+    const postMergeStageId = randomUUID();
     const identifier = "SUP-676";
     const now = new Date();
 
@@ -242,6 +244,13 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
         approvalsNeeded: 1 as const,
         participants: [{ type: "agent" as const, agentId: reviewerAgentId, userId: null }],
       },
+      ...(postMergeStage ? [{
+        id: postMergeStageId,
+        type: "approval" as const,
+        phase: "post_merge" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ type: "user" as const, userId: "cloud-user-1", agentId: null }],
+      }] : []),
     ];
 
     await db.insert(issues).values({
@@ -326,7 +335,7 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       objectType: "pull_request",
       providerKey: "github",
     });
-    return { companyId, reviewerAgentId, issueId, identifier };
+    return { companyId, reviewerAgentId, issueId, identifier, secondStageId, postMergeStageId };
   }
 
   async function seedRun(companyId: string, agentId: string, issueId: string) {
@@ -409,5 +418,40 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
 
     const comments = await mergeArmingComments(issueId);
     expect(comments.some((c) => c.body!.includes("armed"))).toBe(true);
+  });
+
+  it("stamps the approved pre-merge head but cannot close with a pending post-merge stage", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier, secondStageId, postMergeStageId } =
+      await seedFinalStageCard({ postMergeStage: true });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Diff reviewed; live attestation follows merge.\n\nkind: review\ndecision: approved",
+      });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("in_review");
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: postMergeStageId,
+      completedStageIds: expect.arrayContaining([secondStageId]),
+      lastDecisionOutcome: "approved",
+    });
+    expect(row!.executionState?.completedStageIds).not.toContain(postMergeStageId);
+
+    const statusWrites = mockGhFetch.mock.calls.filter(([url, init]) =>
+      url === `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}` && init?.method === "POST",
+    );
+    expect(statusWrites).toHaveLength(1);
+    expect(JSON.parse(String(statusWrites[0]![1]!.body))).toMatchObject({
+      context: "paperclip/approved",
+      state: "success",
+    });
+    expect(graphqlArmCalls()).toHaveLength(1);
+    expect((await armOutcomeOf(issueId))?.kind).toBe("armed");
   });
 });

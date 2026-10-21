@@ -37,6 +37,81 @@ describe("buildExecutionPolicy", () => {
     }
   });
 
+  it("preserves each existing stage's phase when reviewers/approvers are re-saved", () => {
+    const existingPolicy = {
+      mode: "normal" as const,
+      commentRequired: true,
+      stages: [
+        {
+          id: "00000000-0000-4000-8000-0000000000a1",
+          type: "review" as const,
+          approvalsNeeded: 1 as const,
+          phase: "post_merge" as const,
+          participants: [{ id: "00000000-0000-4000-8000-0000000000b1", type: "agent" as const, agentId: AGENT_ID, userId: null }],
+        },
+        {
+          id: "00000000-0000-4000-8000-0000000000a2",
+          type: "approval" as const,
+          approvalsNeeded: 1 as const,
+          participants: [{ id: "00000000-0000-4000-8000-0000000000b2", type: "user" as const, agentId: null, userId: "local-board" }],
+        },
+      ],
+    };
+    const policy = buildExecutionPolicy({
+      existingPolicy,
+      reviewerValues: [`agent:${AGENT_ID}`],
+      approverValues: ["user:local-board"],
+    });
+    expect(policy?.stages.map((stage) => stage.phase)).toEqual(["post_merge", undefined]);
+    expect(issueExecutionPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
+  it.each([
+    { review: "retained post-merge", retainReview: true },
+    { review: "new", retainReview: false },
+  ])("keeps a pre-merge approval ahead of a $review review after a save round-trip", ({ retainReview }) => {
+    const approvalStage = {
+      id: "00000000-0000-4000-8000-0000000000a1",
+      type: "approval" as const,
+      phase: "pre_merge" as const,
+      approvalsNeeded: 1 as const,
+      participants: [{
+        id: "00000000-0000-4000-8000-0000000000b1",
+        type: "user" as const,
+        userId: "local-board",
+      }],
+    };
+    const reviewStage = {
+      id: "00000000-0000-4000-8000-0000000000a2",
+      type: "review" as const,
+      phase: "post_merge" as const,
+      approvalsNeeded: 1 as const,
+      participants: [{
+        id: "00000000-0000-4000-8000-0000000000b2",
+        type: "agent" as const,
+        agentId: AGENT_ID,
+      }],
+    };
+    const saved = buildExecutionPolicy({
+      existingPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [approvalStage, ...(retainReview ? [reviewStage] : [])],
+      },
+      reviewerValues: [`agent:${AGENT_ID}`],
+      approverValues: ["user:local-board"],
+    });
+    const reloaded = issueExecutionPolicySchema.parse(JSON.parse(JSON.stringify(saved)));
+
+    expect(reloaded.stages.map((stage) => stage.type)).toEqual(["approval", "review"]);
+    expect(reloaded.stages.map((stage) => stage.phase)).toEqual([
+      "pre_merge",
+      retainReview ? "post_merge" : "pre_merge",
+    ]);
+    expect(reloaded.stages[0].id).toBe(approvalStage.id);
+    if (retainReview) expect(reloaded.stages[1].id).toBe(reviewStage.id);
+  });
+
   it("omits empty stages from the payload so the API's write boundary does not reject it", () => {
     const policy = buildExecutionPolicy({
       existingPolicy: null,

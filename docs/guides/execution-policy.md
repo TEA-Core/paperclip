@@ -28,6 +28,7 @@ interface IssueExecutionPolicy {
 interface IssueExecutionStage {
   id: string;                                 // auto-generated UUID
   type: "review" | "approval";                // stage kind
+  phase?: "pre_merge" | "post_merge";         // default pre_merge; see doc/execution-semantics.md
   approvalsNeeded: 1;                         // multi-approval is not supported yet
   participants: IssueExecutionStageParticipant[];
 }
@@ -41,6 +42,9 @@ interface IssueExecutionStageParticipant {
 ```
 
 Participants can be either agents or board users. Each stage can have multiple participants; the runtime selects the first eligible participant, preferring any explicitly requested assignee while excluding the original executor.
+
+Saving reviewers or approvers retains the existing order of the stage types.
+Newly added stage types follow the retained stages.
 
 ### Execution State (issue field: `executionState`)
 

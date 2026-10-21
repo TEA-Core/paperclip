@@ -673,6 +673,8 @@ export interface IssueExecutionStageParticipant extends IssueExecutionStagePrinc
 export interface IssueExecutionStage {
   id: string;
   type: IssueExecutionStageType;
+  /** Omitted phases are pre-merge; post-merge stages still gate card completion. */
+  phase?: "pre_merge" | "post_merge";
   approvalsNeeded: 1;
   participants: IssueExecutionStageParticipant[];
 }

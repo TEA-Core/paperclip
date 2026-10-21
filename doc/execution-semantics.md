@@ -88,6 +88,12 @@ Execution work is paused because the next move belongs to a reviewer or approver
 
 An external review service can also be a valid review path when the issue keeps an agent assignee and has an active one-shot monitor that will wake that assignee to check the service later.
 
+Each `executionPolicy.stages` entry may set `phase` to `pre_merge` (the default)
+or `post_merge`. The `paperclip/approved` stamp requires all pre-merge stages to
+be completed and the last recorded decision to be approved; a pending post-merge
+stage does not delay that stamp. Stage order and issue completion are unchanged:
+the review workflow still waits for post-merge stages before closing `done`.
+
 ### `done`
 
 The work is complete and terminal.

@@ -206,6 +206,7 @@ import {
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
   shouldPublishApprovalStatus,
+  ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   MERGE_ARMING_ACTOR_ID,
@@ -4646,9 +4647,7 @@ export function issueRoutes(
       | { completedStageIds?: string[]; lastDecisionOutcome?: string | null }
       | null;
     if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) {
-      const policyStages = ladderPolicy?.stages ?? [];
-      const completedIds = ladderState?.completedStageIds ?? [];
-      const incompleteIds = policyStages.filter((s) => !completedIds.includes(s.id)).map((s) => s.id);
+      const incompleteIds = ladderIncompleteStageIds(ladderPolicy, ladderState);
       const msg = `status:skipped:non-terminal-ladder: incomplete review/approval stages: ${incompleteIds.join(", ")}`;
       try {
         await svc.addComment(
@@ -11248,11 +11247,7 @@ export function issueRoutes(
       lastDecisionOutcome?: string | null;
     };
     if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) {
-      const policyStages = ladderPolicy?.stages ?? [];
-      const completedIds = ladderState.completedStageIds ?? [];
-      const incompleteIds = policyStages
-        .filter((s) => !completedIds.includes(s.id))
-        .map((s) => s.id);
+      const incompleteIds = ladderIncompleteStageIds(ladderPolicy, ladderState);
       res.status(409).json({
         outcome: "rejected",
         reason: "non_terminal_ladder",
