@@ -13,7 +13,6 @@ import {
   externalObjects,
   heartbeatRuns,
   issueComments,
-  issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
   issueExecutionDecisions,
   issues,
@@ -327,36 +326,6 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       objectType: "pull_request",
       providerKey: "github",
     });
-    const receiptId = randomUUID();
-    await db.insert(issueDeliveryReceipts).values({
-      id: receiptId,
-      companyId,
-      sourceIssueId: issueId,
-      provider: "github",
-      owner: OWNER.toLowerCase(),
-      repo: REPO.toLowerCase(),
-      pullRequestNumber: PR_NUMBER,
-      headSha: HEAD_SHA,
-      branchName: DELIVERY_BRANCH,
-      sourceDeliveryRecord: { fixture: true },
-      recoveryReason: "authorized test publication",
-      authorizedByActorType: "user",
-      authorizedByActorId: "cloud-user-1",
-      idempotencyKey: `fixture-${issueId}-${HEAD_SHA}`,
-      state: "ready",
-    });
-
-    await db.insert(issueDeliveryReceiptLinks).values({
-      companyId,
-      receiptId,
-      sourceIssueId: issueId,
-      externalObjectId: externalObj!.id,
-      provider: "github",
-      owner: OWNER.toLowerCase(),
-      repo: REPO.toLowerCase(),
-      pullRequestNumber: PR_NUMBER,
-      headSha: HEAD_SHA,
-    });
     return { companyId, reviewerAgentId, issueId, identifier };
   }
 
@@ -417,6 +386,15 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(issueId)).toBe("done");
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    const statusWrites = mockGhFetch.mock.calls.filter(
+      ([url, init]) => url === `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}` && init?.method === "POST",
+    );
+    expect(statusWrites).toHaveLength(1);
+    expect(JSON.parse(String(statusWrites[0]![1]!.body))).toMatchObject({
+      context: "paperclip/approved",
+      state: "success",
+    });
 
     const armCalls = graphqlArmCalls();
     expect(armCalls).toHaveLength(1);

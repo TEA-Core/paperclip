@@ -4733,7 +4733,7 @@ export function issueRoutes(
             expectedHeadSha: decisionHead.headSha,
             expectedPr: certified,
             enforceDeliveryIdentity: true,
-            requireDeliveryReceipt: true,
+            requireDeliveryReceipt: false,
           },
         );
       } else {
@@ -11088,8 +11088,8 @@ export function issueRoutes(
         throw forbidden("Company owner or admin required to recover a delivery receipt");
       }
     }
-    if (issue.status === "done" || issue.status === "cancelled") {
-      res.status(409).json({ error: "Terminal issues cannot recover delivery receipts" });
+    if (issue.status === "cancelled") {
+      res.status(409).json({ error: "Cancelled issues cannot recover delivery receipts" });
       return;
     }
     const state = (issue.executionState ?? {}) as Record<string, unknown>;
@@ -11312,7 +11312,7 @@ export function issueRoutes(
         closingTransition: true,
         expectedHeadSha: decisionHead.headSha,
         enforceDeliveryIdentity: true,
-        requireDeliveryReceipt: true,
+        requireDeliveryReceipt: false,
       },
     );
 

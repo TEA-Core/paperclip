@@ -584,6 +584,36 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(receiptRows[0]?.state).toBe("ready");
   });
 
+  it("recovers a receipt for a done card with an approved ladder and an open exact-head PR", async () => {
+    const { companyId, issueId } = await seedIssue();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockResolvedValueOnce(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: HEAD_SHA,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 579,
+      headSha: HEAD_SHA,
+      reason: "restore approved publication on done card",
+      idempotencyKey: "recover-done-card",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.receipt.headSha).toBe(HEAD_SHA);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
+  });
+
   it("publishes the recovered target head once and consumes its receipt exactly once", async () => {
     const { companyId, issueId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: 579, headRefName: DELIVERY_BRANCH },
@@ -1137,10 +1167,9 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
-  it("re-publishes and persists the certified head when the card is approvable and delivered", async () => {
+  it("publishes a deliver-branch approval with no receipt row and persists the certified head", async () => {
     const { companyId, issueId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
-      deliveryReceipt: true,
     });
     currentActor = boardActor(companyId);
 
@@ -1163,6 +1192,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const body = JSON.parse(statusCall[1]!.body as string);
     expect(body.context).toBe("paperclip/approved");
     expect(body.state).toBe("success");
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
 
     // The certified head is persisted so Guard A / the enforcer can verify it.
     const [row] = await db
@@ -1171,6 +1201,25 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       .where(eq(issues.id, issueId));
     const approvalStatus = (row?.executionState ?? {})?.approvalStatus as Record<string, unknown> | undefined;
     expect(approvalStatus?.publishedHeadSha).toBe(HEAD_SHA);
+  });
+
+  it("refuses publication when a receipt exists for the PR but its head differs", async () => {
+    const { companyId, issueId } = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      deliveryReceipt: true,
+    });
+    currentActor = boardActor(companyId);
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: OTHER_HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: OTHER_HEAD_SHA } }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.message).toContain("delivery-receipt-head_mismatch");
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.state).toBe("invalidated");
   });
 
   it("refuses with 409 head_moved when the head moves between resolve and publish, zero status writes", async () => {

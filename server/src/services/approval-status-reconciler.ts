@@ -2870,7 +2870,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
    // A SUP-14747 backfill recovers a never-published anchor, so it too is a
    // first publish that enforces the gate.
   let enforceDeliveryIdentity = approvedHead ? approvedHead.firstPublish : false;
-  let requireDeliveryReceipt = approvedHead ? approvedHead.firstPublish : false;
   let backfilledDetail: string | undefined;
    if (approvedHeadSha === null) {
      // SUP-14602: no published head, but the approval-time certification may
@@ -2887,7 +2886,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
        if (backfill.kind === "backfilled") {
           approvedHeadSha = backfill.anchorHeadSha;
           enforceDeliveryIdentity = true;
-          requireDeliveryReceipt = true;
           backfilledDetail = backfill.detail;
        } else {
          return { kind: "skipped", reason: backfill.reason, detail: backfill.detail };
@@ -2896,7 +2894,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
        const selection = await selectOpenPendingCandidate(db, row, pending, target);
         if ("anchor" in selection) {
           approvedHeadSha = selection.anchor;
-          requireDeliveryReceipt = true;
         } else {
          return { kind: "skipped", reason: selection.reason, detail: selection.detail };
        }
@@ -2995,6 +2992,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   } = {
     expectedHeadSha: headSha,
     includeDrafts: true,
+    requireDeliveryReceipt: false,
   };
   // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1
   // delivery-identity gate never successfully ran for this head — the arming
@@ -3006,9 +3004,6 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // gate unset.
   if (enforceDeliveryIdentity) {
     publishOptions.enforceDeliveryIdentity = true;
-  }
-  if (requireDeliveryReceipt) {
-    publishOptions.requireDeliveryReceipt = true;
   }
   const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", publishOptions);
   if (outcome.kind === "armed") {
