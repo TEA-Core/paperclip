@@ -43,6 +43,9 @@ interface IssueExecutionStageParticipant {
 
 Participants can be either agents or board users. Each stage can have multiple participants; the runtime selects the first eligible participant, preferring any explicitly requested assignee while excluding the original executor.
 
+Saving reviewers or approvers retains the existing order of the stage types.
+Newly added stage types follow the retained stages.
+
 ### Execution State (issue field: `executionState`)
 
 Tracks where the issue currently sits in its policy workflow:

@@ -84,8 +84,9 @@ export function buildExecutionPolicy(input: {
   const mode = input.existingPolicy?.mode ?? "normal";
   const stages: IssueExecutionPolicy["stages"] = [];
   const monitor = input.existingPolicy?.monitor ?? null;
+  const existingStages = input.existingPolicy?.stages ?? [];
 
-  const existingReviewStage = input.existingPolicy?.stages.find((stage) => stage.type === "review");
+  const existingReviewStage = existingStages.find((stage) => stage.type === "review");
   const reviewParticipants = mergeParticipants(existingReviewStage?.participants, input.reviewerValues);
   if (reviewParticipants.length > 0) {
     stages.push({
@@ -97,7 +98,7 @@ export function buildExecutionPolicy(input: {
     });
   }
 
-  const existingApprovalStage = input.existingPolicy?.stages.find((stage) => stage.type === "approval");
+  const existingApprovalStage = existingStages.find((stage) => stage.type === "approval");
   const approvalParticipants = mergeParticipants(existingApprovalStage?.participants, input.approverValues);
   if (approvalParticipants.length > 0) {
     stages.push({
@@ -107,6 +108,15 @@ export function buildExecutionPolicy(input: {
       ...(existingApprovalStage?.phase ? { phase: existingApprovalStage.phase } : {}),
       participants: approvalParticipants,
     });
+  }
+
+  // The editor emits at most one stage per type. Keep retained types in their
+  // existing order, and put newly added types after them.
+  if (
+    existingApprovalStage &&
+    (!existingReviewStage || existingStages.indexOf(existingApprovalStage) < existingStages.indexOf(existingReviewStage))
+  ) {
+    stages.reverse();
   }
 
   if (stages.length === 0 && !monitor) return null;
