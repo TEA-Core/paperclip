@@ -581,6 +581,117 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     return interaction!;
   }
 
+  for (const door of ["PATCH", "comment", "escalation"] as const) {
+    it.each([
+      "status", "updatedAt", "delivery binding", "delivery owner", "recorded PR identity",
+      "stage transition", "updatedAt during external preflight",
+    ] as const)(
+      `keeps ${door} final approval pending after a %s mutation`,
+      async (change) => {
+        const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+        const interaction = door === "escalation" ? await seedEscalation(fixture) : null;
+        if (change === "recorded PR identity") {
+          const initial = await fixture.read();
+          await db.update(issues).set({
+            executionState: {
+              ...initial.executionState,
+              delivery: {
+                branch: `${initial.identifier}-delivery`, headSha: fixture.pr.head.sha,
+                prNumber: 42, prUrl: "https://github.com/TEA-Core/paperclip/pull/42",
+                repo: { owner: "TEA-Core", repo: "paperclip" },
+              },
+            },
+          }).where(eq(issues.id, fixture.issue.id));
+        }
+        const receiptsBefore = await db.select().from(issueDeliveryReceipts)
+          .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+        const events: Array<{ payload: Record<string, unknown> }> = [];
+        const unsubscribe = subscribeCompanyLiveEvents(fixture.company.id, (event) => events.push(event));
+        const app = createApp(db, boardActor(fixture.company));
+        const approval = (
+          door === "PATCH"
+            ? fixture.approve()
+            : door === "comment"
+              ? request(app).post(`/api/issues/${fixture.issue.id}/comments`)
+                .send({ body: "## Review: APPROVED\n\nIndependent final review." })
+              : request(app).post(`/api/issues/${fixture.issue.id}/interactions/${interaction!.id}/accept`)
+                .send({})
+        ).then((result) => result);
+        const mutate = async () => {
+          if (change === "status") {
+            await db.update(issues).set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+              .where(eq(issues.id, fixture.issue.id));
+          } else if (change === "updatedAt" || change === "updatedAt during external preflight") {
+            await db.update(issues).set({ updatedAt: new Date(Date.now() + 60_000) })
+              .where(eq(issues.id, fixture.issue.id));
+          } else if (change === "delivery owner") {
+            const unrelated = await seedIssue(db, {
+              companyId: fixture.company.id, title: "Unrelated delivery owner",
+            });
+            const stored = await fixture.read();
+            await db.update(executionWorkspaces).set({ sourceIssueId: unrelated.id })
+              .where(eq(executionWorkspaces.id, stored.executionWorkspaceId!));
+          } else if (change === "delivery binding") {
+            const stored = await fixture.read();
+            await db.update(executionWorkspaces).set({ branchName: "rebound-delivery" })
+              .where(eq(executionWorkspaces.id, stored.executionWorkspaceId!));
+          } else {
+            const stored = await fixture.read();
+            await db.update(issues).set({
+              executionState: {
+                ...(stored.executionState ?? {}),
+                ...(change === "recorded PR identity"
+                  ? { delivery: { ...stored.executionState?.delivery, prNumber: 43 } }
+                  : { currentStageId: randomUUID() }),
+              },
+              updatedAt: new Date(Date.now() + 60_000),
+            }).where(eq(issues.id, fixture.issue.id));
+          }
+        };
+        let response: request.Response;
+        try {
+          if (change === "updatedAt during external preflight") {
+            await fixture.pullReached;
+            await mutate();
+            fixture.releasePull();
+            response = await approval;
+          } else {
+            response = await raceAtDecisionTransaction(fixture, approval, mutate);
+          }
+        } finally {
+          fixture.releasePull();
+          unsubscribe();
+        }
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+        const stored = await fixture.read();
+        expect(stored.status).toBe(change === "status" ? "blocked" : "in_review");
+        expect(stored.executionState).toMatchObject({
+          status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        });
+        expect(stored.executionState?.approvalStatus).toBeUndefined();
+        expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+        if (door === "comment") {
+          expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id))).toEqual([]);
+        }
+        if (interaction) {
+          const [pending] = await db.select().from(issueThreadInteractions)
+            .where(eq(issueThreadInteractions.id, interaction.id));
+          expect(pending?.status).toBe("pending");
+        }
+        expect(await db.select().from(issueDeliveryReceipts)
+          .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receiptsBefore);
+        expect(events.filter((event) => {
+          const action = event.payload.action;
+          return typeof action === "string" &&
+            (action === "issue.updated" || (action.startsWith("issue.done_") && !action.endsWith("_skipped")));
+        })).toEqual([]);
+        expect(fixture.writes).toEqual([]);
+        expect(fixture.armCalls).toEqual([]);
+      },
+    );
+  }
+
   it.each([{ draft: true }, { missing: true }])("leaves an escalation confirmation pending on a refused final delivery: %j", async (options) => {
     const fixture = await pendingDelivery(options);
     const interaction = await seedEscalation(fixture);
@@ -660,6 +771,37 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     return run!;
   }
 
+  async function staleRunFinalReview(fixture: Awaited<ReturnType<typeof pendingDelivery>>) {
+    const authorId = (await fixture.read()).createdByAgentId!;
+    const [author] = await db.select().from(agents).where(eq(agents.id, authorId));
+    const other = await seedAgent(db, fixture.company.id);
+    const [actorRun, staleCheckout, staleExecution] = await db.insert(heartbeatRuns).values([
+      { companyId: fixture.company.id, agentId: authorId, status: "running", contextSnapshot: { issueId: fixture.issue.id } },
+      { companyId: fixture.company.id, agentId: other.id, status: "succeeded", contextSnapshot: { issueId: fixture.issue.id }, startedAt: new Date(), finishedAt: new Date() },
+      { companyId: fixture.company.id, agentId: other.id, status: "succeeded", contextSnapshot: { issueId: fixture.issue.id }, startedAt: new Date(), finishedAt: new Date() },
+    ]).returning();
+    const initial = await fixture.read();
+    await db.update(issues).set({
+      status: "in_progress", assigneeAgentId: authorId, assigneeUserId: null,
+      checkoutRunId: staleCheckout!.id, executionRunId: staleExecution!.id,
+      executionPolicy: {
+        mode: "normal", commentRequired: true, returnAssigneeAgentId: authorId,
+        stages: [{ id: fixture.stageId, type: "review", approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: authorId, userId: null }] }],
+      },
+      executionState: {
+        ...initial.executionState,
+        currentParticipant: { type: "agent", agentId: authorId, userId: null },
+        returnAssignee: { type: "agent", agentId: authorId, userId: null },
+      },
+    }).where(eq(issues.id, fixture.issue.id));
+    return {
+      app: createApp(db, agentActor(fixture.company, author!, actorRun!.id)),
+      actorRun: actorRun!,
+      comment: "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): the stage participant re-ran the close against the armed card and the delivery ref is unchanged.",
+    };
+  }
+
   const reassignToBoardUser = { assigneeAgentId: null, assigneeUserId: "board-user" };
 
   it("approves a final PATCH whose own run cancellation bumps updatedAt", async () => {
@@ -674,6 +816,67 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(cancelled?.status).toBe("cancelled");
     expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
     expect(fixture.writes).toHaveLength(1);
+  });
+
+  it("approves a final PATCH after returning an idle agent assignment", async () => {
+    const fixture = await pendingDelivery();
+    const agentId = (await fixture.read()).createdByAgentId!;
+    await db.update(issues).set({ assigneeAgentId: agentId, assigneeUserId: null })
+      .where(eq(issues.id, fixture.issue.id));
+    const response = await fixture.approve(reassignToBoardUser);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await fixture.read()).status).toBe("done");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
+    expect(fixture.writes).toHaveLength(1);
+  });
+
+  it("approves a final PATCH after its own stale checkout adoption without a recovery action", async () => {
+    const fixture = await pendingDelivery();
+    const { app, comment } = await staleRunFinalReview(fixture);
+    const response = await request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      lastDecisionOutcome: "approved", completedStageIds: [fixture.stageId],
+    });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([
+      expect.objectContaining({ outcome: "approved", stageId: fixture.stageId }),
+    ]);
+  });
+
+  it("refuses an outside timestamp change after its own stale checkout adoption", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const { app, comment, actorRun } = await staleRunFinalReview(fixture);
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const pending = request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment }).then((response) => response);
+    let response: request.Response;
+    try {
+      await fixture.pullReached;
+      expect((await fixture.read()).checkoutRunId).toBe(actorRun.id);
+      await db.update(issues).set({ updatedAt: new Date(Date.now() + 60_000) })
+        .where(eq(issues.id, fixture.issue.id));
+      fixture.releasePull();
+      response = await pending;
+    } finally {
+      fixture.releasePull();
+    }
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_progress");
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
   });
 
   it.each([

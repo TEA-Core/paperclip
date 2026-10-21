@@ -18241,6 +18241,10 @@ export function issueRoutes(
     // The typed ladder-gap refusal (raised under the update lock below) replaces
     // the delivery guard's `done_transition_missing_delivery` catchall for
     // in-scope cards, so the guard is skipped only when the gap is present.
+    const terminalizingIssue =
+      typeof updateFields.status === "string" &&
+      updateFields.status !== existing.status &&
+      isClosedIssueStatus(updateFields.status);
     const terminalApprovalNeedsPreflight =
       shouldPublishApprovalStatus(transition.decision) &&
       ladderIsTerminallyApproved(
@@ -18248,6 +18252,10 @@ export function issueRoutes(
         updateFields.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
       );
     let finalDeliveryPrefetch: FinalDeliveryPrefetch | null = null;
+    // A run release can change updatedAt before the write transaction. Do not
+    // certify the issue until that request-owned mutation has finished.
+    let deferFinalDeliveryPrefetch = false;
+    let originalDeliveryBinding: string | null = null;
     if (isDoneRequest && !missingApprovalStageGap) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
@@ -18270,19 +18278,33 @@ export function issueRoutes(
         return;
       }
       if (terminalApprovalNeedsPreflight && outcome.overrideAccepted !== true) {
-        finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+        deferFinalDeliveryPrefetch = Boolean(existing.assigneeAgentId && (assigneeWillChange || terminalizingIssue));
+        if (deferFinalDeliveryPrefetch) {
+          originalDeliveryBinding = await readFinalDeliveryBinding(db, existing);
+        } else {
+          finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+        }
       }
-      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
-        overrideAccepted: outcome.overrideAccepted === true,
-        prefetched: finalDeliveryPrefetch,
-      });
+      if (!deferFinalDeliveryPrefetch) {
+        await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
+          overrideAccepted: outcome.overrideAccepted === true,
+          prefetched: finalDeliveryPrefetch,
+        });
+      }
     } else if (transition.decision) {
       if (terminalApprovalNeedsPreflight) {
-        finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+        deferFinalDeliveryPrefetch = Boolean(existing.assigneeAgentId && (assigneeWillChange || terminalizingIssue));
+        if (deferFinalDeliveryPrefetch) {
+          originalDeliveryBinding = await readFinalDeliveryBinding(db, existing);
+        } else {
+          finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+        }
       }
-      await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
-        prefetched: finalDeliveryPrefetch,
-      });
+      if (!deferFinalDeliveryPrefetch) {
+        await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
+          prefetched: finalDeliveryPrefetch,
+        });
+      }
     }
 
     if (assigneeWillChange && existing.assigneeAgentId) {
@@ -18316,10 +18338,6 @@ export function issueRoutes(
       }
     }
 
-    const terminalizingIssue =
-      typeof updateFields.status === "string" &&
-      updateFields.status !== existing.status &&
-      isClosedIssueStatus(updateFields.status);
     if (
       !assigneeWillChange &&
       terminalizingIssue &&
@@ -18359,21 +18377,41 @@ export function issueRoutes(
         interruptedRunId = cancelled.id;
       }
     }
-    if (finalDeliveryPrefetch) {
-      // This request's own run-lock writes bump updatedAt and move the run links;
-      // re-anchor only while every other column and the delivery binding are unchanged.
+    if (deferFinalDeliveryPrefetch) {
       const afterStop = await svc.getById(existing.id);
       const withoutRunRelease = (row: object) => {
         const { updatedAt: _u, executionRunId: _r, executionAgentNameKey: _k, executionLockedAt: _l, checkoutRunId: _c, ...rest } = row as Record<string, unknown>;
         return rest;
       };
+      // Agent mutation authorization can atomically adopt a stale checkout into
+      // this request's live run before the first external certificate is taken.
+      // That write changes only run links and stamps both times identically;
+      // any later timestamp write still makes this pre-certificate check stale.
+      const adoptedOwnCheckout = afterStop !== null &&
+        req.actor.type === "agent" &&
+        actor.runId !== null &&
+        existing.status === "in_progress" &&
+        existing.assigneeAgentId === req.actor.agentId &&
+        existing.checkoutRunId !== actor.runId &&
+        afterStop.checkoutRunId === actor.runId &&
+        afterStop.executionRunId === actor.runId &&
+        afterStop.executionLockedAt !== null &&
+        afterStop.executionLockedAt.getTime() === afterStop.updatedAt.getTime();
       if (
-        afterStop &&
-        isDeepStrictEqual(withoutRunRelease(afterStop), withoutRunRelease(existing)) &&
-        (await readFinalDeliveryBinding(db, afterStop)) === finalDeliveryPrefetch.binding
+        !afterStop ||
+        !isDeepStrictEqual(withoutRunRelease(afterStop), withoutRunRelease(existing)) ||
+        (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(afterStop, existing)) ||
+        (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
       ) {
-        finalDeliveryPrefetch = { ...finalDeliveryPrefetch, updatedAtMs: new Date(afterStop.updatedAt).getTime() };
+        throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {
+          code: "approval_final_delivery_preflight_stale",
+          reason: "head_moved: card or delivery binding changed before final delivery preflight",
+        });
       }
+      finalDeliveryPrefetch = await prefetchFinalDelivery(afterStop);
+      await preflightTerminalApproval(afterStop, updateFields, transition.decision, nextExecutionPolicy, {
+        prefetched: finalDeliveryPrefetch,
+      });
     }
     const nextParentId = updateFields.parentId === undefined
       ? existing.parentId
