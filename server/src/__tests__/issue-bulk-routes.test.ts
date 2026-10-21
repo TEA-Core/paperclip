@@ -1,8 +1,19 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, companies, createDb, issues, type Db } from "@paperclipai/db";
+import {
+  activityLog,
+  agents,
+  companies,
+  createDb,
+  executionWorkspaces,
+  issueWorkProducts,
+  issues,
+  projects,
+  type Db,
+} from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -21,6 +32,11 @@ describePostgres("bounded bulk issue read", () => {
   let agentId: string;
   let issueIds: string[];
   let identifiers: string[];
+  let conformanceParentId: string;
+  let conformanceChildId: string;
+  let conformanceOutOfScopeChildId: string;
+  let conformanceWorkspaceId: string;
+  let conformanceChildCreatedAt: Date;
   const limiter = createCompanySearchRateLimiter({ maxRequests: 2 });
 
   function app(actor: Express.Request["actor"]) {
@@ -70,6 +86,41 @@ describePostgres("bounded bulk issue read", () => {
     await db.insert(issues).values({
       companyId: foreignCompanyId, identifier: "FR-1", issueNumber: 1,
       title: "Foreign issue", status: "todo", priority: "medium",
+    });
+
+    const projectId = randomUUID();
+    conformanceParentId = randomUUID();
+    conformanceChildId = randomUUID();
+    conformanceOutOfScopeChildId = randomUUID();
+    conformanceWorkspaceId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Conformance" });
+    await db.insert(issues).values([
+      {
+        id: conformanceParentId, companyId, projectId, identifier: "BK-200", issueNumber: 200,
+        title: "Conformance parent", status: "todo", priority: "medium",
+      },
+      {
+        id: conformanceOutOfScopeChildId, companyId, projectId,
+        identifier: "BK-202", issueNumber: 202, title: "Out of scope", status: "todo", priority: "medium",
+      },
+    ]);
+    conformanceChildCreatedAt = new Date("2026-10-21T17:00:00.000Z");
+    await db.insert(issues).values({
+      id: conformanceChildId, companyId, projectId, parentId: conformanceParentId,
+      identifier: "BK-201", issueNumber: 201, title: "In scope", status: "todo", priority: "medium",
+      createdAt: conformanceChildCreatedAt,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: conformanceWorkspaceId, companyId, projectId, sourceIssueId: conformanceChildId,
+      mode: "isolated_workspace", strategyType: "git_worktree", name: "conformance-child",
+      status: "active", branchName: "feature/conformance-child", providerType: "git_worktree",
+      metadata: { deliveryState: "merged_via_pr" },
+    });
+    await db.update(issues).set({ executionWorkspaceId: conformanceWorkspaceId }).where(eq(issues.id, conformanceChildId));
+    await db.insert(issueWorkProducts).values({
+      companyId, projectId, issueId: conformanceChildId, executionWorkspaceId: conformanceWorkspaceId,
+      type: "pull_request", provider: "github", title: "Conformance PR", status: "merged",
+      reviewState: "none", healthStatus: "healthy", metadata: { mergedAt: "2026-10-21T17:30:00.000Z" }, url: "https://github.com/example/repo/pull/1",
     });
   }, 30_000);
 
@@ -213,6 +264,46 @@ describePostgres("bounded bulk issue read", () => {
       state: "required",
       sourceRunId,
     });
+  });
+
+  it("projects only direct children with hydrated delivery state and PR products", async () => {
+    const response = await request(app(board())).get(
+      `/api/issues/${conformanceParentId}/children/conformance`,
+    );
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.items).toHaveLength(1);
+    expect(response.body.items[0]).toMatchObject({
+      id: conformanceChildId,
+      identifier: "BK-201",
+      currentExecutionWorkspace: {
+        branchName: "feature/conformance-child",
+        deliveryState: "merged_via_pr",
+      },
+      workProducts: [{ type: "pull_request", title: "Conformance PR" }],
+    });
+  });
+
+  it("rejects invalid conformance projection bounds", async () => {
+    const response = await request(app(board())).get(
+      `/api/issues/${conformanceParentId}/children/conformance`,
+    ).query({ limit: "51" });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("applies cutover and cursor bounds to direct-child pages", async () => {
+    const cursor = Buffer.from(JSON.stringify({
+      createdAt: conformanceChildCreatedAt.toISOString(),
+      id: conformanceChildId,
+    })).toString("base64url");
+    const response = await request(app(board())).get(
+      `/api/issues/${conformanceParentId}/children/conformance`,
+    ).query({ cutoverAt: conformanceChildCreatedAt.toISOString(), cursor });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.items).toEqual([]);
+    expect(response.body.nextCursor).toBeNull();
   });
 
   it("keeps SQL statement count flat when requesting more issue IDs", async () => {

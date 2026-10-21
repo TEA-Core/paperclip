@@ -3897,6 +3897,23 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/children/conformance",
+  tags: ["issues"],
+  summary: "List bounded direct-child conformance projections",
+  description: "Returns at most 50 authorization-visible direct children, ordered by (createdAt,id). Optional cutoverAt includes only newer children; cursor is an opaque continuation token.",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({
+      cutoverAt: z.string().datetime().optional(),
+      cursor: z.string().optional(),
+      limit: z.coerce.number().int().positive().max(50).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
