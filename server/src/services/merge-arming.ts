@@ -3713,21 +3713,23 @@ export async function writeCommitStatusWithRetry(
  * inline block did. When the head resolved, the record is a FRESH object (a stale
  * `publishedHeadSha` from a prior cycle must not survive a new certification);
  * when it did not resolve, the record MERGES into any existing `approvalStatus`
- * so a prior `pendingCandidates` / `backfillRefusal` is preserved. `pendingCandidates`
-  * is only ever written when no head resolved — matching the prior inline block.
-  *
-  * SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
-  * record is written atomically against the LIVE `executionState.approvalStatus`
-  * subtree (`jsonb_set` on the root + a jsonb `||`/replace on the subtree), the
-  * same shape {@link recordApprovalAnchor} and the reconciler's
-  * `mergeApprovalStatus` use. The `baseExecutionState` argument is the route's
-  * client snapshot and is no longer read — rebuilding the whole column from it
-  * reverted every root key a concurrent writer committed after the snapshot.
-  *
-  * This helper only WRITES the card's durable record. It does not decide whether
-  * a stamp is published (that stays in {@link publishApprovalStatus} / the
-  * consume-contract) and it never itself re-stamps.
-  */
+ * so a prior `pendingCandidates` / `backfillRefusal` is preserved. The certified
+ * `finalDelivery` survives either outcome from the live subtree.
+ * `pendingCandidates` is only ever written when no head resolved — matching the
+ * prior inline block.
+ *
+ * SUP-16081 stage-3 finding (publish-outcome-root-state-lost-update): the
+ * record is written atomically against the LIVE `executionState.approvalStatus`
+ * subtree (`jsonb_set` on the root + a jsonb `||`/replace on the subtree), the
+ * same shape {@link recordApprovalAnchor} and the reconciler's
+ * `mergeApprovalStatus` use. The `baseExecutionState` argument is the route's
+ * client snapshot and is no longer read — rebuilding the whole column from it
+ * reverted every root key a concurrent writer committed after the snapshot.
+ *
+ * This helper only WRITES the card's durable record. It does not decide whether
+ * a stamp is published (that stays in {@link publishApprovalStatus} / the
+ * consume-contract) and it never itself re-stamps.
+ */
 export async function recordApprovalPublishOutcome(
   db: Db,
   issueId: string,
@@ -3796,7 +3798,14 @@ export async function recordApprovalPublishOutcome(
       approvedAt: nowIso,
       ...patch,
     };
-    approvalStatusExpr = sql`${JSON.stringify(freshSubtree)}::jsonb`;
+    // Freshen old publication fields without dropping the decision's certified
+    // PR identity. Read it from the live row so concurrent updates are not lost.
+    approvalStatusExpr = sql`(
+      case when coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) ? 'finalDelivery'
+        then jsonb_build_object('finalDelivery', ${issues.executionState} -> 'approvalStatus' -> 'finalDelivery')
+        else '{}'::jsonb end
+      || ${JSON.stringify(freshSubtree)}::jsonb
+    )`;
   } else {
     approvalStatusExpr = sql`(
       coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)

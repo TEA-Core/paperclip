@@ -2984,12 +2984,22 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
   }
 
+  const approvalStatus = (row.executionState?.approvalStatus ?? {}) as Record<string, unknown>;
+  const finalDelivery = approvalStatus.finalDelivery as {
+    owner: string; repo: string; number: number; headSha: string; decisionId?: string;
+  } | undefined;
+  const certified =
+    finalDelivery?.decisionId && finalDelivery.decisionId === row.executionState?.lastDecisionId
+      ? finalDelivery
+      : undefined;
   const publishOptions: {
     expectedHeadSha: string;
+    expectedPr?: { owner: string; repo: string; number: number };
     enforceDeliveryIdentity?: boolean;
     includeDrafts?: boolean;
   } = {
-    expectedHeadSha: headSha,
+    expectedHeadSha: certified?.headSha ?? headSha,
+    expectedPr: certified,
     includeDrafts: true,
   };
   // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1

@@ -883,6 +883,27 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(approvalStatus!.publishSkipped).toBeUndefined();
     });
 
+    it.each(["failed", "armed"] as const)("preserves the live final-delivery binding after a %s first publish", async (kind) => {
+      const issueId = await insertIssue();
+      const finalDelivery = {
+        owner: OWNER, repo: REPO, number: 42, headSha: APPROVED_HEAD,
+        displayName: `${OWNER}/${REPO}#42`, decisionId: "decision-42",
+      };
+      await db.update(issues).set({
+        executionState: { approvalStatus: { finalDelivery, publishedHeadSha: "stale-head" } },
+      }).where(eq(issues.id, issueId));
+
+      await recordApprovalPublishOutcome(db, issueId, {}, APPROVED_HEAD,
+        kind === "failed"
+          ? { kind, message: "status:failed:scope_missing" }
+          : { kind, message: "status:published", headSha: APPROVED_HEAD });
+
+      const approvalStatus = await readApprovalStatus(issueId);
+      expect(approvalStatus?.finalDelivery).toEqual(finalDelivery);
+      expect(approvalStatus?.approvedHeadSha).toBe(APPROVED_HEAD);
+      expect(approvalStatus?.publishedHeadSha).toBe(kind === "armed" ? APPROVED_HEAD : undefined);
+    });
+
     it("AC2: a named skip outcome persists its exact refusal reason + attempted head", async () => {
       const issueId = await insertIssue();
       const refusal = "status:skipped:not_delivered: branch mismatch";

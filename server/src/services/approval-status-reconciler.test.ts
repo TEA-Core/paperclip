@@ -751,6 +751,50 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   }
 
   describe("runApprovalStatusReconcilerTick", () => {
+    it.each([
+      ["failed", false],
+      ["failed", true],
+      ["published", false],
+      ["published", true],
+    ] as const)("refuses retargeted PR recovery after %s first publish (receipt=%s)", async (outcome, receipt) => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-42",
+          approvalStatus: {
+            ...(outcome === "failed"
+              ? { approvedHeadSha: APPROVED_HEAD, publishFailure: { reason: "status:failed:scope_missing" } }
+              : { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT }),
+            finalDelivery: {
+              owner: "TEA-Core", repo: "paperclip", number: 42, headSha: APPROVED_HEAD,
+              displayName: "TEA-Core/paperclip#42", decisionId: "decision-42",
+            },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      if (receipt) {
+        await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name", 99);
+      } else {
+        await insertMention(issueId, { number: 99 });
+      }
+      const movedPrUrl = "https://api.github.com/repos/TEA-Core/paperclip/pulls/99";
+      installRoutes([
+        { url: movedPrUrl, body: { ...OPEN_PR_BODY, head: { ref: "some-branch-name", sha: NEW_HEAD } } },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: APPROVED_DIFF_URL, body: { files: [{ filename: "a.ts", sha: "identical-blob", status: "modified" }] } },
+        { url: LIVE_DIFF_URL, body: { files: [{ filename: "a.ts", sha: "identical-blob", status: "modified" }] } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.rearmed).toBe(0);
+      expect(summary.skippedDetails.some((detail) => detail.includes("delivery_moved"))).toBe(true);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+    });
+
     it("republishes exactly once when the status is missing on the live head", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);

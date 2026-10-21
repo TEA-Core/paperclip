@@ -265,6 +265,13 @@ See `doc/project-repositories.md` for the API and UI contract.
 - `cancelled_at` timestamptz null
 - `hidden_at` timestamptz null
 
+For a terminal approval, `execution_state.approvalStatus.finalDelivery` binds
+the approving decision to its certified pull request and head. Publish outcomes
+retain this binding, including failed first publishes. Board stamp recovery and
+the approval-status reconciler must publish against that same PR and head rather
+than a later delivery target. A delivery receipt is optional when no receipt row
+exists for the PR; an existing row must still authorize the published head.
+
 Invariants:
 
 - single assignee only

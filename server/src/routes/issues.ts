@@ -11282,15 +11282,18 @@ export function issueRoutes(
       return;
     }
 
-    // Resolve the decision-time head the way the decision-time arming did, so the
-    // publish is pinned to exactly the head the reviewer approved.
-    const decisionHead = await resolveApprovalDecisionHead(
-      db,
-      issue.companyId,
-      issue.id,
-      identifier,
-      true,
-    );
+    // The final preflight bound the approving decision to a specific PR/head.
+    // Recovery must not silently replace it with a newly delivered PR.
+    const finalDelivery = approvalStatus?.finalDelivery as {
+      owner: string; repo: string; number: number; headSha: string; decisionId?: string;
+    } | undefined;
+    const certified =
+      finalDelivery?.decisionId && finalDelivery.decisionId === state.lastDecisionId
+        ? finalDelivery
+        : undefined;
+    const decisionHead = certified
+      ? { kind: "resolved" as const, headSha: certified.headSha }
+      : await resolveApprovalDecisionHead(db, issue.companyId, issue.id, identifier, true);
     if (decisionHead.kind !== "resolved") {
       res.status(409).json({
         outcome: "rejected",
@@ -11300,8 +11303,8 @@ export function issueRoutes(
       return;
     }
 
-    // Re-run the first publish, pinned to the resolved head, delivery-identity
-    // enforced (a cited-but-not-delivered PR is refused, never stamped).
+    // Re-run the first publish against the original approval-time PR/head.
+    // Historical cards without a final-delivery binding retain head resolution.
     const publishOutcome = await publishApprovalStatus(
       db,
       issue.companyId,
@@ -11310,6 +11313,7 @@ export function issueRoutes(
       {
         closingTransition: true,
         expectedHeadSha: decisionHead.headSha,
+        expectedPr: certified,
         enforceDeliveryIdentity: true,
       },
     );
