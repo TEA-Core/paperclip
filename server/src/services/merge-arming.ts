@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { z } from "zod";
+import type { IssueExecutionStage } from "@paperclipai/shared";
 import { and, eq, ilike, inArray, sql, type SQL } from "drizzle-orm";
 import {
   externalObjectMentions,
@@ -59,32 +60,21 @@ export function shouldPublishApprovalStatus<T extends Pick<MergeArmingDecision, 
 }
 
 /**
- * SUP-15459: the ladder-terminality predicate. True only when EVERY
- * review/approval stage declared on the card's execution policy is present in
- * `completedStageIds` AND the card's last recorded decision outcome is
- * "approved" — i.e. the whole ladder was genuinely reviewed and approved, not
- * just the stage the actor happened to just sign off on.
+ * Stamp eligibility requires every pre-merge review/approval stage to be
+ * completed and the last recorded decision to be approved. Omitted phases are
+ * pre-merge for existing policies. Post-merge stages still gate card completion,
+ * but must not hold the merge stamp pending evidence that requires a merge.
  *
- * This single shared predicate gates EVERY write of the `paperclip/approved`
- * status: the post-approval routes arming hook, the approval-status reconciler's
- * delegated re-publish, and armMergeOnApproval's actuator. Before this the check
- * existed only inline inside armMergeOnApproval, and `publishApprovalStatus`
- * (and therefore its two call sites) stamped on any approved stage — so a
- * mid-ladder approval (completedStageIds short of the policy's full stage set)
- * authorized a merge. Extracting it verbatim into one function keeps the
- * "is the ladder fully reviewed + approved" question from drifting between the
- * three call sites.
- *
- * Pure read of the policy/state shapes; no I/O, so it is unit-testable without a
- * DB and safe to run at decision time, in the reconciler, and in the actuator.
+ * Shared by the post-approval hook, reconciler, and merge actuator; pure read of
+ * policy/state with no I/O.
  */
 export function ladderIsTerminallyApproved(
-  policy: { stages?: Array<{ id: string }> } | null | undefined,
+  policy: { stages?: Array<Pick<IssueExecutionStage, "id" | "phase">> } | null | undefined,
   state: { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | null | undefined,
 ): boolean {
   const policyStages = policy?.stages ?? [];
   const completedIds = state?.completedStageIds ?? [];
-  const allCompleted = policyStages.every((s) => completedIds.includes(s.id));
+  const allCompleted = policyStages.every((s) => s.phase === "post_merge" || completedIds.includes(s.id));
   return allCompleted && state?.lastDecisionOutcome === "approved";
 }
 

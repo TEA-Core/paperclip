@@ -466,6 +466,7 @@ export function normalizeIssueExecutionPolicy(
       return {
         id: stage.id ?? randomUUID(),
         type: stage.type,
+        phase: stage.phase,
         approvalsNeeded: 1 as const,
         participants: dedupedParticipants,
       };

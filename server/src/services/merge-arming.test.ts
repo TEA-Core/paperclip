@@ -209,6 +209,29 @@ describe("ladderIsTerminallyApproved", () => {
     ).toBe(false);
   });
 
+  it("allows publication after pre-merge approval while a post-merge stage is pending", () => {
+    const phasedPolicy = { stages: [{ id: A }, { id: B, phase: "post_merge" as const }] };
+    expect(
+      ladderIsTerminallyApproved(phasedPolicy, { completedStageIds: [A], lastDecisionOutcome: "approved" }),
+    ).toBe(true);
+  });
+
+  it("still requires every explicit or implicit pre-merge stage", () => {
+    const phasedPolicy = {
+      stages: [{ id: A, phase: "pre_merge" as const }, { id: B, phase: "post_merge" as const }, { id: "stage-c" }],
+    };
+    expect(
+      ladderIsTerminallyApproved(phasedPolicy, { completedStageIds: [A, B], lastDecisionOutcome: "approved" }),
+    ).toBe(false);
+  });
+
+  it("does not publish a phased ladder after changes are requested", () => {
+    const phasedPolicy = { stages: [{ id: A }, { id: B, phase: "post_merge" as const }] };
+    expect(
+      ladderIsTerminallyApproved(phasedPolicy, { completedStageIds: [A], lastDecisionOutcome: "changes_requested" }),
+    ).toBe(false);
+  });
+
   it("replays the SUP-15163 4-stage shape: stage-1 of 4 approved is NOT terminally approved; all four complete + approved IS", () => {
     // The exact executed-instance shape from the card: a 4-stage policy where
     // only stage 1 (the support-CR review) is complete and approved. That is the

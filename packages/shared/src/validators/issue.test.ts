@@ -972,6 +972,21 @@ describe("issue validators", () => {
     });
   });
 
+  describe("execution stage phase", () => {
+    it.each(["pre_merge", "post_merge"])("accepts the %s phase", (phase) => {
+      const policy = issueExecutionPolicySchema.parse({ stages: [{ type: "review", phase }] });
+      expect(policy.stages[0].phase).toBe(phase);
+    });
+
+    it.each(["after_deploy", "", null])("rejects an invalid phase %j", (phase) => {
+      const result = issueExecutionPolicySchema.safeParse({ stages: [{ type: "review", phase }] });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].path).toEqual(["stages", 0, "phase"]);
+      }
+    });
+  });
+
   describe("issueExecutionPolicySchema.baseRef (SUP-15838)", () => {
     it("accepts a valid baseRef via the update path and reads it back verbatim", () => {
       const result = updateIssueSchema.safeParse({
