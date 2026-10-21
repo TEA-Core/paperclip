@@ -668,6 +668,29 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     }
   });
 
+  it("keeps the head-review audit if storing the published head fails after the external write (SUP-20624)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    installHeadReviewTransport();
+    await db.execute(sql`alter table ${issues} add constraint head_review_force_publish_record_failure
+      check (execution_state #>> '{approvalStatus,publishedHeadSha}' <> repeat('b', 40)) not valid`);
+    try {
+      const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+        approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed exact delta before publication",
+      });
+      expect(response.status).toBe(500);
+      expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([url]) => url))
+        .toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${REVIEW_HEAD}`]);
+      const events = await db.select().from(activityLog);
+      expect(events.find((event) => event.action === "issue.approval_head_decision")).toMatchObject({
+        actorType: "user", actorId: USER_ID,
+        details: { headSha: REVIEW_HEAD, approvedHeadSha: REVIEWED_HEAD, reason: "Reviewed exact delta before publication" },
+      });
+    } finally {
+      await db.execute(sql`alter table ${issues} drop constraint if exists head_review_force_publish_record_failure`);
+    }
+  });
+
   it("rejects an agent caller with 403 before any GitHub read or write", async () => {
     const { companyId, issueId, reviewerAgentId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },

@@ -189,6 +189,7 @@ import {
   logActivity,
   logActivityInTransaction,
   publishActivity,
+  persistActivity,
   projectService,
   routineService,
   workProductService,
@@ -11385,7 +11386,6 @@ export function issueRoutes(
     } else if (req.actor.type !== "agent" || !req.actor.agentId) {
       throw forbidden("Board or original reviewer required to approve a new head");
     }
-    const publications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
       const [issue] = await tx.select().from(issueRows).where(and(
         eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId),
@@ -11453,10 +11453,10 @@ export function issueRoutes(
         compareUrl: `https://github.com/${target.owner}/${target.repo}/compare/${approvedHeadSha}...${headSha}`,
       };
       if (!input) return { ...preview, outcome: "review_required" };
-      // Audit precedes the external side effect: an unavailable audit sink must
-      // never mint a status. The row lock preserves the completed ladder while
-      // publishing; the publisher re-reads and CAS-pins the live head.
-      await logActivityInTransaction(tx as unknown as Db, {
+      // The decision audit commits independently before the GitHub side effect.
+      // A later failure saving publication state must not erase who authorized
+      // an already-written status. The issue lock still protects the ladder.
+      const decision = await persistActivity(db, {
         companyId: issue.companyId, ...actor,
         action: "issue.approval_head_decision", entityType: "issue", entityId: issue.id,
         details: {
@@ -11464,7 +11464,8 @@ export function issueRoutes(
           delta: { baseSha: proof.delta.baseSha, equivalence: proof.delta.equivalence,
             substanceChange: proof.delta.substanceChange, files: proof.delta.files.map((file) => file.filename) },
         },
-      }, publications);
+      });
+      publishActivity(decision.publication);
       const outcome = await publishApprovalStatus(tx as unknown as Db, issue.companyId, issue.id, issue.identifier ?? "", {
         expectedHeadSha: input.headSha, enforceDeliveryIdentity: true,
         headCertification: { owner: target.owner, repo: target.repo, number: target.number, headSha: input.headSha },
@@ -11482,7 +11483,6 @@ export function issueRoutes(
       }
       return { ...preview, outcome: outcome.kind, message: outcome.message };
     });
-    for (const publication of publications) publishActivity(publication);
     res.status(result.outcome === "armed" || result.outcome === "review_required" ? 200 : 409).json(result);
   }
 
