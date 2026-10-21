@@ -28,6 +28,7 @@ interface IssueExecutionPolicy {
 interface IssueExecutionStage {
   id: string;                                 // auto-generated UUID
   type: "review" | "approval";                // stage kind
+  phase?: "pre_merge" | "post_merge";         // default pre_merge; see doc/execution-semantics.md
   approvalsNeeded: 1;                         // multi-approval is not supported yet
   participants: IssueExecutionStageParticipant[];
 }
