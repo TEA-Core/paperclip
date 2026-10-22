@@ -1377,7 +1377,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         APPROVED_HEAD,
       );
 
-      expect(result).toEqual({ ok: true, approved: true });
+      expect(result).toEqual({ ok: true, approved: true, controlPlaneApproved: false });
       expect(statusesReads).toBe(2);
     });
 
