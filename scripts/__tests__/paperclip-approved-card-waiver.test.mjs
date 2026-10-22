@@ -86,6 +86,8 @@ function run({ ref, author, body = "", labels = [], statuses = [], retired = tru
 
 const PERSON = { login: "kronik187", type: "User" };
 const FLEET_APP = { login: "fleet-only[bot]", type: "Bot" };
+const TEA_CORE_APP = { login: TEA_CORE.login, type: "Bot", id: TEA_CORE.id };
+const UNKNOWN_BOT = { login: "mystery[bot]", type: "Bot", id: 42 };
 const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
 const CARD_BRANCH = "SUP-20772-stamp-merge-release-d";
 const CARDLESS_BRANCH = "doctrine-sync-2026-10-22";
@@ -137,11 +139,27 @@ test("a cardless PR by github-actions[bot] keeps its waiver (the lockfile refres
   assert.equal(run({ ref: "chore/refresh-lockfile", author: ACTIONS_BOT, body: WAIVER_BODY }).code, 0);
 });
 
+test("a cardless PR opened by the tea-core App keeps its waiver (the lockfile refresh)", () => {
+  assert.equal(run({ ref: "chore/refresh-lockfile-123", author: TEA_CORE_APP, body: "Paperclip-Approved-Waiver: automated lockfile refresh" }).code, 0);
+});
+
+test("a SUP-prefixed branch authored by the tea-core App is still refused", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: TEA_CORE_APP, body: WAIVER_BODY });
+  assert.equal(code, 1);
+  assert.match(out, /REFUSED: body waiver/);
+});
+
+test("a cardless PR authored by an unknown bot cannot waive itself", () => {
+  const { code, out } = run({ ref: CARDLESS_BRANCH, author: UNKNOWN_BOT, body: WAIVER_BODY });
+  assert.equal(code, 1);
+  assert.match(out, /may waive a cardless PR/);
+});
+
 test("a cardless PR authored by the fleet App cannot waive itself", () => {
   for (const input of [{ body: WAIVER_BODY }, { labels: ["no-paperclip-card"] }]) {
     const { code, out } = run({ ref: CARDLESS_BRANCH, author: FLEET_APP, ...input });
     assert.equal(code, 1);
-    assert.match(out, /only a person or github-actions\[bot\] may waive/);
+    assert.match(out, /may waive a cardless PR/);
   }
 });
 
