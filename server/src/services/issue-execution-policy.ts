@@ -484,6 +484,18 @@ export function normalizeIssueExecutionPolicy(
     })
     .filter((stage): stage is NonNullable<typeof stage> => stage !== null);
 
+  if (
+    releaseAssurance &&
+    !(
+      stages.length === 1 &&
+      stages[0].type === "approval" &&
+      stages[0].participants.length === 1 &&
+      stages[0].participants[0].type === "agent"
+    )
+  ) {
+    throw unprocessable("approvalAuthority release_assurance requires exactly one approval stage with exactly one agent participant");
+  }
+
   const monitor = parsed.data.monitor
     ? {
       nextCheckAt: parsed.data.monitor.nextCheckAt,
