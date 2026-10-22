@@ -407,7 +407,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -458,7 +458,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -507,7 +507,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live. Agent comment marker: Tier 1.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -553,7 +553,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -600,7 +600,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -642,7 +642,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -668,7 +668,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         status: "done",
         doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): override path. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -738,7 +738,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -798,7 +798,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -830,7 +830,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): guard skipped, no token. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -891,7 +891,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+          "Closed at Tier 2 (live): probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1258,17 +1258,25 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(records[0]?.body).toContain("HTTP 422");
     });
 
-    it("AC2: the verbatim Tier 1 substitution line closes the card", async () => {
+    it("AC2: a verified landed-at-tip Tier 1 line closes the card", async () => {
       const { companyId, agentId, issueId, identifier, branchName } = await seedIssue("SUP13939B");
       currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
       mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(branchName));
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
           comment:
-            "Closed at Tier 1 (landed, not liveness-probed): docs-only change, no runtime surface. Liveness unverified.",
+            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Liveness unverified.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1393,6 +1401,108 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
           .where(eq(issues.id, issueId));
         expect(statusRows[0]?.status).toBe(to);
       }
+    });
+  });
+
+  describe("SUP-20671 shared evaluator on both done-entry doors", () => {
+    const ARBITRARY_TIER1 =
+      "Closed at Tier 1 (landed, not liveness-probed): production probe unavailable. Liveness unverified.";
+
+    async function seedDecisionClose(prefix: string) {
+      const seeded = await seedIssue(prefix);
+      const reviewerAgentId = randomUUID();
+      const stageId = randomUUID();
+      const now = new Date();
+      await db.insert(agents).values({
+        id: reviewerAgentId,
+        companyId: seeded.companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          assigneeAgentId: reviewerAgentId,
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [
+              {
+                id: stageId,
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [{ type: "agent", agentId: reviewerAgentId, userId: null }],
+              },
+            ],
+            returnAssigneeAgentId: seeded.agentId,
+          },
+          executionState: {
+            status: "pending",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+            returnAssignee: { type: "agent", agentId: seeded.agentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: null,
+            changesRequestedCount: 0,
+          },
+        })
+        .where(eq(issues.id, seeded.issueId));
+      return { ...seeded, reviewerAgentId };
+    }
+
+    it("direct close with only arbitrary Tier 1 prose is refused 422 by the shared evaluator", async () => {
+      const { companyId, agentId, issueId, identifier } = await seedIssue("T1DIR");
+      currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: ARBITRARY_TIER1 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(res.body.details.issueId).toBe(issueId);
+      const statusRows = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(statusRows[0]?.status).toBe("todo");
+    });
+
+    it("decision-carrying close with an open linked PR and only arbitrary Tier 1 prose is refused 422", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedDecisionClose("T1DEC");
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      await seedLinkedPrs(companyId, issueId, [
+        { owner: "TEA-Core", repo: "paperclip", number: 4103, state: "open" },
+      ]);
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: `Looks good.\n\nkind: review\ndecision: approved\n\n${ARBITRARY_TIER1}`,
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(res.body.code).not.toBe("done_transition_missing_delivery");
+      const statusRows = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(statusRows[0]?.status).toBe("in_review");
     });
   });
 });

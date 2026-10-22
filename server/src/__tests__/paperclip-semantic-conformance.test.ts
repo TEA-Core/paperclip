@@ -80,11 +80,11 @@ describeEmbedded("Paperclip semantic mock/production conformance", () => {
 
     // TEA-Core fork: every non-board close to `done` must carry a done-tier declaration in its
     // close comment (SUP-12693; board actors are the only exemption), which upstream's semantic
-    // contract does not model. So the finish_task vectors run through BOTH adapters with a Tier-1
+    // contract does not model. So the finish_task vectors run through BOTH adapters with a Tier-2
     // declaration appended to the summary — mock and production must still agree on every other
     // field — and one production-only check pins the divergence: an undeclared close is refused.
     const TIER_1_DECLARATION =
-      "Closed at Tier 1 (landed, not liveness-probed): semantic conformance fixture. Liveness unverified.";
+      "Closed at Tier 2 (live): semantic conformance fixture probe confirms the changed path is live.";
     const upstreamVectors = CAPABILITY_HIGH_RISK_SEMANTIC_VECTORS.filter(
       (vector) => vector.operationId !== "finish_task",
     );
