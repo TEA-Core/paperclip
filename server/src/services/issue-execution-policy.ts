@@ -434,12 +434,23 @@ export function normalizeIssueExecutionPolicy(
   // be able to read back — `hasPendingProviderQuotaRecoveryMonitor` compares the
   // persisted ref against the latest run id to avoid restamping a live monitor — so
   // they opt out of redaction.
-  options?: { preserveMonitorExternalRef?: boolean; preserveEmptyPolicy?: boolean },
+  options?: {
+    preserveMonitorExternalRef?: boolean;
+    preserveEmptyPolicy?: boolean;
+    // SUP-20771: only the trusted board enrollment may select the release-assurance
+    // approval authority. Every create/PATCH/copy path normalizes through here, so
+    // refusing it by default keeps a worker from choosing its own approval seat.
+    allowReleaseAssuranceAuthority?: boolean;
+  },
 ): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
   if (!parsed.success) {
     throw unprocessable("Invalid execution policy", parsed.error.flatten());
+  }
+  const releaseAssurance = parsed.data.approvalAuthority === "release_assurance";
+  if (releaseAssurance && !options?.allowReleaseAssuranceAuthority) {
+    throw unprocessable("approvalAuthority release_assurance can only be selected by a board enrollment");
   }
 
   const stages = parsed.data.stages
@@ -526,6 +537,7 @@ export function normalizeIssueExecutionPolicy(
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
     ...(baseRef ? { baseRef } : {}),
+    ...(releaseAssurance ? { approvalAuthority: "release_assurance" as const } : {}),
   };
 }
 

@@ -11,6 +11,7 @@ import type {
   IssueExecutionMonitorStateStatus,
   IssueExecutionDecisionOutcome,
   IssueMonitorScheduledBy,
+  IssueApprovalAuthority,
   IssueExecutionPolicyMode,
   IssueReferenceSourceKind,
   IssueExecutionStageType,
@@ -696,6 +697,8 @@ export interface IssueExecutionPolicy {
   mode: IssueExecutionPolicyMode;
   commentRequired: boolean;
   stages: IssueExecutionStage[];
+  /** Omitted means `paperclip`; `release_assurance` is board-selected only (SUP-20771). */
+  approvalAuthority?: IssueApprovalAuthority;
   returnAssigneeAgentId?: string | null;
   monitor?: IssueExecutionMonitorPolicy | null;
   reviewPreset?: LowTrustReviewPresetPolicy;
