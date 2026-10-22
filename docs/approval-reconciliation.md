@@ -45,7 +45,7 @@ A card-bound PR whose card cannot be stamped (no ladder, a receipt that cannot e
 
 - `POST /api/issues/:issueId/merge-arming/release` with `{ "headSha": "<40-character live SHA>", "reason": "..." }` publishes `paperclip/approved` as the control plane (the same token path as every other stamp, so the `tea-core[bot]` creator check in `scripts/ci/check-paperclip-approved.sh` accepts it) with the description `released by <actorType>:<actorId> for <sha>: <reason>`, cut to GitHub's 140 characters.
 - The card must have exactly one linked delivery PR in the project repository, open and not a draft, and `headSha` must be that PR's live head. A different or stale head answers 409 with no write. Agent actors and board members who are not owner/admin are refused before any GitHub access. The card's ladder is not consulted.
-- Idempotent: a head that already carries `paperclip/approved` answers 200 `already_approved` with no second write or activity row. A fresh write is recorded as the activity event `issue.merge_release` (actor, head, reason, PR, description).
+- Idempotent: a head whose newest `paperclip/approved` is a success created by the control plane answers 200 `already_approved` with no second write or activity row. A success from any other creator, or a newer non-success, does not count: the release is published and logged as normal. A fresh write is recorded as the activity event `issue.merge_release` (actor, head, reason, PR, description).
 - The status is keyed by SHA, so a push after the release gets no stamp; release the new head.
 - A "release-assurance seat" has no server identity today, so the route is board-only. A seat that needs it acts through the board token.
 
