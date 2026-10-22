@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
+import type { TaskWatchdogMutationScope } from "../services/task-watchdog-scope.js";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const UNRELATED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -69,7 +70,9 @@ vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
 const mockQuestionResponseDeliveries = vi.hoisted(() => ({
   deliver: vi.fn(async () => null),
 }));
-const mockResolveTaskWatchdogMutationScope = vi.hoisted(() => vi.fn(async () => ({ kind: "none" })));
+const mockResolveTaskWatchdogMutationScope = vi.hoisted(() =>
+  vi.fn(async (): Promise<TaskWatchdogMutationScope> => ({ kind: "none" })),
+);
 const mockResolveCoreTrustPreset = vi.hoisted(() => vi.fn(() => ({ kind: "standard" })));
 const mockRunAttribution = vi.hoisted(() => ({
   value: {
