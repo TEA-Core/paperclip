@@ -126,6 +126,7 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
                   companyId: run.companyId ?? null,
                   agentId: run.agentId ?? null,
                   responsibleUserId: run.responsibleUserId ?? null,
+                  status: run.status ?? "running",
                   contextSnapshot: { issueId: mockCrossIssueInfluence.sourceIssueId },
                 }]
               : []),
@@ -289,6 +290,7 @@ async function createApp(actor: Record<string, unknown> = {
       companyId: actor.companyId ?? "company-1",
       agentId: actor.agentId,
       responsibleUserId: actor.onBehalfOfUserId ?? null,
+      status: actor.status ?? "running",
     };
   }
   const [{ issueRoutes }, { errorHandler }] = await loadAppModules();
@@ -343,6 +345,7 @@ describe.sequential("issue thread interaction routes", () => {
       companyId: "company-1",
       agentId: CREATED_AGENT_ID,
       responsibleUserId: null,
+      status: "running",
     };
     mockQuestionResponseDeliveries.deliver.mockResolvedValue(null);
     mockRequestNativeQuestionRunCancellation.mockResolvedValue(null);
@@ -818,6 +821,88 @@ describe.sequential("issue thread interaction routes", () => {
           sourceRunId: RUN_1,
         }),
       }),
+    );
+  });
+
+  it("suppresses the assignment wake when a live resolver self-assigns an accepted suggested task", async () => {
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-self-assigned",
+      kind: "suggest_tasks",
+      status: "pending",
+      createdByAgentId: CREATED_AGENT_ID,
+      sourceRunId: RUN_1,
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "self-assigned",
+          title: "Continue the current work",
+          assigneeAgentId: CREATED_AGENT_ID,
+        }],
+      },
+    });
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-self-assigned",
+        companyId: "company-1",
+        issueId: ISSUE_ID,
+        kind: "suggest_tasks",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        idempotencyKey: null,
+        sourceCommentId: null,
+        sourceRunId: RUN_1,
+        payload: {
+          version: 1,
+          tasks: [{
+            clientKey: "self-assigned",
+            title: "Continue the current work",
+            assigneeAgentId: CREATED_AGENT_ID,
+          }],
+        },
+        result: {
+          version: 1,
+          createdTasks: [{ clientKey: "self-assigned", issueId: "child-self-assigned" }],
+        },
+        createdAt: "2026-04-20T12:00:00.000Z",
+        updatedAt: "2026-04-20T12:05:00.000Z",
+        resolvedAt: "2026-04-20T12:05:00.000Z",
+      },
+      createdIssues: [{
+        id: "child-self-assigned",
+        assigneeAgentId: CREATED_AGENT_ID,
+        status: "todo",
+      }],
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: RUN_1,
+    });
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-self-assigned/accept`)
+      .send({ selectedClientKeys: ["self-assigned"] });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          issueId: ISSUE_ID,
+          interactionId: "interaction-self-assigned",
+          interactionStatus: "accepted",
+        }),
+      }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      CREATED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_assigned" }),
     );
   });
 
