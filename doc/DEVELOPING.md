@@ -1239,14 +1239,16 @@ Environment overrides:
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace and, when the worktree is a registered linked checkout inside
-  the managed worktree root, clean including ignored and skip-worktree files, and no other live
-  session shares it, deletes the worktree. The live-session check is repeated inside a path lock
-  after runtime services stop and immediately before removal. A stop that does not finish within
-  30 seconds does not hold the sweep. Set
-  `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` to log each candidate path and reason without archiving
-  or deleting. A person can reopen the work inside this window. The default is `7`. A value of `0` disables the
-  cooldown and restores immediate reaping. A negative or non-numeric value falls back to the default.
+  archives the execution workspace and, when the worktree is a registered linked
+  checkout inside the managed worktree root, clean including ignored and
+  skip-worktree files, and no other live session shares it, deletes the
+  worktree. The live-session check is repeated inside a path lock after runtime
+  services stop and immediately before removal. A stop that does not finish
+  within 30 seconds does not hold the sweep. Set
+  `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` to log each candidate path and reason
+  without archiving or deleting. A person can reopen the work inside this
+  window. The default is `7`. A value of `0` disables the cooldown and restores
+  immediate reaping. A negative or non-numeric value falls back to the default.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,
