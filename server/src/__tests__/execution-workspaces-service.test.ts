@@ -5869,14 +5869,18 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       return { repoRoot, branchName, remotePath };
     }
 
-    async function gitCallsDuring(run: () => Promise<unknown>) {
+    // Logs each git argv. By default every call fails; passThrough runs the real git.
+    async function gitCallsDuring(run: () => Promise<unknown>, options: { passThrough?: boolean } = {}) {
+      const realGit = options.passThrough
+        ? (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim()
+        : null;
       const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-recorder-"));
       tempDirs.add(binDir);
       const logPath = path.join(binDir, "calls.log");
       const gitPath = path.join(binDir, "git");
       await fs.writeFile(
         gitPath,
-        `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logPath}'\nexit 99\n`,
+        `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logPath}'\n${realGit ? `exec '${realGit}' "$@"` : "exit 99"}\n`,
         "utf8",
       );
       await fs.chmod(gitPath, 0o755);
@@ -6094,6 +6098,19 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       });
     }, 20_000);
 
+    // The git subcommand of each logged argv, past any leading -C <dir> or -c <key=value>.
+    function gitSubcommands(calls: string) {
+      return calls.split("\n").filter(Boolean).map((line) => {
+        const args = line.split(" ");
+        let index = 0;
+        while (args[index] === "-C" || args[index] === "-c") index += 2;
+        return args[index];
+      });
+    }
+
+    // The read-only inspection a dry run may spawn. A fetch or any write verb is not here.
+    const READ_ONLY_GIT_SUBCOMMANDS = ["rev-parse", "status", "rev-list", "merge-base", "show-ref"];
+
     async function dryRunListing(options: { blockGit: boolean }) {
       const info = vi.spyOn(logger, "info");
       let sweep!: Awaited<ReturnType<ReturnType<typeof freshSweep>["sweepTerminalWorkspaces"]>>;
@@ -6102,8 +6119,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           .sweepTerminalWorkspaces();
       };
       try {
-        // The recorder shim fails every git call, so a non-empty log is a git call.
-        const gitCalls = options.blockGit ? await gitCallsDuring(runDry) : (await runDry(), "");
+        // Blocked, the shim fails every git call, so a non-empty log is a git call.
+        // Otherwise it records each call and runs the real git.
+        const gitCalls = await gitCallsDuring(runDry, { passThrough: !options.blockGit });
         const listed = info.mock.calls
           .filter(([, message]) => message === "terminal issue workspace reaper dry run")
           .map(([fields]) => fields as unknown as { executionWorkspaceId: string; action: string; reason: string });
@@ -6178,8 +6196,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const treesBefore = await Promise.all(roots.map((root) => snapshotTree(root)));
       const databaseBefore = await snapshotDatabase();
 
-      const { sweep: dry, listed } = await dryRunListing({ blockGit: false });
+      const { sweep: dry, listed, gitCalls } = await dryRunListing({ blockGit: false });
 
+      // Classifying no-PR rows spawns read-only git inspection, and nothing else.
+      expect(gitSubcommands(gitCalls).length).toBeGreaterThan(0);
+      expect(gitSubcommands(gitCalls).filter((subcommand) => !READ_ONLY_GIT_SUBCOMMANDS.includes(subcommand))).toEqual([]);
       expect(await snapshotDatabase()).toEqual(databaseBefore);
       expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
       expect(dry).toMatchObject({ archived: 0, cleanupFailed: 0, wouldArchive: 3 });
@@ -6225,44 +6246,33 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const treesBefore = await Promise.all(roots.map((root) => snapshotTree(root)));
       const databaseBefore = await snapshotDatabase();
 
-      // Record every git argv, then run the real git.
-      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-      const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-passthrough-"));
-      tempDirs.add(binDir);
-      const logPath = path.join(binDir, "calls.log");
-      await fs.writeFile(
-        path.join(binDir, "git"),
-        `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logPath}'\nexec '${realGit}' "$@"\n`,
-        "utf8",
-      );
-      await fs.chmod(path.join(binDir, "git"), 0o755);
-      const info = vi.spyOn(logger, "info");
-      const previousPath = process.env.PATH;
-      process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
-      let dry!: Awaited<ReturnType<ReturnType<typeof freshSweep>["sweepTerminalWorkspaces"]>>;
-      let listed: Record<string, unknown>[] = [];
-      try {
-        dry = await executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, dryRun: true })
-          .sweepTerminalWorkspaces();
-        listed = info.mock.calls
-          .filter(([, message]) => message === "terminal issue workspace reaper dry run")
-          .map(([fields]) => fields as unknown as Record<string, unknown>);
-      } finally {
-        process.env.PATH = previousPath;
-        info.mockRestore();
-      }
-      const gitCalls = await fs.readFile(logPath, "utf8");
+      const { sweep: dry, listed, gitCalls } = await dryRunListing({ blockGit: false });
 
-      expect(gitCalls).not.toBe("");
-      expect(gitCalls.split("\n").filter((line) => /(^| )fetch( |$)/.test(line))).toEqual([]);
+      expect(gitSubcommands(gitCalls).length).toBeGreaterThan(0);
+      expect(gitSubcommands(gitCalls).filter((subcommand) => !READ_ONLY_GIT_SUBCOMMANDS.includes(subcommand))).toEqual([]);
       expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
       expect(await snapshotDatabase()).toEqual(databaseBefore);
       expect(dry).toMatchObject({ wouldArchive: 0 });
       expect(listed).toEqual([expect.objectContaining({
         executionWorkspaceId: seeded.executionWorkspaceId,
         action: "keep",
-        reason: "not previewed: the recorded branch is missing, and the live sweep fetches the default branch first",
+        reason: "not previewed: the recorded branch is missing. The live sweep first fetches the default branch, which updates remote-tracking refs, their reflog and FETCH_HEAD but no work-tree file, and then archives the row as a record only when no commit is missing from the remote",
       })]);
+
+      // The live pass does what that reason says: it fetches the default branch,
+      // moving origin/main, and archives the row as a record only. No work-tree
+      // file changes.
+      const worktreeBefore = await snapshotTree(seeded.worktreePath);
+      const live = await freshSweep().sweepTerminalWorkspaces();
+      expect(live).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await workspaceStatus(seeded.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | terminal, clean, nothing unique",
+      });
+      expect(await readGit(published.repoRoot, ["rev-parse", "refs/remotes/origin/main"]))
+        .toBe(await readGit(published.repoRoot, ["rev-parse", "refs/heads/main"]));
+      expect(await readGit(published.repoRoot, ["rev-parse", "refs/remotes/origin/main"])).not.toBe(staleMain);
+      expect(await snapshotTree(seeded.worktreePath)).toEqual(worktreeBefore);
     }, 30_000);
 
     it("dry run leaves a stuck ENOENT row and a stale reopen-pending row untouched", async () => {
@@ -6455,7 +6465,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(path.resolve(realizedCwd)).not.toBe(path.resolve(seeded.worktreePath));
       await expect(fs.access(path.join(realizedCwd, "delivered.txt"))).rejects.toThrow();
       expect(provisioned.executionWorkspace.warnings).toEqual(expect.arrayContaining([
-        `Execution workspace ${seeded.executionWorkspaceId} is archived, but its checkout is still on disk at "${seeded.worktreePath}" on branch PAP-16015-delivery. This run uses a different checkout at "${realizedCwd}", so work in the archived checkout is not here. Reopen the archived workspace to continue in it.`,
+        `Execution workspace ${seeded.executionWorkspaceId} is archived, but its checkout is still on disk at "${seeded.worktreePath}" (recorded branch PAP-16015-delivery). This run uses a different checkout at "${realizedCwd}", so work in the archived checkout is not here. Reopen the archived workspace to continue in it.`,
       ]));
       await expect(fs.readFile(path.join(seeded.worktreePath, "delivered.txt"), "utf8")).resolves.toBe("delivered\n");
     }, 60_000);

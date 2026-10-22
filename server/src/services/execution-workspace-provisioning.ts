@@ -752,8 +752,9 @@ export async function provisionIssueExecutionWorkspace(
   }
 
   // SUP-20688: the terminal sweep can archive a finished workspace as a record
-  // only, so its checkout stays on disk. A run that names that workspace then
-  // gets another checkout. Say so in the run log instead of switching silently.
+  // only, so its checkout stays on disk. A run that names that workspace is
+  // provisioned again. When it lands at a different path, say so in the run log
+  // instead of switching silently.
   const archivedCheckoutCwd = existingExecutionWorkspaceDirectoryExists
     ? readNonEmptyString(existingExecutionWorkspace?.cwd)
     : null;
@@ -764,7 +765,7 @@ export async function provisionIssueExecutionWorkspace(
   ) {
     const branch = readNonEmptyString(existingExecutionWorkspace?.branchName);
     executionWorkspace.warnings.push(
-      `Execution workspace ${existingExecutionWorkspace!.id} is archived, but its checkout is still on disk at "${archivedCheckoutCwd}"${branch ? ` on branch ${branch}` : ""}. This run uses a different checkout at "${executionWorkspace.cwd}", so work in the archived checkout is not here. Reopen the archived workspace to continue in it.`,
+      `Execution workspace ${existingExecutionWorkspace!.id} is archived, but its checkout is still on disk at "${archivedCheckoutCwd}"${branch ? ` (recorded branch ${branch})` : ""}. This run uses a different checkout at "${executionWorkspace.cwd}", so work in the archived checkout is not here. Reopen the archived workspace to continue in it.`,
     );
   }
 

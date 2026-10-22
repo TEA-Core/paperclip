@@ -3070,8 +3070,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       const result = { ...emptyTerminalSweepResult(), checked: candidates.length };
       const dryRun = workspaceReaperDryRunEnabled(opts.dryRun);
-      // Dry-run logs one line per candidate with the action the real sweep would
-      // take, and writes nothing.
+      // Dry run: one log line per candidate, and no write to a file, ref, reflog,
+      // index, FETCH_HEAD or database row. It still spawns read-only git inspection
+      // (rev-parse, status, rev-list, merge-base, show-ref) but never a fetch.
+      // archive_record_only, keep and clear_reopen_pending match the live pass on
+      // unchanged inputs, except the missing-recorded-branch keep below.
+      // not_previewed rows are not forecast.
       const logDryRun = (
         workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">,
         action: "archive_record_only" | "not_previewed" | "clear_reopen_pending" | "keep",
@@ -3145,7 +3149,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         if (dryRun && !reopenPending && !archiveWithoutGit && !sharedSession) {
           // Merged-delivery rows and stuck spawn-ENOENT retries go through the
           // inherited cleanup, which the dry run never reaches. Decide from
-          // recorded state before any readiness or git call.
+          // recorded state before any readiness or git call. This runs before the
+          // cooldown and active-run gates and counts in no skip counter, so the
+          // dry skip counters cover previewed rows only and differ from live.
           const recorded = await assessDelivery(workspace, null);
           const inheritedCleanup = (workspace.status === "cleanup_failed" && isStuckGitSpawnEnoentCleanupReason(workspace.cleanupReason))
             || recorded.deliveryState === "merged_via_pr"
@@ -3181,9 +3187,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "issue tree is not terminal", "skippedNonTerminalTree");
           continue;
         }
-        // Every archive outside the recorded merged-delivery path is a database
-        // record only: no git worktree remove, file removal, branch deletion or
-        // runtime-service stop. The tree and branch stay for the host cleanup.
+        // Every archive outside the recorded merged-delivery path changes no work
+        // tree: no git worktree remove, file removal, branch deletion or
+        // runtime-service stop. The tree and branch stay for the host cleanup. The
+        // readiness inspection above can still fetch the default branch when the
+        // recorded branch is missing.
         let recordOnlyReason: string | null = null;
         const mergedDelivery = assessment.deliveryState === "merged_via_pr"
           || assessment.deliveryState === "merged_by_ancestry";
@@ -3209,7 +3217,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             continue;
           }
           if (defaultBranchCheckSkipped) {
-            keep(workspace, "not previewed: the recorded branch is missing, and the live sweep fetches the default branch first");
+            // Not counted as a skip: the live outcome differs.
+            keep(workspace, "not previewed: the recorded branch is missing. The live sweep first fetches the default branch, which updates remote-tracking refs, their reflog and FETCH_HEAD but no work-tree file, and then archives the row as a record only when no commit is missing from the remote");
             continue;
           }
           const commitsMissing = await countCommitsMissingFromRemote(git.workspacePath);
