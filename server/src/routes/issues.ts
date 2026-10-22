@@ -11441,7 +11441,7 @@ export function issueRoutes(
       // A later failure saving publication state must not erase who authorized
       // an already-written status. The issue lock still protects the ladder.
       const decision = await persistActivity(db, {
-        companyId: issue.companyId, ...actor,
+        companyId: issue.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
         action: "issue.approval_head_decision", entityType: "issue", entityId: issue.id,
         details: {
           outcome: "approved", headSha, approvedHeadSha, reason: input.reason, pr: target.displayName,

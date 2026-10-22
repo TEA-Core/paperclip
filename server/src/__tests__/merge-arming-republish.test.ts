@@ -523,7 +523,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       idempotencyKey: `fixture-${issueId}-${headSha}`, state: "ready",
     });
     await db.insert(issueDeliveryReceiptLinks).values({
-      companyId, receiptId, sourceIssueId: issueId, externalObjectId: mention!.objectId, provider: "github",
+      companyId, receiptId, sourceIssueId: issueId, externalObjectId: mention!.objectId!, provider: "github",
       owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: PR_NUMBER, headSha,
     });
   }
