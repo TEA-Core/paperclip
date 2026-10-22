@@ -1243,7 +1243,7 @@ Environment overrides:
   the managed worktree root, clean including ignored and skip-worktree files, and no other live
   session shares it, deletes the worktree. The live-session check is repeated inside a path lock
   after runtime services stop and immediately before removal. A stop that does not finish within
-  `PAPERCLIP_WORKSPACE_REAPER_STOP_TIMEOUT_MS` (default 30000) does not hold the sweep. Set
+  30 seconds does not hold the sweep. Set
   `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` to log each candidate path and reason without archiving
   or deleting. A person can reopen the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls back to the default.

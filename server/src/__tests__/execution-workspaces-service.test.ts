@@ -37,7 +37,6 @@ import {
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
   formatTerminalWorkspaceReaperSkipLogLine,
-  TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
   readExecutionWorkspaceConfig,
@@ -5855,11 +5854,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 
   describe("SUP-20688 terminal workspace archive sweep", () => {
-    function freshSweep(cooldownDays = 0, workspaceIds?: string[]) {
-      return executionWorkspaceService(db, {
-        workspaceReaperCooldownDays: cooldownDays,
-        ...(workspaceIds ? { sweepWorkspaceIds: workspaceIds } : {}),
-      });
+    function freshSweep(cooldownDays = 0) {
+      return executionWorkspaceService(db, { workspaceReaperCooldownDays: cooldownDays });
     }
 
     async function workspaceStatus(id: string) {
@@ -5949,7 +5945,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     it("archives an isolated no-PR clean workspace with nothing unique and removes its worktree", async () => {
       const seeded = await seedAncestryTerminalWorkspace();
       await publishWorktree(seeded.worktreePath);
-      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
       const row = await workspaceStatus(seeded.executionWorkspaceId);
 
       expect(sweep.archived).toBe(1);
@@ -5968,7 +5964,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await runGit(seeded.worktreePath, ["commit", "-m", "Ignore node_modules"]);
       await runGit(seeded.worktreePath, ["push", "origin", "HEAD"]);
 
-      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
       const row = await workspaceStatus(seeded.executionWorkspaceId);
 
       expect(sweep.skippedLocalOnly).toBeGreaterThanOrEqual(1);
@@ -6229,7 +6225,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await markShared(seeded.executionWorkspaceId);
       await fs.writeFile(path.join(seeded.worktreePath, "scratch.txt"), "untracked\n", "utf8");
 
-      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
       const row = await workspaceStatus(seeded.executionWorkspaceId);
 
       expect(sweep.archived).toBe(1);
@@ -6251,7 +6247,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           return original(input);
         });
       try {
-        const sweep = await freshSweep(0, [first.executionWorkspaceId]).sweepTerminalWorkspaces();
+        const sweep = await freshSweep().sweepTerminalWorkspaces();
         const row = await workspaceStatus(first.executionWorkspaceId);
         expect(liveId).not.toBeNull();
         expect(sweep.cleanupFailed).toBe(0);
@@ -6282,7 +6278,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         branchName: foreignBranch,
       }).where(eq(executionWorkspaces.id, own.executionWorkspaceId));
 
-      await freshSweep(0, [own.executionWorkspaceId]).sweepTerminalWorkspaces();
+      await freshSweep().sweepTerminalWorkspaces();
       const row = await workspaceStatus(own.executionWorkspaceId);
 
       expect(row?.cleanupReason ?? "").toContain("cwd is a symlink");
@@ -6305,7 +6301,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         branchName: foreignBranch,
       }).where(eq(executionWorkspaces.id, own.executionWorkspaceId));
 
-      await freshSweep(0, [own.executionWorkspaceId]).sweepTerminalWorkspaces();
+      await freshSweep().sweepTerminalWorkspaces();
       const row = await workspaceStatus(own.executionWorkspaceId);
 
       expect(row?.cleanupReason ?? "").toMatch(/not a registered linked worktree|path is outside the managed worktree root/);
@@ -6318,7 +6314,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "MUTATED-LOCAL\n", "utf8");
       await runGit(seeded.worktreePath, ["update-index", "--skip-worktree", "README.md"]);
 
-      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
       const row = await workspaceStatus(seeded.executionWorkspaceId);
 
       expect(sweep.skippedLocalOnly).toBeGreaterThanOrEqual(1);
@@ -6346,7 +6342,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         const sweep = await executionWorkspaceService(db, {
           workspaceReaperCooldownDays: 0,
           runtimeServiceStopTimeoutMs: 50,
-          sweepWorkspaceIds: [first.executionWorkspaceId, second.executionWorkspaceId],
         }).sweepTerminalWorkspaces();
         expect(sweep.archived + sweep.cleanupFailed).toBeGreaterThanOrEqual(1);
         await expect(fs.access(first.worktreePath)).resolves.toBeUndefined();
@@ -6362,7 +6357,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const previous = process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN;
       process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN = "1";
       try {
-        const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+        const sweep = await freshSweep().sweepTerminalWorkspaces();
         expect(sweep.archived).toBe(0);
         expect(sweep.cleanupFailed).toBe(0);
         expect((await workspaceStatus(seeded.executionWorkspaceId))?.status).toBe("active");
@@ -6371,6 +6366,70 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         if (previous === undefined) delete process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN;
         else process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN = previous;
       }
+    }, 20_000);
+
+    it("archives an isolated no-PR workspace with only untracked files as a record only", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await publishWorktree(seeded.worktreePath);
+      await fs.writeFile(path.join(seeded.worktreePath, "scratch.txt"), "untracked\n", "utf8");
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+      expect(sweep.archived).toBe(1);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toContain("untracked files");
+      await expect(fs.readFile(path.join(seeded.worktreePath, "scratch.txt"), "utf8")).resolves.toBe("untracked\n");
+    }, 20_000);
+
+    it("dry run leaves a stuck ENOENT row and a stale reopen-pending row untouched", async () => {
+      const stuck = await seedTerminalWorkspace({ mergedPr: true });
+      await linkProjectRepo(stuck);
+      await fs.rm(stuck.worktreePath, { recursive: true, force: true });
+      await db
+        .update(executionWorkspaces)
+        .set({
+          status: "cleanup_failed",
+          closedAt: new Date("2026-01-02T00:00:00Z"),
+          cleanupEligibleAt: new Date("2026-01-02T00:00:00Z"),
+          cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+          metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 3 },
+        })
+        .where(eq(executionWorkspaces.id, stuck.executionWorkspaceId));
+      const stale = await seedTerminalWorkspace({ mergedPr: true });
+      await db
+        .update(executionWorkspaces)
+        .set({
+          status: "active",
+          closedAt: null,
+          cleanupReason: null,
+          cleanupEligibleAt: null,
+          metadata: {
+            createdByRuntime: true,
+            [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+            [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+            [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+          },
+        })
+        .where(eq(executionWorkspaces.id, stale.executionWorkspaceId));
+      const snapshot = () => db
+        .select()
+        .from(executionWorkspaces)
+        .where(inArray(executionWorkspaces.id, [stuck.executionWorkspaceId, stale.executionWorkspaceId]))
+        .orderBy(executionWorkspaces.id);
+      const before = await snapshot();
+      const activityBefore = await db.select().from(activityLog);
+
+      const sweep = await executionWorkspaceService(db, {
+        workspaceReaperCooldownDays: 0,
+        dryRun: true,
+      }).sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, clearedStaleReopenPending: 0 });
+      expect(await snapshot()).toEqual(before);
+      expect(await db.select().from(activityLog)).toEqual(activityBefore);
+      expect(await readGit(stuck.repoRoot, ["worktree", "list", "--porcelain"])).toContain(stuck.worktreePath);
+      await expect(fs.access(stale.worktreePath)).resolves.toBeUndefined();
     }, 20_000);
 
     it("puts a counter per skip reason on the terminal reaper skip log line", async () => {
@@ -6398,8 +6457,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       ]) {
         expect(line).toEqual(expect.stringContaining(counter));
       }
-
-      expect(TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT).toBeGreaterThanOrEqual(200);
     }, 20_000);
   });
 });

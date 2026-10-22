@@ -93,7 +93,6 @@ export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
 // worktrees. 200/page clears a 2027-row scan in about five minutes when each
 // page finishes inside the tick, and still inside a few hours when git status
 // dominates.
-export const TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT = 200;
 
 export const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
 const COMMITS_MISSING_FROM_REMOTE_KEEP_REASON = "commits missing from the remote";
@@ -101,7 +100,6 @@ const OTHER_LIVE_SESSIONS_KEEP_REASON = "other active sessions reference this pa
 const LOCAL_ONLY_KEEP_REASON = "ignored or skip-worktree files";
 const WORKTREE_PATH_LOCK_PREFIX = "execution-workspace:worktree-path:";
 export const WORKSPACE_REAPER_DRY_RUN_ENV = "PAPERCLIP_WORKSPACE_REAPER_DRY_RUN";
-export const WORKSPACE_REAPER_STOP_TIMEOUT_ENV = "PAPERCLIP_WORKSPACE_REAPER_STOP_TIMEOUT_MS";
 const DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS = 30_000;
 
 export type TerminalWorkspaceSweepSkipCounts = {
@@ -214,11 +212,9 @@ function workspaceReaperDryRunEnabled(override: boolean | undefined) {
 }
 
 function resolveRuntimeServiceStopTimeoutMs(override: number | undefined) {
-  if (typeof override === "number" && Number.isFinite(override) && override > 0) return override;
-  const raw = process.env[WORKSPACE_REAPER_STOP_TIMEOUT_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS;
+  return typeof override === "number" && Number.isFinite(override) && override > 0
+    ? override
+    : DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS;
 }
 
 async function stopRuntimeServicesBounded(
@@ -456,11 +452,9 @@ export type ExecutionWorkspaceServiceOptions = {
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
   workspaceReaperCooldownDays?: number;
-  // Test isolation. Production callers omit this and the sweep scans every company.
-  sweepWorkspaceIds?: readonly string[];
   // Host dry-run. Also enabled by PAPERCLIP_WORKSPACE_REAPER_DRY_RUN. Default off.
   dryRun?: boolean;
-  // Bounds stopRuntimeServices so a hang cannot hold the in-process sweep flag.
+  // Bounds stopRuntimeServices so a hang cannot hold the in-process sweep flag. Tests only.
   runtimeServiceStopTimeoutMs?: number;
 };
 
@@ -3117,7 +3111,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
     },
 
-    sweepTerminalWorkspaces: async (limit = TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT) => {
+    sweepTerminalWorkspaces: async (limit = 50) => {
       // Skip this sweep while another sweep runs. A concurrent sweep would share
       // the cursor and the boundary and could corrupt the rotation state. A
       // skipped tick is safe: the next tick runs the sweep with intact state.
@@ -3170,14 +3164,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // Keep pending-reopen rows in the rotation so the old generation fence
       // can be cleared after a source issue reopens, without inspecting git.
       const sourceTerminal = inArray(issues.status, ["done", "cancelled"]);
-      const workspaceIdFilter = opts.sweepWorkspaceIds && opts.sweepWorkspaceIds.length > 0
-        ? inArray(executionWorkspaces.id, [...opts.sweepWorkspaceIds])
-        : undefined;
       const scanFilter = and(
         baseCandidateFilter,
         boundaryFilter,
         cursorFilter,
-        workspaceIdFilter,
         or(
           sourceTerminal,
           sql<boolean>`${executionWorkspaces.metadata}->>${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY} = 'true'`,
@@ -3223,12 +3213,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         clearedStaleReopenPending: 0,
       };
 
+      const dryRun = workspaceReaperDryRunEnabled(opts.dryRun);
+      const logDryRunCandidate = (
+        workspace: { id: string },
+        path: string | null,
+        reason: string,
+        wouldRemove: boolean,
+      ) => {
+        logger.info(
+          { executionWorkspaceId: workspace.id, path, reason, wouldRemove },
+          "terminal issue workspace reaper dry run",
+        );
+      };
       for (const workspace of candidates) {
         const reopenPending = metadataHasReopenPendingConsumption(
           workspace.metadata as Record<string, unknown> | null,
         );
         if (!TERMINAL_ISSUE_STATUSES.has(workspace.sourceIssueStatus)) {
-          if (reopenPending) {
+          if (reopenPending && !dryRun) {
             // Candidate selection is a snapshot. Confirm the source is still
             // non-terminal under the lifecycle lock before clearing its fence.
             await clearReopenPendingConsumptionUnderLock(workspace.id, {
@@ -3270,7 +3272,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         const assessment = await assessDelivery(workspace, git);
         if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
-          if (reopenPending) {
+          if (reopenPending && !dryRun) {
             await clearReopenPendingConsumptionUnderLock(workspace.id, {
               expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
                 workspace.metadata as Record<string, unknown> | null,
@@ -3292,7 +3294,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archiveWithoutGit = true;
           deferDeliveryGate = true;
         } else if (!deferDeliveryGate) {
-          if (assessment.workspaceDirty) {
+          const noPrCandidate = !mergedDelivery && !assessment.hasPullRequestProduct;
+          if (noPrCandidate ? git?.hasDirtyTrackedFiles : assessment.workspaceDirty) {
             result.skippedUndelivered += 1;
             if (git?.hasDirtyTrackedFiles) result.skippedTrackedDirty += 1;
             continue;
@@ -3301,10 +3304,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // product archives under a separate reason when the tree has no
           // tracked changes and no commit is missing from the remote.
           let nothingUnique = false;
-          if (!mergedDelivery && !assessment.hasPullRequestProduct) {
+          if (noPrCandidate) {
             if (!git?.repoRoot || !git.workspacePath) {
               result.skippedNoRepoRoot += 1;
-            } else if (!git.hasDirtyTrackedFiles && !git.hasUntrackedFiles) {
+            } else {
               const commitsMissing = await countCommitsMissingFromRemote(git.workspacePath);
               if (commitsMissing === null) result.skippedRemoteCheckFailed += 1;
               else if (commitsMissing > 0) result.skippedUnpushed += 1;
@@ -3315,7 +3318,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             result.skippedUndelivered += 1;
             continue;
           }
-          if (nothingUnique) {
+          if (nothingUnique && git?.hasUntrackedFiles) {
+            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | untracked files`;
+            destructiveCleanup = false;
+          } else if (nothingUnique) {
             plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
             destructiveCleanup = workspace.providerType === "git_worktree";
           }
@@ -3367,6 +3373,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // that a later sweep would then archive and destroy under the request.
           if (await workspaceHasActiveRun(workspace)) {
             result.skippedReopened += 1;
+            continue;
+          }
+          if (dryRun) {
+            logDryRunCandidate(workspace, workspacePath, "clear stale reopen-pending flag", false);
             continue;
           }
           // The reopen-pending flag outlived its consumption window and no run owns
@@ -3454,6 +3464,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           workspace.status === "cleanup_failed"
           && isStuckGitSpawnEnoentCleanupReason(workspace.cleanupReason)
         ) {
+          if (dryRun) {
+            logDryRunCandidate(workspace, workspacePath, "retry stuck git spawn ENOENT cleanup", true);
+            continue;
+          }
           result.eligible += 1;
           const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
             workspace.metadata as Record<string, unknown> | null,
@@ -3523,16 +3537,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           plannedCleanupReason = `${plannedCleanupReason} | ${LOCAL_ONLY_KEEP_REASON}`;
           result.skippedLocalOnly += 1;
         }
-        if (workspaceReaperDryRunEnabled(opts.dryRun)) {
-          logger.info(
-            {
-              executionWorkspaceId: workspace.id,
-              path: workspacePath,
-              reason: plannedCleanupReason,
-              wouldRemove: destructiveCleanup,
-            },
-            "terminal issue workspace reaper dry run",
-          );
+        if (dryRun) {
+          logDryRunCandidate(workspace, workspacePath, plannedCleanupReason, destructiveCleanup);
           continue;
         }
         result.eligible += 1;
