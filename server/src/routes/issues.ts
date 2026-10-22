@@ -64,6 +64,7 @@ import {
   pipelineStages,
   pipelines,
   projectWorkspaces,
+  summarySlots,
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
@@ -4386,6 +4387,16 @@ export function issueRoutes(
   const FINAL_DELIVERY_PREFLIGHT_TIMEOUT_MS = 20_000;
 
   async function resolveFinalDeliveryResolution(issue: FinalDeliveryIssue): Promise<FinalDeliveryResolution> {
+    const [summaryGeneration] = await db
+      .select({ id: summarySlots.id })
+      .from(summarySlots)
+      .where(and(
+        eq(summarySlots.companyId, issue.companyId),
+        eq(summarySlots.generatingIssueId, issue.id),
+      ))
+      .limit(1);
+    if (summaryGeneration) return { repoBacked: false };
+
     const context = await resolveIssueRepoContext(db, issue);
     if (!context?.repoUrl) return { repoBacked: false };
     const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
@@ -4412,12 +4423,21 @@ export function issueRoutes(
 
   async function readFinalDeliveryBinding(dbLike: Db, issue: FinalDeliveryIssue): Promise<string> {
     const context = await resolveIssueRepoContext(dbLike, issue);
+    const [summaryGeneration] = await dbLike
+      .select({ id: summarySlots.id })
+      .from(summarySlots)
+      .where(and(
+        eq(summarySlots.companyId, issue.companyId),
+        eq(summarySlots.generatingIssueId, issue.id),
+      ))
+      .limit(1);
     const ownership = await resolveCardDeliveryBranchOwnership(dbLike, issue.companyId, issue.id);
     const state = issue.executionState as { delivery?: unknown } | null;
     return JSON.stringify({
       projectId: issue.projectId,
       projectWorkspaceId: issue.projectWorkspaceId,
       executionWorkspaceId: issue.executionWorkspaceId,
+      summaryGenerationId: summaryGeneration?.id ?? null,
       context,
       ownership,
       delivery: state?.delivery ?? null,
