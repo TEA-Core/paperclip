@@ -352,6 +352,7 @@ function createRunContextDb(
     : null,
 ) {
   const chatBindingQueries: ReturnType<PgDialect["sqlToQuery"]>[] = [];
+  const heartbeatRunQueries: ReturnType<PgDialect["sqlToQuery"]>[] = [];
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
     : [{
@@ -365,11 +366,21 @@ function createRunContextDb(
   const firstRun = runRows[0] ?? {};
   const runAgentId = typeof firstRun.agentId === "string" ? firstRun.agentId : ownerAgentId;
   const runAgentCompanyId = typeof firstRun.agentCompanyId === "string" ? firstRun.agentCompanyId : companyId;
-  const rowsForSelection = async (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
+  const rowsForSelection = async (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false, heartbeatRunQuery = false) => {
     if (chatBindingQuery) return chatBindings;
     // An unknown selector has no settled recovery receipt. Returning the
     // generic issue fixture here would invent an unrelated replay row.
     if (settledRecoveryQuery) return [];
+    if (heartbeatRunQuery) {
+      const predicate = heartbeatRunQueries.at(-1);
+      const [selectedRunId, selectedCompanyId, selectedAgentId, selectedStatus] = predicate?.params ?? [];
+      return runRows.filter((row) =>
+        row.id === selectedRunId &&
+        row.companyId === selectedCompanyId &&
+        row.agentId === selectedAgentId &&
+        row.status === selectedStatus,
+      );
+    }
     const keys = Object.keys(selection);
     if (keys.includes("entityId")) return [];
     if (keys.includes("sourceIssueId")) {
@@ -383,32 +394,46 @@ function createRunContextDb(
     }
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
-  const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
+  const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false, heartbeatRunQuery = false) => {
     const whereResult = {
       orderBy: vi.fn(async () => []),
       limit: vi.fn(() => ({
-        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery)),
       })),
       for: vi.fn(() => ({
-        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery)),
       })),
-      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery)),
     };
     const query = {
       innerJoin: vi.fn(() => query),
       where: vi.fn((condition: SQL) => {
-        if (chatBindingQuery) chatBindingQueries.push(new PgDialect().sqlToQuery(condition));
+        const predicate = new PgDialect().sqlToQuery(condition);
+        if (chatBindingQuery) chatBindingQueries.push(predicate);
+        if (heartbeatRunQuery) heartbeatRunQueries.push(predicate);
         return whereResult;
       }),
     };
     return query;
   };
-  const dbStub = {
+  const dbStub: Record<string, any> = {
     chatBindingQueries,
-    transaction: async (callback: (tx: typeof dbStub) => Promise<unknown>) => callback(dbStub),
+    heartbeatRunQueries,
+    transaction: async (callback: (tx: Record<string, any>) => Promise<unknown>) => callback(dbStub),
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
-      from: vi.fn((table: Parameters<typeof getTableName>[0]) =>
-        buildQuery(selection, getTableName(table) === "chat_conversations", getTableName(table) === "issue_recovery_actions")),
+      from: vi.fn((table: Parameters<typeof getTableName>[0]) => {
+        const tableName = getTableName(table);
+        const heartbeatRunQuery =
+          tableName === "heartbeat_runs" &&
+          Object.keys(selection).includes("status") &&
+          Object.keys(selection).includes("agentId");
+        return buildQuery(
+          selection,
+          tableName === "chat_conversations",
+          tableName === "issue_recovery_actions",
+          heartbeatRunQuery,
+        );
+      }),
     })),
     insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
   };
@@ -1750,6 +1775,25 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", []],
+    ["non-running", [{ id: ownerRunId, companyId, agentId: ownerAgentId, status: "succeeded" }]],
+    ["different agent", [{ id: ownerRunId, companyId, agentId: peerAgentId, status: "running" }]],
+  ])("does not suppress the assignment wake when the creator run is %s", async (_caseName, runRows) => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({}, runRows),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Self-assigned root without a live matching run", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
   });
 
   it("suppresses assignment wakes for live creator self-assigned accepted-plan children", async () => {
