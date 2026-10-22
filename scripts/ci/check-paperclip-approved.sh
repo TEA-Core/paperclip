@@ -96,8 +96,9 @@
 #     paperclip/approved as the control plane, bound to the exact head SHA.
 #   - On a cardless head both waivers stay, but only for an author that is a
 #     person (user.type User) or this repository's own automation
-#     (github-actions[bot]). Any other App-authored PR (the fleet's) cannot
-#     self-waive.
+#     (github-actions[bot]) or the control-plane App itself (tea-core, the
+#     identity the lockfile refresh opens its PR as). Any other App-authored PR
+#     (the fleet's) cannot self-waive.
 # The switch ships OFF so merging this change cannot freeze anything before the
 # release route is deployed. Turn it on (repository variable of the same name)
 # only after the route answers on the live control plane.
@@ -512,6 +513,7 @@ PR_LABELS="$(jq -c '(.labels // []) | map(.name)' <<<"$PR_JSON")"
 PR_HEAD_REF="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
 PR_AUTHOR="$(jq -r '.user.login // ""' <<<"$PR_JSON")"
 PR_AUTHOR_TYPE="$(jq -r '.user.type // ""' <<<"$PR_JSON")"
+PR_AUTHOR_ID="$(jq -r '.user.id // ""' <<<"$PR_JSON")"
 
 # A card-bound head is `SUP-<n>` or `SUP-<n>-...` (the execution-workspace
 # branch). Case-insensitive so `sup-123-x` cannot step round the rule.
@@ -729,7 +731,8 @@ waiver_honoured() {
   case "${PR_AUTHOR_TYPE}:${PR_AUTHOR}" in
     User:*|Bot:github-actions\[bot\]) return 0 ;;
   esac
-  note "REFUSED: ${what} on PR #${PR_NUMBER} authored by ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — only a person or github-actions[bot] may waive a cardless PR"
+  [ "$PR_AUTHOR_TYPE" = "Bot" ] && [ "$PR_AUTHOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ] && return 0
+  note "REFUSED: ${what} on PR #${PR_NUMBER} authored by ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — only a person, github-actions[bot] or ${APPROVED_STATUS_CREATOR_LOGIN} may waive a cardless PR"
   return 1
 }
 
