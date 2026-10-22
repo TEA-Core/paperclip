@@ -1202,10 +1202,12 @@ The current app also exposes V1-supporting surfaces for:
   archives without a delivery verdict; untracked-only files do not block it. A cwd that is missing or
   not a git repository archives the record without running Git. Archive reason is `issue_terminal`,
   with a ` | <why>` suffix when the worktree is kept. The sweep removes the worktree only for a
-  `git_worktree` row that is clean with nothing unique and has no other live session on the same
-  path, rechecked just before removal; every other archive is record-only:
-  it stops that row's runtime services, detaches issues, and records why in `cleanup_reason`.
-  Record-only stop or detach failures stay `archived` and are appended to `cleanup_reason`. The reaper
+  `git_worktree` row that is a registered linked worktree of the record repo, inside that repo's
+  managed worktree root, not a symlink, and not the repo root or above it. Ignored files and
+  skip-worktree or assume-unchanged edits are not clean: the record archives and the tree stays.
+  The live-session recheck runs again inside a path-only lock after the bounded runtime-service
+  stop and immediately before removal. Every other archive is record-only:
+  it stops that row's runtime services, detaches issues, and records why in `cleanup_reason`. The reaper
   skip log line carries one counter per skip reason. A worktree directory that is already gone counts
   as removed: cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
   of leaving it in `cleanup_failed`. The sweep also retries `cleanup_failed` rows whose reason is

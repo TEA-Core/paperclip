@@ -1609,7 +1609,8 @@ async function startServerWithDatabaseTeardown(
             + (result.skippedGitUnverified ?? 0)
             + result.skippedRace
             + (result.skippedReopened ?? 0)
-            + result.skippedCooldown;
+            + result.skippedCooldown
+            + (result.skippedLocalOnly ?? 0);
           const nowMs = Date.now();
           if (skipped > 0 && nowMs - lastTerminalWorkspaceSkipLogAt >= terminalWorkspaceSkipLogIntervalMs) {
             lastTerminalWorkspaceSkipLogAt = nowMs;

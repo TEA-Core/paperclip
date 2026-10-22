@@ -409,9 +409,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const issuePrefix = `P${companyId.slice(0, 8).toUpperCase()}`;
     const identifier = `${issuePrefix}-1`;
     const repoRoot = await createTempRepo();
-    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-terminal-${randomUUID()}`);
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "PAP-16015-delivery");
     tempDirs.add(repoRoot);
-    tempDirs.add(worktreePath);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
     await runGit(repoRoot, ["branch", "PAP-16015-delivery"]);
     await runGit(repoRoot, ["worktree", "add", worktreePath, "PAP-16015-delivery"]);
     await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
@@ -505,14 +505,25 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       });
       await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, sourceIssueId));
     }
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      isPrimary: true,
+      cwd: repoRoot,
+    });
+    await db.update(executionWorkspaces).set({ projectWorkspaceId }).where(eq(executionWorkspaces.id, executionWorkspaceId));
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, identifier, repoRoot, worktreePath, headSha };
   }
 
   it("reports a squash cross-branch delivery as merged_via_pr and suppresses the ancestry warning", async () => {
     const repoRoot = await createTempRepo();
     tempDirs.add(repoRoot);
-    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-delivery-${randomUUID()}`);
-    tempDirs.add(worktreePath);
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "PAP-16015-delivery");
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
     await runGit(repoRoot, ["branch", "PAP-16015-delivery"]);
     await runGit(repoRoot, ["worktree", "add", worktreePath, "PAP-16015-delivery"]);
     await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
@@ -528,6 +539,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       repoUrl: "https://github.com/paperclipai/paperclip.git",
       branchName: "PAP-16015-delivery",
     }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db.update(projectWorkspaces).set({ cwd: repoRoot }).where(eq(projectWorkspaces.projectId, seeded.projectId));
     await db.insert(issueWorkProducts).values({
       companyId: seeded.companyId,
       issueId: seeded.sourceIssueId,
@@ -574,9 +586,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // merged marker so the workspace is reapeable via merged_via_pr.
     const repoRoot = await createTempRepo();
     tempDirs.add(repoRoot);
-    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-ancestry-${randomUUID()}`);
-    tempDirs.add(worktreePath);
     const branchName = `ancestry-${randomUUID().slice(0, 8)}`;
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
     await runGit(repoRoot, ["branch", branchName]);
     await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
 
@@ -650,7 +662,18 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         metadata: { mergedAt: overrides.prMergedAt },
       });
     }
-    return { companyId, projectId, executionWorkspaceId, sourceIssueId, worktreePath };
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      isPrimary: true,
+      cwd: repoRoot,
+    });
+    await db.update(executionWorkspaces).set({ projectWorkspaceId }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+    return { companyId, projectId, executionWorkspaceId, sourceIssueId, worktreePath, repoRoot };
   }
 
   it("leaves a terminal workspace with no recorded PR verdict as unknown and does not archive it", async () => {
@@ -5832,8 +5855,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 
   describe("SUP-20688 terminal workspace archive sweep", () => {
-    function freshSweep(cooldownDays = 0) {
-      return executionWorkspaceService(db, { workspaceReaperCooldownDays: cooldownDays });
+    function freshSweep(cooldownDays = 0, workspaceIds?: string[]) {
+      return executionWorkspaceService(db, {
+        workspaceReaperCooldownDays: cooldownDays,
+        ...(workspaceIds ? { sweepWorkspaceIds: workspaceIds } : {}),
+      });
     }
 
     async function workspaceStatus(id: string) {
@@ -5923,21 +5949,32 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     it("archives an isolated no-PR clean workspace with nothing unique and removes its worktree", async () => {
       const seeded = await seedAncestryTerminalWorkspace();
       await publishWorktree(seeded.worktreePath);
-      await fs.mkdir(path.join(seeded.worktreePath, "node_modules"), { recursive: true });
-      await fs.writeFile(path.join(seeded.worktreePath, ".gitignore"), "node_modules\n", "utf8");
-      await runGit(seeded.worktreePath, ["add", ".gitignore"]);
-      await runGit(seeded.worktreePath, ["commit", "-m", "Ignore node_modules"]);
-      await runGit(seeded.worktreePath, ["push", "origin", "HEAD"]);
-      const readiness = await freshSweep().getCloseReadiness(seeded.executionWorkspaceId);
-      expect(readiness?.deliveryState).toBe("unknown");
-
-      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
       const row = await workspaceStatus(seeded.executionWorkspaceId);
 
       expect(sweep.archived).toBe(1);
       expect(row?.status).toBe("archived");
       expect(row?.cleanupReason).toContain("terminal, clean, nothing unique");
       await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+    }, 20_000);
+
+    it("archives an isolated no-PR workspace with ignored files as a record only", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await publishWorktree(seeded.worktreePath);
+      await fs.mkdir(path.join(seeded.worktreePath, "node_modules"), { recursive: true });
+      await fs.writeFile(path.join(seeded.worktreePath, "node_modules", ".env"), "SECRET=keep-me\n", "utf8");
+      await fs.writeFile(path.join(seeded.worktreePath, ".gitignore"), "node_modules\n", "utf8");
+      await runGit(seeded.worktreePath, ["add", ".gitignore"]);
+      await runGit(seeded.worktreePath, ["commit", "-m", "Ignore node_modules"]);
+      await runGit(seeded.worktreePath, ["push", "origin", "HEAD"]);
+
+      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+      expect(sweep.skippedLocalOnly).toBeGreaterThanOrEqual(1);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toContain("ignored or skip-worktree files");
+      await expect(fs.readFile(path.join(seeded.worktreePath, "node_modules", ".env"), "utf8")).resolves.toBe("SECRET=keep-me\n");
     }, 20_000);
 
     it("keeps an isolated workspace with an unpushed commit or a tracked change", async () => {
@@ -5989,10 +6026,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const secondId = randomUUID();
       const secondIssueId = randomUUID();
       const issuePrefix = `P${first.companyId.slice(0, 8).toUpperCase()}`;
+      const [owner] = await db.select({ projectWorkspaceId: executionWorkspaces.projectWorkspaceId })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.cwd, first.worktreePath))
+        .limit(1);
       await db.insert(executionWorkspaces).values({
         id: secondId,
         companyId: first.companyId,
         projectId: first.projectId,
+        projectWorkspaceId: owner?.projectWorkspaceId ?? null,
         mode: "shared_workspace",
         strategyType: "git_worktree",
         name: `${issuePrefix}-2`,
@@ -6187,12 +6229,148 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await markShared(seeded.executionWorkspaceId);
       await fs.writeFile(path.join(seeded.worktreePath, "scratch.txt"), "untracked\n", "utf8");
 
-      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
       const row = await workspaceStatus(seeded.executionWorkspaceId);
 
       expect(sweep.archived).toBe(1);
       expect(row?.status).toBe("archived");
       await expect(fs.readFile(path.join(seeded.worktreePath, "scratch.txt"), "utf8")).resolves.toBe("untracked\n");
+    }, 20_000);
+
+    it("keeps the worktree when a live session appears during the stop step", async () => {
+      const first = await seedAncestryTerminalWorkspace();
+      await publishWorktree(first.worktreePath);
+      await db.update(executionWorkspaces).set({
+        updatedAt: new Date("2020-01-01T00:00:00Z"),
+      }).where(eq(executionWorkspaces.id, first.executionWorkspaceId));
+      let liveId: string | null = null;
+      const original = workspaceRuntimeModule.stopRuntimeServicesForExecutionWorkspace;
+      const stop = vi.spyOn(workspaceRuntimeModule, "stopRuntimeServicesForExecutionWorkspace")
+        .mockImplementation(async (input) => {
+          if (!liveId) liveId = await seedLiveSessionOnPath(first);
+          return original(input);
+        });
+      try {
+        const sweep = await freshSweep(0, [first.executionWorkspaceId]).sweepTerminalWorkspaces();
+        const row = await workspaceStatus(first.executionWorkspaceId);
+        expect(liveId).not.toBeNull();
+        expect(sweep.cleanupFailed).toBe(0);
+        expect(row?.status).toBe("archived");
+        expect(row?.cleanupReason).toContain("other active sessions reference this path");
+        expect((await workspaceStatus(liveId!))?.status).toBe("active");
+        await expect(fs.access(first.worktreePath)).resolves.toBeUndefined();
+      } finally {
+        stop.mockRestore();
+      }
+    }, 20_000);
+
+    it("does not remove a foreign worktree when cwd is a symlink with a matching branch", async () => {
+      const own = await seedAncestryTerminalWorkspace();
+      const foreignRepo = await createTempRepo();
+      tempDirs.add(foreignRepo);
+      const foreignBranch = `foreign-${randomUUID().slice(0, 8)}`;
+      const foreignWorktree = path.join(foreignRepo, ".paperclip", "worktrees", foreignBranch);
+      await fs.mkdir(path.dirname(foreignWorktree), { recursive: true });
+      await runGit(foreignRepo, ["branch", foreignBranch]);
+      await runGit(foreignRepo, ["worktree", "add", foreignWorktree, foreignBranch]);
+      await publishWorktree(foreignWorktree);
+      const linkPath = path.join(own.repoRoot, ".paperclip", "worktrees", `link-${randomUUID().slice(0, 8)}`);
+      await fs.symlink(foreignWorktree, linkPath);
+      await db.update(executionWorkspaces).set({
+        cwd: linkPath,
+        providerRef: linkPath,
+        branchName: foreignBranch,
+      }).where(eq(executionWorkspaces.id, own.executionWorkspaceId));
+
+      await freshSweep(0, [own.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const row = await workspaceStatus(own.executionWorkspaceId);
+
+      expect(row?.cleanupReason ?? "").toContain("cwd is a symlink");
+      await expect(fs.access(foreignWorktree)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("does not remove a foreign worktree when the path matches its branch but not the record repo", async () => {
+      const own = await seedAncestryTerminalWorkspace();
+      const foreignRepo = await createTempRepo();
+      tempDirs.add(foreignRepo);
+      const foreignBranch = `foreign-${randomUUID().slice(0, 8)}`;
+      const foreignWorktree = path.join(foreignRepo, ".paperclip", "worktrees", foreignBranch);
+      await fs.mkdir(path.dirname(foreignWorktree), { recursive: true });
+      await runGit(foreignRepo, ["branch", foreignBranch]);
+      await runGit(foreignRepo, ["worktree", "add", foreignWorktree, foreignBranch]);
+      await publishWorktree(foreignWorktree);
+      await db.update(executionWorkspaces).set({
+        cwd: foreignWorktree,
+        providerRef: foreignWorktree,
+        branchName: foreignBranch,
+      }).where(eq(executionWorkspaces.id, own.executionWorkspaceId));
+
+      await freshSweep(0, [own.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const row = await workspaceStatus(own.executionWorkspaceId);
+
+      expect(row?.cleanupReason ?? "").toMatch(/not a registered linked worktree|path is outside the managed worktree root/);
+      await expect(fs.access(foreignWorktree)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("keeps skip-worktree edits when the commits are already pushed", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await publishWorktree(seeded.worktreePath);
+      await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "MUTATED-LOCAL\n", "utf8");
+      await runGit(seeded.worktreePath, ["update-index", "--skip-worktree", "README.md"]);
+
+      const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+      const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+      expect(sweep.skippedLocalOnly).toBeGreaterThanOrEqual(1);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toContain("ignored or skip-worktree files");
+      await expect(fs.readFile(path.join(seeded.worktreePath, "README.md"), "utf8")).resolves.toBe("MUTATED-LOCAL\n");
+    }, 20_000);
+
+    it("does not let a hanging runtime stop hold the sweep", async () => {
+      const first = await seedTerminalWorkspace();
+      await markShared(first.executionWorkspaceId);
+      await db.update(executionWorkspaces).set({
+        updatedAt: new Date("2020-01-01T00:00:00Z"),
+      }).where(eq(executionWorkspaces.id, first.executionWorkspaceId));
+      const second = await seedTerminalWorkspace();
+      await markShared(second.executionWorkspaceId);
+      const original = workspaceRuntimeModule.stopRuntimeServicesForExecutionWorkspace;
+      const hang = new Promise<void>(() => {});
+      const stop = vi.spyOn(workspaceRuntimeModule, "stopRuntimeServicesForExecutionWorkspace")
+        .mockImplementation((input) => {
+          if (input.executionWorkspaceId === first.executionWorkspaceId) return hang;
+          return original(input);
+        });
+      try {
+        const sweep = await executionWorkspaceService(db, {
+          workspaceReaperCooldownDays: 0,
+          runtimeServiceStopTimeoutMs: 50,
+          sweepWorkspaceIds: [first.executionWorkspaceId, second.executionWorkspaceId],
+        }).sweepTerminalWorkspaces();
+        expect(sweep.archived + sweep.cleanupFailed).toBeGreaterThanOrEqual(1);
+        await expect(fs.access(first.worktreePath)).resolves.toBeUndefined();
+        expect((await workspaceStatus(second.executionWorkspaceId))?.status).toBe("archived");
+      } finally {
+        stop.mockRestore();
+      }
+    }, 20_000);
+
+    it("dry run logs the candidate and archives or deletes nothing", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await publishWorktree(seeded.worktreePath);
+      const previous = process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN;
+      process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN = "1";
+      try {
+        const sweep = await freshSweep(0, [seeded.executionWorkspaceId]).sweepTerminalWorkspaces();
+        expect(sweep.archived).toBe(0);
+        expect(sweep.cleanupFailed).toBe(0);
+        expect((await workspaceStatus(seeded.executionWorkspaceId))?.status).toBe("active");
+        await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      } finally {
+        if (previous === undefined) delete process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN;
+        else process.env.PAPERCLIP_WORKSPACE_REAPER_DRY_RUN = previous;
+      }
     }, 20_000);
 
     it("puts a counter per skip reason on the terminal reaper skip log line", async () => {
@@ -6216,6 +6394,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         "skippedRace=0",
         "skippedReopened=0",
         "skippedCooldown=0",
+        "skippedLocalOnly=0",
       ]) {
         expect(line).toEqual(expect.stringContaining(counter));
       }

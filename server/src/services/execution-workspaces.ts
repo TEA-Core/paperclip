@@ -98,6 +98,11 @@ export const TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT = 200;
 export const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
 const COMMITS_MISSING_FROM_REMOTE_KEEP_REASON = "commits missing from the remote";
 const OTHER_LIVE_SESSIONS_KEEP_REASON = "other active sessions reference this path";
+const LOCAL_ONLY_KEEP_REASON = "ignored or skip-worktree files";
+const WORKTREE_PATH_LOCK_PREFIX = "execution-workspace:worktree-path:";
+export const WORKSPACE_REAPER_DRY_RUN_ENV = "PAPERCLIP_WORKSPACE_REAPER_DRY_RUN";
+export const WORKSPACE_REAPER_STOP_TIMEOUT_ENV = "PAPERCLIP_WORKSPACE_REAPER_STOP_TIMEOUT_MS";
+const DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS = 30_000;
 
 export type TerminalWorkspaceSweepSkipCounts = {
   skippedActiveRun: number;
@@ -111,6 +116,7 @@ export type TerminalWorkspaceSweepSkipCounts = {
   skippedRace: number;
   skippedReopened: number;
   skippedCooldown: number;
+  skippedLocalOnly: number;
 };
 
 export function formatTerminalWorkspaceReaperSkipLogLine(
@@ -129,6 +135,7 @@ export function formatTerminalWorkspaceReaperSkipLogLine(
     `skippedRace=${count(result.skippedRace)}`,
     `skippedReopened=${count(result.skippedReopened)}`,
     `skippedCooldown=${count(result.skippedCooldown)}`,
+    `skippedLocalOnly=${count(result.skippedLocalOnly)}`,
   ];
   return `terminal issue workspace reaper skipped all candidates ${parts.join(" ")}`;
 }
@@ -158,6 +165,110 @@ async function countCommitsMissingFromRemote(workspacePath: string): Promise<num
   } catch {
     return null;
   }
+}
+
+async function worktreePathLockKey(workspacePath: string) {
+  const resolved = path.resolve(workspacePath);
+  try {
+    return `${WORKTREE_PATH_LOCK_PREFIX}${await fs.realpath(workspacePath)}`;
+  } catch {
+    return `${WORKTREE_PATH_LOCK_PREFIX}${resolved}`;
+  }
+}
+
+async function lockWorktreePath(tx: DbTransaction, workspacePath: string) {
+  const key = await worktreePathLockKey(workspacePath);
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+}
+
+async function localOnlyBytesBlockRemoval(workspacePath: string): Promise<boolean> {
+  try {
+    await fs.lstat(workspacePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    return true;
+  }
+  try {
+    const status = await runGit(
+      ["status", "--porcelain=v1", "--ignored", "--untracked-files=all"],
+      workspacePath,
+    );
+    if (status.stdout.split(/\r?\n/).some((line) => line.startsWith("!!"))) return true;
+    const listed = await runGit(["ls-files", "-v"], workspacePath);
+    return listed.stdout.split(/\r?\n/).some((line) => {
+      const tag = line[0];
+      return tag === "S" || tag === "s" || tag === "h";
+    });
+  } catch {
+    // A failed local-only scan is not proof the tree is safe to delete.
+    return true;
+  }
+}
+
+function workspaceReaperDryRunEnabled(override: boolean | undefined) {
+  if (override === true) return true;
+  if (override === false) return false;
+  const raw = process.env[WORKSPACE_REAPER_DRY_RUN_ENV]?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+function resolveRuntimeServiceStopTimeoutMs(override: number | undefined) {
+  if (typeof override === "number" && Number.isFinite(override) && override > 0) return override;
+  const raw = process.env[WORKSPACE_REAPER_STOP_TIMEOUT_ENV];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS;
+}
+
+async function stopRuntimeServicesBounded(
+  stop: (input: {
+    db?: Db;
+    executionWorkspaceId: string;
+    workspaceCwd?: string | null;
+  }) => Promise<void>,
+  input: {
+    db?: Db;
+    executionWorkspaceId: string;
+    workspaceCwd?: string | null;
+  },
+  timeoutMs: number,
+) {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      stop(input),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("runtime services stop timed out"));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function emptyTerminalSweepResult() {
+  return {
+    checked: 0,
+    eligible: 0,
+    archived: 0,
+    cleanupFailed: 0,
+    skippedActiveRun: 0,
+    skippedNonTerminalTree: 0,
+    skippedUndelivered: 0,
+    skippedUnpushed: 0,
+    skippedRemoteCheckFailed: 0,
+    skippedNoRepoRoot: 0,
+    skippedTrackedDirty: 0,
+    skippedGitUnverified: 0,
+    skippedRace: 0,
+    skippedReopened: 0,
+    skippedCooldown: 0,
+    skippedLocalOnly: 0,
+    clearedStaleReopenPending: 0,
+  };
 }
 
 // Node reports a missing worktree cwd as `spawn <git> ENOENT`. The git path can
@@ -345,6 +456,12 @@ export type ExecutionWorkspaceServiceOptions = {
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
   workspaceReaperCooldownDays?: number;
+  // Test isolation. Production callers omit this and the sweep scans every company.
+  sweepWorkspaceIds?: readonly string[];
+  // Host dry-run. Also enabled by PAPERCLIP_WORKSPACE_REAPER_DRY_RUN. Default off.
+  dryRun?: boolean;
+  // Bounds stopRuntimeServices so a hang cannot hold the in-process sweep flag.
+  runtimeServiceStopTimeoutMs?: number;
 };
 
 export function deriveExecutionWorkspaceDeliveryState(input: {
@@ -1974,15 +2091,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
+      write: ({ tx }) => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, tx),
     });
   }
 
-  async function runTerminalWorkspaceCleanup(workspace: ExecutionWorkspaceRow, expectedHeadSha: string | null) {
+  async function runTerminalWorkspaceCleanup(
+    workspace: ExecutionWorkspaceRow,
+    expectedHeadSha: string | null,
+    tx: DbTransaction,
+  ) {
     const [
       {
         acquireGitWorktreeCleanupLock,
         cleanupExecutionWorkspaceArtifacts,
+        explainUnsafeTerminalWorktreeRemoval,
         stopRuntimeServicesForExecutionWorkspace,
       },
       { workspaceOperationService },
@@ -2016,14 +2138,33 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      const pathInUseBeforeStop = await otherLiveSessionsReferencePath(workspace);
+      await stopRuntimeServicesBounded(
+        stopRuntimeServicesForExecutionWorkspace,
+        {
+          db,
+          executionWorkspaceId: workspace.id,
+          ...(pathInUseBeforeStop ? {} : { workspaceCwd: workspace.cwd }),
+        },
+        resolveRuntimeServiceStopTimeoutMs(opts.runtimeServiceStopTimeoutMs),
+      );
+      const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+      if (workspacePath) await lockWorktreePath(tx, workspacePath);
       const pathInUse = await otherLiveSessionsReferencePath(workspace);
-      await stopRuntimeServicesForExecutionWorkspace({
-        db,
-        executionWorkspaceId: workspace.id,
-        ...(pathInUse ? {} : { workspaceCwd: workspace.cwd }),
-      });
-      const cleanup = pathInUse
-        ? { cleaned: true, warnings: [OTHER_LIVE_SESSIONS_KEEP_REASON] }
+      let removalRefusal: string | null = null;
+      if (!pathInUse && workspace.providerType === "git_worktree" && workspacePath) {
+        if (await localOnlyBytesBlockRemoval(workspacePath)) {
+          removalRefusal = LOCAL_ONLY_KEEP_REASON;
+        } else {
+          removalRefusal = await explainUnsafeTerminalWorktreeRemoval({
+            worktreePath: workspacePath,
+            recordRepoCwd: projectWorkspace?.cwd ?? null,
+            configuredWorktreeParentDir: projectPolicy?.workspaceStrategy?.worktreeParentDir ?? null,
+          });
+        }
+      }
+      const cleanup = pathInUse || removalRefusal
+        ? { cleaned: true, warnings: [pathInUse ? OTHER_LIVE_SESSIONS_KEEP_REASON : removalRefusal!] }
         : await cleanupExecutionWorkspaceArtifacts({
           workspace,
           projectWorkspace,
@@ -2981,24 +3122,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // the cursor and the boundary and could corrupt the rotation state. A
       // skipped tick is safe: the next tick runs the sweep with intact state.
       if (terminalSweepInProgress) {
-        return {
-          checked: 0,
-          eligible: 0,
-          archived: 0,
-          cleanupFailed: 0,
-          skippedActiveRun: 0,
-          skippedNonTerminalTree: 0,
-          skippedUndelivered: 0,
-          skippedUnpushed: 0,
-          skippedRemoteCheckFailed: 0,
-          skippedNoRepoRoot: 0,
-          skippedTrackedDirty: 0,
-          skippedGitUnverified: 0,
-          skippedRace: 0,
-          skippedReopened: 0,
-          skippedCooldown: 0,
-          clearedStaleReopenPending: 0,
-        };
+        return emptyTerminalSweepResult();
       }
       terminalSweepInProgress = true;
       try {
@@ -3046,10 +3170,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // Keep pending-reopen rows in the rotation so the old generation fence
       // can be cleared after a source issue reopens, without inspecting git.
       const sourceTerminal = inArray(issues.status, ["done", "cancelled"]);
+      const workspaceIdFilter = opts.sweepWorkspaceIds && opts.sweepWorkspaceIds.length > 0
+        ? inArray(executionWorkspaces.id, [...opts.sweepWorkspaceIds])
+        : undefined;
       const scanFilter = and(
         baseCandidateFilter,
         boundaryFilter,
         cursorFilter,
+        workspaceIdFilter,
         or(
           sourceTerminal,
           sql<boolean>`${executionWorkspaces.metadata}->>${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY} = 'true'`,
@@ -3091,6 +3219,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedRace: 0,
         skippedReopened: 0,
         skippedCooldown: 0,
+        skippedLocalOnly: 0,
         clearedStaleReopenPending: 0,
       };
 
@@ -3389,6 +3518,23 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
           continue;
         }
+        if (destructiveCleanup && workspacePath && await localOnlyBytesBlockRemoval(workspacePath)) {
+          destructiveCleanup = false;
+          plannedCleanupReason = `${plannedCleanupReason} | ${LOCAL_ONLY_KEEP_REASON}`;
+          result.skippedLocalOnly += 1;
+        }
+        if (workspaceReaperDryRunEnabled(opts.dryRun)) {
+          logger.info(
+            {
+              executionWorkspaceId: workspace.id,
+              path: workspacePath,
+              reason: plannedCleanupReason,
+              wouldRemove: destructiveCleanup,
+            },
+            "terminal issue workspace reaper dry run",
+          );
+          continue;
+        }
         result.eligible += 1;
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures
@@ -3515,7 +3661,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           const describeFailure = (error: unknown) => error instanceof Error ? error.message : String(error);
           try {
             const { stopRuntimeServicesForExecutionWorkspace } = await import("./workspace-runtime.js");
-            await stopRuntimeServicesForExecutionWorkspace({ db, executionWorkspaceId: archived.id });
+            await stopRuntimeServicesBounded(
+              stopRuntimeServicesForExecutionWorkspace,
+              { db, executionWorkspaceId: archived.id },
+              resolveRuntimeServiceStopTimeoutMs(opts.runtimeServiceStopTimeoutMs),
+            );
           } catch (error) {
             recordOnlyFailures.push(`runtime services stop failed: ${describeFailure(error)}`);
           }
@@ -3611,6 +3761,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const row = await db.transaction(async (tx) => {
         if (pathGuardKey) {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${pathGuardKey}, 0))`);
+        }
+        const pathOnlyKeys = [...new Set([data.cwd, data.providerRef].filter((value): value is string => Boolean(value)))];
+        for (const workspacePath of pathOnlyKeys) {
+          await lockWorktreePath(tx, workspacePath);
         }
         await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db);
         return tx
