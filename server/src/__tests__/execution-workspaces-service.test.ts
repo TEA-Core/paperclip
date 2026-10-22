@@ -5835,8 +5835,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       return executionWorkspaceService(db, { workspaceReaperCooldownDays: cooldownDays });
     }
 
-    const runtimeOwnedBranch = { createdByRuntime: true, gitBranchOwnershipVersion: 1 };
-
     async function workspaceStatus(id: string) {
       const [row] = await db
         .select({
@@ -6096,7 +6094,68 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       });
     }, 20_000);
 
-    it("dry run writes nothing and predicts the live sweep row by row, including refused and destructive cleanups", async () => {
+    async function dryRunListing(options: { blockGit: boolean }) {
+      const info = vi.spyOn(logger, "info");
+      let sweep!: Awaited<ReturnType<ReturnType<typeof freshSweep>["sweepTerminalWorkspaces"]>>;
+      const runDry = async () => {
+        sweep = await executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, dryRun: true })
+          .sweepTerminalWorkspaces();
+      };
+      try {
+        // The recorder shim fails every git call, so a non-empty log is a git call.
+        const gitCalls = options.blockGit ? await gitCallsDuring(runDry) : (await runDry(), "");
+        const listed = info.mock.calls
+          .filter(([, message]) => message === "terminal issue workspace reaper dry run")
+          .map(([fields]) => fields as unknown as { executionWorkspaceId: string; action: string; reason: string });
+        return { sweep, listed, gitCalls };
+      } finally {
+        info.mockRestore();
+      }
+    }
+
+    it("dry run issues no git for shared, non-git, missing-cwd and inherited-cleanup rows and changes nothing", async () => {
+      const shared = await seedTerminalWorkspace();
+      await markShared(shared.executionWorkspaceId);
+      const nonGit = await seedTerminalWorkspace();
+      const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-default-"));
+      tempDirs.add(plainDir);
+      await fs.writeFile(path.join(plainDir, "note.txt"), "keep\n", "utf8");
+      await db.update(executionWorkspaces).set({ cwd: plainDir, providerRef: plainDir, providerType: "local_fs" })
+        .where(eq(executionWorkspaces.id, nonGit.executionWorkspaceId));
+      const missing = await seedTerminalWorkspace();
+      const missingPath = path.join(os.tmpdir(), `paperclip-missing-${randomUUID()}`);
+      await db.update(executionWorkspaces).set({ cwd: missingPath, providerRef: missingPath, providerType: "local_fs" })
+        .where(eq(executionWorkspaces.id, missing.executionWorkspaceId));
+      const merged = await seedTerminalWorkspace({ mergedPr: true });
+      const stuck = await seedTerminalWorkspace({ mergedPr: true });
+      await linkProjectRepo(stuck);
+      await fs.rm(stuck.worktreePath, { recursive: true, force: true });
+      await db.update(executionWorkspaces).set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+      }).where(eq(executionWorkspaces.id, stuck.executionWorkspaceId));
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
+
+      const roots = [shared.repoRoot, shared.worktreePath, plainDir, merged.repoRoot, merged.worktreePath, stuck.repoRoot];
+      const treesBefore = await Promise.all(roots.map((root) => snapshotTree(root)));
+      const databaseBefore = await snapshotDatabase();
+
+      const { sweep, listed, gitCalls } = await dryRunListing({ blockGit: true });
+
+      expect(gitCalls).toBe("");
+      expect(await snapshotDatabase()).toEqual(databaseBefore);
+      expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, wouldArchive: 3 });
+      const entryOf = (id: string) => listed.find((entry) => entry.executionWorkspaceId === id);
+      expect(entryOf(shared.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | shared session record" });
+      expect(entryOf(nonGit.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | cwd is not a git repository" });
+      expect(entryOf(missing.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | cwd does not exist" });
+      expect(entryOf(merged.executionWorkspaceId)).toMatchObject({ action: "not_previewed", reason: "inherited cleanup path" });
+      expect(entryOf(stuck.executionWorkspaceId)).toMatchObject({ action: "not_previewed", reason: "inherited cleanup path" });
+    }, 30_000);
+
+    it("dry run lists the record-only archives and kept rows, and the live sweep archives the same rows record-only", async () => {
       const clean = await seedManagedCleanWorktree();
       const untracked = await seedAncestryTerminalWorkspace();
       const untrackedRepo = await publishWorktree(untracked.worktreePath);
@@ -6107,66 +6166,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const shared = await seedTerminalWorkspace();
       await markShared(shared.executionWorkspaceId);
       const unpushed = await seedTerminalWorkspace();
-      // A runtime-owned branch merged into the verified tip: the cleanup deletes it.
-      const merged = await seedTerminalWorkspace({ mergedPr: true });
-      await db.update(executionWorkspaces).set({ metadata: runtimeOwnedBranch })
-        .where(eq(executionWorkspaces.id, merged.executionWorkspaceId));
-      const nonGit = await seedTerminalWorkspace();
-      const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-default-"));
-      tempDirs.add(plainDir);
-      await fs.writeFile(path.join(plainDir, "note.txt"), "keep\n", "utf8");
-      await db.update(executionWorkspaces).set({ cwd: plainDir, providerRef: plainDir, providerType: "local_fs" })
-        .where(eq(executionWorkspaces.id, nonGit.executionWorkspaceId));
-      // A clean merged worktree with an initialized submodule: `git worktree
-      // remove` refuses it, so the row ends cleanup_failed.
-      const submodule = await seedTerminalWorkspace({ mergedPr: true });
-      const submoduleRepo = await createTempRepo();
-      tempDirs.add(submoduleRepo);
-      await runGit(submodule.worktreePath, ["-c", "protocol.file.allow=always", "submodule", "add", submoduleRepo, "vendor"]);
-      await runGit(submodule.worktreePath, ["commit", "-m", "Add submodule"]);
-      const submoduleHead = await readGit(submodule.worktreePath, ["rev-parse", "HEAD"]);
-      expect(submoduleHead).not.toBe(submodule.headSha);
-      // A stuck ENOENT retry whose runtime-owned branch is not merged into the
-      // repo HEAD: the cleanup prunes, but `git branch -d` keeps the branch.
-      const stuckOwned = await seedTerminalWorkspace({ mergedPr: true });
-      await linkProjectRepo(stuckOwned);
-      await fs.rm(stuckOwned.worktreePath, { recursive: true, force: true });
-      await db.update(executionWorkspaces).set({
-        status: "cleanup_failed",
-        closedAt: new Date("2026-01-02T00:00:00Z"),
-        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
-        metadata: runtimeOwnedBranch,
-      }).where(eq(executionWorkspaces.id, stuckOwned.executionWorkspaceId));
-      // An ignored env file that is not an instance pointer, on a locked
-      // worktree: nothing is removed and the file stays.
-      const invalidInstance = await seedTerminalWorkspace({ mergedPr: true });
-      await fs.appendFile(path.join(invalidInstance.repoRoot, ".git", "info", "exclude"), ".paperclip/\n", "utf8");
-      await fs.mkdir(path.join(invalidInstance.worktreePath, ".paperclip"), { recursive: true });
-      const invalidEnvPath = path.join(invalidInstance.worktreePath, ".paperclip", ".env");
-      await fs.writeFile(invalidEnvPath, "NOT_A_POINTER=true\n", "utf8");
-      await runGit(invalidInstance.repoRoot, ["worktree", "lock", invalidInstance.worktreePath]);
-      // A clean merged row on a locked worktree: live closes it, then the
-      // cleanup refuses and the row ends cleanup_failed.
-      const lockedMerged = await seedTerminalWorkspace({ mergedPr: true });
-      await runGit(lockedMerged.repoRoot, ["worktree", "lock", "--reason", "held by operator", lockedMerged.worktreePath]);
-      // The same lock on a stuck ENOENT row whose worktree is back.
-      const lockedRetry = await seedTerminalWorkspace({ mergedPr: true });
-      await runGit(lockedRetry.repoRoot, ["worktree", "lock", lockedRetry.worktreePath]);
-      await db.update(executionWorkspaces).set({
-        status: "cleanup_failed",
-        closedAt: new Date("2026-01-02T00:00:00Z"),
-        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
-      }).where(eq(executionWorkspaces.id, lockedRetry.executionWorkspaceId));
-      // A runtime-owned local_fs row on a whole repository: the inherited
-      // cleanup removes the directory recursively (SUP-20745).
-      const localFs = await seedTerminalWorkspace({ mergedPr: true });
-      await db.update(executionWorkspaces).set({
-        cwd: localFs.repoRoot,
-        providerRef: localFs.repoRoot,
-        providerType: "local_fs",
-        metadata: { createdByRuntime: true },
-      }).where(eq(executionWorkspaces.id, localFs.executionWorkspaceId));
-      // Age every row so a host clock step cannot put one past the sweep's frozen scan boundary.
       await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
 
       const roots = [
@@ -6175,128 +6174,41 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         dirtyRepo.repoRoot, dirty.worktreePath, dirtyRepo.remotePath,
         shared.repoRoot, shared.worktreePath,
         unpushed.repoRoot, unpushed.worktreePath,
-        merged.repoRoot, merged.worktreePath,
-        nonGit.repoRoot, plainDir,
-        lockedMerged.repoRoot, lockedMerged.worktreePath,
-        lockedRetry.repoRoot, lockedRetry.worktreePath,
-        localFs.repoRoot, localFs.worktreePath,
-        submodule.repoRoot, submodule.worktreePath, submoduleRepo,
-        stuckOwned.repoRoot,
-        invalidInstance.repoRoot, invalidInstance.worktreePath,
       ];
-      const snapshotRoots = () => Promise.all(roots.map((root) => snapshotTree(root)));
-      const treesBefore = await snapshotRoots();
+      const treesBefore = await Promise.all(roots.map((root) => snapshotTree(root)));
       const databaseBefore = await snapshotDatabase();
 
-      type Listed = {
-        executionWorkspaceId: string;
-        action: string;
-        reason: string;
-        wouldRemove?: { kind: string; target: string; repoRoot?: string }[];
-        retriedStuckSpawnEnoent?: boolean;
-      };
-      const info = vi.spyOn(logger, "info");
-      let dry!: Awaited<ReturnType<ReturnType<typeof freshSweep>["sweepTerminalWorkspaces"]>>;
-      let listed: Listed[] = [];
-      try {
-        dry = await executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, dryRun: true })
-          .sweepTerminalWorkspaces();
-        listed = info.mock.calls
-          .filter(([, message]) => message === "terminal issue workspace reaper dry run")
-          .map(([fields]) => fields as unknown as Listed);
-      } finally {
-        info.mockRestore();
-      }
+      const { sweep: dry, listed } = await dryRunListing({ blockGit: false });
 
       expect(await snapshotDatabase()).toEqual(databaseBefore);
-      expect(await snapshotRoots()).toEqual(treesBefore);
-      expect(dry).toMatchObject({ archived: 0, cleanupFailed: 0, wouldArchive: 7, wouldFailCleanup: 4, unknownOutcomes: 0 });
+      expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
+      expect(dry).toMatchObject({ archived: 0, cleanupFailed: 0, wouldArchive: 3 });
       expect(listed).toHaveLength(dry.checked);
-
       const entryOf = (id: string) => listed.find((entry) => entry.executionWorkspaceId === id);
-      expect(entryOf(clean.executionWorkspaceId)).toMatchObject({
-        action: "archive_record_only",
-        reason: "issue_terminal | terminal, clean, nothing unique",
-      });
+      expect(entryOf(clean.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | terminal, clean, nothing unique" });
       expect(entryOf(untracked.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | untracked files" });
       expect(entryOf(shared.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | shared session record" });
-      expect(entryOf(nonGit.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | cwd is not a git repository" });
-      expect(entryOf(merged.executionWorkspaceId)).toMatchObject({
-        action: "archive_with_cleanup",
-        reason: "issue_terminal",
-        wouldRemove: [
-          { kind: "worktree", target: merged.worktreePath },
-          { kind: "branch", target: "PAP-16015-delivery", repoRoot: merged.repoRoot },
-        ],
-      });
-      expect(entryOf(submodule.executionWorkspaceId)).toMatchObject({
-        action: "cleanup_refused",
-        reason: "the worktree contains initialized submodules",
-        wouldRemove: [],
-      });
-      expect(entryOf(stuckOwned.executionWorkspaceId)).toMatchObject({
-        action: "archive_with_cleanup",
-        retriedStuckSpawnEnoent: true,
-        wouldRemove: [{ kind: "stale_worktree_entries", target: stuckOwned.repoRoot }],
-      });
-      expect(entryOf(invalidInstance.executionWorkspaceId)).toMatchObject({
-        action: "cleanup_refused",
-        reason: "the worktree is locked",
-        wouldRemove: [],
-      });
-      expect(entryOf(localFs.executionWorkspaceId)).toMatchObject({
-        action: "archive_with_cleanup",
-        wouldRemove: [{ kind: "directory", target: localFs.repoRoot }],
-      });
-      expect(entryOf(lockedMerged.executionWorkspaceId)).toMatchObject({
-        action: "cleanup_refused",
-        reason: "the worktree is locked: held by operator",
-      });
-      expect(entryOf(lockedRetry.executionWorkspaceId)).toMatchObject({
-        action: "cleanup_refused",
-        reason: "the worktree is locked",
-        retriedStuckSpawnEnoent: true,
-      });
       expect(entryOf(dirty.executionWorkspaceId)).toMatchObject({ action: "keep", reason: "tracked modifications" });
       expect(entryOf(unpushed.executionWorkspaceId)).toMatchObject({ action: "keep", reason: "commits missing from the remote" });
 
       const live = await freshSweep().sweepTerminalWorkspaces();
-      expect(live).toMatchObject({ archived: dry.wouldArchive, cleanupFailed: dry.wouldFailCleanup });
+      expect(live).toMatchObject({ archived: dry.wouldArchive, cleanupFailed: 0 });
       const rows = await db
         .select({ id: executionWorkspaces.id, status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
         .from(executionWorkspaces)
         .where(inArray(executionWorkspaces.id, listed.map((entry) => entry.executionWorkspaceId)));
-      const expectedStatus: Record<string, string> = {
-        archive_record_only: "archived",
-        archive_with_cleanup: "archived",
-        cleanup_refused: "cleanup_failed",
-        keep: "active",
-      };
       for (const entry of listed) {
         const row = rows.find((candidate) => candidate.id === entry.executionWorkspaceId);
         expect({ id: entry.executionWorkspaceId, status: row?.status }).toEqual({
           id: entry.executionWorkspaceId,
-          status: expectedStatus[entry.action],
+          status: entry.action === "archive_record_only" ? "archived" : "active",
         });
         if (entry.action === "archive_record_only") expect(row?.cleanupReason).toBe(entry.reason);
-        // The manifest is exactly what went: each listed path or branch is gone.
-        for (const removal of entry.wouldRemove ?? []) {
-          if (removal.kind === "branch") {
-            await expect(runGit(removal.repoRoot!, ["show-ref", "--verify", `refs/heads/${removal.target}`])).rejects.toThrow();
-          } else if (removal.kind === "stale_worktree_entries") {
-            expect(await readGit(removal.target, ["worktree", "list", "--porcelain"])).not.toContain("prunable");
-          } else {
-            await expect(fs.access(removal.target)).rejects.toThrow();
-          }
-        }
       }
-      // ...and what the manifest leaves out stays.
-      expect(await readGit(stuckOwned.repoRoot, ["rev-parse", "--verify", "refs/heads/PAP-16015-delivery"])).toMatch(/^[0-9a-f]{40}$/);
-      await expect(fs.readFile(invalidEnvPath, "utf8")).resolves.toBe("NOT_A_POINTER=true\n");
-      expect(await readGit(submodule.worktreePath, ["rev-parse", "HEAD"])).toBe(submoduleHead);
-    }, 90_000);
+      expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
+    }, 60_000);
 
-    it("dry run never fetches for a missing recorded branch and labels that outcome unknown", async () => {
+    it("dry run never fetches for a missing recorded branch and keeps that row as not previewed", async () => {
       // A clean pushed worktree whose recorded branch was deleted, with the
       // remote's main ahead of the stale local tracking ref. The live
       // inspection would fetch the default branch here.
@@ -6345,11 +6257,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(gitCalls.split("\n").filter((line) => /(^| )fetch( |$)/.test(line))).toEqual([]);
       expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
       expect(await snapshotDatabase()).toEqual(databaseBefore);
-      expect(dry).toMatchObject({ wouldArchive: 0, wouldFailCleanup: 0, unknownOutcomes: 1 });
+      expect(dry).toMatchObject({ wouldArchive: 0 });
       expect(listed).toEqual([expect.objectContaining({
         executionWorkspaceId: seeded.executionWorkspaceId,
-        action: "unknown",
-        reason: "the recorded branch is missing, so the live sweep fetches the default branch before it counts commits missing from the remote",
+        action: "keep",
+        reason: "not previewed: the recorded branch is missing, and the live sweep fetches the default branch first",
       })]);
     }, 30_000);
 
@@ -6400,13 +6312,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         info.mockRestore();
       }
 
-      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, clearedStaleReopenPending: 0, wouldArchive: 1 });
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, clearedStaleReopenPending: 0, wouldArchive: 0 });
       // The reason is the one the live retry stores.
       expect(listed.find((entry) => entry.executionWorkspaceId === stuck.executionWorkspaceId)).toMatchObject({
-        action: "archive_with_cleanup",
-        reason: "issue_terminal",
-        retriedStuckSpawnEnoent: true,
-        wouldRemove: [{ kind: "stale_worktree_entries", target: stuck.repoRoot }],
+        action: "not_previewed",
+        reason: "inherited cleanup path",
       });
       expect(listed.find((entry) => entry.executionWorkspaceId === stale.executionWorkspaceId)).toMatchObject({
         action: "clear_reopen_pending",

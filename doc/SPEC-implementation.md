@@ -1203,14 +1203,12 @@ The current app also exposes V1-supporting surfaces for:
   (`issue_terminal | terminal, clean, nothing unique`, or `issue_terminal | untracked files`), and a
   cwd that is missing or not a git repository (`issue_terminal | cwd does not exist` or
   `issue_terminal | cwd is not a git repository`, no Git). Unpushed commits or tracked modifications
-  keep a no-PR row active. `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN` writes nothing, never fetches, and logs each
-  candidate's action and reason: `archive_record_only`, `archive_with_cleanup` with the paths and branch
-  the cleanup would remove, `cleanup_refused` with the reason the row would end `cleanup_failed` (for
-  example a locked worktree), `clear_reopen_pending`, `keep`, or `unknown` when it cannot decide without
-  a fetch or a failed git read. A read-only preflight mirrors the cleanup's refusals (git locks, HEAD,
-  branch, worktree registration and lock, initialized submodules) and lists a branch or instance
-  directory only when the cleanup would really remove it, so with no `unknown` rows the counts equal
-  the live result when nothing changes in between. A later run never restores a record-only archived
+  keep a no-PR row active. `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN` writes nothing, never fetches, stops nothing, and uses only
+  the read-only classification of the record-only archives. It logs each candidate's action and reason:
+  `archive_record_only`, `keep` with the reason, `clear_reopen_pending`, or `not_previewed` (`inherited
+  cleanup path`) for a merged-delivery row or a retried `spawn git ENOENT` row, which it does not
+  preview and for which it calls no readiness, git or cleanup helper. It is not an exact forecast of the
+  live result. A later run never restores a record-only archived
   row; it is provisioned again, and a run that names the archived workspace but lands in a different
   checkout gets a run-log warning that the archived checkout is still on disk. A worktree directory that is already gone counts as removed:
   cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead

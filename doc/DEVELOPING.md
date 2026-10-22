@@ -1251,32 +1251,24 @@ Environment overrides:
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
 - `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) makes the reaper
-  write nothing to the database or disk, and it never fetches. It logs
+  write nothing to the database or disk, never fetch, and stop nothing. It uses
+  only the read-only record classification of the record-only archives. It logs
   `terminal issue workspace reaper dry run` once per candidate with `action`
   and `reason`. The actions are:
-  - `archive_record_only`: the row is archived as a database record only.
-  - `archive_with_cleanup`: a row with a recorded merged pull request, or a
-    retried `spawn git ENOENT` row (`retriedStuckSpawnEnoent`). It is archived
-    and the existing cleanup removes what `wouldRemove` lists: a `worktree`, a
-    `directory` (removed recursively), `stale_worktree_entries` (`git worktree
-    prune` in that repo), a `worktree_instance` directory that the worktree's
-    `.paperclip/.env` pointer names and the cleanup's ownership checks accept,
-    or a runtime-owned `branch` that `git branch -d` would delete.
-  - `cleanup_refused`: that cleanup would refuse, for example on a locked
-    worktree, a held git lock or an initialized submodule, and the row ends
-    `cleanup_failed`. `reason`
-    says why. `wouldRemove` lists anything the cleanup still removes before it
-    refuses.
+  - `archive_record_only`: the row would be archived as a database record only.
+  - `not_previewed`: a row with a recorded merged pull request, or a retried
+    `spawn git ENOENT` row, goes through the existing cleanup path. The dry run
+    does not preview it (`inherited cleanup path`) and calls no readiness, git or
+    cleanup helper for it.
   - `clear_reopen_pending`: the live sweep clears a reopen fence and keeps the
     row.
-  - `keep`: the row stays as it is.
-  - `unknown`: the outcome cannot be read without a fetch or a git read that
-    failed, for example a no-PR row whose recorded branch is gone, where the
-    live sweep fetches the default branch first. Check these rows by hand.
+  - `keep`: the row stays as it is. `reason` says why. A no-PR row whose recorded
+    branch is gone is kept as `not previewed`, because the live sweep fetches the
+    default branch first.
 
-  A `terminal issue workspace reaper dry run summary` line follows. Its
-  `wouldArchive` and `wouldFailCleanup` equal the live sweep's `archived` and
-  `cleanupFailed` when nothing changes in between and `unknownOutcomes` is 0.
+  The dry run is not an exact forecast of the live result. A `terminal issue
+  workspace reaper dry run summary` line follows, and its `wouldArchive` counts
+  the record-only archives only.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,
