@@ -256,19 +256,27 @@ function makeIssue(status: "backlog" | "todo" | "in_progress" | "in_review" | "d
     status,
     assigneeAgentId: "22222222-2222-4222-8222-222222222222",
     assigneeUserId: null,
-    createdByAgentId: null,
+    createdByAgentId: "22222222-2222-4222-8222-222222222222",
     identifier: "PAP-580",
     title: "PATCH denial copy",
   };
 }
 
-function agentActor(agentId: string) {
+function agentActor(agentId: string, responsibleUserId?: string) {
   return {
     type: "agent",
     agentId,
     companyId: "company-1",
     source: "agent_key",
     runId: "run-1",
+    ...(responsibleUserId ? {
+      onBehalfOfUserId: responsibleUserId,
+      onBehalfOfMemberships: [{
+        companyId: "company-1",
+        status: "active",
+        membershipRole: "operator",
+      }],
+    } : {}),
   };
 }
 
@@ -351,7 +359,7 @@ describe.sequential("issue PATCH authz denial copy", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("still allows the assignee agent to PATCH its own issue", async () => {
+  it("allows the creator-assignee agent to PATCH its own issue", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("todo"),
@@ -360,15 +368,42 @@ describe.sequential("issue PATCH authz denial copy", () => {
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
       allowed: true,
       action: input.action,
-      reason: "allow_explicit_grant",
-      explanation: "Allowed by test grant.",
+      reason: "allow_self",
+      explanation: "Allowed because the actor owns the assigned issue.",
     }));
 
-    const res = await request(await installActor(createApp(), agentActor("22222222-2222-4222-8222-222222222222")))
+    const res = await request(await installActor(
+      createApp(),
+      agentActor("22222222-2222-4222-8222-222222222222", "responsible-user"),
+    ))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ priority: "low" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("preserves responsible-user denial copy for a creator-assignee PATCH", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_unsupported_action",
+      code: "RESPONSIBLE_USER_UNAUTHORIZED",
+      explanation: "Responsible user is not authorized for issue:mutate.",
+    }));
+
+    const res = await request(await installActor(
+      createApp(),
+      agentActor("22222222-2222-4222-8222-222222222222", "responsible-user"),
+    ))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ priority: "low" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.details.code).toBe("issue_write_responsible_user_ceiling");
+    expect(res.body.error).toContain("Responsible user");
+    expect(res.body.details.code).not.toBe("issue_write_no_grant");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });
