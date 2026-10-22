@@ -11372,19 +11372,18 @@ export function issueRoutes(
   // A completed ladder stays completed. This decision reviews only the delta
   // from its certified head, not another pass through the stage machine.
   async function reviewCompletedIssueHead(req: Request, res: Response, publish: boolean) {
+    assertBoard(req);
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!existing) return;
     const actor = getActorInfo(req);
-    let boardAuthority = false;
-    if (req.actor.type === "board") {
+    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
       const membership = req.actor.userId
         ? await access.getMembership(existing.companyId, "user", req.actor.userId)
         : null;
-      boardAuthority = req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true
-        || (membership?.status === "active"
-          && (membership.membershipRole === "owner" || membership.membershipRole === "admin"));
-    } else if (req.actor.type !== "agent" || !req.actor.agentId) {
-      throw forbidden("Board or original reviewer required to approve a new head");
+      if (membership?.status !== "active"
+        || (membership.membershipRole !== "owner" && membership.membershipRole !== "admin")) {
+        throw forbidden("Company owner or admin required to approve a new head");
+      }
     }
     const result = await db.transaction(async (tx) => {
       const [issue] = await tx.select().from(issueRows).where(and(
@@ -11394,22 +11393,6 @@ export function issueRoutes(
       const state = issue.executionState ?? {};
       const completedIds = Array.isArray(state.completedStageIds) ? state.completedStageIds : [];
       const policy = z.object({ stages: z.array(z.object({ id: z.string(), type: z.string() })) }).safeParse(issue.executionPolicy);
-      if (!boardAuthority) {
-        const decisions = await tx.select().from(issueExecutionDecisions).where(and(
-          eq(issueExecutionDecisions.companyId, issue.companyId),
-          eq(issueExecutionDecisions.issueId, issue.id),
-        ));
-        const latest = latestDecisionPerStage(decisions);
-        const wasReviewer = policy.success && policy.data.stages.some((stage) => {
-          const decision = latest.get(stage.id);
-          return (stage.type === "review" || stage.type === "approval")
-            && completedIds.includes(stage.id) && decision?.outcome === "approved"
-            && (actor.actorType === "agent"
-              ? decision.actorAgentId === actor.actorId
-              : decision.actorUserId === actor.actorId);
-        });
-        if (!wasReviewer) throw forbidden("Only an original approving reviewer may approve this card's new head");
-      }
       const input = publish ? approveIssueHeadSchema.parse(req.body) : null;
       if (issue.status !== "done" || state.lastDecisionOutcome !== "approved"
         || !policy.success || policy.data.stages.length === 0

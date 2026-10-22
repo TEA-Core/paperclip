@@ -35,7 +35,7 @@ The completed ladder is not reopened. Use these company-scoped control-plane API
   }
   ```
 
-Both APIs require board owner/admin authority (including trusted-local/instance-admin board context) or the original user/agent holding the latest approving decision on a completed review/approval stage. Being the author, assignee, a same-company agent, or a user with ordinary membership is not enough. A release-assurance reviewer uses this surface when it holds that recorded review authority; arbitrary role names grant nothing.
+Both APIs require board owner/admin authority (including trusted-local/instance-admin board context). All agent actors are refused before issue lookup or GitHub access, including the original reviewer. Being the author, assignee, a reviewer, or a user with ordinary membership grants no head-approval authority.
 
 The card must be `done`, every declared stage completed, the last decision approved, and Guard B stage integrity intact. Missing anchors, unverifiable deltas, non-open/draft PRs, stale preview anchors, moved heads, foreign delivery identities, and unauthorized actors refuse without a status write. The response includes the reviewed delta and publication outcome. The activity event `issue.approval_head_decision` records the actor, previous and requested heads, PR, reason, and Guard A summary before publication; audit failure prevents the write. Successful publication updates only `executionState.approvalStatus`, preserving the card status, ladder, and stage decisions.
 

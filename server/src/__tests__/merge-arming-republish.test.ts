@@ -533,14 +533,9 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     });
   }
 
-  it.each(["board", "reviewer", "user-reviewer"])("approves exactly the reviewed new head as %s without reopening a completed ladder (SUP-20624)", async (principal) => {
-    const { companyId, issueId, reviewerAgentId } = await seedHeadReview();
-    currentActor = principal === "board" ? boardActor(companyId) : agentActor(companyId, reviewerAgentId);
-    if (principal === "user-reviewer") {
-      currentActor = boardActor(companyId);
-      await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.companyId, companyId));
-      await db.update(issueExecutionDecisions).set({ actorAgentId: null, actorUserId: USER_ID }).where(eq(issueExecutionDecisions.issueId, issueId));
-    }
+  it("approves exactly the board-reviewed new head without reopening a completed ladder (SUP-20624, SUP-20667)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
     installHeadReviewTransport();
     const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
     const decisionsBefore = await db.select().from(issueExecutionDecisions);
@@ -572,8 +567,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(await db.select().from(issueExecutionDecisions)).toEqual(decisionsBefore);
     const events = await db.select().from(activityLog);
     expect(events.find((event) => event.action === "issue.approval_head_decision")).toMatchObject({
-      actorType: principal === "reviewer" ? "agent" : "user",
-      actorId: principal === "reviewer" ? reviewerAgentId : USER_ID,
+      actorType: "user",
+      actorId: USER_ID,
       details: { headSha: REVIEW_HEAD, approvedHeadSha: REVIEWED_HEAD, reason: "Reviewed the post-ladder config correction" },
     });
   });
@@ -616,20 +611,25 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       .toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${REVIEW_HEAD}`]);
   });
 
-  it.each(["unrelated-agent", "author", "cross-company", "board-member"])("refuses %s head approval before GitHub access (SUP-20624)", async (principal) => {
-    const { companyId, issueId } = await seedHeadReview();
+  it.each(["unrelated-agent", "author", "cross-company", "board-member", "original-reviewer", "original-user-reviewer"])("refuses %s head approval before GitHub access (SUP-20624, SUP-20667)", async (principal) => {
+    const { companyId, issueId, reviewerAgentId } = await seedHeadReview();
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const returnAssignee = issue!.executionPolicy!.returnAssigneeAgentId as string;
-    currentActor = principal === "board-member"
+    const boardMember = principal === "board-member" || principal === "original-user-reviewer";
+    currentActor = boardMember
       ? boardActor(companyId)
-      : agentActor(principal === "cross-company" ? randomUUID() : companyId, principal === "author" ? returnAssignee : randomUUID());
-    if (principal === "board-member") {
+      : agentActor(principal === "cross-company" ? randomUUID() : companyId,
+        principal === "author" ? returnAssignee : principal === "original-reviewer" ? reviewerAgentId : randomUUID());
+    if (boardMember) {
       await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.companyId, companyId));
     }
+    if (principal === "original-user-reviewer") {
+      await db.update(issueExecutionDecisions).set({ actorAgentId: null, actorUserId: USER_ID }).where(eq(issueExecutionDecisions.issueId, issueId));
+    }
     const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
-      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Not an authorized reviewer",
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Not an authorized board actor",
     });
-    expect(response.status).toBe(principal === "cross-company" ? 404 : 403);
+    expect(response.status).toBe(403);
     expect(mockGhFetch).not.toHaveBeenCalled();
     const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(after!.executionState).toEqual(issue!.executionState);

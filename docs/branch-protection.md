@@ -101,8 +101,8 @@ contract violation (fake approval). For a skipped first publish, use the
 
 For a reviewed head change **after the card is done**, use
 `GET /api/issues/:issueId/merge-arming/head-review` and
-`POST /api/issues/:issueId/merge-arming/approve-head`. Board authority or a
-recorded original approving reviewer is required. The decision shows the Guard A
+`POST /api/issues/:issueId/merge-arming/approve-head`. Board owner/admin authority
+is required; all non-board actors are refused. The decision shows the Guard A
 delta, records the actor/head/reason, and stamps exactly the submitted SHA without
 reopening stages. Equivalent tree/patch changes can be re-stamped automatically.
 See [Approval-status reconciliation](approval-reconciliation.md) for the request
