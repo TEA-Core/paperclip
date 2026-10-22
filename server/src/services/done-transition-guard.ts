@@ -84,7 +84,10 @@ const TIER_1_SUFFIX = "Liveness unverified.";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 const TIER2_FORM = '"Closed at Tier 2 (live): <probe evidence>"';
-const TIER1_FORM = '"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."';
+export const TIER1_FORM =
+  '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
+  'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
+  '<why Tier 2 was not probed>. Liveness unverified."';
 
 /**
  * ADR-103 M3: the gate that produced a refusal, carried so the route can speak
@@ -596,7 +599,7 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //  - `landed-at-tip`: the named commit is an ancestor of the repo default branch right now.
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
 //    post-merge carrier (the async worker itself is unchanged here).
-// The static TIER1_FORM / remedy strings stay token-free; the refusals below name the tokens.
+// TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
 // Tier 2 is a separate live-probe concern and is not checked here.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
 const LANDING_DELEGATED_TOKEN = "landing-delegated";
@@ -919,9 +922,8 @@ export async function evaluateDoneTierDeclaration(
       allowed: false,
       reason:
         "No accompanying comment and no run id to look up a same-run comment; no done-tier declaration found. " +
-        `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
-        ` or ` +
-        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        `Accepted forms: ${TIER2_FORM}` +
+        ` or ${TIER1_FORM}` +
         ` — per SUP-12693.`,
       tier: null,
       skipped: false,
@@ -950,9 +952,8 @@ export async function evaluateDoneTierDeclaration(
       allowed: false,
       reason:
         "No done-tier declaration found in the accompanying comment or the most recent same-run comment. " +
-        `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
-        ` or ` +
-        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        `Accepted forms: ${TIER2_FORM}` +
+        ` or ${TIER1_FORM}` +
         ` — per SUP-12693.`,
       tier: null,
       skipped: false,
