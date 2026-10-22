@@ -109,6 +109,7 @@ export type TerminalWorkspaceSweepSkipCounts = {
 type TerminalCleanupRemoval = {
   kind: "worktree" | "directory" | "stale_worktree_entries" | "worktree_instance" | "branch";
   target: string;
+  repoRoot?: string;
 };
 
 export function formatTerminalWorkspaceReaperSkipLogLine(
@@ -173,6 +174,7 @@ function emptyTerminalSweepResult() {
     cleanupFailed: 0,
     wouldArchive: 0,
     wouldFailCleanup: 0,
+    unknownOutcomes: 0,
     skippedActiveRun: 0,
     skippedNonTerminalTree: 0,
     skippedUndelivered: 0,
@@ -958,10 +960,16 @@ async function localBranchExists(repoRoot: string, branch: string): Promise<bool
     .catch(() => false);
 }
 
-async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
+// readOnly skips the default-branch probe, which fetches from the remote. The
+// reaper dry run uses it, and defaultBranchCheckSkipped says when it applied.
+async function inspectGitCloseReadiness(
+  workspace: ExecutionWorkspace,
+  options: { readOnly?: boolean } = {},
+): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
   statusInspectionSucceeded: boolean;
+  defaultBranchCheckSkipped?: boolean;
 }> {
   const warnings: string[] = [];
   const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
@@ -1098,13 +1106,19 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   let recordedBranchExists: boolean | null = null;
   let recordedBranchDeleted = false;
   let safeRebindToDefaultBranch = false;
+  let defaultBranchCheckSkipped = false;
 
   if (repoRoot && workspace.branchName) {
     recordedBranchExists = await localBranchExists(repoRoot, workspace.branchName);
     if (!recordedBranchExists) {
       recordedBranchDeleted = true;
       const isClean = dirtyEntryCount === 0 && untrackedEntryCount === 0;
-      if (isClean) {
+      if (isClean && options.readOnly) {
+        defaultBranchCheckSkipped = true;
+        warnings.push(
+          `The recorded branch "${workspace.branchName}" no longer exists in the repository. Paperclip skipped the default-branch check because it would fetch from the remote.`,
+        );
+      } else if (isClean) {
         const currentBranch = await readGitStdout(
           ["symbolic-ref", "--quiet", "--short", "HEAD"],
           workspacePath,
@@ -1153,6 +1167,7 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     },
     warnings,
     statusInspectionSucceeded,
+    ...(defaultBranchCheckSkipped ? { defaultBranchCheckSkipped } : {}),
   };
 }
 
@@ -1742,6 +1757,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function assertTerminalCleanupGitStateUnchanged(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
+    options: { readOnly?: boolean } = {},
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
@@ -1757,7 +1773,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
 
     const [current, currentHeadSha, currentBranchName] = await Promise.all([
-      inspectGitCloseReadiness(toExecutionWorkspace(workspace)),
+      inspectGitCloseReadiness(toExecutionWorkspace(workspace), options),
       readGitStdout(["rev-parse", "HEAD"], workspacePath).catch(() => null),
       readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], workspacePath).catch(() => null),
     ]);
@@ -2074,20 +2090,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   }
 
   // Dry run only. Predicts what runTerminalWorkspaceCleanup would do to this row
-  // without running it: what it would remove, and why it would refuse and leave
-  // the row cleanup_failed. A refusal at the worktree removal comes after the
-  // instance cleanup, so it can still list removals. It mirrors the refusal
-  // points of that cleanup and of cleanupExecutionWorkspaceArtifacts, and every
-  // probe is read-only. A change after the preview is a race that the live pass
-  // reports on its own.
+  // without running it. It mirrors that cleanup's refusal points, runs the real
+  // instance cleanup with no-op effects, and runs only read-only git. The
+  // outcome is "cleanup" with the exact removals, "refused" with why the row
+  // would end cleanup_failed (a refusal at the worktree removal still follows
+  // the instance removal), or "unknown" when a read-only probe cannot decide. A
+  // change after the preview is a race that the live pass reports on its own.
   async function previewTerminalWorkspaceCleanup(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
-  ): Promise<{ wouldRemove: TerminalCleanupRemoval[]; refusal: string | null }> {
+  ): Promise<{ outcome: "cleanup" | "refused" | "unknown"; wouldRemove: TerminalCleanupRemoval[]; reason: string | null }> {
     const wouldRemove: TerminalCleanupRemoval[] = [];
-    const refuse = (refusal: string) => ({ wouldRemove, refusal });
+    const cleanup = () => ({ outcome: "cleanup" as const, wouldRemove, reason: null });
+    const refuse = (reason: string) => ({ outcome: "refused" as const, wouldRemove, reason });
     const workspacePath = workspace.providerRef ?? workspace.cwd;
-    if (!workspacePath) return { wouldRemove, refusal: null };
+    if (!workspacePath) return cleanup();
     const isDirectory = (value: string) => fs.stat(value).then(
       (stat) => stat.isDirectory(),
       (error) => {
@@ -2109,19 +2126,19 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .then((rows) => rows[0]?.cwd ?? null)
         : null;
       if (workspace.providerType === "local_fs" && metadata?.createdByRuntime === true) {
-        if (!exists) return { wouldRemove, refusal: null };
+        if (!exists) return cleanup();
         const resolvedPath = path.resolve(workspacePath);
         const projectPath = projectWorkspaceCwd ? path.resolve(projectWorkspaceCwd) : null;
         if (projectPath && (projectPath === resolvedPath || projectPath.startsWith(`${resolvedPath}${path.sep}`))) {
           return refuse(`"${workspacePath}" contains the project workspace`);
         }
         wouldRemove.push({ kind: "directory", target: resolvedPath });
-        return { wouldRemove, refusal: null };
+        return cleanup();
       }
       if (workspace.providerType !== "git_worktree") {
         return exists
           ? refuse(`cleanup removes nothing for a ${workspace.providerType} workspace, so "${workspacePath}" stays`)
-          : { wouldRemove, refusal: null };
+          : cleanup();
       }
 
       if (exists) {
@@ -2134,7 +2151,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
         }
       }
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      try {
+        await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, { readOnly: true });
+      } catch (error) {
+        return refuse(error instanceof Error ? error.message : String(error));
+      }
       // resolveGitRepoRootForWorkspaceCleanup: the project workspace first, then the worktree.
       const commonDirFrom = async (cwd: string) => {
         const commonDir = await readGitStdout(["rev-parse", "--git-common-dir"], cwd).catch(() => null);
@@ -2142,47 +2163,118 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
       const repoRoot = (projectWorkspaceCwd ? await commonDirFrom(path.resolve(projectWorkspaceCwd)) : null)
         ?? await commonDirFrom(workspacePath);
+      const realPath = (value: string) => fs.realpath(value).catch(() => path.resolve(value));
+      const target = await realPath(workspacePath);
+      const repoRootExists = repoRoot ? await isDirectory(repoRoot) : false;
+      const listing = repoRoot && repoRootExists
+        ? await readGitStdout(["worktree", "list", "--porcelain"], repoRoot)
+        : null;
+      const worktrees = await Promise.all((listing ?? "").split(/\n\s*\n/).filter(Boolean).map(async (block) => {
+        const lines = block.split("\n");
+        const listed = lines.find((line) => line.startsWith("worktree "))?.slice("worktree ".length);
+        return {
+          path: listed ? await realPath(listed) : null,
+          branch: lines.find((line) => line.startsWith("branch "))?.slice("branch ".length) ?? null,
+          locked: lines.find((line) => line === "locked" || line.startsWith("locked ")),
+          prunable: lines.some((line) => line === "prunable" || line.startsWith("prunable ")),
+        };
+      }));
+
       if (exists) {
-        if (await pathExists(path.join(workspacePath, ".paperclip", ".env"))) {
-          wouldRemove.push({ kind: "worktree_instance", target: path.join(workspacePath, ".paperclip", ".env") });
+        // The real instance cleanup decides from the pointer and its ownership
+        // checks. Its effects are no-ops here, so it only names the root.
+        const instanceCleanup = await import("./workspace-instance-cleanup.js");
+        const pointer = await instanceCleanup.readWorktreeInstancePointer(workspacePath).catch(() => null);
+        if (pointer) {
+          let instanceRoot: string | null = null;
+          const instanceRootKey = instanceCleanup.WORKTREE_INSTANCE_ROOT_METADATA_KEY;
+          const plan = await instanceCleanup.cleanupWorktreeInstanceArtifacts({
+            pointer,
+            workspaceId: workspace.id,
+            workspacePath,
+            expectedInstanceId: instanceCleanup.deriveWorktreeInstanceId(workspacePath),
+            expectedInstanceRoot: typeof metadata?.[instanceRootKey] === "string" ? metadata[instanceRootKey] as string : null,
+            recorder: null,
+            dependencies: {
+              stopEmbeddedPostgres: async () => false,
+              removeInstanceRoot: async (root) => {
+                instanceRoot = root;
+              },
+            },
+          });
+          if (plan.status === "removed" && instanceRoot) wouldRemove.push({ kind: "worktree_instance", target: instanceRoot });
         }
         if (!repoRoot) return refuse(`the git repo root of "${workspacePath}" could not be resolved`);
-        if (!(await isDirectory(repoRoot))) {
+        if (!repoRootExists) {
           // With the base repo gone, the cleanup removes the directory directly.
           wouldRemove.push({ kind: "directory", target: path.resolve(workspacePath) });
         } else {
           // `git worktree remove` without --force refuses the main working tree,
-          // a path git does not list as a worktree, and a locked worktree.
-          const listing = await readGitStdout(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-          const realPath = (value: string) => fs.realpath(value).catch(() => path.resolve(value));
-          const target = await realPath(workspacePath);
-          const entries = await Promise.all((listing ?? "").split(/\n\s*\n/).map(async (block) => {
-            const lines = block.split("\n");
-            const listed = lines.find((line) => line.startsWith("worktree "))?.slice("worktree ".length);
-            return {
-              path: listed ? await realPath(listed) : null,
-              locked: lines.find((line) => line === "locked" || line.startsWith("locked ")),
-            };
-          }));
-          const index = entries.findIndex((entry) => entry.path === target);
+          // a path git does not list as a worktree, a locked worktree, and one
+          // with an initialized submodule.
+          const index = worktrees.findIndex((entry) => entry.path === target);
           if (index === -1) return refuse(`"${workspacePath}" is not a registered worktree of ${repoRoot}`);
           if (index === 0) return refuse(`"${workspacePath}" is the main working tree of ${repoRoot}`);
-          const locked = entries[index]!.locked;
+          const locked = worktrees[index]!.locked;
           if (locked) {
             const lockReason = locked.slice("locked".length).trim();
             return refuse(`the worktree is locked${lockReason ? `: ${lockReason}` : ""}`);
           }
+          const gitDir = await readGitStdout(["rev-parse", "--absolute-git-dir"], workspacePath);
+          if (!gitDir) return { outcome: "unknown", wouldRemove, reason: "the worktree git dir could not be read" };
+          let hasSubmodule = await isDirectory(path.join(gitDir, "modules"));
+          if (!hasSubmodule) {
+            const staged = await execFileAsync("git", ["-C", workspacePath, "ls-files", "--stage", "-z"], {
+              cwd: workspacePath,
+              maxBuffer: 256 * 1024 * 1024,
+            });
+            for (const entry of staged.stdout.split("\0")) {
+              if (!entry.startsWith("160000 ")) continue;
+              const submodulePath = entry.slice(entry.indexOf("\t") + 1);
+              if (await pathExists(path.join(workspacePath, submodulePath, ".git"))) {
+                hasSubmodule = true;
+                break;
+              }
+            }
+          }
+          if (hasSubmodule) return refuse("the worktree contains initialized submodules");
           wouldRemove.push({ kind: "worktree", target: path.resolve(workspacePath) });
         }
-      } else if (repoRoot && await isDirectory(repoRoot)) {
+      } else if (repoRoot && repoRootExists) {
         wouldRemove.push({ kind: "stale_worktree_entries", target: repoRoot });
       }
-      if (repoRoot && workspace.branchName && isRuntimeOwnedGitBranch(metadata)) {
-        wouldRemove.push({ kind: "branch", target: workspace.branchName });
+
+      // `git branch -d` deletes only a branch that exists, is not checked out
+      // in another worktree, and is merged into its upstream, or else into
+      // HEAD: the verified tip when the cleanup has one, the repo's otherwise.
+      if (repoRoot && repoRootExists && workspace.branchName && isRuntimeOwnedGitBranch(metadata)) {
+        const branchRef = `refs/heads/${workspace.branchName}`;
+        const branchTip = await readGitStdout(["rev-parse", "--verify", "--quiet", `${branchRef}^{commit}`], repoRoot)
+          .catch(() => null);
+        // The missing-worktree cleanup prunes stale entries before it deletes.
+        const checkedOutElsewhere = worktrees.some((entry) =>
+          entry.path !== target && entry.branch === branchRef && !(entry.prunable && !exists));
+        if (branchTip && !checkedOutElsewhere) {
+          const upstream = await readGitStdout(["rev-parse", "--verify", "--quiet", `${workspace.branchName}@{upstream}`], repoRoot)
+            .catch(() => null);
+          const reference = upstream
+            ?? expectedHeadSha
+            ?? await readGitStdout(["rev-parse", "--verify", "--quiet", "HEAD"], repoRoot).catch(() => null);
+          const merged = reference
+            ? await runGit(["merge-base", "--is-ancestor", branchTip, reference], repoRoot).then(
+                () => true,
+                (error: { code?: unknown }) => (error.code === 1 ? false : null),
+              )
+            : false;
+          if (merged === null) {
+            return { outcome: "unknown", wouldRemove, reason: `whether branch ${workspace.branchName} is merged could not be read` };
+          }
+          if (merged) wouldRemove.push({ kind: "branch", target: workspace.branchName, repoRoot });
+        }
       }
-      return { wouldRemove, refusal: null };
+      return cleanup();
     } catch (error) {
-      return refuse(error instanceof Error ? error.message : String(error));
+      return { outcome: "unknown", wouldRemove, reason: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -3181,7 +3273,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // take, and writes nothing.
       const logDryRun = (
         workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">,
-        action: "archive_record_only" | "archive_with_cleanup" | "cleanup_refused" | "clear_reopen_pending" | "keep",
+        action: "archive_record_only" | "archive_with_cleanup" | "cleanup_refused" | "clear_reopen_pending" | "keep" | "unknown",
         reason: string,
         details: Record<string, unknown> = {},
       ) => {
@@ -3205,9 +3297,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         details: Record<string, unknown> = {},
       ) => {
         const preview = await previewTerminalWorkspaceCleanup(workspace, expectedHeadSha);
-        if (preview.refusal) {
+        if (preview.outcome === "unknown") {
+          result.unknownOutcomes += 1;
+          logDryRun(workspace, "unknown", preview.reason ?? "cleanup outcome could not be read", details);
+        } else if (preview.outcome === "refused") {
           result.wouldFailCleanup += 1;
-          logDryRun(workspace, "cleanup_refused", preview.refusal, { ...details, wouldRemove: preview.wouldRemove });
+          logDryRun(workspace, "cleanup_refused", preview.reason ?? "cleanup refuses", { ...details, wouldRemove: preview.wouldRemove });
         } else {
           result.wouldArchive += 1;
           logDryRun(workspace, "archive_with_cleanup", ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON, {
@@ -3266,13 +3361,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           cwdKind === "not_git" || (cwdKind === "missing" && workspace.providerType !== "git_worktree")
         );
         let git: ExecutionWorkspaceCloseGitReadiness | null = null;
+        // The live sweep's inspection can fetch the default branch; the dry run's never does.
+        let defaultBranchCheckSkipped = false;
         if (!archiveWithoutGit && !sharedSession) {
-          const inspected = await inspectGitCloseReadiness(executionWorkspace);
+          const inspected = await inspectGitCloseReadiness(executionWorkspace, { readOnly: dryRun });
           if (!inspected.statusInspectionSucceeded) {
             keep(workspace, "git status could not be verified", "skippedUndelivered", "skippedGitUnverified");
             continue;
           }
           git = inspected.git;
+          defaultBranchCheckSkipped = inspected.defaultBranchCheckSkipped === true;
         }
         const assessment = await assessDelivery(workspace, git);
         if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
@@ -3316,6 +3414,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
           if (!git?.repoRoot || !git.workspacePath) {
             keep(workspace, "no git repository root", "skippedUndelivered", "skippedNoRepoRoot");
+            continue;
+          }
+          if (defaultBranchCheckSkipped) {
+            // The live sweep fetches here first, which can move the remote refs this count reads.
+            result.unknownOutcomes += 1;
+            logDryRun(workspace, "unknown", "the recorded branch is missing, so the live sweep fetches the default branch before it counts commits missing from the remote");
             continue;
           }
           const commitsMissing = await countCommitsMissingFromRemote(git.workspacePath);
