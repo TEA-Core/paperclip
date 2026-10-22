@@ -1242,9 +1242,11 @@ Environment overrides:
   archives the execution workspace. Only a row with a recorded merged pull
   request also has its worktree deleted. Every other archive (shared sessions,
   rows with no pull request, missing or non-git cwds) changes the database record
-  only and leaves the directory and branch on disk. A later run for that issue
-  does not use the archived checkout: it gets a different checkout, and its run
-  log warns that the archived checkout is still on disk. A person can reopen
+  only and leaves the directory and branch on disk. It also detaches the row's
+  issues, and a later run never restores the archived row: the run is
+  provisioned again from the project's policy. When a run names the archived
+  workspace and lands in a different checkout, its run log warns that the
+  archived checkout is still on disk. A person can reopen
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.

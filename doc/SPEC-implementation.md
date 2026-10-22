@@ -1210,9 +1210,9 @@ The current app also exposes V1-supporting surfaces for:
   a fetch or a failed git read. A read-only preflight mirrors the cleanup's refusals (git locks, HEAD,
   branch, worktree registration and lock, initialized submodules) and lists a branch or instance
   directory only when the cleanup would really remove it, so with no `unknown` rows the counts equal
-  the live result when nothing changes in between. A record-only archived checkout is not used again:
-  a later run that names that workspace gets a different checkout, and its run log warns that the
-  archived checkout is still on disk. A worktree directory that is already gone counts as removed:
+  the live result when nothing changes in between. A later run never restores a record-only archived
+  row; it is provisioned again, and a run that names the archived workspace but lands in a different
+  checkout gets a run-log warning that the archived checkout is still on disk. A worktree directory that is already gone counts as removed:
   cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
   of leaving it in `cleanup_failed`. The sweep also retries `cleanup_failed` rows whose reason is
   `issue_terminal | spawn <git> ENOENT` under the same safety gates. Reopening the source issue
