@@ -2305,7 +2305,7 @@ export async function publishApprovalStatus(
           headSha,
         };
       }
-      const receipt = certification ? null : await claimReceiptForPublication(
+      const receipt = certification && options?.requireDeliveryReceipt !== true ? null : await claimReceiptForPublication(
         db,
         companyId,
         issueId,
@@ -2484,7 +2484,7 @@ export async function publishApprovalStatus(
         headSha,
       };
     }
-    const receipt = certification ? null : await claimReceiptForPublication(
+    const receipt = certification && options?.requireDeliveryReceipt !== true ? null : await claimReceiptForPublication(
       db,
       companyId,
       issueId,

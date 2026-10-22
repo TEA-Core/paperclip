@@ -1898,8 +1898,14 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(calls[0]![0]).toBe(POST_STATUS_URL);
     });
 
-    it.each(["blobs", "patch", "tree"])("re-stamps a bound delivery after a %s-equivalent head move (SUP-20624)", async (equivalence) => {
+    it.each(
+      (["blobs", "patch", "tree"] as const).flatMap((equivalence) => (
+        ["certified", "uncertified-new-head-receipt", "uncertified-no-receipt", "uncertified-prior-head-receipt"] as const
+      ).map((binding) => [equivalence, binding] as const)),
+    )("%s-equivalent head move on a %s card keeps the delivery receipt invariant (SUP-20624)", async (equivalence, binding) => {
       const priorHead = "e".repeat(40);
+      const certified = binding === "certified";
+      const stamps = certified || binding === "uncertified-new-head-receipt";
       const issueId = await insertIssue({
         status: "done",
         executionState: approvedState({
@@ -1915,7 +1921,16 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId);
       await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
-      await seedAuthorizedDeliveryReceipt(issueId, priorHead, "SUP-42-branch");
+      if (certified) {
+        await insertMention(issueId);
+        await certifyIssue(issueId, priorHead);
+      } else if (binding === "uncertified-no-receipt") {
+        await insertMention(issueId);
+      } else {
+        await seedAuthorizedDeliveryReceipt(
+          issueId, binding === "uncertified-new-head-receipt" ? NEW_HEAD : priorHead, "SUP-42-branch",
+        );
+      }
       const approvedFile = {
         filename: "config.txt", status: "modified", sha: "old-blob",
         additions: 1, deletions: 1, patch: "@@ -1 +1 @@\n-before\n+reviewed",
@@ -1935,16 +1950,27 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: `https://api.github.com/repos/TEA-Core/paperclip/git/commits/${priorHead}`, body: { sha: priorHead, tree: { sha: "same-tree" } } },
         { url: `https://api.github.com/repos/TEA-Core/paperclip/git/commits/${NEW_HEAD}`, body: { sha: NEW_HEAD, tree: { sha: "same-tree" } } },
         { url: POST_STATUS_URL, body: { id: 12346 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
-      expect(summary.republished).toBe(1);
-      expect(postStatusCalls().map((call) => call[0])).toEqual([POST_STATUS_URL]);
       const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(row!.status).toBe("done");
       expect(row!.executionState!.completedStageIds).toEqual([APPROVAL_STAGE_ID]);
-      expect(row!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: NEW_HEAD });
+      if (stamps) {
+        expect(summary.republished).toBe(1);
+        expect(postStatusCalls().map((call) => call[0])).toEqual([POST_STATUS_URL]);
+        expect(row!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: NEW_HEAD });
+      } else {
+        const reason = binding === "uncertified-no-receipt" ? "delivery-receipt-missing" : "delivery-receipt-head_mismatch";
+        expect(summary.republished).toBe(0);
+        expect(summary.rearmed).toBe(0);
+        expect(summary.skippedDetails.some((detail) => detail.includes(reason))).toBe(true);
+        expect(postStatusCalls()).toEqual([]);
+        expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+        expect(row!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: priorHead });
+      }
       expect(row!.executionState!.delivery).toMatchObject({ headSha: priorHead });
     });
 
