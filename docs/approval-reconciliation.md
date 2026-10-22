@@ -41,3 +41,15 @@ The card must be `done`, every declared stage completed, the last decision appro
 
 The head decision is durable before the external status write. If GitHub accepts the status but storing publication state subsequently fails, the API reports the failure and the decision audit remains; a database rollback must not erase the authorization for an already-written status. The `issue.approval_head_decision` row records the authorizer, not that publication applied: a refused publication (for example `delivery-receipt-missing` or a moved head) is visible only in the 409 response, and no publish-outcome audit record exists yet.
 
+
+## Release-assurance control plane (shadow mode)
+
+Release assurance (RA) gets its own approval seat and a distinct `release-assurance/approved` status, separate from the normal ladder and from `paperclip/approved` (SUP-20771). This slice ships the control plane in **shadow mode only**: decisions are recorded and visible, but nothing is admitted and no RA status is ever written to GitHub. The database can only express `publication_mode = 'shadow'`, so turning publication on is a deliberate later migration, not a flag.
+
+- `release_assurance_events` is an append-only ledger. `hold` is the board enrollment of a card and its exact linked PR and persists across head changes; `go` and `no_go` are decisions bound to one exact lowercase 40-hex head. A revocation is a `no_go` on that head. `(company_id, event_id)` is the idempotency key: an identical replay returns the recorded event, a different payload under the same event id is 409.
+- `POST /api/issues/:issueId/release-assurance/enroll` (board owner/admin) records the HOLD. The PR must already be linked to the card and `raAgentId` must be an agent of the company. It installs no execution policy.
+- `POST /api/issues/:issueId/release-decisions` (board owner/admin) records a GO (with `evidenceDigest` and `ciRunIds`) or NO-GO. The card must be enrolled and `headSha` must equal the live PR head, otherwise 409; a head with a recorded NO-GO rejects any GO. The response carries `publication: { kind: "shadow", planned }`, the status a later slice would write.
+- `GET /api/issues/:issueId/release-decisions` returns the events and the durable per-head verdict: `not_enrolled`, `held`, `go` or `no_go`. A NO-GO beats a GO on the same head whatever order they arrived in.
+- `executionPolicy.approvalAuthority: "release_assurance"` is accepted by the schema but refused by `normalizeIssueExecutionPolicy` unless a trusted caller passes `allowReleaseAssuranceAuthority`, so no issue create or PATCH can select it. `buildReleaseAssurancePolicy` is the one-stage `approval` template (only the RA seat); it is not installed yet.
+
+Not in this slice: issuer-signature verification and key registry, the `tea-core` publisher and required `release-assurance/go` check, rulesets, repository webhooks, installing the policy on a card, the approval-versus-close separation and decomposed-parent shape, and the exclusion of RA cards from the normal publisher. Those are the later rollout steps and need their own approvals.
