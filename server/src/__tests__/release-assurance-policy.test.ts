@@ -23,6 +23,28 @@ describe("release-assurance execution policy (SUP-20771, shadow)", () => {
     expect(policy?.stages).toHaveLength(1);
   });
 
+  it.each([
+    ["a review stage", [{ type: "review", participants: [{ type: "agent", agentId: AGENT }] }]],
+    ["two stages", [
+      { type: "approval", participants: [{ type: "agent", agentId: AGENT }] },
+      { type: "approval", participants: [{ type: "agent", agentId: AGENT }] },
+    ]],
+    ["an approval stage plus a review stage", [
+      { type: "review", participants: [{ type: "agent", agentId: AGENT }] },
+      { type: "approval", participants: [{ type: "agent", agentId: AGENT }] },
+    ]],
+    ["two participants", [{ type: "approval", participants: [
+      { type: "agent", agentId: AGENT },
+      { type: "agent", agentId: "22222222-2222-4222-8222-222222222222" },
+    ] }]],
+    ["a user participant", [{ type: "approval", participants: [{ type: "user", userId: "board-user" }] }]],
+    ["no stages", []],
+  ])("rejects a release_assurance policy with %s even for a trusted caller", (_label, stages) => {
+    expect(() =>
+      normalizeIssueExecutionPolicy({ approvalAuthority: "release_assurance", stages }, { allowReleaseAssuranceAuthority: true }),
+    ).toThrow(/exactly one approval stage/);
+  });
+
   it("leaves a normal policy byte-identical: an explicit paperclip authority is dropped, nothing is added", () => {
     const stages = [{ type: "review", participants: [{ type: "agent", agentId: AGENT }] }];
     const plain = normalizeIssueExecutionPolicy({ stages });
