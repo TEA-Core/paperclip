@@ -6323,14 +6323,14 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await expect(fs.readFile(path.join(seeded.worktreePath, "README.md"), "utf8")).resolves.toBe("MUTATED-LOCAL\n");
     }, 20_000);
 
-    it("does not let a hanging runtime stop hold the sweep", async () => {
-      const first = await seedTerminalWorkspace();
-      await markShared(first.executionWorkspaceId);
+    it("keeps the worktree and archives the record when the runtime stop hangs", async () => {
+      const first = await seedAncestryTerminalWorkspace();
+      await publishWorktree(first.worktreePath);
       await db.update(executionWorkspaces).set({
         updatedAt: new Date("2020-01-01T00:00:00Z"),
       }).where(eq(executionWorkspaces.id, first.executionWorkspaceId));
-      const second = await seedTerminalWorkspace();
-      await markShared(second.executionWorkspaceId);
+      const second = await seedAncestryTerminalWorkspace();
+      await publishWorktree(second.worktreePath);
       const original = workspaceRuntimeModule.stopRuntimeServicesForExecutionWorkspace;
       const hang = new Promise<void>(() => {});
       const stop = vi.spyOn(workspaceRuntimeModule, "stopRuntimeServicesForExecutionWorkspace")
@@ -6343,9 +6343,19 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           workspaceReaperCooldownDays: 0,
           runtimeServiceStopTimeoutMs: 50,
         }).sweepTerminalWorkspaces();
-        expect(sweep.archived + sweep.cleanupFailed).toBeGreaterThanOrEqual(1);
+        const firstRow = await workspaceStatus(first.executionWorkspaceId);
+        expect(sweep.cleanupFailed).toBe(0);
+        expect(sweep.archived).toBe(2);
+        expect(firstRow?.status).toBe("archived");
+        expect(firstRow?.cleanupReason).toContain("runtime services stop failed: runtime services stop timed out");
         await expect(fs.access(first.worktreePath)).resolves.toBeUndefined();
+        const [issueRow] = await db
+          .select({ executionWorkspaceId: issues.executionWorkspaceId })
+          .from(issues)
+          .where(eq(issues.id, first.sourceIssueId));
+        expect(issueRow?.executionWorkspaceId).toBeNull();
         expect((await workspaceStatus(second.executionWorkspaceId))?.status).toBe("archived");
+        await expect(fs.access(second.worktreePath)).rejects.toThrow();
       } finally {
         stop.mockRestore();
       }

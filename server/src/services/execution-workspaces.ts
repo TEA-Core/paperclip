@@ -87,13 +87,6 @@ function issueTerminalTimestamp(issue: {
 const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
-// A rotation of the measured ~2000 terminal rows should finish in hours at the
-// 30s scheduler cadence, including pages that spend time on git inspection.
-// 50/page left a stuck gate rotating too slowly once archives started deleting
-// worktrees. 200/page clears a 2027-row scan in about five minutes when each
-// page finishes inside the tick, and still inside a few hours when git status
-// dominates.
-
 export const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
 const COMMITS_MISSING_FROM_REMOTE_KEEP_REASON = "commits missing from the remote";
 const OTHER_LIVE_SESSIONS_KEEP_REASON = "other active sessions reference this path";
@@ -2133,20 +2126,25 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
       const pathInUseBeforeStop = await otherLiveSessionsReferencePath(workspace);
-      await stopRuntimeServicesBounded(
-        stopRuntimeServicesForExecutionWorkspace,
-        {
-          db,
-          executionWorkspaceId: workspace.id,
-          ...(pathInUseBeforeStop ? {} : { workspaceCwd: workspace.cwd }),
-        },
-        resolveRuntimeServiceStopTimeoutMs(opts.runtimeServiceStopTimeoutMs),
-      );
+      let stopFailure: string | null = null;
+      try {
+        await stopRuntimeServicesBounded(
+          stopRuntimeServicesForExecutionWorkspace,
+          {
+            db,
+            executionWorkspaceId: workspace.id,
+            ...(pathInUseBeforeStop ? {} : { workspaceCwd: workspace.cwd }),
+          },
+          resolveRuntimeServiceStopTimeoutMs(opts.runtimeServiceStopTimeoutMs),
+        );
+      } catch (error) {
+        stopFailure = `runtime services stop failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
       const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
       if (workspacePath) await lockWorktreePath(tx, workspacePath);
       const pathInUse = await otherLiveSessionsReferencePath(workspace);
       let removalRefusal: string | null = null;
-      if (!pathInUse && workspace.providerType === "git_worktree" && workspacePath) {
+      if (!stopFailure && !pathInUse && workspace.providerType === "git_worktree" && workspacePath) {
         if (await localOnlyBytesBlockRemoval(workspacePath)) {
           removalRefusal = LOCAL_ONLY_KEEP_REASON;
         } else {
@@ -2157,8 +2155,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           });
         }
       }
-      const cleanup = pathInUse || removalRefusal
-        ? { cleaned: true, warnings: [pathInUse ? OTHER_LIVE_SESSIONS_KEEP_REASON : removalRefusal!] }
+      const cleanup = stopFailure || pathInUse || removalRefusal
+        ? { cleaned: true, warnings: [stopFailure ?? (pathInUse ? OTHER_LIVE_SESSIONS_KEEP_REASON : removalRefusal!)] }
         : await cleanupExecutionWorkspaceArtifacts({
           workspace,
           projectWorkspace,
@@ -2178,7 +2176,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           runCleanupCommands: false,
           forceWorktreeRemoval: false,
         });
-      if (cleanup.cleaned && (workspace.mode === "shared_workspace" || pathInUse)) {
+      if (cleanup.cleaned && (workspace.mode === "shared_workspace" || pathInUse || stopFailure)) {
         await db
           .update(issues)
           .set({ executionWorkspaceId: null, updatedAt: now() })

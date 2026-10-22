@@ -1194,11 +1194,12 @@ The current app also exposes V1-supporting surfaces for:
   they do not inspect Git. The dedicated close-readiness route derives `deliveryState` as
   `merged_via_pr | merged_by_ancestry | unmerged | unknown` from a live scan. The terminal workspace
   sweep selects terminal source issues in SQL before inspecting Git, and requires a terminal
-  subtree, cooldown, and no active run (200 rows per tick by default). Delivery gating depends on the
+  subtree, cooldown, and no active run (50 rows per tick by default). Delivery gating depends on the
   row. An isolated row with a merged marker needs a clean worktree. An isolated row with no
   `pull_request` work product is archived as `issue_terminal | terminal, clean, nothing unique` when
-  it has no tracked or untracked changes and no commit missing from the remote; unpushed commits or
-  tracked modifications keep it. A shared-workspace session is a record of a reused workspace and
+  it has no tracked or untracked changes and no commit missing from the remote. An untracked-only row
+  archives as a record only with reason `issue_terminal | untracked files` and keeps the tree.
+  Unpushed commits or tracked modifications keep it. A shared-workspace session is a record of a reused workspace and
   archives without a delivery verdict; untracked-only files do not block it. A cwd that is missing or
   not a git repository archives the record without running Git. Archive reason is `issue_terminal`,
   with a ` | <why>` suffix when the worktree is kept. The sweep removes the worktree only for a
