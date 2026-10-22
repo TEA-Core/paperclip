@@ -1753,7 +1753,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
   describe("POST /issues/:id/merge-arming/release (SUP-20772)", () => {
     const RELEASE_REASON = "stamp cannot be published for this card";
 
-    function installReleaseTransport(opts: { liveHead?: string; alreadyApproved?: boolean; draft?: boolean } = {}) {
+    function installReleaseTransport(opts: { liveHead?: string; statuses?: Array<Record<string, unknown>>; draft?: boolean } = {}) {
       mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
           return createMockResponse({
@@ -1763,7 +1763,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         }
         if (url.includes("/statuses/") && init?.method === "POST") return createMockResponse({ id: 1 }, true, 201);
         if (url.includes("/statuses/")) {
-          return createMockResponse(opts.alreadyApproved ? [{ context: "paperclip/approved", state: "success" }] : []);
+          return createMockResponse(opts.statuses ?? []);
         }
         throw new Error(`Unexpected release request: ${url}`);
       });
@@ -1814,16 +1814,47 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(description.startsWith(`released by user:${USER_ID} for ${HEAD_SHA}: `)).toBe(true);
     });
 
-    it("is idempotent: a head that already carries paperclip/approved gets no second write or log row", async () => {
+    const CONTROL_PLANE_CREATOR = { id: 317012809, login: "tea-core[bot]" };
+    const FLEET_CREATOR = { id: 555, login: "fleet-agent[bot]" };
+    const approvedRow = (state: string, creator: { id: number; login: string }) => ({ context: "paperclip/approved", state, creator });
+    const releaseLogRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release");
+
+    it("is idempotent: a head whose newest paperclip/approved is a control-plane success gets no second write or log row", async () => {
       const { issueId } = await seedReleasable();
-      installReleaseTransport({ alreadyApproved: true });
+      installReleaseTransport({ statuses: [approvedRow("success", CONTROL_PLANE_CREATOR)] });
 
       const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("already_approved");
       expect(statusWrites()).toEqual([]);
-      expect((await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release")).toEqual([]);
+      expect(await releaseLogRows()).toEqual([]);
+    });
+
+    it("does not short-circuit on a success forged by a non-control-plane creator: it publishes and logs", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ statuses: [approvedRow("success", FLEET_CREATOR)] });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("released");
+      expect(statusWrites()).toHaveLength(1);
+      expect(await releaseLogRows()).toHaveLength(1);
+    });
+
+    it("does not short-circuit when a newer non-success follows a control-plane success", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({
+        statuses: [approvedRow("failure", CONTROL_PLANE_CREATOR), approvedRow("success", CONTROL_PLANE_CREATOR)],
+      });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("released");
+      expect(statusWrites()).toHaveLength(1);
+      expect(await releaseLogRows()).toHaveLength(1);
     });
 
     it("refuses a head that is not the PR's live head, with zero writes", async () => {
