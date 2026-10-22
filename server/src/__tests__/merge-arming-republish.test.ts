@@ -1750,6 +1750,157 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
+  describe("POST /issues/:id/merge-arming/release (SUP-20772)", () => {
+    const RELEASE_REASON = "stamp cannot be published for this card";
+
+    function installReleaseTransport(opts: { liveHead?: string; alreadyApproved?: boolean; draft?: boolean } = {}) {
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+          return createMockResponse({
+            state: "open", merged: false, draft: opts.draft ?? false,
+            head: { sha: opts.liveHead ?? HEAD_SHA, ref: DELIVERY_BRANCH },
+          });
+        }
+        if (url.includes("/statuses/") && init?.method === "POST") return createMockResponse({ id: 1 }, true, 201);
+        if (url.includes("/statuses/")) {
+          return createMockResponse(opts.alreadyApproved ? [{ context: "paperclip/approved", state: "success" }] : []);
+        }
+        throw new Error(`Unexpected release request: ${url}`);
+      });
+    }
+
+    const statusWrites = () => mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+
+    async function seedReleasable() {
+      const seeded = await seedIssue({
+        lastDecisionOutcome: null,
+        pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      });
+      currentActor = boardActor(seeded.companyId);
+      return seeded;
+    }
+
+    it("publishes paperclip/approved for exactly the live head with the release description, and logs it", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ outcome: "released", headSha: HEAD_SHA });
+      const writes = statusWrites();
+      expect(writes.map(([url]) => url)).toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`]);
+      expect(JSON.parse(writes[0]![1].body as string)).toMatchObject({
+        state: "success",
+        context: "paperclip/approved",
+        description: `released by user:${USER_ID} for ${HEAD_SHA}: ${RELEASE_REASON}`,
+      });
+      const events = await db.select().from(activityLog);
+      expect(events.find((event) => event.action === "issue.merge_release")).toMatchObject({
+        actorType: "user", actorId: USER_ID, entityId: issueId,
+        details: { headSha: HEAD_SHA, reason: RELEASE_REASON },
+      });
+    });
+
+    it("keeps a long reason inside GitHub's 140-character description limit", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: "x".repeat(900) });
+
+      expect(res.status).toBe(200);
+      const { description } = JSON.parse(statusWrites()[0]![1].body as string);
+      expect(description.length).toBeLessThanOrEqual(140);
+      expect(description.startsWith(`released by user:${USER_ID} for ${HEAD_SHA}: `)).toBe(true);
+    });
+
+    it("is idempotent: a head that already carries paperclip/approved gets no second write or log row", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ alreadyApproved: true });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("already_approved");
+      expect(statusWrites()).toEqual([]);
+      expect((await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release")).toEqual([]);
+    });
+
+    it("refuses a head that is not the PR's live head, with zero writes", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ liveHead: OTHER_HEAD_SHA });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("refused");
+      expect(res.body.message).toContain("head-mismatch");
+      expect(statusWrites()).toEqual([]);
+      expect((await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release")).toEqual([]);
+    });
+
+    it("refuses a stale head after the PR head moved on, then releases the new head", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      expect((await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON })).status).toBe(200);
+
+      mockGhFetch.mockReset();
+      installReleaseTransport({ liveHead: OTHER_HEAD_SHA });
+      const stale = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(stale.status).toBe(409);
+      expect(statusWrites()).toEqual([]);
+
+      const fresh = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: OTHER_HEAD_SHA, reason: RELEASE_REASON });
+      expect(fresh.status).toBe(200);
+      expect(statusWrites().map(([url]) => url)).toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${OTHER_HEAD_SHA}`]);
+    });
+
+    it("refuses a draft PR", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ draft: true });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(statusWrites()).toEqual([]);
+    });
+
+    it("refuses an agent caller before any GitHub I/O", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedReleasable();
+      currentActor = agentActor(companyId, reviewerAgentId);
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(403);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("refuses a board member who is not owner or admin before any GitHub I/O", async () => {
+      const { companyId, issueId } = await seedIssue({
+        membershipRole: "operator",
+        pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      });
+      currentActor = {
+        type: "board", userId: USER_ID, companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "operator", status: "active" }], source: "cloud_tenant",
+      } as unknown as Express.Request["actor"];
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(403);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects a malformed body with 400 before any GitHub I/O", async () => {
+      const { issueId } = await seedReleasable();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: "abc", reason: "" });
+
+      expect(res.status).toBe(400);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+  });
+
 });
 
 describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14824)", () => {

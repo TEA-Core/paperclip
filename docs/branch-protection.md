@@ -305,6 +305,19 @@ in the failure. The override is read-only: it writes no status.
 the gate proves a write-access *person's account*, not a second human. The head
 binding still stops a label from covering work pushed after it.
 
+**Card-bound PRs do not use a waiver (SUP-20772).** Anyone with
+`pull_requests:write` can write either waiver line, and every fleet agent has it.
+With the repository variable `PAPERCLIP_CARD_WAIVER_RETIRED=1`, the enforcer
+ignores both waiver forms on a head named `SUP-<n>-...` and falls through to the
+status check, so the PR lands on a real stamp or on the board's head-bound release
+(`POST /api/issues/:issueId/merge-arming/release`, see
+[Approval-status reconciliation](approval-reconciliation.md)). Cardless heads keep
+both waivers, but only when the PR author is a person (`user.type == User`) or
+`github-actions[bot]`; any other App-authored PR cannot self-waive. The variable
+ships **unset** so merging the change cannot freeze a merge before the release route
+is deployed: deploy the control plane, confirm the route answers, then set the
+variable. Unsetting it is the rollback.
+
 ## Admin bypass — decision (SUP-13629)
 
 The pre-existing `bypass_actors` entry (admin, `bypass_mode: pull_request`) was

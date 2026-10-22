@@ -1,0 +1,152 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+// SUP-20772: the free-text waiver and the no-paperclip-card label stop working
+// on a card-bound (SUP-<n>-...) head once PAPERCLIP_CARD_WAIVER_RETIRED=1, and
+// the board release (a head-bound paperclip/approved from the control plane)
+// is what lands such a PR instead. Cardless PRs keep both, for a person or
+// github-actions[bot] author only.
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const script = path.join(repoRoot, "scripts/ci/check-paperclip-approved.sh");
+
+const REPO = "TEA-Core/paperclip";
+const PR = 4242;
+const HEAD_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const QUEUE_REF = `refs/heads/gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-${PR}-0123456789abcdef`;
+const TEA_CORE = { id: 317012809, login: "tea-core[bot]", type: "Bot" };
+
+const GH_SHIM = [
+  "#!/usr/bin/env bash",
+  "set -euo pipefail",
+  "url=\"\"",
+  "jqfilter=\"\"",
+  "while [ \"$#\" -gt 0 ]; do",
+  "  case \"$1\" in",
+  "    api|--slurp|--paginate) ;;",
+  "    -H) shift ;;",
+  "    --jq|-q) shift; jqfilter=\"$1\" ;;",
+  "    *) [ -n \"$url\" ] || url=\"$1\" ;;",
+  "  esac",
+  "  shift",
+  "done",
+  "case \"$url\" in",
+  "  */statuses*) jq -r \"$jqfilter\" \"$GH_SHIM_DIR/statuses.json\" ;;",
+  "  */pulls/*/reviews*) echo '[]' ;;",
+  "  */pulls/*)    cat \"$GH_SHIM_DIR/pull.json\" ;;",
+  "  *) echo \"gh shim: unexpected call: $url\" >&2; exit 1 ;;",
+  "esac",
+  "",
+].join("\n");
+
+const WAIVER_BODY = "Paperclip-Approved-Waiver: sync with no card";
+
+function run({ ref, author, body = "", labels = [], statuses = [], retired = true }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "pc-card-waiver-"));
+  try {
+    writeFileSync(
+      path.join(dir, "pull.json"),
+      JSON.stringify({
+        head: { sha: HEAD_SHA, ref },
+        body,
+        labels: labels.map((name) => ({ name })),
+        user: author,
+      }),
+    );
+    writeFileSync(path.join(dir, "statuses.json"), JSON.stringify(statuses));
+    const bin = path.join(dir, "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(path.join(bin, "gh"), GH_SHIM);
+    chmodSync(path.join(bin, "gh"), 0o755);
+    const result = spawnSync("bash", [script, "merge_group"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GH_SHIM_DIR: dir,
+        GH_REPO: REPO,
+        PAPERCLIP_APPROVED_STATUS_CREATOR_ID: String(TEA_CORE.id),
+        PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN: TEA_CORE.login,
+        PAPERCLIP_CARD_WAIVER_RETIRED: retired ? "1" : "",
+        GITHUB_REF: QUEUE_REF,
+        GITHUB_REF_NAME: QUEUE_REF.replace("refs/heads/", ""),
+      },
+    });
+    return { code: result.status, out: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const PERSON = { login: "kronik187", type: "User" };
+const FLEET_APP = { login: "fleet-only[bot]", type: "Bot" };
+const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
+const CARD_BRANCH = "SUP-20772-stamp-merge-release-d";
+const CARDLESS_BRANCH = "doctrine-sync-2026-10-22";
+const release = { context: "paperclip/approved", state: "success", creator: TEA_CORE, description: `released by user:u1 for ${HEAD_SHA}: no receipt` };
+
+test("a body waiver on a SUP-prefixed branch is refused", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, body: WAIVER_BODY });
+  assert.equal(code, 1);
+  assert.match(out, /REFUSED: body waiver/);
+  assert.doesNotMatch(out, /waived:/);
+});
+
+test("the no-paperclip-card label on a SUP-prefixed branch is refused", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, labels: ["no-paperclip-card"] });
+  assert.equal(code, 1);
+  assert.match(out, /REFUSED: the 'no-paperclip-card' label/);
+});
+
+test("the SUP prefix match is case-insensitive and also covers a bare SUP-<n>", () => {
+  for (const ref of ["sup-20772-lowercase", "SUP-20772"]) {
+    assert.equal(run({ ref, author: PERSON, body: WAIVER_BODY }).code, 1, ref);
+  }
+});
+
+test("a branch that merely contains SUP- is cardless and keeps its waiver", () => {
+  assert.equal(run({ ref: "fix/SUP-1-in-the-middle", author: PERSON, body: WAIVER_BODY }).code, 0);
+});
+
+test("a board release on the head lands a SUP-prefixed PR and is named in the log", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, body: WAIVER_BODY, statuses: [release] });
+  assert.equal(code, 0);
+  assert.match(out, /pass: paperclip\/approved = success/);
+  assert.match(out, new RegExp(`board release: released by user:u1 for ${HEAD_SHA}`));
+});
+
+test("a waiver on a SUP-prefixed branch does not hide a forged status", () => {
+  const forged = { ...release, creator: { id: 1, login: "fleet-only[bot]", type: "Bot" } };
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, body: WAIVER_BODY, statuses: [forged] });
+  assert.equal(code, 1);
+  assert.match(out, /FORGED/);
+});
+
+test("a cardless PR by a person keeps both the body waiver and the label", () => {
+  assert.equal(run({ ref: CARDLESS_BRANCH, author: PERSON, body: WAIVER_BODY }).code, 0);
+  assert.equal(run({ ref: CARDLESS_BRANCH, author: PERSON, labels: ["no-paperclip-card"] }).code, 0);
+});
+
+test("a cardless PR by github-actions[bot] keeps its waiver (the lockfile refresh)", () => {
+  assert.equal(run({ ref: "chore/refresh-lockfile", author: ACTIONS_BOT, body: WAIVER_BODY }).code, 0);
+});
+
+test("a cardless PR authored by the fleet App cannot waive itself", () => {
+  for (const input of [{ body: WAIVER_BODY }, { labels: ["no-paperclip-card"] }]) {
+    const { code, out } = run({ ref: CARDLESS_BRANCH, author: FLEET_APP, ...input });
+    assert.equal(code, 1);
+    assert.match(out, /only a person or github-actions\[bot\] may waive/);
+  }
+});
+
+test("with the switch off (the shipped default) every waiver behaves as before", () => {
+  for (const [ref, author] of [[CARD_BRANCH, PERSON], [CARDLESS_BRANCH, FLEET_APP]]) {
+    assert.equal(run({ ref, author, body: WAIVER_BODY, retired: false }).code, 0, `${ref} ${author.login}`);
+  }
+});
