@@ -326,7 +326,7 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
       .send({
         status: "done",
         comment:
-          "Closed at Tier 1 (landed, not liveness-probed): decision approved the only review stage. Liveness unverified.\n\nkind: review\ndecision: approved",
+          "Closed at Tier 2 (live): decision approved the only review stage and the patched path is live.\n\nkind: review\ndecision: approved",
       });
   }
 

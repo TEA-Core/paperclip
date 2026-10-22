@@ -41,12 +41,12 @@ async function request(message) {
               // Fork divergence (SUP-12693 done-tier declaration guard, slice 2c): upstream 018ca5daa
               // closes with a bare `status: done`, which the fork refuses for every non-board actor
               // with 422 done_transition_missing_tier_declaration (fork da9d651d2), so the task never
-              // completes. A Tier 1 close comment is that guard's own accepted form. The comment
+              // completes. A Tier 2 close comment is that guard's own accepted form (Tier 1 now needs a landing proof the fixture cannot supply). The comment
               // also carries this turn's reply: a run's own explicit comment takes precedence over
               // materializing its final agent message (resolveHeartbeatRunResponse,
               // server/src/services/heartbeat-run-summary.ts), so a declaration-only comment would
               // hide the reply the browser journeys assert on. The streamed reply below is unchanged.
-              body: JSON.stringify({ status: 'done', comment: 'Answered the pending follow-up once.\n\nClosed at Tier 1 (landed, not liveness-probed): the deterministic ACP Stop fixture has no deliverable. Liveness unverified.' }),
+              body: JSON.stringify({ status: 'done', comment: 'Answered the pending follow-up once.\n\nClosed at Tier 2 (live): the deterministic ACP Stop fixture run completed this turn and the issue re-read as done.' }),
             });
             if (!response.ok) throw new Error(`Task completion failed: ${response.status} ${await response.text()}`);
           }

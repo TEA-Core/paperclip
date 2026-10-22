@@ -95,7 +95,7 @@ for (const { unfinishedWrite, stopResponse } of [{ unfinishedWrite: false, stopR
       }
       // Fork divergence (SUP-12693 done-tier close comment, slice 2c): upstream 018ca5daa posts
       // this reply only when the run finalizes, but the fork fixture closes with a reply-bearing
-      // Tier 1 comment mid-turn, so until the run settles the reply also renders as the live
+      // Tier 2 comment mid-turn, so until the run settles the reply also renders as the live
       // transcript interstitial and an unscoped getByText hits a strict-mode violation. Assert
       // on the posted agent reply bubble, which is the answer this journey checks for.
       await expect(page.getByTestId("task-chat-agent-bubble").getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 30_000 });

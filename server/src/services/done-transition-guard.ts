@@ -591,6 +591,221 @@ function parseTier1Declaration(body: string): Tier1Parse {
     : { kind: "absent" };
 }
 
+// Tier 1 landing proof (SUP-20671). A matched Tier 1 sentence is accepted only if its <reason>
+// carries exactly one landing-state token and that token's claim verifies:
+//  - `landed-at-tip`: the named commit is an ancestor of the repo default branch right now.
+//  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
+//    post-merge carrier (the async worker itself is unchanged here).
+// The static TIER1_FORM / remedy strings stay token-free; the refusals below name the tokens.
+// Tier 2 is a separate live-probe concern and is not checked here.
+const LANDED_AT_TIP_TOKEN = "landed-at-tip";
+const LANDING_DELEGATED_TOKEN = "landing-delegated";
+const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
+const NAMED_PR_RE = /\bPR #([1-9][0-9]*)\b/;
+const NAMED_MERGE_COMMIT_RE = /\b([0-9a-f]{7,40})\b/i;
+
+function refuseTier1(reason: string): DoneTierDeclarationResult {
+  return {
+    allowed: false,
+    reason,
+    tier: null,
+    skipped: false,
+    skipReason: null,
+  };
+}
+
+function acceptTier1(reason: string, sameRun: boolean): DoneTierDeclarationResult {
+  const prefix = sameRun
+    ? "Tier 1 declaration found in same-run comment: "
+    : "Tier 1 declaration found: ";
+  return {
+    allowed: true,
+    reason: `${prefix}${reason.slice(0, 200)}`,
+    tier: "tier1",
+    skipped: false,
+    skipReason: null,
+  };
+}
+
+function unverifiedTier1(err: unknown): string {
+  const detail = err instanceof Error ? err.message : "unknown";
+  return `Tier 1 declaration could not be verified against the default branch (${detail}).`;
+}
+
+async function loadTier1RepoFields(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
+): Promise<{
+  projectId: string | null;
+  projectWorkspaceId: string | null;
+  executionWorkspaceId: string | null;
+}> {
+  if (
+    "projectId" in issue ||
+    "projectWorkspaceId" in issue ||
+    "executionWorkspaceId" in issue
+  ) {
+    return {
+      projectId: issue.projectId ?? null,
+      projectWorkspaceId: issue.projectWorkspaceId ?? null,
+      executionWorkspaceId: issue.executionWorkspaceId ?? null,
+    };
+  }
+  const row = await db
+    .select()
+    .from(issues)
+    .where(eq(issues.id, issue.id))
+    .then((rows) => rows[0] ?? null);
+  return {
+    projectId: row?.projectId ?? null,
+    projectWorkspaceId: row?.projectWorkspaceId ?? null,
+    executionWorkspaceId: row?.executionWorkspaceId ?? null,
+  };
+}
+
+async function proveLandingDelegated(
+  db: Db,
+  issue: { id: string; companyId: string },
+  reason: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  if (!reason.includes(LANDING_BACKSTOP_CARRIER)) {
+    return refuseTier1(
+      'Tier 1 declaration using "landing-delegated" is missing "done-close-landing-backstop" in <reason>.',
+    );
+  }
+  const named = NAMED_PR_RE.exec(reason);
+  if (!named) {
+    return refuseTier1(
+      'Tier 1 declaration using "landing-delegated" must name a linked PR (PR #<N>).',
+    );
+  }
+  const number = Number(named[1]);
+  let linked: LinkedPullRequest[];
+  try {
+    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+  } catch (err) {
+    return refuseTier1(unverifiedTier1(err));
+  }
+  if (!linked.some((pr) => pr.number === number)) {
+    return refuseTier1(
+      `Tier 1 declaration using "landing-delegated" names PR #${number}, which is not a linked pull request.`,
+    );
+  }
+  return acceptTier1(reason, sameRun);
+}
+
+async function proveLandedAtTip(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
+  reason: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  const shaMatch = NAMED_MERGE_COMMIT_RE.exec(reason);
+  if (!shaMatch) {
+    return refuseTier1(
+      'Tier 1 declaration using "landed-at-tip" is missing a named merge commit.',
+    );
+  }
+  const sha = shaMatch[1]!;
+  let ctx: IssueRepoContext | null;
+  try {
+    const fields = await loadTier1RepoFields(db, issue);
+    ctx = await resolveIssueRepoContext(db, {
+      companyId: issue.companyId,
+      projectId: fields.projectId,
+      projectWorkspaceId: fields.projectWorkspaceId,
+      executionWorkspaceId: fields.executionWorkspaceId,
+    });
+  } catch (err) {
+    return refuseTier1(unverifiedTier1(err));
+  }
+  if (!ctx?.repoUrl || !ctx.defaultRef) {
+    return refuseTier1(
+      "Tier 1 declaration could not be verified: no repository default branch is resolvable.",
+    );
+  }
+  const parsed = parseRepoUrl(ctx.repoUrl);
+  if (!parsed) {
+    return refuseTier1(
+      "Tier 1 declaration could not be verified: repository URL is not a GitHub repository.",
+    );
+  }
+  let token: string | null;
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    token = tokenResult.token;
+  } catch (err) {
+    return refuseTier1(unverifiedTier1(err));
+  }
+  if (!token) {
+    return refuseTier1(
+      "Tier 1 declaration could not be verified: GitHub credential is not configured.",
+    );
+  }
+  let aheadBy: number | null;
+  try {
+    aheadBy = await githubCompareAheadBy(
+      parsed.hostname,
+      parsed.owner,
+      parsed.repo,
+      ctx.defaultRef,
+      sha,
+      token,
+    );
+  } catch (err) {
+    return refuseTier1(unverifiedTier1(err));
+  }
+  if (aheadBy !== 0) {
+    return refuseTier1(
+      `Tier 1 declaration merge commit ${sha} is not an ancestor of the default branch ${ctx.defaultRef}.`,
+    );
+  }
+  return acceptTier1(reason, sameRun);
+}
+
+async function proveTier1Landing(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
+  reason: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  const hasLanded = new RegExp(`\\b${LANDED_AT_TIP_TOKEN}\\b`).test(reason);
+  const hasDelegated = new RegExp(`\\b${LANDING_DELEGATED_TOKEN}\\b`).test(reason);
+  if (hasLanded && hasDelegated) {
+    return refuseTier1(
+      'Tier 1 declaration names both "landed-at-tip" and "landing-delegated"; name exactly one.',
+    );
+  }
+  if (!hasLanded && !hasDelegated) {
+    return refuseTier1(
+      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip" ' +
+        'or "landing-delegated".',
+    );
+  }
+  if (hasDelegated) return proveLandingDelegated(db, issue, reason, sameRun);
+  return proveLandedAtTip(db, issue, reason, sameRun);
+}
+
 /**
  * Turn the two parsers' near-miss results into a truthful rejection message.
  * Returns null when neither tier phrase appears at all — the caller then falls
@@ -634,7 +849,14 @@ function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse): string | n
 
 export async function evaluateDoneTierDeclaration(
   db: Db,
-  issue: { id: string; companyId: string; identifier: string | null },
+  issue: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
   accompanyingComment: string | null,
   runId: string | null,
   listComments: (issueId: string) => Promise<IssueComment[]>,
@@ -669,13 +891,7 @@ export async function evaluateDoneTierDeclaration(
           skipReason: null,
         };
       }
-      return {
-        allowed: true,
-        reason: `Tier 1 declaration found: ${tier1.reason.slice(0, 200)}`,
-        tier: "tier1",
-        skipped: false,
-        skipReason: null,
-      };
+      return proveTier1Landing(db, issue, tier1.reason, false);
     }
     return {
       allowed: false,
@@ -768,13 +984,7 @@ export async function evaluateDoneTierDeclaration(
         skipReason: null,
       };
     }
-    return {
-      allowed: true,
-      reason: `Tier 1 declaration found in same-run comment: ${tier1.reason.slice(0, 200)}`,
-      tier: "tier1",
-      skipped: false,
-      skipReason: null,
-    };
+    return proveTier1Landing(db, issue, tier1.reason, true);
   }
 
   return {

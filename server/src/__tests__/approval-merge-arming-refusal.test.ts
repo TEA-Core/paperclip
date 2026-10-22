@@ -366,7 +366,7 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       .send({
         status: "done",
         comment:
-          "Stage approved.\nClosed at Tier 1 (landed, not liveness-probed): review stage approved. Liveness unverified.\n\nkind: review\ndecision: approved",
+          "Stage approved.\nClosed at Tier 2 (live): review stage approved and the patched path is live.\n\nkind: review\ndecision: approved",
       });
   }
 

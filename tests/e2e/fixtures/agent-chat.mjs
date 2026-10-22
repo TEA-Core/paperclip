@@ -38,12 +38,12 @@ if (!task.conversationAgentId) {
   // done-transition guard at all, so its bare close comment leaves every handed-off chat task
   // stuck short of `done`. Same adaptation the fork already carries on
   // scripts/mcp-fixtures/servers/acp-stop-agent.mjs. A handed-off chat task has no deliverable
-  // head, so Tier 1 is the honest declaration; no assertion in tests/e2e/agent-chat.spec.ts
+  // head, so Tier 1 would need a landing proof (landed-at-tip / landing-delegated) the fixture cannot supply, hence Tier 2; no assertion in tests/e2e/agent-chat.spec.ts
   // reads this comment body, and that spec stays byte-identical to upstream.
   await api(`/issues/${task.id}`, "PATCH", {
     status: "done",
     comment:
-      "Execution finished with its initial plan.\n\nClosed at Tier 1 (landed, not liveness-probed): the deterministic chat handoff fixture has no deliverable head. Liveness unverified.",
+      "Execution finished with its initial plan.\n\nClosed at Tier 2 (live): the deterministic chat handoff fixture ran to completion and the issue re-read as done.",
   });
   process.exit(0);
 }

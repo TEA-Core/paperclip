@@ -5225,7 +5225,7 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("Tier 1 via accompanying comment", () => {
-    it("allows transition with well-formed Tier 1 substitution and non-empty reason", async () => {
+    it("refuses a syntactically complete Tier 1 line that is only arbitrary prose", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
@@ -5233,8 +5233,9 @@ describe("evaluateDoneTierDeclaration", () => {
         null,
         () => Promise.resolve([]),
       );
-      expect(result.allowed).toBe(true);
-      expect(result.tier).toBe("tier1");
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("landed-at-tip");
     });
 
     it("rejects Tier 1 substitution with empty reason", async () => {
@@ -5263,6 +5264,186 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   });
 
+  describe("SUP-20671 Tier 1 landing proof", () => {
+    const MERGE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const STRANGER_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    function tier1Line(reason: string) {
+      return `Closed at Tier 1 (landed, not liveness-probed): ${reason} Liveness unverified.`;
+    }
+
+    function landedIssue() {
+      return {
+        ...tierIssue,
+        projectId: "project-1",
+        projectWorkspaceId: "pw-1",
+        executionWorkspaceId: "ew-1",
+      };
+    }
+
+    function linkedPr(number: number, cachedState = "open") {
+      return {
+        id: `pr-${number}`,
+        owner: "TEA-Core",
+        repo: "paperclip",
+        number,
+        nodeId: null,
+        headRefName: null,
+        displayName: `TEA-Core/paperclip#${number}`,
+        title: null,
+        cachedState,
+        lastErrorCode: null,
+        reviewDecision: null,
+      };
+    }
+
+    beforeEach(() => {
+      ghFetchMock.mockReset();
+      mockResolveLinkedPullRequestsWithState.mockReset();
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+      mockResolveGitHubToken.mockReset();
+      mockResolveGitHubToken.mockResolvedValue({
+        token: "test-token",
+        scope: "company",
+        secretName: "GITHUB_TOKEN",
+      });
+      setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+    });
+
+    function compareAhead(aheadBy: number) {
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (String(url).includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: aheadBy }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+    }
+
+    it("refuses arbitrary Tier 1 prose even when an open linked PR is resolved", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("production probe unavailable."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("landed-at-tip");
+      expect(result.reason).toContain("landing-delegated");
+    });
+
+    it("refuses landed-at-tip when the named merge commit is not an ancestor of the default branch", async () => {
+      compareAhead(1);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${STRANGER_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain(STRANGER_SHA);
+      expect(result.reason).toContain("ancestor");
+      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((url) => url.includes("/compare/"));
+      expect(compareUrl).toContain(encodeURIComponent(STRANGER_SHA));
+      expect(compareUrl).toContain("fold%2Ftea-patches-v2026.722.0");
+    });
+
+    it("accepts landed-at-tip when the named merge commit is an ancestor of the default branch", async () => {
+      compareAhead(0);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((url) => url.includes("/compare/"));
+      expect(compareUrl).toContain(encodeURIComponent(MERGE_SHA));
+      expect(compareUrl).toContain("fold%2Ftea-patches-v2026.722.0");
+    });
+
+    it("refuses landing-delegated without a linked PR", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("linked");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses landing-delegated that does not name done-close-landing-backstop", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103)]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103 still open at close."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("done-close-landing-backstop");
+    });
+
+    it("accepts landing-delegated when it names a linked PR and done-close-landing-backstop", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1");
+    });
+
+    it("refuses landed-at-tip when GitHub credential resolution fails, and does not accept", async () => {
+      mockResolveGitHubToken.mockRejectedValue(new Error("secret store down"));
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).toBeNull();
+      expect(result.reason).not.toContain("transition allowed");
+    });
+
+    it("refuses landed-at-tip when the compare call rejects the credential", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 }));
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).toBeNull();
+      expect(result.reason).not.toContain("transition allowed");
+    });
+  });
+
   describe("no accompanying comment — same-run comment lookup", () => {
     it("allows transition when same-run comment has Tier 2 declaration", async () => {
       const result = await evaluateDoneTierDeclaration(
@@ -5276,7 +5457,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier2");
     });
 
-    it("allows transition when same-run comment has Tier 1 substitution", async () => {
+    it("refuses a same-run Tier 1 substitution that is only arbitrary prose", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
@@ -5289,8 +5470,9 @@ describe("evaluateDoneTierDeclaration", () => {
           ),
         ]),
       );
-      expect(result.allowed).toBe(true);
-      expect(result.tier).toBe("tier1");
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("landing-delegated");
     });
 
     it("rejects when same-run comment has no tier declaration", async () => {
