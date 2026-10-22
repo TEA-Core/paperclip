@@ -1193,10 +1193,21 @@ The current app also exposes V1-supporting surfaces for:
   workspace detail reads return persisted workspace state and runtime services with `deliveryState: unknown`;
   they do not inspect Git. The dedicated close-readiness route derives `deliveryState` as
   `merged_via_pr | merged_by_ancestry | unmerged | unknown` from a live scan. The terminal workspace
-  sweep selects terminal source issues in SQL before inspecting Git, and still requires a terminal
-  subtree, clean worktree, merged delivery, cooldown, and no active run. Eligible workspaces are
-  archived with reason `issue_terminal`. A worktree directory that is already gone counts as removed:
-  cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
+  sweep selects terminal source issues in SQL before inspecting Git, and requires a terminal
+  subtree, cooldown, and no active run (200 rows per tick by default). Delivery gating depends on the
+  row. An isolated row with a merged marker needs a clean worktree. An isolated row with no
+  `pull_request` work product is archived as `issue_terminal | terminal, clean, nothing unique` when
+  it has no tracked or untracked changes and no commit missing from the remote; unpushed commits or
+  tracked modifications keep it. A shared-workspace session is a record of a reused workspace and
+  archives without a delivery verdict; untracked-only files do not block it. A cwd that is missing or
+  not a git repository archives the record without running Git. Archive reason is `issue_terminal`,
+  with a ` | <why>` suffix when the worktree is kept. The sweep removes the worktree only for a
+  `git_worktree` row that is clean with nothing unique and has no other live session on the same
+  path, rechecked just before removal; every other archive is record-only:
+  it stops that row's runtime services, detaches issues, and records why in `cleanup_reason`.
+  Record-only stop or detach failures stay `archived` and are appended to `cleanup_reason`. The reaper
+  skip log line carries one counter per skip reason. A worktree directory that is already gone counts
+  as removed: cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
   of leaving it in `cleanup_failed`. The sweep also retries `cleanup_failed` rows whose reason is
   `issue_terminal | spawn <git> ENOENT` under the same safety gates. Reopening the source issue
   records activity but does not restore that workspace.

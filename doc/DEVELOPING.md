@@ -1239,8 +1239,9 @@ Environment overrides:
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace and deletes the worktree. A person can reopen
-  the work inside this window. The default is `7`. A value of `0` disables the
+  archives the execution workspace and, when the worktree is clean with nothing
+  unique and no other live session shares it, deletes the worktree. A person can
+  reopen the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
 
