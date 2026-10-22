@@ -6295,6 +6295,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           },
         })
         .where(eq(executionWorkspaces.id, stale.executionWorkspaceId));
+      // Age every row so a host clock step cannot put one past the sweep's frozen scan boundary.
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
       const databaseBefore = await snapshotDatabase();
 
       const info = vi.spyOn(logger, "info");
