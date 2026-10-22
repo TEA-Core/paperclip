@@ -591,6 +591,13 @@ function parseTier1Declaration(body: string): Tier1Parse {
     : { kind: "absent" };
 }
 
+// Tier 1 landing proof (SUP-20671). A matched Tier 1 sentence is accepted only if its <reason>
+// carries exactly one landing-state token and that token's claim verifies:
+//  - `landed-at-tip`: the named commit is an ancestor of the repo default branch right now.
+//  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
+//    post-merge carrier (the async worker itself is unchanged here).
+// The static TIER1_FORM / remedy strings stay token-free; the refusals below name the tokens.
+// Tier 2 is a separate live-probe concern and is not checked here.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
 const LANDING_DELEGATED_TOKEN = "landing-delegated";
 const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
