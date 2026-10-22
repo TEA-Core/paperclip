@@ -1604,7 +1604,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .select()
         .from(chatConversations)
         .where(eq(chatConversations.endpointId, endpointId))
-        .then((rows) => rows.at(-1));
+        .orderBy(asc(chatConversations.createdAt)).limit(1).then((rows) => rows[0]);
       expect(conversation).toBeDefined();
     });
     if (!conversation) throw new Error("Expected setup conversation");
