@@ -90,6 +90,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { formatTerminalWorkspaceReaperSkipLogLine } from "./services/execution-workspaces.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createMergedOperatorMergeCardSweepService } from "./services/merged-operator-merge-cards.js";
@@ -1601,12 +1602,16 @@ async function startServerWithDatabaseTeardown(
             result.skippedActiveRun
             + result.skippedNonTerminalTree
             + result.skippedUndelivered
+            + (result.skippedUnpushed ?? 0)
+            + (result.skippedTrackedDirty ?? 0)
+            + (result.skippedGitUnverified ?? 0)
             + result.skippedRace
+            + (result.skippedReopened ?? 0)
             + result.skippedCooldown;
           const nowMs = Date.now();
           if (skipped > 0 && nowMs - lastTerminalWorkspaceSkipLogAt >= terminalWorkspaceSkipLogIntervalMs) {
             lastTerminalWorkspaceSkipLogAt = nowMs;
-            logger.info(result, "terminal issue workspace reaper skipped all candidates");
+            logger.info(result, formatTerminalWorkspaceReaperSkipLogLine(result));
           }
           return result;
         })

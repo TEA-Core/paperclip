@@ -87,6 +87,73 @@ function issueTerminalTimestamp(issue: {
 const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
+// A rotation of the measured ~2000 terminal rows should finish in hours at the
+// 30s scheduler cadence, including pages that spend time on git inspection.
+// 50/page left a stuck gate rotating too slowly once archives started deleting
+// worktrees. 200/page clears a 2027-row scan in about five minutes when each
+// page finishes inside the tick, and still inside a few hours when git status
+// dominates.
+export const TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT = 200;
+
+export const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
+const COMMITS_MISSING_FROM_REMOTE_KEEP_REASON = "commits missing from the remote";
+
+export type TerminalWorkspaceSweepSkipCounts = {
+  skippedActiveRun: number;
+  skippedNonTerminalTree: number;
+  skippedUndelivered: number;
+  skippedUnpushed: number;
+  skippedTrackedDirty: number;
+  skippedGitUnverified: number;
+  skippedRace: number;
+  skippedReopened: number;
+  skippedCooldown: number;
+};
+
+export function formatTerminalWorkspaceReaperSkipLogLine(
+  result: Partial<TerminalWorkspaceSweepSkipCounts>,
+): string {
+  const count = (value: number | undefined) => value ?? 0;
+  const parts = [
+    `skippedActiveRun=${count(result.skippedActiveRun)}`,
+    `skippedNonTerminalTree=${count(result.skippedNonTerminalTree)}`,
+    `skippedUndelivered=${count(result.skippedUndelivered)}`,
+    `skippedUnpushed=${count(result.skippedUnpushed)}`,
+    `skippedTrackedDirty=${count(result.skippedTrackedDirty)}`,
+    `skippedGitUnverified=${count(result.skippedGitUnverified)}`,
+    `skippedRace=${count(result.skippedRace)}`,
+    `skippedReopened=${count(result.skippedReopened)}`,
+    `skippedCooldown=${count(result.skippedCooldown)}`,
+  ];
+  return `terminal issue workspace reaper skipped all candidates ${parts.join(" ")}`;
+}
+
+type ExecutionWorkspaceCwdKind = "missing" | "not_git" | "git" | "unreadable";
+
+async function classifyExecutionWorkspaceCwd(workspacePath: string | null): Promise<ExecutionWorkspaceCwdKind> {
+  if (!workspacePath) return "missing";
+  try {
+    await fs.stat(workspacePath);
+  } catch (error) {
+    return isAbsentFilesystemPath(error) ? "missing" : "unreadable";
+  }
+  try {
+    await fs.stat(path.join(workspacePath, ".git"));
+    return "git";
+  } catch (error) {
+    return isAbsentFilesystemPath(error) ? "not_git" : "unreadable";
+  }
+}
+
+async function countCommitsMissingFromRemote(workspacePath: string): Promise<number | null> {
+  try {
+    const output = await runGit(["rev-list", "--count", "HEAD", "--not", "--remotes"], workspacePath);
+    const count = Number.parseInt(output.stdout.trim(), 10);
+    return Number.isFinite(count) ? count : null;
+  } catch {
+    return null;
+  }
+}
 
 // Node reports a missing worktree cwd as `spawn <git> ENOENT`. The git path can
 // contain spaces, so the match is not limited to a single non-space token. The
@@ -1629,6 +1696,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       subtreeTerminal,
       cooldownAnchor,
       workspaceDirty: Boolean(git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles),
+      hasPullRequestProduct: deliveryPullRequestProducts.length > 0,
       workspaceHeadSha,
     };
   }
@@ -1703,6 +1771,32 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ))
       .limit(1);
     return active.length > 0;
+  }
+
+  async function otherLiveSessionsReferencePath(workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">) {
+    const rawPaths = [workspace.cwd, workspace.providerRef]
+      .map((value) => readNullableString(value))
+      .filter((value): value is string => Boolean(value));
+    const paths = [...new Set(rawPaths.flatMap((value) => {
+      const resolved = path.resolve(value);
+      return resolved === value ? [value] : [value, resolved];
+    }))];
+    if (paths.length === 0) return false;
+    // Disk path, not a company list. Another company's live row on the same
+    // directory must keep the worktree too. The query returns only existence.
+    const [row] = await db
+      .select({ id: executionWorkspaces.id })
+      .from(executionWorkspaces)
+      .where(and(
+        ne(executionWorkspaces.id, workspace.id),
+        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+        or(
+          inArray(executionWorkspaces.cwd, paths),
+          inArray(executionWorkspaces.providerRef, paths),
+        ),
+      ))
+      .limit(1);
+    return Boolean(row);
   }
 
   type FenceableWorkspaceRow = {
@@ -2874,7 +2968,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
     },
 
-    sweepTerminalWorkspaces: async (limit = 50) => {
+    sweepTerminalWorkspaces: async (limit = TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT) => {
       // Skip this sweep while another sweep runs. A concurrent sweep would share
       // the cursor and the boundary and could corrupt the rotation state. A
       // skipped tick is safe: the next tick runs the sweep with intact state.
@@ -2887,6 +2981,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           skippedActiveRun: 0,
           skippedNonTerminalTree: 0,
           skippedUndelivered: 0,
+          skippedUnpushed: 0,
+          skippedTrackedDirty: 0,
+          skippedGitUnverified: 0,
           skippedRace: 0,
           skippedReopened: 0,
           skippedCooldown: 0,
@@ -2976,6 +3073,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedActiveRun: 0,
         skippedNonTerminalTree: 0,
         skippedUndelivered: 0,
+        skippedUnpushed: 0,
+        skippedTrackedDirty: 0,
+        skippedGitUnverified: 0,
         skippedRace: 0,
         skippedReopened: 0,
         skippedCooldown: 0,
@@ -3001,10 +3101,31 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         const executionWorkspace = toExecutionWorkspace(workspace);
-        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
-        if (!statusInspectionSucceeded) {
+        const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+        const isOpenRow = workspace.status === "active" || workspace.status === "idle" || workspace.status === "in_review";
+        const sharedSession = workspace.mode === "shared_workspace";
+        const cwdKind = isOpenRow ? await classifyExecutionWorkspaceCwd(workspacePath) : "git";
+        if (cwdKind === "unreadable") {
           result.skippedUndelivered += 1;
+          result.skippedGitUnverified += 1;
           continue;
+        }
+        // Missing and non-git cwds used to stay skipped forever. Archive the
+        // record without spawning git. A missing git worktree is classified
+        // below so a merged row can still prune its admin entry.
+        let archiveWithoutGit = isOpenRow && (
+          cwdKind === "not_git"
+          || (cwdKind === "missing" && workspace.providerType !== "git_worktree")
+        );
+        let git: ExecutionWorkspaceCloseGitReadiness | null = null;
+        if (!archiveWithoutGit && !(sharedSession && isOpenRow)) {
+          const inspected = await inspectGitCloseReadiness(executionWorkspace);
+          git = inspected.git;
+          if (!inspected.statusInspectionSucceeded) {
+            result.skippedUndelivered += 1;
+            result.skippedGitUnverified += 1;
+            continue;
+          }
         }
         const assessment = await assessDelivery(workspace, git);
         if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
@@ -3018,16 +3139,51 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedNonTerminalTree += 1;
           continue;
         }
-        if (assessment.workspaceDirty) {
-          result.skippedUndelivered += 1;
-          continue;
+        let plannedCleanupReason = ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON;
+        let destructiveCleanup = true;
+        let cleanupHeadSha = assessment.workspaceHeadSha;
+        let deferDeliveryGate = isOpenRow && (sharedSession || archiveWithoutGit);
+        const mergedDelivery = assessment.deliveryState === "merged_via_pr"
+          || assessment.deliveryState === "merged_by_ancestry";
+        if (!deferDeliveryGate && cwdKind === "missing" && isOpenRow && !mergedDelivery) {
+          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | cwd does not exist`;
+          destructiveCleanup = false;
+          archiveWithoutGit = true;
+          deferDeliveryGate = true;
+        } else if (!deferDeliveryGate) {
+          if (assessment.workspaceDirty) {
+            result.skippedUndelivered += 1;
+            if (git?.hasDirtyTrackedFiles) result.skippedTrackedDirty += 1;
+            continue;
+          }
+          // SUP-14644: the verdict stays recorded-state only. A row with no PR
+          // product archives under a separate reason when the tree has no
+          // tracked changes and no commit is missing from the remote.
+          let nothingUnique = false;
+          if (
+            !mergedDelivery
+            && !assessment.hasPullRequestProduct
+            && git?.repoRoot
+            && git.workspacePath
+            && !git.hasDirtyTrackedFiles
+            && !git.hasUntrackedFiles
+          ) {
+            nothingUnique = await countCommitsMissingFromRemote(git.workspacePath) === 0;
+          }
+          if (!mergedDelivery && !nothingUnique) {
+            result.skippedUndelivered += 1;
+            if (!assessment.hasPullRequestProduct) result.skippedUnpushed += 1;
+            continue;
+          }
+          if (nothingUnique) {
+            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
+          }
         }
-        if (
-          assessment.deliveryState !== "merged_via_pr"
-          && assessment.deliveryState !== "merged_by_ancestry"
-        ) {
-          result.skippedUndelivered += 1;
-          continue;
+        if (archiveWithoutGit) {
+          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${
+            cwdKind === "missing" ? "cwd does not exist" : "cwd is not a git repository"
+          }`;
+          destructiveCleanup = false;
         }
         // Hold the archive during the cooldown window. The anchor is the most
         // recent terminal timestamp across the issue tree. A person can reopen
@@ -3104,6 +3260,41 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         if (await workspaceHasActiveRun(workspace)) {
           result.skippedActiveRun += 1;
           continue;
+        }
+        if (deferDeliveryGate && sharedSession && !archiveWithoutGit) {
+          const lastSession = !(await otherLiveSessionsReferencePath(workspace));
+          if (!lastSession) {
+            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | other active sessions reference this path`;
+            destructiveCleanup = false;
+          } else {
+            const inspected = await inspectGitCloseReadiness(executionWorkspace);
+            const inspectedGit = inspected.git;
+            const inspectedPath = inspectedGit?.repoRoot && inspectedGit.workspacePath
+              ? inspectedGit.workspacePath
+              : null;
+            const commitsMissing = inspectedPath
+              ? await countCommitsMissingFromRemote(inspectedPath)
+              : null;
+            if (!inspected.statusInspectionSucceeded || !inspectedPath) {
+              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | could not verify git status`;
+              destructiveCleanup = false;
+            } else if (inspectedGit?.hasDirtyTrackedFiles) {
+              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | tracked modifications`;
+              destructiveCleanup = false;
+            } else if (commitsMissing !== 0) {
+              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${COMMITS_MISSING_FROM_REMOTE_KEEP_REASON}`;
+              destructiveCleanup = false;
+            } else if (inspectedGit?.hasUntrackedFiles) {
+              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | untracked files`;
+              destructiveCleanup = false;
+            } else {
+              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
+              destructiveCleanup = true;
+              cleanupHeadSha = await runGit(["rev-parse", "HEAD"], inspectedPath)
+                .then((head) => head.stdout.trim() || null)
+                .catch(() => null);
+            }
+          }
         }
         if (
           workspace.status === "cleanup_failed"
@@ -3194,7 +3385,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               status: "archived",
               closedAt,
               cleanupEligibleAt: workspace.cleanupEligibleAt ?? closedAt,
-              cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
+              cleanupReason: plannedCleanupReason,
               metadata: archivedMetadata,
               updatedAt: closedAt,
             })
@@ -3287,41 +3478,63 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             sourceIssueId: archived.sourceIssueId,
             deliveryState: assessment.deliveryState,
             cleanupEligibleAt: archived.cleanupEligibleAt?.toISOString() ?? null,
-            cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
+            cleanupReason: plannedCleanupReason,
           },
         });
 
         const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
           archived.metadata as Record<string, unknown> | null,
         );
-        try {
-          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration);
-          if (cleanup.skippedReopened) result.skippedReopened += 1;
-          else if (!cleanup.cleaned) result.cleanupFailed += 1;
-          else result.archived += 1;
-        } catch (error) {
-          result.cleanupFailed += 1;
-          const failure = error instanceof Error ? error.message : String(error);
-          // Mark cleanup_failed only while the row is still closed at the
-          // generation this sweep captured. A reopen that raced after the failure
-          // raises the generation and restores the row; a later archive keeps the
-          // higher generation. The fenced write then skips, so stale
-          // cleanup-failure state never lands on a newer archive lifecycle.
-          await markTerminalCleanupFailedFenced({
-            workspaceId: archived.id,
-            capturedGeneration,
-            cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${failure}`,
-          });
-          await logActivity(db, {
-            companyId: archived.companyId,
-            actorType: "system",
-            actorId: "workspace_terminality_reaper",
-            action: "execution_workspace.issue_terminal_cleanup_failed",
-            entityType: "execution_workspace",
-            entityId: archived.id,
-            details: { sourceIssueId: archived.sourceIssueId, failure },
-          });
+        if (!destructiveCleanup) {
+          if (sharedSession) {
+            await detachIssuesFromClosedExecutionWorkspace(db, {
+              companyId: archived.companyId,
+              executionWorkspaceId: archived.id,
+            });
+          }
+          result.archived += 1;
+        } else {
+          try {
+            const cleanup = await cleanupTerminalWorkspace(archived, cleanupHeadSha, capturedGeneration);
+            if (cleanup.skippedReopened) result.skippedReopened += 1;
+            else if (!cleanup.cleaned) result.cleanupFailed += 1;
+            else result.archived += 1;
+          } catch (error) {
+            result.cleanupFailed += 1;
+            const failure = error instanceof Error ? error.message : String(error);
+            // Mark cleanup_failed only while the row is still closed at the
+            // generation this sweep captured. A reopen that raced after the failure
+            // raises the generation and restores the row; a later archive keeps the
+            // higher generation. The fenced write then skips, so stale
+            // cleanup-failure state never lands on a newer archive lifecycle.
+            await markTerminalCleanupFailedFenced({
+              workspaceId: archived.id,
+              capturedGeneration,
+              cleanupReason: `${plannedCleanupReason} | ${failure}`,
+            });
+            await logActivity(db, {
+              companyId: archived.companyId,
+              actorType: "system",
+              actorId: "workspace_terminality_reaper",
+              action: "execution_workspace.issue_terminal_cleanup_failed",
+              entityType: "execution_workspace",
+              entityId: archived.id,
+              details: { sourceIssueId: archived.sourceIssueId, failure },
+            });
+          }
         }
+      }
+      const skipped = result.skippedActiveRun
+        + result.skippedNonTerminalTree
+        + result.skippedUndelivered
+        + result.skippedUnpushed
+        + result.skippedTrackedDirty
+        + result.skippedGitUnverified
+        + result.skippedRace
+        + result.skippedReopened
+        + result.skippedCooldown;
+      if (result.archived === 0 && result.cleanupFailed === 0 && skipped > 0) {
+        logger.info(result, formatTerminalWorkspaceReaperSkipLogLine(result));
       }
       return result;
       } finally {
