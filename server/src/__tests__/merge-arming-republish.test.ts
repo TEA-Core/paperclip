@@ -659,6 +659,21 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(after!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: REVIEWED_HEAD });
   });
 
+  it("refuses head approval when the certified final delivery names a different PR (SUP-20624)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    await db.execute(sql`update ${issues} set execution_state = jsonb_set(execution_state,
+      '{approvalStatus,finalDelivery,number}', ${PR_NUMBER + 1}::int::text::jsonb) where id = ${issueId}`);
+    installHeadReviewTransport();
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed delta",
+    });
+    expect(response.status).toBe(409);
+    expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: REVIEWED_HEAD });
+  });
+
   it("approves an uncertified card head with a board receipt for exactly that head (SUP-20624)", async () => {
     const { companyId, issueId } = await seedHeadReview();
     currentActor = boardActor(companyId);
