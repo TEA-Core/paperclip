@@ -150,7 +150,7 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       }
       // Fork divergence (SUP-12693 done-tier close comment, slice 2c): upstream 9031516a7 posts
       // this reply only when the run finalizes, but the fork fixture closes with a reply-bearing
-      // Tier 1 comment mid-turn, so until the run settles the reply also renders as the live
+      // Tier 2 comment mid-turn, so until the run settles the reply also renders as the live
       // transcript interstitial and an unscoped getByText hits a strict-mode violation. Both
       // reply checks assert on the posted agent reply bubble, which is the response under test.
       // SUP-17651: wait on the real completion signal -- a recovered run (not the seeded
@@ -203,12 +203,12 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       }
       // SUP-17651 (round-4): the old unscoped getByText("Answered the pending
       // follow-up once.") matched every bubble carrying the streamed reply text
-      // -- the live transcript interstitial AND every posted Tier-1 done-close
+      // -- the live transcript interstitial AND every posted Tier-2 done-close
       // bubble -- so it strict-mode-violated the moment two of them were
       // present. A loaded CI shard produced exactly that legitimately: the
       // issue-graph liveness backstop healed a dependency wake on the seeded
       // blocked issue and dispatched a first recovered run whose fixture posted
-      // the Tier-1 done-close, and the user's "Please continue" comment then
+      // the Tier-2 done-close, and the user's "Please continue" comment then
       // woke a second run that posted an identical one (CI evidence: two
       // fixture spawns, two 200 done-close PATCHes, two posted bubbles in the
       // post-reload DOM; 2 recovered heartbeat_runs, 3 issue_comments). The
@@ -218,11 +218,11 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       // The duplicate dispatch/post is tracked in SUP-17780; this spec
       // deliberately does not gate on toHaveCount(1), for the same
       // cause-not-count reason as the pipeline poll above.
-      const postedReplyBubble = page.getByTestId("task-chat-agent-bubble").filter({ hasText: "Closed at Tier 1" });
+      const postedReplyBubble = page.getByTestId("task-chat-agent-bubble").filter({ hasText: "Closed at Tier 2" });
       await expect(postedReplyBubble).not.toHaveCount(0, { timeout: 45_000 });
       await expect(page.getByRole("status", { name: "Task recovery" })).toHaveCount(0);
       // SUP-17651 (round-3): the fixture closes the task with a mid-turn,
-      // reply-bearing Tier-1 done PATCH issued by the run itself
+      // reply-bearing Tier-2 done PATCH issued by the run itself
       // (acp-stop-agent.mjs), so the done close settles as part of the run's
       // finalization pipeline. On a loaded CI shard that pipeline -- the
       // dispatch in_progress promotion and the done close both landing around
