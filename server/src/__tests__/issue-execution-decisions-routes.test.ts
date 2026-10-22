@@ -26,6 +26,7 @@ import {
   issueThreadInteractions,
   issueDeliveryReceipts,
   issueDeliveryReceiptLinks,
+  summarySlots,
 } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -224,6 +225,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
+    await db.delete(summarySlots);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -390,6 +392,23 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }
   }
 
+  it("allows a project summary generation issue to finish without a delivery PR", async () => {
+    const fixture = await pendingDelivery({ missing: true });
+    await db.insert(summarySlots).values({
+      companyId: fixture.company.id,
+      scopeKind: "project",
+      scopeId: fixture.issue.projectId,
+      slotKey: "header",
+      generatingIssueId: fixture.issue.id,
+      status: "generating",
+    });
+
+    const response = await fixture.approve();
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await fixture.read()).status).toBe("done");
+  });
+
   it("refuses final draft delivery without completing or recording an approval", async () => {
     const fixture = await pendingDelivery({ draft: true });
     const response = await fixture.approve();
@@ -400,6 +419,37 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
     expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
     expect(fixture.writes).toEqual([]);
+  });
+
+  it("refuses a summary exemption when its slot binding is cleared during preflight", async () => {
+    const fixture = await pendingDelivery({ missing: true });
+    await db.insert(summarySlots).values({
+      companyId: fixture.company.id,
+      scopeKind: "project",
+      scopeId: fixture.issue.projectId,
+      slotKey: "header",
+      generatingIssueId: fixture.issue.id,
+      status: "generating",
+    });
+    const transact = db.transaction.bind(db);
+    let raced = false;
+    const spy = vi.spyOn(db, "transaction").mockImplementation((async (...args: Parameters<typeof db.transaction>) => {
+      if (!raced) {
+        raced = true;
+        await db.delete(summarySlots).where(eq(summarySlots.generatingIssueId, fixture.issue.id));
+      }
+      return transact(...args);
+    }) as typeof db.transaction);
+    try {
+      const response = await fixture.approve();
+      expect(response.status).toBe(409);
+      expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("names the delivery owner and leaves missing delivery pending", async () => {
