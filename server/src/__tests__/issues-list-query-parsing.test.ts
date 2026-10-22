@@ -56,4 +56,37 @@ describeEmbeddedPostgres("issue list status query parsing", () => {
   it("returns every status when ?status is absent", async () => {
     expect(await listStatuses("")).toEqual(["done", "in_progress", "todo"]);
   });
+
+  it("accepts the stable created sort field", async () => {
+    const company = await seedCompanyWithBoardAccess(ctx.db, "Created sort");
+    const olderIssueId = randomUUID();
+    const newerIssueId = randomUUID();
+    await ctx.db.insert(issues).values([
+      {
+        id: olderIssueId,
+        companyId: company.companyId,
+        title: "Older",
+        status: "todo",
+        priority: "medium",
+        createdAt: new Date("2026-05-01T10:00:00.000Z"),
+      },
+      {
+        id: newerIssueId,
+        companyId: company.companyId,
+        title: "Newer",
+        status: "todo",
+        priority: "medium",
+        createdAt: new Date("2026-05-02T10:00:00.000Z"),
+      },
+    ]);
+
+    const res = await request(routeApp(ctx.db, company.actor, issueRoutes))
+      .get(`/api/companies/${company.companyId}/issues?sortField=created&sortDir=asc`)
+      .expect(200);
+
+    expect((res.body as { id: string }[]).map((issue) => issue.id)).toEqual([
+      olderIssueId,
+      newerIssueId,
+    ]);
+  });
 });
