@@ -3498,6 +3498,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived.metadata as Record<string, unknown> | null,
         );
         if (!destructiveCleanup) {
+          const { stopRuntimeServicesForExecutionWorkspace } = await import("./workspace-runtime.js");
+          await stopRuntimeServicesForExecutionWorkspace({ db, executionWorkspaceId: archived.id });
           await detachIssuesFromClosedExecutionWorkspace(db, {
             companyId: archived.companyId,
             executionWorkspaceId: archived.id,

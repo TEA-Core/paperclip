@@ -6035,6 +6035,42 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       }
     }, 30_000);
 
+    it("stops the runtime services of a shared session archived as a record only", async () => {
+      const seeded = await seedTerminalWorkspace();
+      await markShared(seeded.executionWorkspaceId);
+      const [workspace] = await db
+        .select({ projectId: executionWorkspaces.projectId, sourceIssueId: executionWorkspaces.sourceIssueId })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      const serviceId = randomUUID();
+      await db.insert(workspaceRuntimeServices).values({
+        id: serviceId,
+        companyId: seeded.companyId,
+        projectId: workspace!.projectId,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        issueId: workspace!.sourceIssueId,
+        scopeType: "execution_workspace",
+        serviceName: "web",
+        status: "running",
+        lifecycle: "shared",
+        command: "pnpm dev",
+        cwd: seeded.worktreePath,
+        provider: "local_process",
+        healthStatus: "healthy",
+      });
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const [service] = await db
+        .select({ status: workspaceRuntimeServices.status })
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, serviceId));
+
+      expect(sweep.archived).toBe(1);
+      expect((await workspaceStatus(seeded.executionWorkspaceId))?.status).toBe("archived");
+      expect(service?.status).toBe("stopped");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
     it("keeps the worktree when an isolated row shares its path with a live session", async () => {
       const first = await seedAncestryTerminalWorkspace();
       await publishWorktree(first.worktreePath);
