@@ -360,50 +360,130 @@ describe.sequential("issue PATCH authz denial copy", () => {
   });
 
   it("allows the creator-assignee agent to PATCH its own issue", async () => {
+    const creatorAssigneeId = "22222222-2222-4222-8222-222222222222";
+    const responsibleUserId = "responsible-user";
+    const issueId = "11111111-1111-4111-8111-111111111111";
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("todo"),
       ...patch,
     }));
-    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
-      allowed: true,
-      action: input.action,
-      reason: "allow_self",
-      explanation: "Allowed because the actor owns the assigned issue.",
-    }));
+    mockAccessService.decide.mockImplementation(async (input: {
+      action?: string;
+      actor?: Record<string, unknown>;
+      resource?: Record<string, unknown>;
+      scope?: Record<string, unknown>;
+    }) => {
+      const contextMatches =
+        input.action === "issue:mutate" &&
+        input.actor?.type === "agent" &&
+        input.actor.agentId === creatorAssigneeId &&
+        input.actor.onBehalfOfUserId === responsibleUserId &&
+        input.resource?.issueId === issueId &&
+        input.resource.assigneeAgentId === creatorAssigneeId &&
+        input.resource.createdByAgentId === creatorAssigneeId &&
+        input.scope?.issueId === issueId &&
+        input.scope.assigneeAgentId === creatorAssigneeId &&
+        input.scope.createdByAgentId === creatorAssigneeId;
+      return {
+        allowed: contextMatches,
+        action: input.action,
+        reason: contextMatches ? "allow_self" : "deny_missing_grant",
+        explanation: contextMatches
+          ? "Allowed because the actor owns the assigned issue."
+          : "Missing issue write grant.",
+      };
+    });
 
     const res = await request(await installActor(
       createApp(),
-      agentActor("22222222-2222-4222-8222-222222222222", "responsible-user"),
+      agentActor(creatorAssigneeId, responsibleUserId),
     ))
-      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .patch(`/api/issues/${issueId}`)
       .send({ priority: "low" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:mutate",
+      actor: expect.objectContaining({
+        agentId: creatorAssigneeId,
+        onBehalfOfUserId: responsibleUserId,
+      }),
+      resource: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+      scope: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+    }));
     expect(mockIssueService.update).toHaveBeenCalled();
   });
 
   it("preserves responsible-user denial copy for a creator-assignee PATCH", async () => {
+    const creatorAssigneeId = "22222222-2222-4222-8222-222222222222";
+    const responsibleUserId = "responsible-user";
+    const issueId = "11111111-1111-4111-8111-111111111111";
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
-    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
-      allowed: false,
-      action: input.action,
-      reason: "deny_unsupported_action",
-      code: "RESPONSIBLE_USER_UNAUTHORIZED",
-      explanation: "Responsible user is not authorized for issue:mutate.",
-    }));
+    mockAccessService.decide.mockImplementation(async (input: {
+      action?: string;
+      actor?: Record<string, unknown>;
+      resource?: Record<string, unknown>;
+      scope?: Record<string, unknown>;
+    }) => {
+      const contextMatches =
+        input.action === "issue:mutate" &&
+        input.actor?.type === "agent" &&
+        input.actor.agentId === creatorAssigneeId &&
+        input.actor.onBehalfOfUserId === responsibleUserId &&
+        input.resource?.issueId === issueId &&
+        input.resource.assigneeAgentId === creatorAssigneeId &&
+        input.resource.createdByAgentId === creatorAssigneeId &&
+        input.scope?.issueId === issueId &&
+        input.scope.assigneeAgentId === creatorAssigneeId &&
+        input.scope.createdByAgentId === creatorAssigneeId;
+      return {
+        allowed: !contextMatches,
+        action: input.action,
+        reason: "deny_unsupported_action",
+        code: contextMatches ? "RESPONSIBLE_USER_UNAUTHORIZED" : undefined,
+        explanation: contextMatches
+          ? "Responsible user is not authorized for issue:mutate."
+          : "Missing issue write grant.",
+      };
+    });
 
     const res = await request(await installActor(
       createApp(),
-      agentActor("22222222-2222-4222-8222-222222222222", "responsible-user"),
+      agentActor(creatorAssigneeId, responsibleUserId),
     ))
-      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .patch(`/api/issues/${issueId}`)
       .send({ priority: "low" });
 
     expect(res.status).toBe(403);
     expect(res.body.details.code).toBe("issue_write_responsible_user_ceiling");
     expect(res.body.error).toContain("Responsible user");
     expect(res.body.details.code).not.toBe("issue_write_no_grant");
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:mutate",
+      actor: expect.objectContaining({
+        agentId: creatorAssigneeId,
+        onBehalfOfUserId: responsibleUserId,
+      }),
+      resource: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+      scope: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+    }));
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });
