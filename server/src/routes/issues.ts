@@ -21972,6 +21972,15 @@ export function issueRoutes(
       }
 
       for (const createdIssue of createdIssues) {
+        if (
+          await shouldSuppressCreatorSelfAssignmentWake(
+            issue.companyId,
+            actor,
+            createdIssue.assigneeAgentId,
+          )
+        ) {
+          continue;
+        }
         void queueIssueAssignmentWakeup({
           heartbeat,
           issue: createdIssue,

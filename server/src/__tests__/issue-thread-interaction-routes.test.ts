@@ -91,7 +91,7 @@ const mockReviewTransition = vi.hoisted(() => ({
 }));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([{ companyId: "company-1", agentId: CREATED_AGENT_ID, contextSnapshot: null }]).then(
+    Promise.resolve([{ companyId: "company-1", agentId: CREATED_AGENT_ID, status: "running", contextSnapshot: null }]).then(
       onFulfilled,
       onRejected,
     ),
@@ -817,6 +817,59 @@ describe.sequential("issue thread interaction routes", () => {
           sourceCommentId: "comment-1",
           sourceRunId: RUN_1,
         }),
+      }),
+    );
+  });
+
+  it("suppresses the created-task assignment wake for a live creator run", async () => {
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-live-creator",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "suggest_tasks",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        sourceCommentId: "comment-live-creator",
+        sourceRunId: RUN_1,
+        payload: { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] },
+        result: { version: 1, createdTasks: [{ clientKey: "task-1", issueId: "child-live-creator" }] },
+      },
+      createdIssues: [{
+        id: "child-live-creator",
+        companyId: "company-1",
+        assigneeAgentId: CREATED_AGENT_ID,
+        status: "todo",
+      }],
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: RUN_1,
+    });
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+    }));
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-1/accept")
+      .send({ selectedClientKeys: ["task-1"] });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        source: "automation",
+        reason: "issue_commented",
+      }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      CREATED_AGENT_ID,
+      expect.objectContaining({
+        source: "assignment",
+        reason: "issue_assigned",
       }),
     );
   });
