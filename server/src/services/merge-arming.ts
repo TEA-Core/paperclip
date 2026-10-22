@@ -3041,7 +3041,7 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
   owner: string,
   repo: string,
   headSha: string,
-): Promise<{ ok: true; approved: boolean } | { ok: false; reason: string }> {
+): Promise<{ ok: true; approved: boolean; controlPlaneApproved: boolean } | { ok: false; reason: string }> {
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
   if (candidates.length === 0) {
     const tokenResult = await resolveGitHubTokenForRepo(db, companyId, owner, repo);
@@ -3054,7 +3054,7 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
   let lastMessage: string | null = null;
   for (const candidate of candidates) {
     const result = await fetchHeadCommitStatuses(candidate.token, owner, repo, headSha);
-    if (result.ok) return { ok: true, approved: result.approved };
+    if (result.ok) return { ok: true, approved: result.approved, controlPlaneApproved: result.controlPlaneApproved };
     lastStatus = result.status;
     lastMessage = result.message;
     if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) {
@@ -3294,6 +3294,10 @@ export async function fetchLastMergeQueueEjectionViaTokenCandidates(
   return { ok: false, reason: `pr_error: HTTP ${lastStatus} ${lastMessage ?? ""}` };
 }
 
+// The `tea-core` App; the only identity scripts/ci/check-paperclip-approved.sh accepts as the
+// producer of `paperclip/approved` (its APPROVED_STATUS_CREATOR_ID default).
+const CONTROL_PLANE_STATUS_CREATOR_ID = "317012809";
+
 /**
  * SUP-15315: reads one head SHA's commit statuses from the GitHub statuses API
  * (GET, read-only) and reports whether a `paperclip/approved` status with state
@@ -3304,7 +3308,7 @@ async function fetchHeadCommitStatusesOnce(
   owner: string,
   repo: string,
   headSha: string,
-): Promise<{ ok: boolean; approved: boolean; status: number; message: string | null }> {
+): Promise<{ ok: boolean; approved: boolean; controlPlaneApproved: boolean; status: number; message: string | null }> {
   const url =
     `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
     `/statuses/${encodeURIComponent(headSha)}?per_page=100`;
@@ -3319,27 +3323,32 @@ async function fetchHeadCommitStatusesOnce(
   try {
     response = await ghFetch(url, { headers });
   } catch {
-    return { ok: false, approved: false, status: 0, message: "network_error" };
+    return { ok: false, approved: false, controlPlaneApproved: false, status: 0, message: "network_error" };
   }
 
   if (!response.ok) {
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     const message = body?.message as string | undefined;
-    return { ok: false, approved: false, status: response.status, message: message ?? null };
+    return { ok: false, approved: false, controlPlaneApproved: false, status: response.status, message: message ?? null };
   }
 
   const body = await response.json().catch(() => null);
   const list = Array.isArray(body) ? body : [];
   let approved = false;
+  let newestSeen = false;
+  let controlPlaneApproved = false;
   for (const raw of list) {
     if (typeof raw !== "object" || raw === null) continue;
     const status = raw as Record<string, unknown>;
-    if (status.context === "paperclip/approved" && status.state === "success") {
-      approved = true;
-      break;
+    if (status.context !== "paperclip/approved") continue;
+    if (status.state === "success") approved = true;
+    if (!newestSeen) {
+      newestSeen = true;
+      const creator = status.creator as Record<string, unknown> | null | undefined;
+      controlPlaneApproved = status.state === "success" && String(creator?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID;
     }
   }
-  return { ok: true, approved, status: response.status, message: null };
+  return { ok: true, approved, controlPlaneApproved, status: response.status, message: null };
 }
 
 /**
@@ -3353,7 +3362,7 @@ async function fetchHeadCommitStatuses(
   owner: string,
   repo: string,
   headSha: string,
-): Promise<{ ok: boolean; approved: boolean; status: number; message: string | null }> {
+): Promise<{ ok: boolean; approved: boolean; controlPlaneApproved: boolean; status: number; message: string | null }> {
   return withTransientReadRetry(() => fetchHeadCommitStatusesOnce(token, owner, repo, headSha));
 }
 
@@ -3778,7 +3787,7 @@ export type HeadBoundReleaseOutcome =
  * plane's own token) on exactly `headSha` of one PR. Nothing here consults the
  * card's ladder, so it works for the PR a card cannot be stamped for today. The
  * status is keyed by SHA, so a head that moves after the live read cannot
- * inherit it. A head that already carries `paperclip/approved` is left alone.
+ * inherit it. A head whose newest `paperclip/approved` is a control-plane success is left alone.
  */
 export async function publishHeadBoundRelease(
   db: Db,
@@ -3808,8 +3817,8 @@ export async function publishHeadBoundRelease(
     }
     const existing = await fetchHeadApprovedStatusViaTokenCandidates(db, companyId, owner, repo, input.headSha);
     if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: ${existing.reason}` };
-    if (existing.approved) {
-      return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published on this head" };
+    if (existing.controlPlaneApproved) {
+      return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
     }
     const write = await writeCommitStatusWithRetry(candidate.token, owner, repo, input.headSha, "", {
       description: input.description,

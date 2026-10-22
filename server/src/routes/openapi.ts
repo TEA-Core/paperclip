@@ -7783,7 +7783,7 @@ registry.registerPath({
     "line on a card-bound PR. Publishes paperclip/approved as the control plane with the description " +
     "'released by <actor> for <sha>: <reason>' for exactly headSha, whatever the card's state. 409 when " +
     "the card has no single linked open non-draft PR, or headSha is not the PR's live head (a different " +
-    "or stale head). Idempotent: a head that already carries paperclip/approved returns 200 " +
+    "or stale head). Idempotent: a head whose newest paperclip/approved is a control-plane success returns 200 " +
     "already_approved without a second write. Audited as issue.merge_release on a fresh write.",
   request: {
     params: z.object({ id: z.string() }),
