@@ -11451,6 +11451,7 @@ export function issueRoutes(
       publishActivity(decision.publication);
       const outcome = await publishApprovalStatus(tx as unknown as Db, issue.companyId, issue.id, issue.identifier ?? "", {
         expectedHeadSha: input.headSha, enforceDeliveryIdentity: true,
+        requireDeliveryReceipt: !readCertifiedFinalDelivery(state),
         headCertification: { owner: target.owner, repo: target.repo, number: target.number, headSha: input.headSha },
       });
       if (outcome.kind === "armed") {

@@ -493,6 +493,14 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       status: "done",
       executionState: {
         ...issue!.executionState,
+        lastDecisionId: "decision-42",
+        approvalStatus: {
+          publishedHeadSha: REVIEWED_HEAD, publishedAt: new Date().toISOString(),
+          finalDelivery: {
+            owner: OWNER, repo: REPO, number: PR_NUMBER, headSha: REVIEWED_HEAD,
+            displayName: `${OWNER}/${REPO}#${PR_NUMBER}`, decisionId: "decision-42",
+          },
+        },
         delivery: {
           branch: DELIVERY_BRANCH, headSha: REVIEWED_HEAD,
           repo: { owner: OWNER, repo: REPO }, prNumber: PR_NUMBER,
@@ -502,6 +510,22 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       },
     }).where(eq(issues.id, fixture.issueId));
     return fixture;
+  }
+
+  async function seedHeadReviewReceipt(companyId: string, issueId: string, headSha: string) {
+    const [mention] = await db.select().from(externalObjectMentions).where(eq(externalObjectMentions.sourceIssueId, issueId));
+    const receiptId = randomUUID();
+    await db.insert(issueDeliveryReceipts).values({
+      id: receiptId, companyId, sourceIssueId: issueId, provider: "github",
+      owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: PR_NUMBER, headSha,
+      branchName: DELIVERY_BRANCH, sourceDeliveryRecord: { fixture: true },
+      recoveryReason: "authorized test publication", authorizedByActorType: "user", authorizedByActorId: USER_ID,
+      idempotencyKey: `fixture-${issueId}-${headSha}`, state: "ready",
+    });
+    await db.insert(issueDeliveryReceiptLinks).values({
+      companyId, receiptId, sourceIssueId: issueId, externalObjectId: mention!.objectId, provider: "github",
+      owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: PR_NUMBER, headSha,
+    });
   }
 
   function installHeadReviewTransport(options: { moveAtPublish?: boolean; branch?: string } = {}) {
@@ -577,7 +601,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const { companyId, issueId } = await seedHeadReview();
     currentActor = boardActor(companyId);
     await db.execute(sql`update ${issues} set execution_state = jsonb_set(execution_state, '{approvalStatus}',
-      ${JSON.stringify({ approvedHeadSha: REVIEWED_HEAD, publishedHeadSha: null })}::jsonb) where id = ${issueId}`);
+      execution_state -> 'approvalStatus' || ${JSON.stringify({ approvedHeadSha: REVIEWED_HEAD, publishedHeadSha: null })}::jsonb) where id = ${issueId}`);
     installHeadReviewTransport();
     const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
       approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed the newly delivered head",
@@ -607,6 +631,45 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed this card's delivery only",
     });
     expect(response.status).toBe(200);
+    expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([url]) => url))
+      .toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${REVIEW_HEAD}`]);
+  });
+
+  async function makeHeadReviewUncertified(issueId: string) {
+    await db.execute(sql`update ${issues} set execution_state = jsonb_set(execution_state, '{approvalStatus}',
+      (execution_state -> 'approvalStatus') - 'finalDelivery') where id = ${issueId}`);
+  }
+
+  it.each([
+    { receipt: "none", reason: "delivery-receipt-missing" },
+    { receipt: "prior-head", reason: "delivery-receipt-head_mismatch" },
+  ])("refuses head approval of an uncertified card with $receipt receipt without a status write (SUP-20624)", async ({ receipt, reason }) => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    await makeHeadReviewUncertified(issueId);
+    if (receipt === "prior-head") await seedHeadReviewReceipt(companyId, issueId, REVIEWED_HEAD);
+    installHeadReviewTransport();
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed delta",
+    });
+    expect(response.status).toBe(409);
+    expect(JSON.stringify(response.body)).toContain(reason);
+    expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: REVIEWED_HEAD });
+  });
+
+  it("approves an uncertified card head with a board receipt for exactly that head (SUP-20624)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    await makeHeadReviewUncertified(issueId);
+    await seedHeadReviewReceipt(companyId, issueId, REVIEW_HEAD);
+    installHeadReviewTransport();
+    const response = await request(app).post(`/api/issues/${issueId}/merge-arming/approve-head`).send({
+      approvedHeadSha: REVIEWED_HEAD, headSha: REVIEW_HEAD, reason: "Reviewed delta",
+    });
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ outcome: "armed", headSha: REVIEW_HEAD });
     expect(mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([url]) => url))
       .toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${REVIEW_HEAD}`]);
   });
