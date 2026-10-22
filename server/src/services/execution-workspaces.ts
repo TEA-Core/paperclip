@@ -103,6 +103,8 @@ export type TerminalWorkspaceSweepSkipCounts = {
   skippedNonTerminalTree: number;
   skippedUndelivered: number;
   skippedUnpushed: number;
+  skippedRemoteCheckFailed: number;
+  skippedNoRepoRoot: number;
   skippedTrackedDirty: number;
   skippedGitUnverified: number;
   skippedRace: number;
@@ -119,6 +121,8 @@ export function formatTerminalWorkspaceReaperSkipLogLine(
     `skippedNonTerminalTree=${count(result.skippedNonTerminalTree)}`,
     `skippedUndelivered=${count(result.skippedUndelivered)}`,
     `skippedUnpushed=${count(result.skippedUnpushed)}`,
+    `skippedRemoteCheckFailed=${count(result.skippedRemoteCheckFailed)}`,
+    `skippedNoRepoRoot=${count(result.skippedNoRepoRoot)}`,
     `skippedTrackedDirty=${count(result.skippedTrackedDirty)}`,
     `skippedGitUnverified=${count(result.skippedGitUnverified)}`,
     `skippedRace=${count(result.skippedRace)}`,
@@ -2982,6 +2986,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           skippedNonTerminalTree: 0,
           skippedUndelivered: 0,
           skippedUnpushed: 0,
+          skippedRemoteCheckFailed: 0,
+          skippedNoRepoRoot: 0,
           skippedTrackedDirty: 0,
           skippedGitUnverified: 0,
           skippedRace: 0,
@@ -3074,6 +3080,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedNonTerminalTree: 0,
         skippedUndelivered: 0,
         skippedUnpushed: 0,
+        skippedRemoteCheckFailed: 0,
+        skippedNoRepoRoot: 0,
         skippedTrackedDirty: 0,
         skippedGitUnverified: 0,
         skippedRace: 0,
@@ -3160,23 +3168,23 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // product archives under a separate reason when the tree has no
           // tracked changes and no commit is missing from the remote.
           let nothingUnique = false;
-          if (
-            !mergedDelivery
-            && !assessment.hasPullRequestProduct
-            && git?.repoRoot
-            && git.workspacePath
-            && !git.hasDirtyTrackedFiles
-            && !git.hasUntrackedFiles
-          ) {
-            nothingUnique = await countCommitsMissingFromRemote(git.workspacePath) === 0;
+          if (!mergedDelivery && !assessment.hasPullRequestProduct) {
+            if (!git?.repoRoot || !git.workspacePath) {
+              result.skippedNoRepoRoot += 1;
+            } else if (!git.hasDirtyTrackedFiles && !git.hasUntrackedFiles) {
+              const commitsMissing = await countCommitsMissingFromRemote(git.workspacePath);
+              if (commitsMissing === null) result.skippedRemoteCheckFailed += 1;
+              else if (commitsMissing > 0) result.skippedUnpushed += 1;
+              else nothingUnique = true;
+            }
           }
           if (!mergedDelivery && !nothingUnique) {
             result.skippedUndelivered += 1;
-            if (!assessment.hasPullRequestProduct) result.skippedUnpushed += 1;
             continue;
           }
           if (nothingUnique) {
             plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
+            destructiveCleanup = workspace.providerType === "git_worktree";
           }
         }
         if (archiveWithoutGit) {
@@ -3261,6 +3269,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedActiveRun += 1;
           continue;
         }
+        if (isOpenRow && destructiveCleanup && !deferDeliveryGate && await otherLiveSessionsReferencePath(workspace)) {
+          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | other active sessions reference this path`;
+          destructiveCleanup = false;
+        }
         if (deferDeliveryGate && sharedSession && !archiveWithoutGit) {
           const lastSession = !(await otherLiveSessionsReferencePath(workspace));
           if (!lastSession) {
@@ -3289,7 +3301,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               destructiveCleanup = false;
             } else {
               plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
-              destructiveCleanup = true;
+              destructiveCleanup = workspace.providerType === "git_worktree";
               cleanupHeadSha = await runGit(["rev-parse", "HEAD"], inspectedPath)
                 .then((head) => head.stdout.trim() || null)
                 .catch(() => null);
@@ -3486,12 +3498,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived.metadata as Record<string, unknown> | null,
         );
         if (!destructiveCleanup) {
-          if (sharedSession) {
-            await detachIssuesFromClosedExecutionWorkspace(db, {
-              companyId: archived.companyId,
-              executionWorkspaceId: archived.id,
-            });
-          }
+          await detachIssuesFromClosedExecutionWorkspace(db, {
+            companyId: archived.companyId,
+            executionWorkspaceId: archived.id,
+          });
           result.archived += 1;
         } else {
           try {
@@ -3523,18 +3533,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             });
           }
         }
-      }
-      const skipped = result.skippedActiveRun
-        + result.skippedNonTerminalTree
-        + result.skippedUndelivered
-        + result.skippedUnpushed
-        + result.skippedTrackedDirty
-        + result.skippedGitUnverified
-        + result.skippedRace
-        + result.skippedReopened
-        + result.skippedCooldown;
-      if (result.archived === 0 && result.cleanupFailed === 0 && skipped > 0) {
-        logger.info(result, formatTerminalWorkspaceReaperSkipLogLine(result));
       }
       return result;
       } finally {

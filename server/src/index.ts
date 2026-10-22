@@ -1603,6 +1603,8 @@ async function startServerWithDatabaseTeardown(
             + result.skippedNonTerminalTree
             + result.skippedUndelivered
             + (result.skippedUnpushed ?? 0)
+            + (result.skippedRemoteCheckFailed ?? 0)
+            + (result.skippedNoRepoRoot ?? 0)
             + (result.skippedTrackedDirty ?? 0)
             + (result.skippedGitUnverified ?? 0)
             + result.skippedRace

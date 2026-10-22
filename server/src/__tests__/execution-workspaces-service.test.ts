@@ -36,6 +36,7 @@ import {
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
+  formatTerminalWorkspaceReaperSkipLogLine,
   TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
@@ -48,7 +49,6 @@ import {
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
-import { logger } from "../middleware/logger.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -5984,14 +5984,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect((await workspaceStatus(missing.executionWorkspaceId))?.status).toBe("archived");
     }, 20_000);
 
-    it("removes a worktree only when the last session referencing its path is archived", async () => {
-      const first = await seedAncestryTerminalWorkspace();
-      await publishWorktree(first.worktreePath);
-      await markShared(first.executionWorkspaceId);
-      await db.update(executionWorkspaces).set({
-        updatedAt: new Date("2020-01-01T00:00:00Z"),
-      }).where(eq(executionWorkspaces.id, first.executionWorkspaceId));
-
+    async function seedLiveSessionOnPath(first: { companyId: string; projectId: string; worktreePath: string }) {
       const secondId = randomUUID();
       const secondIssueId = randomUUID();
       const issuePrefix = `P${first.companyId.slice(0, 8).toUpperCase()}`;
@@ -6022,6 +6015,53 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         executionWorkspaceId: secondId,
       });
       await db.update(executionWorkspaces).set({ sourceIssueId: secondIssueId }).where(eq(executionWorkspaces.id, secondId));
+      return secondId;
+
+    }
+
+    it("archives a local_fs session on a clean pushed git cwd as a record only", async () => {
+      for (const mode of ["shared_workspace", "isolated_workspace"] as const) {
+        const seeded = await seedAncestryTerminalWorkspace();
+        await publishWorktree(seeded.worktreePath);
+        await db.update(executionWorkspaces).set({ mode, providerType: "local_fs" })
+          .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+        const sweep = await freshSweep().sweepTerminalWorkspaces();
+        const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+        expect(sweep.cleanupFailed).toBe(0);
+        expect(row?.status).toBe("archived");
+        await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      }
+    }, 30_000);
+
+    it("keeps the worktree when an isolated row shares its path with a live session", async () => {
+      const first = await seedAncestryTerminalWorkspace();
+      await publishWorktree(first.worktreePath);
+      await db.update(executionWorkspaces).set({
+        updatedAt: new Date("2020-01-01T00:00:00Z"),
+      }).where(eq(executionWorkspaces.id, first.executionWorkspaceId));
+      const liveId = await seedLiveSessionOnPath(first);
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces(1);
+      const row = await workspaceStatus(first.executionWorkspaceId);
+
+      expect(sweep.archived).toBe(1);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toContain("other active sessions reference this path");
+      expect((await workspaceStatus(liveId))?.status).toBe("active");
+      await expect(fs.access(first.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("removes a worktree only when the last session referencing its path is archived", async () => {
+      const first = await seedAncestryTerminalWorkspace();
+      await publishWorktree(first.worktreePath);
+      await markShared(first.executionWorkspaceId);
+      await db.update(executionWorkspaces).set({
+        updatedAt: new Date("2020-01-01T00:00:00Z"),
+      }).where(eq(executionWorkspaces.id, first.executionWorkspaceId));
+
+      const secondId = await seedLiveSessionOnPath(first);
 
       const service = freshSweep();
       const earlier = await service.sweepTerminalWorkspaces(1);
@@ -6052,24 +6092,28 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 20_000);
 
     it("puts a counter per skip reason on the terminal reaper skip log line", async () => {
-      const seeded = await seedTerminalWorkspace();
-      const info = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
-      try {
-        const sweep = await freshSweep().sweepTerminalWorkspaces();
-        expect(sweep.skippedUnpushed).toBe(1);
-        const line = info.mock.calls
-          .map((call) => call.map((part) => typeof part === "string" ? part : "").join(" "))
-          .find((text) => text.includes("terminal issue workspace reaper skipped all candidates"));
-        expect(line).toEqual(expect.stringContaining("skippedActiveRun="));
-        expect(line).toEqual(expect.stringContaining("skippedNonTerminalTree="));
-        expect(line).toEqual(expect.stringContaining("skippedUndelivered="));
-        expect(line).toEqual(expect.stringContaining("skippedUnpushed=1"));
-        expect(line).toEqual(expect.stringContaining("skippedTrackedDirty="));
-        expect(line).toEqual(expect.stringContaining("skippedRace="));
-        expect(line).toEqual(expect.stringContaining("skippedReopened="));
-        expect(line).toEqual(expect.stringContaining("skippedCooldown="));
-      } finally {
-        info.mockRestore();
+      await seedTerminalWorkspace();
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      expect(sweep).toMatchObject({
+        skippedUnpushed: 1,
+        skippedRemoteCheckFailed: 0,
+        skippedNoRepoRoot: 0,
+      });
+      const line = formatTerminalWorkspaceReaperSkipLogLine(sweep);
+      for (const counter of [
+        "skippedActiveRun=0",
+        "skippedNonTerminalTree=0",
+        "skippedUndelivered=1",
+        "skippedUnpushed=1",
+        "skippedRemoteCheckFailed=0",
+        "skippedNoRepoRoot=0",
+        "skippedTrackedDirty=0",
+        "skippedGitUnverified=0",
+        "skippedRace=0",
+        "skippedReopened=0",
+        "skippedCooldown=0",
+      ]) {
+        expect(line).toEqual(expect.stringContaining(counter));
       }
 
       expect(TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT).toBeGreaterThanOrEqual(200);
