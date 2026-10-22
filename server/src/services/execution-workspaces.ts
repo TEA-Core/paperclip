@@ -3300,11 +3300,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | untracked files`;
               destructiveCleanup = false;
             } else {
-              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
-              destructiveCleanup = workspace.providerType === "git_worktree";
-              cleanupHeadSha = await runGit(["rev-parse", "HEAD"], inspectedPath)
-                .then((head) => head.stdout.trim() || null)
+              const headSha = await readGitStdout(["rev-parse", "HEAD"], inspectedPath).catch(() => null);
+              const currentBranch = await readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], inspectedPath)
                 .catch(() => null);
+              if (
+                workspace.providerType === "git_worktree"
+                && (!headSha || (workspace.branchName && currentBranch !== workspace.branchName))
+              ) {
+                plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | branch changed or HEAD could not be verified`;
+                destructiveCleanup = false;
+              } else {
+                plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
+                destructiveCleanup = workspace.providerType === "git_worktree";
+                cleanupHeadSha = headSha;
+              }
             }
           }
         }

@@ -6071,6 +6071,22 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
     }, 20_000);
 
+    it("archives a shared session as a record only when its worktree moved off the recorded branch", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await publishWorktree(seeded.worktreePath);
+      await markShared(seeded.executionWorkspaceId);
+      await runGit(seeded.worktreePath, ["checkout", "--detach"]);
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+      expect(sweep.cleanupFailed).toBe(0);
+      expect(sweep.archived).toBe(1);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toContain("branch changed or HEAD could not be verified");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
     it("keeps the worktree when an isolated row shares its path with a live session", async () => {
       const first = await seedAncestryTerminalWorkspace();
       await publishWorktree(first.worktreePath);
