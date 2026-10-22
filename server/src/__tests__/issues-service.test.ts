@@ -1479,6 +1479,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       issueId: firstIssueId,
       body: "Activity after the first page was read",
       createdAt: new Date("2026-05-04T10:00:00.000Z"),
+      updatedAt: new Date("2026-05-04T10:00:00.000Z"),
     });
     const secondPage = await svc.list(companyId, { limit: 2, offset: 2 });
 
