@@ -105,6 +105,12 @@ export type TerminalWorkspaceSweepSkipCounts = {
   skippedCooldown: number;
 };
 
+// What the merged-delivery cleanup would remove, as a dry run reports it.
+type TerminalCleanupRemoval = {
+  kind: "worktree" | "directory" | "stale_worktree_entries" | "worktree_instance" | "branch";
+  target: string;
+};
+
 export function formatTerminalWorkspaceReaperSkipLogLine(
   result: Partial<TerminalWorkspaceSweepSkipCounts>,
 ): string {
@@ -166,6 +172,7 @@ function emptyTerminalSweepResult() {
     archived: 0,
     cleanupFailed: 0,
     wouldArchive: 0,
+    wouldFailCleanup: 0,
     skippedActiveRun: 0,
     skippedNonTerminalTree: 0,
     skippedUndelivered: 0,
@@ -2066,6 +2073,119 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
   }
 
+  // Dry run only. Predicts what runTerminalWorkspaceCleanup would do to this row
+  // without running it: what it would remove, and why it would refuse and leave
+  // the row cleanup_failed. A refusal at the worktree removal comes after the
+  // instance cleanup, so it can still list removals. It mirrors the refusal
+  // points of that cleanup and of cleanupExecutionWorkspaceArtifacts, and every
+  // probe is read-only. A change after the preview is a race that the live pass
+  // reports on its own.
+  async function previewTerminalWorkspaceCleanup(
+    workspace: ExecutionWorkspaceRow,
+    expectedHeadSha: string | null,
+  ): Promise<{ wouldRemove: TerminalCleanupRemoval[]; refusal: string | null }> {
+    const wouldRemove: TerminalCleanupRemoval[] = [];
+    const refuse = (refusal: string) => ({ wouldRemove, refusal });
+    const workspacePath = workspace.providerRef ?? workspace.cwd;
+    if (!workspacePath) return { wouldRemove, refusal: null };
+    const isDirectory = (value: string) => fs.stat(value).then(
+      (stat) => stat.isDirectory(),
+      (error) => {
+        if (isAbsentFilesystemPath(error)) return false;
+        throw error;
+      },
+    );
+    const metadata = workspace.metadata as Record<string, unknown> | null;
+    try {
+      const exists = await isDirectory(workspacePath);
+      const projectWorkspaceCwd = workspace.projectWorkspaceId
+        ? await db
+            .select({ cwd: projectWorkspaces.cwd })
+            .from(projectWorkspaces)
+            .where(and(
+              eq(projectWorkspaces.companyId, workspace.companyId),
+              eq(projectWorkspaces.id, workspace.projectWorkspaceId),
+            ))
+            .then((rows) => rows[0]?.cwd ?? null)
+        : null;
+      if (workspace.providerType === "local_fs" && metadata?.createdByRuntime === true) {
+        if (!exists) return { wouldRemove, refusal: null };
+        const resolvedPath = path.resolve(workspacePath);
+        const projectPath = projectWorkspaceCwd ? path.resolve(projectWorkspaceCwd) : null;
+        if (projectPath && (projectPath === resolvedPath || projectPath.startsWith(`${resolvedPath}${path.sep}`))) {
+          return refuse(`"${workspacePath}" contains the project workspace`);
+        }
+        wouldRemove.push({ kind: "directory", target: resolvedPath });
+        return { wouldRemove, refusal: null };
+      }
+      if (workspace.providerType !== "git_worktree") {
+        return exists
+          ? refuse(`cleanup removes nothing for a ${workspace.providerType} workspace, so "${workspacePath}" stays`)
+          : { wouldRemove, refusal: null };
+      }
+
+      if (exists) {
+        // acquireGitWorktreeCleanupLock fails when any of these lock files exists.
+        const branchRef = await readGitStdout(["symbolic-ref", "--quiet", "HEAD"], workspacePath).catch(() => null);
+        for (const name of ["index.lock", "HEAD.lock", ...(branchRef ? [`${branchRef}.lock`] : [])]) {
+          const lockPath = await readGitStdout(["rev-parse", "--git-path", name], workspacePath);
+          if (lockPath && await pathExists(path.resolve(workspacePath, lockPath))) {
+            return refuse(`git lock "${path.resolve(workspacePath, lockPath)}" is held`);
+          }
+        }
+      }
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      // resolveGitRepoRootForWorkspaceCleanup: the project workspace first, then the worktree.
+      const commonDirFrom = async (cwd: string) => {
+        const commonDir = await readGitStdout(["rev-parse", "--git-common-dir"], cwd).catch(() => null);
+        return commonDir ? path.dirname(path.resolve(cwd, commonDir)) : null;
+      };
+      const repoRoot = (projectWorkspaceCwd ? await commonDirFrom(path.resolve(projectWorkspaceCwd)) : null)
+        ?? await commonDirFrom(workspacePath);
+      if (exists) {
+        if (await pathExists(path.join(workspacePath, ".paperclip", ".env"))) {
+          wouldRemove.push({ kind: "worktree_instance", target: path.join(workspacePath, ".paperclip", ".env") });
+        }
+        if (!repoRoot) return refuse(`the git repo root of "${workspacePath}" could not be resolved`);
+        if (!(await isDirectory(repoRoot))) {
+          // With the base repo gone, the cleanup removes the directory directly.
+          wouldRemove.push({ kind: "directory", target: path.resolve(workspacePath) });
+        } else {
+          // `git worktree remove` without --force refuses the main working tree,
+          // a path git does not list as a worktree, and a locked worktree.
+          const listing = await readGitStdout(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
+          const realPath = (value: string) => fs.realpath(value).catch(() => path.resolve(value));
+          const target = await realPath(workspacePath);
+          const entries = await Promise.all((listing ?? "").split(/\n\s*\n/).map(async (block) => {
+            const lines = block.split("\n");
+            const listed = lines.find((line) => line.startsWith("worktree "))?.slice("worktree ".length);
+            return {
+              path: listed ? await realPath(listed) : null,
+              locked: lines.find((line) => line === "locked" || line.startsWith("locked ")),
+            };
+          }));
+          const index = entries.findIndex((entry) => entry.path === target);
+          if (index === -1) return refuse(`"${workspacePath}" is not a registered worktree of ${repoRoot}`);
+          if (index === 0) return refuse(`"${workspacePath}" is the main working tree of ${repoRoot}`);
+          const locked = entries[index]!.locked;
+          if (locked) {
+            const lockReason = locked.slice("locked".length).trim();
+            return refuse(`the worktree is locked${lockReason ? `: ${lockReason}` : ""}`);
+          }
+          wouldRemove.push({ kind: "worktree", target: path.resolve(workspacePath) });
+        }
+      } else if (repoRoot && await isDirectory(repoRoot)) {
+        wouldRemove.push({ kind: "stale_worktree_entries", target: repoRoot });
+      }
+      if (repoRoot && workspace.branchName && isRuntimeOwnedGitBranch(metadata)) {
+        wouldRemove.push({ kind: "branch", target: workspace.branchName });
+      }
+      return { wouldRemove, refusal: null };
+    } catch (error) {
+      return refuse(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   // Write the cleanup-failed status under the per-workspace lifecycle lock, but
   // only while the row is still closed at the generation the reaper captured. The
   // reaper calls this from its catch handler after a cleanup threw. The cleanup
@@ -3061,9 +3181,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // take, and writes nothing.
       const logDryRun = (
         workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">,
-        action: "archive" | "keep" | "clear_stale_reopen_pending",
+        action: "archive_record_only" | "archive_with_cleanup" | "cleanup_refused" | "clear_reopen_pending" | "keep",
         reason: string,
-        recordOnly?: boolean,
+        details: Record<string, unknown> = {},
       ) => {
         if (!dryRun) return;
         logger.info(
@@ -3072,10 +3192,29 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             path: readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd),
             action,
             reason,
-            ...(recordOnly === undefined ? {} : { recordOnly }),
+            ...details,
           },
           "terminal issue workspace reaper dry run",
         );
+      };
+      // The live pass archives a row whose cleanup succeeds and leaves a row
+      // whose cleanup refuses as cleanup_failed.
+      const logCleanupPreview = async (
+        workspace: ExecutionWorkspaceRow,
+        expectedHeadSha: string | null,
+        details: Record<string, unknown> = {},
+      ) => {
+        const preview = await previewTerminalWorkspaceCleanup(workspace, expectedHeadSha);
+        if (preview.refusal) {
+          result.wouldFailCleanup += 1;
+          logDryRun(workspace, "cleanup_refused", preview.refusal, { ...details, wouldRemove: preview.wouldRemove });
+        } else {
+          result.wouldArchive += 1;
+          logDryRun(workspace, "archive_with_cleanup", ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON, {
+            ...details,
+            wouldRemove: preview.wouldRemove,
+          });
+        }
       };
       const keep = (
         workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">,
@@ -3091,7 +3230,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           workspace.metadata as Record<string, unknown> | null,
         );
         if (!TERMINAL_ISSUE_STATUSES.has(workspace.sourceIssueStatus)) {
-          if (reopenPending && !dryRun) {
+          if (reopenPending && dryRun) {
+            result.skippedNonTerminalTree += 1;
+            logDryRun(workspace, "clear_reopen_pending", "source issue is not terminal");
+            continue;
+          }
+          if (reopenPending) {
             // Candidate selection is a snapshot. Confirm the source is still
             // non-terminal under the lifecycle lock before clearing its fence.
             await clearReopenPendingConsumptionUnderLock(workspace.id, {
@@ -3132,7 +3276,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         const assessment = await assessDelivery(workspace, git);
         if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
-          if (reopenPending && !dryRun) {
+          if (reopenPending && dryRun) {
+            result.skippedNonTerminalTree += 1;
+            logDryRun(workspace, "clear_reopen_pending", "issue tree is not terminal");
+            continue;
+          }
+          if (reopenPending) {
             await clearReopenPendingConsumptionUnderLock(workspace.id, {
               expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
                 workspace.metadata as Record<string, unknown> | null,
@@ -3230,7 +3379,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             continue;
           }
           if (dryRun) {
-            logDryRun(workspace, "clear_stale_reopen_pending", "reopen-pending flag outlived its grace period");
+            logDryRun(workspace, "clear_reopen_pending", "reopen-pending flag outlived its grace period");
             continue;
           }
           // The reopen-pending flag outlived its consumption window and no run owns
@@ -3271,8 +3420,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           && isStuckGitSpawnEnoentCleanupReason(workspace.cleanupReason)
         ) {
           if (dryRun) {
-            result.wouldArchive += 1;
-            logDryRun(workspace, "archive", `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | retry stuck git spawn ENOENT cleanup`, false);
+            await logCleanupPreview(workspace, assessment.workspaceHeadSha, { retriedStuckSpawnEnoent: true });
             continue;
           }
           result.eligible += 1;
@@ -3339,9 +3487,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
           continue;
         }
-        if (dryRun) {
+        if (dryRun && recordOnlyReason) {
           result.wouldArchive += 1;
-          logDryRun(workspace, "archive", cleanupReason, recordOnlyReason !== null);
+          logDryRun(workspace, "archive_record_only", cleanupReason);
+          continue;
+        }
+        if (dryRun) {
+          await logCleanupPreview(workspace, assessment.workspaceHeadSha);
           continue;
         }
         result.eligible += 1;

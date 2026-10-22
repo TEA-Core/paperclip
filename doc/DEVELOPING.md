@@ -1249,9 +1249,25 @@ Environment overrides:
 - `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) makes the reaper
   write nothing to the database or disk. It logs
   `terminal issue workspace reaper dry run` once per candidate with `action`
-  (`archive` or `keep`) and `reason`, then a
-  `terminal issue workspace reaper dry run summary` line whose `wouldArchive`
-  counts the rows a live sweep would archive.
+  and `reason`. The actions are:
+  - `archive_record_only`: the row is archived as a database record only.
+  - `archive_with_cleanup`: a row with a recorded merged pull request, or a
+    retried `spawn git ENOENT` row (`retriedStuckSpawnEnoent`). It is archived
+    and the existing cleanup removes what `wouldRemove` lists: a `worktree`, a
+    `directory` (removed recursively), `stale_worktree_entries` (`git worktree
+    prune` in that repo), a `worktree_instance` named by that env file, or a
+    runtime-owned `branch`.
+  - `cleanup_refused`: that cleanup would refuse, for example on a locked
+    worktree or a held git lock, and the row ends `cleanup_failed`. `reason`
+    says why. `wouldRemove` lists anything the cleanup still removes before it
+    refuses.
+  - `clear_reopen_pending`: the live sweep clears a reopen fence and keeps the
+    row.
+  - `keep`: the row stays as it is.
+
+  A `terminal issue workspace reaper dry run summary` line follows. Its
+  `wouldArchive` and `wouldFailCleanup` equal the live sweep's `archived` and
+  `cleanupFailed` when nothing changes in between.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,
