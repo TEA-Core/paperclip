@@ -1898,6 +1898,115 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(calls[0]![0]).toBe(POST_STATUS_URL);
     });
 
+    it.each(
+      (["blobs", "patch", "tree"] as const).flatMap((equivalence) => (
+        ["certified", "uncertified-new-head-receipt", "uncertified-no-receipt", "uncertified-prior-head-receipt"] as const
+      ).map((binding) => [equivalence, binding] as const)),
+    )("%s-equivalent head move on a %s card keeps the delivery receipt invariant (SUP-20624)", async (equivalence, binding) => {
+      const priorHead = "e".repeat(40);
+      const certified = binding === "certified";
+      const stamps = certified || binding === "uncertified-new-head-receipt";
+      const issueId = await insertIssue({
+        status: "done",
+        executionState: approvedState({
+          delivery: {
+            branch: "SUP-42-branch",
+            headSha: priorHead,
+            repo: { owner: "TEA-Core", repo: "paperclip" },
+            prNumber: 42,
+            prUrl: "https://github.com/TEA-Core/paperclip/pull/42",
+          },
+          approvalStatus: { publishedHeadSha: priorHead, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+      if (certified) {
+        await insertMention(issueId);
+        await certifyIssue(issueId, priorHead);
+      } else if (binding === "uncertified-no-receipt") {
+        await insertMention(issueId);
+      } else {
+        await seedAuthorizedDeliveryReceipt(
+          issueId, binding === "uncertified-new-head-receipt" ? NEW_HEAD : priorHead, "SUP-42-branch",
+        );
+      }
+      const approvedFile = {
+        filename: "config.txt", status: "modified", sha: "old-blob",
+        additions: 1, deletions: 1, patch: "@@ -1 +1 @@\n-before\n+reviewed",
+      };
+      const liveFile = {
+        ...approvedFile,
+        sha: equivalence === "blobs" ? "old-blob" : "new-blob",
+        patch: equivalence === "tree"
+          ? "@@ -1 +1 @@\n-before\n+different"
+          : "@@ -9 +9 @@\n-before\n+reviewed",
+      };
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { statuses: [] } },
+        { url: `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${priorHead}`, body: { files: [approvedFile] } },
+        { url: LIVE_DIFF_URL, body: { files: [liveFile] } },
+        { url: `https://api.github.com/repos/TEA-Core/paperclip/git/commits/${priorHead}`, body: { sha: priorHead, tree: { sha: "same-tree" } } },
+        { url: `https://api.github.com/repos/TEA-Core/paperclip/git/commits/${NEW_HEAD}`, body: { sha: NEW_HEAD, tree: { sha: "same-tree" } } },
+        { url: POST_STATUS_URL, body: { id: 12346 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.status).toBe("done");
+      expect(row!.executionState!.completedStageIds).toEqual([APPROVAL_STAGE_ID]);
+      if (stamps) {
+        expect(summary.republished).toBe(1);
+        expect(postStatusCalls().map((call) => call[0])).toEqual([POST_STATUS_URL]);
+        expect(row!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: NEW_HEAD });
+      } else {
+        const reason = binding === "uncertified-no-receipt" ? "delivery-receipt-missing" : "delivery-receipt-head_mismatch";
+        expect(summary.republished).toBe(0);
+        expect(summary.rearmed).toBe(0);
+        expect(summary.skippedDetails.some((detail) => detail.includes(reason))).toBe(true);
+        expect(postStatusCalls()).toEqual([]);
+        expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+        expect(row!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: priorHead });
+      }
+      expect(row!.executionState!.delivery).toMatchObject({ headSha: priorHead });
+    });
+
+    it.each([
+      { name: "changed content", patch: "@@ -1 +1 @@\n-before\n+unreviewed", additions: 1 },
+      { name: "significant whitespace", patch: "@@ -1 +1 @@\n-before\n+ reviewed", additions: 1 },
+      { name: "truncated hunk", patch: "@@ -1,3 +1,3 @@\n-before\n+reviewed", additions: 1 },
+      { name: "truncated numstat", patch: "@@ -1 +1 @@\n-before\n+reviewed", additions: 2 },
+      { name: "omitted patch", patch: undefined, additions: 1 },
+    ])("refuses automatic patch certification for $name (SUP-20624)", async ({ patch, additions }) => {
+      const issueId = await insertIssue({
+        status: "done",
+        executionState: approvedState({ approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT } }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { statuses: [] } },
+        { url: APPROVED_DIFF_URL, body: { files: [{
+          filename: "config.txt", status: "modified", sha: "old", additions: 1, deletions: 1,
+          patch: "@@ -1 +1 @@\n-before\n+reviewed",
+        }] } },
+        { url: LIVE_DIFF_URL, body: { files: [{
+          filename: "config.txt", status: "modified", sha: "new", additions, deletions: 1, patch,
+        }] } },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
+      ]);
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(postStatusCalls()).toEqual([]);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: APPROVED_HEAD });
+    });
+
     it("republishes exactly once on a byte-identical head move (guard A passes)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({

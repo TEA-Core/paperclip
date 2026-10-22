@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import { z } from "zod";
 import {
   companies,
   externalObjectMentions,
@@ -548,27 +549,19 @@ async function selectOpenPendingCandidate(
   return { anchor: surviving.headShaAtApproval };
 }
 
-/**
- * Build a `filename -> blob sha` map from a GitHub compare response, or null
- * when the response is unusable. `files` entries carry the blob SHA of each
- * side of the diff; equality of two maps therefore means byte-identical
- * content per file. A `truncated` compare (GitHub caps `files` at 300) is not
- * a complete diff and must fail closed.
- */
-function fileMapFromCompare(body: unknown): Map<string, string> | null {
-  const record = body as Record<string, unknown> | null;
-  if (!record || record.truncated === true) return null;
-  const files = record.files;
-  if (!Array.isArray(files)) return null;
-  const map = new Map<string, string>();
-  for (const file of files as Array<Record<string, unknown>>) {
-    const filename = file.filename;
-    const sha = file.sha;
-    if (typeof filename !== "string" || typeof sha !== "string") return null;
-    map.set(filename, sha);
-  }
-  return map;
-}
+// GitHub caps compare files at 300 without a reliable truncation flag.
+// A capped, malformed, or duplicate-path list is not positive evidence.
+const approvalCompareSchema = z.object({
+  truncated: z.literal(false).optional(),
+  files: z.array(z.object({
+    filename: z.string(), sha: z.string(),
+    status: z.string().optional(), previous_filename: z.string().optional(),
+    patch: z.string().optional(), additions: z.number().int().optional(), deletions: z.number().int().optional(),
+  }).passthrough()).max(299).refine((files) => new Set(files.map((file) => file.filename)).size === files.length),
+});
+const approvalCommitTreeSchema = z.object({
+  sha: z.string(), tree: z.object({ sha: z.string().min(1) }),
+});
 
 /**
  * Bounded, human-readable summary of the content the LIVE head introduces that
@@ -611,6 +604,130 @@ function diffSubstanceChange(
   return changed.length > 3
     ? `${shown}, ... (${changed.length} file(s) differ)`
     : `${shown} (${changed.length} file(s) differ)`;
+}
+
+/**
+ * Conservative patch identity: ignore hunk positions, but preserve every byte
+ * of context and changed content (including whitespace significant to code).
+ * GitHub can omit/truncate patches: validate every hunk and the full numstat
+ * before treating one as evidence. Binary/mode-only changes need blob/tree proof.
+ */
+function patchIdentity(file: Record<string, unknown>): string | null {
+  if (file.status !== "modified" || typeof file.patch !== "string"
+    || !Number.isInteger(file.additions) || !Number.isInteger(file.deletions)) return null;
+  const canonical: string[] = [];
+  let oldRemaining = 0;
+  let newRemaining = 0;
+  let additions = 0;
+  let deletions = 0;
+  let hunks = 0;
+  const lines = file.patch.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  for (const line of lines) {
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@.*$/.exec(line);
+    if (hunk) {
+      if (oldRemaining !== 0 || newRemaining !== 0) return null;
+      oldRemaining = hunk[1] === undefined ? 1 : Number(hunk[1]);
+      newRemaining = hunk[2] === undefined ? 1 : Number(hunk[2]);
+      canonical.push("@@");
+      hunks++;
+      continue;
+    }
+    if (hunks === 0) return null;
+    if (line.startsWith("+")) { newRemaining--; additions++; }
+    else if (line.startsWith("-")) { oldRemaining--; deletions++; }
+    else if (line.startsWith(" ")) { oldRemaining--; newRemaining--; }
+    else if (line !== "\\ No newline at end of file") return null;
+    if (oldRemaining < 0 || newRemaining < 0) return null;
+    canonical.push(line);
+  }
+  if (hunks === 0 || oldRemaining !== 0 || newRemaining !== 0
+    || additions !== file.additions || deletions !== file.deletions) return null;
+  return canonical.join("\n");
+}
+
+export interface ApprovalHeadDelta {
+  approvedHeadSha: string;
+  headSha: string;
+  baseSha: string | null;
+  equivalence: "blobs" | "patch" | "tree" | null;
+  substanceChange: string | null;
+  files: Array<{
+    filename: string;
+    approved: Record<string, unknown> | null;
+    live: Record<string, unknown> | null;
+  }>;
+}
+
+/** The same Guard A proof and inspectable delta for automatic and explicit review. */
+export async function readApprovalHeadDelta(
+  db: Db,
+  companyId: string,
+  target: { owner: string; repo: string },
+  approvedHeadSha: string,
+  headSha: string,
+  baseSha: string | null,
+): Promise<{ kind: "verified"; delta: ApprovalHeadDelta } | { kind: "unverifiable"; reason: string; detail: string }> {
+  const read = (path: string) => ghReadJson(db, companyId, target.owner, target.repo, path);
+  let refusal = { kind: "unverifiable" as const, reason: "guard-a:no-base-ref", detail: "guard-a: no base SHA; cannot compute diff-vs-base" };
+  let delta: ApprovalHeadDelta | null = null;
+  if (baseSha) {
+    const approved = await read(`/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHeadSha)}`);
+    const approvedCompare = approved.ok ? approvalCompareSchema.safeParse(approved.body) : null;
+    const live = approvedCompare?.success ? await read(`/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`) : null;
+    const liveCompare = live?.ok ? approvalCompareSchema.safeParse(live.body) : null;
+    if (!approved.ok || (live && !live.ok)) {
+      refusal = { kind: "unverifiable", reason: "guard-a:compare-failed", detail: "guard-a: diff-vs-base compare failed; refusing to publish" };
+    } else if (!approvedCompare?.success || !liveCompare?.success) {
+      refusal = { kind: "unverifiable", reason: "guard-a:unverifiable", detail: "guard-a: incomplete diff-vs-base file list; refusing to publish" };
+    } else {
+      const approvedFiles = approvedCompare.data.files;
+      const liveFiles = liveCompare.data.files;
+      const before = new Map(approvedFiles.map((file) => [file.filename, file]));
+      const after = new Map(liveFiles.map((file) => [file.filename, file]));
+      const substanceChange = diffSubstanceChange(
+        new Map(approvedFiles.map((file) => [file.filename, file.sha])),
+        new Map(liveFiles.map((file) => [file.filename, file.sha])),
+      );
+      const patchEquivalent = substanceChange !== null && liveFiles.every((file) => {
+        const prior = before.get(file.filename);
+        if (!prior) return false;
+        if (prior.sha === file.sha && prior.status === file.status && prior.previous_filename === file.previous_filename) return true;
+        const identity = patchIdentity(file);
+        return identity !== null && identity === patchIdentity(prior);
+      });
+      delta = {
+        approvedHeadSha, headSha, baseSha,
+        equivalence: !substanceChange ? "blobs" : patchEquivalent ? "patch" : null,
+        substanceChange: patchEquivalent ? null : substanceChange,
+        files: [...new Set([...before.keys(), ...after.keys()])].map((filename) => ({
+          filename, approved: before.get(filename) ?? null, live: after.get(filename) ?? null,
+        })),
+      };
+      if (delta.equivalence) return { kind: "verified", delta };
+    }
+  }
+  // Equal commit trees prove identity even when the PR diff changed shape or
+  // cannot be compared. Pin the returned commit SHAs as well as their trees.
+  const approvedCommit = await read(`/git/commits/${encodeURIComponent(approvedHeadSha)}`);
+  const liveCommit = await read(`/git/commits/${encodeURIComponent(headSha)}`);
+  const oldCommit = approvalCommitTreeSchema.safeParse(approvedCommit.body);
+  const newCommit = approvalCommitTreeSchema.safeParse(liveCommit.body);
+  if (approvedCommit.ok && liveCommit.ok && oldCommit.success && newCommit.success
+    && oldCommit.data.sha === approvedHeadSha && newCommit.data.sha === headSha
+    && oldCommit.data.tree.sha === newCommit.data.tree.sha) {
+    return { kind: "verified", delta: {
+      approvedHeadSha, headSha, baseSha, files: delta?.files ?? [],
+      equivalence: "tree", substanceChange: null,
+    } };
+  }
+  return delta ? { kind: "verified", delta } : refusal;
+}
+
+export async function readApprovalPullRequest(
+  db: Db, companyId: string, target: { owner: string; repo: string; number: number },
+): Promise<GitHubReadOutcome> {
+  return ghReadJson(db, companyId, target.owner, target.repo, `/pulls/${target.number}`);
 }
 
 /**
@@ -2920,58 +3037,11 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
    }
   if (approvedHeadSha !== headSha) {
     const baseSha = ((prBody?.base as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
-    if (!baseSha) {
-      return {
-        kind: "skipped",
-        reason: "guard-a:no-base-ref",
-        detail: `guard-a: PR payload for ${target.displayName} carries no base sha; cannot compute diff-vs-base for ${headSha.slice(0, 7)}; refusing to re-publish`,
-      };
+    const proof = await readApprovalHeadDelta(db, row.companyId, target, approvedHeadSha, headSha, baseSha);
+    if (proof.kind === "unverifiable") {
+      return { kind: "skipped", reason: proof.reason, detail: proof.detail };
     }
-    const approvedDiff = await ghReadJson(
-      db,
-      row.companyId,
-      target.owner,
-      target.repo,
-      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHeadSha)}`,
-    );
-    if (!approvedDiff.ok) {
-      return {
-        kind: "skipped",
-        reason: "guard-a:compare-failed",
-        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHeadSha.slice(0, 7)} failed (HTTP ${approvedDiff.status} ${approvedDiff.message ?? ""}); refusing to re-publish`,
-      };
-    }
-    const approvedFiles = fileMapFromCompare(approvedDiff.body);
-    if (!approvedFiles) {
-      return {
-        kind: "skipped",
-        reason: "guard-a:unverifiable",
-        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHeadSha.slice(0, 7)} returned no usable file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
-      };
-    }
-    const liveDiff = await ghReadJson(
-      db,
-      row.companyId,
-      target.owner,
-      target.repo,
-      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
-    );
-    if (!liveDiff.ok) {
-      return {
-        kind: "skipped",
-        reason: "guard-a:compare-failed",
-        detail: `guard-a: live diff-vs-base ${baseSha.slice(0, 7)}...${headSha.slice(0, 7)} failed (HTTP ${liveDiff.status} ${liveDiff.message ?? ""}); refusing to re-publish`,
-      };
-    }
-    const liveFiles = fileMapFromCompare(liveDiff.body);
-    if (!liveFiles) {
-      return {
-        kind: "skipped",
-        reason: "guard-a:unverifiable",
-        detail: `guard-a: live diff-vs-base ${baseSha.slice(0, 7)}...${headSha.slice(0, 7)} returned no usable file list; refusing to re-publish`,
-      };
-    }
-    const substanceChange = diffSubstanceChange(approvedFiles, liveFiles);
+    const substanceChange = proof.delta.substanceChange;
     if (substanceChange) {
       // SUP-14049 / SUP-14996: positive evidence the new head voids the
       // published approval — surface it on the PR itself, advisory-only,
@@ -3021,11 +3091,15 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     enforceDeliveryIdentity?: boolean;
     includeDrafts?: boolean;
     requireDeliveryReceipt?: boolean;
+    headCertification?: { owner: string; repo: string; number: number; headSha: string };
   } = {
     expectedHeadSha: headSha,
     expectedPr: certified,
     requireDeliveryReceipt: !certified,
     includeDrafts: true,
+    ...(approvedHeadSha !== headSha ? {
+      headCertification: { owner: target.owner, repo: target.repo, number: target.number, headSha },
+    } : {}),
   };
   // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1
   // delivery-identity gate never successfully ran for this head — the arming

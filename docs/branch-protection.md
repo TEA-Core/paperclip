@@ -71,13 +71,13 @@ understands — a PR that was hand-merged or closed, a coordinating card that
 merely cited a PR rather than delivering it, a head that moved between the
 approval decision and the publish. The stamp cannot be manufactured by hand:
 the enforcer rejects it, and a locally-written `paperclip/approved` would be a
-contract violation (fake approval). The only sanctioned recovery is the
+contract violation (fake approval). For a skipped first publish, use the
 **operator-invocable re-arm** route:
 
 - `POST /api/issues/:issueId/merge-arming/republish` — board owner/admin only.
   An agent caller is refused (403) before any GitHub read or write. It is the
-  single surface a human may use to re-stamp; hand-writing the status on the PR
-  head is still forbidden.
+  sanctioned recovery for a skipped first publish; hand-writing the status on
+  the PR head is still forbidden.
 - It re-runs `publishApprovalStatus` **verbatim** — pinned to the decision-time
   head and with delivery identity enforced — rather than re-deriving anything.
   It is idempotent: if `executionState.approvalStatus.publishedHeadSha` is
@@ -98,6 +98,16 @@ contract violation (fake approval). The only sanctioned recovery is the
   for card `SUP-123`). The repo half is identical in both cases: a PR in another
   repo is always refused (ADR-091 D5). A shared-workspace card whose head ref is
   unreadable, or which carries another card's prefix, is still refused.
+
+For a reviewed head change **after the card is done**, use
+`GET /api/issues/:issueId/merge-arming/head-review` and
+`POST /api/issues/:issueId/merge-arming/approve-head`. Board owner/admin authority
+is required; all non-board actors are refused. The decision shows the Guard A
+delta, records the actor/head/reason, and stamps exactly the submitted SHA without
+reopening stages. Equivalent tree/patch changes can be re-stamped automatically.
+See [Approval-status reconciliation](approval-reconciliation.md) for the request
+and refusal contract.
+
 
 ### Merge-queue ejection surface (SUP-15375)
 

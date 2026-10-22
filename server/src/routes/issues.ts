@@ -84,6 +84,7 @@ import {
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
   createIssueSchema,
+  approveIssueHeadSchema,
   isAssignedBacklogBlockingCreate,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
@@ -188,6 +189,7 @@ import {
   logActivity,
   logActivityInTransaction,
   publishActivity,
+  persistActivity,
   projectService,
   routineService,
   workProductService,
@@ -205,6 +207,7 @@ import {
   type DecisionHeadResolution,
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
+  resolveLinkedPullRequestsWithState,
   shouldPublishApprovalStatus,
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
@@ -216,6 +219,8 @@ import {
 import {
   evaluateStageIntegrity,
   latestDecisionPerStage,
+  readApprovalHeadDelta,
+  readApprovalPullRequest,
   type CandidateRow,
 } from "../services/approval-status-reconciler.js";
 import { prDeliveryService } from "../services/pr-delivery.js";
@@ -11060,8 +11065,8 @@ export function issueRoutes(
   // SUP-14748: operator-invocable first-publish re-arm for a skipped
   // paperclip/approved stamp. The first publish can skip for reasons only a human
   // understands (a hand-merged PR, a closed PR, a coordinating card that merely
-  // cited a PR, a head that moved between approval and publish). This is the only
-  // sanctioned recovery: it re-runs publishApprovalStatus verbatim — pinned to the
+  // cited a PR, a head that moved between approval and publish). First-publish
+  // recovery re-runs publishApprovalStatus verbatim — pinned to the
   // decision-time head, delivery-identity enforced — instead of a human
   // hand-writing the status, which would manufacture a fake approval. Board-only;
   // an agent caller is refused before any GitHub read or write.
@@ -11363,6 +11368,113 @@ export function issueRoutes(
       message: publishOutcome.message,
     });
   });
+
+  // A completed ladder stays completed. This decision reviews only the delta
+  // from its certified head, not another pass through the stage machine.
+  async function reviewCompletedIssueHead(req: Request, res: Response, publish: boolean) {
+    assertBoard(req);
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!existing) return;
+    const actor = getActorInfo(req);
+    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
+      const membership = req.actor.userId
+        ? await access.getMembership(existing.companyId, "user", req.actor.userId)
+        : null;
+      if (membership?.status !== "active"
+        || (membership.membershipRole !== "owner" && membership.membershipRole !== "admin")) {
+        throw forbidden("Company owner or admin required to approve a new head");
+      }
+    }
+    const result = await db.transaction(async (tx) => {
+      const issueQuery = tx.select().from(issueRows).where(and(
+        eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId),
+      ));
+      const [issue] = publish ? await issueQuery.for("update") : await issueQuery;
+      if (!issue) throw notFound("Issue not found");
+      const state = issue.executionState ?? {};
+      const completedIds = Array.isArray(state.completedStageIds) ? state.completedStageIds : [];
+      const policy = z.object({ stages: z.array(z.object({ id: z.string(), type: z.string() })) }).safeParse(issue.executionPolicy);
+      const input = publish ? approveIssueHeadSchema.parse(req.body) : null;
+      if (issue.status !== "done" || state.lastDecisionOutcome !== "approved"
+        || !policy.success || policy.data.stages.length === 0
+        || !policy.data.stages.every((stage) => completedIds.includes(stage.id))) {
+        throw conflict("Head approval requires a done card with a completed approved ladder");
+      }
+      const candidate: CandidateRow = { ...issue, executionState: state };
+      const integrity = await evaluateStageIntegrity(tx as unknown as Db, candidate);
+      if (integrity) throw conflict(integrity.detail);
+      const approval = z.object({
+        publishedHeadSha: z.string().min(1).nullish(), approvedHeadSha: z.string().min(1).nullish(),
+      }).safeParse(state.approvalStatus);
+      const approvedHeadSha = approval.success
+        ? approval.data.publishedHeadSha ?? approval.data.approvedHeadSha
+        : null;
+      if (!approvedHeadSha) throw conflict("No certified approval head is recorded");
+      if (input && input.approvedHeadSha !== approvedHeadSha) throw conflict("Approval anchor changed; review the delta again");
+      const context = await resolveIssueRepoContext(tx as unknown as Db, issue);
+      const repo = context?.repoUrl ? parseRepoUrl(context.repoUrl) : null;
+      if (!repo) throw conflict("Project repository is not resolvable");
+      const linked = await resolveLinkedPullRequestsWithState(tx as unknown as Db, issue.companyId, issue.id);
+      const delivery = z.object({ prNumber: z.number().int().positive() }).safeParse(state.delivery);
+      const targets = linked.filter((pr) =>
+        pr.owner.toLowerCase() === repo.owner.toLowerCase() && pr.repo.toLowerCase() === repo.repo.toLowerCase()
+        && (!delivery.success || pr.number === delivery.data.prNumber));
+      if (targets.length !== 1) throw conflict("Exactly one linked delivery PR is required for head review");
+      const target = targets[0]!;
+      const live = await readApprovalPullRequest(tx as unknown as Db, issue.companyId, target);
+      const pr = z.object({
+        state: z.literal("open"), merged: z.literal(false), draft: z.literal(false).optional(),
+        head: z.object({ sha: z.string(), ref: z.string() }),
+        base: z.object({ sha: z.string() }),
+      }).safeParse(live.body);
+      if (!live.ok || !pr.success) throw conflict("Head review requires a verified open, non-draft PR");
+      const headSha = pr.data.head.sha;
+      if (input && input.headSha !== headSha) throw conflict("PR head moved; review the new delta before approving");
+      const proof = await readApprovalHeadDelta(tx as unknown as Db, issue.companyId, target, approvedHeadSha, headSha, pr.data.base.sha);
+      if (proof.kind === "unverifiable") throw conflict(proof.detail);
+      const preview = {
+        pr: target.displayName, approvedHeadSha, headSha, delta: proof.delta,
+        compareUrl: `https://github.com/${target.owner}/${target.repo}/compare/${approvedHeadSha}...${headSha}`,
+      };
+      if (!input) return { ...preview, outcome: "review_required" };
+      // The decision audit commits independently before the GitHub side effect.
+      // A later failure saving publication state must not erase who authorized
+      // an already-written status. The issue lock still protects the ladder.
+      const decision = await persistActivity(db, {
+        companyId: issue.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
+        action: "issue.approval_head_decision", entityType: "issue", entityId: issue.id,
+        details: {
+          outcome: "approved", headSha, approvedHeadSha, reason: input.reason, pr: target.displayName,
+          delta: { baseSha: proof.delta.baseSha, equivalence: proof.delta.equivalence,
+            substanceChange: proof.delta.substanceChange, files: proof.delta.files.map((file) => file.filename) },
+        },
+      });
+      publishActivity(decision.publication);
+      const certifiedDelivery = readCertifiedFinalDelivery(state);
+      const outcome = await publishApprovalStatus(tx as unknown as Db, issue.companyId, issue.id, issue.identifier ?? "", {
+        expectedHeadSha: input.headSha, enforceDeliveryIdentity: true,
+        requireDeliveryReceipt: !certifiedDelivery,
+        ...(certifiedDelivery ? { expectedPr: certifiedDelivery } : {}),
+        headCertification: { owner: target.owner, repo: target.repo, number: target.number, headSha: input.headSha },
+      });
+      if (outcome.kind === "armed") {
+        const approvalPatch = {
+          approvedHeadSha: headSha, approvedAt: new Date().toISOString(),
+          publishedHeadSha: headSha, publishedAt: new Date().toISOString(),
+          headReview: { actorType: actor.actorType, actorId: actor.actorId, headSha, previousHeadSha: approvedHeadSha, reason: input.reason },
+        };
+        await tx.update(issueRows).set({
+          executionState: sql`jsonb_set(coalesce(${issueRows.executionState}, '{}'::jsonb), '{approvalStatus}',
+            coalesce(${issueRows.executionState} -> 'approvalStatus', '{}'::jsonb) || ${JSON.stringify(approvalPatch)}::jsonb)`,
+        }).where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId)));
+      }
+      return { ...preview, outcome: outcome.kind, message: outcome.message };
+    });
+    res.status(result.outcome === "armed" || result.outcome === "review_required" ? 200 : 409).json(result);
+  }
+
+  router.get("/issues/:id/merge-arming/head-review", (req, res) => reviewCompletedIssueHead(req, res, false));
+  router.post("/issues/:id/merge-arming/approve-head", (req, res) => reviewCompletedIssueHead(req, res, true));
 
   router.get("/issues/:id/runner-goal", async (req, res) => {
     const id = req.params.id as string;

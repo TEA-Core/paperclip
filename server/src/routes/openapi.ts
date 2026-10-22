@@ -38,6 +38,7 @@ import {
   // Issue
   createIssueSchema,
   updateIssueObjectSchema,
+  approveIssueHeadSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
@@ -1421,6 +1422,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
   "POST /api/issues/{id}/delivery-receipt-recovery",
   "POST /api/issues/{id}/merge-arming/republish",
+  "GET /api/issues/{id}/merge-arming/head-review",
+  "POST /api/issues/{id}/merge-arming/approve-head",
   "POST /api/issues/{id}/execution-stage/board-decision",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
@@ -7632,6 +7635,51 @@ registry.registerPath({
   request: { params: z.object({ id: z.string() }) },
   responses: {
     200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/merge-arming/head-review",
+  tags: ["issues"],
+  summary: "Preview the delta from the approved head to the live PR head on a done card",
+  description:
+    "Board-only (company owner/admin). Read-only: returns the Guard-A delta between the certified " +
+    "approved head and the live PR head with outcome review_required. Refuses 409 when the card is " +
+    "not done with a completed approved ladder, no certified head is recorded, exactly one delivery " +
+    "PR cannot be resolved, or the PR is not a verified open non-draft PR.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/merge-arming/approve-head",
+  tags: ["issues"],
+  summary: "Approve a reviewed new PR head on a done card and publish paperclip/approved for it",
+  description:
+    "Board-only (company owner/admin). Publishes paperclip/approved for exactly headSha without " +
+    "reopening execution stages. approvedHeadSha and headSha must still match the certified anchor " +
+    "and the live PR head; otherwise 409. The delivery receipt is waived only for a matching " +
+    "certified finalDelivery. The decision is audited as issue.approval_head_decision before the " +
+    "GitHub write; a refused publication returns 409 with the outcome message.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(approveIssueHeadSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,

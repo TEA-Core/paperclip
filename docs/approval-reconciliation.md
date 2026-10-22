@@ -10,10 +10,34 @@ A candidate must have a terminal approved ladder and a persisted approval anchor
 
 For every candidate, the reconciler reads the pull request from GitHub before checking the commit status or publishing anything. The live response is authoritative for state, merge status, head SHA, and draft state. A live draft PR is refused with no status write, even when the cached snapshot is stale or an approved head anchor exists.
 
-The live head must equal the certified head, or Guard A must positively prove that the diff-vs-base is unchanged from the certified head. The delegated publish also uses the expected-head compare-and-swap guard. These checks prevent a recovered status from authorizing an unreviewed head.
+The live head must equal the certified head, or Guard A must positively prove content identity. It accepts unchanged PR-diff blobs (including an approved subset absorbed into the base), identical commit trees, or identical complete per-file patches with only hunk positions changed. Patch identity preserves significant whitespace, filenames, and change metadata; missing/binary/truncated patches are not patch proof. Compare lists at GitHub's 300-file cap are incomplete and cannot prove equivalence. Substantive changes still refuse automatic publication.
+
+The delegated publish pins the exact PR and expected head. For a certified head change, only the head component of a recorded delivery binding is superseded: its repository, branch, source card, and PR number remain enforced. The delivery receipt is waived only when the decision carries a certified `finalDelivery` naming that same PR (the explicit decision pins `expectedPr` to it); a card without a matching certified `finalDelivery` still needs an exact-head delivery receipt, and a missing one refuses with `delivery-receipt-missing`. A further push before the publisher's head read refuses instead of stamping another head.
 
 ## Idempotency and failure behavior
 
 The reconciler first checks the live commit status. An existing successful `paperclip/approved` status is treated as already repaired and is not published again. Missing or failed GitHub reads are recorded as failures and retried by a later tick; uncertain validation never publishes.
 
 The recovery path preserves the existing scan cap, cursor, per-head behavior, delivery-identity checks, ladder guards, and merge-arming rules. It does not reopen review, alter approval content, or create a local GitHub status.
+
+## Reviewing a changed head after completion
+
+The completed ladder is not reopened. Use these company-scoped control-plane APIs:
+
+- `GET /api/issues/:issueId/merge-arming/head-review` returns the certified head, live head, Guard A delta, approved/live file records and patches, and a compare link. This is read-only.
+- `POST /api/issues/:issueId/merge-arming/approve-head` records a separate head decision and publishes `paperclip/approved` for exactly the submitted head:
+
+  ```json
+  {
+    "approvedHeadSha": "<40-character certified SHA from the preview>",
+    "headSha": "<40-character live SHA from the preview>",
+    "reason": "Reviewed the post-ladder delta and its verification"
+  }
+  ```
+
+Both APIs require board owner/admin authority (including trusted-local/instance-admin board context). All agent actors are refused before issue lookup or GitHub access, including the original reviewer. Being the author, assignee, a reviewer, or a user with ordinary membership grants no head-approval authority.
+
+The card must be `done`, every declared stage completed, the last decision approved, and Guard B stage integrity intact. Missing anchors, unverifiable deltas, non-open/draft PRs, stale preview anchors, moved heads, foreign delivery identities, and unauthorized actors refuse without a status write. The response includes the reviewed delta and publication outcome. The activity event `issue.approval_head_decision` records the actor, previous and requested heads, PR, reason, and Guard A summary before publication; audit failure prevents the write. Successful publication updates only `executionState.approvalStatus`, preserving the card status, ladder, and stage decisions.
+
+The head decision is durable before the external status write. If GitHub accepts the status but storing publication state subsequently fails, the API reports the failure and the decision audit remains; a database rollback must not erase the authorization for an already-written status. The `issue.approval_head_decision` row records the authorizer, not that publication applied: a refused publication (for example `delivery-receipt-missing` or a moved head) is visible only in the 409 response, and no publish-outcome audit record exists yet.
+
