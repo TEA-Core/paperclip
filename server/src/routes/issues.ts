@@ -11386,9 +11386,10 @@ export function issueRoutes(
       }
     }
     const result = await db.transaction(async (tx) => {
-      const [issue] = await tx.select().from(issueRows).where(and(
+      const issueQuery = tx.select().from(issueRows).where(and(
         eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId),
-      )).for("update");
+      ));
+      const [issue] = publish ? await issueQuery.for("update") : await issueQuery;
       if (!issue) throw notFound("Issue not found");
       const state = issue.executionState ?? {};
       const completedIds = Array.isArray(state.completedStageIds) ? state.completedStageIds : [];

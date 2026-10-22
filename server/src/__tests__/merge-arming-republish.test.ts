@@ -674,6 +674,36 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(after!.executionState!.approvalStatus).toMatchObject({ publishedHeadSha: REVIEWED_HEAD });
   });
 
+  it("does not hold the issue row lock while the head-review preview reads GitHub (SUP-20624)", async () => {
+    const { companyId, issueId } = await seedHeadReview();
+    currentActor = boardActor(companyId);
+    installHeadReviewTransport();
+    const transport = mockGhFetch.getMockImplementation()!;
+    let entered!: () => void;
+    const providerEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const providerHeld = new Promise<void>((resolve) => { release = resolve; });
+    mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      entered();
+      await providerHeld;
+      return transport(url, init);
+    });
+    const preview = request(app).get(`/api/issues/${issueId}/merge-arming/head-review`).then((res) => res);
+    try {
+      await providerEntered;
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`set local lock_timeout = '3s'`);
+        await tx.update(issues).set({ title: "Concurrent writer" }).where(eq(issues.id, issueId));
+      });
+    } finally {
+      release();
+    }
+    const response = await preview;
+    expect(response.status).toBe(200);
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.title).toBe("Concurrent writer");
+  });
+
   it("approves an uncertified card head with a board receipt for exactly that head (SUP-20624)", async () => {
     const { companyId, issueId } = await seedHeadReview();
     currentActor = boardActor(companyId);
