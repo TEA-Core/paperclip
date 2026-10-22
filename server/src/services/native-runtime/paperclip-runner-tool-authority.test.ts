@@ -738,6 +738,26 @@ describe("PaperclipRunnerToolAuthority", () => {
       "create_task",
     );
 
+    await expect(
+      authority.execute({
+        tool: "create_task",
+        callId: "reject-monitor-policy",
+        arguments: {
+          idempotencyKey: "reject-monitor-policy",
+          title: "Reject silent monitor loss",
+          executionPolicy: {
+            monitor: {
+              kind: "external_service",
+              serviceName: "weekly-report-composition",
+              nextCheckAt: "2026-10-22T00:05:00Z",
+              recoveryPolicy: "wake_owner",
+              scheduledBy: "assignee",
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow("paperclip_runner_tool_arguments_invalid");
+
     const prerequisite = await authority.execute({
       tool: "create_task",
       callId: "create-prerequisite",
