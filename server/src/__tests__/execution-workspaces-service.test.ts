@@ -6113,6 +6113,32 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       }
     }, 20_000);
 
+    it("keeps the worktree when a live session appears on its path during the cleanup", async () => {
+      const first = await seedAncestryTerminalWorkspace();
+      await publishWorktree(first.worktreePath);
+      await db.update(executionWorkspaces).set({
+        updatedAt: new Date("2020-01-01T00:00:00Z"),
+      }).where(eq(executionWorkspaces.id, first.executionWorkspaceId));
+      let liveId: string | null = null;
+      const service = executionWorkspaceService(db, {
+        workspaceReaperCooldownDays: 0,
+        beforeTerminalWorkspaceCleanup: async () => {
+          liveId = await seedLiveSessionOnPath(first);
+        },
+      });
+
+      const sweep = await service.sweepTerminalWorkspaces(1);
+      const row = await workspaceStatus(first.executionWorkspaceId);
+
+      expect(liveId).not.toBeNull();
+      expect(sweep.cleanupFailed).toBe(0);
+      expect(sweep.archived).toBe(1);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toContain("other active sessions reference this path");
+      expect((await workspaceStatus(liveId!))?.status).toBe("active");
+      await expect(fs.access(first.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
     it("keeps the worktree when an isolated row shares its path with a live session", async () => {
       const first = await seedAncestryTerminalWorkspace();
       await publishWorktree(first.worktreePath);

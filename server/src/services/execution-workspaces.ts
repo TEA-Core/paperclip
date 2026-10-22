@@ -97,6 +97,7 @@ export const TERMINAL_WORKSPACE_SWEEP_DEFAULT_LIMIT = 200;
 
 export const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
 const COMMITS_MISSING_FROM_REMOTE_KEEP_REASON = "commits missing from the remote";
+const OTHER_LIVE_SESSIONS_KEEP_REASON = "other active sessions reference this path";
 
 export type TerminalWorkspaceSweepSkipCounts = {
   skippedActiveRun: number;
@@ -2015,31 +2016,34 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      const pathInUse = await otherLiveSessionsReferencePath(workspace);
       await stopRuntimeServicesForExecutionWorkspace({
         db,
         executionWorkspaceId: workspace.id,
-        workspaceCwd: workspace.cwd,
+        ...(pathInUse ? {} : { workspaceCwd: workspace.cwd }),
       });
-      const cleanup = await cleanupExecutionWorkspaceArtifacts({
-        workspace,
-        projectWorkspace,
-        cleanupCommand: config?.cleanupCommand ?? null,
-        teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
-        recorder: workspaceOperationService(db).createRecorder({
-          companyId: workspace.companyId,
-          executionWorkspaceId: workspace.id,
-        }),
-        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
-        beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
-        expectedBranchHeadSha: expectedHeadSha,
-        // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
-        // from crossing final validation. The branch lock is released only
-        // after non-forced worktree removal, then deletion is anchored to the
-        // verified HEAD so a raced ref update fails closed.
-        runCleanupCommands: false,
-        forceWorktreeRemoval: false,
-      });
-      if (cleanup.cleaned && workspace.mode === "shared_workspace") {
+      const cleanup = pathInUse
+        ? { cleaned: true, warnings: [OTHER_LIVE_SESSIONS_KEEP_REASON] }
+        : await cleanupExecutionWorkspaceArtifacts({
+          workspace,
+          projectWorkspace,
+          cleanupCommand: config?.cleanupCommand ?? null,
+          teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
+          recorder: workspaceOperationService(db).createRecorder({
+            companyId: workspace.companyId,
+            executionWorkspaceId: workspace.id,
+          }),
+          assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
+          beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
+          expectedBranchHeadSha: expectedHeadSha,
+          // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
+          // from crossing final validation. The branch lock is released only
+          // after non-forced worktree removal, then deletion is anchored to the
+          // verified HEAD so a raced ref update fails closed.
+          runCleanupCommands: false,
+          forceWorktreeRemoval: false,
+        });
+      if (cleanup.cleaned && (workspace.mode === "shared_workspace" || pathInUse)) {
         await db
           .update(issues)
           .set({ executionWorkspaceId: null, updatedAt: now() })
@@ -3270,13 +3274,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         if (isOpenRow && destructiveCleanup && !deferDeliveryGate && await otherLiveSessionsReferencePath(workspace)) {
-          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | other active sessions reference this path`;
+          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${OTHER_LIVE_SESSIONS_KEEP_REASON}`;
           destructiveCleanup = false;
         }
         if (deferDeliveryGate && sharedSession && !archiveWithoutGit) {
           const lastSession = !(await otherLiveSessionsReferencePath(workspace));
           if (!lastSession) {
-            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | other active sessions reference this path`;
+            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${OTHER_LIVE_SESSIONS_KEEP_REASON}`;
             destructiveCleanup = false;
           } else {
             const inspected = await inspectGitCloseReadiness(executionWorkspace);
