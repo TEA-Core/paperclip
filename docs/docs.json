@@ -88,6 +88,7 @@
               "deploy/control-plane-rollout",
               "deploy/database",
               "deploy/secrets",
+              "deploy/rotation-blast-radius",
               "deploy/storage",
               "deploy/environment-variables"
             ]
