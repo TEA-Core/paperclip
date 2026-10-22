@@ -48,6 +48,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
+import * as workspaceRuntimeModule from "../services/workspace-runtime.ts";
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
 
 const execFileAsync = promisify(execFile);
@@ -6085,6 +6086,31 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(row?.status).toBe("archived");
       expect(row?.cleanupReason).toContain("branch changed or HEAD could not be verified");
       await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("keeps a record-only archive and detaches issues when stopping runtime services throws", async () => {
+      const seeded = await seedTerminalWorkspace();
+      await markShared(seeded.executionWorkspaceId);
+      const stop = vi.spyOn(workspaceRuntimeModule, "stopRuntimeServicesForExecutionWorkspace")
+        .mockRejectedValueOnce(new Error("stop exploded"));
+      try {
+        const sweep = await freshSweep().sweepTerminalWorkspaces();
+        const row = await workspaceStatus(seeded.executionWorkspaceId);
+        const [issue] = await db
+          .select({ executionWorkspaceId: issues.executionWorkspaceId })
+          .from(issues)
+          .where(eq(issues.executionWorkspaceId, seeded.executionWorkspaceId));
+
+        expect(stop).toHaveBeenCalled();
+        expect(sweep.archived).toBe(1);
+        expect(sweep.cleanupFailed).toBe(0);
+        expect(row?.status).toBe("archived");
+        expect(row?.cleanupReason).toContain("runtime services stop failed: stop exploded");
+        expect(issue).toBeUndefined();
+        await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      } finally {
+        stop.mockRestore();
+      }
     }, 20_000);
 
     it("keeps the worktree when an isolated row shares its path with a live session", async () => {

@@ -3507,12 +3507,54 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived.metadata as Record<string, unknown> | null,
         );
         if (!destructiveCleanup) {
-          const { stopRuntimeServicesForExecutionWorkspace } = await import("./workspace-runtime.js");
-          await stopRuntimeServicesForExecutionWorkspace({ db, executionWorkspaceId: archived.id });
-          await detachIssuesFromClosedExecutionWorkspace(db, {
-            companyId: archived.companyId,
-            executionWorkspaceId: archived.id,
-          });
+          const recordOnlyFailures: string[] = [];
+          const describeFailure = (error: unknown) => error instanceof Error ? error.message : String(error);
+          try {
+            const { stopRuntimeServicesForExecutionWorkspace } = await import("./workspace-runtime.js");
+            await stopRuntimeServicesForExecutionWorkspace({ db, executionWorkspaceId: archived.id });
+          } catch (error) {
+            recordOnlyFailures.push(`runtime services stop failed: ${describeFailure(error)}`);
+          }
+          try {
+            await detachIssuesFromClosedExecutionWorkspace(db, {
+              companyId: archived.companyId,
+              executionWorkspaceId: archived.id,
+            });
+          } catch (error) {
+            recordOnlyFailures.push(`issue detach failed: ${describeFailure(error)}`);
+          }
+          if (recordOnlyFailures.length > 0) {
+            const failure = recordOnlyFailures.join("; ");
+            try {
+              await fenceLifecycleGenerationWrite<boolean>({
+                workspaceId: archived.id,
+                expectedGeneration: capturedGeneration,
+                isWriteTarget: (fresh) => fresh.status === "archived",
+                onSkip: () => false,
+                write: async ({ tx }) => {
+                  await tx
+                    .update(executionWorkspaces)
+                    .set({ cleanupReason: `${plannedCleanupReason} | ${failure}`, updatedAt: now() })
+                    .where(eq(executionWorkspaces.id, archived.id));
+                  return true;
+                },
+              });
+              await logActivity(db, {
+                companyId: archived.companyId,
+                actorType: "system",
+                actorId: "workspace_terminality_reaper",
+                action: "execution_workspace.issue_terminal_archive_cleanup_warning",
+                entityType: "execution_workspace",
+                entityId: archived.id,
+                details: { sourceIssueId: archived.sourceIssueId, failure },
+              });
+            } catch (error) {
+              logger.warn(
+                { err: error, executionWorkspaceId: archived.id, failure },
+                "could not record record-only archive failure",
+              );
+            }
+          }
           result.archived += 1;
         } else {
           try {
