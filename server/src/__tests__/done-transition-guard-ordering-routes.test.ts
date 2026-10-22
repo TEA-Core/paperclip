@@ -1236,10 +1236,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(res.body.details.identifier).toBe(identifier);
       // The rejection must name both accepted forms.
       expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
-      expect(res.body.details.remedy).toContain(
-        TIER1_FORM,
-
-      );
+      expect(res.body.details.remedy).toContain(TIER1_FORM.slice(1, -1));
+      expect(res.body.details.remedy).not.toContain(TIER1_FORM);
 
       const statusRows = await db
         .select({ status: issues.status })

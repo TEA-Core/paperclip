@@ -5191,7 +5191,7 @@ export function issueRoutes(
       const remedy =
         "Include a done-tier declaration in the close comment: " +
         `"Closed at Tier 2 (live): <probe evidence>"` +
-        ` or ${TIER1_FORM}` +
+        ` or ${TIER1_FORM.slice(1, -1)}` +
         ` — per SUP-12693.`;
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
