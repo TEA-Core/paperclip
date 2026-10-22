@@ -3541,62 +3541,6 @@ async function proveLinkedGitWorktreeRegistration(
   return { registered: true };
 }
 
-export const TERMINAL_WORKTREE_SYMLINK_REFUSAL = "cwd is a symlink";
-export const TERMINAL_WORKTREE_RECORD_REPO_REFUSAL = "record repo could not be verified";
-export const TERMINAL_WORKTREE_REPO_ROOT_REFUSAL = "path is the repo root or above it";
-export const TERMINAL_WORKTREE_MANAGED_ROOT_REFUSAL = "path is outside the managed worktree root";
-export const TERMINAL_WORKTREE_REGISTRATION_REFUSAL = "path is not a registered linked worktree of the record repo";
-
-function isStrictChildPath(parent: string, child: string) {
-  const relative = path.relative(parent, child);
-  return relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
-}
-
-function pathContains(ancestor: string, descendant: string) {
-  const relative = path.relative(ancestor, descendant);
-  return relative === "" || (relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
-}
-
-// The sweep may delete only a registered linked worktree of the record's own
-// repo, inside that repo's managed worktree root. A symlink, a foreign
-// checkout, the primary checkout, and a path above the repo root are refused
-// before git worktree remove can follow them.
-export async function explainUnsafeTerminalWorktreeRemoval(input: {
-  worktreePath: string;
-  recordRepoCwd: string | null;
-  configuredWorktreeParentDir?: string | null;
-}): Promise<string | null> {
-  let listing;
-  try {
-    listing = await fs.lstat(input.worktreePath);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return null;
-    return TERMINAL_WORKTREE_REGISTRATION_REFUSAL;
-  }
-  if (listing.isSymbolicLink()) return TERMINAL_WORKTREE_SYMLINK_REFUSAL;
-  if (!input.recordRepoCwd) return TERMINAL_WORKTREE_RECORD_REPO_REFUSAL;
-  const commonDir = await runGit(
-    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    input.recordRepoCwd,
-  ).catch(() => null);
-  if (!commonDir || commonDir.includes("\n") || !path.isAbsolute(commonDir)) {
-    return TERMINAL_WORKTREE_RECORD_REPO_REFUSAL;
-  }
-  const repoRoot = path.resolve(path.dirname(commonDir));
-  const worktreePath = path.resolve(input.worktreePath);
-  if (pathContains(worktreePath, repoRoot)) return TERMINAL_WORKTREE_REPO_ROOT_REFUSAL;
-  const managedRoot = path.resolve(
-    input.configuredWorktreeParentDir
-      ? resolveConfiguredPath(input.configuredWorktreeParentDir, repoRoot)
-      : path.join(repoRoot, ".paperclip", "worktrees"),
-  );
-  if (!isStrictChildPath(managedRoot, worktreePath)) return TERMINAL_WORKTREE_MANAGED_ROOT_REFUSAL;
-  const registration = await proveLinkedGitWorktreeRegistration(repoRoot, worktreePath);
-  if (!registration.registered) return TERMINAL_WORKTREE_REGISTRATION_REFUSAL;
-  return null;
-}
-
 async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }

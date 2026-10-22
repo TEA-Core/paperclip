@@ -1193,24 +1193,19 @@ The current app also exposes V1-supporting surfaces for:
   workspace detail reads return persisted workspace state and runtime services with `deliveryState: unknown`;
   they do not inspect Git. The dedicated close-readiness route derives `deliveryState` as
   `merged_via_pr | merged_by_ancestry | unmerged | unknown` from a live scan. The terminal workspace
-  sweep selects terminal source issues in SQL before inspecting Git, and requires a terminal
-  subtree, cooldown, and no active run (50 rows per tick by default). Delivery gating depends on the
-  row. An isolated row with a merged marker needs a clean worktree. An isolated row with no
-  `pull_request` work product is archived as `issue_terminal | terminal, clean, nothing unique` when
-  it has no tracked or untracked changes and no commit missing from the remote. An untracked-only row
-  archives as a record only with reason `issue_terminal | untracked files` and keeps the tree.
-  Unpushed commits or tracked modifications keep it. A shared-workspace session is a record of a reused workspace and
-  archives without a delivery verdict; untracked-only files do not block it. A cwd that is missing or
-  not a git repository archives the record without running Git. Archive reason is `issue_terminal`,
-  with a ` | <why>` suffix when the worktree is kept. The sweep removes the worktree only for a
-  `git_worktree` row that is a registered linked worktree of the record repo, inside that repo's
-  managed worktree root, not a symlink, and not the repo root or above it. Ignored files and
-  skip-worktree or assume-unchanged edits are not clean: the record archives and the tree stays.
-  The live-session recheck runs again inside a path-only lock after the bounded runtime-service
-  stop and immediately before removal. Every other archive is record-only:
-  it stops that row's runtime services, detaches issues, and records why in `cleanup_reason`. The reaper
-  skip log line carries one counter per skip reason. A worktree directory that is already gone counts
-  as removed: cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
+  sweep selects terminal source issues in SQL before inspecting Git, and still requires a terminal
+  subtree, cooldown, and no active run. A row with a recorded merged pull request also needs a clean
+  worktree; it is archived with reason `issue_terminal` and its worktree is cleaned up. Every other
+  archive is a database record only: no worktree removal, file removal, branch deletion or
+  runtime-service stop, and the issues are detached from the closed row. These are a shared-workspace
+  session (`issue_terminal | shared session record`, no delivery verdict and no Git), a row with no
+  `pull_request` work product, no tracked change and no commit missing from the remote
+  (`issue_terminal | terminal, clean, nothing unique`, or `issue_terminal | untracked files`), and a
+  cwd that is missing or not a git repository (`issue_terminal | cwd does not exist` or
+  `issue_terminal | cwd is not a git repository`, no Git). Unpushed commits or tracked modifications
+  keep a no-PR row active. `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN` logs each candidate's action and
+  reason and writes nothing. A worktree directory that is already gone counts as removed:
+  cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
   of leaving it in `cleanup_failed`. The sweep also retries `cleanup_failed` rows whose reason is
   `issue_terminal | spawn <git> ENOENT` under the same safety gates. Reopening the source issue
   records activity but does not restore that workspace.

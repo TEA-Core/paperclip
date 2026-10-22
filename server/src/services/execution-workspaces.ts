@@ -87,13 +87,9 @@ function issueTerminalTimestamp(issue: {
 const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
-export const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
-const COMMITS_MISSING_FROM_REMOTE_KEEP_REASON = "commits missing from the remote";
-const OTHER_LIVE_SESSIONS_KEEP_REASON = "other active sessions reference this path";
-const LOCAL_ONLY_KEEP_REASON = "ignored or skip-worktree files";
-const WORKTREE_PATH_LOCK_PREFIX = "execution-workspace:worktree-path:";
-export const WORKSPACE_REAPER_DRY_RUN_ENV = "PAPERCLIP_WORKSPACE_REAPER_DRY_RUN";
-const DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS = 30_000;
+const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
+const SHARED_SESSION_RECORD_ARCHIVE_REASON = "shared session record";
+const WORKSPACE_REAPER_DRY_RUN_ENV = "PAPERCLIP_WORKSPACE_REAPER_DRY_RUN";
 
 export type TerminalWorkspaceSweepSkipCounts = {
   skippedActiveRun: number;
@@ -107,7 +103,6 @@ export type TerminalWorkspaceSweepSkipCounts = {
   skippedRace: number;
   skippedReopened: number;
   skippedCooldown: number;
-  skippedLocalOnly: number;
 };
 
 export function formatTerminalWorkspaceReaperSkipLogLine(
@@ -126,7 +121,6 @@ export function formatTerminalWorkspaceReaperSkipLogLine(
     `skippedRace=${count(result.skippedRace)}`,
     `skippedReopened=${count(result.skippedReopened)}`,
     `skippedCooldown=${count(result.skippedCooldown)}`,
-    `skippedLocalOnly=${count(result.skippedLocalOnly)}`,
   ];
   return `terminal issue workspace reaper skipped all candidates ${parts.join(" ")}`;
 }
@@ -158,84 +152,11 @@ async function countCommitsMissingFromRemote(workspacePath: string): Promise<num
   }
 }
 
-async function worktreePathLockKey(workspacePath: string) {
-  const resolved = path.resolve(workspacePath);
-  try {
-    return `${WORKTREE_PATH_LOCK_PREFIX}${await fs.realpath(workspacePath)}`;
-  } catch {
-    return `${WORKTREE_PATH_LOCK_PREFIX}${resolved}`;
-  }
-}
-
-async function lockWorktreePath(tx: DbTransaction, workspacePath: string) {
-  const key = await worktreePathLockKey(workspacePath);
-  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
-}
-
-async function localOnlyBytesBlockRemoval(workspacePath: string): Promise<boolean> {
-  try {
-    await fs.lstat(workspacePath);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return false;
-    return true;
-  }
-  try {
-    const status = await runGit(
-      ["status", "--porcelain=v1", "--ignored", "--untracked-files=all"],
-      workspacePath,
-    );
-    if (status.stdout.split(/\r?\n/).some((line) => line.startsWith("!!"))) return true;
-    const listed = await runGit(["ls-files", "-v"], workspacePath);
-    return listed.stdout.split(/\r?\n/).some((line) => {
-      const tag = line[0];
-      return tag === "S" || tag === "s" || tag === "h";
-    });
-  } catch {
-    // A failed local-only scan is not proof the tree is safe to delete.
-    return true;
-  }
-}
-
 function workspaceReaperDryRunEnabled(override: boolean | undefined) {
   if (override === true) return true;
   if (override === false) return false;
   const raw = process.env[WORKSPACE_REAPER_DRY_RUN_ENV]?.trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes";
-}
-
-function resolveRuntimeServiceStopTimeoutMs(override: number | undefined) {
-  return typeof override === "number" && Number.isFinite(override) && override > 0
-    ? override
-    : DEFAULT_RUNTIME_SERVICE_STOP_TIMEOUT_MS;
-}
-
-async function stopRuntimeServicesBounded(
-  stop: (input: {
-    db?: Db;
-    executionWorkspaceId: string;
-    workspaceCwd?: string | null;
-  }) => Promise<void>,
-  input: {
-    db?: Db;
-    executionWorkspaceId: string;
-    workspaceCwd?: string | null;
-  },
-  timeoutMs: number,
-) {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      stop(input),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error("runtime services stop timed out"));
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function emptyTerminalSweepResult() {
@@ -244,6 +165,7 @@ function emptyTerminalSweepResult() {
     eligible: 0,
     archived: 0,
     cleanupFailed: 0,
+    wouldArchive: 0,
     skippedActiveRun: 0,
     skippedNonTerminalTree: 0,
     skippedUndelivered: 0,
@@ -255,7 +177,6 @@ function emptyTerminalSweepResult() {
     skippedRace: 0,
     skippedReopened: 0,
     skippedCooldown: 0,
-    skippedLocalOnly: 0,
     clearedStaleReopenPending: 0,
   };
 }
@@ -447,8 +368,6 @@ export type ExecutionWorkspaceServiceOptions = {
   workspaceReaperCooldownDays?: number;
   // Host dry-run. Also enabled by PAPERCLIP_WORKSPACE_REAPER_DRY_RUN. Default off.
   dryRun?: boolean;
-  // Bounds stopRuntimeServices so a hang cannot hold the in-process sweep flag. Tests only.
-  runtimeServiceStopTimeoutMs?: number;
 };
 
 export function deriveExecutionWorkspaceDeliveryState(input: {
@@ -641,6 +560,9 @@ async function runExpensiveGitStatus(input: {
     operation: input.operation,
     fairnessKeys: input.fairnessKeys,
     cacheTtlMs: 0,
+    // Status is an inspection. With optional locks on it rewrites the index,
+    // which would make a dry-run sweep change the worktree it reports on.
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
   });
 }
 
@@ -1882,32 +1804,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     return active.length > 0;
   }
 
-  async function otherLiveSessionsReferencePath(workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">) {
-    const rawPaths = [workspace.cwd, workspace.providerRef]
-      .map((value) => readNullableString(value))
-      .filter((value): value is string => Boolean(value));
-    const paths = [...new Set(rawPaths.flatMap((value) => {
-      const resolved = path.resolve(value);
-      return resolved === value ? [value] : [value, resolved];
-    }))];
-    if (paths.length === 0) return false;
-    // Disk path, not a company list. Another company's live row on the same
-    // directory must keep the worktree too. The query returns only existence.
-    const [row] = await db
-      .select({ id: executionWorkspaces.id })
-      .from(executionWorkspaces)
-      .where(and(
-        ne(executionWorkspaces.id, workspace.id),
-        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-        or(
-          inArray(executionWorkspaces.cwd, paths),
-          inArray(executionWorkspaces.providerRef, paths),
-        ),
-      ))
-      .limit(1);
-    return Boolean(row);
-  }
-
   type FenceableWorkspaceRow = {
     status: string;
     metadata: Record<string, unknown> | null;
@@ -2078,20 +1974,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: ({ tx }) => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, tx),
+      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
     });
   }
 
-  async function runTerminalWorkspaceCleanup(
-    workspace: ExecutionWorkspaceRow,
-    expectedHeadSha: string | null,
-    tx: DbTransaction,
-  ) {
+  async function runTerminalWorkspaceCleanup(workspace: ExecutionWorkspaceRow, expectedHeadSha: string | null) {
     const [
       {
         acquireGitWorktreeCleanupLock,
         cleanupExecutionWorkspaceArtifacts,
-        explainUnsafeTerminalWorktreeRemoval,
         stopRuntimeServicesForExecutionWorkspace,
       },
       { workspaceOperationService },
@@ -2125,58 +2016,31 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
-      const pathInUseBeforeStop = await otherLiveSessionsReferencePath(workspace);
-      let stopFailure: string | null = null;
-      try {
-        await stopRuntimeServicesBounded(
-          stopRuntimeServicesForExecutionWorkspace,
-          {
-            db,
-            executionWorkspaceId: workspace.id,
-            ...(pathInUseBeforeStop ? {} : { workspaceCwd: workspace.cwd }),
-          },
-          resolveRuntimeServiceStopTimeoutMs(opts.runtimeServiceStopTimeoutMs),
-        );
-      } catch (error) {
-        stopFailure = `runtime services stop failed: ${error instanceof Error ? error.message : String(error)}`;
-      }
-      const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
-      if (workspacePath) await lockWorktreePath(tx, workspacePath);
-      const pathInUse = await otherLiveSessionsReferencePath(workspace);
-      let removalRefusal: string | null = null;
-      if (!stopFailure && !pathInUse && workspace.providerType === "git_worktree" && workspacePath) {
-        if (await localOnlyBytesBlockRemoval(workspacePath)) {
-          removalRefusal = LOCAL_ONLY_KEEP_REASON;
-        } else {
-          removalRefusal = await explainUnsafeTerminalWorktreeRemoval({
-            worktreePath: workspacePath,
-            recordRepoCwd: projectWorkspace?.cwd ?? null,
-            configuredWorktreeParentDir: projectPolicy?.workspaceStrategy?.worktreeParentDir ?? null,
-          });
-        }
-      }
-      const cleanup = stopFailure || pathInUse || removalRefusal
-        ? { cleaned: true, warnings: [stopFailure ?? (pathInUse ? OTHER_LIVE_SESSIONS_KEEP_REASON : removalRefusal!)] }
-        : await cleanupExecutionWorkspaceArtifacts({
-          workspace,
-          projectWorkspace,
-          cleanupCommand: config?.cleanupCommand ?? null,
-          teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
-          recorder: workspaceOperationService(db).createRecorder({
-            companyId: workspace.companyId,
-            executionWorkspaceId: workspace.id,
-          }),
-          assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
-          beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
-          expectedBranchHeadSha: expectedHeadSha,
-          // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
-          // from crossing final validation. The branch lock is released only
-          // after non-forced worktree removal, then deletion is anchored to the
-          // verified HEAD so a raced ref update fails closed.
-          runCleanupCommands: false,
-          forceWorktreeRemoval: false,
-        });
-      if (cleanup.cleaned && (workspace.mode === "shared_workspace" || pathInUse || stopFailure)) {
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId: workspace.id,
+        workspaceCwd: workspace.cwd,
+      });
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        workspace,
+        projectWorkspace,
+        cleanupCommand: config?.cleanupCommand ?? null,
+        teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
+        recorder: workspaceOperationService(db).createRecorder({
+          companyId: workspace.companyId,
+          executionWorkspaceId: workspace.id,
+        }),
+        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
+        beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
+        expectedBranchHeadSha: expectedHeadSha,
+        // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
+        // from crossing final validation. The branch lock is released only
+        // after non-forced worktree removal, then deletion is anchored to the
+        // verified HEAD so a raced ref update fails closed.
+        runCleanupCommands: false,
+        forceWorktreeRemoval: false,
+      });
+      if (cleanup.cleaned && workspace.mode === "shared_workspace") {
         await db
           .update(issues)
           .set({ executionWorkspaceId: null, updatedAt: now() })
@@ -3191,38 +3055,37 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         const lastCandidate = candidates[candidates.length - 1]!;
         terminalSweepCursor = { updatedAt: lastCandidate.updatedAt, id: lastCandidate.id };
       }
-      const result = {
-        checked: candidates.length,
-        eligible: 0,
-        archived: 0,
-        cleanupFailed: 0,
-        skippedActiveRun: 0,
-        skippedNonTerminalTree: 0,
-        skippedUndelivered: 0,
-        skippedUnpushed: 0,
-        skippedRemoteCheckFailed: 0,
-        skippedNoRepoRoot: 0,
-        skippedTrackedDirty: 0,
-        skippedGitUnverified: 0,
-        skippedRace: 0,
-        skippedReopened: 0,
-        skippedCooldown: 0,
-        skippedLocalOnly: 0,
-        clearedStaleReopenPending: 0,
-      };
-
+      const result = { ...emptyTerminalSweepResult(), checked: candidates.length };
       const dryRun = workspaceReaperDryRunEnabled(opts.dryRun);
-      const logDryRunCandidate = (
-        workspace: { id: string },
-        path: string | null,
+      // Dry-run logs one line per candidate with the action the real sweep would
+      // take, and writes nothing.
+      const logDryRun = (
+        workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">,
+        action: "archive" | "keep" | "clear_stale_reopen_pending",
         reason: string,
-        wouldRemove: boolean,
+        recordOnly?: boolean,
       ) => {
+        if (!dryRun) return;
         logger.info(
-          { executionWorkspaceId: workspace.id, path, reason, wouldRemove },
+          {
+            executionWorkspaceId: workspace.id,
+            path: readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd),
+            action,
+            reason,
+            ...(recordOnly === undefined ? {} : { recordOnly }),
+          },
           "terminal issue workspace reaper dry run",
         );
       };
+      const keep = (
+        workspace: Pick<ExecutionWorkspaceRow, "id" | "cwd" | "providerRef">,
+        reason: string,
+        ...counters: (keyof TerminalWorkspaceSweepSkipCounts)[]
+      ) => {
+        for (const counter of counters) result[counter] += 1;
+        logDryRun(workspace, "keep", reason);
+      };
+
       for (const workspace of candidates) {
         const reopenPending = metadataHasReopenPendingConsumption(
           workspace.metadata as Record<string, unknown> | null,
@@ -3238,35 +3101,34 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               requireNonTerminalSourceIssueId: workspace.sourceIssueId!,
             });
           }
-          result.skippedNonTerminalTree += 1;
+          keep(workspace, "source issue is not terminal", "skippedNonTerminalTree");
           continue;
         }
         const executionWorkspace = toExecutionWorkspace(workspace);
-        const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
         const isOpenRow = workspace.status === "active" || workspace.status === "idle" || workspace.status === "in_review";
-        const sharedSession = workspace.mode === "shared_workspace";
-        const cwdKind = isOpenRow ? await classifyExecutionWorkspaceCwd(workspacePath) : "git";
+        const sharedSession = isOpenRow && workspace.mode === "shared_workspace";
+        const cwdKind = isOpenRow
+          ? await classifyExecutionWorkspaceCwd(readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd))
+          : "git";
         if (cwdKind === "unreadable") {
-          result.skippedUndelivered += 1;
-          result.skippedGitUnverified += 1;
+          keep(workspace, "cwd could not be read", "skippedUndelivered", "skippedGitUnverified");
           continue;
         }
-        // Missing and non-git cwds used to stay skipped forever. Archive the
-        // record without spawning git. A missing git worktree is classified
-        // below so a merged row can still prune its admin entry.
-        let archiveWithoutGit = isOpenRow && (
-          cwdKind === "not_git"
-          || (cwdKind === "missing" && workspace.providerType !== "git_worktree")
+        // A missing or non-git cwd used to stay skipped forever. Archive the
+        // record without spawning git. A missing git worktree is still inspected
+        // (no git runs for a missing path) so a merged row keeps its existing
+        // cleanup, which prunes the leftover admin entry.
+        const archiveWithoutGit = isOpenRow && (
+          cwdKind === "not_git" || (cwdKind === "missing" && workspace.providerType !== "git_worktree")
         );
         let git: ExecutionWorkspaceCloseGitReadiness | null = null;
-        if (!archiveWithoutGit && !(sharedSession && isOpenRow)) {
+        if (!archiveWithoutGit && !sharedSession) {
           const inspected = await inspectGitCloseReadiness(executionWorkspace);
-          git = inspected.git;
           if (!inspected.statusInspectionSucceeded) {
-            result.skippedUndelivered += 1;
-            result.skippedGitUnverified += 1;
+            keep(workspace, "git status could not be verified", "skippedUndelivered", "skippedGitUnverified");
             continue;
           }
+          git = inspected.git;
         }
         const assessment = await assessDelivery(workspace, git);
         if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
@@ -3277,59 +3139,53 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               ),
             });
           }
-          result.skippedNonTerminalTree += 1;
+          keep(workspace, "issue tree is not terminal", "skippedNonTerminalTree");
           continue;
         }
-        let plannedCleanupReason = ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON;
-        let destructiveCleanup = true;
-        let cleanupHeadSha = assessment.workspaceHeadSha;
-        let deferDeliveryGate = isOpenRow && (sharedSession || archiveWithoutGit);
+        // Every archive outside the recorded merged-delivery path is a database
+        // record only: no git worktree remove, file removal, branch deletion or
+        // runtime-service stop. The tree and branch stay for the host cleanup.
+        let recordOnlyReason: string | null = null;
         const mergedDelivery = assessment.deliveryState === "merged_via_pr"
           || assessment.deliveryState === "merged_by_ancestry";
-        if (!deferDeliveryGate && cwdKind === "missing" && isOpenRow && !mergedDelivery) {
-          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | cwd does not exist`;
-          destructiveCleanup = false;
-          archiveWithoutGit = true;
-          deferDeliveryGate = true;
-        } else if (!deferDeliveryGate) {
-          const noPrCandidate = !mergedDelivery && !assessment.hasPullRequestProduct;
-          if (noPrCandidate ? git?.hasDirtyTrackedFiles : assessment.workspaceDirty) {
-            result.skippedUndelivered += 1;
-            if (git?.hasDirtyTrackedFiles) result.skippedTrackedDirty += 1;
+        if (archiveWithoutGit || (isOpenRow && !mergedDelivery && cwdKind === "missing")) {
+          recordOnlyReason = cwdKind === "missing" ? "cwd does not exist" : "cwd is not a git repository";
+        } else if (sharedSession) {
+          // A shared session is a record of a reused workspace, so it archives
+          // without a delivery verdict.
+          recordOnlyReason = SHARED_SESSION_RECORD_ARCHIVE_REASON;
+        } else if (!mergedDelivery) {
+          if (!isOpenRow || assessment.hasPullRequestProduct) {
+            keep(workspace, "delivery is not recorded as merged", "skippedUndelivered");
             continue;
           }
           // SUP-14644: the verdict stays recorded-state only. A row with no PR
-          // product archives under a separate reason when the tree has no
-          // tracked changes and no commit is missing from the remote.
-          let nothingUnique = false;
-          if (noPrCandidate) {
-            if (!git?.repoRoot || !git.workspacePath) {
-              result.skippedNoRepoRoot += 1;
-            } else {
-              const commitsMissing = await countCommitsMissingFromRemote(git.workspacePath);
-              if (commitsMissing === null) result.skippedRemoteCheckFailed += 1;
-              else if (commitsMissing > 0) result.skippedUnpushed += 1;
-              else nothingUnique = true;
-            }
-          }
-          if (!mergedDelivery && !nothingUnique) {
-            result.skippedUndelivered += 1;
+          // product archives under its own reason when nothing in it is unique.
+          if (git?.hasDirtyTrackedFiles) {
+            keep(workspace, "tracked modifications", "skippedUndelivered", "skippedTrackedDirty");
             continue;
           }
-          if (nothingUnique && git?.hasUntrackedFiles) {
-            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | untracked files`;
-            destructiveCleanup = false;
-          } else if (nothingUnique) {
-            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
-            destructiveCleanup = workspace.providerType === "git_worktree";
+          if (!git?.repoRoot || !git.workspacePath) {
+            keep(workspace, "no git repository root", "skippedUndelivered", "skippedNoRepoRoot");
+            continue;
           }
+          const commitsMissing = await countCommitsMissingFromRemote(git.workspacePath);
+          if (commitsMissing === null) {
+            keep(workspace, "remote check failed", "skippedUndelivered", "skippedRemoteCheckFailed");
+            continue;
+          }
+          if (commitsMissing > 0) {
+            keep(workspace, "commits missing from the remote", "skippedUndelivered", "skippedUnpushed");
+            continue;
+          }
+          recordOnlyReason = git.hasUntrackedFiles ? "untracked files" : TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON;
+        } else if (assessment.workspaceDirty) {
+          keep(workspace, "worktree has local changes", "skippedUndelivered");
+          continue;
         }
-        if (archiveWithoutGit) {
-          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${
-            cwdKind === "missing" ? "cwd does not exist" : "cwd is not a git repository"
-          }`;
-          destructiveCleanup = false;
-        }
+        const cleanupReason = recordOnlyReason
+          ? `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${recordOnlyReason}`
+          : ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON;
         // Hold the archive during the cooldown window. The anchor is the most
         // recent terminal timestamp across the issue tree. A person can reopen
         // the work inside this window. A cooldown of 0 disables the check, so the
@@ -3344,7 +3200,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           && assessment.cooldownAnchor
           && assessment.cooldownAnchor.getTime() > cooldownCutoff.getTime()
         ) {
-          result.skippedCooldown += 1;
+          keep(workspace, "inside the cooldown", "skippedCooldown");
           continue;
         }
         if (reopenPending) {
@@ -3361,7 +3217,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             // not archive it now. The authoritative check is the NOT reopenPending
             // predicate in the archive statement below; this early skip avoids the
             // work when the snapshot already shows the flag.
-            result.skippedReopened += 1;
+            keep(workspace, "reopen in flight", "skippedReopened");
             continue;
           }
           // The flag is older than the grace period, but age alone does not prove
@@ -3370,11 +3226,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // and skip. This stops the sweep from clearing the fence of a slow request
           // that a later sweep would then archive and destroy under the request.
           if (await workspaceHasActiveRun(workspace)) {
-            result.skippedReopened += 1;
+            keep(workspace, "reopen fence held by an active run", "skippedReopened");
             continue;
           }
           if (dryRun) {
-            logDryRunCandidate(workspace, workspacePath, "clear stale reopen-pending flag", false);
+            logDryRun(workspace, "clear_stale_reopen_pending", "reopen-pending flag outlived its grace period");
             continue;
           }
           // The reopen-pending flag outlived its consumption window and no run owns
@@ -3407,63 +3263,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         if (await workspaceHasActiveRun(workspace)) {
-          result.skippedActiveRun += 1;
+          keep(workspace, "active run", "skippedActiveRun");
           continue;
-        }
-        if (isOpenRow && destructiveCleanup && !deferDeliveryGate && await otherLiveSessionsReferencePath(workspace)) {
-          plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${OTHER_LIVE_SESSIONS_KEEP_REASON}`;
-          destructiveCleanup = false;
-        }
-        if (deferDeliveryGate && sharedSession && !archiveWithoutGit) {
-          const lastSession = !(await otherLiveSessionsReferencePath(workspace));
-          if (!lastSession) {
-            plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${OTHER_LIVE_SESSIONS_KEEP_REASON}`;
-            destructiveCleanup = false;
-          } else {
-            const inspected = await inspectGitCloseReadiness(executionWorkspace);
-            const inspectedGit = inspected.git;
-            const inspectedPath = inspectedGit?.repoRoot && inspectedGit.workspacePath
-              ? inspectedGit.workspacePath
-              : null;
-            const commitsMissing = inspectedPath
-              ? await countCommitsMissingFromRemote(inspectedPath)
-              : null;
-            if (!inspected.statusInspectionSucceeded || !inspectedPath) {
-              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | could not verify git status`;
-              destructiveCleanup = false;
-            } else if (inspectedGit?.hasDirtyTrackedFiles) {
-              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | tracked modifications`;
-              destructiveCleanup = false;
-            } else if (commitsMissing !== 0) {
-              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${COMMITS_MISSING_FROM_REMOTE_KEEP_REASON}`;
-              destructiveCleanup = false;
-            } else if (inspectedGit?.hasUntrackedFiles) {
-              plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | untracked files`;
-              destructiveCleanup = false;
-            } else {
-              const headSha = await readGitStdout(["rev-parse", "HEAD"], inspectedPath).catch(() => null);
-              const currentBranch = await readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], inspectedPath)
-                .catch(() => null);
-              if (
-                workspace.providerType === "git_worktree"
-                && (!headSha || (workspace.branchName && currentBranch !== workspace.branchName))
-              ) {
-                plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | branch changed or HEAD could not be verified`;
-                destructiveCleanup = false;
-              } else {
-                plannedCleanupReason = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON}`;
-                destructiveCleanup = workspace.providerType === "git_worktree";
-                cleanupHeadSha = headSha;
-              }
-            }
-          }
         }
         if (
           workspace.status === "cleanup_failed"
           && isStuckGitSpawnEnoentCleanupReason(workspace.cleanupReason)
         ) {
           if (dryRun) {
-            logDryRunCandidate(workspace, workspacePath, "retry stuck git spawn ENOENT cleanup", true);
+            result.wouldArchive += 1;
+            logDryRun(workspace, "archive", `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | retry stuck git spawn ENOENT cleanup`, false);
             continue;
           }
           result.eligible += 1;
@@ -3530,13 +3339,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
           continue;
         }
-        if (destructiveCleanup && workspacePath && await localOnlyBytesBlockRemoval(workspacePath)) {
-          destructiveCleanup = false;
-          plannedCleanupReason = `${plannedCleanupReason} | ${LOCAL_ONLY_KEEP_REASON}`;
-          result.skippedLocalOnly += 1;
-        }
         if (dryRun) {
-          logDryRunCandidate(workspace, workspacePath, plannedCleanupReason, destructiveCleanup);
+          result.wouldArchive += 1;
+          logDryRun(workspace, "archive", cleanupReason, recordOnlyReason !== null);
           continue;
         }
         result.eligible += 1;
@@ -3554,13 +3359,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // lock, so it never archives a workspace that a reopen just restored.
         const archived = await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
-          return tx
+          const row = await tx
             .update(executionWorkspaces)
             .set({
               status: "archived",
               closedAt,
               cleanupEligibleAt: workspace.cleanupEligibleAt ?? closedAt,
-              cleanupReason: plannedCleanupReason,
+              cleanupReason,
               metadata: archivedMetadata,
               updatedAt: closedAt,
             })
@@ -3636,6 +3441,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             ))
             .returning()
             .then((rows) => rows[0] ?? null);
+          // A record-only archive has no cleanup step after it, so detach the
+          // issues here. A closed row left on them breaks dispatch (SUP-17621).
+          if (row && recordOnlyReason) {
+            await detachIssuesFromClosedExecutionWorkspace(tx as unknown as Db, {
+              companyId: row.companyId,
+              executionWorkspaceId: row.id,
+            });
+          }
+          return row;
         });
         if (!archived) {
           result.skippedRace += 1;
@@ -3653,98 +3467,47 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             sourceIssueId: archived.sourceIssueId,
             deliveryState: assessment.deliveryState,
             cleanupEligibleAt: archived.cleanupEligibleAt?.toISOString() ?? null,
-            cleanupReason: plannedCleanupReason,
+            cleanupReason,
           },
         });
+        if (recordOnlyReason) {
+          result.archived += 1;
+          continue;
+        }
 
         const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
           archived.metadata as Record<string, unknown> | null,
         );
-        if (!destructiveCleanup) {
-          const recordOnlyFailures: string[] = [];
-          const describeFailure = (error: unknown) => error instanceof Error ? error.message : String(error);
-          try {
-            const { stopRuntimeServicesForExecutionWorkspace } = await import("./workspace-runtime.js");
-            await stopRuntimeServicesBounded(
-              stopRuntimeServicesForExecutionWorkspace,
-              { db, executionWorkspaceId: archived.id },
-              resolveRuntimeServiceStopTimeoutMs(opts.runtimeServiceStopTimeoutMs),
-            );
-          } catch (error) {
-            recordOnlyFailures.push(`runtime services stop failed: ${describeFailure(error)}`);
-          }
-          try {
-            await detachIssuesFromClosedExecutionWorkspace(db, {
-              companyId: archived.companyId,
-              executionWorkspaceId: archived.id,
-            });
-          } catch (error) {
-            recordOnlyFailures.push(`issue detach failed: ${describeFailure(error)}`);
-          }
-          if (recordOnlyFailures.length > 0) {
-            const failure = recordOnlyFailures.join("; ");
-            try {
-              await fenceLifecycleGenerationWrite<boolean>({
-                workspaceId: archived.id,
-                expectedGeneration: capturedGeneration,
-                isWriteTarget: (fresh) => fresh.status === "archived",
-                onSkip: () => false,
-                write: async ({ tx }) => {
-                  await tx
-                    .update(executionWorkspaces)
-                    .set({ cleanupReason: `${plannedCleanupReason} | ${failure}`, updatedAt: now() })
-                    .where(eq(executionWorkspaces.id, archived.id));
-                  return true;
-                },
-              });
-              await logActivity(db, {
-                companyId: archived.companyId,
-                actorType: "system",
-                actorId: "workspace_terminality_reaper",
-                action: "execution_workspace.issue_terminal_archive_cleanup_warning",
-                entityType: "execution_workspace",
-                entityId: archived.id,
-                details: { sourceIssueId: archived.sourceIssueId, failure },
-              });
-            } catch (error) {
-              logger.warn(
-                { err: error, executionWorkspaceId: archived.id, failure },
-                "could not record record-only archive failure",
-              );
-            }
-          }
-          result.archived += 1;
-        } else {
-          try {
-            const cleanup = await cleanupTerminalWorkspace(archived, cleanupHeadSha, capturedGeneration);
-            if (cleanup.skippedReopened) result.skippedReopened += 1;
-            else if (!cleanup.cleaned) result.cleanupFailed += 1;
-            else result.archived += 1;
-          } catch (error) {
-            result.cleanupFailed += 1;
-            const failure = error instanceof Error ? error.message : String(error);
-            // Mark cleanup_failed only while the row is still closed at the
-            // generation this sweep captured. A reopen that raced after the failure
-            // raises the generation and restores the row; a later archive keeps the
-            // higher generation. The fenced write then skips, so stale
-            // cleanup-failure state never lands on a newer archive lifecycle.
-            await markTerminalCleanupFailedFenced({
-              workspaceId: archived.id,
-              capturedGeneration,
-              cleanupReason: `${plannedCleanupReason} | ${failure}`,
-            });
-            await logActivity(db, {
-              companyId: archived.companyId,
-              actorType: "system",
-              actorId: "workspace_terminality_reaper",
-              action: "execution_workspace.issue_terminal_cleanup_failed",
-              entityType: "execution_workspace",
-              entityId: archived.id,
-              details: { sourceIssueId: archived.sourceIssueId, failure },
-            });
-          }
+        try {
+          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration);
+          if (cleanup.skippedReopened) result.skippedReopened += 1;
+          else if (!cleanup.cleaned) result.cleanupFailed += 1;
+          else result.archived += 1;
+        } catch (error) {
+          result.cleanupFailed += 1;
+          const failure = error instanceof Error ? error.message : String(error);
+          // Mark cleanup_failed only while the row is still closed at the
+          // generation this sweep captured. A reopen that raced after the failure
+          // raises the generation and restores the row; a later archive keeps the
+          // higher generation. The fenced write then skips, so stale
+          // cleanup-failure state never lands on a newer archive lifecycle.
+          await markTerminalCleanupFailedFenced({
+            workspaceId: archived.id,
+            capturedGeneration,
+            cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${failure}`,
+          });
+          await logActivity(db, {
+            companyId: archived.companyId,
+            actorType: "system",
+            actorId: "workspace_terminality_reaper",
+            action: "execution_workspace.issue_terminal_cleanup_failed",
+            entityType: "execution_workspace",
+            entityId: archived.id,
+            details: { sourceIssueId: archived.sourceIssueId, failure },
+          });
         }
       }
+      if (dryRun) logger.info(result, "terminal issue workspace reaper dry run summary");
       return result;
       } finally {
         terminalSweepInProgress = false;
@@ -3765,10 +3528,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const row = await db.transaction(async (tx) => {
         if (pathGuardKey) {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${pathGuardKey}, 0))`);
-        }
-        const pathOnlyKeys = [...new Set([data.cwd, data.providerRef].filter((value): value is string => Boolean(value)))];
-        for (const workspacePath of pathOnlyKeys) {
-          await lockWorktreePath(tx, workspacePath);
         }
         await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db);
         return tx
