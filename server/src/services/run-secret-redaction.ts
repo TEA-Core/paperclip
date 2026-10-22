@@ -8,7 +8,11 @@ import type { StoredSecretVersionMaterial } from "../secrets/types.js";
 
 const REGISTRY_KEY = "paperclipSecretRedactions";
 // Project only the registry: run contexts can contain megabytes of prompt data.
-const registrySnapshot = sql`jsonb_build_object('paperclipSecretRedactions', ${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions')`;
+const registrySnapshot = sql`jsonb_build_object(
+  'issueId', ${heartbeatRuns.contextSnapshot} -> 'issueId',
+  'paperclipIssue', jsonb_build_object('id', ${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' -> 'id'),
+  'paperclipSecretRedactions', ${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions'
+)`;
 
 type RegistryEntry = {
   fingerprintSha256: string;
@@ -78,17 +82,30 @@ export function createRunSecretRedactionRegistry(db: Db) {
     return valuesForRuns(rows);
   }
 
-  async function valuesForIssue(companyId: string, issueId: string) {
+  async function valuesForIssues(companyId: string, issueIds: string[]) {
+    if (issueIds.length === 0) return new Map<string, string[]>();
     const rows = await db.select({ contextSnapshot: registrySnapshot })
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
         or(
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
+          inArray(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`, issueIds),
+          inArray(sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id'`, issueIds),
         ),
       ));
-    return valuesForRuns(rows);
+    const valuesByIssue = new Map<string, Promise<string[]>>();
+    for (const issueId of issueIds) {
+      const matchingRows = rows.filter((row) => {
+        const context = asRecord(row.contextSnapshot);
+        return context?.issueId === issueId || asRecord(context?.paperclipIssue)?.id === issueId;
+      });
+      valuesByIssue.set(issueId, valuesForRuns(matchingRows));
+    }
+    return new Map(await Promise.all([...valuesByIssue].map(async ([issueId, values]) => [issueId, await values] as const)));
+  }
+
+  async function valuesForIssue(companyId: string, issueId: string) {
+    return (await valuesForIssues(companyId, [issueId])).get(issueId) ?? [];
   }
 
   return {
@@ -143,5 +160,9 @@ export function createRunSecretRedactionRegistry(db: Db) {
       redactRegisteredSecretValues(value, await valuesForRun(companyId, runId)),
     redactForIssue: async <T>(companyId: string, issueId: string, value: T): Promise<T> =>
       redactRegisteredSecretValues(value, await valuesForIssue(companyId, issueId)),
+    redactForIssues: async <T extends { issueId: string }>(companyId: string, values: T[]): Promise<T[]> => {
+      const valuesByIssue = await valuesForIssues(companyId, [...new Set(values.map((value) => value.issueId))]);
+      return values.map((value) => redactRegisteredSecretValues(value, valuesByIssue.get(value.issueId) ?? []));
+    },
   };
 }

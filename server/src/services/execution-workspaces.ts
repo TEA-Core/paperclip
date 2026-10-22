@@ -1689,14 +1689,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
   function deriveRecordedDeliveryState(
     products: Array<{ status: string; metadata: unknown }>,
+    aheadOfBase: boolean,
   ): ExecutionWorkspaceDeliveryState {
-    const hasMergedMarker = products.some((product) =>
+    const hasMergedPullRequestProduct = products.some((product) =>
       product.status === "merged"
       && readNullableString(isRecord(product.metadata) ? product.metadata.mergedAt : null) !== null,
     );
-    if (hasMergedMarker) return "merged_via_pr";
-    if (products.length > 0) return "unmerged";
-    return "unknown";
+    return deriveExecutionWorkspaceDeliveryState({
+      hasMergedPullRequestProduct,
+      hasUnmergedPullRequestProduct: products.some((product) =>
+        !(product.status === "merged"
+          && readNullableString(isRecord(product.metadata) ? product.metadata.mergedAt : null) !== null),
+      ),
+      aheadOfBase,
+    });
   }
 
   async function assessDelivery(
@@ -2765,7 +2771,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           toExecutionWorkspace(
             row,
             (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
-            deriveRecordedDeliveryState(productsByIssueId.get(row.sourceIssueId ?? "") ?? []),
+            deriveRecordedDeliveryState(productsByIssueId.get(row.sourceIssueId ?? "") ?? [], false),
           ),
         ]),
       );

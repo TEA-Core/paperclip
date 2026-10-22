@@ -12801,8 +12801,15 @@ export function issueRoutes(
       };
     });
     const last = hasMore ? pageRows[pageRows.length - 1] : null;
+    const redactedItems = (await runRedactions.redactForIssues(
+      parent.companyId,
+      items.map((item) => ({ issueId: item.id, workProducts: item.workProducts })),
+    )).map(({ issueId: _issueId, workProducts }, index) => ({
+      ...items[index]!,
+      workProducts,
+    }));
     res.json({
-      items,
+      items: redactedItems,
       nextCursor: last
         ? Buffer.from(JSON.stringify({
             createdAt: last.createdAtText,

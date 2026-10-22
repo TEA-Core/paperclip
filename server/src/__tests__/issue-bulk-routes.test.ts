@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRuns,
   issueWorkProducts,
   issues,
   projects,
@@ -19,6 +20,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { createCompanySearchRateLimiter } from "../services/company-search-rate-limit.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import type { StorageService } from "../storage/types.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -32,6 +34,7 @@ describePostgres("bounded bulk issue read", () => {
   let agentId: string;
   let issueIds: string[];
   let identifiers: string[];
+  let conformanceProjectId: string;
   let conformanceParentId: string;
   let conformanceChildId: string;
   let conformanceOutOfScopeChildId: string;
@@ -89,6 +92,7 @@ describePostgres("bounded bulk issue read", () => {
     });
 
     const projectId = randomUUID();
+    conformanceProjectId = projectId;
     conformanceParentId = randomUUID();
     conformanceChildId = randomUUID();
     conformanceOutOfScopeChildId = randomUUID();
@@ -283,7 +287,7 @@ describePostgres("bounded bulk issue read", () => {
     });
   });
 
-  it("projects a recorded non-merged PR as unmerged", async () => {
+  it("keeps a recorded non-merged PR unknown without evidence the branch is ahead", async () => {
     await db.update(issueWorkProducts).set({
       status: "open",
       metadata: {},
@@ -292,7 +296,75 @@ describePostgres("bounded bulk issue read", () => {
     const response = await request(app(board())).get(`/api/issues/${conformanceParentId}/children/conformance`);
 
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(response.body.items[0].currentExecutionWorkspace.deliveryState).toBe("unmerged");
+    expect(response.body.items[0].currentExecutionWorkspace.deliveryState).toBe("unknown");
+  });
+
+  it("redacts registered run secrets from conformance work products", async () => {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: { issueId: conformanceChildId },
+    });
+    const secret = "conformance-work-product-redaction-secret-value";
+    await createRunSecretRedactionRegistry(db).register(companyId, runId, secret);
+    await db.update(issueWorkProducts).set({
+      status: "merged",
+      summary: `PR summary contains ${secret}`,
+      metadata: { mergedAt: "2026-10-21T17:30:00.000Z", secret },
+    }).where(eq(issueWorkProducts.issueId, conformanceChildId));
+
+    const response = await request(app(board())).get(`/api/issues/${conformanceParentId}/children/conformance`);
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.items[0].workProducts[0].summary).toBe(
+      "PR summary contains ***REDACTED***",
+    );
+    expect(JSON.stringify(response.body)).not.toContain(secret);
+    expect(response.body.items[0].currentExecutionWorkspace.deliveryState).toBe("merged_via_pr");
+  });
+
+  it("keeps conformance redaction queries bounded as direct-child count grows", async () => {
+    const extraChildId = randomUUID();
+    const extraWorkspaceId = randomUUID();
+    const server = app(board());
+    const endpoint = `/api/issues/${conformanceParentId}/children/conformance`;
+    const spy = vi.spyOn(db, "select");
+    try {
+      const one = await request(server).get(endpoint);
+      const oneCount = spy.mock.calls.length;
+      spy.mockClear();
+      await db.insert(issues).values({
+        id: extraChildId, companyId, projectId: conformanceProjectId, identifier: "BK-203", issueNumber: 203,
+        title: "Second conformance child", status: "todo", priority: "medium", parentId: conformanceParentId,
+      });
+      await db.insert(executionWorkspaces).values({
+        id: extraWorkspaceId, companyId, projectId: conformanceProjectId, sourceIssueId: extraChildId,
+        mode: "isolated_workspace", strategyType: "git_worktree", name: "second-conformance-child",
+        status: "active", branchName: "feature/second-conformance-child", providerType: "git_worktree",
+      });
+      await db.update(issues).set({ executionWorkspaceId: extraWorkspaceId }).where(eq(issues.id, extraChildId));
+      await db.insert(issueWorkProducts).values({
+        companyId, projectId: conformanceProjectId, issueId: extraChildId, executionWorkspaceId: extraWorkspaceId,
+        type: "pull_request", provider: "github", title: "Second conformance PR", status: "open",
+        reviewState: "none", healthStatus: "healthy", metadata: {}, url: "https://github.com/example/repo/pull/2",
+      });
+
+      const many = await request(server).get(endpoint);
+      const manyCount = spy.mock.calls.length;
+
+      expect(one.status, JSON.stringify(one.body)).toBe(200);
+      expect(many.status, JSON.stringify(many.body)).toBe(200);
+      expect(many.body.items).toHaveLength(2);
+      expect(manyCount).toBe(oneCount);
+    } finally {
+      spy.mockRestore();
+      await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, extraChildId));
+      await db.delete(issues).where(eq(issues.id, extraChildId));
+      await db.delete(executionWorkspaces).where(eq(executionWorkspaces.id, extraWorkspaceId));
+    }
   });
 
   it("rejects invalid conformance projection bounds", async () => {
