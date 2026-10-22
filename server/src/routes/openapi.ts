@@ -7714,7 +7714,7 @@ registry.registerPath({
     "Board-only (company owner/admin). The PR must be linked to the card and raAgentId must be an agent " +
     "of the company. Idempotent by eventId: an identical replay returns 200, a different payload under " +
     "the same eventId or a second enrollment of the card or PR is 409. Shadow mode: this installs no " +
-    "execution policy and admits nothing.",
+    "execution policy and admits no PR.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(enrollReleaseAssuranceSchema),
@@ -7731,7 +7731,7 @@ registry.registerPath({
     "Board-only (company owner/admin). The card must be enrolled and headSha must equal the live PR head, " +
     "otherwise 409. A GO also needs an evidence digest and CI run ids; a head with a recorded NO-GO " +
     "rejects any GO. Idempotent by eventId. The response carries the planned status with publication kind " +
-    "shadow: nothing is written to GitHub and no PR is admitted.",
+    "shadow: no GitHub status is written and no PR is admitted.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(releaseAssuranceDecisionSchema),
