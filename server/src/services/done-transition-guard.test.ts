@@ -11,6 +11,7 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  TIER1_FORM,
   GitHubAuthError,
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
@@ -5236,6 +5237,21 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(false);
       expect(result.tier).toBe(null);
       expect(result.reason).toContain("landed-at-tip");
+    });
+
+    it("feeds the Tier 1 remedy form through the landing-token pre-check", async () => {
+      ghFetchMock.mockClear();
+      const remedyForm = TIER1_FORM.slice(1, -1);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        remedyForm,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.reason).not.toContain("missing a landing-state token");
+      expect(result.reason).toContain("must name a linked PR");
+      expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
     it("rejects Tier 1 substitution with empty reason", async () => {

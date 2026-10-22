@@ -26,6 +26,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { TIER1_FORM } from "../services/done-transition-guard.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1236,7 +1237,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       // The rejection must name both accepted forms.
       expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
       expect(res.body.details.remedy).toContain(
-        '"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."',
+        TIER1_FORM,
+
       );
 
       const statusRows = await db
