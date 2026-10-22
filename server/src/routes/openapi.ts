@@ -41,6 +41,7 @@ import {
   approveIssueHeadSchema,
   enrollReleaseAssuranceSchema,
   releaseAssuranceDecisionSchema,
+  releaseIssueHeadSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
@@ -1441,6 +1442,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{id}/release-decisions",
   "POST /api/issues/{id}/release-assurance/enroll",
   "POST /api/issues/{id}/release-decisions",
+  "POST /api/issues/{id}/merge-arming/release",
   "POST /api/issues/{id}/execution-stage/board-decision",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
@@ -7769,6 +7771,32 @@ registry.registerPath({
     body: jsonBody(releaseAssuranceDecisionSchema),
   },
   responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/merge-arming/release",
+  tags: ["issues"],
+  summary: "Release the card's linked PR head to merge: publish paperclip/approved bound to exactly headSha",
+  description:
+    "Board-only (company owner/admin). The audited replacement for the Paperclip-Approved-Waiver body " +
+    "line on a card-bound PR. Publishes paperclip/approved as the control plane with the description " +
+    "'released by <actor> for <sha>: <reason>' for exactly headSha, whatever the card's state. 409 when " +
+    "the card has no single linked open non-draft PR, or headSha is not the PR's live head (a different " +
+    "or stale head). Idempotent: a head that already carries paperclip/approved returns 200 " +
+    "already_approved without a second write. Audited as issue.merge_release on a fresh write.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(releaseIssueHeadSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({

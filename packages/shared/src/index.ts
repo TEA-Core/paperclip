@@ -1976,6 +1976,8 @@ export {
   type EnrollReleaseAssurance,
   releaseAssuranceDecisionSchema,
   type ReleaseAssuranceDecision,
+  releaseIssueHeadSchema,
+  type ReleaseIssueHead,
   stripCreateOnlyIssueAttribution,
   ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS,
   stalledReviewDecisionSchema,
