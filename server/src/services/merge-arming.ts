@@ -3571,6 +3571,7 @@ async function writeCommitStatus(
   repo: string,
   headSha: string,
   issueIdentifier: string,
+  description?: string,
 ): Promise<{ success: boolean; error: string | null; status: number; transient: boolean }> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/statuses/${encodeURIComponent(headSha)}`;
   const headers: Record<string, string> = {
@@ -3583,7 +3584,7 @@ async function writeCommitStatus(
   const body = JSON.stringify({
     state: "success",
     context: "paperclip/approved",
-    description: `${issueIdentifier} approved via Paperclip`,
+    description: description ?? `${issueIdentifier} approved via Paperclip`,
     target_url: `https://paperclip.example.com/issues/${issueIdentifier}`,
   });
 
@@ -3705,6 +3706,8 @@ export interface WriteCommitStatusRetryOptions {
   delayMs?: number;
   /** Injectable delay seam for tests (defaults to a real setTimeout). */
   delay?: (ms: number) => Promise<void>;
+  /** Overrides the default "<issue> approved via Paperclip" status description. */
+  description?: string;
 }
 
 export interface WriteCommitStatusResult {
@@ -3739,14 +3742,77 @@ export async function writeCommitStatusWithRetry(
   const delay =
     options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
-  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier);
+  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description);
   let made = 1;
   while (!result.success && result.transient && made < attempts) {
     await delay(delayMs);
-    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier);
+    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description);
     made += 1;
   }
   return { ...result, attempts: made };
+}
+
+// GitHub rejects a commit-status description over 140 characters.
+const COMMIT_STATUS_DESCRIPTION_MAX = 140;
+
+/** `released by <actor> for <sha>: <reason>`, with the reason cut to fit GitHub's limit. */
+export function headBoundReleaseDescription(actor: string, headSha: string, reason: string): string {
+  const prefix = `released by ${actor} for ${headSha}: `;
+  const text = reason.replace(/\s+/g, " ").trim();
+  const room = Math.max(COMMIT_STATUS_DESCRIPTION_MAX - prefix.length, 0);
+  return `${prefix}${text.length > room ? `${text.slice(0, Math.max(room - 1, 0))}…` : text}`.slice(0, COMMIT_STATUS_DESCRIPTION_MAX);
+}
+
+export type HeadBoundReleaseOutcome =
+  | { kind: "released" | "already_approved"; headSha: string; message: string }
+  | { kind: "refused" | "failed"; message: string };
+
+/**
+ * Board-triggered merge release: publish `paperclip/approved` (as the control
+ * plane's own token) on exactly `headSha` of one PR. Nothing here consults the
+ * card's ladder, so it works for the PR a card cannot be stamped for today. The
+ * status is keyed by SHA, so a head that moves after the live read cannot
+ * inherit it. A head that already carries `paperclip/approved` is left alone.
+ */
+export async function publishHeadBoundRelease(
+  db: Db,
+  companyId: string,
+  target: { owner: string; repo: string; number: number },
+  input: { headSha: string; description: string },
+): Promise<HeadBoundReleaseOutcome> {
+  const { owner, repo, number } = target;
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  if (candidates.length === 0) {
+    return { kind: "failed", message: `status:failed:auth_required: no GitHub token resolvable for ${owner}/${repo}` };
+  }
+  for (const candidate of candidates) {
+    const live = await fetchPullRequestHeadSha(candidate.token, owner, repo, number);
+    if (!live.ok) {
+      if ((live.status === 401 || live.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
+      return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
+    }
+    if (live.merged || live.draft || live.state !== "open") {
+      return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
+    }
+    if (live.headSha !== input.headSha) {
+      return {
+        kind: "refused",
+        message: `status:refused:head-mismatch: ${owner}/${repo}#${number} head is ${live.headSha}, not ${input.headSha}`,
+      };
+    }
+    const existing = await fetchHeadApprovedStatusViaTokenCandidates(db, companyId, owner, repo, input.headSha);
+    if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: ${existing.reason}` };
+    if (existing.approved) {
+      return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published on this head" };
+    }
+    const write = await writeCommitStatusWithRetry(candidate.token, owner, repo, input.headSha, "", {
+      description: input.description,
+    });
+    if (write.success) return { kind: "released", headSha: input.headSha, message: input.description };
+    if ((write.status === 401 || write.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
+    return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
+  }
+  return { kind: "failed", message: "status:failed:auth_required: no candidate token could release the head" };
 }
 
 /**

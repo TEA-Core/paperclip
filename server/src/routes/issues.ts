@@ -86,6 +86,7 @@ import {
   createChildIssueSchema,
   createIssueSchema,
   approveIssueHeadSchema,
+  releaseIssueHeadSchema,
   isAssignedBacklogBlockingCreate,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
@@ -209,6 +210,8 @@ import {
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
   resolveLinkedPullRequestsWithState,
+  publishHeadBoundRelease,
+  headBoundReleaseDescription,
   shouldPublishApprovalStatus,
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
@@ -11393,6 +11396,15 @@ export function issueRoutes(
     });
   });
 
+  async function assertCompanyOwnerOrAdmin(req: Request, companyId: string, message: string) {
+    if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;
+    const membership = req.actor.userId ? await access.getMembership(companyId, "user", req.actor.userId) : null;
+    if (membership?.status !== "active"
+      || (membership.membershipRole !== "owner" && membership.membershipRole !== "admin")) {
+      throw forbidden(message);
+    }
+  }
+
   // A completed ladder stays completed. This decision reviews only the delta
   // from its certified head, not another pass through the stage machine.
   async function reviewCompletedIssueHead(req: Request, res: Response, publish: boolean) {
@@ -11400,15 +11412,7 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!existing) return;
     const actor = getActorInfo(req);
-    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
-      const membership = req.actor.userId
-        ? await access.getMembership(existing.companyId, "user", req.actor.userId)
-        : null;
-      if (membership?.status !== "active"
-        || (membership.membershipRole !== "owner" && membership.membershipRole !== "admin")) {
-        throw forbidden("Company owner or admin required to approve a new head");
-      }
-    }
+    await assertCompanyOwnerOrAdmin(req, existing.companyId, "Company owner or admin required to approve a new head");
     const result = await db.transaction(async (tx) => {
       const issueQuery = tx.select().from(issueRows).where(and(
         eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId),
@@ -11496,6 +11500,40 @@ export function issueRoutes(
     });
     res.status(result.outcome === "armed" || result.outcome === "review_required" ? 200 : 409).json(result);
   }
+
+  // Audited replacement for the free-text Paperclip-Approved-Waiver line on a card-bound PR:
+  // a board owner/admin releases exactly one head of the card's single linked open PR.
+  router.post("/issues/:id/merge-arming/release", async (req, res) => {
+    assertBoard(req);
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!existing) return;
+    const actor = getActorInfo(req);
+    await assertCompanyOwnerOrAdmin(req, existing.companyId, "Company owner or admin required to release a PR head");
+    const input = releaseIssueHeadSchema.parse(req.body);
+    const context = await resolveIssueRepoContext(db, existing);
+    const repo = context?.repoUrl ? parseRepoUrl(context.repoUrl) : null;
+    if (!repo) throw conflict("Project repository is not resolvable");
+    const linked = await resolveLinkedPullRequestsWithState(db, existing.companyId, existing.id);
+    const delivery = z.object({ prNumber: z.number().int().positive() }).safeParse(existing.executionState?.delivery);
+    const targets = linked.filter((pr) =>
+      pr.owner.toLowerCase() === repo.owner.toLowerCase() && pr.repo.toLowerCase() === repo.repo.toLowerCase()
+      && (!delivery.success || pr.number === delivery.data.prNumber));
+    if (targets.length !== 1) throw conflict("Exactly one linked delivery PR is required to release a head");
+    const target = targets[0]!;
+    const description = headBoundReleaseDescription(`${actor.actorType}:${actor.actorId}`, input.headSha, input.reason);
+    const outcome = await publishHeadBoundRelease(db, existing.companyId, target, { headSha: input.headSha, description });
+    if (outcome.kind === "released") {
+      const entry = await persistActivity(db, {
+        companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
+        action: "issue.merge_release", entityType: "issue", entityId: existing.id,
+        details: { headSha: input.headSha, reason: input.reason, pr: target.displayName, description },
+      });
+      publishActivity(entry.publication);
+    }
+    res.status(outcome.kind === "released" || outcome.kind === "already_approved" ? 200 : 409).json({
+      outcome: outcome.kind, headSha: input.headSha, message: outcome.message,
+    });
+  });
 
   router.get("/issues/:id/merge-arming/head-review", (req, res) => reviewCompletedIssueHead(req, res, false));
   router.post("/issues/:id/merge-arming/approve-head", (req, res) => reviewCompletedIssueHead(req, res, true));

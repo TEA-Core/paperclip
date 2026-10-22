@@ -39,6 +39,16 @@ Both APIs require board owner/admin authority (including trusted-local/instance-
 
 The card must be `done`, every declared stage completed, the last decision approved, and Guard B stage integrity intact. Missing anchors, unverifiable deltas, non-open/draft PRs, stale preview anchors, moved heads, foreign delivery identities, and unauthorized actors refuse without a status write. The response includes the reviewed delta and publication outcome. The activity event `issue.approval_head_decision` records the actor, previous and requested heads, PR, reason, and Guard A summary before publication; audit failure prevents the write. Successful publication updates only `executionState.approvalStatus`, preserving the card status, ladder, and stage decisions.
 
+### Head-bound merge release (SUP-20772)
+
+A card-bound PR whose card cannot be stamped (no ladder, a receipt that cannot exist, a head the ladder never saw) is released by a board owner/admin, not by a waiver line:
+
+- `POST /api/issues/:issueId/merge-arming/release` with `{ "headSha": "<40-character live SHA>", "reason": "..." }` publishes `paperclip/approved` as the control plane (the same token path as every other stamp, so the `tea-core[bot]` creator check in `scripts/ci/check-paperclip-approved.sh` accepts it) with the description `released by <actorType>:<actorId> for <sha>: <reason>`, cut to GitHub's 140 characters.
+- The card must have exactly one linked delivery PR in the project repository, open and not a draft, and `headSha` must be that PR's live head. A different or stale head answers 409 with no write. Agent actors and board members who are not owner/admin are refused before any GitHub access. The card's ladder is not consulted.
+- Idempotent: a head that already carries `paperclip/approved` answers 200 `already_approved` with no second write or activity row. A fresh write is recorded as the activity event `issue.merge_release` (actor, head, reason, PR, description).
+- The status is keyed by SHA, so a push after the release gets no stamp; release the new head.
+- A "release-assurance seat" has no server identity today, so the route is board-only. A seat that needs it acts through the board token.
+
 The head decision is durable before the external status write. If GitHub accepts the status but storing publication state subsequently fails, the API reports the failure and the decision audit remains; a database rollback must not erase the authorization for an already-written status. The `issue.approval_head_decision` row records the authorizer, not that publication applied: a refused publication (for example `delivery-receipt-missing` or a moved head) is visible only in the 409 response, and no publish-outcome audit record exists yet.
 
 ## Override label and the reconciler
