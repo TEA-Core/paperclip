@@ -241,3 +241,23 @@ export function buildDispatchUnlaunchedEvidence(input: {
     lastProgressAt,
   };
 }
+
+/**
+ * SUP-16555: positive bootstrap evidence authorizes a legacy retry. Record it
+ * only when the stored reap evidence proves provider work never started. A
+ * child handle, an active or unknown lease, telemetry, or any step other than
+ * admission is ambiguous and must not authorize replay.
+ */
+export function executionRecoveryForDispatchUnlaunched(
+  evidence: DispatchUnlaunchedEvidence | null | undefined,
+): { kind: "bootstrap"; providerWorkStarted: false } | null {
+  if (
+    evidence?.dispatchStep === "admitted_running" &&
+    evidence.leaseOutcome === "no_active_lease_observed" &&
+    evidence.childHandleRegistered === false &&
+    evidence.telemetryObserved === false
+  ) {
+    return { kind: "bootstrap", providerWorkStarted: false };
+  }
+  return null;
+}
