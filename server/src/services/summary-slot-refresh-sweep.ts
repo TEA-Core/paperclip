@@ -102,12 +102,6 @@ export const SUMMARY_SLOT_REFRESH_ACTOR_ID = "system:summary-slot-refresh";
 export interface SummarySlotRefreshSweepOptions {
   /** How old (ms since `lastGeneratedAt`) a summary must be before it counts as stale. */
   staleMs?: number;
-  /**
-   * Same as `staleMs`, but only for `workspaces_overview` slots, where the
-   * shorter of the two applies. Read from
-   * `SUMMARY_SLOT_REFRESH_WORKSPACES_OVERVIEW_STALE_MS` when omitted (default 12h).
-   */
-  workspacesOverviewStaleMs?: number;
   /** Minimum spacing between actual measurement runs. */
   sweepIntervalMs?: number;
   /**
@@ -178,11 +172,6 @@ export function createSummarySlotRefreshSweepService(
   opts: SummarySlotRefreshSweepOptions = {},
 ) {
   const staleMs = opts.staleMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_STALE_MS", DEFAULT_STALE_MS);
-  const workspacesOverviewStaleMs = Math.min(
-    staleMs,
-    opts.workspacesOverviewStaleMs
-      ?? readMsEnv("SUMMARY_SLOT_REFRESH_WORKSPACES_OVERVIEW_STALE_MS", DEFAULT_WORKSPACES_OVERVIEW_STALE_MS),
-  );
   const sweepIntervalMs =
     opts.sweepIntervalMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_SWEEP_INTERVAL_MS", DEFAULT_SWEEP_INTERVAL_MS);
   const wedgedMs = opts.wedgedMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_WEDGED_MS", DEFAULT_WEDGED_MS);
@@ -214,7 +203,7 @@ export function createSummarySlotRefreshSweepService(
     };
 
     const staleCutoff = new Date(checkedAt.getTime() - staleMs);
-    const overviewStaleCutoff = new Date(checkedAt.getTime() - workspacesOverviewStaleMs);
+    const overviewStaleCutoff = new Date(checkedAt.getTime() - DEFAULT_WORKSPACES_OVERVIEW_STALE_MS);
     const candidates = await db
       .select({
         companyId: summarySlots.companyId,
