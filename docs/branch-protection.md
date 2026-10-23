@@ -49,8 +49,8 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
   `review` stage records `approved` **and** the card has exactly one linked,
   open PR. **Nothing in this repository may create, mock or backfill that
   status** — a local write is a contract violation that manufactures a fake
-  approval. The enforcer is read-only (two GETs: `pulls/{n}` and
-  `commits/{sha}/status`).
+  approval. The enforcer is read-only (GETs only; the endpoints it calls are listed in
+  the script header).
 - Behaviour by event: `pull_request` → advisory (exit 0, green — the status
   only exists after the review stage approves); `merge_group` → **fail-closed**
   (missing/pending/failed/unresolvable/API-error all block the merge); `push`
