@@ -91,6 +91,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import { checkWorkspaceDiskHeadroom } from "./workspace-disk-headroom.js";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
@@ -6107,6 +6108,11 @@ export async function realizeExecutionWorkspace(input: {
     }
     throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
   }
+
+  // SUP-20840: only a brand-new worktree is refused; the reuse paths above add
+  // no meaningful data and must keep working so in-flight issues can finish.
+  const diskRefusal = await checkWorkspaceDiskHeadroom({ path: worktreeParentDir });
+  if (diskRefusal) throw new WorkspaceRuntimeValidationFailure(diskRefusal.message, diskRefusal.resultJson);
 
   if (requestedExistingBranch) {
     try {
