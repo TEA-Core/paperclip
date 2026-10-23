@@ -34,8 +34,9 @@ import type {
  *     progressing issue means in-flight and is left alone; a dead/wedged issue
  *     is re-claimed — see below), or
  *   - an `idle` slot that is stale: `lastGeneratedAt` is null, or older than
- *     the staleness threshold. Fresh idle slots are excluded at the query so
- *     a recently-written summary is never re-fired.
+ *     the staleness threshold (`SUMMARY_SLOT_REFRESH_STALE_MS`, default 24h;
+ *     12h for `workspaces_overview` slots, SUP-20900). Fresh idle slots are
+ *     excluded at the query so a recently-written summary is never re-fired.
  *
  * For each candidate the sweep calls `summarySlotService(db).generate` at the
  * service layer — the exact consume-contract the HTTP route uses. For a fresh
