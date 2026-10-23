@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -18,6 +18,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { HttpError } from "../errors.js";
+import { companyService } from "../services/companies.js";
+import { issueService } from "../services/issues.js";
 import { releaseDecisionRoutes } from "../routes/release-decisions.js";
 import type { LivePullRequest } from "../services/release-assurance.js";
 
@@ -229,6 +232,38 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
     expect((await decide(goBody({ headSha: "ABC" }))).status).toBe(400);
     expect((await decide({ ...noGoBody(), evidenceDigest: DIGEST })).status).toBe(400);
     expect(await rows()).toHaveLength(1);
+  });
+
+  it("survives issue deletion: the delete is refused with a 409 and every ledger row stays", async () => {
+    await enroll();
+    await decide(goBody());
+    const error = await issueService(db).remove(issueId).catch((err) => err);
+    expect(error).toBeInstanceOf(HttpError);
+    expect(error).toMatchObject({ status: 409 });
+    expect(await rows()).toHaveLength(2);
+    expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId))).toHaveLength(1);
+  });
+
+  it("survives company deletion: the delete is refused with a 409 and the company and ledger stay", async () => {
+    await enroll();
+    await decide(noGoBody());
+    const error = await companyService(db).remove(companyId).catch((err) => err);
+    expect(error).toBeInstanceOf(HttpError);
+    expect(error).toMatchObject({ status: 409 });
+    expect(await rows()).toHaveLength(2);
+    expect(await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId))).toHaveLength(1);
+  });
+
+  it("keeps the enrolled RA seat identity in the record after the agent row is deleted", async () => {
+    await enroll();
+    await db.delete(agents).where(eq(agents.id, raAgentId));
+    const [hold] = await rows();
+    expect(hold).toMatchObject({ kind: "hold", raAgentId });
+  });
+
+  it("deletes a card that was never enrolled", async () => {
+    await issueService(db).remove(issueId);
+    expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId))).toHaveLength(0);
   });
 
   it("only lets the database express shadow publication and head-bound decisions", async () => {

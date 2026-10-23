@@ -37445,7 +37445,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
+          "onDelete": "no action",
           "onUpdate": "no action"
         },
         "release_assurance_events_issue_id_issues_id_fk": {
@@ -37458,20 +37458,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "release_assurance_events_ra_agent_id_agents_id_fk": {
-          "name": "release_assurance_events_ra_agent_id_agents_id_fk",
-          "tableFrom": "release_assurance_events",
-          "tableTo": "agents",
-          "columnsFrom": [
-            "ra_agent_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
+          "onDelete": "no action",
           "onUpdate": "no action"
         }
       },
