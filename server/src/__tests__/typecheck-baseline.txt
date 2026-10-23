@@ -645,8 +645,8 @@ server/src/__tests__/heartbeat-process-recovery.test.ts(889,5): TS2349
 server/src/__tests__/heartbeat-project-env.test.ts(1235,44): TS2322
 server/src/__tests__/heartbeat-project-env.test.ts(1242,7): TS2322
 server/src/__tests__/heartbeat-project-env.test.ts(7,3): TS2305
-server/src/__tests__/heartbeat-project-repositories.test.ts(152,11): TS7034
-server/src/__tests__/heartbeat-project-repositories.test.ts(177,64): TS7005
+server/src/__tests__/heartbeat-project-repositories.test.ts(197,11): TS7034
+server/src/__tests__/heartbeat-project-repositories.test.ts(222,64): TS7005
 server/src/__tests__/heartbeat-retry-scheduling.test.ts(427,7): TS1117
 server/src/__tests__/heartbeat-run-lease-release-terminalization.test.ts(161,17): TS2769
 server/src/__tests__/heartbeat-run-terminalize-before-release.test.ts(308,49): TS2769
