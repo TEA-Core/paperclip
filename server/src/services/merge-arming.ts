@@ -14,6 +14,7 @@ import {
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   isGitHubTokenResolution,
+  resolveControlPlaneGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
   resolveGitHubTokenForRepo,
   type GitHubTokenResolution,
@@ -3783,51 +3784,81 @@ export type HeadBoundReleaseOutcome =
   | { kind: "refused" | "failed"; message: string };
 
 /**
- * Board-triggered merge release: publish `paperclip/approved` (as the control
- * plane's own token) on exactly `headSha` of one PR. Nothing here consults the
- * card's ladder, so it works for the PR a card cannot be stamped for today. The
- * status is keyed by SHA, so a head that moves after the live read cannot
- * inherit it. A head whose newest `paperclip/approved` is a control-plane success is left alone.
+ * The PR a board release may target: the one the card's verified delivery identity names. The
+ * recorded `executionState.delivery` is cross-checked against the project repo and the card's
+ * control-plane delivery branch (resolveDeliveryIdentity), so a PR that was merely cited on the card
+ * is never a target. The recorded head is not compared: a release is the board's decision on the
+ * live head, and the live PR's branch is matched to the bound branch at publish time instead.
+ */
+export async function resolveReleaseDeliveryTarget(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<
+  | { ok: true; target: { owner: string; repo: string; number: number; displayName: string; branch: string } }
+  | { ok: false; reason: string }
+> {
+  const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+  if (identity.recordedUnusable) return { ok: false, reason: identity.recordedUnusable };
+  if (!identity.binding || !identity.repo) {
+    return { ok: false, reason: "card has no verified delivery PR binding; a cited PR is not a release target" };
+  }
+  const bindingError = deliveryBindingValidationError(identity.binding, identity.repo, issueId);
+  if (bindingError) return { ok: false, reason: bindingError };
+  const { owner, repo } = identity.repo;
+  const number = identity.binding.prNumber;
+  return {
+    ok: true,
+    target: { owner, repo, number, displayName: `${owner}/${repo}#${number}`, branch: identity.binding.branch },
+  };
+}
+
+/**
+ * Board-triggered merge release: publish `paperclip/approved` on exactly `headSha` of one PR, as
+ * the control plane's own App token and no other credential (CI accepts only that creator, so a
+ * fallback write would look released and not be). Nothing here consults the card's ladder, so it
+ * works for the PR a card cannot be stamped for today. The status is keyed by SHA, so a head that
+ * moves after the live read cannot inherit it. A head whose newest `paperclip/approved` is a
+ * control-plane success is left alone. The live PR must still be on `expectedBranch`.
  */
 export async function publishHeadBoundRelease(
   db: Db,
   companyId: string,
   target: { owner: string; repo: string; number: number },
-  input: { headSha: string; description: string },
+  input: { headSha: string; description: string; expectedBranch: string },
 ): Promise<HeadBoundReleaseOutcome> {
   const { owner, repo, number } = target;
-  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
-  if (candidates.length === 0) {
-    return { kind: "failed", message: `status:failed:auth_required: no GitHub token resolvable for ${owner}/${repo}` };
+  const credential = await resolveControlPlaneGitHubToken(db, companyId, owner, repo);
+  if (!credential) {
+    return { kind: "failed", message: `status:failed:auth_required: control-plane GitHub App credential unavailable for ${owner}/${repo}` };
   }
-  for (const candidate of candidates) {
-    const live = await fetchPullRequestHeadSha(candidate.token, owner, repo, number);
-    if (!live.ok) {
-      if ((live.status === 401 || live.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
-      return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
-    }
-    if (live.merged || live.draft || live.state !== "open") {
-      return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
-    }
-    if (live.headSha !== input.headSha) {
-      return {
-        kind: "refused",
-        message: `status:refused:head-mismatch: ${owner}/${repo}#${number} head is ${live.headSha}, not ${input.headSha}`,
-      };
-    }
-    const existing = await fetchHeadApprovedStatusViaTokenCandidates(db, companyId, owner, repo, input.headSha);
-    if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: ${existing.reason}` };
-    if (existing.controlPlaneApproved) {
-      return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
-    }
-    const write = await writeCommitStatusWithRetry(candidate.token, owner, repo, input.headSha, "", {
-      description: input.description,
-    });
-    if (write.success) return { kind: "released", headSha: input.headSha, message: input.description };
-    if ((write.status === 401 || write.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
-    return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
+  const live = await fetchPullRequestHeadSha(credential.token, owner, repo, number);
+  if (!live.ok) return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
+  if (live.merged || live.draft || live.state !== "open") {
+    return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
   }
-  return { kind: "failed", message: "status:failed:auth_required: no candidate token could release the head" };
+  if (live.headRef !== input.expectedBranch) {
+    return {
+      kind: "refused",
+      message: `status:refused:branch-mismatch: ${owner}/${repo}#${number} is on ${live.headRef ?? "(unreadable)"}, not the card's delivery branch ${input.expectedBranch}`,
+    };
+  }
+  if (live.headSha !== input.headSha) {
+    return {
+      kind: "refused",
+      message: `status:refused:head-mismatch: ${owner}/${repo}#${number} head is ${live.headSha}, not ${input.headSha}`,
+    };
+  }
+  const existing = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha);
+  if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
+  if (existing.controlPlaneApproved) {
+    return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
+  }
+  const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+    description: input.description,
+  });
+  if (write.success) return { kind: "released", headSha: input.headSha, message: input.description };
+  return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
 }
 
 /**
