@@ -325,7 +325,7 @@ cannot ask which card owns a PR. Both inputs to the refusal are chosen by the PR
 author: card binding comes from the head ref (`SUP-<n>...`), and "person" comes from
 GitHub's `user.type`. With the switch on, a card work item pushed to a branch that does
 not start `SUP-<n>` still reads as cardless and keeps its waiver, and a machine token
-that is a GitHub `User` (the fleet's `kronik187` token is one) reads as a person. The
+that is a GitHub `User` (the fleet's shared operator token is one) reads as a person. The
 switch therefore only closes the honest mistake and the `SUP-` branch path; it does not
 stop an agent that renames its branch or pushes as a `User`. Closing it needs the card's
 recorded delivery PR/branch passed to this check over a path the author cannot write, and

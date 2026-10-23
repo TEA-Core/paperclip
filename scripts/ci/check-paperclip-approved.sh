@@ -110,7 +110,7 @@
 #   1. Card binding is judged from the head ref (`SUP-<n>...`). A card work item
 #      pushed to any other branch name reads as cardless and keeps its waiver.
 #   2. Author type is GitHub's label, not an identity proof. A machine token that
-#      is a GitHub `User` (the fleet's `kronik187` token is one) reads as a person.
+#      is a GitHub `User` (the fleet's shared operator token is one) reads as a person.
 # So with the switch on this closes the honest mistake and the `SUP-` branch path
 # only; it does not stop an agent that renames its branch or pushes as a User.
 # Closing it needs control-plane data (the card's recorded delivery PR/branch)
