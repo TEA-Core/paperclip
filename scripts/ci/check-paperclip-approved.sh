@@ -103,6 +103,20 @@
 # release route is deployed. Turn it on (repository variable of the same name)
 # only after the route answers on the live control plane.
 #
+# KNOWN RESIDUAL BYPASS -- DO NOT SET THE SWITCH UNTIL BOTH HALVES ARE CLOSED.
+# This script reads GitHub only. It holds no control-plane credential, so it
+# cannot ask which card owns a PR. Both inputs to the refusal are therefore ones
+# the PR author controls:
+#   1. Card binding is judged from the head ref (`SUP-<n>...`). A card work item
+#      pushed to any other branch name reads as cardless and keeps its waiver.
+#   2. Author type is GitHub's label, not an identity proof. A machine token that
+#      is a GitHub `User` (the fleet's `kronik187` token is one) reads as a person.
+# So with the switch on this closes the honest mistake and the `SUP-` branch path
+# only; it does not stop an agent that renames its branch or pushes as a User.
+# Closing it needs control-plane data (the card's recorded delivery PR/branch)
+# fed to this check by a path the author cannot write, plus a fleet token that is
+# not a User. Every waiver honoured with the switch on is logged `UNVERIFIED`.
+#
 # COUNTERSIGNATURE on fold-sync heads -- ADVISORY SINCE 2026-09-07, NOT ENFORCED.
 # A PR whose head ref starts with `fold-sync/` cannot earn `paperclip/approved`
 # at all -- the head must stay `fold-sync/*` for pr.yml's lockfile exemption,
@@ -516,7 +530,9 @@ PR_AUTHOR_TYPE="$(jq -r '.user.type // ""' <<<"$PR_JSON")"
 PR_AUTHOR_ID="$(jq -r '.user.id // ""' <<<"$PR_JSON")"
 
 # A card-bound head is `SUP-<n>` or `SUP-<n>-...` (the execution-workspace
-# branch). Case-insensitive so `sup-123-x` cannot step round the rule.
+# branch). Case-insensitive so `sup-123-x` cannot step round the rule. This is
+# judged from a name the PR author chooses, so it is NOT proof a PR has no card;
+# see KNOWN RESIDUAL BYPASS in the header.
 CARD_BOUND=0
 [[ "$PR_HEAD_REF" =~ ^[Ss][Uu][Pp]-[0-9]+(-|$) ]] && CARD_BOUND=1
 
@@ -717,10 +733,18 @@ evaluate_override() {
   return 0
 }
 
+# waiver_unverified <what>: say, in the log, that a waiver was honoured on
+# author-controlled evidence only (branch name and author type).
+waiver_unverified() {
+  note "UNVERIFIED: ${1} honoured on head '${PR_HEAD_REF}' by author ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — no card binding was checked against the control plane, and a card work item on a non-SUP branch or a machine token typed User passes this check"
+}
+
 # waiver_honoured <what>
 #   0 -> the waiver counts
 #   1 -> refused (SUP-20772): the gate falls through to the status check
-# Always 0 until PAPERCLIP_CARD_WAIVER_RETIRED=1; see the header.
+# Always 0 until PAPERCLIP_CARD_WAIVER_RETIRED=1; see the header, including
+# KNOWN RESIDUAL BYPASS: neither the branch name nor the author type below is
+# control-plane data, so a honoured waiver is logged UNVERIFIED, never trusted.
 waiver_honoured() {
   local what="$1"
   [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ] || return 0
@@ -729,9 +753,9 @@ waiver_honoured() {
     return 1
   fi
   case "${PR_AUTHOR_TYPE}:${PR_AUTHOR}" in
-    User:*|Bot:github-actions\[bot\]) return 0 ;;
+    User:*|Bot:github-actions\[bot\]) waiver_unverified "$what"; return 0 ;;
   esac
-  [ "$PR_AUTHOR_TYPE" = "Bot" ] && [ "$PR_AUTHOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ] && return 0
+  [ "$PR_AUTHOR_TYPE" = "Bot" ] && [ "$PR_AUTHOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ] && { waiver_unverified "$what"; return 0; }
   note "REFUSED: ${what} on PR #${PR_NUMBER} authored by ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — only a person, github-actions[bot] or ${APPROVED_STATUS_CREATOR_LOGIN} may waive a cardless PR"
   return 1
 }
