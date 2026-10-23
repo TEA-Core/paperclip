@@ -211,6 +211,7 @@ import {
   resolveCardDeliveryBranchOwnership,
   resolveLinkedPullRequestsWithState,
   publishHeadBoundRelease,
+  resolveReleaseDeliveryTarget,
   headBoundReleaseDescription,
   shouldPublishApprovalStatus,
   ladderIncompleteStageIds,
@@ -11502,7 +11503,7 @@ export function issueRoutes(
   }
 
   // Audited replacement for the free-text Paperclip-Approved-Waiver line on a card-bound PR:
-  // a board owner/admin releases exactly one head of the card's single linked open PR.
+  // a board owner/admin releases exactly one head of the PR in the card's verified delivery binding.
   router.post("/issues/:id/merge-arming/release", async (req, res) => {
     assertBoard(req);
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
@@ -11510,25 +11511,37 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     await assertCompanyOwnerOrAdmin(req, existing.companyId, "Company owner or admin required to release a PR head");
     const input = releaseIssueHeadSchema.parse(req.body);
-    const context = await resolveIssueRepoContext(db, existing);
-    const repo = context?.repoUrl ? parseRepoUrl(context.repoUrl) : null;
-    if (!repo) throw conflict("Project repository is not resolvable");
-    const linked = await resolveLinkedPullRequestsWithState(db, existing.companyId, existing.id);
-    const delivery = z.object({ prNumber: z.number().int().positive() }).safeParse(existing.executionState?.delivery);
-    const targets = linked.filter((pr) =>
-      pr.owner.toLowerCase() === repo.owner.toLowerCase() && pr.repo.toLowerCase() === repo.repo.toLowerCase()
-      && (!delivery.success || pr.number === delivery.data.prNumber));
-    if (targets.length !== 1) throw conflict("Exactly one linked delivery PR is required to release a head");
-    const target = targets[0]!;
+    const resolved = await resolveReleaseDeliveryTarget(db, existing.companyId, existing.id);
+    if (!resolved.ok) throw conflict(`Card has no verified delivery PR to release: ${resolved.reason}`);
+    const target = resolved.target;
     const description = headBoundReleaseDescription(`${actor.actorType}:${actor.actorId}`, input.headSha, input.reason);
-    const outcome = await publishHeadBoundRelease(db, existing.companyId, target, { headSha: input.headSha, description });
-    if (outcome.kind === "released") {
+    // The intent is durable before the GitHub write: if this insert fails nothing is published, and if
+    // the outcome insert below fails the intent row still names who asked to release which head.
+    const intent = await persistActivity(db, {
+      companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
+      action: "issue.merge_release_requested", entityType: "issue", entityId: existing.id,
+      details: { headSha: input.headSha, reason: input.reason, pr: target.displayName, branch: target.branch, description },
+    });
+    publishActivity(intent.publication);
+    const outcome = await publishHeadBoundRelease(db, existing.companyId, target, {
+      headSha: input.headSha, description, expectedBranch: target.branch,
+    });
+    try {
       const entry = await persistActivity(db, {
         companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
-        action: "issue.merge_release", entityType: "issue", entityId: existing.id,
-        details: { headSha: input.headSha, reason: input.reason, pr: target.displayName, description },
+        action: outcome.kind === "released" ? "issue.merge_release" : "issue.merge_release_outcome",
+        entityType: "issue", entityId: existing.id,
+        details: {
+          headSha: input.headSha, reason: input.reason, pr: target.displayName, description,
+          outcome: outcome.kind, message: outcome.message,
+        },
       });
       publishActivity(entry.publication);
+    } catch (error) {
+      logger.error(
+        { err: error, issueId: existing.id, headSha: input.headSha, outcome: outcome.kind },
+        "merge release outcome could not be recorded; the release intent row is the audit trail",
+      );
     }
     res.status(outcome.kind === "released" || outcome.kind === "already_approved" ? 200 : 409).json({
       outcome: outcome.kind, headSha: input.headSha, message: outcome.message,
