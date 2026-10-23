@@ -34,7 +34,8 @@ import {
   routineRevisions,
   routines,
 } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { isForeignKeyViolation } from "../db-errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import {
   MAX_ISSUE_PREFIX_ATTEMPTS,
@@ -527,6 +528,8 @@ export function companyService(db: Db) {
     },
 
     remove: (id: string) =>
+      // A foreign key without a delete policy (release-assurance ledger, decisions)
+      // keeps its rows on purpose and blocks this delete; answer 409, not a bare 500.
       db.transaction(async (tx) => {
         // Delete from child tables in dependency order
         const companyRunIds = await tx
@@ -575,6 +578,11 @@ export function companyService(db: Db) {
           .where(eq(companies.id, id))
           .returning();
         return rows[0] ?? null;
+      }).catch((err) => {
+        if (isForeignKeyViolation(err)) {
+          throw conflict("Company cannot be deleted because another record still references it.");
+        }
+        throw err;
       }),
 
     stats: () =>

@@ -11,7 +11,6 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
-import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 
@@ -36,7 +35,9 @@ export type ReleaseAssurancePublicationMode = (typeof RELEASE_ASSURANCE_PUBLICAT
  * Append-only ledger of release-assurance enrollment and decisions (SUP-20771).
  * Rows are only ever inserted: a decision is never rewritten, so a later head
  * change, comment deletion, or policy edit cannot erase an enrollment or a
- * denial. `(companyId, eventId)` is the idempotency key — a replay of the same
+ * denial. The company and issue foreign keys carry no delete policy (the
+ * `decisions` precedent), so deleting a card or company that still has ledger
+ * rows is refused rather than cascading the audit trail away. `(companyId, eventId)` is the idempotency key — a replay of the same
  * canonical payload is a no-op and a conflicting reuse fails — and `sequence`
  * is the server-side ordering, never the caller's clock.
  *
@@ -50,8 +51,8 @@ export const releaseAssuranceEvents = pgTable(
   "release_assurance_events",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
-    issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
+    companyId: uuid("company_id").notNull().references(() => companies.id),
+    issueId: uuid("issue_id").notNull().references(() => issues.id),
     eventId: uuid("event_id").notNull(),
     sequence: bigserial("sequence", { mode: "number" }).notNull(),
     kind: text("kind").$type<ReleaseAssuranceEventKind>().notNull(),
@@ -60,7 +61,9 @@ export const releaseAssuranceEvents = pgTable(
     pullRequestNumber: integer("pull_request_number").notNull(),
     headSha: text("head_sha"),
     policyRevision: integer("policy_revision").notNull().default(1),
-    raAgentId: uuid("ra_agent_id").references(() => agents.id, { onDelete: "set null" }),
+    // Recorded identity, deliberately not a foreign key: the enrolled seat must stay readable
+    // in the durable record after the agent row is deleted or its id is reused elsewhere.
+    raAgentId: uuid("ra_agent_id"),
     evidenceDigest: text("evidence_digest"),
     ciRunIds: jsonb("ci_run_ids").$type<number[]>(),
     reason: text("reason").notNull(),
