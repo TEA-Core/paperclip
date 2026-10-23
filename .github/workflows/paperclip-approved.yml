@@ -41,6 +41,9 @@ jobs:
   paperclip-approved-enforcer:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The same three read scopes also cover the override-label lookups (issue
+    # events, collaborator permission, head-branch activity); see the script
+    # header. The override needs no write scope and creates no label.
     permissions:
       contents: read
       statuses: read

@@ -49,13 +49,16 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
   `review` stage records `approved` **and** the card has exactly one linked,
   open PR. **Nothing in this repository may create, mock or backfill that
   status** — a local write is a contract violation that manufactures a fake
-  approval. The enforcer is read-only (two GETs: `pulls/{n}` and
-  `commits/{sha}/status`).
+  approval. The enforcer is read-only (GETs only; the endpoints it calls are listed in
+  the script header).
 - Behaviour by event: `pull_request` → advisory (exit 0, green — the status
   only exists after the review stage approves); `merge_group` → **fail-closed**
   (missing/pending/failed/unresolvable/API-error all block the merge); `push`
   → no-op success (never `skipped`, so the context can be required without
   deadlocking the queue — SUP-13500).
+- **Override label** (SUP-20897): `override:paperclip-approval` lets a person
+  approve one PR when the reviewer pipeline cannot publish the stamp. See
+  [Override label](#override-label-sup-20897).
 - The job lives in its **own workflow** so a `push` to the fold runs only the
   lightweight enforcer, not the full `pr.yml` suite.
 - Fold adaptation: the merge-queue ref embeds the base branch, which itself
@@ -252,6 +255,55 @@ refresh bot) must declare either the PR-body line
 reason or label. The lockfile refresh bot's PR body already carries the waiver
 (`.github/workflows/refresh-lockfile.yml`, SUP-13629) so its auto-merge is not
 stranded by the required context.
+
+## Override label (SUP-20897)
+
+The label is spelled exactly `override:paperclip-approval`. It mirrors the label
+of the same name in Trading-Signal-Platform and has the same meaning: a person
+approves this one PR in place of the control-plane stamp. It is **not** created
+by any PR. A maintainer creates it once in the repository:
+
+```bash
+gh label create "override:paperclip-approval" --repo TEA-Core/paperclip \
+  --description "Person-approved PR: replaces the paperclip/approved stamp" --color B60205
+```
+
+The enforcer consults the label only when the head has no valid
+`paperclip/approved` stamp. A forged stamp still fails; the waivers
+(`Paperclip-Approved-Waiver`, `no-paperclip-card`) are checked first and are
+unchanged. The override is honored only when **all** of these hold, and the
+enforcer fails closed (merge_group exit 1, pull_request advisory) on any doubt:
+
+- **Authority.** The most recent `labeled` event for the label has an actor of
+  type `User` (the machine-identity rejection the fold countersignature applies
+  through `user.type`) whose role on this repository is `admin`, `maintain` or
+  `write` (the OWNER / MEMBER / COLLABORATOR standing the countersignature
+  requires; the role is read from `collaborators/{login}/permission` because
+  issue events carry no `author_association`). A bot, an App, or a triage/read
+  collaborator is refused. The PR author is *not* excluded, because every fleet
+  PR is opened as the shared operator identity that also holds the lever.
+- **Head binding.** The PR head is in this repository (forks are refused), and the
+  newest activity on the PR's head branch is a push of exactly the PR head SHA,
+  recorded strictly before the label event. The activity timestamp is set by
+  GitHub, so a head pushed, force-pushed or fast-forwarded after the label,
+  including a commit pre-built and backdated elsewhere, voids the override.
+  Re-apply the label after the last push.
+- **No check runs.** The binding reads issue events and branch activity only.
+  Check runs are deliberately unused: on `merge_group` they carry no PR
+  association, and a check-run-bound override ejects a labeled, green PR from the
+  queue. The PR number comes from the queue ref, so the same logic serves
+  `pull_request` and `merge_group`.
+- **No branch-name input.** Nothing reads the head ref name as a signal, so card-bound
+  work cannot override itself by how its branch is named.
+
+Every honored override logs `OVERRIDE HONORED: ... applied by @<actor> at <time>`,
+writes a workflow warning annotation and a job summary naming the labeler and
+head SHA. A refusal logs `override NOT honored: <reason>` and repeats the reason
+in the failure. The override is read-only: it writes no status.
+
+**Residual risk.** Whoever can use the operator identity can apply the label, so
+the gate proves a write-access *person's account*, not a second human. The head
+binding still stops a label from covering work pushed after it.
 
 ## Admin bypass — decision (SUP-13629)
 
