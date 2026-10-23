@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildDispatchUnlaunchedEvidence,
   buildDispatchUnlaunchedMessage,
+  executionRecoveryForDispatchUnlaunched,
   canDetectStillbornRun,
   isDispatchUnlaunchedRun,
   isStillbornRun,
@@ -263,5 +264,45 @@ describe("buildDispatchUnlaunchedEvidence", () => {
     });
     expect(evidence.adapterType).toBeNull();
     expect(evidence.telemetryObserved).toBe(true);
+  });
+});
+
+describe("executionRecoveryForDispatchUnlaunched", () => {
+  const provingEvidence = buildDispatchUnlaunchedEvidence({
+    adapterType: "opencode_local",
+    graceMs: DEFAULT_DISPATCH_UNLAUNCHED_GRACE_MS,
+    hasActiveEnvironmentLease: false,
+    processPid: null,
+    processGroupId: null,
+    processStartedAt: null,
+    logBytes: null,
+    usageJson: null,
+    resultJson: null,
+    lastProgressAt: NOW,
+  });
+
+  it("records bootstrap recovery only when stored evidence proves provider work never started", () => {
+    expect(executionRecoveryForDispatchUnlaunched(provingEvidence)).toEqual({
+      kind: "bootstrap",
+      providerWorkStarted: false,
+    });
+    expect(executionRecoveryForDispatchUnlaunched(null)).toBeNull();
+    expect(executionRecoveryForDispatchUnlaunched(undefined)).toBeNull();
+  });
+
+  it("does not record bootstrap recovery when the stored evidence is ambiguous", () => {
+    const ambiguous = [
+      { ...provingEvidence, childHandleRegistered: true },
+      { ...provingEvidence, leaseOutcome: "active_lease_present" as const },
+      { ...provingEvidence, telemetryObserved: true },
+      { ...provingEvidence, dispatchStep: "spawned" },
+    ];
+    for (const evidence of ambiguous) {
+      expect(
+        executionRecoveryForDispatchUnlaunched(
+          evidence as typeof provingEvidence,
+        ),
+      ).toBeNull();
+    }
   });
 });

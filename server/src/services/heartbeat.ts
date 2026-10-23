@@ -390,6 +390,7 @@ import {
 import { boundContextSnapshot } from "./context-snapshot-bound.js";
 import {
   buildDispatchUnlaunchedEvidence,
+  executionRecoveryForDispatchUnlaunched,
   buildDispatchUnlaunchedMessage,
   buildStillbornRunMessage,
   canDetectStillbornRun,
@@ -22091,6 +22092,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // SUP-15842: a never-launched run carries bounded root-cause evidence (last dispatch step
       // reached, lease outcome, child-handle and telemetry state) so the next occurrence's
       // failure is self-describing instead of re-diagnosing from a bare `process_lost`.
+      // SUP-16555: that same evidence is the only proof that provider work never started.
+      // Record bootstrap recovery only when it proves that, so the legacy path can retry
+      // instead of holding. Ambiguous evidence stays absent and keeps the board hold. A remote
+      // adapter never registers a child handle, so absent pid evidence proves nothing for it.
       const dispatchUnlaunchedEvidence = dispatchUnlaunched
         ? buildDispatchUnlaunchedEvidence({
             adapterType,
@@ -22104,6 +22109,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             resultJson: run.resultJson,
             lastProgressAt: run.updatedAt ?? run.startedAt ?? run.createdAt,
           })
+        : null;
+      const dispatchUnlaunchedBootstrapRecovery = currentAdapterTracksLocalChild
+        ? executionRecoveryForDispatchUnlaunched(dispatchUnlaunchedEvidence)
         : null;
 
       const failureWrite = await setRunStatusFromLive(
@@ -22129,6 +22137,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
             if (hostRestartMarker) result.hostRestart = hostRestartMarker;
             if (dispatchUnlaunchedEvidence) result.dispatchUnlaunched = dispatchUnlaunchedEvidence;
+            if (dispatchUnlaunchedBootstrapRecovery) {
+              result.executionRecovery = dispatchUnlaunchedBootstrapRecovery;
+            }
             return result;
           })(),
         },
