@@ -54,6 +54,7 @@ const WORKSPACE_SCAN_NOTICES: Record<string, { title: string; nextAction: string
   workspace_git_scan_output_limit: { title: "Workspace scan exceeded its limit", nextAction: "Check the repository size and workspace scan output limit before retrying the task." },
   workspace_git_scan_failed: { title: "Workspace scan failed", nextAction: "Inspect the failed run and check repository access and integrity before retrying the task." },
   workspace_git_scan_cancelled: { title: "Workspace scan was cancelled", nextAction: "Inspect why workspace preparation was cancelled before retrying the task." },
+  workspace_disk_headroom_exceeded: { title: "Workspace disk is nearly full", nextAction: "Free disk space or raise PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT, then retry the task." },
 };
 
 export function buildImmediateExecutionPathRecoveryNoticeSeed(input: {

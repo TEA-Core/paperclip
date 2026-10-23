@@ -15,6 +15,9 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // SUP-20840: the worktree disk guard would otherwise fail every suite that
+    // provisions a worktree whenever the machine running the tests is >80% full.
+    env: { PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT: "0" },
     include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
     // Each server suite boots + tears down its own embedded Postgres in
     // beforeAll/afterAll. Under the loaded serial shard (maxWorkers=1) the
