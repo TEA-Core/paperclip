@@ -236,10 +236,12 @@ mounted checkout used from another OS), pass it on the command line:
 `pnpm install --force`.
 
 New worktrees are refused when the volume that holds the worktree directory is
-at or above 80% used (`disk_headroom_exceeded`), because a burst of
-provisioning can otherwise fill the disk. Reusing an existing worktree is never
-refused. Set `PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT` to change
-the limit; `0` or `off` disables the guard.
+at or above 80% used (`workspace_disk_headroom_exceeded`), because a burst of
+provisioning can otherwise fill the disk. The refusal is transient: the run is
+retried on the bounded transient-failure schedule rather than blocking the
+issue on the first failure. Reusing an existing worktree is never refused. Set
+`PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT` to change the limit; `0`
+disables the guard.
 
 ## Hot-Restart Deploys
 

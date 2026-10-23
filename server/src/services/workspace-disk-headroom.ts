@@ -20,14 +20,13 @@ export const DEFAULT_WORKSPACE_DISK_MAX_USED_PERCENT = 80;
 type StatFs = (path: string) => Promise<{ blocks: number; bfree: number; bavail: number }>;
 
 /**
- * Threshold in percent used, or null when the guard is disabled. `0`, `off`,
- * `false` and `disabled` turn it off; an unset or unparseable value falls back
- * to the default so a typo cannot silently disable the guard.
+ * Threshold in percent used, or null when the guard is disabled. Only `0` turns
+ * it off; an unset or unparseable value falls back to the default so a typo
+ * cannot silently disable the guard.
  */
 export function resolveWorkspaceDiskMaxUsedPercent(env: NodeJS.ProcessEnv = process.env): number | null {
-  const raw = env[WORKSPACE_DISK_MAX_USED_PERCENT_ENV]?.trim().toLowerCase();
+  const raw = env[WORKSPACE_DISK_MAX_USED_PERCENT_ENV]?.trim();
   if (!raw) return DEFAULT_WORKSPACE_DISK_MAX_USED_PERCENT;
-  if (raw === "off" || raw === "false" || raw === "disabled") return null;
   const value = Number(raw);
   if (!Number.isFinite(value) || value < 0 || value > 100) return DEFAULT_WORKSPACE_DISK_MAX_USED_PERCENT;
   return value === 0 ? null : value;
@@ -41,15 +40,15 @@ export function diskUsedPercent(stat: { blocks: number; bfree: number; bavail: n
 }
 
 /**
- * Returns the refusal (message and `resultJson` for a WorkspaceRuntimeValidationFailure)
- * when the volume holding `path` is at or above the limit, otherwise null.
+ * Returns the refusal (message and error details for a WorkspaceGitScanError) when
+ * the volume holding `path` is at or above the limit, otherwise null.
  */
 export async function checkWorkspaceDiskHeadroom(input: {
   /** Any existing path on the volume that will receive the worktree. */
   path: string;
   env?: NodeJS.ProcessEnv;
   statfs?: StatFs;
-}): Promise<{ message: string; resultJson: Record<string, unknown> } | null> {
+}): Promise<{ message: string; details: Record<string, unknown> } | null> {
   const maxUsedPercent = resolveWorkspaceDiskMaxUsedPercent(input.env);
   if (maxUsedPercent === null) return null;
   let usedPercent: number;
@@ -65,14 +64,11 @@ export async function checkWorkspaceDiskHeadroom(input: {
       `Refusing to provision a new worktree: the volume holding "${input.path}" is ${usedPercent.toFixed(1)}% used, `
       + `at or above the ${maxUsedPercent}% limit. Free disk space (remove stale worktrees or old logs), `
       + `or raise ${WORKSPACE_DISK_MAX_USED_PERCENT_ENV} (0 disables the guard), then retry.`,
-    resultJson: {
-      workspaceValidation: {
-        reason: "disk_headroom_exceeded",
-        path: input.path,
-        usedPercent: Number(usedPercent.toFixed(1)),
-        maxUsedPercent,
-        envVar: WORKSPACE_DISK_MAX_USED_PERCENT_ENV,
-      },
+    details: {
+      path: input.path,
+      usedPercent: Number(usedPercent.toFixed(1)),
+      maxUsedPercent,
+      envVar: WORKSPACE_DISK_MAX_USED_PERCENT_ENV,
     },
   };
 }
