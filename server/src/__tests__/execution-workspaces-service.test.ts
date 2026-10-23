@@ -28,6 +28,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { logger } from "../middleware/logger.js";
 import {
   detachIssuesFromClosedExecutionWorkspace,
   decideReprovisionProceed,
@@ -36,6 +37,7 @@ import {
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
+  formatTerminalWorkspaceReaperSkipLogLine,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
   readExecutionWorkspaceConfig,
@@ -760,6 +762,69 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // The flag resets after the first sweep, so a later sweep runs its scan.
     const laterSweep = await svc.sweepTerminalWorkspaces();
     expect(laterSweep).toMatchObject({ archived: 0 });
+  }, 20_000);
+
+  it("processes more than fifty candidates with the default sweep budget", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issuePrefix = `P${companyId.slice(0, 8).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Sweep throughput",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Sweep throughput",
+      status: "in_progress",
+    });
+    const candidates = Array.from({ length: 51 }, (_, index) => ({
+      executionWorkspaceId: randomUUID(),
+      sourceIssueId: randomUUID(),
+      updatedAt: new Date(Date.UTC(2020, 0, index + 1)),
+    }));
+    await db.insert(executionWorkspaces).values(candidates.map((candidate, index) => ({
+      id: candidate.executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "shared_workspace" as const,
+      strategyType: "local_fs" as const,
+      name: `${issuePrefix}-${index + 1}`,
+      status: "active" as const,
+      providerType: "local_fs" as const,
+      updatedAt: candidate.updatedAt,
+    })));
+    await db.insert(issues).values(candidates.map((candidate, index) => ({
+      id: candidate.sourceIssueId,
+      companyId,
+      projectId,
+      identifier: `${issuePrefix}-${index + 1}`,
+      title: `Terminal candidate ${index + 1}`,
+      status: "done" as const,
+      priority: "medium" as const,
+      executionWorkspaceId: candidate.executionWorkspaceId,
+      updatedAt: candidate.updatedAt,
+    })));
+    for (const candidate of candidates) {
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId: candidate.sourceIssueId })
+        .where(eq(executionWorkspaces.id, candidate.executionWorkspaceId));
+    }
+
+    const sweep = await executionWorkspaceService(db, { workspaceReaperCooldownDays: 0 })
+      .sweepTerminalWorkspaces();
+
+    expect(sweep.checked).toBe(51);
+    expect(sweep.archived).toBe(51);
+    const rows = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(inArray(executionWorkspaces.id, candidates.map((candidate) => candidate.executionWorkspaceId)));
+    expect(rows).toHaveLength(51);
+    expect(rows.every((row) => row.status === "archived")).toBe(true);
   }, 20_000);
 
   it("archives an eligible workspace behind a full page of non-terminal subtrees", async () => {
@@ -5827,6 +5892,673 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect((await workspaceRow(running.executionWorkspaceId))?.status).toBe("cleanup_failed");
     expect(await readGit(running.repoRoot, ["worktree", "list", "--porcelain"])).toContain(running.worktreePath);
   }, 20_000);
+
+  describe("SUP-20688 terminal workspace archive sweep", () => {
+    function freshSweep(cooldownDays = 0) {
+      return executionWorkspaceService(db, { workspaceReaperCooldownDays: cooldownDays });
+    }
+
+    async function workspaceStatus(id: string) {
+      const [row] = await db
+        .select({
+          status: executionWorkspaces.status,
+          cleanupReason: executionWorkspaces.cleanupReason,
+        })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, id));
+      return row;
+    }
+
+    async function markShared(id: string) {
+      await db
+        .update(executionWorkspaces)
+        .set({ mode: "shared_workspace" })
+        .where(eq(executionWorkspaces.id, id));
+    }
+
+    async function publishWorktree(worktreePath: string) {
+      const commonDir = await readGit(worktreePath, ["rev-parse", "--git-common-dir"]);
+      if (!commonDir) throw new Error("worktree has no git common dir");
+      const repoRoot = path.dirname(path.resolve(worktreePath, commonDir));
+      const branchName = await readGit(worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+      if (!branchName) throw new Error("worktree has no branch");
+      const remotePath = path.join(path.dirname(repoRoot), `paperclip-remote-${randomUUID()}`);
+      tempDirs.add(remotePath);
+      await fs.mkdir(remotePath, { recursive: true });
+      await runGit(remotePath, ["init", "--bare"]);
+      await runGit(repoRoot, ["remote", "add", "origin", remotePath]);
+      await runGit(repoRoot, ["push", "origin", "main"]);
+      await runGit(worktreePath, ["push", "-u", "origin", branchName]);
+      return { repoRoot, branchName, remotePath };
+    }
+
+    // Logs each git argv. By default every call fails; passThrough runs the real git.
+    async function gitCallsDuring(run: () => Promise<unknown>, options: { passThrough?: boolean } = {}) {
+      const realGit = options.passThrough
+        ? (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim()
+        : null;
+      const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-recorder-"));
+      tempDirs.add(binDir);
+      const logPath = path.join(binDir, "calls.log");
+      const gitPath = path.join(binDir, "git");
+      await fs.writeFile(
+        gitPath,
+        `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logPath}'\n${realGit ? `exec '${realGit}' "$@"` : "exit 99"}\n`,
+        "utf8",
+      );
+      await fs.chmod(gitPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+      try {
+        await run();
+      } finally {
+        process.env.PATH = previousPath;
+      }
+      return fs.readFile(logPath, "utf8").catch(() => "");
+    }
+
+    // Every file's bytes and mode, every symlink target, every directory. The
+    // git admin data under each repo root (index, refs, worktrees) is included.
+    async function snapshotTree(root: string) {
+      const entries: string[] = [];
+      async function walk(dir: string) {
+        for (const name of (await fs.readdir(dir)).sort()) {
+          const full = path.join(dir, name);
+          const relative = path.relative(root, full);
+          const stat = await fs.lstat(full);
+          if (stat.isSymbolicLink()) {
+            entries.push(`${relative} -> ${await fs.readlink(full)}`);
+          } else if (stat.isDirectory()) {
+            entries.push(`${relative}/`);
+            await walk(full);
+          } else {
+            entries.push(`${relative} ${stat.mode} ${createHash("sha256").update(await fs.readFile(full)).digest("hex")}`);
+          }
+        }
+      }
+      await walk(root);
+      return entries;
+    }
+
+    async function snapshotDatabase() {
+      const tables = await db.execute<{ table_name: string }>(sql`
+        select table_name from information_schema.tables
+        where table_schema = 'public' and table_type = 'BASE TABLE'
+        order by table_name
+      `);
+      const digests: Record<string, string | null> = {};
+      for (const { table_name: table } of tables) {
+        const [row] = await db.execute<{ digest: string | null }>(sql.raw(
+          `select md5(string_agg(t::text, '|' order by t::text)) as digest from "${table}" t`,
+        ));
+        digests[table] = row?.digest ?? null;
+      }
+      return digests;
+    }
+
+    // A changed mtime with unchanged bytes makes git status refresh the index
+    // unless optional locks are off.
+    async function touchTrackedFile(worktreePath: string) {
+      await fs.utimes(path.join(worktreePath, "README.md"), new Date(), new Date(Date.now() - 3_600_000));
+    }
+
+    // The production layout: a pushed, clean linked worktree under
+    // <repo>/.paperclip/worktrees, with the project workspace on the repo.
+    async function seedManagedCleanWorktree() {
+      const seeded = await seedAncestryTerminalWorkspace();
+      const published = await publishWorktree(seeded.worktreePath);
+      const worktreePath = path.join(published.repoRoot, ".paperclip", "worktrees", published.branchName);
+      await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+      await runGit(published.repoRoot, ["worktree", "move", seeded.worktreePath, worktreePath]);
+      await db.update(executionWorkspaces).set({ cwd: worktreePath, providerRef: worktreePath })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await linkProjectRepo({ ...seeded, repoRoot: published.repoRoot });
+      await touchTrackedFile(worktreePath);
+      return { ...seeded, ...published, worktreePath };
+    }
+
+    it("archives a clean no-PR worktree as a record only and leaves its directory and branch byte-identical", async () => {
+      const seeded = await seedManagedCleanWorktree();
+      const branchBefore = await readGit(seeded.repoRoot, ["rev-parse", `refs/heads/${seeded.branchName}`]);
+      const repoBefore = await snapshotTree(seeded.repoRoot);
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toBe("issue_terminal | terminal, clean, nothing unique");
+      expect(await snapshotTree(seeded.repoRoot)).toEqual(repoBefore);
+      expect(await readGit(seeded.repoRoot, ["rev-parse", `refs/heads/${seeded.branchName}`])).toBe(branchBefore);
+    }, 20_000);
+
+    it("archives a shared session as a record only without running git or stopping its runtime services", async () => {
+      const seeded = await seedTerminalWorkspace();
+      await markShared(seeded.executionWorkspaceId);
+      await fs.writeFile(path.join(seeded.worktreePath, "scratch.txt"), "untracked\n", "utf8");
+      const [workspace] = await db
+        .select({ projectId: executionWorkspaces.projectId, sourceIssueId: executionWorkspaces.sourceIssueId })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      const serviceId = randomUUID();
+      await db.insert(workspaceRuntimeServices).values({
+        id: serviceId,
+        companyId: seeded.companyId,
+        projectId: workspace!.projectId,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        issueId: workspace!.sourceIssueId,
+        scopeType: "execution_workspace",
+        serviceName: "web",
+        status: "running",
+        lifecycle: "shared",
+        command: "pnpm dev",
+        cwd: seeded.worktreePath,
+        provider: "local_process",
+        healthStatus: "healthy",
+      });
+
+      let sweep!: Awaited<ReturnType<ReturnType<typeof freshSweep>["sweepTerminalWorkspaces"]>>;
+      const gitCalls = await gitCallsDuring(async () => {
+        sweep = await freshSweep().sweepTerminalWorkspaces();
+      });
+      const [service] = await db
+        .select({ status: workspaceRuntimeServices.status })
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, serviceId));
+      const [issue] = await db
+        .select({ executionWorkspaceId: issues.executionWorkspaceId })
+        .from(issues)
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      expect(gitCalls).toBe("");
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await workspaceStatus(seeded.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | shared session record",
+      });
+      expect(service?.status).toBe("running");
+      expect(issue?.executionWorkspaceId).toBeNull();
+      expect(await readGit(seeded.worktreePath, ["rev-parse", "HEAD"])).toBe(seeded.headSha);
+      await expect(fs.readFile(path.join(seeded.worktreePath, "scratch.txt"), "utf8")).resolves.toBe("untracked\n");
+    }, 20_000);
+
+    it("does not archive a shared session during cooldown or while a run is active", async () => {
+      const cooling = await seedTerminalWorkspace();
+      await markShared(cooling.executionWorkspaceId);
+      const cooled = await freshSweep(7).sweepTerminalWorkspaces();
+      expect(cooled).toMatchObject({ archived: 0, skippedCooldown: 1 });
+      expect((await workspaceStatus(cooling.executionWorkspaceId))?.status).toBe("active");
+
+      const running = await seedTerminalWorkspace({ activeRun: true });
+      await markShared(running.executionWorkspaceId);
+      const active = await freshSweep().sweepTerminalWorkspaces();
+      expect(active.skippedActiveRun).toBeGreaterThanOrEqual(1);
+      expect((await workspaceStatus(running.executionWorkspaceId))?.status).toBe("active");
+    }, 20_000);
+
+    it("keeps an isolated workspace with an unpushed commit or a tracked change", async () => {
+      const unpushed = await seedTerminalWorkspace();
+      const unpushedSweep = await freshSweep().sweepTerminalWorkspaces();
+      expect(unpushedSweep.archived).toBe(0);
+      expect(unpushedSweep.skippedUnpushed).toBe(1);
+      expect((await workspaceStatus(unpushed.executionWorkspaceId))?.status).toBe("active");
+
+      const dirty = await seedAncestryTerminalWorkspace();
+      await publishWorktree(dirty.worktreePath);
+      await fs.writeFile(path.join(dirty.worktreePath, "README.md"), "tracked edit\n", "utf8");
+      const dirtySweep = await freshSweep().sweepTerminalWorkspaces();
+      expect(dirtySweep.archived).toBe(0);
+      expect(dirtySweep.skippedTrackedDirty).toBe(1);
+      expect((await workspaceStatus(dirty.executionWorkspaceId))?.status).toBe("active");
+      await expect(fs.readFile(path.join(dirty.worktreePath, "README.md"), "utf8")).resolves.toBe("tracked edit\n");
+    }, 20_000);
+
+    it("archives an isolated no-PR workspace with only untracked files as a record only", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await publishWorktree(seeded.worktreePath);
+      await fs.writeFile(path.join(seeded.worktreePath, "scratch.txt"), "untracked\n", "utf8");
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+
+      expect(sweep.archived).toBe(1);
+      expect(await workspaceStatus(seeded.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | untracked files",
+      });
+      await expect(fs.readFile(path.join(seeded.worktreePath, "scratch.txt"), "utf8")).resolves.toBe("untracked\n");
+    }, 20_000);
+
+    it("archives a non-git cwd and a missing cwd without calling git", async () => {
+      const nonGit = await seedTerminalWorkspace();
+      const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-default-"));
+      tempDirs.add(plainDir);
+      await fs.writeFile(path.join(plainDir, "note.txt"), "keep\n", "utf8");
+      await db.update(executionWorkspaces).set({
+        cwd: plainDir,
+        providerRef: plainDir,
+        providerType: "local_fs",
+      }).where(eq(executionWorkspaces.id, nonGit.executionWorkspaceId));
+      const nonGitCalls = await gitCallsDuring(() => freshSweep().sweepTerminalWorkspaces());
+      expect(nonGitCalls).toBe("");
+      expect(await workspaceStatus(nonGit.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | cwd is not a git repository",
+      });
+      await expect(fs.readFile(path.join(plainDir, "note.txt"), "utf8")).resolves.toBe("keep\n");
+
+      const missing = await seedTerminalWorkspace();
+      const missingPath = path.join(os.tmpdir(), `paperclip-missing-${randomUUID()}`);
+      await db.update(executionWorkspaces).set({
+        cwd: missingPath,
+        providerRef: missingPath,
+        providerType: "local_fs",
+      }).where(eq(executionWorkspaces.id, missing.executionWorkspaceId));
+      const missingCalls = await gitCallsDuring(() => freshSweep().sweepTerminalWorkspaces());
+      expect(missingCalls).toBe("");
+      expect(await workspaceStatus(missing.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | cwd does not exist",
+      });
+    }, 20_000);
+
+    // The git subcommand of each logged argv, past any leading -C <dir> or -c <key=value>.
+    function gitSubcommands(calls: string) {
+      return calls.split("\n").filter(Boolean).map((line) => {
+        const args = line.split(" ");
+        let index = 0;
+        while (args[index] === "-C" || args[index] === "-c") index += 2;
+        return args[index];
+      });
+    }
+
+    // The read-only inspection a dry run may spawn. A fetch or any write verb is not here.
+    const READ_ONLY_GIT_SUBCOMMANDS = ["rev-parse", "status", "rev-list", "merge-base", "show-ref"];
+
+    async function dryRunListing(options: { blockGit: boolean }) {
+      const info = vi.spyOn(logger, "info");
+      let sweep!: Awaited<ReturnType<ReturnType<typeof freshSweep>["sweepTerminalWorkspaces"]>>;
+      const runDry = async () => {
+        sweep = await executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, dryRun: true })
+          .sweepTerminalWorkspaces();
+      };
+      try {
+        // Blocked, the shim fails every git call, so a non-empty log is a git call.
+        // Otherwise it records each call and runs the real git.
+        const gitCalls = await gitCallsDuring(runDry, { passThrough: !options.blockGit });
+        const listed = info.mock.calls
+          .filter(([, message]) => message === "terminal issue workspace reaper dry run")
+          .map(([fields]) => fields as unknown as { executionWorkspaceId: string; action: string; reason: string });
+        return { sweep, listed, gitCalls };
+      } finally {
+        info.mockRestore();
+      }
+    }
+
+    it("dry run issues no git for shared, non-git, missing-cwd and inherited-cleanup rows and changes nothing", async () => {
+      const shared = await seedTerminalWorkspace();
+      await markShared(shared.executionWorkspaceId);
+      const nonGit = await seedTerminalWorkspace();
+      const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-default-"));
+      tempDirs.add(plainDir);
+      await fs.writeFile(path.join(plainDir, "note.txt"), "keep\n", "utf8");
+      await db.update(executionWorkspaces).set({ cwd: plainDir, providerRef: plainDir, providerType: "local_fs" })
+        .where(eq(executionWorkspaces.id, nonGit.executionWorkspaceId));
+      const missing = await seedTerminalWorkspace();
+      const missingPath = path.join(os.tmpdir(), `paperclip-missing-${randomUUID()}`);
+      await db.update(executionWorkspaces).set({ cwd: missingPath, providerRef: missingPath, providerType: "local_fs" })
+        .where(eq(executionWorkspaces.id, missing.executionWorkspaceId));
+      const merged = await seedTerminalWorkspace({ mergedPr: true });
+      const stuck = await seedTerminalWorkspace({ mergedPr: true });
+      await linkProjectRepo(stuck);
+      await fs.rm(stuck.worktreePath, { recursive: true, force: true });
+      await db.update(executionWorkspaces).set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+      }).where(eq(executionWorkspaces.id, stuck.executionWorkspaceId));
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
+
+      const roots = [shared.repoRoot, shared.worktreePath, plainDir, merged.repoRoot, merged.worktreePath, stuck.repoRoot];
+      const treesBefore = await Promise.all(roots.map((root) => snapshotTree(root)));
+      const databaseBefore = await snapshotDatabase();
+
+      const { sweep, listed, gitCalls } = await dryRunListing({ blockGit: true });
+
+      expect(gitCalls).toBe("");
+      expect(await snapshotDatabase()).toEqual(databaseBefore);
+      expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, wouldArchive: 3 });
+      const entryOf = (id: string) => listed.find((entry) => entry.executionWorkspaceId === id);
+      expect(entryOf(shared.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | shared session record" });
+      expect(entryOf(nonGit.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | cwd is not a git repository" });
+      expect(entryOf(missing.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | cwd does not exist" });
+      expect(entryOf(merged.executionWorkspaceId)).toMatchObject({ action: "not_previewed", reason: "inherited cleanup path" });
+      expect(entryOf(stuck.executionWorkspaceId)).toMatchObject({ action: "not_previewed", reason: "inherited cleanup path" });
+    }, 30_000);
+
+    it("dry run lists the record-only archives and kept rows, and the live sweep archives the same rows record-only", async () => {
+      const clean = await seedManagedCleanWorktree();
+      const untracked = await seedAncestryTerminalWorkspace();
+      const untrackedRepo = await publishWorktree(untracked.worktreePath);
+      await fs.writeFile(path.join(untracked.worktreePath, "scratch.txt"), "untracked\n", "utf8");
+      const dirty = await seedAncestryTerminalWorkspace();
+      const dirtyRepo = await publishWorktree(dirty.worktreePath);
+      await fs.writeFile(path.join(dirty.worktreePath, "README.md"), "tracked edit\n", "utf8");
+      const shared = await seedTerminalWorkspace();
+      await markShared(shared.executionWorkspaceId);
+      const unpushed = await seedTerminalWorkspace();
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
+
+      const roots = [
+        clean.repoRoot, clean.remotePath,
+        untrackedRepo.repoRoot, untracked.worktreePath, untrackedRepo.remotePath,
+        dirtyRepo.repoRoot, dirty.worktreePath, dirtyRepo.remotePath,
+        shared.repoRoot, shared.worktreePath,
+        unpushed.repoRoot, unpushed.worktreePath,
+      ];
+      const treesBefore = await Promise.all(roots.map((root) => snapshotTree(root)));
+      const databaseBefore = await snapshotDatabase();
+
+      const { sweep: dry, listed, gitCalls } = await dryRunListing({ blockGit: false });
+
+      // Classifying no-PR rows spawns read-only git inspection, and nothing else.
+      expect(gitSubcommands(gitCalls).length).toBeGreaterThan(0);
+      expect(gitSubcommands(gitCalls).filter((subcommand) => !READ_ONLY_GIT_SUBCOMMANDS.includes(subcommand))).toEqual([]);
+      expect(await snapshotDatabase()).toEqual(databaseBefore);
+      expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
+      expect(dry).toMatchObject({ archived: 0, cleanupFailed: 0, wouldArchive: 3 });
+      expect(listed).toHaveLength(dry.checked);
+      const entryOf = (id: string) => listed.find((entry) => entry.executionWorkspaceId === id);
+      expect(entryOf(clean.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | terminal, clean, nothing unique" });
+      expect(entryOf(untracked.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | untracked files" });
+      expect(entryOf(shared.executionWorkspaceId)).toMatchObject({ action: "archive_record_only", reason: "issue_terminal | shared session record" });
+      expect(entryOf(dirty.executionWorkspaceId)).toMatchObject({ action: "keep", reason: "tracked modifications" });
+      expect(entryOf(unpushed.executionWorkspaceId)).toMatchObject({ action: "keep", reason: "commits missing from the remote" });
+
+      const live = await freshSweep().sweepTerminalWorkspaces();
+      expect(live).toMatchObject({ archived: dry.wouldArchive, cleanupFailed: 0 });
+      const rows = await db
+        .select({ id: executionWorkspaces.id, status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+        .from(executionWorkspaces)
+        .where(inArray(executionWorkspaces.id, listed.map((entry) => entry.executionWorkspaceId)));
+      for (const entry of listed) {
+        const row = rows.find((candidate) => candidate.id === entry.executionWorkspaceId);
+        expect({ id: entry.executionWorkspaceId, status: row?.status }).toEqual({
+          id: entry.executionWorkspaceId,
+          status: entry.action === "archive_record_only" ? "archived" : "active",
+        });
+        if (entry.action === "archive_record_only") expect(row?.cleanupReason).toBe(entry.reason);
+      }
+      expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
+    }, 60_000);
+
+    it("dry run never fetches for a missing recorded branch and keeps that row as not previewed", async () => {
+      // A clean pushed worktree whose recorded branch was deleted, with the
+      // remote's main ahead of the stale local tracking ref. The live
+      // inspection would fetch the default branch here.
+      const seeded = await seedAncestryTerminalWorkspace();
+      const published = await publishWorktree(seeded.worktreePath);
+      await runGit(seeded.worktreePath, ["switch", "-c", "replacement"]);
+      await runGit(published.repoRoot, ["branch", "-D", published.branchName]);
+      const staleMain = await readGit(published.repoRoot, ["rev-parse", "refs/remotes/origin/main"]);
+      await runGit(published.repoRoot, ["commit", "--allow-empty", "-m", "Advance main"]);
+      await runGit(published.repoRoot, ["push", "origin", "main"]);
+      await runGit(published.repoRoot, ["update-ref", "refs/remotes/origin/main", staleMain!]);
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
+      const roots = [published.repoRoot, seeded.worktreePath, published.remotePath];
+      const treesBefore = await Promise.all(roots.map((root) => snapshotTree(root)));
+      const databaseBefore = await snapshotDatabase();
+
+      const { sweep: dry, listed, gitCalls } = await dryRunListing({ blockGit: false });
+
+      expect(gitSubcommands(gitCalls).length).toBeGreaterThan(0);
+      expect(gitSubcommands(gitCalls).filter((subcommand) => !READ_ONLY_GIT_SUBCOMMANDS.includes(subcommand))).toEqual([]);
+      expect(await Promise.all(roots.map((root) => snapshotTree(root)))).toEqual(treesBefore);
+      expect(await snapshotDatabase()).toEqual(databaseBefore);
+      expect(dry).toMatchObject({ wouldArchive: 0 });
+      expect(listed).toEqual([expect.objectContaining({
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        action: "keep",
+        reason: "not previewed: the recorded branch is missing. The live sweep first fetches the default branch, which updates remote-tracking refs, their reflog and FETCH_HEAD but no work-tree file, and then archives the row as a record only when no commit is missing from the remote",
+      })]);
+
+      // The live pass does what that reason says: it fetches the default branch,
+      // moving origin/main, and archives the row as a record only. No work-tree
+      // file changes.
+      const worktreeBefore = await snapshotTree(seeded.worktreePath);
+      const live = await freshSweep().sweepTerminalWorkspaces();
+      expect(live).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await workspaceStatus(seeded.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | terminal, clean, nothing unique",
+      });
+      expect(await readGit(published.repoRoot, ["rev-parse", "refs/remotes/origin/main"]))
+        .toBe(await readGit(published.repoRoot, ["rev-parse", "refs/heads/main"]));
+      expect(await readGit(published.repoRoot, ["rev-parse", "refs/remotes/origin/main"])).not.toBe(staleMain);
+      expect(await snapshotTree(seeded.worktreePath)).toEqual(worktreeBefore);
+    }, 30_000);
+
+    it("dry run leaves a stuck ENOENT row and a stale reopen-pending row untouched", async () => {
+      const stuck = await seedTerminalWorkspace({ mergedPr: true });
+      await linkProjectRepo(stuck);
+      await fs.rm(stuck.worktreePath, { recursive: true, force: true });
+      await db
+        .update(executionWorkspaces)
+        .set({
+          status: "cleanup_failed",
+          closedAt: new Date("2026-01-02T00:00:00Z"),
+          cleanupEligibleAt: new Date("2026-01-02T00:00:00Z"),
+          cleanupReason: STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON,
+          metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 3 },
+        })
+        .where(eq(executionWorkspaces.id, stuck.executionWorkspaceId));
+      const stale = await seedTerminalWorkspace({ mergedPr: true });
+      await db
+        .update(executionWorkspaces)
+        .set({
+          status: "active",
+          closedAt: null,
+          cleanupReason: null,
+          cleanupEligibleAt: null,
+          metadata: {
+            createdByRuntime: true,
+            [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 4,
+            [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+            [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+          },
+        })
+        .where(eq(executionWorkspaces.id, stale.executionWorkspaceId));
+      // Age every row so a host clock step cannot put one past the sweep's frozen scan boundary.
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
+      const databaseBefore = await snapshotDatabase();
+
+      const info = vi.spyOn(logger, "info");
+      let sweep!: Awaited<ReturnType<ReturnType<typeof freshSweep>["sweepTerminalWorkspaces"]>>;
+      let listed: Record<string, unknown>[] = [];
+      try {
+        sweep = await executionWorkspaceService(db, {
+          workspaceReaperCooldownDays: 0,
+          dryRun: true,
+        }).sweepTerminalWorkspaces();
+        listed = info.mock.calls
+          .filter(([, message]) => message === "terminal issue workspace reaper dry run")
+          .map(([fields]) => fields as unknown as Record<string, unknown>);
+      } finally {
+        info.mockRestore();
+      }
+
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, clearedStaleReopenPending: 0, wouldArchive: 0 });
+      // The reason is the one the live retry stores.
+      expect(listed.find((entry) => entry.executionWorkspaceId === stuck.executionWorkspaceId)).toMatchObject({
+        action: "not_previewed",
+        reason: "inherited cleanup path",
+      });
+      expect(listed.find((entry) => entry.executionWorkspaceId === stale.executionWorkspaceId)).toMatchObject({
+        action: "clear_reopen_pending",
+        reason: "reopen-pending flag outlived its grace period",
+      });
+      expect(await snapshotDatabase()).toEqual(databaseBefore);
+      expect(await readGit(stuck.repoRoot, ["worktree", "list", "--porcelain"])).toContain(stuck.worktreePath);
+      await expect(fs.access(stale.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("warns when a run that names a record-only archived workspace lands in a different checkout", async () => {
+      // A pushed custom branch (PAP-16015-delivery) whose delivered.txt is not on main.
+      const seeded = await seedTerminalWorkspace();
+      const published = await publishWorktree(seeded.worktreePath);
+      await linkProjectRepo({ ...seeded, repoRoot: published.repoRoot });
+      const projectPolicy = {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: true,
+        workspaceStrategy: { type: "git_worktree", baseRef: "main", branchTemplate: "{{issue.identifier}}" },
+      } as const;
+      await db.update(projects).set({ executionWorkspacePolicy: projectPolicy })
+        .where(eq(projects.id, seeded.projectId));
+      await db.update(issues).set({ executionWorkspacePreference: "reuse_existing" })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) });
+
+      await freshSweep().sweepTerminalWorkspaces();
+      expect(await workspaceStatus(seeded.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | terminal, clean, nothing unique",
+      });
+
+      const [projectWorkspace] = await db.select({ id: projectWorkspaces.id }).from(projectWorkspaces)
+        .where(eq(projectWorkspaces.projectId, seeded.projectId));
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId: seeded.companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId, status: "queued" });
+      await db.update(issues).set({ status: "in_progress", projectWorkspaceId: projectWorkspace!.id })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+      const savedSession = { cwd: seeded.worktreePath };
+
+      const { provisionIssueExecutionWorkspace } = await import("../services/execution-workspace-provisioning.ts");
+      const provisioned = await provisionIssueExecutionWorkspace({
+        db,
+        run: run!,
+        agent: agent!,
+        issueId: issue!.id,
+        issueRef: {
+          id: issue!.id,
+          identifier: issue!.identifier,
+          title: issue!.title,
+          status: issue!.status,
+          priority: issue!.priority,
+          workMode: issue!.workMode,
+          description: null,
+          projectId: issue!.projectId,
+          projectWorkspaceId: issue!.projectWorkspaceId,
+          executionWorkspaceId: issue!.executionWorkspaceId,
+          executionWorkspacePreference: issue!.executionWorkspacePreference,
+        },
+        requestedExecutionWorkspaceIdOverride: seeded.executionWorkspaceId,
+        runId,
+        previousSessionParams: savedSession,
+        effectiveExecutionWorkspaceMode: "isolated_workspace",
+        trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} } as never,
+        isolatedWorkspacesEnabled: true,
+        selectedEnvironmentId: null,
+        selectedEnvironmentForConfig: null,
+        localEnvironment: {
+          id: "local-env",
+          name: "Local",
+          description: null,
+          driver: "local",
+          status: "active",
+          config: {},
+          envVars: {},
+          metadata: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } as never,
+        environmentSelectionSource: "local",
+        configSnapshot: null,
+        secretManifest: [],
+        projectExecutionWorkspacePolicy: projectPolicy,
+        issueExecutionWorkspaceSettings: { mode: "isolated_workspace" },
+        executionProjectId: seeded.projectId,
+        resolvedInstanceSettings: {
+          experimental: { enableWorkspaceBranchReconcileForward: false, enableWorkspaceDirtyQuarantineRepair: false },
+        },
+        mergedConfig: {},
+        executionPolicy: { executionMode: "standard" },
+        context: { issueId: issue!.id, taskId: issue!.id, wakeReason: "issue_assigned" },
+        resolveWorkspace: async () => ({
+          cwd: published.repoRoot,
+          source: "project_primary",
+          projectId: seeded.projectId,
+          workspaceId: projectWorkspace!.id,
+          repoUrl: null,
+          repoRef: null,
+          workspaceHints: [],
+          warnings: [],
+          baseCwdFallback: false,
+          materializationFailures: [],
+          additionalWorkspaces: [],
+          referencedProjectFailures: [],
+        }),
+        resolveSessionConfig: async () => ({
+          previousSessionParams: savedSession,
+          resetTaskSession: false,
+          sessionResetReason: null,
+          sessionConfigFreshness: { reset: false, reasons: [], changedCategories: [] } as never,
+          sessionConfigMetadata: {} as never,
+        }),
+        runLifecycle: { onExecutionWorkspaceOccupied: async () => undefined },
+      });
+
+      if (provisioned.kind !== "provisioned") throw new Error("expected a provisioned workspace");
+      const realizedCwd = provisioned.executionWorkspace.cwd;
+      expect(path.resolve(realizedCwd)).not.toBe(path.resolve(seeded.worktreePath));
+      await expect(fs.access(path.join(realizedCwd, "delivered.txt"))).rejects.toThrow();
+      expect(provisioned.executionWorkspace.warnings).toEqual(expect.arrayContaining([
+        `Execution workspace ${seeded.executionWorkspaceId} is archived, but its checkout is still on disk at "${seeded.worktreePath}" (recorded branch PAP-16015-delivery). This run uses a different checkout at "${realizedCwd}", so work in the archived checkout is not here. Reopen the archived workspace to continue in it.`,
+      ]));
+      await expect(fs.readFile(path.join(seeded.worktreePath, "delivered.txt"), "utf8")).resolves.toBe("delivered\n");
+    }, 60_000);
+
+    it("puts a counter per skip reason on the terminal reaper skip log line", async () => {
+      await seedTerminalWorkspace();
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      expect(sweep).toMatchObject({
+        skippedUnpushed: 1,
+        skippedRemoteCheckFailed: 0,
+        skippedNoRepoRoot: 0,
+      });
+      const line = formatTerminalWorkspaceReaperSkipLogLine(sweep);
+      for (const counter of [
+        "skippedActiveRun=0",
+        "skippedNonTerminalTree=0",
+        "skippedUndelivered=1",
+        "skippedUnpushed=1",
+        "skippedRemoteCheckFailed=0",
+        "skippedNoRepoRoot=0",
+        "skippedTrackedDirty=0",
+        "skippedGitUnverified=0",
+        "skippedRace=0",
+        "skippedReopened=0",
+        "skippedCooldown=0",
+      ]) {
+        expect(line).toEqual(expect.stringContaining(counter));
+      }
+    }, 20_000);
+  });
 });
 
 describeEmbeddedPostgres("detachIssuesFromClosedExecutionWorkspace", () => {

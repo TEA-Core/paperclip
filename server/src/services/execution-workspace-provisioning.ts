@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import path from "node:path";
 import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issues } from "@paperclipai/db";
@@ -747,6 +748,24 @@ export async function provisionIssueExecutionWorkspace(
         executionWorkspaceCwd: executionWorkspace.cwd,
       },
       "inherited execution workspace could not be restored; re-provisioned a fresh workspace instead of failing the dispatch",
+    );
+  }
+
+  // SUP-20688: the terminal sweep can archive a finished workspace as a record
+  // only, so its checkout stays on disk. A run that names that workspace is
+  // provisioned again. When it lands at a different path, say so in the run log
+  // instead of switching silently.
+  const archivedCheckoutCwd = existingExecutionWorkspaceDirectoryExists
+    ? readNonEmptyString(existingExecutionWorkspace?.cwd)
+    : null;
+  if (
+    archivedCheckoutCwd
+    && executionWorkspace.cwd
+    && path.resolve(archivedCheckoutCwd) !== path.resolve(executionWorkspace.cwd)
+  ) {
+    const branch = readNonEmptyString(existingExecutionWorkspace?.branchName);
+    executionWorkspace.warnings.push(
+      `Execution workspace ${existingExecutionWorkspace!.id} is archived, but its checkout is still on disk at "${archivedCheckoutCwd}"${branch ? ` (recorded branch ${branch})` : ""}. This run uses a different checkout at "${executionWorkspace.cwd}", so work in the archived checkout is not here. Reopen the archived workspace to continue in it.`,
     );
   }
 
