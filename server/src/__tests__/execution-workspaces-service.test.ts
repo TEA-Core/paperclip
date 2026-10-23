@@ -764,6 +764,69 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(laterSweep).toMatchObject({ archived: 0 });
   }, 20_000);
 
+  it("processes more than fifty candidates with the default sweep budget", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issuePrefix = `P${companyId.slice(0, 8).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Sweep throughput",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Sweep throughput",
+      status: "in_progress",
+    });
+    const candidates = Array.from({ length: 51 }, (_, index) => ({
+      executionWorkspaceId: randomUUID(),
+      sourceIssueId: randomUUID(),
+      updatedAt: new Date(Date.UTC(2020, 0, index + 1)),
+    }));
+    await db.insert(executionWorkspaces).values(candidates.map((candidate, index) => ({
+      id: candidate.executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "shared_workspace" as const,
+      strategyType: "local_fs" as const,
+      name: `${issuePrefix}-${index + 1}`,
+      status: "active" as const,
+      providerType: "local_fs" as const,
+      updatedAt: candidate.updatedAt,
+    })));
+    await db.insert(issues).values(candidates.map((candidate, index) => ({
+      id: candidate.sourceIssueId,
+      companyId,
+      projectId,
+      identifier: `${issuePrefix}-${index + 1}`,
+      title: `Terminal candidate ${index + 1}`,
+      status: "done" as const,
+      priority: "medium" as const,
+      executionWorkspaceId: candidate.executionWorkspaceId,
+      updatedAt: candidate.updatedAt,
+    })));
+    for (const candidate of candidates) {
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId: candidate.sourceIssueId })
+        .where(eq(executionWorkspaces.id, candidate.executionWorkspaceId));
+    }
+
+    const sweep = await executionWorkspaceService(db, { workspaceReaperCooldownDays: 0 })
+      .sweepTerminalWorkspaces();
+
+    expect(sweep.checked).toBe(51);
+    expect(sweep.archived).toBe(51);
+    const rows = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(inArray(executionWorkspaces.id, candidates.map((candidate) => candidate.executionWorkspaceId)));
+    expect(rows).toHaveLength(51);
+    expect(rows.every((row) => row.status === "archived")).toBe(true);
+  }, 20_000);
+
   it("archives an eligible workspace behind a full page of non-terminal subtrees", async () => {
     // Terminal source issues with open descendants still occupy a page, so the
     // cursor must rotate past them to reach eligible workspaces.
