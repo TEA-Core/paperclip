@@ -86,7 +86,7 @@ const mockStorageService = vi.hoisted(() => ({
   deleteObject: vi.fn(),
 }));
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
-  getById: vi.fn(async () => null),
+  getById: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
   closePinnedWorkspaceForReprovision: vi.fn(async () => ({ outcome: "archived", workspace: null })),
   assessReprovisionClose: vi.fn(async () => ({
     proceed: true,
@@ -107,9 +107,9 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
-  getActiveForIssue: vi.fn(async () => null),
+  getActiveForIssue: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
   listActiveForIssues: vi.fn(async () => new Map()),
-  resolveActiveForIssue: vi.fn(async () => null),
+  resolveActiveForIssue: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
 }));
 const mockTaskWatchdogService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
@@ -130,8 +130,8 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
-  getRun: vi.fn(async () => null),
-  getActiveRunForAgent: vi.fn(async () => null),
+  getRun: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
+  getActiveRunForAgent: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
   cancelRun: vi.fn(async () => null),
 }));
 const mockRunnerGoalService = vi.hoisted(() => ({
@@ -3351,7 +3351,7 @@ describe("agent issue mutation checkout ownership", () => {
       ]);
       const order: string[] = [];
       const transaction = db.transaction;
-      db.transaction = async (callback) => {
+      db.transaction = async (callback: (tx: Record<string, any>) => Promise<unknown>) => {
         order.push("begin");
         try {
           const result = await transaction(callback);
