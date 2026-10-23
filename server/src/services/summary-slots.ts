@@ -31,7 +31,7 @@ import { builtInAgentService } from "./built-in-agents.js";
 import { agentService } from "./agents.js";
 import { issueService } from "./issues.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { releaseSummarySlotBinding } from "./summary-slot-finalization.js";
+import { readGenerationToken, releaseSummarySlotBinding } from "./summary-slot-finalization.js";
 
 /** Built-in agent key for the Summarizer bundle (see PAP-13920). */
 export const SUMMARIZER_BUILT_IN_KEY = "summarizer";
@@ -65,19 +65,6 @@ export const GENERATION_ISSUE_ID_PLACEHOLDER = "NEW-ISSUE-ID-PLACEHOLDER";
 
 const GENERATION_ISSUE_ID_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function readGenerationToken(
-  description: string | null | undefined,
-): Record<string, unknown> | null {
-  const match = description?.match(/```json\n([\s\S]*?)\n```/);
-  if (!match) return null;
-  try {
-    const parsed: unknown = JSON.parse(match[1]);
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * SUP-17156: mint-time guard. The generation issue's description must carry the

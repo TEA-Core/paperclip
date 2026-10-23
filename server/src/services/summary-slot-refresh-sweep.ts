@@ -1,4 +1,4 @@
-import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions, issues, summarySlots } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -34,8 +34,9 @@ import type {
  *     progressing issue means in-flight and is left alone; a dead/wedged issue
  *     is re-claimed — see below), or
  *   - an `idle` slot that is stale: `lastGeneratedAt` is null, or older than
- *     the staleness threshold. Fresh idle slots are excluded at the query so
- *     a recently-written summary is never re-fired.
+ *     the staleness threshold (`SUMMARY_SLOT_REFRESH_STALE_MS`, default 24h;
+ *     12h for `workspaces_overview` slots, SUP-20900). Fresh idle slots are
+ *     excluded at the query so a recently-written summary is never re-fired.
  *
  * For each candidate the sweep calls `summarySlotService(db).generate` at the
  * service layer — the exact consume-contract the HTTP route uses. For a fresh
@@ -91,6 +92,9 @@ import type {
  */
 
 const DEFAULT_STALE_MS = 24 * 60 * 60 * 1000;
+// The workspaces overview is the one slot class the board expects fresher than a
+// day (SUP-20900); every other class keeps DEFAULT_STALE_MS.
+const DEFAULT_WORKSPACES_OVERVIEW_STALE_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_WEDGED_MS = 6 * 60 * 60 * 1000;
 
@@ -200,6 +204,7 @@ export function createSummarySlotRefreshSweepService(
     };
 
     const staleCutoff = new Date(checkedAt.getTime() - staleMs);
+    const overviewStaleCutoff = new Date(checkedAt.getTime() - DEFAULT_WORKSPACES_OVERVIEW_STALE_MS);
     const candidates = await db
       .select({
         companyId: summarySlots.companyId,
@@ -217,7 +222,17 @@ export function createSummarySlotRefreshSweepService(
           eq(summarySlots.status, "generating"),
           and(
             eq(summarySlots.status, "idle"),
-            or(isNull(summarySlots.lastGeneratedAt), lt(summarySlots.lastGeneratedAt, staleCutoff)),
+            or(
+              isNull(summarySlots.lastGeneratedAt),
+              and(
+                eq(summarySlots.scopeKind, "workspaces_overview"),
+                lt(summarySlots.lastGeneratedAt, overviewStaleCutoff),
+              ),
+              and(
+                ne(summarySlots.scopeKind, "workspaces_overview"),
+                lt(summarySlots.lastGeneratedAt, staleCutoff),
+              ),
+            ),
           ),
         ),
       );

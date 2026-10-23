@@ -272,8 +272,9 @@ export function BuiltInBundlePanel({
   const instructions = findResource(resources, "instructions");
   const routine = findResource(resources, "routine");
   const scheduleEnabled = routine?.scheduleEnabled === true;
-  const routineKey = bundle.routine.routineKey;
-  const scheduleLabel = bundle.routine.scheduleLabel ?? "Weekly schedule";
+  const stockRoutine = bundle.routine;
+  const routineKey = stockRoutine?.routineKey ?? "";
+  const scheduleLabel = stockRoutine?.scheduleLabel ?? "Weekly schedule";
   const proposalIssueRef = routine?.pendingUpdateIssueIdentifier ?? routine?.pendingUpdateIssueId ?? null;
   const proposalHref = proposalIssueRef && routine?.pendingUpdateInteractionId
     ? `/issues/${proposalIssueRef}#interaction-${routine.pendingUpdateInteractionId}`
@@ -352,71 +353,73 @@ export function BuiltInBundlePanel({
           )}
 
         {/* Routine — zero-token-by-default; the weekly schedule ships off. */}
-        <BundleRow
-          label="Routine"
-          secondary={bundle.routine.title}
-          chips={
-            <>
-              <ResourceStatusChip
-                variant={scheduleEnabled ? "schedule_on" : "schedule_off"}
-                label={scheduleEnabled ? scheduleLabel : undefined}
-              />
-              {routine && driftVariant(routine) && (
-                <ResourceStatusChip variant={driftVariant(routine)!} />
-              )}
-            </>
-          }
-          detail={
-            scheduleEnabled
-              ? "The weekly schedule is enabled and can create background work."
-              : "Nothing runs until you enable the weekly schedule — it costs zero tokens by default."
-          }
-          actions={
-            routine ? (
+        {stockRoutine && (
+          <BundleRow
+            label="Routine"
+            secondary={stockRoutine.title}
+            chips={
               <>
-                {onRunRoutine && (
-                  <ConfirmActionButton
-                    title="Run Reflection Coach once?"
-                    body="Paperclip will create one routine task now. This does not enable the weekly schedule or turn on background work."
-                    triggerLabel="Run once"
-                    confirmLabel="Run once"
-                    pending={routineActionPending === "run"}
-                    onConfirm={() => onRunRoutine(routineKey)}
-                  />
-                )}
-                {scheduleEnabled
-                  ? onDisableSchedule && (
-                    <ConfirmActionButton
-                      title="Disable the weekly schedule?"
-                      body="Paperclip will stop future scheduled Reflection Coach runs. Manual Run once remains available."
-                      triggerLabel="Disable schedule"
-                      confirmLabel="Disable schedule"
-                      pending={routineActionPending === "disable"}
-                      onConfirm={() => onDisableSchedule(routineKey)}
-                    />
-                  )
-                  : onEnableSchedule && (
-                    <ConfirmActionButton
-                      title="Enable the weekly schedule?"
-                      body="Paperclip will allow Reflection Coach to create routine tasks on the weekly schedule. It can spend tokens when those tasks run."
-                      triggerLabel="Enable weekly"
-                      confirmLabel="Enable weekly"
-                      pending={routineActionPending === "enable"}
-                      onConfirm={() => onEnableSchedule(routineKey)}
-                    />
-                  )}
-                {driftVariant(routine) && (
-                  <ResourceActionButton
-                    resource={routine}
-                    label="routine"
-                    onConfirm={() => onResetResource("routine")}
-                    pending={resettingResource === "routine"}
-                  />
+                <ResourceStatusChip
+                  variant={scheduleEnabled ? "schedule_on" : "schedule_off"}
+                  label={scheduleEnabled ? scheduleLabel : undefined}
+                />
+                {routine && driftVariant(routine) && (
+                  <ResourceStatusChip variant={driftVariant(routine)!} />
                 )}
               </>
-            ) : undefined
-          }
-        />
+            }
+            detail={
+              scheduleEnabled
+                ? "The weekly schedule is enabled and can create background work."
+                : "Nothing runs until you enable the weekly schedule — it costs zero tokens by default."
+            }
+            actions={
+              routine ? (
+                <>
+                  {onRunRoutine && (
+                    <ConfirmActionButton
+                      title="Run Reflection Coach once?"
+                      body="Paperclip will create one routine task now. This does not enable the weekly schedule or turn on background work."
+                      triggerLabel="Run once"
+                      confirmLabel="Run once"
+                      pending={routineActionPending === "run"}
+                      onConfirm={() => onRunRoutine(routineKey)}
+                    />
+                  )}
+                  {scheduleEnabled
+                    ? onDisableSchedule && (
+                      <ConfirmActionButton
+                        title="Disable the weekly schedule?"
+                        body="Paperclip will stop future scheduled Reflection Coach runs. Manual Run once remains available."
+                        triggerLabel="Disable schedule"
+                        confirmLabel="Disable schedule"
+                        pending={routineActionPending === "disable"}
+                        onConfirm={() => onDisableSchedule(routineKey)}
+                      />
+                    )
+                    : onEnableSchedule && (
+                      <ConfirmActionButton
+                        title="Enable the weekly schedule?"
+                        body="Paperclip will allow Reflection Coach to create routine tasks on the weekly schedule. It can spend tokens when those tasks run."
+                        triggerLabel="Enable weekly"
+                        confirmLabel="Enable weekly"
+                        pending={routineActionPending === "enable"}
+                        onConfirm={() => onEnableSchedule(routineKey)}
+                      />
+                    )}
+                  {driftVariant(routine) && (
+                    <ResourceActionButton
+                      resource={routine}
+                      label="routine"
+                      onConfirm={() => onResetResource("routine")}
+                      pending={resettingResource === "routine"}
+                    />
+                  )}
+                </>
+              ) : undefined
+            }
+          />
+        )}
         {proposalHref && (
           <BundleRow
             label="Proposal"

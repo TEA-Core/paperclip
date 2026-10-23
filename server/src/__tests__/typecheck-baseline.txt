@@ -94,11 +94,11 @@ server/src/__tests__/authz-secret-context.test.ts(54,45): TS2740
 server/src/__tests__/authz-secret-context.test.ts(69,45): TS2740
 server/src/__tests__/authz-secret-context.test.ts(89,47): TS2740
 server/src/__tests__/bootstrap-claim-routes.test.ts(128,63): TS2345
-server/src/__tests__/built-in-agents.test.ts(1451,7): TS2769
-server/src/__tests__/built-in-agents.test.ts(1542,7): TS2769
-server/src/__tests__/built-in-agents.test.ts(1637,7): TS2769
-server/src/__tests__/built-in-agents.test.ts(1798,7): TS2322
-server/src/__tests__/built-in-agents.test.ts(1857,7): TS2322
+server/src/__tests__/built-in-agents.test.ts(1440,7): TS2769
+server/src/__tests__/built-in-agents.test.ts(1531,7): TS2769
+server/src/__tests__/built-in-agents.test.ts(1626,7): TS2769
+server/src/__tests__/built-in-agents.test.ts(1787,7): TS2322
+server/src/__tests__/built-in-agents.test.ts(1846,7): TS2322
 server/src/__tests__/built-in-agents.test.ts(550,50): TS2345
 server/src/__tests__/bundled-plugins.test.ts(471,43): TS2322
 server/src/__tests__/chat-channels.integration.test.ts(13336,37): TS2554
