@@ -5398,6 +5398,7 @@ const issueListSelect = {
   harnessKind: issues.harnessKind,
   priority: issues.priority,
   reviewPolicy: issues.reviewPolicy,
+  deliveryRequirement: issues.deliveryRequirement,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
   checkoutRunId: issues.checkoutRunId,

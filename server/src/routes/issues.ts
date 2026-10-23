@@ -3660,6 +3660,7 @@ function toCompactIssue(issue: any): CompactIssue {
     workMode: issue.workMode,
     priority: issue.priority,
     reviewPolicy: issue.reviewPolicy,
+    deliveryRequirement: issue.deliveryRequirement,
     assigneeAgentId: issue.assigneeAgentId,
     assigneeUserId: issue.assigneeUserId,
     checkoutRunId: issue.checkoutRunId,
@@ -4384,7 +4385,8 @@ export function issueRoutes(
   };
   type FinalDeliveryIssue = Pick<typeof issueRows.$inferSelect,
     "id" | "companyId" | "projectId" | "projectWorkspaceId" | "executionWorkspaceId" |
-    "executionPolicy" | "executionState" | "identifier" | "issueNumber">;
+    "executionPolicy" | "executionState" | "identifier" | "issueNumber" | "deliveryRequirement"
+  >;
   const FINAL_DELIVERY_PREFLIGHT_TIMEOUT_MS = 20_000;
 
   async function resolveFinalDeliveryResolution(issue: FinalDeliveryIssue): Promise<FinalDeliveryResolution> {
@@ -4438,6 +4440,7 @@ export function issueRoutes(
       projectId: issue.projectId,
       projectWorkspaceId: issue.projectWorkspaceId,
       executionWorkspaceId: issue.executionWorkspaceId,
+      deliveryRequirement: issue.deliveryRequirement,
       summaryGenerationId: summaryGeneration?.id ?? null,
       context,
       ownership,
@@ -4471,6 +4474,9 @@ export function issueRoutes(
       | undefined;
     if (!shouldPublishApprovalStatus(decision) || !ladderIsTerminallyApproved(policy, state)) return;
     if (options.overrideAccepted) return;
+    if (issue.deliveryRequirement === "record_only") {
+      if (options.locked === undefined || options.locked.prefetch === null) return;
+    }
     let resolution: FinalDeliveryResolution;
     if (options.locked === undefined) {
       resolution = options.prefetched?.resolution ?? await resolveFinalDeliveryResolution(issue);
@@ -11676,7 +11682,9 @@ export function issueRoutes(
       previousStatus: string;
     };
     let outcome: BoardDecisionTransactionResult | null = null;
-    const finalDeliveryPrefetch = decision === "approved" ? await prefetchFinalDelivery(issue) : null;
+    const finalDeliveryPrefetch = decision === "approved" && issue.deliveryRequirement !== "record_only"
+      ? await prefetchFinalDelivery(issue)
+      : null;
 
     try {
       outcome = await db.transaction(async (tx) => {
@@ -11782,9 +11790,14 @@ export function issueRoutes(
           ...(rawExecutionState as Record<string, unknown>),
           lastDecisionId: decisionId,
         };
-        await preflightTerminalApproval(lockedIssue, result.patch, result.decision, lockedPolicy, {
-          locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
-        });
+        await preflightTerminalApproval(
+          lockedIssue,
+          result.patch,
+          result.decision,
+          lockedPolicy,
+          { locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db } },
+        );
+
         const nextExecutionState = result.patch.executionState as Record<string, unknown>;
 
         const updated = await svc.update(
@@ -12676,7 +12689,7 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const finalDeliveryPrefetch =
-        sourceIssueStatus === "done" && existing.status !== "done"
+        sourceIssueStatus === "done" && existing.status !== "done" && existing.deliveryRequirement !== "record_only"
           ? await prefetchFinalDelivery((await svc.getById(existing.id)) ?? existing)
           : null;
       const result = await db.transaction(async (tx) => {
@@ -15528,8 +15541,19 @@ export function issueRoutes(
         assigneeAgentName: normalizedAssigneeAgentRef.name,
       });
       const actor = getActorInfo(req);
+      if (
+        rawCreateBody.deliveryRequirement === "record_only" &&
+        req.actor.type === "agent" &&
+        req.actor.agentId === normalizedAssigneeAgentRef.id
+      ) {
+        res.status(403).json({
+          error: "Only the board or an authorized non-assignee may select record_only delivery",
+        });
+        return;
+      }
       const requestsWorkspaceInheritanceFromRun =
         !hasExplicitIssueWorkspaceCreateSelection(rawCreateBody);
+
       const runWorkspaceInheritanceSourceIssueId =
         requestsWorkspaceInheritanceFromRun
           ? await resolveRunIssueWorkspaceInheritanceSource(companyId, actor)
@@ -17376,6 +17400,16 @@ export function issueRoutes(
       }
     }
     if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
+    if (
+      req.body.deliveryRequirement === "record_only" &&
+      req.actor.type === "agent" &&
+      req.actor.agentId === existing.assigneeAgentId
+    ) {
+      res.status(403).json({
+        error: "Only the board or an authorized non-assignee may select record_only delivery",
+      });
+      return;
+    }
     const issueMutationAuthorizationReason = req.actor.type === "agent"
       ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
       : issueWriteAuthorizationReason(req, true);
@@ -18456,6 +18490,7 @@ export function issueRoutes(
       updateFields.status !== existing.status &&
       isClosedIssueStatus(updateFields.status);
     const terminalApprovalNeedsPreflight =
+      existing.deliveryRequirement !== "record_only" &&
       shouldPublishApprovalStatus(transition.decision) &&
       ladderIsTerminallyApproved(
         nextExecutionPolicy,
@@ -18618,7 +18653,9 @@ export function issueRoutes(
           reason: "head_moved: card or delivery binding changed before final delivery preflight",
         });
       }
-      finalDeliveryPrefetch = await prefetchFinalDelivery(afterStop);
+      if (existing.deliveryRequirement !== "record_only") {
+        finalDeliveryPrefetch = await prefetchFinalDelivery(afterStop);
+      }
       await preflightTerminalApproval(afterStop, updateFields, transition.decision, nextExecutionPolicy, {
         prefetched: finalDeliveryPrefetch,
       });
@@ -21623,7 +21660,8 @@ export function issueRoutes(
         if (projected.decision && projected.patch.executionState) {
           projected.patch.executionState = { ...projected.patch.executionState, lastDecisionId: randomUUID() };
         }
-        if (shouldPublishApprovalStatus(projected.decision) &&
+        if (issue.deliveryRequirement !== "record_only" &&
+            shouldPublishApprovalStatus(projected.decision) &&
             ladderIsTerminallyApproved(
               issue.executionPolicy,
               projected.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
@@ -23444,6 +23482,7 @@ export function issueRoutes(
         };
       }
       const finalDeliveryPrefetch =
+        currentIssue.deliveryRequirement !== "record_only" &&
         shouldPublishApprovalStatus(transition.decision) &&
         ladderIsTerminallyApproved(
           currentExecutionPolicy,

@@ -29,6 +29,7 @@ import {
   summarySlots,
 } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import type { IssueDeliveryRequirement } from "@paperclipai/shared";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -155,6 +156,8 @@ async function seedIssue(db: Db, input: {
   title: string;
   status?: string;
   executionPolicy?: Record<string, unknown>;
+  deliveryRequirement?: IssueDeliveryRequirement;
+  assigneeAgentId?: string | null;
 }) {
   const [issue] = await db.insert(issues).values({
     companyId: input.companyId,
@@ -163,8 +166,9 @@ async function seedIssue(db: Db, input: {
     title: input.title,
     status: input.status ?? "todo",
     priority: "medium",
-    assigneeAgentId: null,
+    assigneeAgentId: input.assigneeAgentId ?? null,
     responsibleUserId: "board-user",
+    deliveryRequirement: input.deliveryRequirement,
     executionPolicy: input.executionPolicy ?? null,
   }).returning();
   return issue!;
@@ -247,7 +251,27 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 
-  async function pendingDelivery({ draft = false, missing = false, mid = false, repo = true, unmentioned = false, holdPull = false, mergeArmingEnabled = false } = {}) {
+  async function pendingDelivery({
+    draft = false,
+    missing = false,
+    mid = false,
+    repo = true,
+    unmentioned = false,
+    holdPull = false,
+    mergeArmingEnabled = false,
+    deliveryRequirement,
+    assigneeAgentId = null,
+  }: {
+    draft?: boolean;
+    missing?: boolean;
+    mid?: boolean;
+    repo?: boolean;
+    unmentioned?: boolean;
+    holdPull?: boolean;
+    mergeArmingEnabled?: boolean;
+    deliveryRequirement?: IssueDeliveryRequirement;
+    assigneeAgentId?: string | null;
+  } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
       await db.update(companies).set({ mergeArmingEnabled: true }).where(eq(companies.id, company.id));
@@ -261,8 +285,13 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const stages = [{ id: stageId, type: "review", participants: [{ type: "user", userId: "board-user" }] }];
     if (mid) stages.push({ id: randomUUID(), type: "approval", participants: [{ type: "user", userId: "board-user" }] });
     const issue = await seedIssue(db, {
-      companyId: company.id, projectId: project.id, title: "Final delivery",
-      status: "in_review", executionPolicy: { mode: "normal", stages },
+      companyId: company.id,
+      projectId: project.id,
+      title: "Final delivery",
+      status: "in_review",
+      executionPolicy: { mode: "normal", stages },
+      deliveryRequirement,
+      assigneeAgentId,
     });
     const identifier = `${company.issuePrefix}-1`;
     const branch = `${identifier}-delivery`;
@@ -409,6 +438,17 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect((await fixture.read()).status).toBe("done");
   });
 
+  it("records a record-only final approval without requiring an open delivery PR", async () => {
+    const fixture = await pendingDelivery({ deliveryRequirement: "record_only", missing: true });
+    const response = await fixture.approve();
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.deliveryRequirement).toBe("record_only");
+    expect(fixture.writes).toEqual([]);
+  });
+
   it("refuses final draft delivery without completing or recording an approval", async () => {
     const fixture = await pendingDelivery({ draft: true });
     const response = await fixture.approve();
@@ -532,6 +572,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
     expect(fixture.writes).toEqual([]);
     expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("keeps repository delivery fail-closed by default", async () => {
+    const fixture = await pendingDelivery({ missing: true });
+    expect((await fixture.read()).deliveryRequirement).toBe("repository_delivery");
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight" });
   });
 
   it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
@@ -679,7 +728,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
   for (const door of ["PATCH", "comment", "escalation"] as const) {
     it.each([
-      "status", "updatedAt", "delivery binding", "delivery owner", "recorded PR identity",
+      "status", "updatedAt", "delivery binding", "delivery classification", "delivery owner", "recorded PR identity",
       "stage transition", "updatedAt during external preflight",
     ] as const)(
       `keeps ${door} final approval pending after a %s mutation`,
@@ -731,6 +780,9 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
             const stored = await fixture.read();
             await db.update(executionWorkspaces).set({ branchName: "rebound-delivery" })
               .where(eq(executionWorkspaces.id, stored.executionWorkspaceId!));
+          } else if (change === "delivery classification") {
+            await db.update(issues).set({ deliveryRequirement: "record_only" })
+              .where(eq(issues.id, fixture.issue.id));
           } else {
             const stored = await fixture.read();
             await db.update(issues).set({
