@@ -278,7 +278,7 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         "acpx_auth_required", "claude_auth_required",
         "workspace_git_scan_timeout", "workspace_git_scan_saturated",
         "workspace_git_scan_cancelled", "workspace_git_scan_output_limit",
-        "workspace_git_scan_failed",
+        "workspace_git_scan_failed", "workspace_disk_headroom_exceeded",
         "low_trust_isolation_unavailable", "low_trust_requires_isolated_workspace",
         "low_trust_boundary_mismatch", "low_trust_requires_sandbox_environment",
         "low_trust_runtime_services_denied",
