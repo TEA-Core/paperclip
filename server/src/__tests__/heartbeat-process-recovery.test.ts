@@ -1,7 +1,7 @@
 import * as controllerLeases from "../services/legacy-controller-lease.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { randomUUID } from "node:crypto";
-import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { legacyExecutionNeedsReconciliation, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
@@ -2962,7 +2962,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
       agentStatus: "idle",
-      processPid: null,
+      // A registered child keeps this a lost process, not dispatch_unlaunched.
+      // SUP-16555's bootstrap evidence applies only when the reap proves provider
+      // work never started; an unknown in-flight outcome still holds.
+      processPid: 999_999_999,
       processGroupId: null,
       contextSnapshot: { wakeReason: "issue_monitor_due" },
     });
@@ -4324,16 +4327,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         adapterType: "opencode_local",
         graceMs: 30_000,
       },
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
     });
+    expect(legacyExecutionNeedsReconciliation(run!)).toBe(false);
   });
 
-  // A never-launched run registered no child process, so the reaper's process-loss retry gate
-  // (a recorded pid/group, or a lost monitor dispatch) cannot stamp it `retryReason: "process_lost"`.
-  // These pin that: the plain reap queues no process-loss retry, and the monitor reap's retry
-  // records `issue_continuation_needed`.
-  it("never records a process_lost retry reason for a never-launched reap", async () => {
+  // PR #694/#696 pinned that a never-launched reap recorded no process_lost retry
+  // reason because it carried no executionRecovery, so the legacy retry gate held
+  // it for board reconciliation. SUP-16555 records bootstrap evidence when the
+  // stored reap evidence proves provider work never started. The plain reap still
+  // has no child handle, so the process-loss gate does not stamp process_lost.
+  it("records bootstrap recovery, not a process_lost retry, for a never-launched reap", async () => {
     const recent = new Date(Date.now() - 60_000);
-    const { agentId, runId } = await seedRunFixture({
+    const { agentId, runId, issueId } = await seedRunFixture({
       adapterType: "opencode_local",
       agentStatus: "idle",
       startedAt: recent,
@@ -4348,15 +4354,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs.find((row) => row.id === runId)?.errorCode).toBe("dispatch_unlaunched");
+    const failed = runs.find((row) => row.id === runId);
+    expect(failed?.errorCode).toBe("dispatch_unlaunched");
+    expect(failed?.resultJson).toMatchObject({
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      dispatchUnlaunched: {
+        dispatchStep: "admitted_running",
+        leaseOutcome: "no_active_lease_observed",
+        childHandleRegistered: false,
+      },
+    });
+    expect(legacyExecutionNeedsReconciliation(failed!)).toBe(false);
     const retryReasons = runs.map(
       (row) => (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ?? null,
     );
     expect(retryReasons).not.toContain("process_lost");
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+    ).not.toContainEqual(
+      expect.objectContaining({ cause: "legacy_execution_requires_reconciliation" }),
+    );
   });
 
-  it("records issue_continuation_needed, not process_lost, when a never-launched monitor dispatch is retried", async () => {
-    const { companyId, agentId, runId } = await seedRunFixture({
+  it("retries a never-launched monitor dispatch instead of holding it or stamping process_lost", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
       agentStatus: "idle",
       processPid: null,
@@ -4376,7 +4400,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
-    expect(failedRun?.errorCode).toBe("dispatch_unlaunched");
+    expect(failedRun).toMatchObject({
+      errorCode: "dispatch_unlaunched",
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        dispatchUnlaunched: {
+          dispatchStep: "admitted_running",
+          leaseOutcome: "no_active_lease_observed",
+          childHandleRegistered: false,
+        },
+      },
+    });
+    expect(legacyExecutionNeedsReconciliation(failedRun!)).toBe(false);
 
     const retries = await db
       .select()
@@ -4389,17 +4424,100 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       );
     expect(retries).toHaveLength(1);
-    // Upstream #13075 (35fdc0c66) removed the `process_lost_retry` wake: enqueueProcessLossRetry now
-    // defers to scheduleBoundedRetryForRun, which declines a legacy run whose provider outcomes are
-    // unknown. This retry is therefore the fork's in-file release continuation (D9 deferred; see
-    // "requires reconciliation for a lost monitor whose provider outcomes are unknown"), whose wake
-    // reason is `issue_continuation_needed`. The invariant pinned here is unchanged: the retry never
-    // records `retryReason: "process_lost"`.
-    expect(retries[0]?.contextSnapshot).toMatchObject({
-      wakeReason: "issue_continuation_needed",
-      retryReason: "issue_continuation_needed",
+    // PR #694/#696 expected issue_continuation_needed: the reap recorded no
+    // executionRecovery, so enqueueProcessLossRetry declined and the fork
+    // continuation ran. Bootstrap evidence opens the legacy bounded retry.
+    // The reason is still not process_lost.
+    expect(retries[0]).toMatchObject({
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: {
+        wakeReason: "transient_failure_retry",
+        retryReason: "transient_failure",
+      },
     });
     expect(retries[0]?.contextSnapshot).not.toMatchObject({ retryReason: "process_lost" });
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+    ).toEqual([]);
+  });
+
+  it("does not flag a never-launched reap for board reconciliation (SUP-16555)", async () => {
+    const recent = new Date(Date.now() - 60_000);
+    const { runId, issueId } = await seedRunFixture({
+      adapterType: "process",
+      agentStatus: "idle",
+      startedAt: recent,
+      updatedAt: recent,
+    });
+    const heartbeat = heartbeatService(db);
+
+    expect(
+      await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }),
+    ).toEqual({ reaped: 1, runIds: [runId] });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({
+      status: "failed",
+      errorCode: "dispatch_unlaunched",
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        dispatchUnlaunched: {
+          dispatchStep: "admitted_running",
+          leaseOutcome: "no_active_lease_observed",
+          childHandleRegistered: false,
+          telemetryObserved: false,
+        },
+      },
+    });
+    expect(legacyExecutionNeedsReconciliation(run!)).toBe(false);
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+    ).not.toContainEqual(
+      expect.objectContaining({ cause: "legacy_execution_requires_reconciliation" }),
+    );
+  });
+
+  it("still flags a reap for board reconciliation when provider work may have started", async () => {
+    const { runId, issueId } = await seedRunFixture({
+      adapterType: "process",
+      agentStatus: "idle",
+      processPid: 999_999_999,
+    });
+    const heartbeat = heartbeatService(db);
+
+    expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).not.toMatchObject({
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+    });
+    expect(legacyExecutionNeedsReconciliation(run!)).toBe(true);
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+    ).toEqual([
+      expect.objectContaining({
+        cause: "legacy_execution_requires_reconciliation",
+        ownerType: "board",
+      }),
+    ]);
   });
 
   it("does not reap a healthy dispatch still inside the launch grace", async () => {
