@@ -226,6 +226,21 @@ exit status. Patch contents are part of the install fingerprint. Generated
 lockfile changes remain local to the worktree; the repository's lockfile bot
 owns committed updates.
 
+Worktree installs only fetch the optional platform binaries (codex,
+claude-agent-sdk, opencode) of the host they run on, about 3 GB per worktree.
+A user-level `force=true` (for example in `~/.npmrc`) makes pnpm install every
+platform's variants, about 10 GB per worktree, and `pnpm.supportedArchitectures`
+cannot narrow that, so the repository `.npmrc` pins `force=false`. To
+deliberately install binaries for other platforms (cross-platform packaging, a
+mounted checkout used from another OS), pass it on the command line:
+`pnpm install --force`.
+
+New worktrees are refused when the volume that holds the worktree directory is
+at or above 80% used (`disk_headroom_exceeded`), because a burst of
+provisioning can otherwise fill the disk. Reusing an existing worktree is never
+refused. Set `PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT` to change
+the limit; `0` or `off` disables the guard.
+
 ## Hot-Restart Deploys
 
 Primary-instance rebuilds that restart `paperclip.service` can request one-shot live-run adoption instead of using the normal graceful shutdown drain. Before restarting the service, write the marker from the newly staged app with the current service PID:
