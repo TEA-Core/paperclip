@@ -1,4 +1,4 @@
-import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions, issues, summarySlots } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -91,6 +91,9 @@ import type {
  */
 
 const DEFAULT_STALE_MS = 24 * 60 * 60 * 1000;
+// The workspaces overview is the one slot class the board expects fresher than a
+// day (SUP-20900); every other class keeps DEFAULT_STALE_MS.
+const DEFAULT_WORKSPACES_OVERVIEW_STALE_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_WEDGED_MS = 6 * 60 * 60 * 1000;
 
@@ -99,6 +102,12 @@ export const SUMMARY_SLOT_REFRESH_ACTOR_ID = "system:summary-slot-refresh";
 export interface SummarySlotRefreshSweepOptions {
   /** How old (ms since `lastGeneratedAt`) a summary must be before it counts as stale. */
   staleMs?: number;
+  /**
+   * Same as `staleMs`, but only for `workspaces_overview` slots, where the
+   * shorter of the two applies. Read from
+   * `SUMMARY_SLOT_REFRESH_WORKSPACES_OVERVIEW_STALE_MS` when omitted (default 12h).
+   */
+  workspacesOverviewStaleMs?: number;
   /** Minimum spacing between actual measurement runs. */
   sweepIntervalMs?: number;
   /**
@@ -169,6 +178,11 @@ export function createSummarySlotRefreshSweepService(
   opts: SummarySlotRefreshSweepOptions = {},
 ) {
   const staleMs = opts.staleMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_STALE_MS", DEFAULT_STALE_MS);
+  const workspacesOverviewStaleMs = Math.min(
+    staleMs,
+    opts.workspacesOverviewStaleMs
+      ?? readMsEnv("SUMMARY_SLOT_REFRESH_WORKSPACES_OVERVIEW_STALE_MS", DEFAULT_WORKSPACES_OVERVIEW_STALE_MS),
+  );
   const sweepIntervalMs =
     opts.sweepIntervalMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_SWEEP_INTERVAL_MS", DEFAULT_SWEEP_INTERVAL_MS);
   const wedgedMs = opts.wedgedMs ?? readMsEnv("SUMMARY_SLOT_REFRESH_WEDGED_MS", DEFAULT_WEDGED_MS);
@@ -200,6 +214,7 @@ export function createSummarySlotRefreshSweepService(
     };
 
     const staleCutoff = new Date(checkedAt.getTime() - staleMs);
+    const overviewStaleCutoff = new Date(checkedAt.getTime() - workspacesOverviewStaleMs);
     const candidates = await db
       .select({
         companyId: summarySlots.companyId,
@@ -217,7 +232,17 @@ export function createSummarySlotRefreshSweepService(
           eq(summarySlots.status, "generating"),
           and(
             eq(summarySlots.status, "idle"),
-            or(isNull(summarySlots.lastGeneratedAt), lt(summarySlots.lastGeneratedAt, staleCutoff)),
+            or(
+              isNull(summarySlots.lastGeneratedAt),
+              and(
+                eq(summarySlots.scopeKind, "workspaces_overview"),
+                lt(summarySlots.lastGeneratedAt, overviewStaleCutoff),
+              ),
+              and(
+                ne(summarySlots.scopeKind, "workspaces_overview"),
+                lt(summarySlots.lastGeneratedAt, staleCutoff),
+              ),
+            ),
           ),
         ),
       );

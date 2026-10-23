@@ -142,10 +142,10 @@ describe("built-in routine markdown/code parity", () => {
       expect(typeof routineKey, `${doc.relativePath} has no routineKey`).toBe("string");
 
       const definition = listBuiltInAgentDefinitions()
-        .find((candidate) => candidate.bundle?.routine.routineKey === routineKey);
+        .find((candidate) => candidate.bundle?.routine?.routineKey === routineKey);
       expect(definition, `no built-in agent defines routine "${String(routineKey)}"`).toBeDefined();
 
-      const codeVariables = definition!.bundle!.routine.variables.map(normalizeCodeVariable);
+      const codeVariables = definition!.bundle!.routine!.variables.map(normalizeCodeVariable);
       const docVariables = (frontmatter.variables as unknown[]).map(normalizeDocVariableForCompare);
 
       expect(docVariables).toEqual(codeVariables);
@@ -154,7 +154,7 @@ describe("built-in routine markdown/code parity", () => {
 
   it("keeps every inline variable type valid too", () => {
     for (const definition of listBuiltInAgentDefinitions()) {
-      for (const variable of definition.bundle?.routine.variables ?? []) {
+      for (const variable of definition.bundle?.routine?.variables ?? []) {
         expect(
           ROUTINE_VARIABLE_TYPES,
           `${definition.key}: inline variable "${variable.name}" has type "${variable.type}"`,

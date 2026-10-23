@@ -12,6 +12,7 @@ import {
   issueWatchdogs,
   issues,
   nativeRunFinalizations,
+  summarySlots,
   type Db,
 } from "@paperclipai/db";
 import type { SuccessfulRunHandoffState } from "@paperclipai/shared";
@@ -30,6 +31,7 @@ import {
   toContinuationPathDate,
 } from "./issue-continuation-path.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "./successful-run-handoff-state.js";
+import { hasSummaryGenerationToken } from "./summary-slot-finalization.js";
 
 /**
  * Terminal run states — a run in any of these is not live and cannot be
@@ -190,6 +192,104 @@ export async function reapStaleExecutionOwnerLeases(
 }
 
 /**
+ * A token-bearing task younger than this may still be mid-mint: `generate()`
+ * creates the issue and arms the slot in separate writes.
+ */
+const UNBOUND_SUMMARY_GENERATION_MIN_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * Cancel summary generation tasks that no slot is bound to (SUP-20900). Only
+ * `generate()` binds a slot, and only a bound task can pass the Summarizer write
+ * guard, so a token-bearing task with no `summary_slots.generating_issue_id`
+ * pointing at it (self-armed by the Summarizer heartbeat, a manual routine run,
+ * or reopened after its binding was released) can never be completed and only
+ * feeds the 403 loop. Keyed on the token block and the binding by the issue's
+ * own id, not on the assignee, so a bound task that review reassigned to another
+ * agent is left alone. Cancellation goes through the standard update funnel;
+ * finalize is a no-op for an unbound issue.
+ */
+async function reapUnboundSummaryGenerationIssues(
+  db: Db,
+  now: Date,
+): Promise<{ scanned: number; terminalized: number }> {
+  const cutoff = new Date(now.getTime() - UNBOUND_SUMMARY_GENERATION_MIN_AGE_MS);
+  const unbound = (issueId: unknown, companyId: unknown) => sql`not exists (
+    select 1
+    from ${summarySlots}
+    where ${summarySlots.companyId} = ${companyId}
+      and ${summarySlots.generatingIssueId} = ${issueId}
+  )`;
+  const candidates = await db
+    .select({ issueId: issues.id, companyId: issues.companyId })
+    .from(issues)
+    .where(
+      and(
+        notInArray(issues.status, ["done", "cancelled"]),
+        lte(issues.createdAt, cutoff),
+        sql`${issues.description} like '%"generationIssueId"%'`,
+        unbound(issues.id, issues.companyId),
+      ),
+    )
+    .limit(50);
+
+  let terminalized = 0;
+  for (const candidate of candidates) {
+    try {
+      const postCommitActivityPublications: ActivityPublication[] = [];
+      const postCommitIssueActions: IssuePostCommitAction[] = [];
+      const cancelled = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+        );
+        const [issue] = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.id, candidate.issueId), eq(issues.companyId, candidate.companyId)))
+          .for("update");
+        // Re-check under the row lock: the issue may have closed, or a
+        // concurrent generate() may have bound a slot to it, since the scan.
+        if (!issue) return false;
+        if (issue.status === "done" || issue.status === "cancelled") return false;
+        if (issue.createdAt.getTime() > cutoff.getTime()) return false;
+        if (!hasSummaryGenerationToken(issue.description)) return false;
+        const [bound] = await tx
+          .select({ one: sql<number>`1` })
+          .from(summarySlots)
+          .where(
+            and(
+              eq(summarySlots.companyId, issue.companyId),
+              eq(summarySlots.generatingIssueId, issue.id),
+            ),
+          )
+          .limit(1);
+        if (bound) return false;
+        const updated = await issueService(db).update(
+          issue.id,
+          { status: "cancelled", companyGuard: issue.companyId },
+          tx,
+          postCommitActivityPublications,
+          postCommitIssueActions,
+        );
+        return updated?.status === "cancelled";
+      });
+      if (cancelled) {
+        terminalized += 1;
+        for (const publication of postCommitActivityPublications) publishActivity(publication);
+        if (postCommitIssueActions.length > 0) {
+          await executeIssuePostCommitActions(db, postCommitIssueActions);
+        }
+      }
+    } catch {
+      logger.warn(
+        { issueId: candidate.issueId },
+        "Unbound summary-generation cancellation remains pending; continuing with other issues",
+      );
+    }
+  }
+  return { scanned: candidates.length, terminalized };
+}
+
+/**
  * Terminalize summary-generation cards assigned to the Summarizer whose
  * continuation paths have all died (SUP-17698 backfill, amended contract).
  *
@@ -226,7 +326,11 @@ export async function reapStaleExecutionOwnerLeases(
  */
 export async function reapStrandedSummaryGenerationIssues(
   db: Db,
+  now = new Date(),
 ): Promise<{ scanned: number; terminalized: number }> {
+  // Unbound token-bearing tasks first, so they end `cancelled` rather than
+  // `done` by the continuation-path class below.
+  const unboundReaping = await reapUnboundSummaryGenerationIssues(db, now);
   const candidates = await db
     .select({
       issueId: issues.id,
@@ -500,7 +604,10 @@ export async function reapStrandedSummaryGenerationIssues(
       }
     }),
   );
-  return { scanned: candidates.length, terminalized };
+  return {
+    scanned: candidates.length + unboundReaping.scanned,
+    terminalized: terminalized + unboundReaping.terminalized,
+  };
 }
 
 /** Only newly recorded control deadlines are eligible. Upgrades never replay ambiguous historical runs. */

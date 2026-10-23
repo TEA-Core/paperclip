@@ -10,6 +10,39 @@ import type { IssueStatus } from "@paperclipai/shared";
 
 const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
 
+/**
+ * Parses the generation token block `generate()` writes into a generation
+ * issue's description. Lives here (dependency-free of the issue service) so the
+ * issue-update funnel and the reaper can share it with `summary-slots.ts`.
+ */
+export function readGenerationToken(
+  description: string | null | undefined,
+): Record<string, unknown> | null {
+  const match = description?.match(/```json\n([\s\S]*?)\n```/);
+  if (!match) return null;
+  try {
+    const parsed: unknown = JSON.parse(match[1]);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the description carries a summary generation token block (SUP-20900).
+ * Matches on the key set `generate()` writes, not on the token's values: a
+ * self-armed task carries a literal placeholder for `generationIssueId`.
+ */
+export function hasSummaryGenerationToken(description: string | null | undefined): boolean {
+  const token = readGenerationToken(description);
+  return (
+    token !== null &&
+    Object.hasOwn(token, "generationIssueId") &&
+    Object.hasOwn(token, "scopeKind") &&
+    Object.hasOwn(token, "slotKey")
+  );
+}
+
 interface TerminalGenerationIssue {
   id: string;
   companyId: string;

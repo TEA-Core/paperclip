@@ -47,13 +47,15 @@ function redactBuiltInAgentListState(state: BuiltInAgentState): BuiltInAgentStat
           canonicalKey: state.definition.bundle.skill.canonicalKey,
           files: Object.keys(state.definition.bundle.skill.files),
         },
-        routine: {
-          routineKey: state.definition.bundle.routine.routineKey,
-          title: state.definition.bundle.routine.title,
-          status: state.definition.bundle.routine.status,
-          triggerCount: state.definition.bundle.routine.triggers.length,
-          scheduleLabel: formatScheduleLabel(state.definition.bundle.routine.triggers[0]),
-        },
+        routine: state.definition.bundle.routine
+          ? {
+            routineKey: state.definition.bundle.routine.routineKey,
+            title: state.definition.bundle.routine.title,
+            status: state.definition.bundle.routine.status,
+            triggerCount: state.definition.bundle.routine.triggers.length,
+            scheduleLabel: formatScheduleLabel(state.definition.bundle.routine.triggers[0]),
+          }
+          : undefined,
       }
       : undefined,
   } as BuiltInAgentState["definition"];
