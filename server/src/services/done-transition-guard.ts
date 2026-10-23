@@ -131,6 +131,15 @@ export interface DoneTransitionGuardResult {
   ladderedChildIdentifiers?: string[];
   /** ADR-103 M3.5: the carve-out-excluded children, printed so an exclusion is never silent. */
   excludedChildIdentifiers?: string[];
+  missingStageLabels?: string[];
+  outOfOrderStageLabels?: string[];
+  outOfOrderMatches?: Array<{
+    label: string;
+    stageIndex: number;
+    stageId: string | null;
+    reseated: boolean;
+  }>;
+  ladderedChildCount?: number;
   skipped: boolean;
   skipReason: string | null;
 }
@@ -1630,11 +1639,17 @@ export async function countLadderedChildren(
  * empty means the ladder carries the full close-ladder shape in the ratified
  * order.
  */
-interface Adr072CloseLadderShape {
+export interface Adr072CloseLadderShape {
   /** Requirements with no matching stage at all (the unchanged "missing" shape). */
   missingStageLabels: string[];
   /** Requirements matched only out of order — a distinct ordering violation (SUP-16532). */
   outOfOrderStageLabels: string[];
+  outOfOrderMatches: Array<{
+    label: string;
+    stageIndex: number;
+    stageId: string | null;
+    reseated: boolean;
+  }>;
 }
 
 export async function findMissingAdr072CloseLadderStages(
@@ -1659,6 +1674,7 @@ export async function findMissingAdr072CloseLadderStages(
     return {
       missingStageLabels: ADR072_CLOSE_LADDER.map((requirement) => requirement.label),
       outOfOrderStageLabels: [],
+      outOfOrderMatches: [],
     };
   }
 
@@ -1813,8 +1829,12 @@ export async function findMissingAdr072CloseLadderStages(
   // stage) is recorded separately rather than accepted, so the final approver
   // can no longer sign off before the Definition-of-Done gate runs.
   let cursor = 0;
-  const matchedOutOfOrder = new Set<number>();
-  for (const stage of stages) {
+  const matchedOutOfOrder = new Map<number, {
+    stageIndex: number;
+    stageId: string | null;
+    reseated: boolean;
+  }>();
+  for (const [stageIndex, stage] of stages.entries()) {
     const matches: number[] = [];
     for (let i = 0; i < requirementCount; i += 1) {
       if (stageSatisfiesRequirement(stage, i)) matches.push(i);
@@ -1826,12 +1846,21 @@ export async function findMissingAdr072CloseLadderStages(
     } else {
       // No in-order progress here: any LATER requirement this stage satisfies
       // appears before the rung still owed — an ordering violation.
-      for (const j of matches) if (j > cursor) matchedOutOfOrder.add(j);
+      for (const j of matches) {
+        if (j > cursor && !matchedOutOfOrder.has(j)) {
+          matchedOutOfOrder.set(j, {
+            stageIndex,
+            stageId: stage.id,
+            reseated: principalUrlKeys.has(ADR072_CLOSE_LADDER[j].agentUrlKey),
+          });
+        }
+      }
     }
   }
 
   const missingStageLabels: string[] = [];
   const outOfOrderStageLabels: string[] = [];
+  const outOfOrderMatches: Adr072CloseLadderShape["outOfOrderMatches"] = [];
   for (let i = 0; i < requirementCount; i += 1) {
     // An out-of-order approval remains a violation even if a later duplicate
     // matches in order: the approver signed before the Definition-of-Done reviews.
@@ -1846,12 +1875,19 @@ export async function findMissingAdr072CloseLadderStages(
       )
     ) {
       outOfOrderStageLabels.push(ADR072_CLOSE_LADDER[i].label);
+      const match = matchedOutOfOrder.get(i);
+      if (match) {
+        outOfOrderMatches.push({
+          label: ADR072_CLOSE_LADDER[i].label,
+          ...match,
+        });
+      }
       continue;
     }
     if (i < cursor) continue; // satisfied in order
     missingStageLabels.push(ADR072_CLOSE_LADDER[i].label);
   }
-  return { missingStageLabels, outOfOrderStageLabels };
+  return { missingStageLabels, outOfOrderStageLabels, outOfOrderMatches };
 }
 
 /**
@@ -1966,12 +2002,13 @@ async function evaluateDoneTransitionGuardCore(
     excludedChildIdentifiers: string[];
     missingStageLabels: string[];
     outOfOrderStageLabels: string[];
+    outOfOrderMatches: Adr072CloseLadderShape["outOfOrderMatches"];
   } | null = null;
   if (reviewLadder !== null && reviewLadder.satisfied) {
     const laddered = await countLadderedChildren(db, issue.companyId, issue.id);
     if (observer) observer.census = laddered;
     if (laddered.count >= 2) {
-      const { missingStageLabels, outOfOrderStageLabels } =
+      const { missingStageLabels, outOfOrderStageLabels, outOfOrderMatches } =
         await findMissingAdr072CloseLadderStages(
           db,
           issue.companyId,
@@ -1987,6 +2024,7 @@ async function evaluateDoneTransitionGuardCore(
           excludedChildIdentifiers: laddered.excludedChildIdentifiers,
           missingStageLabels,
           outOfOrderStageLabels,
+          outOfOrderMatches,
         };
       }
     }
@@ -2082,6 +2120,7 @@ async function evaluateDoneTransitionGuardCore(
       reason: "adr072_close_ladder_shape_incomplete",
       missingStageLabels: ladderShape.missingStageLabels,
       outOfOrderStageLabels: ladderShape.outOfOrderStageLabels,
+      outOfOrderMatches: ladderShape.outOfOrderMatches,
       ladderedChildCount: ladderShape.ladderedChildCount,
       ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
       excludedChildIdentifiers: ladderShape.excludedChildIdentifiers,
@@ -2133,6 +2172,10 @@ async function evaluateDoneTransitionGuardCore(
       repo: null,
       mechanism: "D",
       remedy: mechanismRemedy,
+      missingStageLabels: ladderShape.missingStageLabels,
+      outOfOrderStageLabels: ladderShape.outOfOrderStageLabels,
+      outOfOrderMatches: ladderShape.outOfOrderMatches,
+      ladderedChildCount: ladderShape.ladderedChildCount,
       ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
       excludedChildIdentifiers: ladderShape.excludedChildIdentifiers,
       skipped: false,

@@ -451,6 +451,9 @@ describe("SUP-16532 ADR-072 close-ladder shape: ordered forward scan (ADR-102 M3
           reason: "adr072_close_ladder_shape_incomplete",
           missingStageLabels: [],
           outOfOrderStageLabels: ["approval:exec-CTO"],
+          outOfOrderMatches: [
+            { label: "approval:exec-CTO", stageIndex: 1, stageId: stage3, reseated: false },
+          ],
           ladderedChildCount: 2,
         }),
       }),
@@ -492,6 +495,28 @@ describe("SUP-16532 ADR-072 close-ladder shape: ordered forward scan (ADR-102 M3
         }),
       }),
     );
+  });
+
+  it("records the first out-of-order stage identity (AC1b)", async () => {
+    const executionPolicy = {
+      stages: [
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+      ],
+    };
+    setupDbMock({ issues: twoLadderedChildren, agents });
+    const result = await findMissingAdr072CloseLadderStages(
+      mockDb,
+      "company-1",
+      "issue-1",
+      executionPolicy,
+      satisfiedState([stage1, stage2, stage3]),
+      null,
+    );
+    expect(result.outOfOrderMatches).toEqual([
+      { label: "approval:exec-CTO", stageIndex: 0, stageId: stage3, reseated: false },
+    ]);
   });
 
   it("still closes a ladder in the ratified ADR-072 order (AC2)", async () => {
@@ -658,7 +683,33 @@ describe("SUP-20529 Mechanism D re-seated rung ordering", () => {
       ),
       null,
     );
-    expect(result).toEqual({ missingStageLabels: [], outOfOrderStageLabels: [] });
+    expect(result).toEqual({
+      missingStageLabels: [],
+      outOfOrderStageLabels: [],
+      outOfOrderMatches: [],
+    });
+  });
+
+  it("reports a re-seated out-of-order rung with reseated true", async () => {
+    const approvalFirst = {
+      stages: [
+         { id: stage3, type: "approval", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage1, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: coderLeId }] },
+      ],
+    };
+    const executionState = principalState([stage1, stage2, stage3], execCtoId);
+    const result = await findMissingAdr072CloseLadderStages(
+      mockDb,
+      "company-1",
+      "issue-1",
+      approvalFirst,
+      executionState,
+      execCtoId,
+    );
+    expect(result.outOfOrderMatches).toEqual([
+      { label: "approval:exec-CTO", stageIndex: 0, stageId: stage3, reseated: true },
+    ]);
   });
 
   it("allows the completed parent transition for the re-seated ladder", async () => {
@@ -710,6 +761,9 @@ describe("SUP-20529 Mechanism D re-seated rung ordering", () => {
     expect(shape).toEqual({
       missingStageLabels: [],
       outOfOrderStageLabels: ["approval:exec-CTO"],
+      outOfOrderMatches: [
+        { label: "approval:exec-CTO", stageIndex: 0, stageId: stage1, reseated: true },
+      ],
     });
 
     const result = await evaluateDoneTransitionGuard(
@@ -1255,5 +1309,6 @@ describe("SUP-17647 ADR-072 close-ladder shape: a completed rung is discharged b
     );
     expect(verdict.missingStageLabels).toEqual([]);
     expect(verdict.outOfOrderStageLabels).toEqual([]);
+    expect(verdict.outOfOrderMatches).toEqual([]);
   });
 });
