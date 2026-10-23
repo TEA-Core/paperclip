@@ -319,6 +319,21 @@ ships **unset** so merging the change cannot freeze a merge before the release r
 is deployed: deploy the control plane, confirm the route answers, then set the
 variable. Unsetting it is the rollback.
 
+**Known residual bypass — do not set `PAPERCLIP_CARD_WAIVER_RETIRED` until it is
+closed.** The enforcer reads GitHub only and has no control-plane credential, so it
+cannot ask which card owns a PR. Both inputs to the refusal are chosen by the PR
+author: card binding comes from the head ref (`SUP-<n>...`), and "person" comes from
+GitHub's `user.type`. With the switch on, a card work item pushed to a branch that does
+not start `SUP-<n>` still reads as cardless and keeps its waiver, and a machine token
+that is a GitHub `User` (the fleet's `kronik187` token is one) reads as a person. The
+switch therefore only closes the honest mistake and the `SUP-` branch path; it does not
+stop an agent that renames its branch or pushes as a `User`. Closing it needs the card's
+recorded delivery PR/branch passed to this check over a path the author cannot write, and
+a fleet token that is not a `User`. Until then the shipped default (unset) is the safe
+state, and every waiver honoured with the switch on is logged `UNVERIFIED`. The tests in
+`scripts/__tests__/paperclip-approved-card-waiver.test.mjs` pin this behaviour so it
+cannot change unnoticed.
+
 ## Admin bypass — decision (SUP-13629)
 
 The pre-existing `bypass_actors` entry (admin, `bypass_mode: pull_request`) was

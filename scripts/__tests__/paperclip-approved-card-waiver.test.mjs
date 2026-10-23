@@ -46,13 +46,14 @@ const GH_SHIM = [
 
 const WAIVER_BODY = "Paperclip-Approved-Waiver: sync with no card";
 
-function run({ ref, author, body = "", labels = [], statuses = [], retired = true }) {
+function run({ ref, author, body = "", title = "", labels = [], statuses = [], retired = true }) {
   const dir = mkdtempSync(path.join(tmpdir(), "pc-card-waiver-"));
   try {
     writeFileSync(
       path.join(dir, "pull.json"),
       JSON.stringify({
         head: { sha: HEAD_SHA, ref },
+        title,
         body,
         labels: labels.map((name) => ({ name })),
         user: author,
@@ -167,4 +168,47 @@ test("with the switch off (the shipped default) every waiver behaves as before",
   for (const [ref, author] of [[CARD_BRANCH, PERSON], [CARDLESS_BRANCH, FLEET_APP]]) {
     assert.equal(run({ ref, author, body: WAIVER_BODY, retired: false }).code, 0, `${ref} ${author.login}`);
   }
+});
+
+// KNOWN RESIDUAL BYPASS (see the header of the script and docs/branch-protection.md).
+// The check reads GitHub only, so card binding (head ref) and "person" (user.type)
+// are author-chosen. These tests pin what the check does today with the switch on, so
+// the residual cannot be widened or closed by accident; they are not an endorsement.
+
+test("residual: a card work item pushed to a non-SUP branch keeps its waiver, logged UNVERIFIED", () => {
+  const { code, out } = run({
+    ref: "agent/renamed-away-from-the-card",
+    author: PERSON,
+    title: "feat(SUP-20772): the card's real work item",
+    body: `Card SUP-20772.\n${WAIVER_BODY}`,
+  });
+  assert.equal(code, 0);
+  assert.match(out, /waived:/);
+  assert.match(out, /UNVERIFIED: body waiver .* honoured on head 'agent\/renamed-away-from-the-card'/);
+  assert.match(out, /no card binding was checked against the control plane/);
+});
+
+test("residual: a machine token typed User passes as a person for the body waiver and the label, logged UNVERIFIED", () => {
+  const machineUser = { login: "fleet-token-user", type: "User" };
+  for (const input of [{ body: WAIVER_BODY }, { labels: ["no-paperclip-card"] }]) {
+    const { code, out } = run({ ref: CARDLESS_BRANCH, author: machineUser, ...input });
+    assert.equal(code, 0);
+    assert.match(out, /UNVERIFIED: .* by author fleet-token-user \(type User\)/);
+  }
+});
+
+test("the same machine token typed User is still refused on a SUP-prefixed branch", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: { login: "fleet-token-user", type: "User" }, body: WAIVER_BODY });
+  assert.equal(code, 1);
+  assert.match(out, /REFUSED: body waiver/);
+  assert.doesNotMatch(out, /UNVERIFIED/);
+});
+
+test("UNVERIFIED is only logged for a waiver honoured with the switch on", () => {
+  const off = run({ ref: CARDLESS_BRANCH, author: PERSON, body: WAIVER_BODY, retired: false });
+  assert.equal(off.code, 0);
+  assert.doesNotMatch(off.out, /UNVERIFIED/);
+  const refused = run({ ref: CARDLESS_BRANCH, author: FLEET_APP, body: WAIVER_BODY });
+  assert.equal(refused.code, 1);
+  assert.doesNotMatch(refused.out, /UNVERIFIED/);
 });
