@@ -10,7 +10,8 @@ import {
   diskUsedPercent,
   resolveWorkspaceDiskMaxUsedPercent,
 } from "../services/workspace-disk-headroom.ts";
-import { WorkspaceRuntimeValidationFailure, realizeExecutionWorkspace } from "../services/workspace-runtime.ts";
+import { WORKSPACE_GIT_SCAN_ERROR_CODES, WorkspaceGitScanError } from "../services/workspace-git-operation-scheduler.ts";
+import { realizeExecutionWorkspace } from "../services/workspace-runtime.ts";
 
 // SUP-20840 — provisioning refuses to create a new worktree once the data volume is
 // at or above the configured used-percent limit (default 80).
@@ -26,10 +27,11 @@ describe("resolveWorkspaceDiskMaxUsedPercent", () => {
     expect(resolveWorkspaceDiskMaxUsedPercent({ [ENV]: "65" })).toBe(65);
   });
 
-  it("is disabled by 0 or off, and a typo falls back to the default", () => {
+  it("is disabled only by 0; anything else unparseable falls back to the default", () => {
     expect(resolveWorkspaceDiskMaxUsedPercent({ [ENV]: "0" })).toBeNull();
-    expect(resolveWorkspaceDiskMaxUsedPercent({ [ENV]: "off" })).toBeNull();
-    expect(resolveWorkspaceDiskMaxUsedPercent({ [ENV]: "eighty" })).toBe(80);
+    for (const typo of ["off", "false", "disabled", "eighty"]) {
+      expect(resolveWorkspaceDiskMaxUsedPercent({ [ENV]: typo })).toBe(80);
+    }
     expect(resolveWorkspaceDiskMaxUsedPercent({ [ENV]: "150" })).toBe(80);
   });
 });
@@ -51,9 +53,7 @@ describe("checkWorkspaceDiskHeadroom", () => {
       const refusal = await checkWorkspaceDiskHeadroom({ path: "/x", env: {}, statfs: statAt(used) });
       expect(refusal?.message).toContain(`${used.toFixed(1)}% used`);
       expect(refusal?.message).toContain(ENV);
-      expect(refusal?.resultJson).toMatchObject({
-        workspaceValidation: { reason: "disk_headroom_exceeded", maxUsedPercent: 80, usedPercent: used },
-      });
+      expect(refusal?.details).toMatchObject({ maxUsedPercent: 80, usedPercent: used });
     }
   });
 
@@ -120,8 +120,9 @@ describe("realizeExecutionWorkspace disk guard", () => {
     // 0.001% is below any real volume's usage, so a fresh worktree must be refused...
     process.env[ENV] = "0.001";
     const refused = await realize(repo, "PAP-2").catch((error) => error);
-    expect(refused).toBeInstanceOf(WorkspaceRuntimeValidationFailure);
-    expect(refused.resultJson).toMatchObject({ workspaceValidation: { reason: "disk_headroom_exceeded" } });
+    expect(refused).toBeInstanceOf(WorkspaceGitScanError);
+    expect(refused.code).toBe(WORKSPACE_GIT_SCAN_ERROR_CODES.diskHeadroom);
+    expect(refused.details).toMatchObject({ retryable: true, maxUsedPercent: 0.001 });
     await expect(fs.stat(path.join(repo, ".paperclip", "worktrees", "PAP-2-disk-guard"))).rejects.toThrow();
 
     // ...while the worktree that already exists keeps working.

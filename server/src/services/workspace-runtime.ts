@@ -90,7 +90,11 @@ import {
 } from "./base-repo-reset-lease.js";
 import { logger } from "../middleware/logger.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
-import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import {
+  WORKSPACE_GIT_SCAN_ERROR_CODES,
+  WorkspaceGitScanError,
+  workspaceGitOperationScheduler,
+} from "./workspace-git-operation-scheduler.js";
 import { checkWorkspaceDiskHeadroom } from "./workspace-disk-headroom.js";
 import {
   cleanupWorktreeInstanceArtifacts,
@@ -6112,7 +6116,9 @@ export async function realizeExecutionWorkspace(input: {
   // SUP-20840: only a brand-new worktree is refused; the reuse paths above add
   // no meaningful data and must keep working so in-flight issues can finish.
   const diskRefusal = await checkWorkspaceDiskHeadroom({ path: worktreeParentDir });
-  if (diskRefusal) throw new WorkspaceRuntimeValidationFailure(diskRefusal.message, diskRefusal.resultJson);
+  if (diskRefusal) {
+    throw new WorkspaceGitScanError(WORKSPACE_GIT_SCAN_ERROR_CODES.diskHeadroom, diskRefusal.message, diskRefusal.details);
+  }
 
   if (requestedExistingBranch) {
     try {
