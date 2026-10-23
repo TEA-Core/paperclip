@@ -112,6 +112,10 @@ export const issues = pgTable(
     )`),
     companyIdUq: unique("issues_company_id_uq").on(table.companyId, table.id),
     parentLinkKindCheck: check("issues_parent_link_kind_check", sql`${table.parentLinkKind} in ('decomposition', 'process')`),
+    deliveryRequirementCheck: check(
+      "issues_delivery_requirement_check",
+      sql`${table.deliveryRequirement} in ('repository_delivery', 'record_only')`,
+    ),
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
     companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(

@@ -16455,6 +16455,16 @@ export function issueRoutes(
           sanitizedBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      if (
+        sanitizedBody.deliveryRequirement === "record_only" &&
+        req.actor.type === "agent" &&
+        req.actor.agentId === normalizedAssigneeAgentRef.id
+      ) {
+        res.status(403).json({
+          error: "Only the board or an authorized non-assignee may select record_only delivery",
+        });
+        return;
+      }
       await assertNoAgentDelegationCycleAndRecord({
         req,
         parent,
@@ -16756,6 +16766,16 @@ export function issueRoutes(
             sanitizedChild.assigneeAgentId as string | null | undefined,
             { actorType: req.actor.type },
           );
+        if (
+          sanitizedChild.deliveryRequirement === "record_only" &&
+          req.actor.type === "agent" &&
+          req.actor.agentId === normalizedAssigneeAgentRef.id
+        ) {
+          res.status(403).json({
+            error: "Only the board or an authorized non-assignee may select record_only delivery",
+          });
+          return;
+        }
         const childBody = {
           ...sanitizedChild,
           ...(normalizedAssigneeAgentRef.id !== undefined
@@ -17400,16 +17420,6 @@ export function issueRoutes(
       }
     }
     if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
-    if (
-      req.body.deliveryRequirement === "record_only" &&
-      req.actor.type === "agent" &&
-      req.actor.agentId === existing.assigneeAgentId
-    ) {
-      res.status(403).json({
-        error: "Only the board or an authorized non-assignee may select record_only delivery",
-      });
-      return;
-    }
     const issueMutationAuthorizationReason = req.actor.type === "agent"
       ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
       : issueWriteAuthorizationReason(req, true);
@@ -17452,6 +17462,18 @@ export function issueRoutes(
       { actorType: req.actor.type },
     );
     const normalizedAssigneeAgentId = normalizedAssigneeAgentRef.id;
+    const effectiveDeliveryRequirement =
+      req.body.deliveryRequirement ?? existing.deliveryRequirement;
+    if (
+      effectiveDeliveryRequirement === "record_only" &&
+      req.actor.type === "agent" &&
+      req.actor.agentId === (normalizedAssigneeAgentId ?? existing.assigneeAgentId)
+    ) {
+      res.status(403).json({
+        error: "Only the board or an authorized non-assignee may select record_only delivery",
+      });
+      return;
+    }
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)
@@ -18490,7 +18512,7 @@ export function issueRoutes(
       updateFields.status !== existing.status &&
       isClosedIssueStatus(updateFields.status);
     const terminalApprovalNeedsPreflight =
-      existing.deliveryRequirement !== "record_only" &&
+      effectiveDeliveryRequirement !== "record_only" &&
       shouldPublishApprovalStatus(transition.decision) &&
       ladderIsTerminallyApproved(
         nextExecutionPolicy,
@@ -19046,6 +19068,14 @@ export function issueRoutes(
           if (finalDeliveryPrefetch) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) return null;
+            if (
+              lockedIssue.deliveryRequirement !== existing.deliveryRequirement
+            ) {
+              throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
+                code: "approval_final_delivery_preflight_stale",
+                reason: "head_moved: delivery classification changed before final delivery preflight",
+              });
+            }
             await preflightTerminalApproval(lockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
               locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
             });
@@ -23520,6 +23550,12 @@ export function issueRoutes(
           if (finalDeliveryPrefetch) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+            if (lockedIssue.deliveryRequirement !== currentIssue.deliveryRequirement) {
+              throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
+                code: "approval_final_delivery_preflight_stale",
+                reason: "head_moved: delivery classification changed before final delivery preflight",
+              });
+            }
             await preflightTerminalApproval(lockedIssue, updatePatch, transition.decision, currentExecutionPolicy, {
               locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
             });
