@@ -41,3 +41,6 @@ The card must be `done`, every declared stage completed, the last decision appro
 
 The head decision is durable before the external status write. If GitHub accepts the status but storing publication state subsequently fails, the API reports the failure and the decision audit remains; a database rollback must not erase the authorization for an already-written status. The `issue.approval_head_decision` row records the authorizer, not that publication applied: a refused publication (for example `delivery-receipt-missing` or a moved head) is visible only in the 409 response, and no publish-outcome audit record exists yet.
 
+## Override label and the reconciler
+
+A PR carrying `override:paperclip-approval` (see [branch protection](branch-protection.md#override-label-sup-20897)) clears the CI enforcer without a `paperclip/approved` status. The reconciler is unaffected: it reads and writes only the status, never the label, and an overridden PR gets no status. Do not publish one to "match" the override. If the control plane later approves the head, the stamp passes the enforcer on its own and the label is not consulted.

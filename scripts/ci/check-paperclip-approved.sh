@@ -20,8 +20,12 @@
 #   GET repos/{owner}/{repo}/commits/{head-sha}/statuses
 #   GET repos/{owner}/{repo}/pulls/{n}/reviews   (only when a waiver is
 #                                                 present on a fold-sync head)
+#   and, only when the override label is on the PR and the head has no stamp:
+#   GET repos/{owner}/{repo}/issues/{n}/events
+#   GET repos/{owner}/{repo}/collaborators/{labeler}/permission
+#   GET repos/{owner}/{repo}/activity?ref=refs/heads/{head-ref}
 #
-# All three go through `gh_api_retry`, which re-issues them on an HTTP 5xx or a
+# All of them go through `gh_api_retry`, which re-issues them on an HTTP 5xx or a
 # transport failure (3 attempts, 2s then 5s, so at most +7s per call site) and
 # never on a 4xx. See the long note at that function for why a 403 is excluded
 # and for the incident that motivated it.
@@ -53,6 +57,30 @@
 # TEA-Core/paperclip fold, whose base branch name itself contains slashes) —
 # and from that source only. An unresolvable identity must never read as
 # approved.
+#
+# Override (SUP-20897): the label `override:paperclip-approval` lets a person with
+# write access approve ONE PR when the reviewer pipeline cannot publish
+# `paperclip/approved`. It is consulted only when the head carries no valid
+# stamp, never replaces a FORGED-stamp refusal, and is honored only when ALL hold
+# (every uncertainty fails closed; the reason is logged either way):
+#   - the label is on the PR now and its most recent `labeled` issue event was
+#     applied by an `actor.type == "User"` (the same machine-identity rejection
+#     as human_countersigner's `user.type`) whose repository role is admin,
+#     maintain or write (the OWNER/MEMBER/COLLABORATOR standing the waiver path
+#     requires, read from the collaborator-permission API because issue events
+#     carry no author_association);
+#   - the PR head repo is this repo (no fork) and the NEWEST activity on the PR's
+#     head branch is a push of exactly the current head SHA, recorded strictly
+#     BEFORE the label event. The activity timestamp is server-set, and a
+#     pusher cannot choose it, so a head pushed or fast-forwarded after the label
+#     (including a commit pre-built elsewhere and backdated) is refused.
+# The binding reads only PR-scoped data (issue events + the PR head branch's
+# activity), never check runs: a merge_group check run carries no PR association,
+# and an override that needs one is ejected from the queue even when the PR is
+# labeled and green. The PR number comes from the queue ref (see below), so the
+# override serves pull_request and merge_group alike. Branch names are never an
+# input: a card-bound branch cannot self-override. Read-only; no label is created
+# here (see docs/branch-protection.md for creating it).
 #
 # Waiver (either one) for PRs with no Paperclip card (doctrine sync, rescue,
 # router-only):
@@ -104,7 +132,8 @@
 #
 # Exit codes:
 #   0  approved, OR advisory (pull_request), OR push no-op, OR valid waiver
-#      (on a fold-sync head, "valid" additionally means countersigned)
+#      (on a fold-sync head, "valid" additionally means countersigned), OR an
+#      honored override label
 #   1  enforcement failure on merge_group: status missing/pending/failed,
 #      unresolvable PR identity, unresolvable repository, or API failure —
 #      fail-closed: an error must never read as approved
@@ -586,6 +615,85 @@ require_countersignature() {
   return 0
 }
 
+# --- per-PR override (SUP-20897) ----------------------------------------------
+OVERRIDE_LABEL="override:paperclip-approval"
+OVERRIDE_REFUSAL=""
+OVERRIDE_ACTOR=""
+OVERRIDE_TS=""
+
+# override_refuse <reason>: record why the override is not honored; always 1.
+override_refuse() {
+  OVERRIDE_REFUSAL="$*"
+  return 1
+}
+
+# evaluate_override
+#   0 -> honored (OVERRIDE_ACTOR / OVERRIDE_TS name the audit trail)
+#   1 -> label present but not honored (OVERRIDE_REFUSAL says why)
+#   2 -> label absent, nothing attempted
+evaluate_override() {
+  local events last event ts actor actor_type role head_repo enc newest
+  local push_type push_after push_ts
+
+  printf '%s' "$PR_LABELS" | jq -e --arg l "$OVERRIDE_LABEL" 'index($l)' >/dev/null 2>&1 || return 2
+
+  # A fork head lives in another repository, so its branch activity is not
+  # readable here: fail closed rather than bind to a name this repo does not own.
+  head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$PR_JSON")"
+  [ -n "$head_repo" ] && [ "${head_repo,,}" = "${REPO,,}" ] \
+    || { override_refuse "PR head repository '${head_repo:-<deleted>}' is not ${REPO}; a fork head cannot be bound to the label"; return 1; }
+
+  # Ascending, so the LAST labeled/unlabeled event is the current state. '-'
+  # stands in for a missing field: IFS-tab `read` collapses empty fields.
+  events="$(gh_api_retry --paginate \
+    "repos/${REPO}/issues/${PR_NUMBER}/events?per_page=100" \
+    --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "'"${OVERRIDE_LABEL}"'") | [.event, (.created_at // "-"), (.actor.login // "-"), (.actor.type // "-")] | @tsv')" \
+    || { override_refuse "API failure: GET repos/${REPO}/issues/${PR_NUMBER}/events — ${events}"; return 1; }
+  last="$(tail -n 1 <<<"$events")"
+  [ -n "$last" ] || { override_refuse "no labeled event for ${OVERRIDE_LABEL} in the issue history of PR #${PR_NUMBER}"; return 1; }
+  IFS=$'\t' read -r event ts actor actor_type <<<"$last"
+  [ "$event" = "labeled" ] \
+    || { override_refuse "the most recent ${OVERRIDE_LABEL} event is '${event}', not 'labeled'"; return 1; }
+  OVERRIDE_ACTOR="$actor"
+  OVERRIDE_TS="$ts"
+  jq -ne --arg t "$ts" '$t | fromdateiso8601 | . > 0' >/dev/null 2>&1 \
+    || { override_refuse "the ${OVERRIDE_LABEL} event has no valid created_at (${ts}); the override cannot be audited"; return 1; }
+
+  # Authority: a person (not an App or bot — the machine-identity rejection
+  # human_countersigner applies via user.type) with write access. Deliberately
+  # NOT "not the PR author": every fleet PR is opened as the shared operator
+  # identity, which is also the person holding the lever. The head binding below
+  # is what stops a label from covering work pushed after it.
+  [ "$actor_type" = "User" ] \
+    || { override_refuse "labeler '${actor}' is type '${actor_type}', not User; a bot or App cannot apply the override"; return 1; }
+  [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] \
+    || { override_refuse "labeler login '${actor}' is not a valid GitHub user login"; return 1; }
+  role="$(gh_api_retry "repos/${REPO}/collaborators/${actor}/permission" --jq '.role_name // .permission // ""')" \
+    || { override_refuse "API failure: GET repos/${REPO}/collaborators/${actor}/permission — ${role}"; return 1; }
+  case "$role" in
+    admin|maintain|write) ;;
+    *) override_refuse "labeler '${actor}' has role '${role:-none}' on ${REPO}; the override needs admin, maintain or write"; return 1 ;;
+  esac
+
+  # Head binding. Newest activity on the PR's head branch must be a push of
+  # exactly HEAD_SHA, recorded before the label. Newest-first, one row.
+  enc="$(jq -rn --arg r "refs/heads/${PR_HEAD_REF}" '$r | @uri')"
+  newest="$(gh_api_retry "repos/${REPO}/activity?ref=${enc}&per_page=1" \
+    --jq '(.[0] // empty) | [.activity_type, (.after // "-"), (.timestamp // "-")] | @tsv')" \
+    || { override_refuse "API failure: GET repos/${REPO}/activity?ref=refs/heads/${PR_HEAD_REF} — ${newest}"; return 1; }
+  [ -n "$newest" ] || { override_refuse "no push activity recorded for refs/heads/${PR_HEAD_REF}; the push time of head ${HEAD_SHA} is unverifiable"; return 1; }
+  IFS=$'\t' read -r push_type push_after push_ts <<<"$newest"
+  case "$push_type" in
+    push|force_push|branch_creation) ;;
+    *) override_refuse "the newest activity on refs/heads/${PR_HEAD_REF} is '${push_type}', not a push"; return 1 ;;
+  esac
+  [ "$push_after" = "$HEAD_SHA" ] \
+    || { override_refuse "the newest push to refs/heads/${PR_HEAD_REF} left ${push_after}, not the PR head ${HEAD_SHA}; the head moved or was reset"; return 1; }
+  jq -ne --arg p "$push_ts" --arg l "$ts" '($p | fromdateiso8601) < ($l | fromdateiso8601)' >/dev/null 2>&1 \
+    || { override_refuse "override voided: head ${HEAD_SHA} was pushed at ${push_ts}, not strictly before the ${OVERRIDE_LABEL} event at ${ts}"; return 1; }
+  return 0
+}
+
 # Waiver 1: body line "Paperclip-Approved-Waiver: <reason>" with a non-empty
 # reason (a cardless PR never gets a paperclip/approved status, so the
 # waiver is checked before the status lookup).
@@ -661,10 +769,29 @@ if [ "$APPROVAL_STATE" = "$STATE" ]; then
   exit 0
 fi
 
+# --- per-PR override: consulted only when the head carries no valid stamp -------
+OVERRIDE_RC=0
+evaluate_override || OVERRIDE_RC=$?
+if [ "$OVERRIDE_RC" = "0" ]; then
+  note "OVERRIDE HONORED: ${OVERRIDE_LABEL} applied by @${OVERRIDE_ACTOR} at ${OVERRIDE_TS}; PR #${PR_NUMBER} head ${HEAD_SHA} was last pushed before the label (stamp ${APPROVAL_STATE}, no ${CONTEXT} required)"
+  warn_annotation "${CONTEXT} OVERRIDDEN on PR #${PR_NUMBER} head ${HEAD_SHA}: ${OVERRIDE_LABEL} applied by @${OVERRIDE_ACTOR} at ${OVERRIDE_TS}. The head has no control-plane approval; a person approved this PR."
+  job_summary "$(printf '%s\n' \
+    "### ${BT}${CONTEXT}${BT} OVERRIDDEN" \
+    "" \
+    "- **PR:** #${PR_NUMBER}" \
+    "- **Head SHA:** ${BT}${HEAD_SHA}${BT}" \
+    "- **Label:** ${BT}${OVERRIDE_LABEL}${BT} applied by @${OVERRIDE_ACTOR} at ${OVERRIDE_TS}" \
+    "" \
+    "A person with write access approved this head by label. A push after the label voids it.")"
+  exit 0
+elif [ "$OVERRIDE_RC" = "1" ]; then
+  note "override NOT honored: ${OVERRIDE_REFUSAL}"
+fi
+
 if [ "$MODE" = "advisory" ]; then
   note "ADVISORY: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE}; pull_request is non-blocking — the merge queue enforces at the merge boundary"
   advisory_summary_absent
-  warn_annotation "${CONTEXT} is ${APPROVAL_STATE:-missing} on head ${HEAD_SHA} (PR #${PR_NUMBER}): this PR will be evicted from the merge queue until the control plane publishes ${CONTEXT} = ${STATE}. This check is advisory and reports success."
+  warn_annotation "${CONTEXT} is ${APPROVAL_STATE:-missing} on head ${HEAD_SHA} (PR #${PR_NUMBER}): this PR will be evicted from the merge queue until the control plane publishes ${CONTEXT} = ${STATE}${OVERRIDE_REFUSAL:+ (override not honored: ${OVERRIDE_REFUSAL})}. This check is advisory and reports success."
   exit 0
 fi
 
@@ -672,4 +799,5 @@ err "FAIL: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE} — PR #${PR_NUMBE
 err "  an approval is produced by the control plane when the card's review stage records 'approved'"
 err "  (a hand PATCH of the card status skips publishApprovalStatus — no status is ever published)"
 err "  or waive a cardless PR: body line 'Paperclip-Approved-Waiver: <reason>' or the 'no-paperclip-card' label"
+err "  or have a person with write access apply the '${OVERRIDE_LABEL}' label AFTER the last push${OVERRIDE_REFUSAL:+ — override not honored: ${OVERRIDE_REFUSAL}}"
 exit 1
