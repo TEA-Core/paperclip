@@ -8,7 +8,7 @@ import { conflict, notFound } from "../errors.js";
 import { logActivityInTransaction } from "./activity-log.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { peekWarmAppInstallationToken } from "./github-credential.js";
-import { parseRepoUrl, resolveIssueRepoContext } from "./merge-arming.js";
+import { resolveDeliveryIdentity } from "./merge-arming.js";
 
 /**
  * Release-assurance control plane, SHADOW mode (SUP-20771, design report §3.1–3.3).
@@ -34,37 +34,37 @@ export type ReleaseAssuranceActor = {
 };
 
 export type LivePullRequest =
-  | { ok: true; open: boolean; headSha: string | null }
+  | { ok: true; open: boolean; draft: boolean; headSha: string | null }
   | { ok: false; message: string };
+
+export type RecordedDelivery = { owner: string; repo: string; number: number; branch: string };
 
 export type ReleaseAssuranceDeps = {
   /**
-   * The one PR the card actually delivers: its recorded delivery PR number in the
-   * card's project repository. A PR that is only mentioned in a comment or title
-   * is not a delivery and never binds.
+   * The card's authoritative recorded delivery: repository, branch and PR number from
+   * the recorded delivery identity, cross-checked by the existing delivery-identity
+   * resolver against the project repository and the control-plane delivery branch.
+   * A PR that is only mentioned in a comment or title is not a delivery and never binds.
+   * It takes the executor so the append transaction can re-read it under the issue lock.
    */
-  recordedDelivery(companyId: string, issueId: string): Promise<{ owner: string; repo: string; number: number } | null>;
+  recordedDelivery(executor: Db, companyId: string, issueId: string): Promise<RecordedDelivery | null>;
   readLivePullRequest(companyId: string, target: { owner: string; repo: string; number: number }): Promise<LivePullRequest>;
 };
 
+const sameDelivery = (a: { owner: string; repo: string; number: number }, b: { owner: string; repo: string; number: number }) =>
+  a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase() && a.number === b.number;
+
 export function releaseAssuranceDeps(db: Db): ReleaseAssuranceDeps {
   return {
-    recordedDelivery: async (companyId, issueId) => {
-      const [issue] = await db
-        .select({
-          projectId: issues.projectId,
-          projectWorkspaceId: issues.projectWorkspaceId,
-          executionWorkspaceId: issues.executionWorkspaceId,
-          executionState: issues.executionState,
-        })
-        .from(issues)
-        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
-      const number = (issue?.executionState as { delivery?: { prNumber?: unknown } } | null)?.delivery?.prNumber;
-      if (!issue || typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0) return null;
-      const context = await resolveIssueRepoContext(db, { companyId, ...issue });
-      const repo = context?.repoUrl ? parseRepoUrl(context.repoUrl) : null;
-      if (!repo || repo.hostname.toLowerCase() !== "github.com") return null;
-      return { owner: repo.owner, repo: repo.repo, number };
+    recordedDelivery: async (executor, companyId, issueId) => {
+      const identity = await resolveDeliveryIdentity(executor, companyId, issueId);
+      const { binding, repo } = identity;
+      if (identity.recordedUnusable || !binding || !repo) return null;
+      // The recorded PR url must be a github.com url naming the same repository and number; a mismatch
+      // (or a non-GitHub host) is an unusable record.
+      const url = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/i.exec(binding.prUrl);
+      if (!url || url[1]!.toLowerCase() !== repo.owner.toLowerCase() || url[2]!.toLowerCase() !== repo.repo.toLowerCase() || Number(url[3]) !== binding.prNumber) return null;
+      return { owner: repo.owner, repo: repo.repo, number: binding.prNumber, branch: binding.branch };
     },
     // Shadow mode makes zero external writes, so this reads with an already-warm
     // cached App token only. The usual credential resolver can mint an installation
@@ -93,6 +93,7 @@ export function releaseAssuranceDeps(db: Db): ReleaseAssuranceDeps {
       return {
         ok: true,
         open: body.state === "open" && body.merged !== true,
+        draft: body.draft === true,
         headSha: typeof head?.sha === "string" ? head.sha.toLowerCase() : null,
       };
     },
@@ -189,7 +190,8 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
     actor: ReleaseAssuranceActor;
     payload: Record<string, unknown>;
     row: Omit<typeof releaseAssuranceEvents.$inferInsert, "companyId" | "issueId" | "eventId" | "payloadDigest" | "recordedByActorType" | "recordedByActorId">;
-    guard: (events: ReleaseAssuranceEventRow[]) => void;
+    /** Runs under the issue row lock, immediately before the insert, with the same transaction. */
+    guard: (events: ReleaseAssuranceEventRow[], tx: Db) => void | Promise<void>;
   }) {
     const digest = payloadDigest({ ...input.payload, issueId: input.issueId });
     try {
@@ -211,7 +213,7 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
           }
           return { event: prior, events, replayed: true };
         }
-        input.guard(events);
+        await input.guard(events, tx as unknown as Db);
         const [event] = await tx.insert(releaseAssuranceEvents).values({
           ...input.row,
           companyId: input.companyId,
@@ -253,17 +255,23 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
     async enroll(input: { companyId: string; issueId: string; actor: ReleaseAssuranceActor; body: EnrollReleaseAssurance }) {
       const owner = input.body.owner.toLowerCase();
       const repo = input.body.repo.toLowerCase();
-      // An identical replay answers from the ledger even after the delivery record or
-      // the seat changed; the prerequisites below only gate a brand-new enrollment.
+      // An identical replay answers from the ledger even after the delivery record, the PR state
+      // or the seat changed; the prerequisites below only gate a brand-new enrollment.
       const [replay] = await db
         .select({ id: releaseAssuranceEvents.id })
         .from(releaseAssuranceEvents)
         .where(and(eq(releaseAssuranceEvents.companyId, input.companyId), eq(releaseAssuranceEvents.eventId, input.body.eventId)));
+      const requested = { owner, repo, number: input.body.pullRequestNumber };
+      let delivery: RecordedDelivery | null = null;
       if (!replay) {
-        const delivery = await deps.recordedDelivery(input.companyId, input.issueId);
-        if (!delivery || delivery.owner.toLowerCase() !== owner || delivery.repo.toLowerCase() !== repo || delivery.number !== input.body.pullRequestNumber) {
-          throw conflict("The pull request is not this card's recorded delivery");
-        }
+        delivery = await deps.recordedDelivery(db, input.companyId, input.issueId);
+        if (!delivery || !sameDelivery(delivery, requested)) throw conflict("The pull request is not this card's recorded delivery");
+        // Enrollment needs a PR that can still be released: open, not merged, not a draft. The read uses
+        // the warm-cache reader only, so a cold cache fails closed instead of reaching out.
+        const live = await deps.readLivePullRequest(input.companyId, delivery);
+        if (!live.ok) throw conflict(`Live PR state is unavailable: ${live.message}`);
+        if (!live.open) throw conflict("The pull request is closed or merged");
+        if (live.draft) throw conflict("The pull request is a draft");
         const [seat] = await db
           .select({ id: agents.id })
           .from(agents)
@@ -280,8 +288,14 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
           kind: "hold", owner, repo, pullRequestNumber: input.body.pullRequestNumber, headSha: null,
           policyRevision: RELEASE_ASSURANCE_POLICY_REVISION, raAgentId: input.body.raAgentId, reason: input.body.reason,
         },
-        guard: (events) => {
+        guard: async (events, tx) => {
           if (events.some((event) => event.kind === "hold")) throw conflict("This card is already enrolled in release assurance");
+          // Re-validate the binding under the issue lock so a delivery that changed since the
+          // check above cannot be enrolled for the PR that was checked.
+          const current = await deps.recordedDelivery(tx, input.companyId, input.issueId);
+          if (!current || !sameDelivery(current, requested) || (delivery && current.branch !== delivery.branch)) {
+            throw conflict("The card's recorded delivery changed during enrollment");
+          }
         },
       });
     },
@@ -302,6 +316,7 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
         const live = await deps.readLivePullRequest(input.companyId, { owner: hold.owner, repo: hold.repo, number: hold.pullRequestNumber });
         if (!live.ok) throw conflict(`Live PR head is unavailable: ${live.message}`);
         if (!live.open) throw conflict("The pull request is not open");
+        if (live.draft && body.decision === "go") throw conflict("The pull request is a draft; a GO needs a ready PR");
         if (live.headSha !== body.headSha) throw conflict("PR head moved; a decision must name the current head", { liveHeadSha: live.headSha });
       }
       const result = await append({
@@ -315,9 +330,18 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
           policyRevision: hold.policyRevision, raAgentId: hold.raAgentId, reason: body.reason,
           ...(body.decision === "go" ? { evidenceDigest: body.evidenceDigest, ciRunIds: payload.ciRunIds as number[] } : {}),
         },
-        guard: (events) => {
+        guard: async (events, tx) => {
+          if (events.find((event) => event.kind === "hold")?.id !== hold.id) throw conflict("The enrollment changed during the decision");
           if (evaluateReleaseAssuranceHead(events, body.headSha) === "no_go") {
             throw conflict("This head has a recorded NO-GO; fix it on a new head");
+          }
+          // A GO is granted only while the card's recorded delivery is still the enrolled PR, checked
+          // under the issue lock. A NO-GO is a veto on the enrolled PR and stays recordable.
+          if (body.decision === "go") {
+            const current = await deps.recordedDelivery(tx, input.companyId, input.issueId);
+            if (!current || !sameDelivery(current, { owner: hold.owner, repo: hold.repo, number: hold.pullRequestNumber })) {
+              throw conflict("The card's recorded delivery no longer matches the enrolled pull request");
+            }
           }
         },
       });

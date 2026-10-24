@@ -7709,10 +7709,12 @@ registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/release-assurance/enroll",
   tags: ["issues"],
-  summary: "Enroll a card and its exact linked PR in release assurance (records a HOLD)",
+  summary: "Enroll a card and its exact recorded-delivery PR in release assurance (records a HOLD)",
   description:
-    "Board-only (company owner/admin). The PR must be linked to the card and raAgentId must be an agent " +
-    "of the company. Idempotent by eventId: an identical replay returns 200, a different payload under " +
+    "Board-only (company owner/admin). The PR must be the card's authoritative recorded delivery " +
+    "(repository, branch and PR number from the recorded delivery identity, checked again under the issue " +
+    "lock), and it must be open, not merged and not a draft. A PR that is only mentioned on the card never " +
+    "binds. raAgentId must be an agent of the company. Idempotent by eventId: an identical replay returns 200, a different payload under " +
     "the same eventId or a second enrollment of the card or PR is 409. Shadow mode: this installs no " +
     "execution policy and admits no PR.",
   request: {
@@ -7730,7 +7732,8 @@ registry.registerPath({
   description:
     "Board-only (company owner/admin). The card must be enrolled and headSha must equal the live PR head, " +
     "otherwise 409. A GO also needs an evidence digest and CI run ids; a head with a recorded NO-GO " +
-    "rejects any GO. Idempotent by eventId. The response carries the planned status with publication kind " +
+    "rejects any GO. A GO is refused on a draft PR or when the card's recorded delivery no longer matches " +
+    "the enrolled PR. Idempotent by eventId. The response carries the planned status with publication kind " +
     "shadow: no GitHub status is written and no PR is admitted.",
   request: {
     params: z.object({ id: z.string() }),

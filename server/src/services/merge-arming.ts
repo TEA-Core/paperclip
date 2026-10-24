@@ -1603,7 +1603,7 @@ interface DeliveryBinding {
   sourceIssueId?: string;
 }
 
-async function resolveDeliveryIdentity(
+export async function resolveDeliveryIdentity(
   db: Db,
   companyId: string,
   issueId: string,

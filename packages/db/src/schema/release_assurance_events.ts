@@ -44,9 +44,12 @@ export type ReleaseAssurancePublicationMode = (typeof RELEASE_ASSURANCE_PUBLICAT
  * Append-only is enforced by the database, not only by the service: the migration
  * revokes UPDATE, DELETE and TRUNCATE from the serving role and installs a trigger
  * that rejects UPDATE and DELETE for every role. TRUNCATE has no trigger, so the
- * owner's `TRUNCATE ... CASCADE` fixture cleanup keeps working. The one governed repair
- * path is a table owner or superuser disabling the trigger for the repair and
- * re-enabling it, which leaves a trail in the database log; ordinary SQL cannot do it.
+ * owner's `TRUNCATE ... CASCADE` fixture cleanup keeps working. The guarantee holds
+ * against the serving role and ordinary SQL, not against a table owner or superuser:
+ * those can still remove or rewrite rows by disabling or dropping the trigger, by
+ * setting `session_replication_role = replica`, or by `TRUNCATE` (including
+ * `CASCADE`). That is privileged administration, so production must run the
+ * application as the restricted serving role and keep the owner out of the app.
  * `(companyId, eventId)` is the idempotency key — a replay of the same
  * canonical payload is a no-op and a conflicting reuse fails — and `sequence`
  * is the server-side ordering, never the caller's clock.
