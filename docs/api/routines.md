@@ -54,6 +54,7 @@ Fields:
 | `status` | no | `active` (default), `paused`, `archived` |
 | `concurrencyPolicy` | no | Behaviour when a run fires while a previous one is still active |
 | `catchUpPolicy` | no | Behaviour for missed scheduled runs |
+| `executionWorkspacePreference` | no | Workspace each run issue uses: `inherit`, `shared_workspace`, `isolated_workspace`, `operator_branch`, or `agent_default`. Unset keeps the project default. `reuse_existing` is rejected. Refused with `422 WORKSPACE_ISSUE_OVERRIDE_DISALLOWED` when the project policy has `allowIssueOverride: false`. A run-supplied workspace selection takes precedence |
 
 **Concurrency policies:**
 

@@ -56,6 +56,7 @@ POST /api/companies/{companyId}/routines
 | `status` | no | `active` (default) `paused` `archived` |
 | `concurrencyPolicy` | no | See below |
 | `catchUpPolicy` | no | See below |
+| `executionWorkspacePreference` | no | Workspace for run issues: `inherit`, `shared_workspace`, `isolated_workspace`, `operator_branch`, `agent_default` (not `reuse_existing`). Unset = project default. Use `shared_workspace` for high-frequency routines to avoid a worktree per run. Refused with 422 when the project policy sets `allowIssueOverride: false` |
 | `activityGatePolicy` | no | `always` (default) or `require_external_activity`; see below |
 | `activityGateScope` | no | `company` (default) or `project`; see below |
 
