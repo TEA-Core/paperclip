@@ -1252,27 +1252,22 @@ describeEmbeddedPostgres("summary slot service", () => {
       await issueService(db).update(generationIssueId, { status: "done" });
       const settled = await svc.getSlot(projectSelector(companyId, projectId));
       expect(settled.slot).toMatchObject({ status: "idle", generatingIssueId: null });
-
-      await db
-        .update(summarySlots)
-        .set({ status: "generating", generatingIssueId: generationIssueId })
-        .where(
-          and(
-            eq(summarySlots.companyId, companyId),
-            eq(summarySlots.scopeKind, "project"),
-            eq(summarySlots.slotKey, "header"),
-            eq(summarySlots.scopeId, projectId),
-          ),
-        );
+      await issueService(db).update(generationIssueId, { status: "in_progress" });
+      const reopened = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(reopened.slot).toMatchObject({
+        status: "idle",
+        generatingIssueId: null,
+      });
       await db
         .update(issues)
         .set({ checkoutRunId: resubmitRunId })
         .where(eq(issues.id, generationIssueId));
+
       await expect(
         svc.write(
           {
             ...projectSelector(companyId, projectId),
-            markdown: "# Too late",
+            markdown: "# Summary v3 after reopen",
             baseRevisionId: second.revision.id,
             generationIssueId,
           },
@@ -1280,7 +1275,7 @@ describeEmbeddedPostgres("summary slot service", () => {
         ),
       ).rejects.toMatchObject({
         status: 403,
-        message: "Summary write is not available from a terminal generation task",
+        message: "Summary write is unavailable; ask a board operator to re-generate the summary",
       });
     });
 
