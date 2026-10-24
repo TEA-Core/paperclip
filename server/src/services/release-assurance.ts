@@ -6,8 +6,9 @@ import { and, asc, eq } from "drizzle-orm";
 import { isUniqueViolation } from "../db-errors.js";
 import { conflict, notFound } from "../errors.js";
 import { logActivityInTransaction } from "./activity-log.js";
-import { readApprovalPullRequest } from "./approval-status-reconciler.js";
-import { resolveLinkedPullRequestsWithState } from "./merge-arming.js";
+import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { peekWarmAppInstallationToken } from "./github-credential.js";
+import { parseRepoUrl, resolveIssueRepoContext } from "./merge-arming.js";
 
 /**
  * Release-assurance control plane, SHADOW mode (SUP-20771, design report §3.1–3.3).
@@ -37,19 +38,57 @@ export type LivePullRequest =
   | { ok: false; message: string };
 
 export type ReleaseAssuranceDeps = {
-  /** PRs this card is linked to; the enrollment binds only one of these. */
-  linkedPullRequests(companyId: string, issueId: string): Promise<Array<{ owner: string; repo: string; number: number }>>;
+  /**
+   * The one PR the card actually delivers: its recorded delivery PR number in the
+   * card's project repository. A PR that is only mentioned in a comment or title
+   * is not a delivery and never binds.
+   */
+  recordedDelivery(companyId: string, issueId: string): Promise<{ owner: string; repo: string; number: number } | null>;
   readLivePullRequest(companyId: string, target: { owner: string; repo: string; number: number }): Promise<LivePullRequest>;
 };
 
 export function releaseAssuranceDeps(db: Db): ReleaseAssuranceDeps {
   return {
-    linkedPullRequests: (companyId, issueId) =>
-      resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true }),
+    recordedDelivery: async (companyId, issueId) => {
+      const [issue] = await db
+        .select({
+          projectId: issues.projectId,
+          projectWorkspaceId: issues.projectWorkspaceId,
+          executionWorkspaceId: issues.executionWorkspaceId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+      const number = (issue?.executionState as { delivery?: { prNumber?: unknown } } | null)?.delivery?.prNumber;
+      if (!issue || typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0) return null;
+      const context = await resolveIssueRepoContext(db, { companyId, ...issue });
+      const repo = context?.repoUrl ? parseRepoUrl(context.repoUrl) : null;
+      if (!repo || repo.hostname.toLowerCase() !== "github.com") return null;
+      return { owner: repo.owner, repo: repo.repo, number };
+    },
+    // Shadow mode makes zero external writes, so this reads with an already-warm
+    // cached App token only. The usual credential resolver can mint an installation
+    // token (a POST) and stamps company_secrets on every secret read; neither is
+    // allowed here. A cold cache refuses the decision and the HOLD stays recorded.
     readLivePullRequest: async (companyId, target) => {
-      const live = await readApprovalPullRequest(db, companyId, target);
-      const body = live.ok && live.body && typeof live.body === "object" ? (live.body as Record<string, unknown>) : null;
-      if (!live.ok || !body) return { ok: false, message: `GitHub PR read failed: HTTP ${live.status}` };
+      const credential = peekWarmAppInstallationToken(companyId, target.owner, target.repo);
+      if (!credential) return { ok: false, message: "no warm GitHub App credential is cached; shadow mode never mints one" };
+      const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${target.number}`;
+      let response: Response;
+      try {
+        response = await ghFetch(url, {
+          headers: {
+            accept: "application/vnd.github+json",
+            authorization: `Bearer ${credential.token}`,
+            "user-agent": "paperclip-release-assurance-shadow",
+            "x-github-api-version": "2022-11-28",
+          },
+        });
+      } catch {
+        return { ok: false, message: "GitHub PR read failed: network error" };
+      }
+      const body = response.ok ? ((await response.json().catch(() => null)) as Record<string, unknown> | null) : null;
+      if (!response.ok || !body) return { ok: false, message: `GitHub PR read failed: HTTP ${response.status}` };
       const head = body.head as { sha?: unknown } | undefined;
       return {
         ok: true,
@@ -214,15 +253,23 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
     async enroll(input: { companyId: string; issueId: string; actor: ReleaseAssuranceActor; body: EnrollReleaseAssurance }) {
       const owner = input.body.owner.toLowerCase();
       const repo = input.body.repo.toLowerCase();
-      const linked = await deps.linkedPullRequests(input.companyId, input.issueId);
-      if (!linked.some((pr) => pr.owner.toLowerCase() === owner && pr.repo.toLowerCase() === repo && pr.number === input.body.pullRequestNumber)) {
-        throw conflict("The pull request is not linked to this card");
+      // An identical replay answers from the ledger even after the delivery record or
+      // the seat changed; the prerequisites below only gate a brand-new enrollment.
+      const [replay] = await db
+        .select({ id: releaseAssuranceEvents.id })
+        .from(releaseAssuranceEvents)
+        .where(and(eq(releaseAssuranceEvents.companyId, input.companyId), eq(releaseAssuranceEvents.eventId, input.body.eventId)));
+      if (!replay) {
+        const delivery = await deps.recordedDelivery(input.companyId, input.issueId);
+        if (!delivery || delivery.owner.toLowerCase() !== owner || delivery.repo.toLowerCase() !== repo || delivery.number !== input.body.pullRequestNumber) {
+          throw conflict("The pull request is not this card's recorded delivery");
+        }
+        const [seat] = await db
+          .select({ id: agents.id })
+          .from(agents)
+          .where(and(eq(agents.id, input.body.raAgentId), eq(agents.companyId, input.companyId)));
+        if (!seat) throw conflict("raAgentId is not an agent of this company");
       }
-      const [seat] = await db
-        .select({ id: agents.id })
-        .from(agents)
-        .where(and(eq(agents.id, input.body.raAgentId), eq(agents.companyId, input.companyId)));
-      if (!seat) throw conflict("raAgentId is not an agent of this company");
       return append({
         companyId: input.companyId,
         issueId: input.issueId,

@@ -39,13 +39,20 @@ export function isUniqueViolation(error: unknown, constraintName?: string): bool
  * A delete that leaves an orphan reference raises this code. Drizzle wraps the
  * driver failure in its own `Failed query: ...` error, so the Postgres error
  * that carries the code is reachable only through `cause`. This helper walks
- * the `cause` chain, the same way `isUniqueViolation` does.
+ * the `cause` chain, the same way `isUniqueViolation` does. With a
+ * `constraintNamePrefix` it matches only constraints whose name starts with it
+ * (the driver's `constraint` / `constraint_name`, or the name quoted in the message).
  */
-export function isForeignKeyViolation(error: unknown): boolean {
+export function isForeignKeyViolation(error: unknown, constraintNamePrefix?: string): boolean {
   let current: unknown = error;
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
-    const candidate = current as { code?: unknown; cause?: unknown };
-    if (candidate.code === FOREIGN_KEY_VIOLATION) return true;
+    const candidate = current as { code?: unknown; constraint?: unknown; constraint_name?: unknown; message?: unknown; cause?: unknown };
+    if (candidate.code === FOREIGN_KEY_VIOLATION) {
+      if (!constraintNamePrefix) return true;
+      const constraint = candidate.constraint ?? candidate.constraint_name;
+      if (typeof constraint === "string" && constraint.startsWith(constraintNamePrefix)) return true;
+      if (typeof candidate.message === "string" && candidate.message.includes(`"${constraintNamePrefix}`)) return true;
+    }
     current = candidate.cause;
   }
   return false;

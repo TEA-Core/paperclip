@@ -37448,14 +37448,16 @@
           "onDelete": "no action",
           "onUpdate": "no action"
         },
-        "release_assurance_events_issue_id_issues_id_fk": {
-          "name": "release_assurance_events_issue_id_issues_id_fk",
+        "release_assurance_events_company_issue_fk": {
+          "name": "release_assurance_events_company_issue_fk",
           "tableFrom": "release_assurance_events",
           "tableTo": "issues",
           "columnsFrom": [
+            "company_id",
             "issue_id"
           ],
           "columnsTo": [
+            "company_id",
             "id"
           ],
           "onDelete": "no action",
