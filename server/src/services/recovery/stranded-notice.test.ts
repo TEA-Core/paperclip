@@ -88,6 +88,16 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
     expect(notice.body).not.toContain("retried continuation");
     expect(JSON.stringify(notice.metadata)).toContain("repository access and server load");
   });
+  it("names a disk headroom refusal and its repair", () => {
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
+      recoveryActionId: "disk-recovery",
+      recoveryOwner: null,
+      sourceRun: { id: "failed-run", status: "failed", errorCode: "workspace_disk_headroom_exceeded" },
+    });
+    expect(notice.presentation.title).toBe("Workspace disk is nearly full");
+    expect(JSON.stringify(notice.metadata)).toContain("PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT");
+  });
   const actionId = "6a2f8e64-6f5e-4b58-b7fd-111111111111";
   const owner = { id: "9b1c2d3e-4f50-4a61-8b72-222222222222", name: "CTO" };
   const sourceRun = {

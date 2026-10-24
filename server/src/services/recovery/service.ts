@@ -700,6 +700,7 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "workspace_git_scan_cancelled",
   "workspace_git_scan_output_limit",
   "workspace_git_scan_failed",
+  "workspace_disk_headroom_exceeded",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",

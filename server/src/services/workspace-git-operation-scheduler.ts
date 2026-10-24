@@ -11,6 +11,7 @@ export const WORKSPACE_GIT_SCAN_ERROR_CODES = {
   cancelled: "workspace_git_scan_cancelled",
   outputLimit: "workspace_git_scan_output_limit",
   failed: "workspace_git_scan_failed",
+  diskHeadroom: "workspace_disk_headroom_exceeded",
 } as const;
 
 export type WorkspaceGitScanErrorCode =
@@ -20,6 +21,9 @@ const WORKSPACE_GIT_SCAN_ERROR_CODE_SET: ReadonlySet<string> = new Set<string>(
   Object.values(WORKSPACE_GIT_SCAN_ERROR_CODES),
 );
 
+// SUP-20840: `diskHeadroom` is the worktree provisioning refusal at >=80% disk used. It is
+// transient (space gets freed), so it rides this family's bounded retry instead of the
+// block-on-first-failure workspace_validation_failed code.
 // Fold 2d (upstream #13442/#13636): heartbeat setup owns the shared durable retry
 // budget for every workspace_git_scan_* failure -- executeRun routes the transient
 // codes to scheduleBoundedRetryForRun (BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
