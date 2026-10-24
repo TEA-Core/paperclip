@@ -46,7 +46,7 @@ const GH_SHIM = [
 
 const WAIVER_BODY = "Paperclip-Approved-Waiver: sync with no card";
 
-function run({ ref, author, body = "", title = "", labels = [], statuses = [], retired = true }) {
+function run({ ref, author, body = "", title = "", labels = [], statuses = [], retired = true, retiredValue }) {
   const dir = mkdtempSync(path.join(tmpdir(), "pc-card-waiver-"));
   try {
     writeFileSync(
@@ -74,7 +74,7 @@ function run({ ref, author, body = "", title = "", labels = [], statuses = [], r
         GH_REPO: REPO,
         PAPERCLIP_APPROVED_STATUS_CREATOR_ID: String(TEA_CORE.id),
         PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN: TEA_CORE.login,
-        PAPERCLIP_CARD_WAIVER_RETIRED: retired ? "1" : "",
+        PAPERCLIP_CARD_WAIVER_RETIRED: retiredValue ?? (retired ? "1" : ""),
         GITHUB_REF: QUEUE_REF,
         GITHUB_REF_NAME: QUEUE_REF.replace("refs/heads/", ""),
       },
@@ -162,6 +162,31 @@ test("a cardless PR authored by the fleet App cannot waive itself", () => {
     assert.equal(code, 1);
     assert.match(out, /may waive a cardless PR/);
   }
+});
+
+test("with the switch off a genuine board release is not announced, and the denial has no board hint", () => {
+  const passed = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retired: false });
+  assert.equal(passed.code, 0);
+  assert.match(passed.out, /pass: paperclip\/approved = success/);
+  assert.doesNotMatch(passed.out, /board release/);
+  const denied = run({ ref: CARD_BRANCH, author: PERSON, retired: false });
+  assert.equal(denied.code, 1);
+  assert.match(denied.out, /FAIL: paperclip\/approved is missing/);
+  assert.doesNotMatch(denied.out, /merge-arming\/release/);
+});
+
+test("only the exact value 1 arms the switch (and its board-release output)", () => {
+  for (const value of ["", "0", "true", "TRUE", "false", " 1 ", "yes"]) {
+    const { out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retiredValue: value });
+    assert.doesNotMatch(out, /board release/, JSON.stringify(value));
+  }
+  assert.match(run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retiredValue: "1" }).out, /board release/);
+});
+
+test("with the switch on the denial points at the board release route", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON });
+  assert.equal(code, 1);
+  assert.match(out, /POST \/api\/issues\/:id\/merge-arming\/release/);
 });
 
 test("with the switch off (the shipped default) every waiver behaves as before", () => {
