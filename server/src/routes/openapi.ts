@@ -7698,9 +7698,10 @@ registry.registerPath({
     "Board-only (company owner/admin). The audited replacement for the Paperclip-Approved-Waiver body " +
     "line on a card-bound PR. Publishes paperclip/approved with the control-plane App token only (no fallback " +
     "credential) and the description 'released by <actor> for <sha>: <reason>' for exactly headSha, whatever " +
-    "the card's state. 409 when the card has no verified delivery PR binding (a merely cited PR is never a " +
-    "target), the PR is not open and non-draft or left the bound branch, or headSha is not the PR's live head " +
-    "(a different or stale head). Idempotent: a head whose newest paperclip/approved is a control-plane success " +
+    "the card's ladder state. 409 when the card has no verified delivery PR binding (a merely cited PR is never a " +
+    "target), the bound PR is not the card's certified approvalStatus.finalDelivery, the PR is not open and " +
+    "non-draft or left the bound branch, or headSha is not the PR's live head (a different, stale or moved " +
+    "head: refused before the write and before each retry). Idempotent: a head whose newest paperclip/approved is a control-plane success " +
     "returns 200 already_approved without a second write. Audited: issue.merge_release_requested before the " +
     "write, then issue.merge_release (fresh write) or issue.merge_release_outcome.",
   request: {
