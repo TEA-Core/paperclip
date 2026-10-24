@@ -759,6 +759,48 @@ const postgresSupport = await getEmbeddedPostgresTestSupport();
     expect(issue.assigneeAgentId).toBe(participantId);
   });
 
+  it("does not rewrite a resolved action while routing an unavailable participant to the board", async () => {
+    const { issueId, recovery, enqueueWakeup } = await seed("paused");
+    const [snapshot] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const transaction = db.transaction.bind(db);
+    let resolvedBeforeReroute = false;
+    const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) =>
+      transaction(async (tx) => {
+        if (!resolvedBeforeReroute) {
+          const [action] = await competingDb.select().from(issueRecoveryActions)
+            .where(eq(issueRecoveryActions.sourceIssueId, issueId)).limit(1);
+          if (action?.status === "active" && action.ownerAgentId === managerId) {
+            await competingDb.update(issueRecoveryActions).set({
+              status: "resolved",
+              nextAction: "Operator already resolved this action.",
+            }).where(eq(issueRecoveryActions.id, action.id));
+            resolvedBeforeReroute = true;
+          }
+        }
+        return callback(tx);
+      }, config),
+    );
+    try {
+      const result = await recovery.escalateStrandedAssignedIssue({
+        issue: snapshot, previousStatus: "in_review", latestRun: null,
+        recoveryCause: "execution_review_participant_recovery", recoveryOwnerAgentId: managerId,
+      });
+      expect(resolvedBeforeReroute).toBe(true);
+      expect(result).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+    const [action] = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toMatchObject({
+      status: "resolved", ownerType: "agent", ownerAgentId: managerId,
+      nextAction: "Operator already resolved this action.",
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: participantId });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("keeps a live reviewer assigned while the recovery manager works", async () => {
     const { issueId, recovery } = await seed("active");
     await recovery.reconcileStrandedAssignedIssues();

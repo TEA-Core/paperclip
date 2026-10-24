@@ -5421,6 +5421,7 @@ export function recoveryService(
         }).where(and(
           eq(issueRecoveryActions.id, recoveryAction.id),
           eq(issueRecoveryActions.companyId, current.companyId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).returning();
         if (!boardAction) return null;
         recoveryAction = {
