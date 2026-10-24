@@ -4555,6 +4555,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.resultJson).toMatchObject({ stopReason: "process_lost" });
   });
 
+  it("does not fast-fail an untracked native run as dispatch_unlaunched (SUP-16549)", async () => {
+    const recent = new Date(Date.now() - 60_000);
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      runtimeMode: "native",
+      startedAt: recent,
+      updatedAt: recent,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // The same shape as the legacy fast-fail above, inside the process-loss threshold: the
+    // legacy reaper has no dispatch_unlaunched termination authority over a native run.
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(result.runIds).not.toContain(runId);
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).not.toBe("dispatch_unlaunched");
+  });
+
   it("does not fast-fail a run holding an active environment lease", async () => {
     const recent = new Date(Date.now() - 60_000);
     const { companyId, runId, issueId } = await seedRunFixture({
