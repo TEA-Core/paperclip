@@ -2292,6 +2292,50 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect((await requestRows())[0]).toMatchObject({ details: { basis: "approved_ladder" } });
     });
 
+    describe("a card re-approved on a new head whose publish was dropped (published A, approved B)", () => {
+      async function seedPublishedAApprovedB() {
+        const seeded = await seedReleasable("ladder", { prePublishedHeadSha: OTHER_HEAD });
+        await db.execute(sql`update issues set execution_state = jsonb_set(execution_state, '{approvalStatus,approvedHeadSha}', to_jsonb(${HEAD_SHA}::text)) where id = ${seeded.issueId}`);
+        return seeded;
+      }
+      const release = (issueId: string, headSha: string) =>
+        request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha, reason: RELEASE_REASON });
+
+      it("releases the re-approved head B on the default route", async () => {
+        const { issueId } = await seedPublishedAApprovedB();
+        installReleaseTransport();
+
+        const res = await release(issueId, HEAD_SHA);
+
+        expect(res.status).toBe(200);
+        expect(res.body.outcome).toBe("released");
+        expect((await requestRows())[0]).toMatchObject({ details: { basis: "approved_ladder" } });
+      });
+
+      it("still releases the published head A", async () => {
+        const { issueId } = await seedPublishedAApprovedB();
+        installReleaseTransport({ liveHead: OTHER_HEAD });
+
+        const res = await release(issueId, OTHER_HEAD);
+
+        expect(res.status).toBe(200);
+        expect(res.body.outcome).toBe("released");
+        expect((await requestRows())[0]).toMatchObject({ details: { basis: "approved_ladder" } });
+      });
+
+      it("refuses a third head with no GitHub call", async () => {
+        const { issueId } = await seedPublishedAApprovedB();
+        installReleaseTransport();
+
+        const res = await release(issueId, "d".repeat(40));
+
+        expect(res.status).toBe(409);
+        expect(JSON.stringify(res.body)).toMatch(/no completed approving ladder or certified delivery/);
+        expect(mockGhFetch).not.toHaveBeenCalled();
+        expect(await requestRows()).toEqual([]);
+      });
+    });
+
     it("releases a certified delivery bound to that head", async () => {
       const { issueId } = await seedReleasable("certified");
       installReleaseTransport();
