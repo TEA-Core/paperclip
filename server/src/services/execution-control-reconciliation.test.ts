@@ -727,3 +727,145 @@ describeEmbeddedPostgres(
     });
   },
 );
+
+describeEmbeddedPostgres(
+  "reapStrandedSummaryGenerationIssues cancels unbound summary generation tasks (SUP-20900)",
+  () => {
+    let db!: ReturnType<typeof createDb>;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+    let companyId!: string;
+    let reviewerAgentId!: string;
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("unbound-summary-generation-reaper-");
+      db = createDb(tempDb.connectionString);
+      companyId = randomUUID();
+      reviewerAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Unbound Summary Generation",
+        issuePrefix: `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      });
+      await db.insert(agents).values([
+        { id: SUMMARIZER_AGENT_ID, companyId, name: "Summarizer", adapterType: "claude_local", status: "idle" },
+        { id: reviewerAgentId, companyId, name: "Reviewer", adapterType: "claude_local", status: "idle" },
+      ]);
+    }, 30_000);
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    function tokenDescription(generationIssueId: string) {
+      return [
+        "Generate the workspaces overview summary.",
+        "",
+        "```json",
+        JSON.stringify(
+          { scopeKind: "workspaces_overview", scopeId: null, slotKey: "header", generationIssueId },
+          null,
+          2,
+        ),
+        "```",
+      ].join("\n");
+    }
+
+    async function seedTask(opts: {
+      assigneeAgentId: string;
+      ageMs?: number;
+      description?: (issueId: string) => string;
+      bound?: boolean;
+      monitor?: boolean;
+    }) {
+      const issueId = randomUUID();
+      const age = opts.ageMs ?? 60 * 60_000;
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Refresh stale summary slot",
+        status: "in_progress",
+        assigneeAgentId: opts.assigneeAgentId,
+        description: (opts.description ?? tokenDescription)(issueId),
+        createdAt: new Date(Date.now() - age),
+        updatedAt: new Date(Date.now() - age),
+        monitorNextCheckAt: opts.monitor ? new Date(Date.now() + 60 * 60_000) : null,
+      });
+      if (opts.bound) {
+        await db.insert(summarySlots).values({
+          companyId,
+          scopeKind: "project",
+          scopeId: randomUUID(),
+          slotKey: "header",
+          status: "generating",
+          generatingIssueId: issueId,
+        });
+      }
+      return issueId;
+    }
+
+    const statusOf = (issueId: string) =>
+      db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.status);
+
+    it("cancels an unbound token-bearing task", async () => {
+      const issueId = await seedTask({ assigneeAgentId: SUMMARIZER_AGENT_ID });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result.terminalized).toBeGreaterThanOrEqual(1);
+      expect(await statusOf(issueId)).toBe("cancelled");
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+    });
+
+    it("cancels a task whose token carries the self-armed placeholder id", async () => {
+      const issueId = await seedTask({
+        assigneeAgentId: reviewerAgentId,
+        description: () => tokenDescription("<this-issue-id>"),
+      });
+
+      await reapStrandedSummaryGenerationIssues(db);
+
+      expect(await statusOf(issueId)).toBe("cancelled");
+    });
+
+    it("leaves a task bound to a slot alone", async () => {
+      const issueId = await seedTask({ assigneeAgentId: SUMMARIZER_AGENT_ID, bound: true, monitor: true });
+
+      await reapStrandedSummaryGenerationIssues(db);
+
+      expect(await statusOf(issueId)).toBe("in_progress");
+    });
+
+    it("leaves a bound task that review reassigned to another agent alone", async () => {
+      const issueId = await seedTask({ assigneeAgentId: reviewerAgentId, bound: true });
+
+      await reapStrandedSummaryGenerationIssues(db);
+
+      expect(await statusOf(issueId)).toBe("in_progress");
+    });
+
+    it("leaves a freshly minted unbound task alone while it may still be mid-mint", async () => {
+      const issueId = await seedTask({ assigneeAgentId: reviewerAgentId, ageMs: 60_000 });
+
+      await reapStrandedSummaryGenerationIssues(db);
+
+      expect(await statusOf(issueId)).toBe("in_progress");
+    });
+
+    it("leaves an issue without a generation token block alone", async () => {
+      const plain = await seedTask({ assigneeAgentId: reviewerAgentId, description: () => "Fix the thing." });
+      const otherJson = await seedTask({
+        assigneeAgentId: reviewerAgentId,
+        description: () => "```json\n{\"generationIssueId\": \"x\"}\n```",
+      });
+
+      await reapStrandedSummaryGenerationIssues(db);
+
+      expect(await statusOf(plain)).toBe("in_progress");
+      expect(await statusOf(otherJson)).toBe("in_progress");
+    });
+  },
+);

@@ -215,7 +215,7 @@ import {
 import { USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS } from "./issue-interaction-kinds.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
-import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+import { finalizeSummarySlotsForTerminalIssue, hasSummaryGenerationToken } from "./summary-slot-finalization.js";
 import {
   logActivity,
   logActivityInTransaction,
@@ -11668,6 +11668,22 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
+      }
+
+      // SUP-20900. Closing a summary generation task releases the slot binding
+      // (finalizeSummarySlotsForTerminalIssue), and nothing re-arms it on reopen,
+      // so a reopened task is one the Summarizer can never write against.
+      if (
+        issueData.status &&
+        issueData.status !== "done" &&
+        issueData.status !== "cancelled" &&
+        (existing.status === "done" || existing.status === "cancelled") &&
+        hasSummaryGenerationToken(existing.description)
+      ) {
+        throw conflict(
+          "Summary generation tasks cannot be reopened; mint a new generation instead",
+          { code: "summary_generation_reopen_forbidden", issueId: existing.id },
+        );
       }
 
       // SUP-11332. A terminal issue status expires every pending interaction in

@@ -5146,6 +5146,10 @@ export function issueRoutes(
             // diagnosable without re-deriving the gate. The wire `code` stays
             // `done_transition_missing_delivery` for compatibility (M3.7).
             mechanism,
+            missingStageLabels: guardResult.missingStageLabels ?? null,
+            outOfOrderStageLabels: guardResult.outOfOrderStageLabels ?? null,
+            outOfOrderMatches: guardResult.outOfOrderMatches ?? null,
+            ladderedChildCount: guardResult.ladderedChildCount ?? null,
             ladderedChildIdentifiers: guardResult.ladderedChildIdentifiers ?? null,
             excludedChildIdentifiers: guardResult.excludedChildIdentifiers ?? null,
             remedy: refusalRemedy,
@@ -21972,6 +21976,15 @@ export function issueRoutes(
       }
 
       for (const createdIssue of createdIssues) {
+        if (
+          await shouldSuppressCreatorSelfAssignmentWake(
+            issue.companyId,
+            actor,
+            createdIssue.assigneeAgentId,
+          )
+        ) {
+          continue;
+        }
         void queueIssueAssignmentWakeup({
           heartbeat,
           issue: createdIssue,

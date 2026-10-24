@@ -322,6 +322,16 @@ jobs:
         # which omits `creator` and is how the hole stood open.
         run: node --test ./scripts/__tests__/paperclip-approved-status-attribution.test.mjs
 
+      - name: Test paperclip-approved override label
+        # `override:paperclip-approval` lets a person with write access approve
+        # one PR when the reviewer pipeline cannot publish the stamp. It must
+        # work on `merge_group`, where check runs carry no PR association, so
+        # these tests pin that the head is bound through issue events and the
+        # head branch's push activity, never check runs, and that a head
+        # pushed after the label, a bot labeler, a fork and a branch name all
+        # fail closed.
+        run: node --test ./scripts/__tests__/paperclip-approved-override.test.mjs
+
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 

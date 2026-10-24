@@ -109,7 +109,9 @@ export interface BuiltInAgentBundleDefinition {
     canonicalKey: string;
     files: Record<string, string>;
   };
-  routine: {
+  // Optional: the Summarizer ships without a routine, its only supported refresh
+  // path is the in-process sweep that mints bound generation tasks.
+  routine?: {
     routineKey: string;
     title: string;
     description: string;
@@ -184,13 +186,6 @@ const FALLBACK_SUMMARIZER_INSTRUCTIONS = [
   "Turn the current state of a Paperclip scope (project, workspaces overview, project workspace, or execution workspace) into a short, honest, human-readable Markdown summary and write it back to that scope's summary slot as a new revision. Use the `summarize-status` skill as your operating procedure.",
   "",
   "Read-and-report only: never change issues, workspaces, or code. Cite issue identifiers, never fabricate status, keep every read company-scoped, and run on the low-cost model profile lane by default.",
-  "",
-].join("\n");
-
-const FALLBACK_SUMMARIZER_ROUTINE = [
-  "Regenerate summary slots whose scope has changed since their last revision.",
-  "",
-  "Paused by default; spends no tokens until an operator enables the schedule or runs it manually. Read-and-report only — the only write is the summary revision.",
   "",
 ].join("\n");
 
@@ -282,10 +277,6 @@ const REFLECTION_COACH_SKILL = readBuiltInTextWithFallback(
 );
 
 const SUMMARIZER_INSTRUCTIONS = readBuiltInText("summarizer/AGENTS.md", FALLBACK_SUMMARIZER_INSTRUCTIONS);
-const SUMMARIZER_ROUTINE = readBuiltInText(
-  "summarizer/routines/refresh-stale-summaries.md",
-  FALLBACK_SUMMARIZER_ROUTINE,
-);
 const SUMMARIZER_SKILL = readBuiltInTextWithFallback(
   "summarizer/SKILL.md",
   [
@@ -437,36 +428,6 @@ const DEFINITIONS = validateBuiltInAgentDefinitions([
           "summarize-status/SKILL.md": SUMMARIZER_SKILL,
         },
       },
-      routine: {
-        routineKey: "refresh-stale-summaries",
-        title: "Refresh stale summary slots",
-        description: SUMMARIZER_ROUTINE,
-        status: "paused",
-        priority: "medium",
-        concurrencyPolicy: "coalesce_if_active",
-        catchUpPolicy: "skip_missed",
-        variables: [
-          { name: "staleAfterHours", label: "Refresh slots older than (hours)", type: "number", defaultValue: 24, required: false, options: [] },
-          { name: "maxSlots", label: "Max slots to refresh per run", type: "number", defaultValue: 10, required: false, options: [] },
-          {
-            name: "scopeKinds",
-            label: "Scope kinds to include",
-            type: "select",
-            defaultValue: "all",
-            required: false,
-            options: ["all", "project", "workspaces_overview", "project_workspace", "execution_workspace"],
-          },
-        ],
-        triggers: [
-          {
-            kind: "schedule",
-            label: "Daily stale-summary refresh",
-            enabled: false,
-            cronExpression: "0 8 * * *",
-            timezone: "UTC",
-          },
-        ],
-      },
     },
   },
 ]);
@@ -610,7 +571,7 @@ export function validateBuiltInAgentDefinitions(definitions: BuiltInAgentDefinit
       if (!definition.bundle.skill.files[`${definition.bundle.skill.slug}/SKILL.md`]) {
         throw new Error(`Built-in agent ${definition.key} bundle skill requires SKILL.md`);
       }
-      if (!definition.bundle.routine.description.trim()) {
+      if (definition.bundle.routine && !definition.bundle.routine.description.trim()) {
         throw new Error(`Built-in agent ${definition.key} bundle routine requires a description`);
       }
     }
@@ -630,11 +591,11 @@ export function validateBuiltInAgentDefinitions(definitions: BuiltInAgentDefinit
         ...definition.bundle.skill,
         files: { ...definition.bundle.skill.files },
       },
-      routine: {
+      routine: definition.bundle.routine ? {
         ...definition.bundle.routine,
         variables: definition.bundle.routine.variables.map((variable) => ({ ...variable, options: [...variable.options] })),
         triggers: definition.bundle.routine.triggers.map((trigger) => ({ ...trigger })),
-      },
+      } : undefined,
     } : undefined,
   }));
 }
@@ -1169,7 +1130,7 @@ export function builtInAgentService(db: Db) {
 
   function routineDefaultsHash(
     routine: Pick<
-      BuiltInAgentBundleDefinition["routine"],
+      NonNullable<BuiltInAgentBundleDefinition["routine"]>,
       "title" | "description" | "priority" | "concurrencyPolicy" | "catchUpPolicy" | "variables"
     >,
     triggers: Array<{
@@ -1191,7 +1152,9 @@ export function builtInAgentService(db: Db) {
   }
 
   async function getRoutineByBinding(companyId: string, definition: BuiltInAgentDefinition) {
-    const binding = await getManagedResourceBinding(companyId, definition.key, "routine", definition.bundle!.routine.routineKey);
+    const routineKey = definition.bundle?.routine?.routineKey;
+    if (!routineKey) return { binding: null, routine: null, triggers: [] as RoutineTrigger[] };
+    const binding = await getManagedResourceBinding(companyId, definition.key, "routine", routineKey);
     const routine = binding
       ? await db
         .select()
@@ -1204,7 +1167,7 @@ export function builtInAgentService(db: Db) {
         .where(and(
           eq(routines.companyId, companyId),
           eq(routines.originKind, "built_in_agent_bundle"),
-          eq(routines.originId, `${definition.key}:${definition.bundle!.routine.routineKey}`),
+          eq(routines.originId, `${definition.key}:${routineKey}`),
         ))
         .then((rows) => rows[0] as Routine | undefined ?? null);
     const triggers = routine
@@ -1265,7 +1228,7 @@ export function builtInAgentService(db: Db) {
 
   async function requireBundleRoutine(companyId: string, key: string, routineKey: string) {
     const definition = requireBuiltInAgentDefinition(key);
-    if (!definition.bundle || definition.bundle.routine.routineKey !== routineKey) {
+    if (definition.bundle?.routine?.routineKey !== routineKey) {
       throw notFound("Built-in routine not found");
     }
     await ensureCompany(companyId);
@@ -1285,7 +1248,7 @@ export function builtInAgentService(db: Db) {
   }
 
   async function createOrResetRoutine(agent: Agent, definition: BuiltInAgentDefinition, existing: Routine | null, mode: "reconcile" | "reset") {
-    const routine = definition.bundle!.routine;
+    const routine = definition.bundle!.routine!;
     const actor = { agentId: null, userId: "built-in-bundles" };
     const nextRoutine = existing
       ? await routineSvc.update(existing.id, {
@@ -1359,7 +1322,8 @@ export function builtInAgentService(db: Db) {
 
   async function materializeRoutine(agent: Agent, definition: BuiltInAgentDefinition, mode: "reconcile" | "reset") {
     const bundle = definition.bundle!;
-    const stock = routineDefaultsHash(bundle.routine, bundle.routine.triggers);
+    const stockRoutine = bundle.routine!;
+    const stock = routineDefaultsHash(stockRoutine, stockRoutine.triggers);
     const { binding, routine, triggers } = await getRoutineByBinding(agent.companyId, definition);
     const currentHash = routine ? routineDefaultsHash({
       title: routine.title,
@@ -1371,7 +1335,7 @@ export function builtInAgentService(db: Db) {
     }, triggers) : null;
     const currentState = stockState({
       resourceKind: "routine",
-      resourceKey: bundle.routine.routineKey,
+      resourceKey: stockRoutine.routineKey,
       resourceId: routine?.id ?? null,
       stockVersion: bundle.stockVersion,
       latestStockHash: stock,
@@ -1389,20 +1353,20 @@ export function builtInAgentService(db: Db) {
       companyId: agent.companyId,
       bundleKey: definition.key,
       resourceKind: "routine",
-      resourceKey: bundle.routine.routineKey,
+      resourceKey: stockRoutine.routineKey,
       resourceId: nextRoutine.id,
       stockVersion: bundle.stockVersion,
       stockHash: shouldWrite ? stock : binding?.stockHash ?? stock,
       defaultsJson: {
-        title: bundle.routine.title,
-        status: bundle.routine.status,
-        triggerCount: bundle.routine.triggers.length,
+        title: stockRoutine.title,
+        status: stockRoutine.status,
+        triggerCount: stockRoutine.triggers.length,
       },
     });
     const next = await getRoutineByBinding(agent.companyId, definition);
     return withRoutineControls(stockState({
       resourceKind: "routine",
-      resourceKey: bundle.routine.routineKey,
+      resourceKey: stockRoutine.routineKey,
       resourceId: nextRoutine.id,
       stockVersion: bundle.stockVersion,
       latestStockHash: stock,
@@ -1418,10 +1382,13 @@ export function builtInAgentService(db: Db) {
   async function bundleResourceStates(companyId: string, definition: BuiltInAgentDefinition, agent: Agent | null) {
     if (!definition.bundle || !agent) return [];
     const bundle = definition.bundle;
+    const stockRoutine = bundle.routine;
     const [instructionBinding, skillBinding, routineBinding] = await Promise.all([
       getManagedResourceBinding(companyId, definition.key, "instructions", "AGENTS.md"),
       getManagedResourceBinding(companyId, definition.key, "skill", bundle.skill.skillKey),
-      getManagedResourceBinding(companyId, definition.key, "routine", bundle.routine.routineKey),
+      stockRoutine
+        ? getManagedResourceBinding(companyId, definition.key, "routine", stockRoutine.routineKey)
+        : Promise.resolve(null),
     ]);
     const instructionFiles = await currentInstructionFiles(agent, bundle);
     const skill = skillBinding
@@ -1465,15 +1432,17 @@ export function builtInAgentService(db: Db) {
         bindingStockHash: skillBinding?.stockHash ?? null,
         changedFiles: changedFileList(skillFiles, bundle.skill.files),
       }),
-      withRoutineControls(stockState({
-        resourceKind: "routine",
-        resourceKey: bundle.routine.routineKey,
-        resourceId: routine?.id ?? null,
-        stockVersion: bundle.stockVersion,
-        latestStockHash: routineDefaultsHash(bundle.routine, bundle.routine.triggers),
-        currentHash: routineHash,
-        bindingStockHash: routineBinding?.stockHash ?? null,
-      }), { routine, triggers, proposal }),
+      ...(stockRoutine
+        ? [withRoutineControls(stockState({
+          resourceKind: "routine",
+          resourceKey: stockRoutine.routineKey,
+          resourceId: routine?.id ?? null,
+          stockVersion: bundle.stockVersion,
+          latestStockHash: routineDefaultsHash(stockRoutine, stockRoutine.triggers),
+          currentHash: routineHash,
+          bindingStockHash: routineBinding?.stockHash ?? null,
+        }), { routine, triggers, proposal })]
+        : []),
     ];
   }
 
@@ -1497,6 +1466,7 @@ export function builtInAgentService(db: Db) {
       : byKind.get("skill")!;
     const refreshedAfterSkill = await agentSvc.getById(agent.id) as Agent | null;
     if (!refreshedAfterSkill) throw notFound("Built-in agent not found");
+    if (!definition.bundle.routine) return [instruction, skill];
     const routine = selected.has("routine")
       ? await materializeRoutine(refreshedAfterSkill, definition, mode)
       : byKind.get("routine")!;

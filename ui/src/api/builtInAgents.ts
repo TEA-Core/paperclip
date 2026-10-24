@@ -34,7 +34,7 @@ export interface BuiltInAgentBundleMeta {
     canonicalKey: string;
     files: string[];
   };
-  routine: {
+  routine?: {
     routineKey: string;
     title: string;
     status: "active" | "paused";

@@ -1198,7 +1198,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(grantKeys).not.toContain("skills:create");
   });
 
-  it("materializes the Summarizer bundle paused on Claude Haiku with a disabled routine", async () => {
+  it("materializes the Summarizer bundle paused on Claude Haiku with no routine", async () => {
     const companyId = await seedCompany();
     const root = await agentService(db).create(companyId, {
       name: "CEO",
@@ -1233,7 +1233,6 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(state.resources.map((resource) => [resource.resourceKind, resource.stockStatus])).toEqual([
       ["instructions", "stock_current"],
       ["skill", "stock_current"],
-      ["routine", "stock_current"],
     ]);
 
     const [skill] = await db
@@ -1246,24 +1245,14 @@ describeEmbeddedPostgres("built-in agents", () => {
     });
     expect(readPaperclipSkillSyncPreference(state.agent!.adapterConfig).desiredSkills).toContain(skill!.key);
 
-    const [routine] = await db
+    // The manual refresh routine mints unbound generation tasks the Summarizer
+    // cannot write against (SUP-20900); the sweep is the only refresh path.
+    const summarizerRoutines = await db
       .select()
       .from(routines)
       .where(and(eq(routines.companyId, companyId), eq(routines.assigneeAgentId, state.agentId!)));
-    expect(routine).toMatchObject({
-      title: "Refresh stale summary slots",
-      status: "paused",
-      assigneeAgentId: state.agentId,
-      originKind: "built_in_agent_bundle",
-      originId: "summarizer:refresh-stale-summaries",
-    });
-    const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine!.id));
-    expect(trigger).toMatchObject({
-      kind: "schedule",
-      enabled: false,
-      cronExpression: "0 8 * * *",
-      timezone: "UTC",
-    });
+    expect(summarizerRoutines).toEqual([]);
+    expect(state.definition.bundle?.routine).toBeUndefined();
   });
 
   it("keeps the Summarizer not-configured until an adapter model is set", async () => {

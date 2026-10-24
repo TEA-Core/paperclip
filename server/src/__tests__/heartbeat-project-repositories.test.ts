@@ -11,6 +11,7 @@ import { runLocalGit, setExpensiveWorkspaceGitExecutor } from "@paperclipai/adap
 import { WorkspaceGitScanError } from "../services/workspace-git-operation-scheduler.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const execute = vi.hoisted(() => vi.fn(async (_input: any) => ({ exitCode: 0, signal: null, timedOut: false })));
@@ -142,6 +143,50 @@ suite("task project repository provisioning", () => {
     expect(await readFile(path.join(copies[0]!.cwd, "README.md"), "utf8")).toBe("preserved dirty work");
     await expect(readFile(path.join(copies[0]!.cwd, "private.secret"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(path.join(source, "README.md"), "utf8")).toBe("preserved dirty work");
+  }, 40_000);
+
+  // SUP-20840: a disk-headroom refusal is transient, so the issue must not block on the first
+  // failure the way workspace_validation_failed does; it retries and recovers once space is freed.
+  it("retries a disk-headroom refusal instead of blocking the issue, then provisions once space is freed", async () => {
+    const companyId = randomUUID(), projectId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const source = path.join(root, companyId, "source");
+    await mkdir(source, { recursive: true });
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: source, stdio: "ignore" });
+    git("init", "-b", "main");
+    await writeFile(path.join(source, "README.md"), "committed");
+    git("add", ".");
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed");
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({ id: companyId, name: "Disk headroom", issuePrefix: `D${companyId.slice(0, 6)}`, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(projects).values({
+      id: projectId, companyId, name: "Isolated", status: "in_progress",
+      executionWorkspacePolicy: { enabled: true, defaultMode: "isolated_workspace", workspaceStrategy: { type: "git_worktree", baseRef: "HEAD" } },
+    });
+    await db.insert(projectWorkspaces).values({ id: randomUUID(), companyId, projectId, name: "Primary", sourceType: "local_path", cwd: source, isPrimary: true });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Test", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(issues).values({ id: issueId, companyId, projectId, title: "Provision under disk pressure", status: "todo", assigneeAgentId: agentId });
+
+    vi.stubEnv("PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT", "0.001");
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId, projectId } });
+    await vi.waitFor(async () => expect((await heartbeat.getRun(run!.id))?.errorCode).toBe("workspace_disk_headroom_exceeded"), { timeout: 15_000 });
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(0);
+
+    let retry: typeof heartbeatRuns.$inferSelect;
+    await vi.waitFor(async () => {
+      const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run!.id));
+      expect(rows).toHaveLength(1);
+      retry = rows[0]!;
+      expect(retry.status).toBe("scheduled_retry");
+    });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).not.toBe("blocked");
+
+    vi.stubEnv("PAPERCLIP_WORKSPACE_PROVISION_MAX_DISK_USED_PERCENT", "0");
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, retry!.id));
+    await heartbeat.promoteDueScheduledRetries();
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(async () => expect((await heartbeat.getRun(retry!.id))?.status).toBe("succeeded"), { timeout: 15_000 });
+    expect(execute.mock.calls.filter(([input]) => input.runId === retry!.id)).toHaveLength(1);
   }, 40_000);
 
   it.each([1, 2])("gives a task all %i repositories without any configured local folders", async (count) => {

@@ -813,9 +813,7 @@ describe("Inbox toolbar", () => {
         </QueryClientProvider>,
       );
     });
-    await vi.waitFor(() => {
-      expect(container.querySelector('[data-slot="task-row"]')?.textContent).toContain("Workspace Aurora");
-    }, { timeout: 5000 });
+    await vi.waitFor(() => expect(container.textContent).toContain("Workspace-aware task"));
 
     const taskRow = container.querySelector('[data-slot="task-row"]');
     const identifier = taskRow?.querySelector('[data-slot="task-row-identifier"]');
@@ -879,7 +877,7 @@ describe("Inbox toolbar", () => {
 
     await vi.waitFor(() => {
       expect(apiMocks.issuesList).toHaveBeenCalledTimes(3);
-    }, { timeout: 5000 });
+    });
 
     expect(apiMocks.issuesList.mock.calls.map((call) => call[1]?.includeLiveDescendantSummary)).toEqual([
       true,

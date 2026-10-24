@@ -1,9 +1,10 @@
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const journalPath = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
+const snapshotsDir = fileURLToPath(new URL("./migrations/meta", import.meta.url));
 
 /**
  * `when` monotonicity is enforced from this entry onward, not over the whole
@@ -140,6 +141,62 @@ function ensureJournalMatchesFiles(migrationFiles: string[], journalTags: string
   }
 }
 
+/**
+ * Every snapshot names its parent by `prevId`, and every snapshot is itself
+ * addressable by its `id`. Two snapshots claiming one `prevId` are two children
+ * of one parent — a fork drizzle-kit cannot resolve — and two snapshots sharing
+ * one `id` make every `prevId` pointing at it ambiguous. Neither is caught
+ * downstream: `drizzle-kit generate` prints the collision and exits 0, so the
+ * broken chain lands on disk and the next generate builds on top of it.
+ *
+ * Only duplicates are checked. Full adjacency is NOT: snapshots are retained
+ * sparsely, so a `prevId` may legitimately name an id no retained file carries.
+ */
+export function ensureSnapshotChain(snapshots: Array<{ file: string; id: string; prevId: string }>) {
+  const prevIdOwners = new Map<string, string>();
+  const idOwners = new Map<string, string>();
+
+  for (const snapshot of snapshots) {
+    const prevIdOwner = prevIdOwners.get(snapshot.prevId);
+    if (prevIdOwner) {
+      throw new Error(
+        `Duplicate snapshot prevId ${snapshot.prevId} in ${prevIdOwner} and ${snapshot.file}: `
+          + `two snapshots claim the same parent. drizzle-kit reports this as a collision and exits 0, `
+          + `so the broken chain would land silently. Point the newer snapshot's prevId at the id of `
+          + `the snapshot that actually precedes it.`,
+      );
+    }
+    prevIdOwners.set(snapshot.prevId, snapshot.file);
+
+    const idOwner = idOwners.get(snapshot.id);
+    if (idOwner) {
+      throw new Error(
+        `Duplicate snapshot id ${snapshot.id} in ${idOwner} and ${snapshot.file}: `
+          + `two snapshots cannot share an id, every prevId that names it is ambiguous.`,
+      );
+    }
+    idOwners.set(snapshot.id, snapshot.file);
+  }
+}
+
+async function readSnapshotChain(): Promise<Array<{ file: string; id: string; prevId: string }>> {
+  const snapshotFiles = (await readdir(snapshotsDir))
+    .filter((entry) => entry.endsWith("_snapshot.json"))
+    .sort();
+
+  const snapshots: Array<{ file: string; id: string; prevId: string }> = [];
+  for (const file of snapshotFiles) {
+    const raw = await readFile(join(snapshotsDir, file), "utf8");
+    const snapshot = JSON.parse(raw) as { id?: unknown; prevId?: unknown };
+    if (typeof snapshot.id !== "string" || typeof snapshot.prevId !== "string") {
+      throw new Error(`Snapshot ${file} is missing a string "id" or "prevId"`);
+    }
+    snapshots.push({ file, id: snapshot.id, prevId: snapshot.prevId });
+  }
+
+  return snapshots;
+}
+
 async function main() {
   const migrationFiles = (await readdir(migrationsDir))
     .filter((entry) => entry.endsWith(".sql"))
@@ -162,6 +219,7 @@ async function main() {
   ensureStrictlyOrdered(journalTags, "migration journal");
   ensureJournalMatchesFiles(migrationFiles, journalTags);
   ensureMonotonicWhen(journal.entries ?? []);
+  ensureSnapshotChain(await readSnapshotChain());
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

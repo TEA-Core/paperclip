@@ -1359,6 +1359,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.body.code).toBe("done_transition_missing_delivery");
     expect(res.body.details.remedy).not.toContain("Merge the issue's pull request");
     expect(res.body.details.mechanism).toBe("D");
+    expect(res.body.details.missingStageLabels).toEqual(["review:coder-LE"]);
+    expect(res.body.details.outOfOrderStageLabels).toEqual(["approval:exec-CTO"]);
+    expect(res.body.details.outOfOrderMatches).toEqual([
+      { label: "approval:exec-CTO", stageIndex: 1, stageId: expect.any(String), reseated: false },
+    ]);
+    expect(res.body.details.ladderedChildCount).toBe(2);
     // Board ruling 2026-10-02 (F1 server half): the approver holding the live
     // stage is also the assignee in in_review, but its seat is
     // currentParticipant. The ADR-103 re-parent/declare-process remedy is
@@ -1445,6 +1451,10 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.code).toBe("done_transition_missing_delivery");
     expect(res.body.details.mechanism).toBe("delivery");
+    expect(res.body.details.missingStageLabels).toBeNull();
+    expect(res.body.details.outOfOrderStageLabels).toBeNull();
+    expect(res.body.details.outOfOrderMatches).toBeNull();
+    expect(res.body.details.ladderedChildCount).toBeNull();
     expect(res.body.details.remedy).toContain("Merge the issue's pull request");
     expect(await statusOf(issueId)).toBe("in_review");
   });

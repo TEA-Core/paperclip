@@ -1507,7 +1507,12 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       cleanups.push(() => fs.promises.rm(directory, { recursive: true, force: true }));
       const migrationsRoot = new URL("./migrations/", import.meta.url);
       const journal = JSON.parse(await fs.promises.readFile(new URL("meta/_journal.json", migrationsRoot), "utf8"));
-      const priorEntries = journal.entries.filter((entry: { idx: number }) => entry.idx < 227);
+      const boundary = journal.entries.find(
+        (entry: { idx: number; tag: string }) => entry.tag === "0229_yielding_starbolt",
+      );
+      expect(boundary, "0229_yielding_starbolt").toBeDefined();
+      // Anchor this window on a tag because a fold resequences journal idx values.
+      const priorEntries = journal.entries.filter((entry: { idx: number }) => entry.idx < boundary!.idx);
       await fs.promises.mkdir(join(directory, "meta"));
       for (const entry of priorEntries) {
         await fs.promises.copyFile(new URL(`${entry.tag}.sql`, migrationsRoot), join(directory, `${entry.tag}.sql`));
