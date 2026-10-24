@@ -2829,9 +2829,9 @@ export function recoveryService(
   async function isInvocationBudgetBlocked(
     issue: typeof issues.$inferSelect,
     agentId: string,
-    runner: Db = db,
+    budgetRunner: ReturnType<typeof budgetService> = budgets,
   ) {
-    const budgetBlock = await (runner === db ? budgets : budgetService(runner)).getInvocationBlock(
+    const budgetBlock = await budgetRunner.getInvocationBlock(
       issue.companyId,
       agentId,
       {
@@ -5400,7 +5400,7 @@ export function recoveryService(
         (!participantAgent ||
           !isAgentStatusInvokable(participantAgent.status) ||
           !(await isAgentInvokable(participantAgent, txDb)) ||
-          (await isInvocationBudgetBlocked(current, participantAgent.id, txDb)) ||
+          (await isInvocationBudgetBlocked(current, participantAgent.id, budgetService(txDb))) ||
           (await hasConsecutiveWakeFailuresForAgent(participantAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, txDb)));
       let recoveryAction = routedAction;
       if (boardOnlyPendingParticipant && recoveryAction.ownerAgentId) {
