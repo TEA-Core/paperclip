@@ -1750,6 +1750,16 @@ describe("openapi auth parity (SUP-14798)", () => {
     expect(count, `POST /api/issues/{id}/stalled-review-decision should be registered exactly once`).toBe(1);
   });
 
+  it("documents the merge release 409 as either a card refusal or a publication outcome", () => {
+    for (const routePath of ["/api/issues/{id}/merge-arming/release", "/api/issues/{id}/merge-arming/release-override"]) {
+      const schema = JSON.stringify(
+        (operation("post", routePath) as any)?.responses?.["409"]?.content?.["application/json"]?.schema,
+      );
+      expect(schema, `${routePath} 409`).toContain("outcome");
+      expect(schema, `${routePath} 409`).toMatch(/"error"|Error/);
+    }
+  });
+
   it("board and instance-admin routes carry the board-only security requirement", () => {
     for (const route of [...BOARD_ROUTES, ...INSTANCE_ADMIN_ROUTES]) {
       const [method, routePath] = splitAuthRoute(route);

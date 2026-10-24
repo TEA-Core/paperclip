@@ -1771,6 +1771,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       liveHeadNow?: () => string;
       statuses?: Array<Record<string, unknown>>;
       draft?: boolean;
+      /** Read on every PR GET, so a test can draft the PR mid-call. */
+      draftNow?: () => boolean;
       /** Runs when the status list is read. */
       onStatusRead?: () => void | Promise<void>;
       /** Response for the Nth (1-based) status POST; default is a 201. */
@@ -1783,7 +1785,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
           if (opts.prReadFailsAfterWrite && posts > 0) return createMockResponse({ message: "bad gateway" }, false, 502);
           return createMockResponse({
-            state: opts.state ?? "open", merged: opts.merged ?? false, draft: opts.draft ?? false,
+            state: opts.state ?? "open", merged: opts.merged ?? false, draft: opts.draftNow?.() ?? opts.draft ?? false,
             head: { sha: opts.liveHeadNow?.() ?? opts.liveHead ?? HEAD_SHA, ref: opts.liveBranch ?? DELIVERY_BRANCH },
           });
         }
@@ -2647,6 +2649,141 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(res.body.outcome).toBe("refused");
       expect(res.body.message).toContain("head-mismatch");
       expect(statusWrites()).toEqual([]);
+    });
+
+
+    // ---- Round 4: every required stage's LATEST decision must be an attributed approval by a non-author ----
+
+    const stageDecisionRows = async (issueId: string) =>
+      db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+
+    it("refuses a ladder whose only stage decision was overwritten with a rejection", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId));
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a ladder whose latest stage decision is a newer rejection", async () => {
+      const { issueId, companyId, reviewerAgentId } = await seedReleasable("ladder");
+      await db.insert(issueExecutionDecisions).values({
+        companyId, issueId, stageId: STAGE_ID, stageType: "approval", actorAgentId: reviewerAgentId, actorUserId: null,
+        outcome: "changes_requested", body: "Rejected", createdAt: new Date(Date.now() + 60_000), updatedAt: new Date(Date.now() + 60_000),
+      });
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a ladder whose latest stage decision is unattributed", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      await db.update(issueExecutionDecisions).set({ actorAgentId: null, actorUserId: null }).where(eq(issueExecutionDecisions.issueId, issueId));
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a self-approval that the single resolved principal would miss (the return user, shadowed by a policy return agent)", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      await db.update(issues).set({
+        executionState: { ...(issue!.executionState as Record<string, unknown>), returnAssignee: { type: "user", userId: USER_ID } },
+      }).where(eq(issues.id, issueId));
+      await db.update(issueExecutionDecisions).set({ actorAgentId: null, actorUserId: USER_ID }).where(eq(issueExecutionDecisions.issueId, issueId));
+      await expectLadderRefused(issueId);
+    });
+
+    it("answers 409, not 500, for a malformed null stage in the policy", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      await db.update(issues).set({
+        executionPolicy: { ...(issue!.executionPolicy as Record<string, unknown>), stages: [null] },
+      }).where(eq(issues.id, issueId));
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses with no write when, after the first read, the approving stage decision is reversed", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      installReleaseTransport({
+        onStatusRead: async () => { await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId)); },
+      });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.message).toContain("eligibility-changed");
+      expect(statusWrites()).toEqual([]);
+      expect((await stageDecisionRows(issueId)).length).toBe(1);
+    });
+
+    // ---- Round 4: revalidation must not need a second root-pool connection while it holds the lock connection ----
+
+    it.each([1, 2])("completes concurrent releases on a pool of %i connection(s) without deadlocking", async (poolSize) => {
+      const { issueId } = await seedReleasable("ladder");
+      const smallDb = createDb(tempDb!.connectionString, { maxConnections: poolSize });
+      const smallApp = express();
+      smallApp.use(express.json());
+      smallApp.use((req, _res, next) => { req.actor = currentActor; next(); });
+      smallApp.use("/api", issueRoutes(smallDb, {} as any));
+      smallApp.use(errorHandler);
+      let written = false;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+          return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+        }
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          written = true;
+          return createMockResponse({ id: 1 }, true, 201);
+        }
+        if (url.includes("/statuses/")) return createMockResponse(written ? [approvedRow("success", CONTROL_PLANE_CREATOR)] : []);
+        throw new Error(`Unexpected release request: ${url}`);
+      });
+
+      const send = () => request(smallApp).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`releases deadlocked on a pool of ${poolSize}`)), 12_000));
+      const responses = await Promise.race([Promise.all([send(), send(), send()]), timeout]);
+
+      expect(responses.map((res) => res.body.outcome).sort()).toEqual(["already_approved", "already_approved", "released"]);
+      expect(statusWrites()).toHaveLength(1);
+    }, 20_000);
+
+    // ---- Round 4: a head that stops being the live, open, non-draft head right after the write is not a release ----
+
+    it("answers stale and marks the status failed when the PR is turned into a draft right after the write", async () => {
+      const { issueId } = await seedReleasable();
+      let draft = false;
+      installReleaseTransport({ draftNow: () => draft, postStatus: (call) => { if (call === 1) draft = true; return { ok: true, status: 201 }; } });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("stale");
+      expect(statusWrites()).toHaveLength(2);
+      expect(JSON.parse(statusWrites()[1]![1].body as string)).toMatchObject({ state: "failure" });
+      expect(await releaseLogRows()).toEqual([]);
+    });
+
+    // ---- Round 4: a failed outcome insert is reported, not hidden ----
+
+    it("tells the caller the outcome audit row was recorded", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.auditRecorded).toBe(true);
+    });
+
+    it("tells the caller when the outcome audit row could not be recorded", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      await db.execute(sql.raw(
+        "alter table activity_log add constraint merge_release_round4_outcome_audit_failure check (action <> 'issue.merge_release') not valid",
+      ));
+      try {
+        const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+        expect(res.status).toBe(200);
+        expect(res.body.outcome).toBe("released");
+        expect(res.body.auditRecorded).toBe(false);
+      } finally {
+        await db.execute(sql.raw("alter table activity_log drop constraint merge_release_round4_outcome_audit_failure"));
+      }
     });
 
     it("rejects a malformed body with 400 before any GitHub I/O", async () => {

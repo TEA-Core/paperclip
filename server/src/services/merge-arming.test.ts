@@ -1381,12 +1381,12 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(statusesReads).toBe(2);
     });
 
-    it("SUP-20772: with ignoreRelease a board-release success does not count as approved; an ordinary success still does", async () => {
-      const releaseSuccess = {
-        context: "paperclip/approved", state: "success",
-        description: `released by user:u1 for ${APPROVED_HEAD}: ladder cannot complete`,
-      };
-      const read = async (statuses: unknown[], options?: { ignoreRelease: boolean }) => {
+    describe("SUP-20772: strict reading of the approval for arming decisions", () => {
+      const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]" };
+      const FLEET = { id: 555, login: "fleet-agent[bot]" };
+      const release = { context: "paperclip/approved", state: "success", creator: CONTROL_PLANE, description: `released by user:u1 for ${APPROVED_HEAD}: ladder cannot complete` };
+      const review = { context: "paperclip/approved", state: "success", creator: CONTROL_PLANE, description: "SUP-42 approved via Paperclip" };
+      const read = async (statuses: unknown[], options?: { strict?: boolean; ignoreRelease?: boolean }) => {
         mockGhFetch.mockImplementation(async (url: string) => {
           if (String(url) === HEAD_STATUSES_URL(APPROVED_HEAD)) {
             return { ok: true, status: 200, json: async () => statuses } as unknown as Response;
@@ -1396,10 +1396,30 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         return fetchHeadApprovedStatusViaTokenCandidates(db, companyId, OWNER, REPO, APPROVED_HEAD, options);
       };
 
-      expect(await read([releaseSuccess])).toMatchObject({ ok: true, approved: true });
-      expect(await read([releaseSuccess], { ignoreRelease: true })).toMatchObject({ ok: true, approved: false });
-      expect(await read([releaseSuccess, { context: "paperclip/approved", state: "success", description: "SUP-42 approved via Paperclip" }], { ignoreRelease: true }))
-        .toMatchObject({ ok: true, approved: true });
+      it("without options any matching success counts, as before", async () => {
+        expect(await read([release])).toMatchObject({ ok: true, approved: true });
+        expect(await read([{ context: "paperclip/approved", state: "success" }])).toMatchObject({ ok: true, approved: true });
+      });
+
+      it("ignoreRelease: a board-release success is not an approval, an ordinary control-plane success is", async () => {
+        expect(await read([release], { strict: true, ignoreRelease: true })).toMatchObject({ approved: false });
+        expect(await read([review], { strict: true, ignoreRelease: true })).toMatchObject({ approved: true });
+        expect(await read([release], { strict: true, ignoreRelease: false })).toMatchObject({ approved: true });
+      });
+
+      it("strict: a success written by anyone but the control plane is not an approval", async () => {
+        const forged = { ...review, creator: FLEET };
+        expect(await read([forged], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
+        expect(await read([forged, release], { strict: true, ignoreRelease: true })).toMatchObject({ approved: false });
+        expect(await read([{ context: "paperclip/approved", state: "success" }], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
+      });
+
+      it("strict: only the newest paperclip/approved status decides, so a failure after a success revokes it", async () => {
+        const failure = { context: "paperclip/approved", state: "failure", creator: CONTROL_PLANE, description: "superseded" };
+        expect(await read([failure, review], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
+        expect(await read([failure, release], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
+        expect(await read([review, failure], { strict: true, ignoreRelease: false })).toMatchObject({ approved: true });
+      });
     });
 
     it("AC3: transient-exhausted yields the terminal outcome with its prefix intact", async () => {

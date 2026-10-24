@@ -3042,7 +3042,7 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
   owner: string,
   repo: string,
   headSha: string,
-  options: { ignoreRelease?: boolean } = {},
+  options: { strict?: boolean; ignoreRelease?: boolean } = {},
 ): Promise<{ ok: true; approved: boolean; controlPlaneApproved: boolean } | { ok: false; reason: string }> {
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
   if (candidates.length === 0) {
@@ -3310,7 +3310,7 @@ async function fetchHeadCommitStatusesOnce(
   owner: string,
   repo: string,
   headSha: string,
-  options: { ignoreRelease?: boolean } = {},
+  options: { strict?: boolean; ignoreRelease?: boolean } = {},
 ): Promise<{ ok: boolean; approved: boolean; controlPlaneApproved: boolean; status: number; message: string | null }> {
   const url =
     `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
@@ -3344,13 +3344,18 @@ async function fetchHeadCommitStatusesOnce(
     if (typeof raw !== "object" || raw === null) continue;
     const status = raw as Record<string, unknown>;
     if (status.context !== "paperclip/approved") continue;
-    // A board release is a human decision on one head, not a review (SUP-20772): a caller that decides
-    // whether to arm a merge can ask for it not to count as approval.
-    if (status.state === "success" && !(options.ignoreRelease && isHeadBoundReleaseDescription(status.description))) approved = true;
+    if (!options.strict && status.state === "success") approved = true;
     if (!newestSeen) {
       newestSeen = true;
       const creator = status.creator as Record<string, unknown> | null | undefined;
       controlPlaneApproved = status.state === "success" && String(creator?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID;
+      // Strict reading, for deciding whether to arm a merge: only the NEWEST paperclip/approved status
+      // counts (a later failure revokes an earlier success), it must have been written by the control
+      // plane (a success from any other identity is a forgery, not a stamp), and when asked a board
+      // release does not count, because it is a human decision on one head and not a review (SUP-20772).
+      if (options.strict) {
+        approved = controlPlaneApproved && !(options.ignoreRelease && isHeadBoundReleaseDescription(status.description));
+      }
     }
   }
   return { ok: true, approved, controlPlaneApproved, status: response.status, message: null };
@@ -3367,7 +3372,7 @@ async function fetchHeadCommitStatuses(
   owner: string,
   repo: string,
   headSha: string,
-  options: { ignoreRelease?: boolean } = {},
+  options: { strict?: boolean; ignoreRelease?: boolean } = {},
 ): Promise<{ ok: boolean; approved: boolean; controlPlaneApproved: boolean; status: number; message: string | null }> {
   return withTransientReadRetry(() => fetchHeadCommitStatusesOnce(token, owner, repo, headSha, options));
 }
@@ -3816,7 +3821,7 @@ export async function resolveReleaseDeliveryTarget(
     headSha: string;
     mode: "standard" | "override";
     /** Null when the card's stage decisions pass the approval path's integrity check, else why not. */
-    ladderIntegrity: (issueId: string) => Promise<string | null>;
+    ladderIntegrity: (conn: Db, issueId: string) => Promise<string | null>;
   },
 ): Promise<
   | { ok: true; target: { owner: string; repo: string; number: number; displayName: string; branch: string }; basis: ReleaseBasis }
@@ -3865,7 +3870,7 @@ export async function resolveReleaseDeliveryTarget(
   const decidedHeadMatches = opts.headSha.length > 0 &&
     [approvalStatus?.publishedHeadSha, approvalStatus?.approvedHeadSha].includes(opts.headSha);
   const stages = Array.isArray((issueRow?.executionPolicy as { stages?: unknown } | null)?.stages)
-    ? (issueRow!.executionPolicy as { stages: Array<{ id?: unknown }> }).stages
+    ? (issueRow!.executionPolicy as { stages: Array<{ id?: unknown } | null> }).stages
     : [];
   const completedIds = Array.isArray(state?.completedStageIds) ? (state!.completedStageIds as unknown[]) : [];
   let ladderWhy = "the ladder is not complete, or not approved on this head";
@@ -3873,10 +3878,10 @@ export async function resolveReleaseDeliveryTarget(
     issueRow?.status === "done" &&
     state?.lastDecisionOutcome === "approved" &&
     stages.length > 0 &&
-    stages.every((stage) => typeof stage.id === "string" && completedIds.includes(stage.id)) &&
+    stages.every((stage) => stage !== null && typeof stage === "object" && typeof stage.id === "string" && completedIds.includes(stage.id)) &&
     decidedHeadMatches
   ) {
-    const integrity = await opts.ladderIntegrity(issueId);
+    const integrity = await opts.ladderIntegrity(db, issueId);
     if (integrity === null) return { ok: true, target, basis: "approved_ladder" };
     ladderWhy = integrity;
   }
@@ -3911,7 +3916,7 @@ export async function publishHeadBoundRelease(
      * lock, right before the write, so a cancel, a reversed decision or a retarget after the first
      * read cannot still release the old target.
      */
-    revalidate: () => Promise<
+    revalidate: (conn: Db) => Promise<
       | { ok: true; target: { owner: string; repo: string; number: number; branch: string } }
       | { ok: false; reason: string }
     >;
@@ -3943,8 +3948,8 @@ export async function publishHeadBoundRelease(
     }
     return null;
   };
-  const eligibilityRefusal = async (): Promise<HeadBoundReleaseOutcome | null> => {
-    const again = await input.revalidate();
+  const eligibilityRefusal = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => {
+    const again = await input.revalidate(conn);
     if (!again.ok) {
       return { kind: "refused", message: `status:refused:eligibility-changed: ${again.reason}` };
     }
@@ -3958,17 +3963,18 @@ export async function publishHeadBoundRelease(
     return null;
   };
   // The PR's liveness and the card's eligibility, both as they are now.
-  const recheck = async (): Promise<HeadBoundReleaseOutcome | null> => (await liveRefusal()) ?? (await eligibilityRefusal());
-  const publishLocked = async (): Promise<HeadBoundReleaseOutcome> => {
+  // `conn` is the lock's own connection: eligibility is read on it, never on a second pool connection.
+  const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => (await liveRefusal()) ?? (await eligibilityRefusal(conn));
+  const publishLocked = async (conn: Db): Promise<HeadBoundReleaseOutcome> => {
     // The live PR is checked before anything else, so an "already approved" answer is never given for a
     // PR that is stale, a draft, closed, merged or off its branch.
-    const firstRefusal = await recheck();
+    const firstRefusal = await recheck(conn);
     if (firstRefusal) return firstRefusal;
     const existing = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha);
     if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
     if (existing.controlPlaneApproved) {
       // The status lookup took time: look at the head again before answering that it is approved.
-      const stillLive = await recheck();
+      const stillLive = await recheck(conn);
       if (stillLive) return stillLive;
       return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
     }
@@ -3979,23 +3985,24 @@ export async function publishHeadBoundRelease(
     // release. A transient failure is retried only after the live head and eligibility are checked again.
     const attempts = 3;
     for (let attempt = 1; ; attempt += 1) {
-      const refusal = await recheck();
+      const refusal = await recheck(conn);
       if (refusal) return refusal;
       const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
         description: input.description,
         attempts: 1,
       });
       if (write.success) {
-        const after = await fetchPullRequestHeadSha(credential.token, owner, repo, number);
-        if (!after.ok) {
+        // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
+        const after = await liveRefusal();
+        if (after && after.kind === "failed") {
           return {
             kind: "failed",
-            message: `status:failed:post_write_pr_read: HTTP ${after.status} ${after.message ?? ""}; the status on ${input.headSha} WAS written but the head could not be confirmed`.trim(),
+            message: `status:failed:post_write_pr_read: ${after.message}; the status on ${input.headSha} WAS written but the head could not be confirmed`,
           };
         }
-        if (after.headSha !== input.headSha) {
+        if (after) {
           const marked = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
-            description: `superseded: ${number} head moved to ${after.headSha.slice(0, 12)} before the release was confirmed`,
+            description: `superseded: ${number} is no longer the live head ${input.headSha.slice(0, 12)} the release covered`,
             state: "failure",
             attempts: 2,
             delayMs: input.retryDelayMs ?? 1000,
@@ -4004,10 +4011,10 @@ export async function publishHeadBoundRelease(
             kind: "stale",
             headSha: input.headSha,
             message:
-              `status:stale:head-moved-after-write: ${owner}/${repo}#${number} head is now ${after.headSha}; ` +
+              `status:stale:head-moved-after-write: ${after.message}; ` +
               (marked.success
-                ? `the status written to ${input.headSha} was set to failure and does not cover it`
-                : `the status written to ${input.headSha} could NOT be set to failure (${marked.error ?? `HTTP ${marked.status}`}) and does not cover the new head`),
+                ? `the status written to ${input.headSha} was followed by a failure status`
+                : `a failure status on ${input.headSha} could NOT be written (${marked.error ?? `HTTP ${marked.status}`})`),
           };
         }
         return { kind: "released", headSha: input.headSha, message: input.description };
@@ -4023,7 +4030,7 @@ export async function publishHeadBoundRelease(
   const lockKey = `merge-release:${companyId}:${owner}/${repo}@${input.headSha}`.toLowerCase();
   return db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
-    return publishLocked();
+    return publishLocked(tx as unknown as Db);
   });
 }
 

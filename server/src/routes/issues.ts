@@ -223,6 +223,7 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
+import { evaluateApprovingLadder } from "../services/release-ladder.js";
 import {
   evaluateStageIntegrity,
   latestDecisionPerStage,
@@ -11546,19 +11547,20 @@ export function issueRoutes(
     const { headSha, reason } = mode === "override"
       ? (({ headSha, overrideReason }) => ({ headSha, reason: overrideReason }))(overrideReleaseIssueHeadSchema.parse(req.body))
       : releaseIssueHeadSchema.parse(req.body);
-    // The stage decisions must pass the same integrity check the approval path (approve-head) runs.
-    const ladderIntegrity = async (issueId: string): Promise<string | null> => {
+    // A completed APPROVING ladder: the approval path's integrity check plus, for every stage, a latest
+    // decision that is an attributed approval by someone who did not author the work. It runs on the
+    // connection it is given (the publication lock's own), so a revalidation never needs a second one.
+    const ladderIntegrity = async (conn: Db, issueId: string): Promise<string | null> => {
       try {
-        const [row] = await db.select().from(issueRows).where(and(eq(issueRows.id, issueId), eq(issueRows.companyId, existing.companyId)));
+        const [row] = await conn.select().from(issueRows).where(and(eq(issueRows.id, issueId), eq(issueRows.companyId, existing.companyId)));
         if (!row) return "card not found";
-        const integrity = await evaluateStageIntegrity(db, { ...row, executionState: row.executionState ?? {} } as CandidateRow);
-        return integrity ? integrity.detail : null;
+        return await evaluateApprovingLadder(conn, { ...row, executionState: row.executionState ?? {} } as CandidateRow);
       } catch (error) {
         return `stage integrity could not be verified: ${error instanceof Error ? error.message : String(error)}`;
       }
     };
-    const resolveTarget = () => resolveReleaseDeliveryTarget(db, existing.companyId, existing.id, { headSha, mode, ladderIntegrity });
-    const resolved = await resolveTarget();
+    const resolveTarget = (conn: Db) => resolveReleaseDeliveryTarget(conn, existing.companyId, existing.id, { headSha, mode, ladderIntegrity });
+    const resolved = await resolveTarget(db);
     if (!resolved.ok) throw conflict(`Card cannot be released: ${resolved.reason}`);
     const { target, basis } = resolved;
     const kinds = MERGE_RELEASE_AUDIT[mode];
@@ -11588,6 +11590,7 @@ export function issueRoutes(
         message: `status:failed:internal: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
+    let auditRecorded = true;
     try {
       const entry = await persistActivity(db, {
         companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
@@ -11600,13 +11603,16 @@ export function issueRoutes(
       });
       publishActivity(entry.publication);
     } catch (error) {
+      // The status is already out and cannot be un-written, so this cannot fail the request; the caller is
+      // told instead, and the intent row is the audit trail.
+      auditRecorded = false;
       logger.error(
         { err: error, issueId: existing.id, headSha, outcome: outcome.kind, intentId: intent.activity.id },
         "merge release outcome could not be recorded; the release intent row is the audit trail",
       );
     }
     res.status(outcome.kind === "released" || outcome.kind === "already_approved" ? 200 : 409).json({
-      outcome: outcome.kind, headSha, message: outcome.message,
+      outcome: outcome.kind, headSha, message: outcome.message, auditRecorded,
     });
   }
 
