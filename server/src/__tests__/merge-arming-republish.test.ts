@@ -2958,6 +2958,55 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(statusWrites()).toHaveLength(1);
     }, 20_000);
 
+    it("answers stale within the deadline when the superseding failure status never answers", async () => {
+      const { companyId } = await seedReleasable();
+      let posts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+          return createMockResponse({
+            state: "open", merged: false, draft: false,
+            head: { sha: posts > 0 ? OTHER_HEAD_SHA : HEAD_SHA, ref: DELIVERY_BRANCH },
+          });
+        }
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          posts += 1;
+          return posts === 1 ? createMockResponse({ id: 1 }, true, 201) : new Promise(() => {});
+        }
+        if (url.includes("/statuses/")) return createMockResponse([]);
+        throw new Error(`Unexpected release request: ${url}`);
+      });
+
+      const outcome = await directRelease(companyId, { deadlines: { fetchMs: 200 } });
+
+      expect(outcome.kind).toBe("stale");
+      expect(outcome.message).toContain("could NOT");
+      expect(statusWrites()).toHaveLength(2);
+    }, 20_000);
+
+    it("answers failed within the deadline when the voiding failure status never answers", async () => {
+      const { companyId } = await seedReleasable();
+      let posts = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+          if (posts > 0) return createMockResponse({ message: "bad gateway" }, false, 502);
+          return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+        }
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          posts += 1;
+          return posts === 1 ? createMockResponse({ id: 1 }, true, 201) : new Promise(() => {});
+        }
+        if (url.includes("/statuses/")) return createMockResponse([]);
+        throw new Error(`Unexpected release request: ${url}`);
+      });
+
+      const outcome = await directRelease(companyId, { deadlines: { fetchMs: 200 } });
+
+      expect(outcome.kind).toBe("failed");
+      expect(outcome.message).toContain("post_write_pr_read");
+      expect(outcome.message).toContain("could NOT be voided");
+      expect(statusWrites()).toHaveLength(2);
+    }, 20_000);
+
     it("rejects a malformed body with 400 before any GitHub I/O", async () => {
       const { issueId } = await seedReleasable();
 
