@@ -528,8 +528,9 @@ export function companyService(db: Db) {
     },
 
     remove: (id: string) =>
-      // A foreign key without a delete policy (release-assurance ledger, decisions)
-      // keeps its rows on purpose and blocks this delete; answer 409, not a bare 500.
+      // The release-assurance ledger keeps its rows on purpose (its foreign keys have no
+      // delete policy) and blocks this delete; answer 409, not a bare 500. Any other
+      // foreign-key failure keeps its existing behavior.
       db.transaction(async (tx) => {
         // Delete from child tables in dependency order
         const companyRunIds = await tx
@@ -579,8 +580,8 @@ export function companyService(db: Db) {
           .returning();
         return rows[0] ?? null;
       }).catch((err) => {
-        if (isForeignKeyViolation(err)) {
-          throw conflict("Company cannot be deleted because another record still references it.");
+        if (isForeignKeyViolation(err, "release_assurance_events_")) {
+          throw conflict("Company cannot be deleted because release-assurance records still reference it.");
         }
         throw err;
       }),

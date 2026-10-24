@@ -194,6 +194,34 @@ export interface AppInstallationTokenSecrets {
   ) => Promise<string>;
 }
 
+/**
+ * Read-only peek at an already-cached default-App installation token for one repo.
+ * It never reads a secret, never mints a token and never touches the database, so a
+ * caller that must make zero external writes (release-assurance shadow mode) can use
+ * a warm credential and otherwise refuse. Owner and repo match case-insensitively
+ * because the cache key keeps whatever casing its minting caller used.
+ */
+export function peekWarmAppInstallationToken(
+  companyId: string,
+  owner: string,
+  repo: string,
+  app: GitHubAppDescriptor = DEFAULT_GITHUB_APP,
+): GitHubTokenResolution | null {
+  const wanted = `${companyId}:${app.appId}:${owner}:${repo}:`.toLowerCase();
+  const now = Date.now();
+  for (const [key, cached] of appTokenCache) {
+    if (key.toLowerCase() !== wanted || isExpired(cached, now)) continue;
+    return {
+      token: cached.token,
+      scope: "app_installation",
+      secretName: app.privateKeySecretName,
+      installationId: cached.installationId,
+      expiresAt: cached.expiresAt,
+    };
+  }
+  return null;
+}
+
 export async function resolveAppInstallationToken(
   companyId: string,
   secrets: AppInstallationTokenSecrets,

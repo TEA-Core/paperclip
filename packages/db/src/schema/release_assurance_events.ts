@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   bigserial,
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -37,7 +38,14 @@ export type ReleaseAssurancePublicationMode = (typeof RELEASE_ASSURANCE_PUBLICAT
  * change, comment deletion, or policy edit cannot erase an enrollment or a
  * denial. The company and issue foreign keys carry no delete policy (the
  * `decisions` precedent), so deleting a card or company that still has ledger
- * rows is refused rather than cascading the audit trail away.
+ * rows is refused rather than cascading the audit trail away. The issue key is
+ * composite with the company, so the pair must belong together.
+ *
+ * Append-only is enforced by the database, not only by the service: the migration
+ * revokes UPDATE, DELETE and TRUNCATE from the serving role and installs triggers
+ * that reject UPDATE, DELETE and TRUNCATE for every role. The one governed repair
+ * path is a table owner or superuser disabling the trigger for the repair and
+ * re-enabling it, which leaves a trail in the database log; ordinary SQL cannot do it.
  * `(companyId, eventId)` is the idempotency key — a replay of the same
  * canonical payload is a no-op and a conflicting reuse fails — and `sequence`
  * is the server-side ordering, never the caller's clock.
@@ -53,7 +61,7 @@ export const releaseAssuranceEvents = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
-    issueId: uuid("issue_id").notNull().references(() => issues.id),
+    issueId: uuid("issue_id").notNull(),
     eventId: uuid("event_id").notNull(),
     sequence: bigserial("sequence", { mode: "number" }).notNull(),
     kind: text("kind").$type<ReleaseAssuranceEventKind>().notNull(),
@@ -75,6 +83,13 @@ export const releaseAssuranceEvents = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    // The pair must match: an issue of another company cannot be attributed to this one.
+    // `issues_company_id_uq` already exists, so this adds no index to `issues`.
+    companyIssueFk: foreignKey({
+      columns: [table.companyId, table.issueId],
+      foreignColumns: [issues.companyId, issues.id],
+      name: "release_assurance_events_company_issue_fk",
+    }),
     companyEventUq: uniqueIndex("release_assurance_events_company_event_uq").on(table.companyId, table.eventId),
     issueHoldUq: uniqueIndex("release_assurance_events_issue_hold_uq")
       .on(table.companyId, table.issueId)
