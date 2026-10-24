@@ -1749,7 +1749,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         userId,
       }),
       trigger:
-        endpoint.provider === "telegram"
+        endpoint.provider === "telegram" || endpoint.provider === "imessage-photon"
           ? "direct_message"
           : "subscribed_message",
     });
