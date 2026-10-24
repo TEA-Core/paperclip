@@ -1215,7 +1215,7 @@ export async function detachIssuesFromClosedExecutionWorkspace(
     .set({
       executionWorkspaceId: null,
       executionWorkspacePreference: sql`case when ${issues.executionWorkspacePreference} = 'reuse_existing' then null else ${issues.executionWorkspacePreference} end`,
-      updatedAt: new Date(),
+      // updatedAt is deliberately untouched: closing a workspace is not an edit of the card (SUP-21017).
     })
     .where(
       and(
@@ -2056,7 +2056,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
         await db
           .update(issues)
-          .set({ executionWorkspaceId: null, updatedAt: now() })
+          // Detaching is bookkeeping: it must not reorder cards by "last updated" (SUP-21017).
+          .set({ executionWorkspaceId: null })
           .where(and(
             eq(issues.companyId, workspace.companyId),
             eq(issues.executionWorkspaceId, workspace.id),

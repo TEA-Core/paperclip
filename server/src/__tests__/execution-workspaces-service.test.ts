@@ -1316,6 +1316,24 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(cleanupMarker)).rejects.toThrow();
   });
 
+  it("keeps the source issue's updatedAt when the sweep archives a shared workspace (SUP-21017)", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db.update(executionWorkspaces).set({ mode: "shared_workspace" })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const oldUpdatedAt = new Date("2026-01-01T00:00:00.000Z");
+    await db.update(issues).set({ updatedAt: oldUpdatedAt }).where(eq(issues.id, seeded.sourceIssueId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const [issue] = await db
+      .select({ executionWorkspaceId: issues.executionWorkspaceId, updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    expect(sweep).toMatchObject({ archived: 1 });
+    expect(issue?.executionWorkspaceId).toBeNull();
+    expect(issue?.updatedAt.toISOString()).toBe(oldUpdatedAt.toISOString());
+  });
+
   it("does not reap a reopened workspace while the source issue is still terminal", async () => {
     // Reproduce the reverse-ordering race. A resume reopens the archived
     // workspace and publishes it active, but the route has not yet changed the
@@ -6615,6 +6633,25 @@ describeEmbeddedPostgres("detachIssuesFromClosedExecutionWorkspace", () => {
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
     });
+  });
+
+  it("does not touch updatedAt of the detached issue (SUP-21017)", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 4,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+    const oldUpdatedAt = new Date("2026-01-01T00:00:00.000Z");
+    await db.update(issues).set({ updatedAt: oldUpdatedAt }).where(eq(issues.id, issueId));
+
+    await detachIssuesFromClosedExecutionWorkspace(db, {
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+    });
+
+    const [row] = await db.select({ updatedAt: issues.updatedAt }).from(issues).where(eq(issues.id, issueId));
+    expect(row?.updatedAt.toISOString()).toBe(oldUpdatedAt.toISOString());
   });
 
   it("preserves mode preferences that stay meaningful without a workspace id", async () => {
