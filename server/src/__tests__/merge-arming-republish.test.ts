@@ -1765,6 +1765,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     function installReleaseTransport(opts: {
       liveHead?: string;
       liveBranch?: string;
+      state?: string;
+      merged?: boolean;
       /** Read on every PR GET, so a test can move the head mid-call. */
       liveHeadNow?: () => string;
       statuses?: Array<Record<string, unknown>>;
@@ -1778,7 +1780,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
           return createMockResponse({
-            state: "open", merged: false, draft: opts.draft ?? false,
+            state: opts.state ?? "open", merged: opts.merged ?? false, draft: opts.draft ?? false,
             head: { sha: opts.liveHeadNow?.() ?? opts.liveHead ?? HEAD_SHA, ref: opts.liveBranch ?? DELIVERY_BRANCH },
           });
         }
@@ -1816,9 +1818,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       }).where(eq(issues.id, issueId));
     }
 
-    async function seedReleasable() {
+    // "certified": the card's review certified this PR at this head (finalDelivery).
+    // "ladder": a completed approving ladder whose approved head is this head, no certification.
+    // "none": never approved, so only the explicit override can release it.
+    async function seedReleasable(basis: "certified" | "ladder" | "none" = "certified", seedOpts: Record<string, unknown> = {}) {
       const seeded = await seedIssue({
-        lastDecisionOutcome: null,
+        ...(basis === "certified" ? { certifiedDelivery: true } : {}),
+        ...(basis === "ladder" ? { prePublishedHeadSha: HEAD_SHA } : {}),
+        ...(basis === "none" ? { lastDecisionOutcome: null } : {}),
+        ...seedOpts,
         pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
       });
       await bindDelivery(seeded.issueId);
@@ -1919,7 +1927,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect((await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release")).toEqual([]);
     });
 
-    it("refuses a stale head after the PR head moved on, then releases the new head", async () => {
+    it("refuses a stale head after the PR head moved on; the new head is not covered by the old certification, so only the override releases it", async () => {
       const { issueId } = await seedReleasable();
       installReleaseTransport();
       expect((await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON })).status).toBe(200);
@@ -1930,7 +1938,13 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(stale.status).toBe(409);
       expect(statusWrites()).toEqual([]);
 
-      const fresh = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: OTHER_HEAD_SHA, reason: RELEASE_REASON });
+      const notCovered = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: OTHER_HEAD_SHA, reason: RELEASE_REASON });
+      expect(notCovered.status).toBe(409);
+      expect(statusWrites()).toEqual([]);
+
+      const fresh = await request(app)
+        .post(`/api/issues/${issueId}/merge-arming/release-override`)
+        .send({ headSha: OTHER_HEAD_SHA, overrideReason: "new head pushed after the certification; board accepts it" });
       expect(fresh.status).toBe(200);
       expect(statusWrites().map(([url]) => url)).toEqual([`https://api.github.com/repos/${OWNER}/${REPO}/statuses/${OTHER_HEAD_SHA}`]);
     });
@@ -2099,7 +2113,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     });
 
     it("targets the bound PR, not another PR cited on the card", async () => {
-      const { issueId } = await seedReleasable();
+      const { issueId } = await seedReleasable("ladder");
       await bindDelivery(issueId, {
         prNumber: PR_NUMBER + 1,
         prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER + 1}`,
@@ -2191,7 +2205,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
           lastDecisionId: "decision-certified",
           approvalStatus: {
             ...((state.approvalStatus as Record<string, unknown> | undefined) ?? {}),
-            finalDelivery: { decisionId: "decision-certified", owner: OWNER, repo: REPO, number, headSha: RECORDED_HEAD },
+            finalDelivery: { decisionId: "decision-certified", owner: OWNER, repo: REPO, number, headSha: HEAD_SHA },
           },
         },
       }).where(eq(issues.id, issueId));
@@ -2218,6 +2232,261 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("released");
+    });
+
+
+    // ---- What may be released by the default route (captain's decision on PR 974, 2026-10-24) ----
+
+    async function expectRefusedBeforeAnyGitHubIo(issueId: string, text: RegExp) {
+      installReleaseTransport();
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(res.status).toBe(409);
+      expect(JSON.stringify(res.body)).toMatch(text);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(statusWrites()).toEqual([]);
+      expect(await requestRows()).toEqual([]);
+    }
+
+    it("refuses a card that was never approved: no completed approving ladder and no certified delivery", async () => {
+      const { issueId } = await seedReleasable("none");
+      await expectRefusedBeforeAnyGitHubIo(issueId, /no completed approving ladder or certified delivery/);
+    });
+
+    it("refuses a card whose ladder is incomplete", async () => {
+      const { issueId } = await seedReleasable("ladder", { pendingStageIds: ["stage-review-pending"] });
+      await expectRefusedBeforeAnyGitHubIo(issueId, /no completed approving ladder or certified delivery/);
+    });
+
+    it("refuses a cancelled card even when it is certified", async () => {
+      const { issueId } = await seedReleasable("certified");
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+      await expectRefusedBeforeAnyGitHubIo(issueId, /cancelled/);
+    });
+
+    it("refuses a stale certification: the certified head is not the head being released", async () => {
+      const { issueId } = await seedReleasable("certified");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const state = issue!.executionState as Record<string, any>;
+      await db.update(issues).set({
+        executionState: { ...state, approvalStatus: { ...state.approvalStatus, finalDelivery: { ...state.approvalStatus.finalDelivery, headSha: OTHER_HEAD } } },
+      }).where(eq(issues.id, issueId));
+      await expectRefusedBeforeAnyGitHubIo(issueId, /no completed approving ladder or certified delivery/);
+    });
+
+    it("refuses a completed ladder whose approved head is not the head being released", async () => {
+      const { issueId } = await seedReleasable("ladder", { prePublishedHeadSha: OTHER_HEAD });
+      await expectRefusedBeforeAnyGitHubIo(issueId, /no completed approving ladder or certified delivery/);
+    });
+
+    it("releases a card with a completed approving ladder on the approved head", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("released");
+      expect((await requestRows())[0]).toMatchObject({ details: { basis: "approved_ladder" } });
+    });
+
+    it("releases a certified delivery bound to that head", async () => {
+      const { issueId } = await seedReleasable("certified");
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect((await requestRows())[0]).toMatchObject({ details: { basis: "certified_delivery" } });
+    });
+
+    it("does not accept the override field: the default call cannot reach the override", async () => {
+      const { issueId } = await seedReleasable("none");
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({
+        headSha: HEAD_SHA, reason: RELEASE_REASON, overrideReason: "needed because the ladder cannot be completed",
+      });
+
+      expect(res.status).toBe(400);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    // ---- The separate, explicitly audited override ----
+
+    const OVERRIDE_REASON = "ladder cannot complete: card was cancelled when the work shipped; board accepts the head";
+    const overridePath = (issueId: string) => `/api/issues/${issueId}/merge-arming/release-override`;
+    const overrideRows = async (action: string) => (await db.select().from(activityLog)).filter((event) => event.action === action);
+
+    it("override: releases a never-approved card, with its own audit kinds and the same head-bound status", async () => {
+      const { issueId } = await seedReleasable("none");
+      installReleaseTransport();
+
+      const res = await request(app).post(overridePath(issueId)).send({ headSha: HEAD_SHA, overrideReason: OVERRIDE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ outcome: "released", headSha: HEAD_SHA });
+      const writes = statusWrites();
+      expect(writes).toHaveLength(1);
+      expect(JSON.parse(writes[0]![1].body as string)).toMatchObject({ state: "success", context: "paperclip/approved" });
+      expect(JSON.parse(writes[0]![1].body as string).description).toContain("override");
+      expect(await overrideRows("issue.merge_release_override_requested")).toHaveLength(1);
+      expect(await overrideRows("issue.merge_release_override")).toHaveLength(1);
+      expect(await requestRows()).toEqual([]);
+      expect(await releaseLogRows()).toEqual([]);
+      expect((await overrideRows("issue.merge_release_override"))[0]).toMatchObject({
+        actorType: "user", actorId: USER_ID, details: { headSha: HEAD_SHA, overrideReason: OVERRIDE_REASON, basis: "override" },
+      });
+    });
+
+    it("override: also releases a cancelled card, still bound to the live PR and its head", async () => {
+      const { issueId } = await seedReleasable("none");
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+      installReleaseTransport({ liveHead: OTHER_HEAD });
+
+      const res = await request(app).post(overridePath(issueId)).send({ headSha: HEAD_SHA, overrideReason: OVERRIDE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.message).toContain("head-mismatch");
+      expect(statusWrites()).toEqual([]);
+      expect((await overrideRows("issue.merge_release_override_outcome"))[0]).toMatchObject({ details: { outcome: "refused" } });
+    });
+
+    it("override: writes its intent row before the GitHub write", async () => {
+      const { issueId } = await seedReleasable("none");
+      let intentRowsAtWrite = -1;
+      installReleaseTransport();
+      const original = mockGhFetch.getMockImplementation()!;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          intentRowsAtWrite = (await overrideRows("issue.merge_release_override_requested")).length;
+        }
+        return original(url, init);
+      });
+
+      const res = await request(app).post(overridePath(issueId)).send({ headSha: HEAD_SHA, overrideReason: OVERRIDE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(intentRowsAtWrite).toBe(1);
+    });
+
+    it("override: requires a written reason in its own field, and refuses the default route's field", async () => {
+      const { issueId } = await seedReleasable("none");
+      for (const body of [
+        { headSha: HEAD_SHA },
+        { headSha: HEAD_SHA, overrideReason: "" },
+        { headSha: HEAD_SHA, overrideReason: "ok" },
+        { headSha: HEAD_SHA, reason: OVERRIDE_REASON },
+        { headSha: HEAD_SHA, reason: RELEASE_REASON, overrideReason: OVERRIDE_REASON },
+      ]) {
+        const res = await request(app).post(overridePath(issueId)).send(body);
+        expect(res.status, JSON.stringify(body)).toBe(400);
+      }
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(await overrideRows("issue.merge_release_override_requested")).toEqual([]);
+    });
+
+    it("override: refused for a member who is not an owner or admin, and for an agent, with no GitHub call", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedReleasable("none", { membershipRole: "operator" });
+      currentActor = {
+        type: "board", userId: USER_ID, companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "operator", status: "active" }], source: "cloud_tenant",
+      } as unknown as Express.Request["actor"];
+      expect((await request(app).post(overridePath(issueId)).send({ headSha: HEAD_SHA, overrideReason: OVERRIDE_REASON })).status).toBe(403);
+
+      currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key" } as unknown as Express.Request["actor"];
+      expect((await request(app).post(overridePath(issueId)).send({ headSha: HEAD_SHA, overrideReason: OVERRIDE_REASON })).status).toBe(403);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("override: keeps the certified-delivery pin", async () => {
+      const { issueId } = await seedReleasable("certified");
+      await certifyDelivery(issueId, PR_NUMBER + 50);
+
+      const res = await request(app).post(overridePath(issueId)).send({ headSha: HEAD_SHA, overrideReason: OVERRIDE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    // ---- Live PR checks before any already-approved answer; head moved after the write; at-most-once; thrown prerequisites ----
+
+    it.each([
+      ["a stale head", { liveHead: OTHER_HEAD }],
+      ["a draft PR", { draft: true }],
+      ["a closed PR", { state: "closed" }],
+      ["a merged PR", { merged: true, state: "closed" }],
+      ["a PR that left the bound branch", { liveBranch: FOREIGN_BRANCH }],
+    ])("does not answer already_approved for %s: the live PR is checked first", async (_name, transport) => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ ...transport, statuses: [approvedRow("success", CONTROL_PLANE_CREATOR)] });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("refused");
+      expect(statusWrites()).toEqual([]);
+    });
+
+    it("reports a head that moved after the write as stale, not as a release", async () => {
+      const { issueId } = await seedReleasable();
+      let head = HEAD_SHA;
+      installReleaseTransport({ liveHeadNow: () => head, postStatus: () => { head = OTHER_HEAD; return { ok: true, status: 201 }; } });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("stale");
+      expect(res.body.message).toContain("head-moved-after-write");
+      expect(statusWrites()).toHaveLength(1);
+      expect(await releaseLogRows()).toEqual([]);
+      expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "stale" } });
+    });
+
+    it("serializes concurrent releases of one head: one status write, the other answers already_approved", async () => {
+      const { issueId } = await seedReleasable();
+      let written = false;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+          return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+        }
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          written = true;
+          return createMockResponse({ id: 1 }, true, 201);
+        }
+        if (url.includes("/statuses/")) return createMockResponse(written ? [approvedRow("success", CONTROL_PLANE_CREATOR)] : []);
+        throw new Error(`Unexpected release request: ${url}`);
+      });
+
+      const send = () => request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      const [a, b] = await Promise.all([send(), send()]);
+
+      expect([a.body.outcome, b.body.outcome].sort()).toEqual(["already_approved", "released"]);
+      expect(statusWrites()).toHaveLength(1);
+      expect(await releaseLogRows()).toHaveLength(1);
+    });
+
+    it("records a failed outcome row, tied to the intent row, when a publish prerequisite throws", async () => {
+      const { issueId } = await seedReleasable();
+      mockResolveControlPlaneToken.mockRejectedValue(new Error("secret store unreachable"));
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("failed");
+      expect(res.body.message).toContain("status:failed:internal");
+      const [intent] = await requestRows();
+      expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "failed", intentId: intent!.id } });
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("writes the status without a placeholder target_url", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+
+      await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(JSON.parse(statusWrites()[0]![1].body as string)).not.toHaveProperty("target_url");
     });
 
     it("rejects a malformed body with 400 before any GitHub I/O", async () => {

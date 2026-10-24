@@ -1151,6 +1151,14 @@ export const releaseIssueHeadSchema = z.object({
 }).strict();
 export type ReleaseIssueHead = z.infer<typeof releaseIssueHeadSchema>;
 
+// The explicit override for a card the default release refuses (no completed approving ladder or
+// certified delivery, or cancelled). Its own request field, so the default body cannot reach it.
+export const overrideReleaseIssueHeadSchema = z.object({
+  headSha: z.string().regex(/^[0-9a-f]{40}$/),
+  overrideReason: z.string().trim().min(10).max(1000),
+}).strict();
+export type OverrideReleaseIssueHead = z.infer<typeof overrideReleaseIssueHeadSchema>;
+
 export const stalledReviewDecisionSchema = z
   .object({
     action: z.enum(["approve", "request_changes", "send_back"]),
