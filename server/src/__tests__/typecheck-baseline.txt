@@ -358,10 +358,10 @@ server/src/__tests__/codex-local-execute.test.ts(1437,68): TS18047
 server/src/__tests__/companies-route-merge-arming-flag.test.ts(111,12): TS2531
 server/src/__tests__/companies-route-merge-arming-flag.test.ts(70,12): TS2531
 server/src/__tests__/companies-route-merge-arming-flag.test.ts(87,12): TS2531
-server/src/__tests__/company-portability.test.ts(2731,7): TS2322
-server/src/__tests__/company-portability.test.ts(2733,7): TS2322
-server/src/__tests__/company-portability.test.ts(2761,40): TS2322
-server/src/__tests__/company-portability.test.ts(2791,40): TS2322
+server/src/__tests__/company-portability.test.ts(2736,7): TS2322
+server/src/__tests__/company-portability.test.ts(2738,7): TS2322
+server/src/__tests__/company-portability.test.ts(2766,40): TS2322
+server/src/__tests__/company-portability.test.ts(2796,40): TS2322
 server/src/__tests__/company-portability.test.ts(496,45): TS2339
 server/src/__tests__/company-portability.test.ts(498,45): TS2339
 server/src/__tests__/company-search-rate-limit-routes.test.ts(107,7): TS2741
