@@ -28,7 +28,6 @@ export type {
   RunSummary,
 } from "./application/types.js";
 export { WakeQueueApplicationError } from "./application/types.js";
-export { recordNativeTerminalRecoveryIfNeeded } from "./adapters/postgres.js";
 export type {
   IssueSnapshot,
   RunSnapshot,

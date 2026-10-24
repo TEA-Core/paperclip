@@ -8,7 +8,6 @@ import {
   companies,
   createDb,
   heartbeatRuns,
-  issueRecoveryActions,
   issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
@@ -19,9 +18,8 @@ import {
 import { heartbeatService } from "../services/heartbeat.js";
 
 // Fold 2c / native retry cancel. Upstream #13075 (35fdc0c66) lets cancelRun stop a failed native
-// run whose durable retry is still pending. That cancellation reaches the fork's in-file release,
-// which takes upstream's native exit (recordNativeTerminalRecoveryIfNeeded): it holds the task for
-// board reconciliation and must not answer the cancellation with a generic
+// run whose durable retry is still pending. With D9 deferred, that cancellation reaches the fork's
+// in-file release. The release must not answer the cancellation with a generic
 // issue_continuation_needed replacement run. Upstream's native-safe-replacement test pins this
 // only on a fixture with no responsible user, where the unfixed release threw 422 before inserting
 // anything. This file pins the production shape too: the company has a default responsible user,
@@ -44,7 +42,7 @@ const support = await getEmbeddedPostgresTestSupport();
   it.each([
     ["a company default responsible user", "responsible-user"],
     ["no responsible user", null],
-  ])("holds the task for reconciliation without a replacement run when there is %s", async (_label, responsibleUserId) => {
+  ])("releases the task without a replacement run when there is %s", async (_label, responsibleUserId) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -99,17 +97,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await heartbeat.cancelRun(runId)).toMatchObject({ status: "cancelled" });
 
     const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
-    expect(coordinator).toMatchObject({ phase: "terminal_failure", nextAttemptAt: null, failureCode: "native_continuation_requires_reconciliation" });
+    expect(coordinator).toMatchObject({ phase: "terminal_failure", nextAttemptAt: null, failureCode: "native_retry_cancelled" });
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     expect(runs.map((run) => ({ id: run.id, status: run.status }))).toEqual([{ id: runId, status: "cancelled" }]);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
     const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(task).toMatchObject({ status: "blocked", assigneeAgentId: agentId, executionRunId: null });
-    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(action).toMatchObject({
-      cause: "native_continuation_requires_reconciliation",
-      ownerType: "board",
-      fingerprint: `native-continuation:${runId}`,
-    });
+    expect(task).toMatchObject({ status: "in_progress", assigneeAgentId: agentId, executionRunId: null });
   });
 });
