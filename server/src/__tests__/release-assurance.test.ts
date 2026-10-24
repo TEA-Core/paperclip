@@ -570,6 +570,43 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
       expect(await resolve()).toBeNull();
     });
 
+    it("matches the recorded branch and the card's workspace branch exactly, in both directions", async () => {
+      // Git refs are case-sensitive: `Feature/X` is not `feature/x`, whichever side carries the alias.
+      for (const [recorded, workspace] of [["Feature/X", "feature/x"], ["feature/x", "Feature/X"]] as const) {
+        await seedDeliveryCard(record({ branch: recorded }), "https://github.com/TEA-Core/paperclip", workspace);
+        expect(await resolve()).toBeNull();
+        await db.update(issues).set({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: null, executionState: null }).where(eq(issues.id, issueId));
+        await db.delete(executionWorkspaces);
+        await db.delete(projectWorkspaces);
+        await db.delete(projects);
+      }
+      await seedDeliveryCard(record({ branch: "Feature/X" }), "https://github.com/TEA-Core/paperclip", "Feature/X");
+      expect(await resolve()).toMatchObject({ branch: "Feature/X" });
+    });
+
+    it("refuses hold and go for a case-distinct recorded branch even when the live ref carries the same alias", async () => {
+      const realApp = express();
+      realApp.use(express.json());
+      realApp.use((req, _res, next) => { req.actor = actor; next(); });
+      realApp.use("/api", releaseDecisionRoutes(db, { ...releaseAssuranceDeps(db), readLivePullRequest: async () => live }));
+      realApp.use(errorHandler);
+      const hold = (body = enrollBody()) => request(realApp).post(`/api/issues/${issueId}/release-assurance/enroll`).send(body);
+      const go = (body = goBody()) => request(realApp).post(`/api/issues/${issueId}/release-decisions`).send(body);
+
+      // The card's workspace is `feature/x`; the stored record and the live PR both say `Feature/X`.
+      const { executionWorkspaceId } = await seedDeliveryCard(record({ branch: "Feature/X" }), "https://github.com/TEA-Core/paperclip", "feature/x");
+      live = livePr({ branch: "Feature/X" });
+      expect((await hold()).status).toBe(409);
+      expect(await rows()).toHaveLength(0);
+
+      // Exact record: enrolls. Then a workspace-only case change before the GO is refused too.
+      await db.update(executionWorkspaces).set({ branchName: "Feature/X" }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+      expect((await hold()).status).toBe(201);
+      await db.update(executionWorkspaces).set({ branchName: "feature/x" }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+      expect((await go()).status).toBe(409);
+      expect((await rows()).map((r) => r.kind)).toEqual(["hold"]);
+    });
+
     it("refuses a non-GitHub project repository", async () => {
       await seedDeliveryCard(record({ repo: { owner: "a", repo: "b" }, prUrl: "https://gitlab.example.com/a/b/-/merge_requests/4242" }), "https://gitlab.example.com/a/b");
       expect(await resolve()).toBeNull();

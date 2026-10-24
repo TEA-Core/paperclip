@@ -1768,7 +1768,8 @@ export async function resolveDeliveryIdentity(
     const branchOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
     if (
       branchOwnership.branch === null ||
-      branch.toLowerCase() !== branchOwnership.branch.toLowerCase()
+      // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
+      branch !== branchOwnership.branch
     ) {
       return {
         branch: null,
