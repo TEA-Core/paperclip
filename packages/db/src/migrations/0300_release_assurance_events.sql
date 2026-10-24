@@ -2,11 +2,13 @@
 -- table only: no existing table, row, or constraint is altered. Rows are
 -- inserted and never rewritten; `publication_mode` can only be 'shadow'. The
 -- company and issue foreign keys have no delete policy, so deleting a parent
--- that still has ledger rows is refused instead of erasing the audit trail. The
--- issue key is composite with the company so the pair must match. The ledger is
--- append-only in the database: UPDATE/DELETE/TRUNCATE are revoked from the
--- serving role; UPDATE/DELETE are also rejected by a trigger for every role.
-CREATE TABLE IF NOT EXISTS "release_assurance_events" (
+-- that still has ledger rows is refused instead of erasing the audit trail.
+-- The table, constraints and indexes below are drizzle-kit generated from
+-- schema/release_assurance_events.ts. The append-only trigger and REVOKEs after
+-- them are hand-authored because the generator cannot emit them: UPDATE/DELETE/
+-- TRUNCATE are revoked from the serving role, and UPDATE/DELETE are also
+-- rejected by a trigger for every role.
+CREATE TABLE "release_assurance_events" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"company_id" uuid NOT NULL,
 	"issue_id" uuid NOT NULL,
@@ -36,19 +38,13 @@ CREATE TABLE IF NOT EXISTS "release_assurance_events" (
 	CONSTRAINT "release_assurance_events_evidence_digest_check" CHECK ("release_assurance_events"."evidence_digest" is null or "release_assurance_events"."evidence_digest" ~ '^[0-9a-f]{64}$')
 );
 --> statement-breakpoint
-DO $$ BEGIN ALTER TABLE "release_assurance_events" ADD CONSTRAINT "release_assurance_events_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE no action ON UPDATE no action; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
---> statement-breakpoint
-DO $$ BEGIN ALTER TABLE "release_assurance_events" ADD CONSTRAINT "release_assurance_events_company_issue_fk" FOREIGN KEY ("company_id","issue_id") REFERENCES "public"."issues"("company_id","id") ON DELETE no action ON UPDATE no action; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
---> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "release_assurance_events_company_event_uq" ON "release_assurance_events" USING btree ("company_id","event_id");
---> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "release_assurance_events_issue_hold_uq" ON "release_assurance_events" USING btree ("company_id","issue_id") WHERE "release_assurance_events"."kind" = 'hold';
---> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "release_assurance_events_pr_hold_uq" ON "release_assurance_events" USING btree ("company_id","owner","repo","pull_request_number") WHERE "release_assurance_events"."kind" = 'hold';
---> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "release_assurance_events_issue_head_go_uq" ON "release_assurance_events" USING btree ("company_id","issue_id","head_sha") WHERE "release_assurance_events"."kind" = 'go';
---> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "release_assurance_events_issue_sequence_idx" ON "release_assurance_events" USING btree ("company_id","issue_id","sequence");
+ALTER TABLE "release_assurance_events" ADD CONSTRAINT "release_assurance_events_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "release_assurance_events" ADD CONSTRAINT "release_assurance_events_company_issue_fk" FOREIGN KEY ("company_id","issue_id") REFERENCES "public"."issues"("company_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+CREATE UNIQUE INDEX "release_assurance_events_company_event_uq" ON "release_assurance_events" USING btree ("company_id","event_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "release_assurance_events_issue_hold_uq" ON "release_assurance_events" USING btree ("company_id","issue_id") WHERE "release_assurance_events"."kind" = 'hold';--> statement-breakpoint
+CREATE UNIQUE INDEX "release_assurance_events_pr_hold_uq" ON "release_assurance_events" USING btree ("company_id","owner","repo","pull_request_number") WHERE "release_assurance_events"."kind" = 'hold';--> statement-breakpoint
+CREATE UNIQUE INDEX "release_assurance_events_issue_head_go_uq" ON "release_assurance_events" USING btree ("company_id","issue_id","head_sha") WHERE "release_assurance_events"."kind" = 'go';--> statement-breakpoint
+CREATE INDEX "release_assurance_events_issue_sequence_idx" ON "release_assurance_events" USING btree ("company_id","issue_id","sequence");
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION "release_assurance_events_reject_mutation"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'release_assurance_events is append-only: % is not allowed', TG_OP USING ERRCODE = '55000'; END $$;
 --> statement-breakpoint
