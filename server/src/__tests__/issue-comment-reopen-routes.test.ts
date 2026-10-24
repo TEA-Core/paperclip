@@ -3417,7 +3417,7 @@ describe.sequential("issue comment reopen routes", () => {
 
   it("rejects auto-approval when delivery classification changes before the locked transition", async () => {
     const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
-    const policy = await normalizePolicy({
+    const policy = (await normalizePolicy({
       stages: [
         {
           id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -3425,7 +3425,7 @@ describe.sequential("issue comment reopen routes", () => {
           participants: [{ type: "agent", agentId: reviewerAgentId }],
         },
       ],
-    })!;
+    }))!;
     const issue = {
       ...makeIssue("todo"),
       status: "in_review",
