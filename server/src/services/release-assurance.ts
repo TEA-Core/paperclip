@@ -60,7 +60,8 @@ const sameDelivery = (a: { owner: string; repo: string; number: number }, b: { o
  * (for example a deleted head repository) cannot be verified, so it fails closed.
  */
 const livePrMismatch = (live: Extract<LivePullRequest, { ok: true }>, delivery: RecordedDelivery) => {
-  if (!live.branch || live.branch.toLowerCase() !== delivery.branch.toLowerCase()) {
+  // Git refs are case-sensitive, so the branch is an exact comparison; repository names are not.
+  if (!live.branch || live.branch !== delivery.branch) {
     return "The live pull request's head branch is not the card's recorded delivery branch";
   }
   if (!live.headRepo || live.headRepo.toLowerCase() !== `${delivery.owner}/${delivery.repo}`.toLowerCase()) {

@@ -216,7 +216,15 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
       expect((await enroll()).status).toBe(409);
     }
     expect(await rows()).toHaveLength(0);
-    live = livePr({ branch: PR.branch.toUpperCase(), headRepo: "tea-core/PAPERCLIP" }); // comparison ignores case
+    // Git refs are case-sensitive: a branch that differs only in case is a different branch, here at another commit.
+    live = livePr({ branch: PR.branch.toLowerCase(), headSha: HEAD_B });
+    expect(PR.branch.toLowerCase()).not.toBe(PR.branch);
+    expect((await enroll()).status).toBe(409);
+    live = livePr({ branch: PR.branch.toUpperCase() });
+    expect((await enroll()).status).toBe(409);
+    expect(await rows()).toHaveLength(0);
+    // Repository names are case-insensitive on GitHub, so only the repository comparison ignores case.
+    live = livePr({ headRepo: "tea-core/PAPERCLIP" });
     expect((await enroll()).status).toBe(201);
   });
 
@@ -226,7 +234,12 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
     expect((await decide(goBody())).status).toBe(409);
     live = livePr({ headRepo: null });
     expect((await decide(goBody())).status).toBe(409);
+    live = livePr({ branch: PR.branch.toLowerCase(), headSha: HEAD_B }); // case-distinct branch at another commit
+    expect((await decide(goBody({ headSha: HEAD_B }))).status).toBe(409);
+    live = livePr({ branch: PR.branch.toUpperCase() });
+    expect((await decide(goBody())).status).toBe(409);
     expect((await rows()).map((row) => row.kind)).toEqual(["hold"]);
+    live = livePr();
     expect((await decide(noGoBody())).status).toBe(201);
   });
 
