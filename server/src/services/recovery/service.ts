@@ -1370,16 +1370,17 @@ async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: strin
 export async function blockIssueWithUnresolvedBlockers(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null; status: string },
-  opts: { source: string; previousStatus: string; extraUpdate?: Record<string, unknown>; tx?: unknown },
+  opts: { source: string; previousStatus: string; extraUpdate?: Record<string, unknown>; tx?: Db },
 ) {
-  const blockedByIssueIds = (await unresolvedBlockerIssues(db, issue.companyId, issue.id)).map((row) => row.id);
+  const runner = opts.tx ?? db;
+  const blockedByIssueIds = (await unresolvedBlockerIssues(runner, issue.companyId, issue.id)).map((row) => row.id);
   if (blockedByIssueIds.length === 0) {
     logger.info(
       { issueId: issue.id, identifier: issue.identifier, source: opts.source, previousStatus: opts.previousStatus },
       "recovery blocked-write has an empty blocker set; zero-blocker heal or recovery owner will wake it",
     );
   }
-  return (await issueService(db).update(issue.id, { status: "blocked", blockedByIssueIds, ...opts.extraUpdate, companyGuard: issue.companyId }, opts.tx ?? db)) ?? null;
+  return (await issueService(runner).update(issue.id, { status: "blocked", blockedByIssueIds, ...opts.extraUpdate, companyGuard: issue.companyId }, runner)) ?? null;
 }
 
 /**
@@ -1526,20 +1527,20 @@ export function recoveryService(
   // unaffected by the restart.
   const undispatchableAssignedSightCounts = new Map<string, number>();
 
-  async function getAgent(agentId: string) {
-    return db
+  async function getAgent(agentId: string, runner: Db = db) {
+    return runner
       .select()
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined): Promise<AgentInvokability> {
-    return evaluateAgentInvokabilityFromDb(db, agent);
+  async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined, runner: Db = db): Promise<AgentInvokability> {
+    return evaluateAgentInvokabilityFromDb(runner, agent);
   }
 
-  async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
-    return (await getAgentInvokability(agent)).invokable;
+  async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined, runner: Db = db) {
+    return (await getAgentInvokability(agent, runner)).invokable;
   }
 
   // SUP-17884 C2 liveness read: the agent's K most recent wake-request outcomes,
@@ -1549,8 +1550,9 @@ export function recoveryService(
   async function hasConsecutiveWakeFailuresForAgent(
     agentId: string,
     consecutiveFailures: number,
+    runner: Db = db,
   ): Promise<boolean> {
-    const statuses = await db
+    const statuses = await runner
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId))
@@ -2827,8 +2829,9 @@ export function recoveryService(
   async function isInvocationBudgetBlocked(
     issue: typeof issues.$inferSelect,
     agentId: string,
+    runner: Db = db,
   ) {
-    const budgetBlock = await budgets.getInvocationBlock(
+    const budgetBlock = await (runner === db ? budgets : budgetService(runner)).getInvocationBlock(
       issue.companyId,
       agentId,
       {
@@ -2939,14 +2942,17 @@ export function recoveryService(
       // the PATCH handler and the other recovery paths. A refusal keeps the
       // blocker unassigned instead of making its review stage self-satisfiable.
       const updated = await db.transaction(async (tx) => {
+        // Drizzle's transaction omits $client from Db's type, but its queries
+        // use the same reserved connection as the issue-row lock.
+        const txDb = tx as unknown as Db;
         const [current] = await tx.select().from(issues)
           .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId)))
           .for("update").limit(1);
         if (!current) return null;
         if (current.assigneeAgentId || current.assigneeUserId) return null;
-        const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, nextAgent.id);
+        const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, nextAgent.id, txDb);
         if (!nextAssigneeAgentId) return null;
-        return issuesSvc.update(candidate.id, {
+        return issueService(txDb).update(candidate.id, {
           assigneeAgentId: nextAssigneeAgentId,
           assigneeUserId: null,
           companyGuard: candidate.companyId,
@@ -4457,10 +4463,10 @@ export function recoveryService(
       executionState: unknown;
     },
     recoveryOwnerAgentId: string | null,
-    currentAssigneeAgentId?: string | null,
+    runner: Db = db,
   ): Promise<string | null> {
     const candidate = recoveryOwnerAgentId ?? issue.assigneeAgentId;
-    const effectiveCurrent = currentAssigneeAgentId ?? issue.assigneeAgentId;
+    const effectiveCurrent = issue.assigneeAgentId;
     if (!candidate || candidate === effectiveCurrent) return candidate;
 
     let reviewStageSelfSatisfies = false;
@@ -4480,12 +4486,12 @@ export function recoveryService(
     // it fresh so a live agent that started failing between selection and
     // write is still refused here (this is also the backstop for the
     // original-agent routing path, which does not run the C2 filter).
-    const targetAgent = await getAgent(candidate);
+    const targetAgent = await getAgent(candidate, runner);
     const recoveryOwnerLive =
       targetAgent != null &&
       targetAgent.companyId === issue.companyId &&
-      (await isAgentInvokable(targetAgent)) &&
-      !(await hasConsecutiveWakeFailuresForAgent(candidate, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES));
+      (await isAgentInvokable(targetAgent, runner)) &&
+      !(await hasConsecutiveWakeFailuresForAgent(candidate, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, runner));
 
     const decision = decideRecoveryReassignment({
       currentAssigneeAgentId: effectiveCurrent,
@@ -5374,6 +5380,7 @@ export function recoveryService(
     // the same transaction. A concurrent transition into review cannot be
     // displaced by the earlier sweep snapshot.
     const escalation = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
       const [current] = await tx.select().from(issues)
         .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
         .for("update").limit(1);
@@ -5382,7 +5389,7 @@ export function recoveryService(
       const participantAgent = pendingParticipant?.type === "agent" &&
         pendingParticipant.agentId &&
         pendingParticipant.agentId === current.assigneeAgentId
-        ? await getAgent(pendingParticipant.agentId)
+        ? await getAgent(pendingParticipant.agentId, txDb)
         : null;
       const boardOnlyPendingParticipant =
         wouldDisplacePendingStageParticipant({
@@ -5392,15 +5399,14 @@ export function recoveryService(
         }) &&
         (!participantAgent ||
           !isAgentStatusInvokable(participantAgent.status) ||
-          !(await isAgentInvokable(participantAgent)) ||
-          (await isInvocationBudgetBlocked(current, participantAgent.id)) ||
-          (await hasConsecutiveWakeFailuresForAgent(participantAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES)));
+          !(await isAgentInvokable(participantAgent, txDb)) ||
+          (await isInvocationBudgetBlocked(current, participantAgent.id, txDb)) ||
+          (await hasConsecutiveWakeFailuresForAgent(participantAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, txDb)));
       let recoveryAction = routedAction;
       if (boardOnlyPendingParticipant && recoveryAction.ownerAgentId) {
-        // The legacy heartbeat claimant rejects a source-scoped recovery run
-        // for a non-assignee. An unavailable participant cannot own a live
-        // stage and a replacement owner cannot run, so require board repair
-        // immediately instead of queuing a run that is certain to be cancelled.
+        // A participant that cannot run cannot complete its pending stage.
+        // Even an authorized replacement worker cannot decide that stage on
+        // behalf of the participant; require explicit board repair instead.
         const [boardAction] = await tx.update(issueRecoveryActions).set({
           ownerType: "board",
           ownerAgentId: null,
@@ -5423,7 +5429,7 @@ export function recoveryService(
           evidence: boardAction.evidence,
         };
       }
-      const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, recoveryAction.ownerAgentId);
+      const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, recoveryAction.ownerAgentId, txDb);
       const updated = await blockIssueWithUnresolvedBlockers(db, current, {
         source: escalationSource,
         previousStatus: input.previousStatus,
@@ -5432,7 +5438,7 @@ export function recoveryService(
         extraUpdate: nextAssigneeAgentId === current.assigneeAgentId
           ? {}
           : { assigneeAgentId: nextAssigneeAgentId },
-        tx,
+        tx: txDb,
       });
       return updated ? { recoveryAction, updated, current } : null;
     });
@@ -5646,18 +5652,19 @@ export function recoveryService(
           currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
       ) {
         const reblocked = await db.transaction(async (tx) => {
+          const txDb = tx as unknown as Db;
           const [latest] = await tx.select().from(issues)
             .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
             .for("update").limit(1);
           if (!latest) return null;
-          const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(latest, recoveryAction.ownerAgentId);
+          const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(latest, recoveryAction.ownerAgentId, txDb);
           return blockIssueWithUnresolvedBlockers(db, latest, {
             source: escalationSource,
             previousStatus: input.previousStatus,
             extraUpdate: nextAssigneeAgentId === latest.assigneeAgentId
               ? {}
               : { assigneeAgentId: nextAssigneeAgentId },
-            tx,
+            tx: txDb,
           });
         });
         if (reblocked) return reblocked;
@@ -10146,8 +10153,8 @@ export function recoveryService(
   //   - terminal/missing source issues are dropped (nothing left to recover)
   //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
   //     causes are skipped without burning an attempt
-  //   - `board_escalation` actions are rerouted to an invokable agent owner when
-  //     one can be resolved, instead of waiting on a human forever
+  //   - ordinary `board_escalation` actions may be rerouted to an invokable
+  //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
   //     pre-image, so concurrent sweeps cannot double-fire
   //   - at `maxAttempts` the action is escalated to the board with a comment on
@@ -10242,6 +10249,19 @@ export function recoveryService(
         continue;
       }
       if (!candidate.ownerAgentId && wakePolicyType !== "board_escalation") {
+        result.nonWakeableSkipped += 1;
+        continue;
+      }
+
+      // This action was deliberately sent to the board because its pending
+      // participant cannot run. A different agent may be invokable, but
+      // reassigning the action to it recreates the failed recovery path.
+      // Board repair must explicitly restore/re-arm or reset the workflow.
+      if (
+        candidate.ownerType === "board" &&
+        wakePolicyType === "board_escalation" &&
+        readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
+      ) {
         result.nonWakeableSkipped += 1;
         continue;
       }

@@ -20375,7 +20375,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issue.assigneeAgentId !== run.agentId &&
       !isInteractionWake &&
       !isCurrentReviewParticipant &&
-      !isNonAssigneeWorkspaceBusyRetry(retryReason, context)
+      !isNonAssigneeWorkspaceBusyRetry(retryReason, context) &&
+      !authorizedSourceScopedRecovery
     ) {
       // Prefer the in-review participant when one is set: on an in_review issue
       // that agent is the owner the staleness gate below will actually accept,

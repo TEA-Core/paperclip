@@ -4,13 +4,14 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agents, budgetPolicies, companies, costEvents, createDb, heartbeatRuns,
+  agents, agentWakeupRequests, budgetPolicies, companies, costEvents, createDb, heartbeatRuns,
   issueRecoveryActions, issueRelations, issues,
   type Db, type EmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { errorHandler } from "../../middleware/index.js";
 import { issueRoutes } from "../../routes/issues.js";
+import { heartbeatService } from "../heartbeat.js";
 import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
 import {
   RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES,
@@ -22,6 +23,39 @@ import {
   wouldDisplacePendingStageParticipant,
   recoveryService,
 } from "./service.js";
+
+const mockRecoveryAdapterExecute = vi.hoisted(() => vi.fn(async (_input: { runId: string }) => ({
+  exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+  summary: "Disposable recovery claim", provider: "test", model: "test",
+})));
+vi.mock("../../adapters/index.js", async () => {
+  const actual = await vi.importActual<typeof import("../../adapters/index.js")>("../../adapters/index.js");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute: mockRecoveryAdapterExecute })),
+  };
+});
+
+const issueUpdateHook = vi.hoisted(() => ({
+  beforeUpdate: null as null | (() => Promise<void>),
+}));
+vi.mock("../issues.js", async () => {
+  const actual = await vi.importActual<typeof import("../issues.js")>("../issues.js");
+  return {
+    ...actual,
+    issueService: (...args: Parameters<typeof actual.issueService>) => {
+      const service = actual.issueService(...args);
+      const update = service.update;
+      service.update = async (...updateArgs: Parameters<typeof update>) => {
+        const beforeUpdate = issueUpdateHook.beforeUpdate;
+        issueUpdateHook.beforeUpdate = null;
+        if (beforeUpdate) await beforeUpdate();
+        return update(...updateArgs);
+      };
+      return service;
+    },
+  };
+});
 
 describe("SUP-17884: recovery bounce eligibility (pure helpers)", () => {
   describe("RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES", () => {
@@ -513,17 +547,20 @@ const postgresSupport = await getEmbeddedPostgresTestSupport();
     db = createDb(temp.connectionString);
     competingDb = createDb(temp.connectionString);
   }, 60_000);
-  afterEach(async () => { await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterEach(async () => {
+    issueUpdateHook.beforeUpdate = null;
+    await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
+  });
   afterAll(async () => { await temp?.cleanup(); });
 
-  async function seed(status: "active" | "paused" | "terminated" | "pending_approval" | "budget_paused" | "over_budget", state = stage) {
+  async function seed(status: "active" | "error" | "paused" | "terminated" | "pending_approval" | "budget_paused" | "over_budget" | "archived" | "active_wake_fail", state = stage) {
     const companyId = randomUUID();
     const issueId = randomUUID();
     const old = new Date(Date.now() - 3_600_000);
-    await db.insert(companies).values({ id: companyId, name: "Pending review recovery", issuePrefix: "PRR", requireBoardApprovalForNewAgents: false });
+    await db.insert(companies).values({ id: companyId, name: "Pending review recovery", issuePrefix: "PRR", requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "board-test" });
     await db.insert(agents).values([
       { id: managerId, companyId, name: "Manager", role: "cto", status: "idle", adapterType: "codex_local", permissions: { canAssignTasks: true } },
-      { id: participantId, companyId, name: "Reviewer", role: "engineer", status: status === "budget_paused" ? "paused" : status === "over_budget" ? "active" : status, pauseReason: status === "budget_paused" ? "budget" : null, reportsTo: managerId, adapterType: "codex_local" },
+      { id: participantId, companyId, name: "Reviewer", role: "engineer", status: status === "budget_paused" ? "paused" : status === "over_budget" || status === "active_wake_fail" ? "active" : status as typeof agents.$inferInsert.status, pauseReason: status === "budget_paused" ? "budget" : null, reportsTo: managerId, adapterType: "codex_local" },
       { id: authorId, companyId, name: "Author", role: "engineer", status: "idle", reportsTo: managerId, adapterType: "codex_local" },
     ]);
     const policy = normalizeIssueExecutionPolicy({ mode: "normal", stages: [{ id: stageId, type: "review", participants: [participant] }] });
@@ -533,29 +570,194 @@ const postgresSupport = await getEmbeddedPostgresTestSupport();
       await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: participantId, metric: "billed_cents", windowKind: "calendar_month", amount: 1, hardStopEnabled: true });
       await db.insert(costEvents).values({ companyId, agentId: participantId, provider: "test", model: "test", costCents: 2, billingType: "metered", occurredAt: new Date() });
     }
-    const enqueueWakeup = vi.fn(async () => null);
+    if (status === "active_wake_fail") {
+      await db.insert(agentWakeupRequests).values([0, 1, 2].map((index) => ({
+        companyId, agentId: participantId, source: "automation" as const,
+        reason: "fixture_failed_dispatch", status: "failed" as const,
+        requestedAt: new Date(old.getTime() - index * 1_000),
+        payload: { issueId },
+      })));
+    }
+    const enqueueWakeup = vi.fn(async (_agentId: string, _opts?: unknown) => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     return { issueId, companyId, recovery, enqueueWakeup };
   }
 
-  it.each(["paused", "terminated", "pending_approval", "budget_paused", "over_budget"] as const)(
-    "routes an unavailable %s participant to the board instead of cancelling a replacement wake",
+  async function claimQueuedRecoveryRun(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    recoveryActionId: string,
+    wakeOptions?: {
+      reason: string;
+      payload: Record<string, unknown>;
+      contextSnapshot: Record<string, unknown>;
+    },
+  ) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const contextSnapshot = wakeOptions?.contextSnapshot ?? {
+      issueId, taskId: issueId, wakeReason: "source_scoped_recovery_action",
+      recoveryActionId,
+    };
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId, companyId, agentId, source: "assignment",
+      reason: wakeOptions?.reason ?? "source_scoped_recovery_action",
+      status: "queued", runId, payload: wakeOptions?.payload ?? { issueId, recoveryActionId },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "queued",
+      invocationSource: "assignment", runtimeMode: "legacy",
+      wakeupRequestId, contextSnapshot,
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    return run;
+  }
+
+  async function completeWithinPoolDeadline<T>(
+    work: Promise<T>,
+    applicationName: string,
+    timeoutMs = 4_000,
+  ) {
+    // Real pool acquisition can stall independently of Vitest's clock; bound
+    // only this disposable integration fixture and interrupt its named backend.
+    // The test tsconfig does not include ES2024 Promise.withResolvers.
+    let resolveDeadline!: (value: { kind: "timed_out" }) => void;
+    const deadline = new Promise<{ kind: "timed_out" }>((resolve) => { resolveDeadline = resolve; });
+    const timer = setTimeout(() => resolveDeadline({ kind: "timed_out" }), timeoutMs);
+    const outcome = await Promise.race([
+      work.then((value) => ({ kind: "completed" as const, value }), (error: unknown) => ({ kind: "failed" as const, error })),
+      deadline,
+    ]);
+    clearTimeout(timer);
+    if (outcome.kind === "timed_out") {
+      // Only this disposable fixture's named pool is interrupted. Await its
+      // rejected transaction before truncating rows or stopping PostgreSQL.
+      await competingDb.execute(sql`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = ${applicationName}`);
+      await work.catch(() => undefined);
+    }
+    expect(outcome.kind).toBe("completed");
+    if (outcome.kind === "failed") throw outcome.error;
+    return outcome.kind === "completed" ? outcome.value : null;
+  }
+
+  it.each([true, false])("completes locked recovery with a one-connection pool, pending stage %s", async (pending) => {
+    const { issueId } = await seed("paused");
+    if (!pending) {
+      await db.update(issues).set({ executionState: null, executionPolicy: null }).where(eq(issues.id, issueId));
+    }
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const applicationName = `pending-review-one-${randomUUID()}`;
+    const limited = createDb(temp.connectionString, { maxConnections: 1, applicationName });
+    const recovery = recoveryService(limited, { enqueueWakeup: async () => null });
+    await completeWithinPoolDeadline(
+      recovery.escalateStrandedAssignedIssue({
+        issue, previousStatus: "in_review", latestRun: null,
+        recoveryCause: "execution_review_participant_recovery", recoveryOwnerAgentId: managerId,
+      }),
+      applicationName,
+    );
+    const [updated] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updated.status).toBe("blocked");
+    expect(updated.assigneeAgentId).toBe(pending ? participantId : managerId);
+  }, 20_000);
+
+  it("completes simultaneous locked recovery with a shared two-connection pool", async () => {
+    const { issueId, companyId } = await seed("paused");
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId, companyId, title: "Another review", issueNumber: 2,
+      identifier: "PRR-2", status: "in_review", assigneeAgentId: participantId,
+      executionState: stage, createdByAgentId: authorId,
+    });
+    const rows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+    expect(rows.map((row) => row.id).sort()).toEqual([issueId, secondIssueId].sort());
+    const applicationName = `pending-review-two-${randomUUID()}`;
+    const limited = createDb(temp.connectionString, { maxConnections: 2, applicationName });
+    const transaction = limited.transaction.bind(limited);
+    let entrants = 0;
+    let release!: () => void;
+    const bothEntered = new Promise<void>((resolve) => { release = resolve; });
+    const spy = vi.spyOn(limited, "transaction").mockImplementation((callback, config) =>
+      transaction(async (tx) => {
+        if (++entrants === 2) release();
+        await bothEntered;
+        return callback(tx);
+      }, config),
+    );
+    try {
+      const recovery = recoveryService(limited, { enqueueWakeup: async () => null });
+      const results = await completeWithinPoolDeadline(Promise.allSettled(rows.map((issue) =>
+        recovery.escalateStrandedAssignedIssue({
+          issue, previousStatus: "in_review", latestRun: null,
+          recoveryCause: "execution_review_participant_recovery", recoveryOwnerAgentId: managerId,
+        }),
+      )), applicationName);
+      expect(results?.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+      const updated = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      expect(updated.map((row) => row.status)).toEqual(["blocked", "blocked"]);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 20_000);
+
+  it.each(["paused", "terminated", "pending_approval", "budget_paused", "over_budget", "archived", "active_wake_fail"] as const)(
+    "keeps the %s participant's recovery board-owned across stale sweep and rejects unauthorized manager claim",
     async (status) => {
-      const { issueId, recovery, enqueueWakeup } = await seed(status);
+      const { issueId, companyId, recovery, enqueueWakeup } = await seed(status);
       await recovery.reconcileStrandedAssignedIssues();
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
-      expect(issue.status).toBe("blocked");
-      expect(issue.assigneeAgentId).toBe(participantId);
-      expect(issue.executionState).toMatchObject({ status: "pending", currentParticipant: participant });
+      expect(issue).toMatchObject({
+        status: "blocked", assigneeAgentId: participantId,
+        executionState: { status: "pending", currentParticipant: participant },
+      });
       expect(action).toMatchObject({
         ownerType: "board", ownerAgentId: null,
         evidence: { routingPolicy: "board_escalation_no_takeover_v1" },
       });
       expect(action.nextAction).toContain("Restore or replace the participant");
       expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      await db.update(issueRecoveryActions).set({ lastAttemptAt: new Date(0) })
+        .where(eq(issueRecoveryActions.id, action.id));
+      const swept = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 1 });
+      const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(swept.rerouted).toBe(0);
+      expect(after).toMatchObject({ status: "active", ownerType: "board", ownerAgentId: null });
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      mockRecoveryAdapterExecute.mockClear();
+      const forgedManagerRun = await claimQueuedRecoveryRun(companyId, issueId, managerId, action.id);
+      expect(forgedManagerRun).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      // A failed-wake participant can still receive a claimant handoff;
+      // the forged manager's own run must never reach the adapter.
+      expect(mockRecoveryAdapterExecute.mock.calls.some(([input]) => input.runId === forgedManagerRun.id)).toBe(false);
+      const [afterClaim] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(afterClaim.ownerType).toBe("board");
     },
   );
+
+  it("admits an authorized manager recovery run without changing the pending participant", async () => {
+    const { issueId, companyId, recovery, enqueueWakeup } = await seed("error");
+    await recovery.reconcileStrandedAssignedIssues();
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toMatchObject({ ownerType: "agent", ownerAgentId: managerId });
+    const [wakeAgentId, wakeOptions] = enqueueWakeup.mock.calls.at(-1) ?? [];
+    expect(wakeAgentId).toBe(managerId);
+    mockRecoveryAdapterExecute.mockClear();
+    const run = await claimQueuedRecoveryRun(
+      companyId, issueId, managerId, action.id,
+      wakeOptions as Parameters<typeof claimQueuedRecoveryRun>[4],
+    );
+    expect(run.errorCode).not.toBe("issue_assignee_changed");
+    expect(mockRecoveryAdapterExecute).toHaveBeenCalledOnce();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.assigneeAgentId).toBe(participantId);
+  });
 
   it("keeps a live reviewer assigned while the recovery manager works", async () => {
     const { issueId, recovery } = await seed("active");
@@ -584,6 +786,40 @@ const postgresSupport = await getEmbeddedPostgresTestSupport();
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue.assigneeAgentId).toBe(participantId);
     expect(issue.executionState).toMatchObject({ status: "pending", currentParticipant: participant });
+  });
+  it("cannot install a stale pending participant during a locked recovery reassignment", async () => {
+    const { issueId, recovery } = await seed("active", { ...stage, status: "changes_requested" });
+    const [snapshot] = await db.select().from(issues).where(eq(issues.id, issueId));
+    let competingLockAttempted = false;
+    issueUpdateHook.beforeUpdate = async () => {
+      try {
+        await competingDb.transaction(async (tx) => {
+          competingLockAttempted = true;
+          const [observed] = await tx.select().from(issues)
+            .where(eq(issues.id, issueId))
+            .for("update", { noWait: true })
+            .limit(1);
+          if (!observed?.assigneeAgentId) throw new Error("Expected an assigned participant");
+          await tx.update(issues).set({
+            executionState: {
+              ...stage,
+              currentParticipant: { ...participant, agentId: observed.assigneeAgentId },
+            },
+          }).where(eq(issues.id, issueId));
+        });
+      } catch (error) {
+        const postgresError = error as { code?: string; cause?: { code?: string } };
+        if (postgresError.code !== "55P03" && postgresError.cause?.code !== "55P03") throw error;
+      }
+    };
+    await recovery.escalateStrandedAssignedIssue({
+      issue: snapshot, previousStatus: "in_review", latestRun: null,
+      recoveryCause: "execution_review_participant_recovery", recoveryOwnerAgentId: managerId,
+    });
+    expect(competingLockAttempted).toBe(true);
+    const [updated] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updated.assigneeAgentId).toBe(managerId);
+    expect(updated.executionState).toMatchObject({ status: "changes_requested" });
   });
   it("does not assign an orphan blocker whose pending participant acquired the card after selection", async () => {
     const { issueId, companyId, recovery, enqueueWakeup } = await seed("active");
