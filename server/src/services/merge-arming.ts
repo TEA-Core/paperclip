@@ -3845,9 +3845,9 @@ export async function resolveReleaseDeliveryTarget(
   }
   if (samePrAsCertified && certified!.headSha === opts.headSha) return { ok: true, target, basis: "certified_delivery" };
   const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
-  const approvedHead = [approvalStatus?.publishedHeadSha, approvalStatus?.approvedHeadSha]
-    .find((sha): sha is string => typeof sha === "string" && sha.length > 0);
-  if (ladderIsTerminallyApproved(issueRow?.executionPolicy as never, state as never) && approvedHead === opts.headSha) {
+  const decidedHeadMatches = opts.headSha.length > 0 &&
+    [approvalStatus?.publishedHeadSha, approvalStatus?.approvedHeadSha].includes(opts.headSha);
+  if (ladderIsTerminallyApproved(issueRow?.executionPolicy as never, state as never) && decidedHeadMatches) {
     return { ok: true, target, basis: "approved_ladder" };
   }
   return {
