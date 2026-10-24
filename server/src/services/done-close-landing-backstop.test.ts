@@ -1255,6 +1255,57 @@ describe("createDoneCloseLandingBackstopService", () => {
       expect(mockAddComment).not.toHaveBeenCalled();
     });
 
+    // SUP-20772: a board release (paperclip/approved with a "released by" description) is a human
+    // decision, not a review, so it may re-enqueue a card only when the card is certified at that head.
+    it.each([
+      ["an uncertified card ignores a board-release status", { approvalStatus: { approvedHeadSha: LIVE_SHA } }, true],
+      [
+        "a card certified at the live head still counts a board-release status",
+        {
+          lastDecisionId: "decision-1",
+          approvalStatus: {
+            approvedHeadSha: LIVE_SHA,
+            finalDelivery: { owner: "paperclipai", repo: "paperclip", number: 514, headSha: LIVE_SHA, decisionId: "decision-1" },
+          },
+        },
+        false,
+      ],
+      [
+        "a card certified at another head ignores a board-release status",
+        {
+          lastDecisionId: "decision-1",
+          approvalStatus: {
+            approvedHeadSha: LIVE_SHA,
+            finalDelivery: { owner: "paperclipai", repo: "paperclip", number: 514, headSha: "e".repeat(40), decisionId: "decision-1" },
+          },
+        },
+        true,
+      ],
+    ])("%s when it re-reads the head's approval", async (_name, issueExecutionState, ignoreRelease) => {
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState,
+        },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({ token: "ghp_test_token", scope: "company", secretName: "github-token" });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      await service.sweep();
+
+      expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
+        expect.anything(), expect.anything(), "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease },
+      );
+    });
+
     it("escalates when merge arming is enabled but no token is resolvable", async () => {
       const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
       const { service } = makeService(
@@ -1633,7 +1684,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       }));
       // The status reader WAS consulted because the stamp did not cover the live head.
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA,
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease: true },
       );
     });
 
@@ -1850,7 +1901,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
       // The status reader IS consulted (the anchor is not trusted as a stamp).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA,
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease: true },
       );
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
     });
@@ -1974,7 +2025,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       // The gate consulted the live head's real stamp (the moved anchor alone does
       // not authorize; the new head's success status does).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA,
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease: true },
       );
       // No refusal row / no escalation: this head is approvable, so it quiesces by
       // landing, not by a board action.

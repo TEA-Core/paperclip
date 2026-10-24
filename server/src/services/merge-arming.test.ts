@@ -1381,6 +1381,27 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(statusesReads).toBe(2);
     });
 
+    it("SUP-20772: with ignoreRelease a board-release success does not count as approved; an ordinary success still does", async () => {
+      const releaseSuccess = {
+        context: "paperclip/approved", state: "success",
+        description: `released by user:u1 for ${APPROVED_HEAD}: ladder cannot complete`,
+      };
+      const read = async (statuses: unknown[], options?: { ignoreRelease: boolean }) => {
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (String(url) === HEAD_STATUSES_URL(APPROVED_HEAD)) {
+            return { ok: true, status: 200, json: async () => statuses } as unknown as Response;
+          }
+          throw new Error(`unmocked ghFetch URL: ${String(url)}`);
+        });
+        return fetchHeadApprovedStatusViaTokenCandidates(db, companyId, OWNER, REPO, APPROVED_HEAD, options);
+      };
+
+      expect(await read([releaseSuccess])).toMatchObject({ ok: true, approved: true });
+      expect(await read([releaseSuccess], { ignoreRelease: true })).toMatchObject({ ok: true, approved: false });
+      expect(await read([releaseSuccess, { context: "paperclip/approved", state: "success", description: "SUP-42 approved via Paperclip" }], { ignoreRelease: true }))
+        .toMatchObject({ ok: true, approved: true });
+    });
+
     it("AC3: transient-exhausted yields the terminal outcome with its prefix intact", async () => {
       let statusesReads = 0;
       mockGhFetch.mockImplementation(async (url: string) => {
