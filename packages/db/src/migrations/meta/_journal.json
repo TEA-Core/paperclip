@@ -2080,6 +2080,13 @@
       "when": 1792306695236,
       "tag": "0298_issue_delivery_receipts",
       "breakpoints": true
+    },
+    {
+      "idx": 297,
+      "version": "7",
+      "when": 1792699900000,
+      "tag": "0299_release_assurance_events",
+      "breakpoints": true
     }
   ]
 }

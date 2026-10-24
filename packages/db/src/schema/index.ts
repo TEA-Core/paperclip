@@ -49,6 +49,7 @@ export { externalObjects } from "./external_objects.js";
 export { externalObjectMentions } from "./external_object_mentions.js";
 export { issueDeliveryReceipts, ISSUE_DELIVERY_RECEIPT_STATES, ISSUE_DELIVERY_RECEIPT_PROVIDERS, ISSUE_DELIVERY_RECEIPT_ACTOR_TYPES } from "./issue_delivery_receipts.js";
 export { issueDeliveryReceiptLinks } from "./issue_delivery_receipt_links.js";
+export { releaseAssuranceEvents, RELEASE_ASSURANCE_EVENT_KINDS, RELEASE_ASSURANCE_PUBLICATION_MODES } from "./release_assurance_events.js";
 export { connectionEventDeliveries } from "./connection_event_deliveries.js";
 export {
   chatEndpoints,

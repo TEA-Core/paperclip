@@ -536,6 +536,15 @@ export type ExternalObjectMentionConfidence = (typeof EXTERNAL_OBJECT_MENTION_CO
 export const ISSUE_EXECUTION_POLICY_MODES = ["normal", "auto"] as const;
 export type IssueExecutionPolicyMode = (typeof ISSUE_EXECUTION_POLICY_MODES)[number];
 
+/**
+ * Who may publish the head-bound approval stamp for a card. Absent means
+ * `paperclip`: the normal review ladder. `release_assurance` is the separate
+ * release-assurance seat (SUP-20771) and can only be selected by a trusted
+ * board action, never by an issue create or PATCH body.
+ */
+export const ISSUE_APPROVAL_AUTHORITIES = ["paperclip", "release_assurance"] as const;
+export type IssueApprovalAuthority = (typeof ISSUE_APPROVAL_AUTHORITIES)[number];
+
 export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval"] as const;
 export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[number];
 
