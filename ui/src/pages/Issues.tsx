@@ -140,6 +140,9 @@ export function Issues() {
     setBreadcrumbs([{ label: "Tasks" }]);
   }, [setBreadcrumbs]);
 
+  // null until IssuesList reports its persisted status filter, so the first fetch is already filtered.
+  const [statusFilter, setStatusFilter] = useState<string[] | null>(null);
+  const statusParam = statusFilter && statusFilter.length > 0 ? statusFilter.join(",") : undefined;
   const issuePageSize = workspaceIdFilter ? WORKSPACE_FILTER_ISSUE_LIMIT : ISSUES_PAGE_SIZE;
 
   const {
@@ -156,6 +159,8 @@ export function Issues() {
       participantAgentId ?? "__all__",
       "workspace",
       workspaceIdFilter ?? "__all__",
+      "status",
+      statusParam ?? "__all__",
       "compact",
       "with-routine-executions",
       "infinite",
@@ -164,6 +169,7 @@ export function Issues() {
     queryFn: ({ pageParam, signal }) => issuesApi.listCompact(selectedCompanyId!, {
       participantAgentId,
       workspaceId: workspaceIdFilter,
+      status: statusParam,
       includeRoutineExecutions: true,
       limit: issuePageSize,
       offset: pageParam,
@@ -173,7 +179,7 @@ export function Issues() {
     initialPageParam: 0,
     getNextPageParam: (lastPage, _allPages, lastPageParam) =>
       getNextIssuesPageOffset(lastPage.length, lastPageParam, issuePageSize),
-    enabled: !!selectedCompanyId,
+    enabled: !!selectedCompanyId && statusFilter !== null,
     placeholderData: (previousData) => previousData,
   });
 
@@ -211,7 +217,7 @@ export function Issues() {
   return (
     <IssuesList
       issues={issues ?? []}
-      isLoading={isLoading}
+      isLoading={isLoading || statusFilter === null}
       isLoadingMoreIssues={isFetchingNextPage}
       error={error as Error | null}
       agents={agents}
@@ -228,6 +234,7 @@ export function Issues() {
       enableRoutineVisibilityFilter
       hasMoreIssues={hasMoreServerIssues}
       onLoadMoreIssues={loadMoreServerIssues}
+      onStatusFilterChange={setStatusFilter}
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
       searchFilters={participantAgentId || workspaceIdFilter ? { participantAgentId, workspaceId: workspaceIdFilter } : undefined}
     />

@@ -490,6 +490,8 @@ interface IssuesListProps {
   mutedIssueIds?: Set<string>;
   issueBadgeById?: Map<string, string>;
   onLoadMoreIssues?: () => void;
+  /** Reports the active status filter (also on mount) so the caller can filter server-side. */
+  onStatusFilterChange?: (statuses: string[]) => void;
   onSearchChange?: (search: string) => void;
   /** Opt in per surface while the canonical task row rolls out across collections. */
   rowPresentation?: IssueRowPresentation;
@@ -724,6 +726,7 @@ function StreamlinedIssuesList({
   mutedIssueIds,
   issueBadgeById,
   onLoadMoreIssues,
+  onStatusFilterChange,
   onSearchChange,
   rowPresentation = "legacy",
   toolbarPresentation = "legacy",
@@ -811,6 +814,10 @@ function StreamlinedIssuesList({
   useEffect(() => {
     setIssueSearch(initialSearch ?? "");
   }, [initialSearch]);
+
+  useEffect(() => {
+    onStatusFilterChange?.(viewState.statuses);
+  }, [onStatusFilterChange, viewState.statuses]);
 
   // Reload view state whenever the persisted context changes.
   const prevViewStateContextKey = useRef(`${scopedKey}::${initialAssigneesKey}::${initialWorkspacesKey}`);
