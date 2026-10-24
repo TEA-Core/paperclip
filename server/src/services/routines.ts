@@ -2561,9 +2561,18 @@ export function routineService(
           });
         }
 
+        // The pre-lock policy check used a stale row; re-run it on the final (project, preference) pair.
+        const finalProjectId = patch.projectId === undefined ? locked.projectId : patch.projectId;
+        const finalPreference = patch.executionWorkspacePreference === undefined
+          ? locked.executionWorkspacePreference
+          : patch.executionWorkspacePreference;
+        if (patch.projectId !== undefined || patch.executionWorkspacePreference !== undefined) {
+          await assertRoutineWorkspacePreferenceAllowed(finalProjectId, finalPreference);
+        }
+
         const candidate: RoutineRow = {
           ...locked,
-          projectId: nextProjectId,
+          projectId: finalProjectId,
           folderId: nextFolderId,
           goalId: patch.goalId === undefined ? locked.goalId : patch.goalId,
           parentIssueId: patch.parentIssueId === undefined ? locked.parentIssueId : patch.parentIssueId,
@@ -2579,10 +2588,7 @@ export function routineService(
           variables: nextVariables,
           env: nextEnv,
           executionPolicy: patch.executionPolicy === undefined ? locked.executionPolicy : patch.executionPolicy,
-          executionWorkspacePreference:
-            patch.executionWorkspacePreference === undefined
-              ? locked.executionWorkspacePreference
-              : patch.executionWorkspacePreference,
+          executionWorkspacePreference: finalPreference,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,

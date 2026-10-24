@@ -66,9 +66,7 @@ export const routineVariableSchema = z.object({
 // "reuse_existing" needs an execution workspace id, which a routine cannot carry.
 const routineExecutionWorkspacePreferenceSchema = z
   .enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES)
-  .refine((value) => value !== "reuse_existing", {
-    message: "reuse_existing is not supported on a routine",
-  });
+  .exclude(["reuse_existing"]);
 
 export const createRoutineSchema = z.object({
   projectId: z.string().guid().optional().nullable(),

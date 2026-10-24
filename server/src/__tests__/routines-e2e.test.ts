@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +16,7 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  folders,
   heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
@@ -1131,6 +1132,87 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       .send({ projectId: strictProjectId });
     expect(moveRes.status, JSON.stringify(moveRes.body)).toBe(422);
     expect(moveRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+  }, 30_000);
+
+  it("revalidates the final project and preference under the routine lock when PATCHes race (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const strictProjectId = randomUUID();
+    await db.insert(projects).values({
+      id: strictProjectId,
+      companyId,
+      name: "Strict project",
+      status: "in_progress",
+      executionWorkspacePolicy: { enabled: true, allowIssueOverride: false },
+    });
+    const folderId = randomUUID();
+    await db.insert(folders).values({
+      id: folderId,
+      companyId,
+      kind: "routine",
+      name: "Race folder",
+      slug: "race-folder",
+    });
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Racing routine", assigneeAgentId: agentId });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    const routineId = createRes.body.id as string;
+
+    // Park request 1 after its pre-lock policy check by holding a lock on the folder lookup it does next.
+    let releaseFolderLock!: () => void;
+    const folderLockHeld = new Promise<void>((resolve) => {
+      releaseFolderLock = resolve;
+    });
+    let folderLockAcquired!: () => void;
+    const folderLockReady = new Promise<void>((resolve) => {
+      folderLockAcquired = resolve;
+    });
+    const lockHolder = db.transaction(async (tx) => {
+      await tx.execute(sql`lock table folders in access exclusive mode`);
+      folderLockAcquired();
+      await folderLockHeld;
+    });
+    await folderLockReady;
+
+    const moveRequest = request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ projectId: strictProjectId, folderId })
+      .then((res) => res);
+    for (let i = 0; i < 100; i += 1) {
+      const waiting = await db.execute(
+        sql`select 1 from pg_stat_activity where wait_event_type = 'Lock' and query ilike '%folders%'`,
+      );
+      if (waiting.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    const preferenceRes = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ executionWorkspacePreference: "shared_workspace" });
+    expect(preferenceRes.status, JSON.stringify(preferenceRes.body)).toBe(200);
+
+    releaseFolderLock();
+    await lockHolder;
+    const moveRes = await moveRequest;
+    expect(moveRes.status, JSON.stringify(moveRes.body)).toBe(422);
+    expect(moveRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    const [stored] = await db
+      .select({
+        projectId: routines.projectId,
+        executionWorkspacePreference: routines.executionWorkspacePreference,
+      })
+      .from(routines)
+      .where(eq(routines.id, routineId));
+    expect(stored).toEqual({ projectId, executionWorkspacePreference: "shared_workspace" });
   }, 30_000);
 
   it("fails the run with the override-disallowed reason when project policy flips after the routine is saved (SUP-21022)", async () => {
