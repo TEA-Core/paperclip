@@ -53,6 +53,7 @@
               "guides/board-operator/status-cards",
               "guides/board-operator/approvals",
               "approval-reconciliation",
+              "approval-final-delivery-preflight",
               "delivery-identity",
               "guides/board-operator/costs-and-budgets",
               "guides/board-operator/activity-log",
