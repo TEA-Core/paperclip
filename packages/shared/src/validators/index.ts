@@ -439,6 +439,8 @@ export {
   type ReleaseAssuranceDecision,
   releaseIssueHeadSchema,
   type ReleaseIssueHead,
+  overrideReleaseIssueHeadSchema,
+  type OverrideReleaseIssueHead,
   stripCreateOnlyIssueAttribution,
   ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS,
   stalledReviewDecisionSchema,

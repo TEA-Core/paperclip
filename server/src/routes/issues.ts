@@ -87,6 +87,7 @@ import {
   createIssueSchema,
   approveIssueHeadSchema,
   releaseIssueHeadSchema,
+  overrideReleaseIssueHeadSchema,
   isAssignedBacklogBlockingCreate,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
@@ -211,6 +212,7 @@ import {
   resolveCardDeliveryBranchOwnership,
   resolveLinkedPullRequestsWithState,
   publishHeadBoundRelease,
+  type HeadBoundReleaseOutcome,
   resolveReleaseDeliveryTarget,
   headBoundReleaseDescription,
   shouldPublishApprovalStatus,
@@ -11517,51 +11519,87 @@ export function issueRoutes(
     res.status(result.outcome === "armed" || result.outcome === "review_required" ? 200 : 409).json(result);
   }
 
-  // Audited replacement for the free-text Paperclip-Approved-Waiver line on a card-bound PR:
-  // a board owner/admin releases exactly one head of the PR in the card's verified delivery binding.
-  router.post("/issues/:id/merge-arming/release", async (req, res) => {
+  // Audited replacement for the free-text Paperclip-Approved-Waiver line on a card-bound PR: a board
+  // owner/admin releases exactly one head of the PR in the card's verified delivery binding. The default
+  // route only re-publishes what the card's own review decided on that head (a completed approving
+  // ladder or a certified delivery). Everything else needs the separate override route, which takes its
+  // own request field and writes its own audit kinds.
+  const MERGE_RELEASE_AUDIT = {
+    standard: {
+      requested: "issue.merge_release_requested",
+      released: "issue.merge_release",
+      outcome: "issue.merge_release_outcome",
+    },
+    override: {
+      requested: "issue.merge_release_override_requested",
+      released: "issue.merge_release_override",
+      outcome: "issue.merge_release_override_outcome",
+    },
+  } as const;
+
+  async function releaseIssueHead(req: Request, res: Response, mode: "standard" | "override") {
     assertBoard(req);
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!existing) return;
     const actor = getActorInfo(req);
     await assertCompanyOwnerOrAdmin(req, existing.companyId, "Company owner or admin required to release a PR head");
-    const input = releaseIssueHeadSchema.parse(req.body);
-    const resolved = await resolveReleaseDeliveryTarget(db, existing.companyId, existing.id);
-    if (!resolved.ok) throw conflict(`Card has no verified delivery PR to release: ${resolved.reason}`);
-    const target = resolved.target;
-    const description = headBoundReleaseDescription(`${actor.actorType}:${actor.actorId}`, input.headSha, input.reason);
+    const { headSha, reason } = mode === "override"
+      ? (({ headSha, overrideReason }) => ({ headSha, reason: overrideReason }))(overrideReleaseIssueHeadSchema.parse(req.body))
+      : releaseIssueHeadSchema.parse(req.body);
+    const resolved = await resolveReleaseDeliveryTarget(db, existing.companyId, existing.id, { headSha, mode });
+    if (!resolved.ok) throw conflict(`Card cannot be released: ${resolved.reason}`);
+    const { target, basis } = resolved;
+    const kinds = MERGE_RELEASE_AUDIT[mode];
+    const reasonKey = mode === "override" ? "overrideReason" : "reason";
+    const description = headBoundReleaseDescription(
+      `${actor.actorType}:${actor.actorId}`, headSha, mode === "override" ? `override: ${reason}` : reason,
+    );
     // The intent is durable before the GitHub write: if this insert fails nothing is published, and if
     // the outcome insert below fails the intent row still names who asked to release which head.
     const intent = await persistActivity(db, {
       companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
-      action: "issue.merge_release_requested", entityType: "issue", entityId: existing.id,
-      details: { headSha: input.headSha, reason: input.reason, pr: target.displayName, branch: target.branch, description },
+      action: kinds.requested, entityType: "issue", entityId: existing.id,
+      details: { headSha, [reasonKey]: reason, pr: target.displayName, branch: target.branch, basis, description },
     });
     publishActivity(intent.publication);
-    const outcome = await publishHeadBoundRelease(db, existing.companyId, target, {
-      headSha: input.headSha, description, expectedBranch: target.branch,
-    });
+    let outcome: HeadBoundReleaseOutcome;
+    try {
+      outcome = await publishHeadBoundRelease(db, existing.companyId, target, {
+        headSha, description, expectedBranch: target.branch,
+      });
+    } catch (error) {
+      // A throwing prerequisite (secret lookup, token resolver, lock) must still leave a failed outcome
+      // row next to the intent row, never a requested-only trail.
+      logger.error({ err: error, issueId: existing.id, headSha, intentId: intent.activity.id }, "merge release publish threw");
+      outcome = {
+        kind: "failed",
+        message: `status:failed:internal: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     try {
       const entry = await persistActivity(db, {
         companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
-        action: outcome.kind === "released" ? "issue.merge_release" : "issue.merge_release_outcome",
+        action: outcome.kind === "released" ? kinds.released : kinds.outcome,
         entityType: "issue", entityId: existing.id,
         details: {
-          headSha: input.headSha, reason: input.reason, pr: target.displayName, description,
-          outcome: outcome.kind, message: outcome.message,
+          headSha, [reasonKey]: reason, pr: target.displayName, basis, description,
+          outcome: outcome.kind, message: outcome.message, intentId: intent.activity.id,
         },
       });
       publishActivity(entry.publication);
     } catch (error) {
       logger.error(
-        { err: error, issueId: existing.id, headSha: input.headSha, outcome: outcome.kind },
+        { err: error, issueId: existing.id, headSha, outcome: outcome.kind, intentId: intent.activity.id },
         "merge release outcome could not be recorded; the release intent row is the audit trail",
       );
     }
     res.status(outcome.kind === "released" || outcome.kind === "already_approved" ? 200 : 409).json({
-      outcome: outcome.kind, headSha: input.headSha, message: outcome.message,
+      outcome: outcome.kind, headSha, message: outcome.message,
     });
-  });
+  }
+
+  router.post("/issues/:id/merge-arming/release", (req, res) => releaseIssueHead(req, res, "standard"));
+  router.post("/issues/:id/merge-arming/release-override", (req, res) => releaseIssueHead(req, res, "override"));
 
   router.get("/issues/:id/merge-arming/head-review", (req, res) => reviewCompletedIssueHead(req, res, false));
   router.post("/issues/:id/merge-arming/approve-head", (req, res) => reviewCompletedIssueHead(req, res, true));

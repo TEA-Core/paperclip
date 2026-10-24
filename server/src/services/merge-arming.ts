@@ -3601,7 +3601,7 @@ async function writeCommitStatus(
     state: "success",
     context: "paperclip/approved",
     description: description ?? `${issueIdentifier} approved via Paperclip`,
-    target_url: `https://paperclip.example.com/issues/${issueIdentifier}`,
+    ...(issueIdentifier ? { target_url: `https://paperclip.example.com/issues/${issueIdentifier}` } : {}),
   });
 
   let response: Response;
@@ -3786,7 +3786,12 @@ export function isHeadBoundReleaseDescription(description: unknown): boolean {
 
 export type HeadBoundReleaseOutcome =
   | { kind: "released" | "already_approved"; headSha: string; message: string }
+  /** The status was written, but the PR head had moved on by the time the write was confirmed. */
+  | { kind: "stale"; headSha: string; message: string }
   | { kind: "refused" | "failed"; message: string };
+
+/** Why a release was allowed: a certified delivery or completed ladder, or the explicit override. */
+export type ReleaseBasis = "certified_delivery" | "approved_ladder" | "override";
 
 /**
  * The PR a board release may target: the one the card's verified delivery identity names. The
@@ -3799,8 +3804,9 @@ export async function resolveReleaseDeliveryTarget(
   db: Db,
   companyId: string,
   issueId: string,
+  opts: { headSha: string; mode: "standard" | "override" },
 ): Promise<
-  | { ok: true; target: { owner: string; repo: string; number: number; displayName: string; branch: string } }
+  | { ok: true; target: { owner: string; repo: string; number: number; displayName: string; branch: string }; basis: ReleaseBasis }
   | { ok: false; reason: string }
 > {
   const identity = await resolveDeliveryIdentity(db, companyId, issueId);
@@ -3812,34 +3818,54 @@ export async function resolveReleaseDeliveryTarget(
   if (bindingError) return { ok: false, reason: bindingError };
   const { owner, repo } = identity.repo;
   const number = identity.binding.prNumber;
-  // A card whose review certified one PR for delivery keeps that boundary: the release may not move to
-  // another PR just because the recorded delivery binding was later pointed elsewhere.
-  const [issueRow] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
-  const certified = readCertifiedFinalDelivery(issueRow?.executionState as Record<string, unknown> | null | undefined);
-  if (
-    certified &&
-    (certified.number !== number ||
-      certified.owner.toLowerCase() !== owner.toLowerCase() ||
-      certified.repo.toLowerCase() !== repo.toLowerCase())
-  ) {
+  const [issueRow] = await db
+    .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+    .from(issues)
+    .where(eq(issues.id, issueId));
+  const state = issueRow?.executionState as Record<string, unknown> | null | undefined;
+  // A card whose review certified one PR for delivery keeps that boundary, on both routes: the release may
+  // not move to another PR just because the recorded delivery binding was later pointed elsewhere.
+  const certified = readCertifiedFinalDelivery(state);
+  const samePrAsCertified = certified !== undefined &&
+    certified.number === number &&
+    certified.owner.toLowerCase() === owner.toLowerCase() &&
+    certified.repo.toLowerCase() === repo.toLowerCase();
+  if (certified && !samePrAsCertified) {
     return {
       ok: false,
       reason: `the card's certified final delivery is ${certified.displayName}, not ${owner}/${repo}#${number}; a release may not change the certified PR`,
     };
   }
+  const target = { owner, repo, number, displayName: `${owner}/${repo}#${number}`, branch: identity.binding.branch };
+  if (opts.mode === "override") return { ok: true, target, basis: "override" };
+
+  // The default route only re-publishes what the card's own review already decided on this exact head.
+  if (issueRow?.status === "cancelled") {
+    return { ok: false, reason: "the card is cancelled; only the explicit override can release it" };
+  }
+  if (samePrAsCertified && certified!.headSha === opts.headSha) return { ok: true, target, basis: "certified_delivery" };
+  const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
+  const approvedHead = [approvalStatus?.publishedHeadSha, approvalStatus?.approvedHeadSha]
+    .find((sha): sha is string => typeof sha === "string" && sha.length > 0);
+  if (ladderIsTerminallyApproved(issueRow?.executionPolicy as never, state as never) && approvedHead === opts.headSha) {
+    return { ok: true, target, basis: "approved_ladder" };
+  }
   return {
-    ok: true,
-    target: { owner, repo, number, displayName: `${owner}/${repo}#${number}`, branch: identity.binding.branch },
+    ok: false,
+    reason:
+      `the card has no completed approving ladder or certified delivery bound to head ${opts.headSha}; ` +
+      "the explicit override (merge-arming/release-override) is the only way to release it",
   };
 }
 
 /**
  * Board-triggered merge release: publish `paperclip/approved` on exactly `headSha` of one PR, as
  * the control plane's own App token and no other credential (CI accepts only that creator, so a
- * fallback write would look released and not be). Nothing here consults the card's ladder, so it
- * works for the PR a card cannot be stamped for today. The status is keyed by SHA, so a head that
- * moves after the live read cannot inherit it. A head whose newest `paperclip/approved` is a
- * control-plane success is left alone. The live PR must still be on `expectedBranch`.
+ * fallback write would look released and not be). Whether the card may be released at all is decided
+ * by the caller (resolveReleaseDeliveryTarget); this function only publishes. The status is keyed by
+ * SHA, so a head that moves after the live read cannot inherit it. The live PR is read first and must
+ * be open, non-draft, on `expectedBranch` and at `headSha`, even when the head already carries a
+ * control-plane success (which is then left alone). Releases of one head are serialized.
  */
 export async function publishHeadBoundRelease(
   db: Db,
@@ -3873,29 +3899,52 @@ export async function publishHeadBoundRelease(
     }
     return null;
   };
-  // The status read comes first so the live-head check is the last read before the write.
-  const existing = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha);
-  if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
-  if (existing.controlPlaneApproved) {
-    return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
-  }
-  // GitHub has no compare-and-swap on a commit status, so a push landing between the last live read and
-  // the POST can still leave one status on the old SHA. That status is keyed by SHA, so the new head
-  // does not inherit it. A transient failure is retried only after the live head is checked again.
-  const attempts = 3;
-  for (let attempt = 1; ; attempt += 1) {
-    const refusal = await liveRefusal();
-    if (refusal) return refusal;
-    const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
-      description: input.description,
-      attempts: 1,
-    });
-    if (write.success) return { kind: "released", headSha: input.headSha, message: input.description };
-    if (!write.transient || attempt >= attempts) {
-      return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
+  const publishLocked = async (): Promise<HeadBoundReleaseOutcome> => {
+    // The live PR is checked before anything else, so an "already approved" answer is never given for a
+    // PR that is stale, a draft, closed, merged or off its branch.
+    const firstRefusal = await liveRefusal();
+    if (firstRefusal) return firstRefusal;
+    const existing = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha);
+    if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
+    if (existing.controlPlaneApproved) {
+      return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, input.retryDelayMs ?? 1000));
-  }
+    // GitHub has no compare-and-swap on a commit status, so a push landing between the last live read and
+    // the POST can still leave one status on the old SHA. It is keyed by SHA, so the new head does not
+    // inherit it, and the head is read once more after the write: a head that moved is reported as stale,
+    // never as a release. A transient failure is retried only after the live head is checked again.
+    const attempts = 3;
+    for (let attempt = 1; ; attempt += 1) {
+      const refusal = await liveRefusal();
+      if (refusal) return refusal;
+      const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+        description: input.description,
+        attempts: 1,
+      });
+      if (write.success) {
+        const after = await fetchPullRequestHeadSha(credential.token, owner, repo, number);
+        if (after.ok && after.headSha !== input.headSha) {
+          return {
+            kind: "stale",
+            headSha: input.headSha,
+            message: `status:stale:head-moved-after-write: ${owner}/${repo}#${number} head is now ${after.headSha}; the status written to ${input.headSha} does not cover it`,
+          };
+        }
+        return { kind: "released", headSha: input.headSha, message: input.description };
+      }
+      if (!write.transient || attempt >= attempts) {
+        return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, input.retryDelayMs ?? 1000));
+    }
+  };
+  // At most one release per company/repo/head at a time: the second caller waits, then sees the first
+  // one's status and answers already_approved instead of writing again.
+  const lockKey = `merge-release:${companyId}:${owner}/${repo}@${input.headSha}`.toLowerCase();
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+    return publishLocked();
+  });
 }
 
 /**
