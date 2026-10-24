@@ -593,6 +593,7 @@ function paperclipIssue(overrides: Partial<Issue> = {}): Issue {
     assigneeAdapterOverrides: null,
     executionPolicy: null,
     executionState: null,
+    deliveryRequirement: "repository_delivery",
     executionWorkspaceId: null,
     executionWorkspacePreference: null,
     executionWorkspaceSettings: null,
@@ -1697,6 +1698,7 @@ Duplicate headings receive stable suffixes.
     expect(writes).toHaveLength(0);
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_sources"))).toBe(false);
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_operations"))).toBe(false);
+    expect(issue.deliveryRequirement).toBe("repository_delivery");
   });
 
   it("records enabled Paperclip issue events as cursor observations without creating ingest operations", async () => {
