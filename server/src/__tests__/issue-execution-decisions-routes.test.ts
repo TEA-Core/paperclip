@@ -906,15 +906,21 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.armCalls).toEqual([]);
   });
 
-  it("keeps a record-only final review escalation pending when classification changes before acceptance", async () => {
-    const fixture = await pendingDelivery({ deliveryRequirement: "record_only", repo: false });
+  it.each([
+    { from: "record_only", to: "repository_delivery" },
+    { from: "repository_delivery", to: "record_only" },
+  ] as const)("keeps a final review escalation pending when classification changes from $from to $to before acceptance", async ({ from, to }) => {
+    const fixture = await pendingDelivery({
+      deliveryRequirement: from,
+      repo: from === "repository_delivery",
+    });
     const interaction = await seedEscalation(fixture);
     let raced = false;
     const transact = db.transaction.bind(db);
     const transactionSpy = vi.spyOn(db, "transaction").mockImplementation((async (...args) => {
       if (!raced) {
         raced = true;
-        await db.update(issues).set({ deliveryRequirement: "repository_delivery" })
+        await db.update(issues).set({ deliveryRequirement: to })
           .where(eq(issues.id, fixture.issue.id));
       }
       return transact(...args);
@@ -929,7 +935,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(response.status).toBe(409);
       expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
       const stored = await fixture.read();
-      expect(stored.deliveryRequirement).toBe("repository_delivery");
+      expect(stored.deliveryRequirement).toBe(to);
       expect(stored.status).toBe("in_review");
       expect(stored.executionState).toMatchObject({
         status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
