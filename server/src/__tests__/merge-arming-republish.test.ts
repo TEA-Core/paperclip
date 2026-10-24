@@ -1762,16 +1762,33 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
   describe("POST /issues/:id/merge-arming/release (SUP-20772)", () => {
     const RELEASE_REASON = "stamp cannot be published for this card";
 
-    function installReleaseTransport(opts: { liveHead?: string; statuses?: Array<Record<string, unknown>>; draft?: boolean } = {}) {
+    function installReleaseTransport(opts: {
+      liveHead?: string;
+      liveBranch?: string;
+      /** Read on every PR GET, so a test can move the head mid-call. */
+      liveHeadNow?: () => string;
+      statuses?: Array<Record<string, unknown>>;
+      draft?: boolean;
+      /** Runs when the status list is read. */
+      onStatusRead?: () => void;
+      /** Response for the Nth (1-based) status POST; default is a 201. */
+      postStatus?: (call: number) => { ok: boolean; status: number };
+    } = {}) {
+      let posts = 0;
       mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
           return createMockResponse({
             state: "open", merged: false, draft: opts.draft ?? false,
-            head: { sha: opts.liveHead ?? HEAD_SHA, ref: DELIVERY_BRANCH },
+            head: { sha: opts.liveHeadNow?.() ?? opts.liveHead ?? HEAD_SHA, ref: opts.liveBranch ?? DELIVERY_BRANCH },
           });
         }
-        if (url.includes("/statuses/") && init?.method === "POST") return createMockResponse({ id: 1 }, true, 201);
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          posts += 1;
+          const response = opts.postStatus?.(posts) ?? { ok: true, status: 201 };
+          return createMockResponse({ id: 1 }, response.ok, response.status);
+        }
         if (url.includes("/statuses/")) {
+          opts.onStatusRead?.();
           return createMockResponse(opts.statuses ?? []);
         }
         throw new Error(`Unexpected release request: ${url}`);
@@ -2115,18 +2132,92 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
     it("refuses when the bound PR's live branch is no longer the card's delivery branch, with zero writes", async () => {
       const { issueId } = await seedReleasable();
-      mockGhFetch.mockImplementation(async (url: string) => {
-        if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
-          return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: FOREIGN_BRANCH } });
-        }
-        throw new Error(`Unexpected release request: ${url}`);
-      });
+      installReleaseTransport({ liveBranch: FOREIGN_BRANCH });
 
       const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
       expect(res.status).toBe(409);
       expect(res.body.message).toContain("branch-mismatch");
       expect(statusWrites()).toEqual([]);
+    });
+
+    const OTHER_HEAD = "c".repeat(40);
+
+    it("writes nothing when the head moves while the existing statuses are being read", async () => {
+      const { issueId } = await seedReleasable();
+      let head = HEAD_SHA;
+      installReleaseTransport({ liveHeadNow: () => head, onStatusRead: () => { head = OTHER_HEAD; } });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.message).toContain("head-mismatch");
+      expect(statusWrites()).toEqual([]);
+    });
+
+    it("does not retry a transient write failure onto a head that has since moved", async () => {
+      const { issueId } = await seedReleasable();
+      let head = HEAD_SHA;
+      installReleaseTransport({
+        liveHeadNow: () => head,
+        postStatus: () => { head = OTHER_HEAD; return { ok: false, status: 502 }; },
+      });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.message).toContain("head-mismatch");
+      expect(statusWrites()).toHaveLength(1);
+    });
+
+    it("retries a transient write failure while the head is unchanged", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postStatus: (call) => (call === 1 ? { ok: false, status: 502 } : { ok: true, status: 201 }) });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("released");
+      expect(statusWrites()).toHaveLength(2);
+    });
+
+    // The card's review certified one PR for delivery (executionState.approvalStatus.finalDelivery).
+    async function certifyDelivery(issueId: string, number: number) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const state = issue!.executionState as Record<string, unknown>;
+      await db.update(issues).set({
+        executionState: {
+          ...state,
+          lastDecisionId: "decision-certified",
+          approvalStatus: {
+            ...((state.approvalStatus as Record<string, unknown> | undefined) ?? {}),
+            finalDelivery: { decisionId: "decision-certified", owner: OWNER, repo: REPO, number, headSha: RECORDED_HEAD },
+          },
+        },
+      }).where(eq(issues.id, issueId));
+    }
+
+    it("refuses a release whose bound PR is not the PR the card's review certified", async () => {
+      const { issueId } = await seedReleasable();
+      await certifyDelivery(issueId, PR_NUMBER + 50);
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.message ?? res.body.error).toContain("certified final delivery");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(await requestRows()).toEqual([]);
+    });
+
+    it("releases the PR the card's review certified", async () => {
+      const { issueId } = await seedReleasable();
+      await certifyDelivery(issueId, PR_NUMBER);
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("released");
     });
 
     it("rejects a malformed body with 400 before any GitHub I/O", async () => {

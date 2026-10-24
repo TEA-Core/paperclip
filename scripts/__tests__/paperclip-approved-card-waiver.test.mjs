@@ -85,7 +85,7 @@ function run({ ref, author, body = "", title = "", labels = [], statuses = [], r
   }
 }
 
-const PERSON = { login: "kronik187", type: "User" };
+const PERSON = { login: "release-operator", type: "User" };
 const FLEET_APP = { login: "fleet-only[bot]", type: "Bot" };
 const TEA_CORE_APP = { login: TEA_CORE.login, type: "Bot", id: TEA_CORE.id };
 const UNKNOWN_BOT = { login: "mystery[bot]", type: "Bot", id: 42 };
