@@ -398,7 +398,7 @@ function assertReusableExecutionWorkspaceBound(input: {
  * Absent policy, or `allowIssueOverride` absent/`true`, is unchanged behaviour —
  * the default stays `true`.
  */
-function assertIssueExecutionWorkspaceOverrideAllowed(input: {
+export function assertIssueExecutionWorkspaceOverrideAllowed(input: {
   projectPolicy: ReturnType<typeof parseProjectExecutionWorkspacePolicy> | undefined;
   suppliedExecutionWorkspaceId: string | null | undefined;
   suppliedExecutionWorkspacePreference: string | null | undefined;

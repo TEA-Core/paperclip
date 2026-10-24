@@ -58,11 +58,12 @@ import {
   syncRoutineVariablesWithTemplate,
 } from "@paperclipai/shared";
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
+import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { issueService } from "./issues.js";
+import { assertIssueExecutionWorkspaceOverrideAllowed, issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -1222,6 +1223,24 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
     if (!project) throw notFound("Project not found");
     if (project.companyId !== companyId) throw unprocessable("Project must belong to same company");
+  }
+
+  async function assertRoutineWorkspacePreferenceAllowed(
+    projectId: string | null | undefined,
+    preference: string | null | undefined,
+  ) {
+    if (!projectId || !preference) return;
+    if (!(await instanceSettings.getExperimental()).enableIsolatedWorkspaces) return;
+    const project = await db
+      .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+      .from(projects)
+      .where(eq(projects.id, projectId))
+      .then((rows) => rows[0] ?? null);
+    assertIssueExecutionWorkspaceOverrideAllowed({
+      projectPolicy: parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy),
+      suppliedExecutionWorkspaceId: null,
+      suppliedExecutionWorkspacePreference: preference,
+    });
   }
 
   async function assertGoal(companyId: string, goalId: string) {
@@ -2392,6 +2411,7 @@ export function routineService(
 
     create: async (companyId: string, input: CreateRoutine, actor: Actor): Promise<Routine> => {
       await assertProject(companyId, input.projectId ?? null);
+      await assertRoutineWorkspacePreferenceAllowed(input.projectId, input.executionWorkspacePreference);
       await assertRoutineFolder(companyId, input.folderId ?? null);
       await assertAssignableAgent(db, companyId, input.assigneeAgentId ?? null, { kind: "routine" });
       if (input.goalId) await assertGoal(companyId, input.goalId);
@@ -2486,6 +2506,14 @@ export function routineService(
         patch.variables === undefined ? existing.variables : sanitizeRoutineVariableInputs(patch.variables),
       );
       if (patch.projectId !== undefined) await assertProject(existing.companyId, nextProjectId);
+      if (patch.projectId !== undefined || patch.executionWorkspacePreference !== undefined) {
+        await assertRoutineWorkspacePreferenceAllowed(
+          nextProjectId,
+          patch.executionWorkspacePreference === undefined
+            ? existing.executionWorkspacePreference
+            : patch.executionWorkspacePreference,
+        );
+      }
       if (patch.folderId !== undefined) await assertRoutineFolder(existing.companyId, nextFolderId);
       if (patch.assigneeAgentId !== undefined || patch.status === "active") {
         await assertAssignableAgent(db, existing.companyId, nextAssigneeAgentId, { kind: "routine" });
@@ -2904,6 +2932,10 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      await assertRoutineWorkspacePreferenceAllowed(
+        routineSnapshot.projectId,
+        routineSnapshot.executionWorkspacePreference,
+      );
 
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
