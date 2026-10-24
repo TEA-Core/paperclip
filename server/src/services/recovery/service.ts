@@ -5403,7 +5403,7 @@ export function recoveryService(
           (await isInvocationBudgetBlocked(current, participantAgent.id, budgetService(txDb))) ||
           (await hasConsecutiveWakeFailuresForAgent(participantAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, txDb)));
       let recoveryAction = routedAction;
-      if (boardOnlyPendingParticipant && recoveryAction.ownerAgentId) {
+      if (boardOnlyPendingParticipant) {
         // A participant that cannot run cannot complete its pending stage.
         // Even an authorized replacement worker cannot decide that stage on
         // behalf of the participant; require explicit board repair instead.

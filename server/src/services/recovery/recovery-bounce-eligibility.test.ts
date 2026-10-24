@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -738,6 +738,44 @@ const postgresSupport = await getEmbeddedPostgresTestSupport();
       expect(mockRecoveryAdapterExecute.mock.calls.some(([input]) => input.runId === forgedManagerRun.id)).toBe(false);
       const [afterClaim] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
       expect(afterClaim.ownerType).toBe("board");
+    },
+  );
+
+  it.each(["paused", "terminated", "pending_approval", "budget_paused", "over_budget", "archived"] as const)(
+    "keeps an initially ownerless %s participant recovery manual when the manager returns",
+    async (status) => {
+      const { issueId, recovery, enqueueWakeup } = await seed(status);
+      await db.update(agents).set({ status: "paused" })
+        .where(inArray(agents.id, [managerId, authorId]));
+      await recovery.reconcileStrandedAssignedIssues();
+      const [initial] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(initial).toMatchObject({ status: "active", ownerType: "board", ownerAgentId: null });
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, managerId));
+      await db.update(issueRecoveryActions).set({ lastAttemptAt: new Date(0) })
+        .where(eq(issueRecoveryActions.id, initial.id));
+      for (let tick = 0; tick < 2; tick += 1) {
+        const swept = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 1 });
+        expect(swept.rerouted).toBe(0);
+        expect(swept.nonWakeableSkipped).toBe(1);
+      }
+      const [after] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, initial.id));
+      expect(after).toMatchObject({
+        status: "active", ownerType: "board", ownerAgentId: null,
+        attemptCount: initial.attemptCount,
+        wakePolicy: { type: "board_escalation", reason: "pending_participant_unavailable" },
+        evidence: { routingPolicy: "board_escalation_no_takeover_v1" },
+      });
+      expect(after.nextAction).toContain("Restore or replace the participant");
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue).toMatchObject({
+        status: "blocked", assigneeAgentId: participantId,
+        executionState: { status: "pending", currentParticipant: participant },
+      });
     },
   );
 
