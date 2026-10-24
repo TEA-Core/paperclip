@@ -1775,10 +1775,13 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       onStatusRead?: () => void;
       /** Response for the Nth (1-based) status POST; default is a 201. */
       postStatus?: (call: number) => { ok: boolean; status: number };
+      /** Every PR GET after the first status POST fails with a 502. */
+      prReadFailsAfterWrite?: boolean;
     } = {}) {
       let posts = 0;
       mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+          if (opts.prReadFailsAfterWrite && posts > 0) return createMockResponse({ message: "bad gateway" }, false, 502);
           return createMockResponse({
             state: opts.state ?? "open", merged: opts.merged ?? false, draft: opts.draft ?? false,
             head: { sha: opts.liveHeadNow?.() ?? opts.liveHead ?? HEAD_SHA, ref: opts.liveBranch ?? DELIVERY_BRANCH },
@@ -2440,6 +2443,20 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(statusWrites()).toHaveLength(1);
       expect(await releaseLogRows()).toEqual([]);
       expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "stale" } });
+    });
+
+    it("fails closed when the head cannot be re-read after the write: failed outcome, no release row", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ prReadFailsAfterWrite: true });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("failed");
+      expect(res.body.message).toContain("post_write_pr_read");
+      expect(statusWrites()).toHaveLength(1);
+      expect(await releaseLogRows()).toEqual([]);
+      expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "failed" } });
     });
 
     it("serializes concurrent releases of one head: one status write, the other answers already_approved", async () => {

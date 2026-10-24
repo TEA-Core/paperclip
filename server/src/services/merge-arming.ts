@@ -3923,7 +3923,13 @@ export async function publishHeadBoundRelease(
       });
       if (write.success) {
         const after = await fetchPullRequestHeadSha(credential.token, owner, repo, number);
-        if (after.ok && after.headSha !== input.headSha) {
+        if (!after.ok) {
+          return {
+            kind: "failed",
+            message: `status:failed:post_write_pr_read: the status on ${input.headSha} WAS written but the head could not be confirmed (HTTP ${after.status} ${after.message ?? ""})`.trim(),
+          };
+        }
+        if (after.headSha !== input.headSha) {
           return {
             kind: "stale",
             headSha: input.headSha,
