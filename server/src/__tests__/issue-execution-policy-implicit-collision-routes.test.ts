@@ -332,6 +332,77 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     expect(res.body.deliveryRequirement).toBe("record_only");
   });
 
+  it("rejects an assigned agent selecting record-only while reassigning the issue", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Agent reassignment bypass", status: "todo", assigneeAgentId: closerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: closerAgentId,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: created.body.id },
+    });
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        agentId: closerAgentId,
+        companyId,
+        companyIds: [companyId],
+        memberships: [],
+        isInstanceAdmin: false,
+        source: "session",
+        runId,
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, heartbeatStub));
+    app.use(errorHandler);
+
+    const patched = await request(app)
+      .patch(`/api/issues/${created.body.id}`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send({ deliveryRequirement: "record_only", assigneeAgentId: reviewerAgentId });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(403);
+    expect(patched.body.error).toMatch(/authorized non-assignee/);
+
+    const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    expect(stored[0]?.deliveryRequirement).toBe("repository_delivery");
+    expect(stored[0]?.assigneeAgentId).toBe(closerAgentId);
+  });
+
+  it("rejects an assigned user selecting record-only delivery", async () => {
+    const { companyId, closerAgentId } = await seedCompanyWithAgents();
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "User record-only bypass",
+        status: "todo",
+        assigneeUserId: "board-user",
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+    const patched = await request(createApp(companyId))
+      .patch(`/api/issues/${created.body.id}`)
+      .send({ deliveryRequirement: "record_only" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(403);
+    expect(patched.body.error).toMatch(/authorized non-assignee/);
+
+    const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    expect(stored[0]?.deliveryRequirement).toBe("repository_delivery");
+    expect(stored[0]?.assigneeUserId).toBe("board-user");
+  });
+
   it("accepts a create where the assignee is not the sole participant", async () => {
     const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
 

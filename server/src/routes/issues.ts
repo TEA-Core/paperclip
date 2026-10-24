@@ -17464,11 +17464,10 @@ export function issueRoutes(
     const normalizedAssigneeAgentId = normalizedAssigneeAgentRef.id;
     const effectiveDeliveryRequirement =
       req.body.deliveryRequirement ?? existing.deliveryRequirement;
-    if (
-      req.body.deliveryRequirement === "record_only" &&
-      req.actor.type === "agent" &&
-      req.actor.agentId === (normalizedAssigneeAgentId ?? existing.assigneeAgentId)
-    ) {
+    const isCurrentAssignee =
+      (req.actor.type === "agent" && req.actor.agentId === existing.assigneeAgentId) ||
+      (req.actor.type !== "agent" && req.actor.userId === existing.assigneeUserId);
+    if (req.body.deliveryRequirement === "record_only" && isCurrentAssignee) {
       res.status(403).json({
         error: "Only the board or an authorized non-assignee may select record_only delivery",
       });
