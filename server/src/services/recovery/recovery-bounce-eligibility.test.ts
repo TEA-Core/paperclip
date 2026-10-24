@@ -6,6 +6,7 @@ import {
   recoveryBounceStatusRank,
   selectRecoveryBounceCandidate,
   decideRecoveryReassignment,
+  wouldDisplacePendingStageParticipant,
 } from "./service.js";
 
 describe("SUP-17884: recovery bounce eligibility (pure helpers)", () => {
@@ -277,5 +278,189 @@ describe("SUP-17808 shape: ladder collapsing to a dead root agent", () => {
     });
     expect(decision.assigneeAgentId).toBe("exec-ceo");
     expect(decision.refused).toBe(false);
+  });
+});
+
+
+describe("orphaned-stage deadlock: recovery must not move a card off its pending stage participant", () => {
+  const SUPPORT_CR = "44953859-74c2-44de-9699-6d02e5f51817";
+  const EXEC_CTO = "e75502a7-952d-4895-93df-6a2b524a804b";
+  const CODER_BE = "3ff8593a-9166-4910-ae1e-1e0ded21521c";
+  const BOARD_USER = "yuoJHg46O2i22rvDncrPSbBK0iUdakvZ";
+
+  // The executionState of a production card as read just before the 2026-10-24 repair
+  // (review stage 0 pending, participant support-CR). On that card the platform's
+  // `reconcile_execution_review_participant` had re-seated the assignee from support-CR
+  // to exec-CTO at 05:20:58Z while this state stayed pending, which deadlocked it.
+  const pendingStageHeldBySupportCr = {
+      "status": "pending",
+      "monitor": null,
+      "delivery": {
+        "repo": {
+          "owner": "TEA-Core",
+          "repo": "paperclip"
+        },
+        "branch": "fixture",
+        "headSha": "0000000000000000000000000000000000000000",
+        "recordedAt": "2026-10-24T04:23:48.370Z",
+        "recordedByRunId": "00000000-0000-4000-8000-000000000000"
+      },
+      "pendingSince": "2026-10-24T04:42:01.988Z",
+      "reviewRequest": null,
+      "currentStageId": "ef5d6619-c670-49a9-a294-0fad81bdd628",
+      "deliveryAuthor": {
+        "type": "agent",
+        "userId": null,
+        "agentId": "3ff8593a-9166-4910-ae1e-1e0ded21521c"
+      },
+      "lastDecisionId": "38d25ab4-0214-48f4-8cdd-2c4ca4a2ad74",
+      "returnAssignee": {
+        "type": "agent",
+        "userId": null,
+        "agentId": "3ff8593a-9166-4910-ae1e-1e0ded21521c"
+      },
+      "skippedStageIds": [],
+      "currentStageType": "review",
+      "completedStageIds": [],
+      "currentStageIndex": 0,
+      "currentParticipant": {
+        "id": "71d4bbda-5cf8-44d4-b8a9-7092528cc0b6",
+        "type": "agent",
+        "userId": null,
+        "agentId": "44953859-74c2-44de-9699-6d02e5f51817"
+      },
+      "lastDecisionOutcome": "changes_requested",
+      "changesRequestedCount": 2
+    };
+
+  it("fixture parses as a pending agent-participant stage", () => {
+    // Guards the fixture itself: a schema drift must fail loudly here rather than
+    // turning every assertion below into a vacuous `false`.
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: pendingStageHeldBySupportCr,
+        currentAssigneeAgentId: SUPPORT_CR,
+        candidateAgentId: EXEC_CTO,
+      }),
+    ).toBe(true);
+  });
+
+  it("flags a reassignment from the pending participant to a different recovery owner", () => {
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: pendingStageHeldBySupportCr,
+        currentAssigneeAgentId: SUPPORT_CR,
+        candidateAgentId: EXEC_CTO,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not flag keeping the card with the participant", () => {
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: pendingStageHeldBySupportCr,
+        currentAssigneeAgentId: SUPPORT_CR,
+        candidateAgentId: SUPPORT_CR,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not flag when the stage is not pending or there is no state", () => {
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: { ...pendingStageHeldBySupportCr, status: "changes_requested" },
+        currentAssigneeAgentId: SUPPORT_CR,
+        candidateAgentId: EXEC_CTO,
+      }),
+    ).toBe(false);
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: null,
+        currentAssigneeAgentId: SUPPORT_CR,
+        candidateAgentId: EXEC_CTO,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not flag when the current assignee is already not the participant (no new orphan is created)", () => {
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: pendingStageHeldBySupportCr,
+        currentAssigneeAgentId: CODER_BE,
+        candidateAgentId: EXEC_CTO,
+      }),
+    ).toBe(false);
+  });
+
+  it("leaves a user-held escalation hold to its own sticky-hold rules", () => {
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: {
+          ...pendingStageHeldBySupportCr,
+          currentParticipant: { ...pendingStageHeldBySupportCr.currentParticipant, type: "user", agentId: null, userId: BOARD_USER },
+        },
+        currentAssigneeAgentId: null,
+        candidateAgentId: EXEC_CTO,
+      }),
+    ).toBe(false);
+  });
+
+  it("ignores missing assignee or candidate ids", () => {
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: pendingStageHeldBySupportCr,
+        currentAssigneeAgentId: null,
+        candidateAgentId: EXEC_CTO,
+      }),
+    ).toBe(false);
+    expect(
+      wouldDisplacePendingStageParticipant({
+        executionState: pendingStageHeldBySupportCr,
+        currentAssigneeAgentId: SUPPORT_CR,
+        candidateAgentId: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("decideRecoveryReassignment refuses and keeps the participant when the displacement flag is set", () => {
+    const decision = decideRecoveryReassignment({
+      currentAssigneeAgentId: SUPPORT_CR,
+      recoveryOwnerAgentId: EXEC_CTO,
+      reviewStageSelfSatisfies: false,
+      pendingStageParticipantDisplaced: true,
+      recoveryOwnerLive: true,
+    });
+    expect(decision).toEqual({
+      assigneeAgentId: SUPPORT_CR,
+      refused: true,
+      refusalReason: "pending_stage_participant_displaced",
+      refusedAssigneeAgentId: EXEC_CTO,
+      keptAssigneeAgentId: SUPPORT_CR,
+    });
+  });
+
+  it("decideRecoveryReassignment still reassigns when nothing pins the card (flag omitted or false)", () => {
+    for (const flag of [undefined, false]) {
+      const decision = decideRecoveryReassignment({
+        currentAssigneeAgentId: SUPPORT_CR,
+        recoveryOwnerAgentId: EXEC_CTO,
+        reviewStageSelfSatisfies: false,
+        pendingStageParticipantDisplaced: flag,
+        recoveryOwnerLive: true,
+      });
+      expect(decision.refused).toBe(false);
+      expect(decision.assigneeAgentId).toBe(EXEC_CTO);
+    }
+  });
+
+  it("the self-satisfy refusal keeps precedence over the displacement refusal", () => {
+    const decision = decideRecoveryReassignment({
+      currentAssigneeAgentId: SUPPORT_CR,
+      recoveryOwnerAgentId: EXEC_CTO,
+      reviewStageSelfSatisfies: true,
+      pendingStageParticipantDisplaced: true,
+      recoveryOwnerLive: true,
+    });
+    expect(decision.refusalReason).toBe("review_stage_self_satisfy");
   });
 });

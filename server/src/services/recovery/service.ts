@@ -1211,6 +1211,7 @@ export function isRecoveryBounceTargetLive(
 
 export type RecoveryReassignmentRefusalReason =
   | "review_stage_self_satisfy"
+  | "pending_stage_participant_displaced"
   | "reassignment_target_not_live";
 
 export interface RecoveryReassignmentDecision {
@@ -1219,6 +1220,38 @@ export interface RecoveryReassignmentDecision {
   refusalReason: RecoveryReassignmentRefusalReason | null;
   refusedAssigneeAgentId: string | null;
   keptAssigneeAgentId: string | null;
+}
+
+/**
+ * Would a recovery reassignment move a card OFF the agent that is the current
+ * participant of its pending review/approval stage?
+ *
+ * A pending stage can only be advanced by its participant, and the participant
+ * can only act while it holds the card. Re-seating the card under a recovery
+ * owner while the stage still names someone else produces the orphaned-stage
+ * deadlock: the participant cannot transition the stage (it is not the
+ * assignee), the new assignee cannot reach it (it is not the participant), and
+ * every recovery wake on either side is refused until the attempt ceiling
+ * escalates to the board. Observed on 24 of 27 live cards on 2026-10-24, all
+ * minted by `recovery.reconcile_execution_review_participant`.
+ *
+ * Only an agent participant that currently holds the card is protected; a
+ * user-held escalation hold and a card whose assignee already differs from the
+ * participant are unaffected (no new orphan can be created there).
+ */
+export function wouldDisplacePendingStageParticipant(input: {
+  executionState: unknown;
+  currentAssigneeAgentId: string | null;
+  candidateAgentId: string | null;
+}): boolean {
+  const { currentAssigneeAgentId, candidateAgentId } = input;
+  if (!currentAssigneeAgentId || !candidateAgentId) return false;
+  if (candidateAgentId === currentAssigneeAgentId) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (!state || state.status !== "pending") return false;
+  const participant = state.currentParticipant;
+  if (!participant || participant.type !== "agent") return false;
+  return participant.agentId === currentAssigneeAgentId;
 }
 
 /**
@@ -1237,6 +1270,8 @@ export function decideRecoveryReassignment(input: {
   currentAssigneeAgentId: string | null;
   recoveryOwnerAgentId: string | null;
   reviewStageSelfSatisfies: boolean;
+  /** Optional so existing callers keep compiling; defaults to "does not displace". */
+  pendingStageParticipantDisplaced?: boolean;
   recoveryOwnerLive: boolean;
 }): RecoveryReassignmentDecision {
   const effectiveCurrent = input.currentAssigneeAgentId;
@@ -1255,6 +1290,15 @@ export function decideRecoveryReassignment(input: {
       assigneeAgentId: effectiveCurrent,
       refused: true,
       refusalReason: "review_stage_self_satisfy",
+      refusedAssigneeAgentId: candidate,
+      keptAssigneeAgentId: effectiveCurrent,
+    };
+  }
+  if (input.pendingStageParticipantDisplaced) {
+    return {
+      assigneeAgentId: effectiveCurrent,
+      refused: true,
+      refusalReason: "pending_stage_participant_displaced",
       refusedAssigneeAgentId: candidate,
       keptAssigneeAgentId: effectiveCurrent,
     };
@@ -4432,6 +4476,11 @@ export function recoveryService(
       currentAssigneeAgentId: effectiveCurrent,
       recoveryOwnerAgentId,
       reviewStageSelfSatisfies,
+      pendingStageParticipantDisplaced: wouldDisplacePendingStageParticipant({
+        executionState: issue.executionState,
+        currentAssigneeAgentId: effectiveCurrent,
+        candidateAgentId: candidate,
+      }),
       recoveryOwnerLive,
     });
     if (decision.refused && decision.refusalReason === "review_stage_self_satisfy") {
@@ -4444,6 +4493,16 @@ export function recoveryService(
           error: reviewStageError,
         },
         "recovery reassignment refused: assignee write would make an incomplete review stage self-satisfiable",
+      );
+    } else if (decision.refused && decision.refusalReason === "pending_stage_participant_displaced") {
+      logger.warn(
+        {
+          issueId: issue.id,
+          identifier: issue.identifier,
+          refusedAssigneeAgentId: decision.refusedAssigneeAgentId,
+          keptAssigneeAgentId: decision.keptAssigneeAgentId,
+        },
+        "recovery reassignment refused: it would move the card off its pending review stage participant (orphaned-stage deadlock); keeping current assignee",
       );
     } else if (decision.refused && decision.refusalReason === "reassignment_target_not_live") {
       logger.warn(
