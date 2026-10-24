@@ -15,6 +15,7 @@ export function agentChatDraft(
     workMode,
     priority: "medium",
     reviewPolicy: null,
+    deliveryRequirement: "repository_delivery",
     projectId: null,
     projectWorkspaceId: null,
     goalId: null,

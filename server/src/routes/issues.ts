@@ -17465,7 +17465,7 @@ export function issueRoutes(
     const effectiveDeliveryRequirement =
       req.body.deliveryRequirement ?? existing.deliveryRequirement;
     if (
-      effectiveDeliveryRequirement === "record_only" &&
+      req.body.deliveryRequirement === "record_only" &&
       req.actor.type === "agent" &&
       req.actor.agentId === (normalizedAssigneeAgentId ?? existing.assigneeAgentId)
     ) {
@@ -18511,13 +18511,19 @@ export function issueRoutes(
       typeof updateFields.status === "string" &&
       updateFields.status !== existing.status &&
       isClosedIssueStatus(updateFields.status);
-    const terminalApprovalNeedsPreflight =
-      effectiveDeliveryRequirement !== "record_only" &&
+    const terminalApprovalNeedsClassificationCheck =
       shouldPublishApprovalStatus(transition.decision) &&
       ladderIsTerminallyApproved(
         nextExecutionPolicy,
         updateFields.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
       );
+    const terminalApprovalNeedsPreflight =
+      effectiveDeliveryRequirement !== "record_only" &&
+      terminalApprovalNeedsClassificationCheck;
+    const finalDeliveryIssue =
+      effectiveDeliveryRequirement === existing.deliveryRequirement
+        ? existing
+        : { ...existing, deliveryRequirement: effectiveDeliveryRequirement };
     let finalDeliveryPrefetch: FinalDeliveryPrefetch | null = null;
     // A run release can change updatedAt before the write transaction. Do not
     // certify the issue until that request-owned mutation has finished.
@@ -18549,11 +18555,11 @@ export function issueRoutes(
         if (deferFinalDeliveryPrefetch) {
           originalDeliveryBinding = await readFinalDeliveryBinding(db, existing);
         } else {
-          finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+          finalDeliveryPrefetch = await prefetchFinalDelivery(finalDeliveryIssue);
         }
       }
       if (!deferFinalDeliveryPrefetch) {
-        await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
+        await preflightTerminalApproval(finalDeliveryIssue, updateFields, transition.decision, nextExecutionPolicy, {
           overrideAccepted: outcome.overrideAccepted === true,
           prefetched: finalDeliveryPrefetch,
         });
@@ -18564,11 +18570,11 @@ export function issueRoutes(
         if (deferFinalDeliveryPrefetch) {
           originalDeliveryBinding = await readFinalDeliveryBinding(db, existing);
         } else {
-          finalDeliveryPrefetch = await prefetchFinalDelivery(existing);
+          finalDeliveryPrefetch = await prefetchFinalDelivery(finalDeliveryIssue);
         }
       }
       if (!deferFinalDeliveryPrefetch) {
-        await preflightTerminalApproval(existing, updateFields, transition.decision, nextExecutionPolicy, {
+        await preflightTerminalApproval(finalDeliveryIssue, updateFields, transition.decision, nextExecutionPolicy, {
           prefetched: finalDeliveryPrefetch,
         });
       }
@@ -18675,12 +18681,22 @@ export function issueRoutes(
           reason: "head_moved: card or delivery binding changed before final delivery preflight",
         });
       }
-      if (existing.deliveryRequirement !== "record_only") {
-        finalDeliveryPrefetch = await prefetchFinalDelivery(afterStop);
+      if (effectiveDeliveryRequirement !== "record_only") {
+        finalDeliveryPrefetch = await prefetchFinalDelivery(
+          effectiveDeliveryRequirement === afterStop.deliveryRequirement
+            ? afterStop
+            : { ...afterStop, deliveryRequirement: effectiveDeliveryRequirement },
+        );
       }
-      await preflightTerminalApproval(afterStop, updateFields, transition.decision, nextExecutionPolicy, {
-        prefetched: finalDeliveryPrefetch,
-      });
+      await preflightTerminalApproval(
+        effectiveDeliveryRequirement === afterStop.deliveryRequirement
+          ? afterStop
+          : { ...afterStop, deliveryRequirement: effectiveDeliveryRequirement },
+        updateFields,
+        transition.decision,
+        nextExecutionPolicy,
+        { prefetched: finalDeliveryPrefetch },
+      );
     }
     const nextParentId = updateFields.parentId === undefined
       ? existing.parentId
@@ -19065,7 +19081,7 @@ export function issueRoutes(
 
           // Revalidate the external certification against the locked row and
           // delivery binding before persisting the final decision or its receipt.
-          if (finalDeliveryPrefetch) {
+          if (terminalApprovalNeedsClassificationCheck) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) return null;
             if (
@@ -19076,9 +19092,16 @@ export function issueRoutes(
                 reason: "head_moved: delivery classification changed before final delivery preflight",
               });
             }
-            await preflightTerminalApproval(lockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
-              locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
-            });
+            if (effectiveDeliveryRequirement !== "record_only") {
+              const effectiveLockedIssue =
+                effectiveDeliveryRequirement === lockedIssue.deliveryRequirement
+                  ? lockedIssue
+                  : { ...lockedIssue, deliveryRequirement: effectiveDeliveryRequirement };
+              const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
+              await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
+                locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
+              });
+            }
             issueUpdateData.executionState = updateFields.executionState;
           }
 
@@ -23511,13 +23534,15 @@ export function issueRoutes(
           lastDecisionId: decisionId,
         };
       }
-      const finalDeliveryPrefetch =
-        currentIssue.deliveryRequirement !== "record_only" &&
+      const terminalApprovalNeedsDeliveryClassificationCheck =
         shouldPublishApprovalStatus(transition.decision) &&
         ladderIsTerminallyApproved(
           currentExecutionPolicy,
           transition.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
-        )
+        );
+      const finalDeliveryPrefetch =
+        currentIssue.deliveryRequirement !== "record_only" &&
+        terminalApprovalNeedsDeliveryClassificationCheck
           ? await prefetchFinalDelivery(currentIssue)
           : null;
       await preflightTerminalApproval(currentIssue, transition.patch, transition.decision, currentExecutionPolicy, {
@@ -23547,7 +23572,10 @@ export function issueRoutes(
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
-          if (finalDeliveryPrefetch) {
+          if (
+            terminalApprovalNeedsDeliveryClassificationCheck &&
+            (finalDeliveryPrefetch || currentIssue.deliveryRequirement === "record_only")
+          ) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) throw new AutoApprovalIssueMissingError();
             if (lockedIssue.deliveryRequirement !== currentIssue.deliveryRequirement) {
@@ -23556,9 +23584,11 @@ export function issueRoutes(
                 reason: "head_moved: delivery classification changed before final delivery preflight",
               });
             }
-            await preflightTerminalApproval(lockedIssue, updatePatch, transition.decision, currentExecutionPolicy, {
-              locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
-            });
+            if (finalDeliveryPrefetch) {
+              await preflightTerminalApproval(lockedIssue, updatePatch, transition.decision, currentExecutionPolicy, {
+                locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
+              });
+            }
           }
 
           const insertedComment = await svc.addComment(

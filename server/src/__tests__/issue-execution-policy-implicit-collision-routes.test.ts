@@ -8,6 +8,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRuns,
   issues,
 } from "@paperclipai/db";
 import {
@@ -16,6 +17,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -94,7 +96,11 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     }
   });
 
-  const heartbeatStub = { requestWakeup: async () => null, enqueueWakeup: async () => null } as any;
+  const heartbeatStub = {
+    requestWakeup: async () => null,
+    enqueueWakeup: async () => null,
+    wakeup: async () => null,
+  } as any;
 
   function createApp(companyId: string) {
     const app = express();
@@ -213,6 +219,55 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
 
     expect(patched.status, JSON.stringify(patched.body)).toBe(200);
     expect(patched.body.deliveryRequirement).toBe("record_only");
+  });
+
+  it("allows an assigned agent to update an issue that is already record-only", async () => {
+    const { companyId, closerAgentId } = await seedCompanyWithAgents();
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Already record-only",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        deliveryRequirement: "record_only",
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+    const runId = randomUUID();
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        agentId: closerAgentId,
+        companyId,
+        companyIds: [companyId],
+        memberships: [],
+        isInstanceAdmin: false,
+        source: "session",
+        runId,
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, heartbeatStub));
+    app.use(reportUnexpectedRouteError("issue-execution-policy-implicit-collision-routes"));
+    app.use(errorHandler);
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: closerAgentId,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: created.body.id },
+    });
+    const patched = await request(app)
+      .patch(`/api/issues/${created.body.id}`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send({ description: "Updated by assigned agent" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(patched.body.description).toBe("Updated by assigned agent");
   });
 
   it("rejects an assigned agent selecting record-only delivery", async () => {
