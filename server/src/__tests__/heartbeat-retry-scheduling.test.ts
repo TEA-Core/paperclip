@@ -412,6 +412,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     runtimeConfig?: Record<string, unknown>;
     adapterType?: string;
     issueStatus?: string;
+    agentName?: string;
   }) {
     const companyId = input?.companyId ?? randomUUID();
     const agentId = input?.agentId ?? randomUUID();
@@ -431,7 +432,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.insert(agents).values({
       id: agentId,
       companyId,
-      name: "ClaudeCoder",
+      name: input?.agentName ?? "ClaudeCoder",
       role: "engineer",
       status: "active",
       adapterType: input?.adapterType ?? "claude_local",
@@ -942,7 +943,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       updatedAt: new Date(scheduled.run.createdAt.getTime() + 1),
     });
     await db.update(agentWakeupRequests).set({ runId: siblingRunId }).where(eq(agentWakeupRequests.id, siblingWakeupId));
-    await db.update(issues).set({ executionRunId: siblingRunId }).where(eq(issues.id, issueId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
 
     await heartbeat.promoteDueScheduledRetries(now);
     claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
@@ -2058,13 +2059,16 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       if (scheduled.outcome !== "scheduled") return;
       if (phase === "promote") await clearLock();
       const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
-      expect(promotion.runIds).toContain(scheduled.run.id);
-      if (phase === "promote") return;
-      if (phase === "dispatch") await clearLock();
-      const adapter = createPostgresRunDispatchAdapter(db);
-      expect(await adapter.cancelStaleQueuedRun({
-        companyId, runId: scheduled.run.id, expectedStatus: "queued", now: scheduled.dueAt,
-      })).toMatchObject({ outcome: "cancelled", errorCode: "issue_execution_lock_changed" });
+      if (phase === "promote" || phase === "dispatch") {
+        expect(promotion).toEqual({ promoted: 0, runIds: [] });
+      } else {
+        expect(promotion.runIds).toContain(scheduled.run.id);
+        await clearLock();
+        const adapter = createPostgresRunDispatchAdapter(db);
+        expect(await adapter.cancelStaleQueuedRun({
+          companyId, runId: scheduled.run.id, expectedStatus: "queued", now: scheduled.dueAt,
+        })).toMatchObject({ outcome: "cancelled", errorCode: "issue_execution_lock_changed" });
+      }
       expect(await heartbeat.getRun(scheduled.run.id)).toMatchObject({
         status: "cancelled", errorCode: "issue_execution_lock_changed",
       });
@@ -2108,8 +2112,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
-  it("does not promote a duplicate max-turn continuation that does not own the issue lock", async () => {
-    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture();
+  it("promotes duplicate max-turn continuations and retires the loser at claim", async () => {
+    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture({
+      adapterType: CLAIM_RETRY_TEST_ADAPTER,
+    });
 
     const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
       now,
@@ -2166,21 +2172,48 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(promotion.promoted).toBe(2);
     expect(promotion.runIds).toEqual(expect.arrayContaining([scheduled.run.id, duplicateRunId]));
 
-    const runs = await db
+    const promotedRuns = await db
       .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(inArray(heartbeatRuns.id, [scheduled.run.id, duplicateRunId]));
-    expect(runs).toEqual(expect.arrayContaining([
-      { id: scheduled.run.id, status: "queued" },
-      { id: duplicateRunId, status: "queued" },
-    ]));
+    expect(promotedRuns).toEqual(
+      expect.arrayContaining([
+        { id: scheduled.run.id, status: "queued" },
+        { id: duplicateRunId, status: "queued" },
+      ]),
+    );
+
+    claimRetryExecution = { started: deferred<void>(), release: deferred<void>() };
+    await heartbeat.resumeQueuedRuns();
+    await claimRetryExecution.started.promise;
+
+    const winner = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(winner?.status).toBe("running");
+
+    const duplicate = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, duplicateRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(duplicate).toEqual({
+      id: duplicateRunId,
+      status: "cancelled",
+      errorCode: "retry_superseded_by_winner",
+    });
 
     const duplicateWakeup = await db
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, duplicateWakeupId))
       .then((rows) => rows[0] ?? null);
-    expect(duplicateWakeup?.status).toBe("queued");
+    expect(duplicateWakeup?.status).toBe("cancelled");
+
+    claimRetryExecution?.release.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
   it.each(["blocked", "todo", "backlog"] as const)(

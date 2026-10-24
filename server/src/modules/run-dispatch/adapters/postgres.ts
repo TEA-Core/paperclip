@@ -286,7 +286,8 @@ export function createPostgresRunDispatchAdapter(
       runAgentId: input.agentId,
       issueId,
       retryReasonKind,
-      enforceIssueExecutionLock: false,
+      enforceIssueExecutionLock:
+        retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
       budgetBlock: null,
       agentInvokable: true,
