@@ -21682,7 +21682,7 @@ export function issueRoutes(
           executionState: parseIssueExecutionState(issue.executionState),
         });
       let escalationApproval: {
-        prefetch: FinalDeliveryPrefetch;
+        prefetch: FinalDeliveryPrefetch | null;
         patch: Record<string, unknown>;
         decision: MergeArmingDecision | null | undefined;
       } | null = null;
@@ -21713,14 +21713,15 @@ export function issueRoutes(
         if (projected.decision && projected.patch.executionState) {
           projected.patch.executionState = { ...projected.patch.executionState, lastDecisionId: randomUUID() };
         }
-        if (issue.deliveryRequirement !== "record_only" &&
-            shouldPublishApprovalStatus(projected.decision) &&
-            ladderIsTerminallyApproved(
-              issue.executionPolicy,
-              projected.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
-            )) {
+        if (
+          shouldPublishApprovalStatus(projected.decision) &&
+          ladderIsTerminallyApproved(
+            issue.executionPolicy,
+            projected.patch.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | undefined,
+          )
+        ) {
           escalationApproval = {
-            prefetch: await prefetchFinalDelivery(issue),
+            prefetch: issue.deliveryRequirement === "record_only" ? null : await prefetchFinalDelivery(issue),
             patch: projected.patch,
             decision: projected.decision,
           };

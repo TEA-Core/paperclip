@@ -906,6 +906,43 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.armCalls).toEqual([]);
   });
 
+  it("keeps a record-only final review escalation pending when classification changes before acceptance", async () => {
+    const fixture = await pendingDelivery({ deliveryRequirement: "record_only", repo: false });
+    const interaction = await seedEscalation(fixture);
+    let raced = false;
+    const transact = db.transaction.bind(db);
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation((async (...args) => {
+      if (!raced) {
+        raced = true;
+        await db.update(issues).set({ deliveryRequirement: "repository_delivery" })
+          .where(eq(issues.id, fixture.issue.id));
+      }
+      return transact(...args);
+    }) as typeof db.transaction);
+
+    try {
+      const response = await request(createApp(db, boardActor(fixture.company)))
+        .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`)
+        .send({});
+
+      expect(raced).toBe(true);
+      expect(response.status).toBe(409);
+      expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+      const stored = await fixture.read();
+      expect(stored.deliveryRequirement).toBe("repository_delivery");
+      expect(stored.status).toBe("in_review");
+      expect(stored.executionState).toMatchObject({
+        status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+      });
+      const [pending] = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interaction.id));
+      expect(pending?.status).toBe("pending");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    } finally {
+      transactionSpy.mockRestore();
+    }
+  });
+
   async function withIssueTrigger(name: string, when: string, body: string, run: () => Promise<void>) {
     await db.execute(sql.raw(`create or replace function ${name}() returns trigger language plpgsql as $$ begin ${body} end $$`));
     await db.execute(sql.raw(`create trigger ${name} before update on issues for each row when (${when}) execute function ${name}()`));
