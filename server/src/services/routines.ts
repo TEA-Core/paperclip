@@ -558,6 +558,7 @@ function createRoutineDispatchFingerprint(input: {
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
+const ROUTINE_WRITE_LOCK_TIMEOUT_MS = 15_000;
 const ROUTINE_WORKSPACE_PREFERENCE_MODES = new Set([
   "shared_workspace",
   "isolated_workspace",
@@ -1225,22 +1226,45 @@ export function routineService(
     if (project.companyId !== companyId) throw unprocessable("Project must belong to same company");
   }
 
+  async function loadIsolatedWorkspacesEnabled() {
+    return (await instanceSettings.getExperimental()).enableIsolatedWorkspaces === true;
+  }
+
+  // Inside a transaction, pass the transaction's executor and a pre-read flag so no read leaves the
+  // transaction's connection, plus lockProject so a concurrent policy change waits for this write.
   async function assertRoutineWorkspacePreferenceAllowed(
     projectId: string | null | undefined,
     preference: string | null | undefined,
+    options: { executor?: Db; isolatedWorkspacesEnabled?: boolean; lockProject?: boolean } = {},
   ) {
     if (!projectId || !preference) return;
-    if (!(await instanceSettings.getExperimental()).enableIsolatedWorkspaces) return;
-    const project = await db
+    const enabled = options.isolatedWorkspacesEnabled ?? (await loadIsolatedWorkspacesEnabled());
+    if (!enabled) return;
+    const query = (options.executor ?? db)
       .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
       .from(projects)
-      .where(eq(projects.id, projectId))
-      .then((rows) => rows[0] ?? null);
+      .where(eq(projects.id, projectId));
+    const project = await (options.lockProject ? query.for("share") : query).then((rows) => rows[0] ?? null);
     assertIssueExecutionWorkspaceOverrideAllowed({
       projectPolicy: parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy),
       suppliedExecutionWorkspaceId: null,
       suppliedExecutionWorkspacePreference: preference,
     });
+  }
+
+  // Bounds how long a routine write may wait on a row lock, and reports a timeout as a retryable conflict.
+  async function runRoutineWriteTransaction<T>(fn: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<T>) {
+    try {
+      return await db.transaction(async (tx) => {
+        await tx.execute(sql`select set_config('lock_timeout', ${`${ROUTINE_WRITE_LOCK_TIMEOUT_MS}ms`}, true)`);
+        return fn(tx);
+      });
+    } catch (error) {
+      const code = (error as { code?: string; cause?: { code?: string } } | null)?.code
+        ?? (error as { cause?: { code?: string } } | null)?.cause?.code;
+      if (code === "55P03") throw conflict("Routine is busy; retry the request");
+      throw error;
+    }
   }
 
   async function assertGoal(companyId: string, goalId: string) {
@@ -2432,8 +2456,16 @@ export function routineService(
       if (!responsibleUserId) {
         throw unprocessable("Routine requires a responsible user");
       }
-      const createdRoutine = await db.transaction(async (tx) => {
+      const isolatedWorkspacesEnabled = input.executionWorkspacePreference
+        ? await loadIsolatedWorkspacesEnabled()
+        : false;
+      const createdRoutine = await runRoutineWriteTransaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await assertRoutineWorkspacePreferenceAllowed(input.projectId, input.executionWorkspacePreference, {
+          executor: txDb,
+          isolatedWorkspacesEnabled,
+          lockProject: true,
+        });
         const [created] = await txDb
           .insert(routines)
           .values({
@@ -2545,7 +2577,10 @@ export function routineService(
       if (!responsibleUserId) {
         throw unprocessable("Routine requires a responsible user");
       }
-      const updatedRoutine = await db.transaction(async (tx) => {
+      const isolatedWorkspacesEnabled = patch.projectId !== undefined || patch.executionWorkspacePreference !== undefined
+        ? await loadIsolatedWorkspacesEnabled()
+        : false;
+      const updatedRoutine = await runRoutineWriteTransaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${id} for update`);
         const locked = await txDb
@@ -2567,7 +2602,11 @@ export function routineService(
           ? locked.executionWorkspacePreference
           : patch.executionWorkspacePreference;
         if (patch.projectId !== undefined || patch.executionWorkspacePreference !== undefined) {
-          await assertRoutineWorkspacePreferenceAllowed(finalProjectId, finalPreference);
+          await assertRoutineWorkspacePreferenceAllowed(finalProjectId, finalPreference, {
+            executor: txDb,
+            isolatedWorkspacesEnabled,
+            lockProject: true,
+          });
         }
 
         const candidate: RoutineRow = {
@@ -2943,7 +2982,10 @@ export function routineService(
         routineSnapshot.executionWorkspacePreference,
       );
 
-      const result = await db.transaction(async (tx) => {
+      const isolatedWorkspacesEnabled = routineSnapshot.executionWorkspacePreference
+        ? await loadIsolatedWorkspacesEnabled()
+        : false;
+      const result = await runRoutineWriteTransaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existingRoutine.id} for update`);
         const locked = await txDb
@@ -2952,6 +2994,11 @@ export function routineService(
           .where(eq(routines.id, existingRoutine.id))
           .then((rows) => rows[0] ?? null);
         if (!locked) throw notFound("Routine not found");
+        await assertRoutineWorkspacePreferenceAllowed(
+          routineSnapshot.projectId,
+          routineSnapshot.executionWorkspacePreference,
+          { executor: txDb, isolatedWorkspacesEnabled, lockProject: true },
+        );
         if (locked.latestRevisionId === targetRevision.id) {
           throw conflict("Selected revision is already the latest revision", {
             currentRevisionId: locked.latestRevisionId,

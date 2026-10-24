@@ -153,7 +153,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     vi.clearAllMocks();
   });
 
-  async function createApp(actor: Record<string, unknown>) {
+  async function createApp(actor: Record<string, unknown>, database: typeof db = db) {
     const { routineRoutes } = await import("../routes/routines.js");
     const { errorHandler } = await import("../middleware/index.js");
     const app = express();
@@ -162,7 +162,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       (req as any).actor = actor;
       next();
     });
-    app.use("/api", routineRoutes(db));
+    app.use("/api", routineRoutes(database));
     app.use(reportUnexpectedRouteError("routines-e2e"));
     app.use(errorHandler);
     return app;
@@ -1214,6 +1214,143 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       .where(eq(routines.id, routineId));
     expect(stored).toEqual({ projectId, executionWorkspacePreference: "shared_workspace" });
   }, 30_000);
+
+  describe.each([1, 2, 5])("with a connection pool of %i (SUP-21022)", (maxConnections) => {
+    it("completes concurrent routine PATCHes without stalling on the pool", async () => {
+      const { companyId, agentId, projectId, userId } = await seedFixture();
+      await seedIsolatedByDefaultProject(companyId, projectId);
+      const limitedDb = createDb(tempDb!.connectionString, { maxConnections });
+      const actor = {
+        type: "board",
+        userId,
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      };
+      const app = await createApp(actor, limitedDb);
+      const createRes = await request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({ projectId, title: "Pool routine", assigneeAgentId: agentId });
+      expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+
+      const preferences = ["shared_workspace", "isolated_workspace", "inherit", "agent_default"];
+      const burst = Promise.all(
+        Array.from({ length: Math.max(maxConnections * 2, 3) }, (_, i) =>
+          request(app)
+            .patch(`/api/routines/${createRes.body.id}`)
+            .send({ executionWorkspacePreference: preferences[i % preferences.length] })
+            .then((res) => res.status),
+        ),
+      );
+      const timedOut = Symbol("timed out");
+      const outcome = await Promise.race([
+        burst,
+        new Promise<symbol>((resolve) => setTimeout(() => resolve(timedOut), 20_000)),
+      ]);
+      expect(outcome).not.toBe(timedOut);
+      expect(outcome).toEqual(Array.from({ length: Math.max(maxConnections * 2, 3) }, () => 200));
+    }, 40_000);
+  });
+
+  // Holds an uncommitted policy flip so the request under test sees the old, permissive policy until the flip commits.
+  async function withPendingPolicyFlip(projectId: string, run: () => Promise<unknown>) {
+    let commitFlip!: () => void;
+    const flipHeld = new Promise<void>((resolve) => {
+      commitFlip = resolve;
+    });
+    let flipStaged!: () => void;
+    const flipReady = new Promise<void>((resolve) => {
+      flipStaged = resolve;
+    });
+    const flip = db.transaction(async (tx) => {
+      await tx.execute(sql`
+        update projects
+        set execution_workspace_policy = jsonb_set(execution_workspace_policy, '{allowIssueOverride}', 'false'::jsonb)
+        where id = ${projectId}
+      `);
+      flipStaged();
+      await flipHeld;
+    });
+    await flipReady;
+    const pending = run();
+    for (let i = 0; i < 100; i += 1) {
+      const waiting = await db.execute(
+        sql`select 1 from pg_stat_activity where wait_event_type = 'Lock' and query ilike '%projects%'`,
+      );
+      if (waiting.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    commitFlip();
+    await flip;
+    return pending;
+  }
+
+  it("serializes the policy check with the save when the project policy flips (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    await setAllowIssueOverride(projectId, true);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const baseRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Revision source",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect([200, 201], JSON.stringify(baseRes.body)).toContain(baseRes.status);
+    const sourceRevisionId = baseRes.body.latestRevisionId as string;
+    const clearRes = await request(app)
+      .patch(`/api/routines/${baseRes.body.id}`)
+      .send({ executionWorkspacePreference: null });
+    expect(clearRes.status, JSON.stringify(clearRes.body)).toBe(200);
+
+    const patchRes = (await withPendingPolicyFlip(projectId, () =>
+      request(app)
+        .patch(`/api/routines/${baseRes.body.id}`)
+        .send({ executionWorkspacePreference: "shared_workspace" })
+        .then((res) => res),
+    )) as request.Response;
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(422);
+    expect(patchRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    await setAllowIssueOverride(projectId, true);
+    const createdRes = (await withPendingPolicyFlip(projectId, () =>
+      request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({
+          projectId,
+          title: "Flipped create",
+          assigneeAgentId: agentId,
+          executionWorkspacePreference: "shared_workspace",
+        })
+        .then((res) => res),
+    )) as request.Response;
+    expect(createdRes.status, JSON.stringify(createdRes.body)).toBe(422);
+    expect(createdRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    await setAllowIssueOverride(projectId, true);
+    const restoreRes = (await withPendingPolicyFlip(projectId, () =>
+      request(app)
+        .post(`/api/routines/${baseRes.body.id}/revisions/${sourceRevisionId}/restore`)
+        .send({})
+        .then((res) => res),
+    )) as request.Response;
+    expect(restoreRes.status, JSON.stringify(restoreRes.body)).toBe(422);
+    expect(restoreRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    const stored = await db
+      .select({ executionWorkspacePreference: routines.executionWorkspacePreference })
+      .from(routines)
+      .where(eq(routines.projectId, projectId));
+    expect(stored.every((row) => row.executionWorkspacePreference === null)).toBe(true);
+  }, 60_000);
 
   it("fails the run with the override-disallowed reason when project policy flips after the routine is saved (SUP-21022)", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
