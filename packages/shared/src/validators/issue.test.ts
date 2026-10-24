@@ -121,6 +121,29 @@ describe("issue validators", () => {
     ).toBeUndefined();
   });
 
+  it("accepts delivery requirements on create and update while rejecting unknown values", () => {
+    expect(createIssueSchema.parse({ title: "Default delivery" }).deliveryRequirement).toBeUndefined();
+    expect(
+      createIssueSchema.parse({
+        title: "Record-only issue",
+        deliveryRequirement: "record_only",
+      }).deliveryRequirement,
+    ).toBe("record_only");
+    expect(
+      updateIssueSchema.parse({ deliveryRequirement: "repository_delivery" })
+        .deliveryRequirement,
+    ).toBe("repository_delivery");
+    expect(
+      createIssueSchema.safeParse({
+        title: "Invalid delivery requirement",
+        deliveryRequirement: "inferred",
+      }).success,
+    ).toBe(false);
+    expect(
+      updateIssueSchema.safeParse({ deliveryRequirement: "inferred" }).success,
+    ).toBe(false);
+  });
+
   it("accepts review policies on create and update while rejecting unknown values", () => {
     expect(
       createIssueSchema.parse({

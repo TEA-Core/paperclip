@@ -190,6 +190,7 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     status: "todo",
     priority: "medium",
     reviewPolicy: null,
+    deliveryRequirement: "repository_delivery",
     assigneeAgentId: null,
     assigneeUserId: null,
     responsibleUserId: null,

@@ -750,6 +750,7 @@ export function createIssue(overrides: Partial<Issue> = {}): Issue {
     status: "in_progress",
     priority: "high",
     reviewPolicy: null,
+    deliveryRequirement: "repository_delivery",
     assigneeAgentId: "agent-codex",
     assigneeUserId: null,
     responsibleUserId: null,

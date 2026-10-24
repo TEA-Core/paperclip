@@ -3415,6 +3415,90 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it("rejects auto-approval when delivery classification changes before the locked transition", async () => {
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const policy = (await normalizePolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        },
+      ],
+    }))!;
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      deliveryRequirement: "record_only" as const,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: {
+          type: "agent",
+          agentId: "22222222-2222-4222-8222-222222222222",
+        },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getByIdForUpdate.mockResolvedValue({
+      ...issue,
+      deliveryRequirement: "repository_delivery",
+    });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-review-classification-race",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: reviewBody,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: reviewerAgentId,
+      authorUserId: null,
+    });
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>, tx?: unknown) => ({
+        ...issue,
+        ...patch,
+        executionState: patch.executionState,
+        status: "done",
+        completedAt: new Date(),
+        updatedAt: new Date(),
+        _tx: tx,
+      }),
+    );
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-review-classification-race",
+      }),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: reviewBody });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({
+      code: "approval_final_delivery_preflight_stale",
+    });
+    expect(mockIssueService.getByIdForUpdate).toHaveBeenCalledWith(
+      issue.id,
+      mockTx,
+    );
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("auto-approves a reviewer comment with structured review metadata", async () => {
     const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
     const policy = await normalizePolicy({

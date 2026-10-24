@@ -81,6 +81,7 @@ export function routineRunIssue(
     workMode: "standard",
     priority: normalizeIssuePriority(summary.priority),
     reviewPolicy: null,
+    deliveryRequirement: "repository_delivery",
     assigneeAgentId: null,
     assigneeUserId: null,
     checkoutRunId: null,

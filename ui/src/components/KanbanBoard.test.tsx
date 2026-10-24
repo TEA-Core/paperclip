@@ -44,6 +44,7 @@ function createIssue(index: number, status: IssueStatus): Issue {
     workMode: "standard",
     priority: "medium",
     reviewPolicy: null,
+    deliveryRequirement: "repository_delivery",
     assigneeAgentId: index === 1 ? "agent-1" : null,
     assigneeUserId: null,
     responsibleUserId: null,
