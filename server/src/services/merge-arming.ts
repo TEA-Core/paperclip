@@ -3972,6 +3972,16 @@ export async function publishHeadBoundRelease(
       if (timer) clearTimeout(timer);
     }
   };
+  const failureStatusWrite = (headSha: string, description: string) =>
+    bounded(
+      () => writeCommitStatusWithRetry(credential.token, owner, repo, headSha, "", {
+        description,
+        state: "failure",
+        attempts: 2,
+        delayMs: input.retryDelayMs ?? 1000,
+      }),
+      { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+    );
   const timedOut = (what: string) => ({ ok: false as const, status: 0, message: `timeout: ${what} did not answer within ${deadlines.fetchMs}ms` });
   const readPullRequest = () =>
     bounded(() => fetchPullRequestHeadSha(credential.token, owner, repo, number), { ...timedOut("the PR read"), headSha: null, headRef: null, open: null, draft: null, merged: null } as HeadShaResult);
@@ -4051,12 +4061,7 @@ export async function publishHeadBoundRelease(
         if (after && after.kind === "failed") {
           // The success cannot be confirmed to cover the live head, so it is voided: nothing may consume it.
           // The board can release again, which writes a fresh success (the newest status then decides).
-          const voided = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
-            description: `voided: the head of ${number} could not be confirmed after the release`,
-            state: "failure",
-            attempts: 2,
-            delayMs: input.retryDelayMs ?? 1000,
-          });
+          const voided = await failureStatusWrite(input.headSha, `voided: the head of ${number} could not be confirmed after the release`);
           return {
             kind: "failed",
             message:
@@ -4065,12 +4070,7 @@ export async function publishHeadBoundRelease(
           };
         }
         if (after) {
-          const marked = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
-            description: `superseded: ${number} is no longer the live head ${input.headSha.slice(0, 12)} the release covered`,
-            state: "failure",
-            attempts: 2,
-            delayMs: input.retryDelayMs ?? 1000,
-          });
+          const marked = await failureStatusWrite(input.headSha, `superseded: ${number} is no longer the live head ${input.headSha.slice(0, 12)} the release covered`);
           return {
             kind: "stale",
             headSha: input.headSha,
