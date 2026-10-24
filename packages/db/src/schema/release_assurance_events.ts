@@ -42,8 +42,9 @@ export type ReleaseAssurancePublicationMode = (typeof RELEASE_ASSURANCE_PUBLICAT
  * composite with the company, so the pair must belong together.
  *
  * Append-only is enforced by the database, not only by the service: the migration
- * revokes UPDATE, DELETE and TRUNCATE from the serving role and installs triggers
- * that reject UPDATE, DELETE and TRUNCATE for every role. The one governed repair
+ * revokes UPDATE, DELETE and TRUNCATE from the serving role and installs a trigger
+ * that rejects UPDATE and DELETE for every role. TRUNCATE has no trigger, so the
+ * owner's `TRUNCATE ... CASCADE` fixture cleanup keeps working. The one governed repair
  * path is a table owner or superuser disabling the trigger for the repair and
  * re-enabling it, which leaves a trail in the database log; ordinary SQL cannot do it.
  * `(companyId, eventId)` is the idempotency key — a replay of the same
