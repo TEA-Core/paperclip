@@ -570,13 +570,11 @@ import {
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
-  recordNativeTerminalRecoveryIfNeeded,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type PostCommitEffect as WakeQueuePostCommitEffect,
   type ReleaseRecoveryBlockedNoticeKind,
   type RunSnapshot as WakeQueueRunSnapshot,
 } from "../modules/wake-queue/index.js";
-import { isRetiredExternalChatQuestionSource } from "./question-response-delivery.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
   decideIssueReviewPathRecovery,
@@ -21945,10 +21943,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         currentBootId: currentHostBootId,
         detectedAt: now.toISOString(),
       });
-      // SUP-16549: native runs are excluded here as they are from `stillborn`; the legacy reaper
-      // holds no dispatch_unlaunched termination authority over them.
       const dispatchUnlaunched =
-        !nativeRun &&
         !stillborn &&
         run.invocationSource !== "self_declared" &&
         !hostRestartMarker &&
@@ -29247,28 +29242,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "released" as const };
       }
 
-      // Upstream native terminal-release exit, ported from the dormant wake-queue adapter (fold D9).
-      // A failed/cancelled native run on its assigned task holds the task for board reconciliation
-      // (native_continuation_requires_reconciliation) instead of getting a generic continuation
-      // successor. A retired external chat question source is owned by its durable answer, so it
-      // releases without an incident, as in the adapter.
-      if (
-        run.runtimeMode === "native" &&
-        run.status === "cancelled" &&
-        run.errorCode === "external_chat_continuation" &&
-        (await isRetiredExternalChatQuestionSource(txDb, {
-          companyId: run.companyId,
-          issueId: issue.id,
-          agentId: run.agentId,
-          runId: run.id,
-        }))
-      ) {
-        return { kind: "released" as const };
-      }
-      if (await recordNativeTerminalRecoveryIfNeeded(txDb, run, issue, new Date())) {
-        return { kind: "released" as const };
-      }
-
       // Upstream #13275, ported from the dormant wake-queue postgres adapter (fold D9): a legacy
       // queue interrupt authorizes only its original pending queue for the interrupted agent.
       // Replays after dispatch, a discarded queue, or a stale queue id cannot launch other work.
@@ -33624,13 +33597,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .catch(() => false));
         await releaseIssueExecutionAndPromote(cancelled, {
           // Fold 2c / native retry cancel: upstream #13075 (35fdc0c66) made a failed native run
-          // with a durable retry cancellable, and the cancellation terminalizes its coordinator.
-          // The in-file release now takes upstream's native exit (recordNativeTerminalRecoveryIfNeeded):
-          // it records native_continuation_requires_reconciliation and queues no run. This
-          // suppression stays as the belt for cases that exit does not cover (an acknowledged
-          // Stop, or a task that is no longer assigned to the run's agent), where the fork's own
-          // finalize rule (suppressImmediateRecovery: nativeTerminalFailureCode !== null) still
-          // forbids a generic issue_continuation_needed replacement chain.
+          // with a durable retry cancellable, and the cancellation terminalizes its coordinator
+          // (native_retry_cancelled). Upstream's release then records the incident without a new
+          // run (recordNativeTerminalRecoveryIfNeeded). With D9 deferred, the fork's in-file
+          // release is live and has no native exit, so it queued a generic
+          // issue_continuation_needed run as retryOfRunId of the cancelled run, or threw 422 when
+          // no responsible user resolved and left the task's execution lock on the cancelled run.
+          // The fork's own finalize rule (suppressImmediateRecovery: nativeTerminalFailureCode
+          // !== null) forbids that replacement chain, so apply it here too. The D9 port makes
+          // this redundant; delete it in that change.
           suppressImmediateRecovery:
             options.suppressImmediateRecovery ||
             pendingNativeRetry ||
