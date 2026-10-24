@@ -34,7 +34,7 @@ export type ReleaseAssuranceActor = {
 };
 
 export type LivePullRequest =
-  | { ok: true; open: boolean; draft: boolean; headSha: string | null }
+  | { ok: true; open: boolean; draft: boolean; headSha: string | null; branch: string | null; headRepo: string | null }
   | { ok: false; message: string };
 
 export type RecordedDelivery = { owner: string; repo: string; number: number; branch: string };
@@ -54,14 +54,29 @@ export type ReleaseAssuranceDeps = {
 const sameDelivery = (a: { owner: string; repo: string; number: number }, b: { owner: string; repo: string; number: number }) =>
   a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase() && a.number === b.number;
 
+/**
+ * The live PR must be the one the card delivered: its head branch is the recorded delivery branch and
+ * lives in the delivery repository. A recorded PR number alone does not establish that. A missing ref
+ * (for example a deleted head repository) cannot be verified, so it fails closed.
+ */
+const livePrMismatch = (live: Extract<LivePullRequest, { ok: true }>, delivery: RecordedDelivery) => {
+  if (!live.branch || live.branch.toLowerCase() !== delivery.branch.toLowerCase()) {
+    return "The live pull request's head branch is not the card's recorded delivery branch";
+  }
+  if (!live.headRepo || live.headRepo.toLowerCase() !== `${delivery.owner}/${delivery.repo}`.toLowerCase()) {
+    return "The live pull request's head repository is not the card's recorded delivery repository";
+  }
+  return null;
+};
+
 export function releaseAssuranceDeps(db: Db): ReleaseAssuranceDeps {
   return {
     recordedDelivery: async (executor, companyId, issueId) => {
       const identity = await resolveDeliveryIdentity(executor, companyId, issueId);
       const { binding, repo } = identity;
-      if (identity.recordedUnusable || !binding || !repo) return null;
-      // The recorded PR url must be a github.com url naming the same repository and number; a mismatch
-      // (or a non-GitHub host) is an unusable record.
+      if (identity.recordedUnusable || !binding || !repo || repo.hostname?.toLowerCase() !== "github.com") return null;
+      // Only github.com repositories resolve. The recorded PR url must also be a github.com url naming the
+      // same repository and number; any mismatch is an unusable record.
       const url = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/i.exec(binding.prUrl);
       if (!url || url[1]!.toLowerCase() !== repo.owner.toLowerCase() || url[2]!.toLowerCase() !== repo.repo.toLowerCase() || Number(url[3]) !== binding.prNumber) return null;
       return { owner: repo.owner, repo: repo.repo, number: binding.prNumber, branch: binding.branch };
@@ -89,12 +104,14 @@ export function releaseAssuranceDeps(db: Db): ReleaseAssuranceDeps {
       }
       const body = response.ok ? ((await response.json().catch(() => null)) as Record<string, unknown> | null) : null;
       if (!response.ok || !body) return { ok: false, message: `GitHub PR read failed: HTTP ${response.status}` };
-      const head = body.head as { sha?: unknown } | undefined;
+      const head = body.head as { sha?: unknown; ref?: unknown; repo?: { full_name?: unknown } | null } | undefined;
       return {
         ok: true,
         open: body.state === "open" && body.merged !== true,
         draft: body.draft === true,
         headSha: typeof head?.sha === "string" ? head.sha.toLowerCase() : null,
+        branch: typeof head?.ref === "string" && head.ref ? head.ref : null,
+        headRepo: typeof head?.repo?.full_name === "string" && head.repo.full_name ? head.repo.full_name : null,
       };
     },
   };
@@ -272,6 +289,8 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
         if (!live.ok) throw conflict(`Live PR state is unavailable: ${live.message}`);
         if (!live.open) throw conflict("The pull request is closed or merged");
         if (live.draft) throw conflict("The pull request is a draft");
+        const branchMismatch = livePrMismatch(live, delivery);
+        if (branchMismatch) throw conflict(branchMismatch);
         const [seat] = await db
           .select({ id: agents.id })
           .from(agents)
@@ -312,12 +331,14 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
         .select({ id: releaseAssuranceEvents.id })
         .from(releaseAssuranceEvents)
         .where(and(eq(releaseAssuranceEvents.companyId, input.companyId), eq(releaseAssuranceEvents.eventId, body.eventId)));
+      let liveRead: Extract<LivePullRequest, { ok: true }> | null = null;
       if (!replay) {
         const live = await deps.readLivePullRequest(input.companyId, { owner: hold.owner, repo: hold.repo, number: hold.pullRequestNumber });
         if (!live.ok) throw conflict(`Live PR head is unavailable: ${live.message}`);
         if (!live.open) throw conflict("The pull request is not open");
         if (live.draft && body.decision === "go") throw conflict("The pull request is a draft; a GO needs a ready PR");
         if (live.headSha !== body.headSha) throw conflict("PR head moved; a decision must name the current head", { liveHeadSha: live.headSha });
+        liveRead = live;
       }
       const result = await append({
         companyId: input.companyId,
@@ -342,6 +363,9 @@ export function releaseAssuranceService(db: Db, deps: ReleaseAssuranceDeps = rel
             if (!current || !sameDelivery(current, { owner: hold.owner, repo: hold.repo, number: hold.pullRequestNumber })) {
               throw conflict("The card's recorded delivery no longer matches the enrolled pull request");
             }
+            // The live PR read earlier must be the recorded delivery branch, compared with the branch re-read here under the lock.
+            const branchMismatch = liveRead && livePrMismatch(liveRead, current);
+            if (branchMismatch) throw conflict(branchMismatch);
           }
         },
       });

@@ -48,6 +48,10 @@ const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
 const DIGEST = "c".repeat(64);
 const PR = { owner: "TEA-Core", repo: "paperclip", number: 4242, branch: "SUP-1-delivery" };
+// A live PR that is exactly the card's delivery: same head branch, in the same repository.
+const livePr = (over: Partial<Extract<LivePullRequest, { ok: true }>> = {}): LivePullRequest => ({
+  ok: true, open: true, draft: false, headSha: HEAD_A, branch: PR.branch, headRepo: "TEA-Core/paperclip", ...over,
+});
 
 /**
  * SUP-20771: release-assurance control plane in SHADOW mode. The ledger is
@@ -125,7 +129,7 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
     actor = boardActor();
     delivery = PR;
     deliverySequence = [];
-    live = { ok: true, open: true, draft: false, headSha: HEAD_A };
+    live = livePr({ open: true, draft: false, headSha: HEAD_A });
   });
 
   const enrollBody = (over: Record<string, unknown> = {}) => ({
@@ -184,14 +188,14 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
   });
 
   it("refuses to enroll a closed, merged or draft PR, and fails closed when the PR state is unreadable", async () => {
-    live = { ok: true, open: false, draft: false, headSha: HEAD_A };
+    live = livePr({ open: false, draft: false, headSha: HEAD_A });
     expect((await enroll()).status).toBe(409);
-    live = { ok: true, open: true, draft: true, headSha: HEAD_A };
+    live = livePr({ open: true, draft: true, headSha: HEAD_A });
     expect((await enroll()).status).toBe(409);
     live = { ok: false, message: "no warm credential" };
     expect((await enroll()).status).toBe(409);
     expect(await rows()).toHaveLength(0);
-    live = { ok: true, open: true, draft: false, headSha: HEAD_A };
+    live = livePr({ open: true, draft: false, headSha: HEAD_A });
     expect((await enroll()).status).toBe(201);
   });
 
@@ -199,6 +203,31 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
     deliverySequence = [PR, { ...PR, number: PR.number + 1 }];
     expect((await enroll()).status).toBe(409);
     expect(await rows()).toHaveLength(0);
+  });
+
+  it("refuses to enroll a live PR whose head branch or head repository is not the card's recorded delivery", async () => {
+    for (const mismatch of [
+      livePr({ branch: "UNRELATED-branch" }),
+      livePr({ branch: null }),
+      livePr({ headRepo: "someone-else/paperclip" }),
+      livePr({ headRepo: null }),
+    ]) {
+      live = mismatch;
+      expect((await enroll()).status).toBe(409);
+    }
+    expect(await rows()).toHaveLength(0);
+    live = livePr({ branch: PR.branch.toUpperCase(), headRepo: "tea-core/PAPERCLIP" }); // comparison ignores case
+    expect((await enroll()).status).toBe(201);
+  });
+
+  it("refuses a GO whose live PR head branch is not the recorded delivery branch, but still records a NO-GO", async () => {
+    await enroll();
+    live = livePr({ branch: "UNRELATED-branch" });
+    expect((await decide(goBody())).status).toBe(409);
+    live = livePr({ headRepo: null });
+    expect((await decide(goBody())).status).toBe(409);
+    expect((await rows()).map((row) => row.kind)).toEqual(["hold"]);
+    expect((await decide(noGoBody())).status).toBe(201);
   });
 
   it("refuses a GO when the card's recorded delivery no longer matches the enrolled PR, but still records a NO-GO veto", async () => {
@@ -211,7 +240,7 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
 
   it("never grants a GO on a draft PR, but still records a NO-GO", async () => {
     await enroll();
-    live = { ok: true, open: true, draft: true, headSha: HEAD_A };
+    live = livePr({ open: true, draft: true, headSha: HEAD_A });
     expect((await decide(goBody())).status).toBe(409);
     const denied = await decide(noGoBody());
     expect(denied.status).toBe(201);
@@ -244,14 +273,14 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
 
   it("rejects a decision for a stale head and an unreadable or closed PR, recording nothing", async () => {
     await enroll();
-    live = { ok: true, open: true, draft: false, headSha: HEAD_B };
+    live = livePr({ open: true, draft: false, headSha: HEAD_B });
     const stale = await decide(goBody());
     expect(stale.status).toBe(409);
     expect(stale.body.details).toMatchObject({ liveHeadSha: HEAD_B });
     expect((await decide(noGoBody())).status).toBe(409);
     live = { ok: false, message: "boom" };
     expect((await decide(goBody())).status).toBe(409);
-    live = { ok: true, open: false, draft: false, headSha: HEAD_A };
+    live = livePr({ open: false, draft: false, headSha: HEAD_A });
     expect((await decide(goBody())).status).toBe(409);
     expect((await rows()).map((row) => row.kind)).toEqual(["hold"]);
   });
@@ -282,13 +311,13 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
     await enroll();
     const body = goBody();
     const first = await decide(body);
-    live = { ok: true, open: true, draft: false, headSha: HEAD_B };
+    live = livePr({ open: true, draft: false, headSha: HEAD_B });
     const replay = await decide(body);
     expect(replay.status).toBe(200);
     expect(replay.body).toMatchObject({ replayed: true, event: { id: first.body.event.id } });
     expect((await decide({ ...body, reason: "changed" })).status).toBe(409);
     expect((await decide(goBody())).status).toBe(409); // different event id, head is no longer live
-    live = { ok: true, open: true, draft: false, headSha: HEAD_A };
+    live = livePr({ open: true, draft: false, headSha: HEAD_A });
     expect((await decide(goBody())).status).toBe(409); // a second GO for the same head
     expect(await rows()).toHaveLength(2);
   });
@@ -300,7 +329,7 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
     expect(denied.body).toMatchObject({ verdict: "no_go", publication: { planned: { state: "failure" } } });
     expect((await decide(goBody())).status).toBe(409);
 
-    live = { ok: true, open: true, draft: false, headSha: HEAD_B };
+    live = livePr({ open: true, draft: false, headSha: HEAD_B });
     const next = await decide(goBody({ headSha: HEAD_B }));
     expect(next.body.verdict).toBe("go");
     const read = await request(app).get(`/api/issues/${issueId}/release-decisions`);
@@ -443,9 +472,9 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
 
     it("reads the PR with an already-warm cached App token only, using one GET", async () => {
       appTokenCache.set(`${companyId}:4595159:tea-core:paperclip:`, { token: "warm-token", installationId: "1", expiresAt: Date.now() + 60 * 60 * 1000 });
-      mockGhFetch.mockResolvedValue(new Response(JSON.stringify({ state: "open", merged: false, head: { sha: HEAD_A.toUpperCase() } }), { status: 200 }));
+      mockGhFetch.mockResolvedValue(new Response(JSON.stringify({ state: "open", merged: false, head: { sha: HEAD_A.toUpperCase(), ref: PR.branch, repo: { full_name: "TEA-Core/paperclip" } } }), { status: 200 }));
       const live = await releaseAssuranceDeps(db).readLivePullRequest(companyId, target);
-      expect(live).toEqual({ ok: true, open: true, draft: false, headSha: HEAD_A });
+      expect(live).toEqual(livePr());
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
       const [url, init] = mockGhFetch.mock.calls[0]!;
       expect(url).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/4242");
@@ -520,6 +549,14 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
       expect(await resolve()).toMatchObject({ number: 4242 });
     });
 
+    it("resolves only github.com repositories, even when a recorded GitHub PR url names the same owner and repo", async () => {
+      // The scout's probe: both workspaces point at a non-GitHub host, the recorded repo and PR url say github.com.
+      await seedDeliveryCard(record(), "https://gitlab.example.com/TEA-Core/paperclip");
+      expect(await resolve()).toBeNull();
+      await seedDeliveryCard(record(), "https://github.example.com/TEA-Core/paperclip");
+      expect(await resolve()).toBeNull();
+    });
+
     it("refuses a non-GitHub project repository", async () => {
       await seedDeliveryCard(record({ repo: { owner: "a", repo: "b" }, prUrl: "https://gitlab.example.com/a/b/-/merge_requests/4242" }), "https://gitlab.example.com/a/b");
       expect(await resolve()).toBeNull();
@@ -532,8 +569,10 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
       expect(await releaseAssuranceDeps(db).readLivePullRequest(companyId, target)).toMatchObject({ ok: false });
       expect(mockGhFetch).not.toHaveBeenCalled();
       appTokenCache.set(`${companyId}:4595159:tea-core:paperclip:`, { token: "warm", installationId: "1", expiresAt: Date.now() + 3_600_000 });
-      mockGhFetch.mockResolvedValue(new Response(JSON.stringify({ state: "open", merged: false, draft: true, head: { sha: HEAD_A } }), { status: 200 }));
-      expect(await releaseAssuranceDeps(db).readLivePullRequest(companyId, target)).toEqual({ ok: true, open: true, draft: true, headSha: HEAD_A });
+      mockGhFetch.mockResolvedValue(new Response(JSON.stringify({ state: "open", merged: false, draft: true, head: { sha: HEAD_A, ref: PR.branch, repo: { full_name: "TEA-Core/paperclip" } } }), { status: 200 }));
+      expect(await releaseAssuranceDeps(db).readLivePullRequest(companyId, target)).toEqual(livePr({ draft: true }));
+      mockGhFetch.mockResolvedValue(new Response(JSON.stringify({ state: "open", merged: false, head: { sha: HEAD_A, repo: null } }), { status: 200 }));
+      expect(await releaseAssuranceDeps(db).readLivePullRequest(companyId, target)).toEqual(livePr({ branch: null, headRepo: null }));
     });
   });
 });

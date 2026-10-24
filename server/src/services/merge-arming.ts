@@ -1609,7 +1609,8 @@ export async function resolveDeliveryIdentity(
   issueId: string,
 ): Promise<{
    branch: string | null;
-   repo: { owner: string; repo: string } | null;
+   // `hostname` is the project repository host (parseRepoUrl); callers that must stay on github.com check it.
+   repo: { owner: string; repo: string; hostname?: string } | null;
    binding?: DeliveryBinding;
    recordedUnusable?: string;
    /**
