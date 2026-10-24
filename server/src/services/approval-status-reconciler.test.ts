@@ -3250,6 +3250,49 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(comments[0]!.authorType).toBe("system");
     });
 
+    const RELEASE_STATUS = {
+      context: PAPERCLIP_APPROVED,
+      state: "success",
+      description: `released by user:u1 for ${NEW_HEAD}: stamp cannot be published`,
+    };
+    const graphqlCalls = () => mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+
+    it("SUP-20772: a board-release success on a card with no certified delivery does not re-arm the merge", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBeUndefined();
+      expect(summary.rearmed).toBe(0);
+      expect(graphqlCalls()).toHaveLength(0);
+    });
+
+    it("SUP-20772: a board-release success on a certified card at its certified head still re-arms, as before", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(1);
+    });
+
     it("an already-success head with a recorded armed armOutcome is not re-armed (no arm actuator I/O)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
