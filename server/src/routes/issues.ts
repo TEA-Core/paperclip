@@ -21793,6 +21793,12 @@ export function issueRoutes(
                 .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
                 .for("update");
               if (!lockedIssue) throw notFound("Issue not found");
+              if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
+                throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
+                  code: "approval_final_delivery_preflight_stale",
+                  reason: "head_moved: delivery classification changed before final delivery preflight",
+                });
+              }
               await preflightTerminalApproval(lockedIssue, escalationApproval!.patch, escalationApproval!.decision, lockedIssue.executionPolicy, {
                 locked: { prefetch: escalationApproval!.prefetch, tx: tx as unknown as Db },
               });
