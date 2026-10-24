@@ -256,19 +256,27 @@ function makeIssue(status: "backlog" | "todo" | "in_progress" | "in_review" | "d
     status,
     assigneeAgentId: "22222222-2222-4222-8222-222222222222",
     assigneeUserId: null,
-    createdByAgentId: null,
+    createdByAgentId: "22222222-2222-4222-8222-222222222222",
     identifier: "PAP-580",
     title: "PATCH denial copy",
   };
 }
 
-function agentActor(agentId: string) {
+function agentActor(agentId: string, responsibleUserId?: string) {
   return {
     type: "agent",
     agentId,
     companyId: "company-1",
     source: "agent_key",
     runId: "run-1",
+    ...(responsibleUserId ? {
+      onBehalfOfUserId: responsibleUserId,
+      onBehalfOfMemberships: [{
+        companyId: "company-1",
+        status: "active",
+        membershipRole: "operator",
+      }],
+    } : {}),
   };
 }
 
@@ -351,24 +359,131 @@ describe.sequential("issue PATCH authz denial copy", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("still allows the assignee agent to PATCH its own issue", async () => {
+  it("allows the creator-assignee agent to PATCH its own issue", async () => {
+    const creatorAssigneeId = "22222222-2222-4222-8222-222222222222";
+    const responsibleUserId = "responsible-user";
+    const issueId = "11111111-1111-4111-8111-111111111111";
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("todo"),
       ...patch,
     }));
-    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
-      allowed: true,
-      action: input.action,
-      reason: "allow_explicit_grant",
-      explanation: "Allowed by test grant.",
-    }));
+    mockAccessService.decide.mockImplementation(async (input: {
+      action?: string;
+      actor?: Record<string, unknown>;
+      resource?: Record<string, unknown>;
+      scope?: Record<string, unknown>;
+    }) => {
+      const contextMatches =
+        input.action === "issue:mutate" &&
+        input.actor?.type === "agent" &&
+        input.actor.agentId === creatorAssigneeId &&
+        input.actor.onBehalfOfUserId === responsibleUserId &&
+        input.resource?.issueId === issueId &&
+        input.resource.assigneeAgentId === creatorAssigneeId &&
+        input.resource.createdByAgentId === creatorAssigneeId &&
+        input.scope?.issueId === issueId &&
+        input.scope.assigneeAgentId === creatorAssigneeId &&
+        input.scope.createdByAgentId === creatorAssigneeId;
+      return {
+        allowed: contextMatches,
+        action: input.action,
+        reason: contextMatches ? "allow_self" : "deny_missing_grant",
+        explanation: contextMatches
+          ? "Allowed because the actor owns the assigned issue."
+          : "Missing issue write grant.",
+      };
+    });
 
-    const res = await request(await installActor(createApp(), agentActor("22222222-2222-4222-8222-222222222222")))
-      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+    const res = await request(await installActor(
+      createApp(),
+      agentActor(creatorAssigneeId, responsibleUserId),
+    ))
+      .patch(`/api/issues/${issueId}`)
       .send({ priority: "low" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:mutate",
+      actor: expect.objectContaining({
+        agentId: creatorAssigneeId,
+        onBehalfOfUserId: responsibleUserId,
+      }),
+      resource: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+      scope: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+    }));
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("preserves responsible-user denial copy for a creator-assignee PATCH", async () => {
+    const creatorAssigneeId = "22222222-2222-4222-8222-222222222222";
+    const responsibleUserId = "responsible-user";
+    const issueId = "11111111-1111-4111-8111-111111111111";
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockAccessService.decide.mockImplementation(async (input: {
+      action?: string;
+      actor?: Record<string, unknown>;
+      resource?: Record<string, unknown>;
+      scope?: Record<string, unknown>;
+    }) => {
+      const contextMatches =
+        input.action === "issue:mutate" &&
+        input.actor?.type === "agent" &&
+        input.actor.agentId === creatorAssigneeId &&
+        input.actor.onBehalfOfUserId === responsibleUserId &&
+        input.resource?.issueId === issueId &&
+        input.resource.assigneeAgentId === creatorAssigneeId &&
+        input.resource.createdByAgentId === creatorAssigneeId &&
+        input.scope?.issueId === issueId &&
+        input.scope.assigneeAgentId === creatorAssigneeId &&
+        input.scope.createdByAgentId === creatorAssigneeId;
+      return {
+        allowed: !contextMatches,
+        action: input.action,
+        reason: "deny_unsupported_action",
+        code: contextMatches ? "RESPONSIBLE_USER_UNAUTHORIZED" : undefined,
+        explanation: contextMatches
+          ? "Responsible user is not authorized for issue:mutate."
+          : "Missing issue write grant.",
+      };
+    });
+
+    const res = await request(await installActor(
+      createApp(),
+      agentActor(creatorAssigneeId, responsibleUserId),
+    ))
+      .patch(`/api/issues/${issueId}`)
+      .send({ priority: "low" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.details.code).toBe("issue_write_responsible_user_ceiling");
+    expect(res.body.error).toContain("Responsible user");
+    expect(res.body.details.code).not.toBe("issue_write_no_grant");
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:mutate",
+      actor: expect.objectContaining({
+        agentId: creatorAssigneeId,
+        onBehalfOfUserId: responsibleUserId,
+      }),
+      resource: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+      scope: expect.objectContaining({
+        issueId,
+        assigneeAgentId: creatorAssigneeId,
+        createdByAgentId: creatorAssigneeId,
+      }),
+    }));
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });

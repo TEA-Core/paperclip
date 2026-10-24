@@ -385,6 +385,9 @@ server/src/__tests__/device-login-service.test.ts(208,26): TS2741
 server/src/__tests__/document-annotation-routes.test.ts(298,7): TS2322
 server/src/__tests__/document-annotation-routes.test.ts(299,7): TS2322
 server/src/__tests__/document-annotation-routes.test.ts(306,55): TS2345
+server/src/__tests__/document-annotation-routes.test.ts(324,7): TS2322
+server/src/__tests__/document-annotation-routes.test.ts(325,7): TS2322
+server/src/__tests__/document-annotation-routes.test.ts(332,55): TS2345
 server/src/__tests__/documents-upsert-unique-violation.test.ts(24,15): TS2339
 server/src/__tests__/documents-upsert-unique-violation.test.ts(25,15): TS2339
 server/src/__tests__/duplex-observability-recorder.test.ts(188,50): TS2345
