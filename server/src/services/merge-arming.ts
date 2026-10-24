@@ -1006,6 +1006,11 @@ export interface EnableAutoMergeOptions {
   retryDelayMs?: number;
   /** Injectable sleep, for tests. Defaults to a real setTimeout. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * The head the arm is authorized for. GitHub then refuses the mutation if the PR's head is
+   * something else, so an authorization given for one head cannot arm another (SUP-20772).
+   */
+  expectedHeadOid?: string;
 }
 
 /**
@@ -1039,8 +1044,12 @@ export async function enableAutoMerge(
   const baseDelay = options.retryDelayMs ?? 250;
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
+  if (options.expectedHeadOid !== undefined && !/^[0-9a-f]{40}$/i.test(options.expectedHeadOid)) {
+    return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0 };
+  }
   const attempt = async (): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> => {
-    const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
+    const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
+    const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
 
     try {
       const response = await ghFetch(GITHUB_GRAPHQL_URL, {
@@ -3902,6 +3911,29 @@ export async function resolveReleaseDeliveryTarget(
  * be open, non-draft, on `expectedBranch` and at `headSha`, even when the head already carries a
  * control-plane success (which is then left alone). Releases of one head are serialized.
  */
+/** Bounds on the release path: a hung GitHub call or database wait must not hold the publication lock for ever. */
+export interface ReleaseDeadlines {
+  /** One GitHub call. */
+  fetchMs: number;
+  /** Waiting for the publication lock. */
+  lockMs: number;
+  /** One SQL statement on the lock connection. */
+  statementMs: number;
+  /** Idle in the lock transaction (it idles while GitHub is called), so this bounds the whole release. */
+  idleInTransactionMs: number;
+}
+const DEFAULT_RELEASE_DEADLINES: ReleaseDeadlines = {
+  fetchMs: 10_000,
+  lockMs: 20_000,
+  statementMs: 30_000,
+  idleInTransactionMs: 180_000,
+};
+
+/** The advisory-lock key that serializes releases of one head (statuses are repository and SHA scoped). */
+export function releaseLockKey(companyId: string, owner: string, repo: string, headSha: string): string {
+  return `merge-release:${companyId}:${owner}/${repo}@${headSha}`.toLowerCase();
+}
+
 export async function publishHeadBoundRelease(
   db: Db,
   companyId: string,
@@ -3911,6 +3943,7 @@ export async function publishHeadBoundRelease(
     description: string;
     expectedBranch: string;
     retryDelayMs?: number;
+    deadlines?: Partial<ReleaseDeadlines>;
     /**
      * Re-resolves eligibility and target from the card as it is now. Called inside the publication
      * lock, right before the write, so a cancel, a reversed decision or a retarget after the first
@@ -3923,13 +3956,28 @@ export async function publishHeadBoundRelease(
   },
 ): Promise<HeadBoundReleaseOutcome> {
   const { owner, repo, number } = target;
+  const deadlines = { ...DEFAULT_RELEASE_DEADLINES, ...input.deadlines };
   const credential = await resolveControlPlaneGitHubToken(db, companyId, owner, repo);
   if (!credential) {
     return { kind: "failed", message: `status:failed:auth_required: control-plane GitHub App credential unavailable for ${owner}/${repo}` };
   }
+  // One GitHub call, given up on after `fetchMs`. The request itself is not cancelled, so a timed-out
+  // write has an unknown outcome and is never retried.
+  const bounded = async <T>(run: () => Promise<T>, onTimeout: T): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<T>((resolve) => { timer = setTimeout(() => resolve(onTimeout), deadlines.fetchMs); });
+    try {
+      return await Promise.race([run(), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const timedOut = (what: string) => ({ ok: false as const, status: 0, message: `timeout: ${what} did not answer within ${deadlines.fetchMs}ms` });
+  const readPullRequest = () =>
+    bounded(() => fetchPullRequestHeadSha(credential.token, owner, repo, number), { ...timedOut("the PR read"), headSha: null, headRef: null, open: null, draft: null, merged: null } as HeadShaResult);
   // Re-read the live PR and refuse unless it is still the open PR on the bound branch at `headSha`.
   const liveRefusal = async (): Promise<HeadBoundReleaseOutcome | null> => {
-    const live = await fetchPullRequestHeadSha(credential.token, owner, repo, number);
+    const live = await readPullRequest();
     if (!live.ok) return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
     if (live.merged || live.draft || live.state !== "open") {
       return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
@@ -3970,7 +4018,10 @@ export async function publishHeadBoundRelease(
     // PR that is stale, a draft, closed, merged or off its branch.
     const firstRefusal = await recheck(conn);
     if (firstRefusal) return firstRefusal;
-    const existing = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha);
+    const existing = await bounded(
+      () => fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha),
+      { ...timedOut("the status read"), approved: false, controlPlaneApproved: false },
+    );
     if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
     if (existing.controlPlaneApproved) {
       // The status lookup took time: look at the head again before answering that it is approved.
@@ -3987,17 +4038,30 @@ export async function publishHeadBoundRelease(
     for (let attempt = 1; ; attempt += 1) {
       const refusal = await recheck(conn);
       if (refusal) return refusal;
-      const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
-        description: input.description,
-        attempts: 1,
-      });
+      const write = await bounded(
+        () => writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+          description: input.description,
+          attempts: 1,
+        }),
+        { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+      );
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
         const after = await liveRefusal();
         if (after && after.kind === "failed") {
+          // The success cannot be confirmed to cover the live head, so it is voided: nothing may consume it.
+          // The board can release again, which writes a fresh success (the newest status then decides).
+          const voided = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+            description: `voided: the head of ${number} could not be confirmed after the release`,
+            state: "failure",
+            attempts: 2,
+            delayMs: input.retryDelayMs ?? 1000,
+          });
           return {
             kind: "failed",
-            message: `status:failed:post_write_pr_read: ${after.message}; the status on ${input.headSha} WAS written but the head could not be confirmed`,
+            message:
+              `status:failed:post_write_pr_read: ${after.message}; the status on ${input.headSha} WAS written but the head could not be confirmed; ` +
+              (voided.success ? "it was voided by a failure status" : `it could NOT be voided (${voided.error ?? `HTTP ${voided.status}`})`),
           };
         }
         if (after) {
@@ -4027,11 +4091,29 @@ export async function publishHeadBoundRelease(
   };
   // At most one release per company/repo/head at a time: the second caller waits, then sees the first
   // one's status and answers already_approved instead of writing again.
-  const lockKey = `merge-release:${companyId}:${owner}/${repo}@${input.headSha}`.toLowerCase();
-  return db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
-    return publishLocked(tx as unknown as Db);
-  });
+  const lockKey = releaseLockKey(companyId, owner, repo, input.headSha);
+  try {
+    return await db.transaction(async (tx) => {
+      // Bounded: a waiter gives up instead of queueing for ever, a hung statement is cancelled, and a
+      // release that stalls while idle in its transaction is cut off by the server, which frees the lock.
+      await tx.execute(sql`select
+        set_config('lock_timeout', ${`${deadlines.lockMs}ms`}, true),
+        set_config('statement_timeout', ${`${deadlines.statementMs}ms`}, true),
+        set_config('idle_in_transaction_session_timeout', ${`${deadlines.idleInTransactionMs}ms`}, true)`);
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      return publishLocked(tx as unknown as Db);
+    });
+  } catch (error) {
+    // The transaction is rolled back (which frees the lock) before we get here.
+    const code = (error as { code?: string }).code ?? (error as { cause?: { code?: string } }).cause?.code;
+    if (code === "55P03") {
+      return { kind: "failed", message: `status:failed:lock_timeout: another release of this head held the publication lock for more than ${deadlines.lockMs}ms` };
+    }
+    if (code === "57014") {
+      return { kind: "failed", message: `status:failed:statement_timeout: a database statement of the release ran for more than ${deadlines.statementMs}ms` };
+    }
+    throw error;
+  }
 }
 
 /**

@@ -157,7 +157,7 @@ export type MeasuredPullRequestState = "merged" | "closed" | "open";
  *    (network/auth/404) — fail closed, defer to a later sweep, never report.
  */
 export type RequeueAuthorization =
-  | { kind: "authorized" }
+  | { kind: "authorized"; headSha: string }
   | { kind: "refused"; headSha: string; approvedHeadSha: string | null; reason: string }
   | { kind: "deferred"; reason: string };
 
@@ -1105,6 +1105,15 @@ export function createDoneCloseLandingBackstopService(
             const reenqueueSucceeded = await attemptReenqueue(
               issue.companyId,
               pr,
+              gate.headSha,
+              // Right before the arm the head and the approval are read again, with the certificate
+              // as it is now: the authorization above was given for one head and may not outlive it.
+              async () => authorizeReenqueueHead(
+                issue.companyId,
+                pr,
+                approvedHeadSha,
+                mergeArmingEnabled ? await readCertifiedTarget(db, issue.id) : null,
+              ),
             );
             if (reenqueueSucceeded) {
               await logActivity(db, {
@@ -1334,7 +1343,7 @@ export function createDoneCloseLandingBackstopService(
       },
     );
     if (!status.ok) return { kind: "deferred", reason: status.reason };
-    if (status.approved) return { kind: "authorized" };
+    if (status.approved) return { kind: "authorized", headSha: liveHeadSha };
     const shortLive = liveHeadSha.slice(0, 7);
     const shortAnchor = approvedHeadSha !== null ? approvedHeadSha.slice(0, 7) : null;
     let reason: string;
@@ -1455,6 +1464,8 @@ export function createDoneCloseLandingBackstopService(
   async function attemptReenqueue(
     companyId: string,
     pr: LinkedPullRequest,
+    authorizedHeadSha: string,
+    reauthorize: () => Promise<RequeueAuthorization>,
   ): Promise<boolean> {
     const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
     if (!isGitHubTokenResolution(tokenResult)) {
@@ -1473,7 +1484,16 @@ export function createDoneCloseLandingBackstopService(
       );
       return false;
     }
-    const result = await enableAutoMerge(tokenResult.token, nodeId);
+    const again = await reauthorize();
+    if (again.kind !== "authorized" || again.headSha !== authorizedHeadSha) {
+      logger.info(
+        { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, authorizedHeadSha },
+        "done-close backstop: re-enqueue skipped — the head or its approval changed after the authorization",
+      );
+      return false;
+    }
+    // GitHub refuses the mutation if the PR's head is not the one authorized.
+    const result = await enableAutoMerge(tokenResult.token, nodeId, { expectedHeadOid: authorizedHeadSha });
     if (!result.success) {
       logger.info(
         { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },

@@ -1242,7 +1242,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
 
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
       expect(mockLogActivity).toHaveBeenCalledTimes(1);
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: "issue.done_close_landing_reenqueued",
@@ -1326,6 +1326,58 @@ describe("createDoneCloseLandingBackstopService", () => {
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
         expect.anything(), expect.anything(), "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease },
       );
+    });
+
+    // SUP-20772: the authorization to arm is bound to the head it was given for. The mutation carries the
+    // expected head, and the head and the approval are read again right before it.
+    describe("binds the arm to the authorized head", () => {
+      const OTHER_HEAD = "f".repeat(40);
+      function armingFixture() {
+        const { service } = makeService({
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        });
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
+        ]);
+        mockResolver(async () => openSnapshot);
+        mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+        mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+        mockResolveGitHubTokenForRepo.mockResolvedValue({ token: "ghp_test_token", scope: "company", secretName: "github-token" });
+        mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+        return service;
+      }
+
+      it("passes the authorized head to the enable mutation", async () => {
+        await armingFixture().sweep();
+
+        expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+        expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
+      });
+
+      it("does not arm when the PR head moved between the authorization and the arm", async () => {
+        const service = armingFixture();
+        mockFetchHeadViaTokenCandidates
+          .mockResolvedValueOnce({ ok: true, headSha: LIVE_SHA })
+          .mockResolvedValueOnce({ ok: true, headSha: OTHER_HEAD });
+
+        await service.sweep();
+
+        expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      });
+
+      it("does not arm when the approval is gone by the time of the arm", async () => {
+        const service = armingFixture();
+        mockFetchHeadApprovedStatusViaTokenCandidates
+          .mockResolvedValueOnce({ ok: true, approved: true })
+          .mockResolvedValueOnce({ ok: true, approved: false });
+
+        await service.sweep();
+
+        expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      });
     });
 
     it("escalates when merge arming is enabled but no token is resolvable", async () => {
@@ -1414,7 +1466,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
 
       expect(mockFetchGitHubNodeId).toHaveBeenCalledWith("ghp_fetched", "paperclipai", "paperclip", 514);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_fetched", "PRNode_fetched");
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_fetched", "PRNode_fetched", { expectedHeadOid: expect.stringMatching(/^[0-9a-f]{40}$/) });
     });
 
     it("re-examines and re-enqueues again on a later sweep while the cap is unexhausted (SUP-15073)", async () => {
@@ -1700,7 +1752,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         reenqueued: 1,
         escalated: 0, draftStranded: 0,
       });
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: "issue.done_close_landing_reenqueued",
       }));
@@ -3553,7 +3605,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
         draftStranded: 0,
       });
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
@@ -3609,7 +3661,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
 
       // Re-enqueue proceeded through the pre-existing path (guard inert).
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
       // No delivery-refusal / escalation was emitted and the card was not blocked.
       expect(mockUpdate).not.toHaveBeenCalled();
       for (const call of mockLogActivity.mock.calls) {
