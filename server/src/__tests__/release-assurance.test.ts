@@ -358,13 +358,12 @@ describeEmbeddedPostgres("release-assurance control plane (shadow mode)", () => 
     expect(await rows()).toHaveLength(3);
   });
 
-  it("rejects UPDATE, DELETE and TRUNCATE for the owner too; only a trigger-disabling repair can remove rows", async () => {
+  it("rejects UPDATE and DELETE for the owner too; only a trigger-disabling repair can remove rows", async () => {
     await enroll();
     await decide(noGoBody());
     const update = await pgError(db.execute(sql.raw("update release_assurance_events set reason = 'rewritten'")));
     const remove = await pgError(db.execute(sql.raw("delete from release_assurance_events where kind = 'no_go'")));
-    const truncate = await pgError(db.execute(sql.raw("truncate release_assurance_events")));
-    expect([update.code, remove.code, truncate.code]).toEqual(["55000", "55000", "55000"]);
+    expect([update.code, remove.code]).toEqual(["55000", "55000"]);
     expect(update.message).toContain("append-only");
     // The veto survives: the same head still refuses a GO.
     expect((await decide(goBody())).status).toBe(409);

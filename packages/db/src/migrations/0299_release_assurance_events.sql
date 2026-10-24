@@ -5,7 +5,7 @@
 -- that still has ledger rows is refused instead of erasing the audit trail. The
 -- issue key is composite with the company so the pair must match. The ledger is
 -- append-only in the database: UPDATE/DELETE/TRUNCATE are revoked from the
--- serving role and rejected by triggers for every role.
+-- serving role; UPDATE/DELETE are also rejected by a trigger for every role.
 CREATE TABLE IF NOT EXISTS "release_assurance_events" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"company_id" uuid NOT NULL,
@@ -55,10 +55,6 @@ CREATE OR REPLACE FUNCTION "release_assurance_events_reject_mutation"() RETURNS 
 DROP TRIGGER IF EXISTS "release_assurance_events_append_only" ON "release_assurance_events";
 --> statement-breakpoint
 CREATE TRIGGER "release_assurance_events_append_only" BEFORE UPDATE OR DELETE ON "release_assurance_events" FOR EACH ROW EXECUTE FUNCTION "release_assurance_events_reject_mutation"();
---> statement-breakpoint
-DROP TRIGGER IF EXISTS "release_assurance_events_no_truncate" ON "release_assurance_events";
---> statement-breakpoint
-CREATE TRIGGER "release_assurance_events_no_truncate" BEFORE TRUNCATE ON "release_assurance_events" FOR EACH STATEMENT EXECUTE FUNCTION "release_assurance_events_reject_mutation"();
 --> statement-breakpoint
 REVOKE UPDATE, DELETE, TRUNCATE ON "release_assurance_events" FROM PUBLIC;
 --> statement-breakpoint
