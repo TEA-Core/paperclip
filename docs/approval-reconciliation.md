@@ -41,7 +41,6 @@ The card must be `done`, every declared stage completed, the last decision appro
 
 The head decision is durable before the external status write. If GitHub accepts the status but storing publication state subsequently fails, the API reports the failure and the decision audit remains; a database rollback must not erase the authorization for an already-written status. The `issue.approval_head_decision` row records the authorizer, not that publication applied: a refused publication (for example `delivery-receipt-missing` or a moved head) is visible only in the 409 response, and no publish-outcome audit record exists yet.
 
-
 ## Release-assurance control plane (shadow mode)
 
 Release assurance (RA) gets its own approval seat and a distinct `release-assurance/approved` status, separate from the normal ladder and from `paperclip/approved` (SUP-20771). This slice ships the control plane in **shadow mode only**: decisions are recorded and visible, but nothing is admitted and no RA status is ever written to GitHub. The database can only express `publication_mode = 'shadow'`, so turning publication on is a deliberate later migration, not a flag.
