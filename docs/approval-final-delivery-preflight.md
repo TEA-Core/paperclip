@@ -4,7 +4,7 @@ SUP-19860 (AS-02) moves repository-delivery eligibility ahead of the terminal ex
 
 ## Producer contract
 
-Before committing a terminal approved decision, the issue routes reuse the delivery-owner resolver and decision-head resolver. Repository-backed cards must resolve exactly one owned delivery PR, then positively verify its live OPEN, unmerged, non-draft state, recorded repository/branch identity, and unchanged readable head. A cited foreign PR is not delivery. Existing independent-review, full-ladder, done-transition, tier, and authorization guards remain in force.
+Before committing a terminal approved decision, the issue routes reuse the delivery-owner resolver and decision-head resolver. Repository-backed cards must resolve exactly one owned delivery PR, then positively verify its live OPEN, unmerged, non-draft state, recorded repository/branch identity, and unchanged readable head. A cited foreign PR is not delivery. Issues default to `deliveryRequirement: repository_delivery`; only an authorized board or non-assignee actor may explicitly select `record_only`, which skips only this final open-PR preflight. Existing independent-review, full-ladder, done-transition, tier, and authorization guards remain in force.
 
 A refusal returns HTTP 409 with `approval_final_delivery_preflight`, the underlying named reason, `deliveryOwnerIssueId`, and an actionable `remedy`. Draft delivery requires the owner to mark the PR ready and submit the final review again. Missing delivery requires that owner to provide the delivery receipt/PR. The stage stays pending: no approved decision, completion, approval stamp, or merge arm is committed.
 

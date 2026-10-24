@@ -253,6 +253,7 @@ function createIssue(): Issue {
     workMode: "standard",
     priority: "medium",
     reviewPolicy: null,
+    deliveryRequirement: "repository_delivery",
     assigneeAgentId: null,
     assigneeUserId: null,
     responsibleUserId: null,

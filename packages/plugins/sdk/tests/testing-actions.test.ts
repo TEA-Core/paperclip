@@ -108,6 +108,8 @@ describe("createTestHarness issue interactions", () => {
       title: "Pick files",
     });
 
+    expect(issue.deliveryRequirement).toBe("repository_delivery");
+
     const interaction = await harness.ctx.issues.requestCheckboxConfirmation(
       issue.id,
       {

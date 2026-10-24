@@ -593,6 +593,8 @@ export {
   type IssueStatus,
   type IssuePriority,
   type IssueReviewPolicy,
+  ISSUE_DELIVERY_REQUIREMENTS,
+  type IssueDeliveryRequirement,
   type IssueWorkMode,
   type IssueHarnessKind,
   type SummarySlotScopeKind,

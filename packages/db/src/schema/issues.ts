@@ -20,7 +20,12 @@ import { companies } from "./companies.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { projectWorkspaces } from "./project_workspaces.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
-import type { IssueReviewPolicy, IssueUnblockDescriptor, SourceTrustMetadata } from "@paperclipai/shared";
+import type {
+  IssueDeliveryRequirement,
+  IssueReviewPolicy,
+  IssueUnblockDescriptor,
+  SourceTrustMetadata,
+} from "@paperclipai/shared";
 
 export const issues = pgTable(
   "issues",
@@ -46,6 +51,10 @@ export const issues = pgTable(
     harnessKind: text("harness_kind"),
     priority: text("priority").notNull().default("medium"),
     reviewPolicy: text("review_policy").$type<IssueReviewPolicy>(),
+    deliveryRequirement: text("delivery_requirement")
+      .$type<IssueDeliveryRequirement>()
+      .notNull()
+      .default("repository_delivery"),
     assigneeAgentId: uuid("assignee_agent_id").references(() => agents.id),
     assigneeUserId: text("assignee_user_id"),
     checkoutRunId: uuid("checkout_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
@@ -103,6 +112,10 @@ export const issues = pgTable(
     )`),
     companyIdUq: unique("issues_company_id_uq").on(table.companyId, table.id),
     parentLinkKindCheck: check("issues_parent_link_kind_check", sql`${table.parentLinkKind} in ('decomposition', 'process')`),
+    deliveryRequirementCheck: check(
+      "issues_delivery_requirement_check",
+      sql`${table.deliveryRequirement} in ('repository_delivery', 'record_only')`,
+    ),
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
     companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(

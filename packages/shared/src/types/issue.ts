@@ -19,6 +19,7 @@ import type {
   IssueOriginKind,
   IssuePriority,
   IssueReviewPolicy,
+  IssueDeliveryRequirement,
   IssueRecoveryActionKind,
   IssueRecoveryActionOutcome,
   IssueRecoveryActionOwnerType,
@@ -862,6 +863,7 @@ export interface Issue {
   workMode: IssueWorkMode;
   priority: IssuePriority;
   reviewPolicy: IssueReviewPolicy | null;
+  deliveryRequirement: IssueDeliveryRequirement;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
   checkoutRunId: string | null;
@@ -951,6 +953,7 @@ export type CompactIssue = Pick<
   | "workMode"
   | "priority"
   | "reviewPolicy"
+  | "deliveryRequirement"
   | "assigneeAgentId"
   | "assigneeUserId"
   | "checkoutRunId"

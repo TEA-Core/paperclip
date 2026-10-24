@@ -1606,6 +1606,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           workMode: "standard",
           priority: input.priority ?? "medium",
           reviewPolicy: null,
+          deliveryRequirement: "repository_delivery",
           assigneeAgentId: input.assigneeAgentId ?? null,
           assigneeUserId: input.assigneeUserId ?? null,
           checkoutRunId: null,

@@ -192,6 +192,7 @@ function makeIssue(id: string, isUnreadForMe: boolean): Issue {
     workMode: "standard",
     priority: "medium",
     reviewPolicy: null,
+    deliveryRequirement: "repository_delivery",
     assigneeAgentId: null,
     assigneeUserId: null,
     responsibleUserId: null,
