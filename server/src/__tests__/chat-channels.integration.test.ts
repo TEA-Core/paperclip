@@ -1593,7 +1593,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   }
 
-  async function setupRoundTripQualified(endpointId: string) {
+  async function setupRoundTripQualified(
+    endpointId: string,
+    setupFollowUpMessageId: string,
+  ) {
     const endpoint = await db
       .select({
         assignedAgentId: chatEndpoints.assignedAgentId,
@@ -1634,6 +1637,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         and(
           eq(chatDeliveries.companyId, endpoint.companyId),
           eq(chatDeliveries.endpointId, endpointId),
+          sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${setupFollowUpMessageId}`,
           eq(chatDeliveries.state, "processed"),
           gte(chatDeliveries.processedAt, testStartedAt),
           sql`${chatDeliveries.normalizedEvent}->>'trigger' = ${requiredTrigger}`,
@@ -1815,7 +1819,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         );
       if (followUp) await service.processPendingDeliveries(25, followUp.id);
       await service.processPendingPublications();
-      expect(await setupRoundTripQualified(endpointId)).toBe(true);
+      expect(
+        await setupRoundTripQualified(endpointId, setupFollowUpMessageId),
+      ).toBe(true);
     });
     const providerRuntime = fakeRuntime.endpoints.get(endpointId);
     if (providerRuntime) providerRuntime.posts.length = 0;
