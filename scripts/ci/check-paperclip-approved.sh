@@ -739,6 +739,15 @@ waiver_unverified() {
   note "UNVERIFIED: ${1} honoured on head '${PR_HEAD_REF}' by author ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — no card binding was checked against the control plane, and a card work item on a non-SUP branch or a machine token typed User passes this check"
 }
 
+# waiver_retirement_on: the single reading of PAPERCLIP_CARD_WAIVER_RETIRED.
+# Only the exact value 1 arms it. Everything that exists because of the board
+# release (the waiver refusal, the description column, the release log line and
+# the denial hint) is gated on this, so with the switch off the script's output
+# is the output it had before SUP-20772.
+waiver_retirement_on() {
+  [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ]
+}
+
 # waiver_honoured <what>
 #   0 -> the waiver counts
 #   1 -> refused (SUP-20772): the gate falls through to the status check
@@ -747,7 +756,7 @@ waiver_unverified() {
 # control-plane data, so a honoured waiver is logged UNVERIFIED, never trusted.
 waiver_honoured() {
   local what="$1"
-  [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ] || return 0
+  waiver_retirement_on || return 0
   if [ "$CARD_BOUND" = "1" ]; then
     note "REFUSED: ${what} on card-bound head '${PR_HEAD_REF}' — a card-bound PR lands on a control-plane paperclip/approved or a board release (POST /api/issues/:id/merge-arming/release), never a waiver"
     return 1
@@ -799,9 +808,16 @@ fi
 # unpaginated read sees `missing` and — this leg being fail-closed — blocks an
 # approved entry out of the queue. Pagination preserves order across pages, so
 # the first matching row is still the newest.
+# The description column exists only to name a board release in the log, so it
+# is requested only with the switch on; off, the query and the parse are the
+# ones this script had before SUP-20772.
+STATUS_ROW='(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")'
+if waiver_retirement_on; then
+  STATUS_ROW="${STATUS_ROW}, ((.description // \"\") | if . == \"\" then \"-\" else . end)"
+fi
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-  --jq '.[] | [(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // ""), ((.description // "") | if . == "" then "-" else . end)] | @tsv')" \
+  --jq ".[] | [${STATUS_ROW}] | @tsv")" \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
@@ -833,9 +849,11 @@ if [ "$APPROVAL_STATE" = "$STATE" ]; then
     fail "${CONTEXT} on ${HEAD_SHA} was not published by the control plane"
   fi
   note "pass: ${CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA} (published by ${APPROVAL_CREATOR_LOGIN})"
-  case "$APPROVAL_DESCRIPTION" in
-    "released by "*) note "board release: ${APPROVAL_DESCRIPTION}" ;;
-  esac
+  if waiver_retirement_on; then
+    case "$APPROVAL_DESCRIPTION" in
+      "released by "*) note "board release: ${APPROVAL_DESCRIPTION}" ;;
+    esac
+  fi
   if [ "$MODE" = "advisory" ]; then
     advisory_summary_present
   fi
@@ -871,7 +889,9 @@ fi
 err "FAIL: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE} — PR #${PR_NUMBER} head ${HEAD_SHA} is not approved"
 err "  an approval is produced by the control plane when the card's review stage records 'approved'"
 err "  (a hand PATCH of the card status skips publishApprovalStatus — no status is ever published)"
-err "  a card-bound PR can also be released by the board: POST /api/issues/:id/merge-arming/release {headSha, reason}"
+if waiver_retirement_on; then
+  err "  a card-bound PR can also be released by the board: POST /api/issues/:id/merge-arming/release {headSha, reason}"
+fi
 err "  or waive a cardless PR: body line 'Paperclip-Approved-Waiver: <reason>' or the 'no-paperclip-card' label"
 err "  or have a person with write access apply the '${OVERRIDE_LABEL}' label AFTER the last push${OVERRIDE_REFUSAL:+ — override not honored: ${OVERRIDE_REFUSAL}}"
 exit 1
