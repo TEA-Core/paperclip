@@ -570,12 +570,12 @@ import {
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
+  recordNativeTerminalRecoveryIfNeeded,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type PostCommitEffect as WakeQueuePostCommitEffect,
   type ReleaseRecoveryBlockedNoticeKind,
   type RunSnapshot as WakeQueueRunSnapshot,
 } from "../modules/wake-queue/index.js";
-import { recordNativeTerminalRecoveryIfNeeded } from "../modules/wake-queue/adapters/postgres.js";
 import { isRetiredExternalChatQuestionSource } from "./question-response-delivery.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
