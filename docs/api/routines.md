@@ -54,7 +54,7 @@ Fields:
 | `status` | no | `active` (default), `paused`, `archived` |
 | `concurrencyPolicy` | no | Behaviour when a run fires while a previous one is still active |
 | `catchUpPolicy` | no | Behaviour for missed scheduled runs |
-| `executionWorkspacePreference` | no | Workspace each run issue uses: `inherit`, `shared_workspace`, `isolated_workspace`, `operator_branch`, or `agent_default`. Unset keeps the project default. `reuse_existing` is rejected. When isolated workspaces are enabled and the project policy has `allowIssueOverride: false`, any value other than `inherit` is refused with `422` and `details.code` `workspace_issue_override_disallowed`. A run-supplied workspace selection takes precedence |
+| `executionWorkspacePreference` | no | Workspace each run issue uses: `inherit`, `shared_workspace`, `isolated_workspace`, `operator_branch`, or `agent_default`. Unset keeps the project default. `reuse_existing` is rejected. When isolated workspaces are enabled and the project policy has `allowIssueOverride: false`, any value other than `inherit` is refused with `422` and `details.code` `workspace_issue_override_disallowed` on create, update (including a project change) and revision restore, and a run whose project policy later changed to `allowIssueOverride: false` fails at dispatch with the same error. A run-supplied workspace selection takes precedence |
 
 **Concurrency policies:**
 
