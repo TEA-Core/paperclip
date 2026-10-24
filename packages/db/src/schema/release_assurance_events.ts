@@ -37,7 +37,8 @@ export type ReleaseAssurancePublicationMode = (typeof RELEASE_ASSURANCE_PUBLICAT
  * change, comment deletion, or policy edit cannot erase an enrollment or a
  * denial. The company and issue foreign keys carry no delete policy (the
  * `decisions` precedent), so deleting a card or company that still has ledger
- * rows is refused rather than cascading the audit trail away. `(companyId, eventId)` is the idempotency key — a replay of the same
+ * rows is refused rather than cascading the audit trail away.
+ * `(companyId, eventId)` is the idempotency key — a replay of the same
  * canonical payload is a no-op and a conflicting reuse fails — and `sequence`
  * is the server-side ordering, never the caller's clock.
  *
