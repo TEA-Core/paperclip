@@ -625,7 +625,7 @@ export function createDoneCloseLandingBackstopService(
     // merge on a head the merge boundary has not authorized. Fetch the card's
     // pinned approval stamp once per candidate so the per-PR gate can compare
     // the live head against it. Only needed when the re-enqueue lane is open.
-    const certifiedHeadSha = mergeArmingEnabled ? await readCertifiedHeadSha(db, issue.id) : null;
+    const certifiedTarget = mergeArmingEnabled ? await readCertifiedTarget(db, issue.id) : null;
     const approvedHeadSha = mergeArmingEnabled
       ? await readApprovedHeadSha(db, issue.id)
       : null;
@@ -1090,7 +1090,7 @@ export function createDoneCloseLandingBackstopService(
           ejectionRefusal = ejectionGate;
           await recordEjectionRefusal(issue, prKey, ejectionGate, alreadyRefused);
         } else {
-          const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha, certifiedHeadSha);
+          const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha, certifiedTarget);
           if (gate.kind === "deferred") {
             // AC4: unresolvable head or approval status — fail closed, never
             // re-enqueue and never report; retry on a later sweep.
@@ -1249,12 +1249,12 @@ export function createDoneCloseLandingBackstopService(
    * (`executionState.approvalStatus.approvedHeadSha`), or null when the card has
    * no stamped head (e.g. an arming-refusal candidate).
    */
-  async function readCertifiedHeadSha(db: Db, issueId: string): Promise<string | null> {
+  async function readCertifiedTarget(db: Db, issueId: string) {
     const row = await db
       .select({ executionState: issues.executionState })
       .from(issues)
       .where(eq(issues.id, issueId));
-    return readCertifiedFinalDelivery(row[0]?.executionState as Record<string, unknown> | null | undefined)?.headSha ?? null;
+    return readCertifiedFinalDelivery(row[0]?.executionState as Record<string, unknown> | null | undefined) ?? null;
   }
 
   async function readApprovedHeadSha(
@@ -1298,7 +1298,7 @@ export function createDoneCloseLandingBackstopService(
     companyId: string,
     pr: LinkedPullRequest,
     approvedHeadSha: string | null,
-    certifiedHeadSha: string | null,
+    certifiedTarget: { owner: string; repo: string; number: number; headSha: string } | null,
   ): Promise<RequeueAuthorization> {
     const head = await fetchHeadViaTokenCandidates(
       db,
@@ -1319,9 +1319,19 @@ export function createDoneCloseLandingBackstopService(
       pr.owner,
       pr.repo,
       liveHeadSha,
-      // A board release (SUP-20772) is a human decision, not a review: it re-enqueues a card only when
-      // the card's own review certified this exact head.
-      { ignoreRelease: certifiedHeadSha !== liveHeadSha },
+      // Strict reading (SUP-20772): the newest paperclip/approved status must be a control-plane success,
+      // never a forged or historical one. A board release is a human decision, not a review, so it
+      // re-enqueues a card only when the card's own review certified this exact repository, PR and head.
+      {
+        strict: true,
+        ignoreRelease: !(
+          certifiedTarget !== null &&
+          certifiedTarget.headSha === liveHeadSha &&
+          certifiedTarget.number === pr.number &&
+          certifiedTarget.owner.toLowerCase() === pr.owner.toLowerCase() &&
+          certifiedTarget.repo.toLowerCase() === pr.repo.toLowerCase()
+        ),
+      },
     );
     if (!status.ok) return { kind: "deferred", reason: status.reason };
     if (status.approved) return { kind: "authorized" };

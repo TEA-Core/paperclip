@@ -1271,6 +1271,28 @@ describe("createDoneCloseLandingBackstopService", () => {
         false,
       ],
       [
+        "a card certified for another PR at the same head ignores a board-release status",
+        {
+          lastDecisionId: "decision-1",
+          approvalStatus: {
+            approvedHeadSha: LIVE_SHA,
+            finalDelivery: { owner: "paperclipai", repo: "paperclip", number: 999, headSha: LIVE_SHA, decisionId: "decision-1" },
+          },
+        },
+        true,
+      ],
+      [
+        "a card certified for another repository at the same head ignores a board-release status",
+        {
+          lastDecisionId: "decision-1",
+          approvalStatus: {
+            approvedHeadSha: LIVE_SHA,
+            finalDelivery: { owner: "paperclipai", repo: "other-repo", number: 514, headSha: LIVE_SHA, decisionId: "decision-1" },
+          },
+        },
+        true,
+      ],
+      [
         "a card certified at another head ignores a board-release status",
         {
           lastDecisionId: "decision-1",
@@ -1302,7 +1324,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       await service.sweep();
 
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), expect.anything(), "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease },
+        expect.anything(), expect.anything(), "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease },
       );
     });
 
@@ -1684,7 +1706,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       }));
       // The status reader WAS consulted because the stamp did not cover the live head.
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease: true },
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease: true },
       );
     });
 
@@ -1901,7 +1923,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
       // The status reader IS consulted (the anchor is not trusted as a stamp).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease: true },
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease: true },
       );
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
     });
@@ -2025,7 +2047,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       // The gate consulted the live head's real stamp (the moved anchor alone does
       // not authorize; the new head's success status does).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { ignoreRelease: true },
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease: true },
       );
       // No refusal row / no escalation: this head is approvable, so it quiesces by
       // landing, not by a board action.

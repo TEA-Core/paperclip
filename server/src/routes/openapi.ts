@@ -7722,6 +7722,18 @@ registry.registerPath({
   },
 });
 
+const MergeReleaseOutcomeSchema = z.object({
+  outcome: z.enum(["released", "already_approved", "refused", "failed", "stale"]),
+  headSha: z.string(),
+  message: z.string(),
+  auditRecorded: z.boolean(),
+});
+// A card refusal ({ error }) is answered before anything is published; a publication outcome is not.
+const mergeReleaseConflict = {
+  description: "Conflict: a card refusal ({ error }) or a publication outcome ({ outcome, headSha, message, auditRecorded })",
+  content: { "application/json": { schema: z.union([z.object({ error: z.string() }), MergeReleaseOutcomeSchema]) } },
+};
+
 registry.registerPath({
   method: "get",
   path: "/api/issues/{id}/release-decisions",
@@ -7799,12 +7811,12 @@ registry.registerPath({
     body: jsonBody(releaseIssueHeadSchema),
   },
   responses: {
-    200: r.ok(),
+    200: r.ok(MergeReleaseOutcomeSchema),
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
-    409: r.conflict,
+    409: mergeReleaseConflict,
   },
 });
 
@@ -7826,12 +7838,12 @@ registry.registerPath({
     body: jsonBody(overrideReleaseIssueHeadSchema),
   },
   responses: {
-    200: r.ok(),
+    200: r.ok(MergeReleaseOutcomeSchema),
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
-    409: r.conflict,
+    409: mergeReleaseConflict,
   },
 });
 
