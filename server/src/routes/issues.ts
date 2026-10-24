@@ -11546,7 +11546,19 @@ export function issueRoutes(
     const { headSha, reason } = mode === "override"
       ? (({ headSha, overrideReason }) => ({ headSha, reason: overrideReason }))(overrideReleaseIssueHeadSchema.parse(req.body))
       : releaseIssueHeadSchema.parse(req.body);
-    const resolved = await resolveReleaseDeliveryTarget(db, existing.companyId, existing.id, { headSha, mode });
+    // The stage decisions must pass the same integrity check the approval path (approve-head) runs.
+    const ladderIntegrity = async (issueId: string): Promise<string | null> => {
+      try {
+        const [row] = await db.select().from(issueRows).where(and(eq(issueRows.id, issueId), eq(issueRows.companyId, existing.companyId)));
+        if (!row) return "card not found";
+        const integrity = await evaluateStageIntegrity(db, { ...row, executionState: row.executionState ?? {} } as CandidateRow);
+        return integrity ? integrity.detail : null;
+      } catch (error) {
+        return `stage integrity could not be verified: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    };
+    const resolveTarget = () => resolveReleaseDeliveryTarget(db, existing.companyId, existing.id, { headSha, mode, ladderIntegrity });
+    const resolved = await resolveTarget();
     if (!resolved.ok) throw conflict(`Card cannot be released: ${resolved.reason}`);
     const { target, basis } = resolved;
     const kinds = MERGE_RELEASE_AUDIT[mode];
@@ -11565,7 +11577,7 @@ export function issueRoutes(
     let outcome: HeadBoundReleaseOutcome;
     try {
       outcome = await publishHeadBoundRelease(db, existing.companyId, target, {
-        headSha, description, expectedBranch: target.branch,
+        headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
       });
     } catch (error) {
       // A throwing prerequisite (secret lookup, token resolver, lock) must still leave a failed outcome

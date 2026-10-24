@@ -3042,6 +3042,7 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
   owner: string,
   repo: string,
   headSha: string,
+  options: { ignoreRelease?: boolean } = {},
 ): Promise<{ ok: true; approved: boolean; controlPlaneApproved: boolean } | { ok: false; reason: string }> {
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
   if (candidates.length === 0) {
@@ -3054,7 +3055,7 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
   let lastStatus = 0;
   let lastMessage: string | null = null;
   for (const candidate of candidates) {
-    const result = await fetchHeadCommitStatuses(candidate.token, owner, repo, headSha);
+    const result = await fetchHeadCommitStatuses(candidate.token, owner, repo, headSha, options);
     if (result.ok) return { ok: true, approved: result.approved, controlPlaneApproved: result.controlPlaneApproved };
     lastStatus = result.status;
     lastMessage = result.message;
@@ -3309,6 +3310,7 @@ async function fetchHeadCommitStatusesOnce(
   owner: string,
   repo: string,
   headSha: string,
+  options: { ignoreRelease?: boolean } = {},
 ): Promise<{ ok: boolean; approved: boolean; controlPlaneApproved: boolean; status: number; message: string | null }> {
   const url =
     `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
@@ -3342,7 +3344,9 @@ async function fetchHeadCommitStatusesOnce(
     if (typeof raw !== "object" || raw === null) continue;
     const status = raw as Record<string, unknown>;
     if (status.context !== "paperclip/approved") continue;
-    if (status.state === "success") approved = true;
+    // A board release is a human decision on one head, not a review (SUP-20772): a caller that decides
+    // whether to arm a merge can ask for it not to count as approval.
+    if (status.state === "success" && !(options.ignoreRelease && isHeadBoundReleaseDescription(status.description))) approved = true;
     if (!newestSeen) {
       newestSeen = true;
       const creator = status.creator as Record<string, unknown> | null | undefined;
@@ -3363,8 +3367,9 @@ async function fetchHeadCommitStatuses(
   owner: string,
   repo: string,
   headSha: string,
+  options: { ignoreRelease?: boolean } = {},
 ): Promise<{ ok: boolean; approved: boolean; controlPlaneApproved: boolean; status: number; message: string | null }> {
-  return withTransientReadRetry(() => fetchHeadCommitStatusesOnce(token, owner, repo, headSha));
+  return withTransientReadRetry(() => fetchHeadCommitStatusesOnce(token, owner, repo, headSha, options));
 }
 
 export interface HeadShaSuccess extends GitHubFetchResult {
@@ -3588,6 +3593,7 @@ async function writeCommitStatus(
   headSha: string,
   issueIdentifier: string,
   description?: string,
+  state: "success" | "failure" = "success",
 ): Promise<{ success: boolean; error: string | null; status: number; transient: boolean }> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/statuses/${encodeURIComponent(headSha)}`;
   const headers: Record<string, string> = {
@@ -3598,7 +3604,7 @@ async function writeCommitStatus(
   };
 
   const body = JSON.stringify({
-    state: "success",
+    state,
     context: "paperclip/approved",
     description: description ?? `${issueIdentifier} approved via Paperclip`,
     ...(issueIdentifier ? { target_url: `https://paperclip.example.com/issues/${issueIdentifier}` } : {}),
@@ -3724,6 +3730,8 @@ export interface WriteCommitStatusRetryOptions {
   delay?: (ms: number) => Promise<void>;
   /** Overrides the default "<issue> approved via Paperclip" status description. */
   description?: string;
+  /** The status state to write (default success). */
+  state?: "success" | "failure";
 }
 
 export interface WriteCommitStatusResult {
@@ -3758,11 +3766,11 @@ export async function writeCommitStatusWithRetry(
   const delay =
     options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
-  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description);
+  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state);
   let made = 1;
   while (!result.success && result.transient && made < attempts) {
     await delay(delayMs);
-    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description);
+    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state);
     made += 1;
   }
   return { ...result, attempts: made };
@@ -3804,7 +3812,12 @@ export async function resolveReleaseDeliveryTarget(
   db: Db,
   companyId: string,
   issueId: string,
-  opts: { headSha: string; mode: "standard" | "override" },
+  opts: {
+    headSha: string;
+    mode: "standard" | "override";
+    /** Null when the card's stage decisions pass the approval path's integrity check, else why not. */
+    ladderIntegrity: (issueId: string) => Promise<string | null>;
+  },
 ): Promise<
   | { ok: true; target: { owner: string; repo: string; number: number; displayName: string; branch: string }; basis: ReleaseBasis }
   | { ok: false; reason: string }
@@ -3844,16 +3857,33 @@ export async function resolveReleaseDeliveryTarget(
     return { ok: false, reason: "the card is cancelled; only the explicit override can release it" };
   }
   if (samePrAsCertified && certified!.headSha === opts.headSha) return { ok: true, target, basis: "certified_delivery" };
+  // A completed approving ladder, as the approval path (approve-head) understands it: a done card, an
+  // approving last decision, a non-empty policy whose every stage is completed, stage decisions that pass
+  // the same integrity check (no missing decision, no skipped stage, no self-approval), and an approved
+  // head equal to the head being released.
   const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
   const decidedHeadMatches = opts.headSha.length > 0 &&
     [approvalStatus?.publishedHeadSha, approvalStatus?.approvedHeadSha].includes(opts.headSha);
-  if (ladderIsTerminallyApproved(issueRow?.executionPolicy as never, state as never) && decidedHeadMatches) {
-    return { ok: true, target, basis: "approved_ladder" };
+  const stages = Array.isArray((issueRow?.executionPolicy as { stages?: unknown } | null)?.stages)
+    ? (issueRow!.executionPolicy as { stages: Array<{ id?: unknown }> }).stages
+    : [];
+  const completedIds = Array.isArray(state?.completedStageIds) ? (state!.completedStageIds as unknown[]) : [];
+  let ladderWhy = "the ladder is not complete, or not approved on this head";
+  if (
+    issueRow?.status === "done" &&
+    state?.lastDecisionOutcome === "approved" &&
+    stages.length > 0 &&
+    stages.every((stage) => typeof stage.id === "string" && completedIds.includes(stage.id)) &&
+    decidedHeadMatches
+  ) {
+    const integrity = await opts.ladderIntegrity(issueId);
+    if (integrity === null) return { ok: true, target, basis: "approved_ladder" };
+    ladderWhy = integrity;
   }
   return {
     ok: false,
     reason:
-      `the card has no completed approving ladder or certified delivery bound to head ${opts.headSha}; ` +
+      `the card has no completed approving ladder or certified delivery bound to head ${opts.headSha} (${ladderWhy}); ` +
       "the explicit override (merge-arming/release-override) is the only way to release it",
   };
 }
@@ -3871,7 +3901,21 @@ export async function publishHeadBoundRelease(
   db: Db,
   companyId: string,
   target: { owner: string; repo: string; number: number },
-  input: { headSha: string; description: string; expectedBranch: string; retryDelayMs?: number },
+  input: {
+    headSha: string;
+    description: string;
+    expectedBranch: string;
+    retryDelayMs?: number;
+    /**
+     * Re-resolves eligibility and target from the card as it is now. Called inside the publication
+     * lock, right before the write, so a cancel, a reversed decision or a retarget after the first
+     * read cannot still release the old target.
+     */
+    revalidate: () => Promise<
+      | { ok: true; target: { owner: string; repo: string; number: number; branch: string } }
+      | { ok: false; reason: string }
+    >;
+  },
 ): Promise<HeadBoundReleaseOutcome> {
   const { owner, repo, number } = target;
   const credential = await resolveControlPlaneGitHubToken(db, companyId, owner, repo);
@@ -3899,23 +3943,43 @@ export async function publishHeadBoundRelease(
     }
     return null;
   };
+  const eligibilityRefusal = async (): Promise<HeadBoundReleaseOutcome | null> => {
+    const again = await input.revalidate();
+    if (!again.ok) {
+      return { kind: "refused", message: `status:refused:eligibility-changed: ${again.reason}` };
+    }
+    const t = again.target;
+    if (t.owner !== owner || t.repo !== repo || t.number !== number || t.branch !== input.expectedBranch) {
+      return {
+        kind: "refused",
+        message: `status:refused:eligibility-changed: the card's delivery now targets ${t.owner}/${t.repo}#${t.number}, not ${owner}/${repo}#${number}`,
+      };
+    }
+    return null;
+  };
+  // The PR's liveness and the card's eligibility, both as they are now.
+  const recheck = async (): Promise<HeadBoundReleaseOutcome | null> => (await liveRefusal()) ?? (await eligibilityRefusal());
   const publishLocked = async (): Promise<HeadBoundReleaseOutcome> => {
     // The live PR is checked before anything else, so an "already approved" answer is never given for a
     // PR that is stale, a draft, closed, merged or off its branch.
-    const firstRefusal = await liveRefusal();
+    const firstRefusal = await recheck();
     if (firstRefusal) return firstRefusal;
     const existing = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha);
     if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
     if (existing.controlPlaneApproved) {
+      // The status lookup took time: look at the head again before answering that it is approved.
+      const stillLive = await recheck();
+      if (stillLive) return stillLive;
       return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
     }
     // GitHub has no compare-and-swap on a commit status, so a push landing between the last live read and
     // the POST can still leave one status on the old SHA. It is keyed by SHA, so the new head does not
-    // inherit it, and the head is read once more after the write: a head that moved is reported as stale,
-    // never as a release. A transient failure is retried only after the live head is checked again.
+    // inherit it, and the head is read once more after the write: a head that moved is reported as stale
+    // (and the status written to the old head is set to failure, so no success stays on it), never as a
+    // release. A transient failure is retried only after the live head and eligibility are checked again.
     const attempts = 3;
     for (let attempt = 1; ; attempt += 1) {
-      const refusal = await liveRefusal();
+      const refusal = await recheck();
       if (refusal) return refusal;
       const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
         description: input.description,
@@ -3926,14 +3990,24 @@ export async function publishHeadBoundRelease(
         if (!after.ok) {
           return {
             kind: "failed",
-            message: `status:failed:post_write_pr_read: the status on ${input.headSha} WAS written but the head could not be confirmed (HTTP ${after.status} ${after.message ?? ""})`.trim(),
+            message: `status:failed:post_write_pr_read: HTTP ${after.status} ${after.message ?? ""}; the status on ${input.headSha} WAS written but the head could not be confirmed`.trim(),
           };
         }
         if (after.headSha !== input.headSha) {
+          const marked = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+            description: `superseded: ${number} head moved to ${after.headSha.slice(0, 12)} before the release was confirmed`,
+            state: "failure",
+            attempts: 2,
+            delayMs: input.retryDelayMs ?? 1000,
+          });
           return {
             kind: "stale",
             headSha: input.headSha,
-            message: `status:stale:head-moved-after-write: ${owner}/${repo}#${number} head is now ${after.headSha}; the status written to ${input.headSha} does not cover it`,
+            message:
+              `status:stale:head-moved-after-write: ${owner}/${repo}#${number} head is now ${after.headSha}; ` +
+              (marked.success
+                ? `the status written to ${input.headSha} was set to failure and does not cover it`
+                : `the status written to ${input.headSha} could NOT be set to failure (${marked.error ?? `HTTP ${marked.status}`}) and does not cover the new head`),
           };
         }
         return { kind: "released", headSha: input.headSha, message: input.description };

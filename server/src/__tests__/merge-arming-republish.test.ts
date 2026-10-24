@@ -1772,7 +1772,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       statuses?: Array<Record<string, unknown>>;
       draft?: boolean;
       /** Runs when the status list is read. */
-      onStatusRead?: () => void;
+      onStatusRead?: () => void | Promise<void>;
       /** Response for the Nth (1-based) status POST; default is a 201. */
       postStatus?: (call: number) => { ok: boolean; status: number };
       /** Every PR GET after the first status POST fails with a 502. */
@@ -1793,7 +1793,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
           return createMockResponse({ id: 1 }, response.ok, response.status);
         }
         if (url.includes("/statuses/")) {
-          opts.onStatusRead?.();
+          await opts.onStatusRead?.();
           return createMockResponse(opts.statuses ?? []);
         }
         throw new Error(`Unexpected release request: ${url}`);
@@ -1832,6 +1832,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         ...seedOpts,
         pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
       });
+      if (basis === "ladder") await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.issueId));
       await bindDelivery(seeded.issueId);
       currentActor = boardActor(seeded.companyId);
       return seeded;
@@ -2484,7 +2485,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(res.status).toBe(409);
       expect(res.body.outcome).toBe("stale");
       expect(res.body.message).toContain("head-moved-after-write");
-      expect(statusWrites()).toHaveLength(1);
+      // The success written to the old head is superseded by a failure, so no success remains on it.
+      const writes = statusWrites();
+      expect(writes).toHaveLength(2);
+      expect(writes.map(([url]) => url)).toEqual([
+        `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`,
+        `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${HEAD_SHA}`,
+      ]);
+      expect(JSON.parse(writes[0]![1].body as string)).toMatchObject({ state: "success", context: "paperclip/approved" });
+      expect(JSON.parse(writes[1]![1].body as string)).toMatchObject({ state: "failure", context: "paperclip/approved" });
       expect(await releaseLogRows()).toEqual([]);
       expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "stale" } });
     });
@@ -2548,6 +2557,96 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
       expect(JSON.parse(statusWrites()[0]![1].body as string)).not.toHaveProperty("target_url");
+    });
+
+
+    // ---- G1: the default route must establish a real completed ladder ----
+
+    async function expectLadderRefused(issueId: string) {
+      installReleaseTransport();
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(res.status).toBe(409);
+      expect(JSON.stringify(res.body)).toMatch(/no completed approving ladder or certified delivery/);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(statusWrites()).toEqual([]);
+      expect(await requestRows()).toEqual([]);
+    }
+
+    it("refuses a ladder with no stages: an empty policy is not a completed ladder", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      await db.update(issues).set({
+        executionPolicy: { ...(issue!.executionPolicy as Record<string, unknown>), stages: [] },
+        executionState: { ...(issue!.executionState as Record<string, unknown>), completedStageIds: [] },
+      }).where(eq(issues.id, issueId));
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a card with no execution policy", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      await db.update(issues).set({ executionPolicy: null }).where(eq(issues.id, issueId));
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a completed stage that has no decision row", async () => {
+      const { issueId } = await seedReleasable("ladder", { seedDecision: false });
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a stage decided by the return assignee (self-approval)", async () => {
+      const { issueId } = await seedReleasable("ladder", { returnAssigneeDecides: true });
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a ladder that records a skipped stage as completed", async () => {
+      const { issueId } = await seedReleasable("ladder", { skippedStageIds: [STAGE_ID] });
+      await expectLadderRefused(issueId);
+    });
+
+    it("refuses a ladder whose card is not done", async () => {
+      const { issueId } = await seedReleasable("ladder");
+      await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+      await expectLadderRefused(issueId);
+    });
+
+    // ---- Eligibility and target are re-checked inside the publication lock ----
+
+    it.each([
+      ["the card is cancelled", async (issueId: string) => { await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId)); }],
+      ["the approving decision is reversed", async (issueId: string) => {
+        const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        await db.update(issues).set({ executionState: { ...(issue!.executionState as Record<string, unknown>), lastDecisionOutcome: "changes_requested" } }).where(eq(issues.id, issueId));
+      }],
+      ["the delivery binding is retargeted", async (issueId: string) => {
+        await bindDelivery(issueId, { prNumber: PR_NUMBER + 1, prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER + 1}` });
+      }],
+    ])("refuses with no write when, after the first read, %s", async (_name, mutate) => {
+      const { issueId } = await seedReleasable("ladder");
+      installReleaseTransport({ onStatusRead: () => mutate(issueId) });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("refused");
+      expect(res.body.message).toContain("eligibility-changed");
+      expect(statusWrites()).toEqual([]);
+    });
+
+    it("does not answer already_approved when the head moves during the status lookup", async () => {
+      const { issueId } = await seedReleasable();
+      let head = HEAD_SHA;
+      installReleaseTransport({
+        liveHeadNow: () => head,
+        statuses: [approvedRow("success", CONTROL_PLANE_CREATOR)],
+        onStatusRead: () => { head = OTHER_HEAD; },
+      });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("refused");
+      expect(res.body.message).toContain("head-mismatch");
+      expect(statusWrites()).toEqual([]);
     });
 
     it("rejects a malformed body with 400 before any GitHub I/O", async () => {
