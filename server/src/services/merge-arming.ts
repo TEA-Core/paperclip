@@ -3773,6 +3773,11 @@ export function headBoundReleaseDescription(actor: string, headSha: string, reas
   return `${prefix}${text.length > room ? `${text.slice(0, Math.max(room - 1, 0))}…` : text}`.slice(0, COMMIT_STATUS_DESCRIPTION_MAX);
 }
 
+/** True for a status description written by {@link headBoundReleaseDescription}. */
+export function isHeadBoundReleaseDescription(description: unknown): boolean {
+  return typeof description === "string" && description.startsWith("released by ");
+}
+
 export type HeadBoundReleaseOutcome =
   | { kind: "released" | "already_approved"; headSha: string; message: string }
   | { kind: "refused" | "failed"; message: string };
@@ -3801,6 +3806,21 @@ export async function resolveReleaseDeliveryTarget(
   if (bindingError) return { ok: false, reason: bindingError };
   const { owner, repo } = identity.repo;
   const number = identity.binding.prNumber;
+  // A card whose review certified one PR for delivery keeps that boundary: the release may not move to
+  // another PR just because the recorded delivery binding was later pointed elsewhere.
+  const [issueRow] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+  const certified = readCertifiedFinalDelivery(issueRow?.executionState as Record<string, unknown> | null | undefined);
+  if (
+    certified &&
+    (certified.number !== number ||
+      certified.owner.toLowerCase() !== owner.toLowerCase() ||
+      certified.repo.toLowerCase() !== repo.toLowerCase())
+  ) {
+    return {
+      ok: false,
+      reason: `the card's certified final delivery is ${certified.displayName}, not ${owner}/${repo}#${number}; a release may not change the certified PR`,
+    };
+  }
   return {
     ok: true,
     target: { owner, repo, number, displayName: `${owner}/${repo}#${number}`, branch: identity.binding.branch },
@@ -3819,40 +3839,57 @@ export async function publishHeadBoundRelease(
   db: Db,
   companyId: string,
   target: { owner: string; repo: string; number: number },
-  input: { headSha: string; description: string; expectedBranch: string },
+  input: { headSha: string; description: string; expectedBranch: string; retryDelayMs?: number },
 ): Promise<HeadBoundReleaseOutcome> {
   const { owner, repo, number } = target;
   const credential = await resolveControlPlaneGitHubToken(db, companyId, owner, repo);
   if (!credential) {
     return { kind: "failed", message: `status:failed:auth_required: control-plane GitHub App credential unavailable for ${owner}/${repo}` };
   }
-  const live = await fetchPullRequestHeadSha(credential.token, owner, repo, number);
-  if (!live.ok) return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
-  if (live.merged || live.draft || live.state !== "open") {
-    return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
-  }
-  if (live.headRef !== input.expectedBranch) {
-    return {
-      kind: "refused",
-      message: `status:refused:branch-mismatch: ${owner}/${repo}#${number} is on ${live.headRef ?? "(unreadable)"}, not the card's delivery branch ${input.expectedBranch}`,
-    };
-  }
-  if (live.headSha !== input.headSha) {
-    return {
-      kind: "refused",
-      message: `status:refused:head-mismatch: ${owner}/${repo}#${number} head is ${live.headSha}, not ${input.headSha}`,
-    };
-  }
+  // Re-read the live PR and refuse unless it is still the open PR on the bound branch at `headSha`.
+  const liveRefusal = async (): Promise<HeadBoundReleaseOutcome | null> => {
+    const live = await fetchPullRequestHeadSha(credential.token, owner, repo, number);
+    if (!live.ok) return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
+    if (live.merged || live.draft || live.state !== "open") {
+      return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
+    }
+    if (live.headRef !== input.expectedBranch) {
+      return {
+        kind: "refused",
+        message: `status:refused:branch-mismatch: ${owner}/${repo}#${number} is on ${live.headRef ?? "(unreadable)"}, not the card's delivery branch ${input.expectedBranch}`,
+      };
+    }
+    if (live.headSha !== input.headSha) {
+      return {
+        kind: "refused",
+        message: `status:refused:head-mismatch: ${owner}/${repo}#${number} head is ${live.headSha}, not ${input.headSha}`,
+      };
+    }
+    return null;
+  };
+  // The status read comes first so the live-head check is the last read before the write.
   const existing = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha);
   if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
   if (existing.controlPlaneApproved) {
     return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
   }
-  const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
-    description: input.description,
-  });
-  if (write.success) return { kind: "released", headSha: input.headSha, message: input.description };
-  return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
+  // GitHub has no compare-and-swap on a commit status, so a push landing between the last live read and
+  // the POST can still leave one status on the old SHA. That status is keyed by SHA, so the new head
+  // does not inherit it. A transient failure is retried only after the live head is checked again.
+  const attempts = 3;
+  for (let attempt = 1; ; attempt += 1) {
+    const refusal = await liveRefusal();
+    if (refusal) return refusal;
+    const write = await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+      description: input.description,
+      attempts: 1,
+    });
+    if (write.success) return { kind: "released", headSha: input.headSha, message: input.description };
+    if (!write.transient || attempt >= attempts) {
+      return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, input.retryDelayMs ?? 1000));
+  }
 }
 
 /**
