@@ -16,7 +16,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { armMergeOnApproval, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { armMergeOnApproval, enableAutoMerge, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -472,6 +472,21 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       expect(result.kind).toBe("armed");
       expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#3157");
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("SUP-20772: the enable mutation carries the expected head when given one, and refuses a malformed one without any call", async () => {
+      const head = "a".repeat(40);
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+      expect(await enableAutoMerge("tok", "PR_node", { expectedHeadOid: head })).toMatchObject({ success: true });
+      const body = JSON.parse(String(mockGhFetch.mock.calls[0]![1].body));
+      expect(body.query).toContain(`expectedHeadOid: "${head}"`);
+
+      mockGhFetch.mockClear();
+      const bad = await enableAutoMerge("tok", "PR_node", { expectedHeadOid: 'x"}) { evil' });
+      expect(bad).toMatchObject({ success: false });
+      expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
     it("arms when the branch names the transitioning issue and the title names no card (SUP-12421 behaviour)", async () => {

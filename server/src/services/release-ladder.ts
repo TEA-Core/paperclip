@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueExecutionDecisions } from "@paperclipai/db";
+import { agents, companyMemberships, issueExecutionDecisions } from "@paperclipai/db";
 import {
   evaluateStageIntegrity,
   latestDecisionPerStage,
@@ -48,18 +48,51 @@ export async function evaluateApprovingLadder(
     .where(and(eq(issueExecutionDecisions.issueId, row.id), eq(issueExecutionDecisions.companyId, row.companyId)));
   const latest = latestDecisionPerStage(decisions);
   const authors = resolveSelfApprovalPrincipals(policy, state, row.createdByAgentId ?? null);
+  // The card's creator is an author too, whether an agent or a user.
+  if (row.createdByUserId) authors.userIds.add(row.createdByUserId);
   for (const stageId of stageIds) {
     const decision = latest.get(stageId);
     if (!decision) return `stage ${stageId} has no decision`;
-    if (decision.outcome !== "approved") {
-      return `the latest decision of stage ${stageId} is ${decision.outcome}, not approved`;
+    // The latest decision is the newest by time. Decisions sharing that instant have no order the
+    // database records (the id is random), so one that is not an approval among them wins: ties are
+    // never settled in favour of the approval.
+    const newest = decision.createdAt.getTime();
+    const rejecting = decisions.find((d) => d.stageId === stageId && d.createdAt.getTime() === newest && d.outcome !== "approved");
+    const effective = rejecting ?? decision;
+    if (effective.outcome !== "approved") {
+      return `the latest decision of stage ${stageId} is ${effective.outcome}, not approved`;
     }
-    if (!decision.actorAgentId && !decision.actorUserId) return `the latest decision of stage ${stageId} is not attributed to anyone`;
+    if (!effective.actorAgentId && !effective.actorUserId) return `the latest decision of stage ${stageId} is not attributed to anyone`;
     if (
-      (decision.actorAgentId && authors.agentIds.has(decision.actorAgentId)) ||
-      (decision.actorUserId && authors.userIds.has(decision.actorUserId))
+      (effective.actorAgentId && authors.agentIds.has(effective.actorAgentId)) ||
+      (effective.actorUserId && authors.userIds.has(effective.actorUserId))
     ) {
       return `the latest decision of stage ${stageId} was made by someone who authored the work`;
+    }
+    // The decider must still be a member of this card's company: an agent of the company that is not
+    // terminated or awaiting approval, or a user with an active membership in it.
+    if (effective.actorAgentId) {
+      const [agent] = await conn
+        .select({ companyId: agents.companyId, status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, effective.actorAgentId));
+      if (!agent || agent.companyId !== row.companyId || agent.status === "terminated" || agent.status === "pending_approval") {
+        return `the latest decision of stage ${stageId} was made by an agent that is not a current agent of this company`;
+      }
+    }
+    if (effective.actorUserId) {
+      const [membership] = await conn
+        .select({ id: companyMemberships.id })
+        .from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, row.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, effective.actorUserId),
+          eq(companyMemberships.status, "active"),
+        ));
+      if (!membership) {
+        return `the latest decision of stage ${stageId} was made by a user who is not a current member of this company`;
+      }
     }
   }
   return null;
