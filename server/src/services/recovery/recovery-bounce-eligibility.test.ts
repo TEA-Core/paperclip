@@ -1,4 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { eq, sql } from "drizzle-orm";
+import express from "express";
+import request from "supertest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  agents, budgetPolicies, companies, costEvents, createDb, heartbeatRuns,
+  issueRecoveryActions, issueRelations, issues,
+  type Db, type EmbeddedPostgresTestDatabase,
+} from "@paperclipai/db";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { errorHandler } from "../../middleware/index.js";
+import { issueRoutes } from "../../routes/issues.js";
+import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
 import {
   RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES,
   hasConsecutiveWakeFailures,
@@ -7,6 +20,7 @@ import {
   selectRecoveryBounceCandidate,
   decideRecoveryReassignment,
   wouldDisplacePendingStageParticipant,
+  recoveryService,
 } from "./service.js";
 
 describe("SUP-17884: recovery bounce eligibility (pure helpers)", () => {
@@ -333,17 +347,6 @@ describe("orphaned-stage deadlock: recovery must not move a card off its pending
       "changesRequestedCount": 2
     };
 
-  it("fixture parses as a pending agent-participant stage", () => {
-    // Guards the fixture itself: a schema drift must fail loudly here rather than
-    // turning every assertion below into a vacuous `false`.
-    expect(
-      wouldDisplacePendingStageParticipant({
-        executionState: pendingStageHeldBySupportCr,
-        currentAssigneeAgentId: SUPPORT_CR,
-        candidateAgentId: EXEC_CTO,
-      }),
-    ).toBe(true);
-  });
 
   it("flags a reassignment from the pending participant to a different recovery owner", () => {
     expect(
@@ -462,5 +465,174 @@ describe("orphaned-stage deadlock: recovery must not move a card off its pending
       recoveryOwnerLive: true,
     });
     expect(decision.refusalReason).toBe("review_stage_self_satisfy");
+  });
+  it("ignores pending rows without a concrete review or approval stage", () => {
+    for (const executionState of [
+      { ...pendingStageHeldBySupportCr, currentStageId: null },
+      { ...pendingStageHeldBySupportCr, currentStageType: null },
+    ]) {
+      expect(wouldDisplacePendingStageParticipant({
+        executionState, currentAssigneeAgentId: SUPPORT_CR, candidateAgentId: EXEC_CTO,
+      })).toBe(false);
+    }
+    expect(wouldDisplacePendingStageParticipant({
+      executionState: { ...pendingStageHeldBySupportCr, currentStageType: "approval" },
+      currentAssigneeAgentId: SUPPORT_CR, candidateAgentId: EXEC_CTO,
+    })).toBe(true);
+  });
+});
+
+const postgresSupport = await getEmbeddedPostgresTestSupport();
+(postgresSupport.supported ? describe : describe.skip)("pending participant recovery with real service", () => {
+  let temp: EmbeddedPostgresTestDatabase;
+  let db: Db;
+  let competingDb: Db;
+  const participantId = randomUUID();
+  const managerId = randomUUID();
+  const authorId = randomUUID();
+  const stageId = randomUUID();
+  const participant = { id: randomUUID(), type: "agent" as const, agentId: participantId, userId: null };
+  const stage = {
+    status: "pending", monitor: null,
+    delivery: {
+      repo: { owner: "example", repo: "test" }, branch: "fixture",
+      headSha: "0000000000000000000000000000000000000000",
+      recordedAt: new Date().toISOString(), recordedByRunId: randomUUID(),
+    },
+    pendingSince: new Date().toISOString(), reviewRequest: null,
+    currentStageId: stageId, currentStageType: "review", currentStageIndex: 0,
+    currentParticipant: participant,
+    deliveryAuthor: { type: "agent", agentId: authorId, userId: null },
+    returnAssignee: { type: "agent", agentId: authorId, userId: null },
+    lastDecisionId: randomUUID(), lastDecisionOutcome: "changes_requested",
+    completedStageIds: [], skippedStageIds: [], changesRequestedCount: 2,
+  };
+
+  beforeAll(async () => {
+    temp = await startEmbeddedPostgresTestDatabase("paperclip-pending-recovery-");
+    db = createDb(temp.connectionString);
+    competingDb = createDb(temp.connectionString);
+  }, 60_000);
+  afterEach(async () => { await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterAll(async () => { await temp?.cleanup(); });
+
+  async function seed(status: "active" | "paused" | "terminated" | "pending_approval" | "budget_paused" | "over_budget", state = stage) {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const old = new Date(Date.now() - 3_600_000);
+    await db.insert(companies).values({ id: companyId, name: "Pending review recovery", issuePrefix: "PRR", requireBoardApprovalForNewAgents: false });
+    await db.insert(agents).values([
+      { id: managerId, companyId, name: "Manager", role: "cto", status: "idle", adapterType: "codex_local", permissions: { canAssignTasks: true } },
+      { id: participantId, companyId, name: "Reviewer", role: "engineer", status: status === "budget_paused" ? "paused" : status === "over_budget" ? "active" : status, pauseReason: status === "budget_paused" ? "budget" : null, reportsTo: managerId, adapterType: "codex_local" },
+      { id: authorId, companyId, name: "Author", role: "engineer", status: "idle", reportsTo: managerId, adapterType: "codex_local" },
+    ]);
+    const policy = normalizeIssueExecutionPolicy({ mode: "normal", stages: [{ id: stageId, type: "review", participants: [participant] }] });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Review pending", issueNumber: 1, identifier: "PRR-1", status: "in_review", assigneeAgentId: participantId, createdByAgentId: authorId, executionPolicy: policy ? { ...policy } : null, executionState: state, createdAt: old, updatedAt: old });
+    await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId, agentId: participantId, status: "failed", invocationSource: "automation", errorCode: "fixture_failed", resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }, contextSnapshot: { issueId, taskId: issueId, retryReason: "execution_review_participant_recovery" }, startedAt: old, finishedAt: old, createdAt: old, updatedAt: old });
+    if (status === "over_budget") {
+      await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: participantId, metric: "billed_cents", windowKind: "calendar_month", amount: 1, hardStopEnabled: true });
+      await db.insert(costEvents).values({ companyId, agentId: participantId, provider: "test", model: "test", costCents: 2, billingType: "metered", occurredAt: new Date() });
+    }
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    return { issueId, companyId, recovery, enqueueWakeup };
+  }
+
+  it.each(["paused", "terminated", "pending_approval", "budget_paused", "over_budget"] as const)(
+    "routes an unavailable %s participant to the board instead of cancelling a replacement wake",
+    async (status) => {
+      const { issueId, recovery, enqueueWakeup } = await seed(status);
+      await recovery.reconcileStrandedAssignedIssues();
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(issue.status).toBe("blocked");
+      expect(issue.assigneeAgentId).toBe(participantId);
+      expect(issue.executionState).toMatchObject({ status: "pending", currentParticipant: participant });
+      expect(action).toMatchObject({
+        ownerType: "board", ownerAgentId: null,
+        evidence: { routingPolicy: "board_escalation_no_takeover_v1" },
+      });
+      expect(action.nextAction).toContain("Restore or replace the participant");
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps a live reviewer assigned while the recovery manager works", async () => {
+    const { issueId, recovery } = await seed("active");
+    await recovery.reconcileStrandedAssignedIssues();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.assigneeAgentId).toBe(participantId);
+  });
+
+  it("rechecks a stale issue snapshot under lock before reassigning its pending stage", async () => {
+    const { issueId, recovery } = await seed("active", { ...stage, status: "changes_requested" });
+    const [oldIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, "transaction").mockImplementationOnce(async (callback, config) => {
+      await competingDb.update(issues).set({ executionState: stage }).where(eq(issues.id, issueId));
+      return transaction(callback, config);
+    });
+    try {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: oldIssue, previousStatus: "in_review", latestRun: null,
+        recoveryCause: "execution_review_participant_recovery", recoveryOwnerAgentId: managerId,
+      });
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.assigneeAgentId).toBe(participantId);
+    expect(issue.executionState).toMatchObject({ status: "pending", currentParticipant: participant });
+  });
+  it("does not assign an orphan blocker whose pending participant acquired the card after selection", async () => {
+    const { issueId, companyId, recovery, enqueueWakeup } = await seed("active");
+    const blockedId = randomUUID();
+    await db.insert(issues).values({
+      id: blockedId, companyId, title: "Blocked by review", status: "todo",
+      issueNumber: 2, identifier: "PRR-2", assigneeAgentId: authorId,
+    });
+    await db.insert(issueRelations).values({
+      companyId, issueId, relatedIssueId: blockedId, type: "blocks",
+    });
+    await db.update(issues).set({ status: "todo", assigneeAgentId: null }).where(eq(issues.id, issueId));
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, "transaction").mockImplementationOnce(async (callback, config) => {
+      await competingDb.update(issues).set({ assigneeAgentId: participantId, executionState: stage })
+        .where(eq(issues.id, issueId));
+      return transaction(callback, config);
+    });
+    try {
+      await recovery.reconcileStrandedAssignedIssues();
+      expect(spy).toHaveBeenCalledOnce();
+    } finally {
+      spy.mockRestore();
+    }
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.assigneeAgentId).toBe(participantId);
+    expect(issue.executionState).toMatchObject({ status: "pending", currentParticipant: participant });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+  it("lets the board reset a terminated participant's stage and hand the card to a live owner", async () => {
+    const { issueId, companyId, recovery } = await seed("terminated");
+    await recovery.reconcileStrandedAssignedIssues();
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as typeof req & { actor: { type: "board"; source: "local_implicit" } }).actor = {
+        type: "board", source: "local_implicit",
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never, {}));
+    app.use(errorHandler);
+    const response = await request(app).patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", assigneeAgentId: managerId });
+    expect(response.status).toBe(200);
+    const [issue] = await db.select().from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({
+      companyId, status: "todo", assigneeAgentId: managerId, executionState: null,
+    });
   });
 });
