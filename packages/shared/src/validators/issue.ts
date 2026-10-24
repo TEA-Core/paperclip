@@ -1064,6 +1064,12 @@ export const approveIssueHeadSchema = z.object({
 }).strict();
 export type ApproveIssueHead = z.infer<typeof approveIssueHeadSchema>;
 
+export const releaseIssueHeadSchema = z.object({
+  headSha: z.string().regex(/^[0-9a-f]{40}$/),
+  reason: z.string().trim().min(1).max(1000),
+}).strict();
+export type ReleaseIssueHead = z.infer<typeof releaseIssueHeadSchema>;
+
 export const stalledReviewDecisionSchema = z
   .object({
     action: z.enum(["approve", "request_changes", "send_back"]),

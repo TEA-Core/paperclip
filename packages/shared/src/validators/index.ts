@@ -433,6 +433,8 @@ export {
   updateIssueObjectSchema,
   approveIssueHeadSchema,
   type ApproveIssueHead,
+  releaseIssueHeadSchema,
+  type ReleaseIssueHead,
   stripCreateOnlyIssueAttribution,
   ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS,
   stalledReviewDecisionSchema,

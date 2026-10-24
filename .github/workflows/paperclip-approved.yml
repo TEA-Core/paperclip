@@ -65,6 +65,9 @@ jobs:
       - name: Check the paperclip/approved status
         env:
           GH_REPO: ${{ github.repository }}
+          # SUP-20772: off until the board release route is live. See the
+          # script header before turning it on.
+          PAPERCLIP_CARD_WAIVER_RETIRED: ${{ vars.PAPERCLIP_CARD_WAIVER_RETIRED }}
         run: |
           case "${{ github.event_name }}" in
             pull_request) bash scripts/ci/check-paperclip-approved.sh pull_request "${{ github.event.pull_request.number }}" ;;

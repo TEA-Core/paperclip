@@ -478,6 +478,22 @@ export async function resolveGitHubTokenCandidatesForRepo(
   return candidates;
 }
 
+/**
+ * The control plane's own GitHub App installation token (the `tea-core` App, DEFAULT_GITHUB_APP) and
+ * nothing else. Used where only that identity's write is honoured downstream (a commit status
+ * scripts/ci/check-paperclip-approved.sh accepts from creator 317012809): there is deliberately no
+ * PAT, project-env or fleet fallback, because a write by any other credential is rejected by CI and
+ * would leave a release that looks done and is not.
+ */
+export async function resolveControlPlaneGitHubToken(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+): Promise<GitHubTokenResolution | null> {
+  return resolveAppInstallationToken(companyId, secretService(db), owner, repo, undefined, DEFAULT_GITHUB_APP);
+}
+
 export async function resolveGitHubTokenForRepo(
   db: Db,
   companyId: string,

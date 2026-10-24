@@ -87,6 +87,36 @@
 #   1. PR body contains a line:  Paperclip-Approved-Waiver: <reason>
 #   2. PR carries the label:     no-paperclip-card
 #
+# RETIRED FOR CARDED PRs (SUP-20772) -- ARMED BY PAPERCLIP_CARD_WAIVER_RETIRED=1.
+# Anyone with `pull_requests:write` can write either waiver, and that includes
+# every fleet agent, so a free-text waiver is no control. Once the switch is on:
+#   - On a card-bound head (`SUP-<n>-...`) neither waiver is honoured. The gate
+#     falls through to the status check; the PR lands on a real stamp or on the
+#     board release (POST /api/issues/:id/merge-arming/release), which publishes
+#     paperclip/approved as the control plane, bound to the exact head SHA.
+#   - On a cardless head both waivers stay, but only for an author that is a
+#     person (user.type User) or this repository's own automation
+#     (github-actions[bot]) or the control-plane App itself (tea-core, the
+#     identity the lockfile refresh opens its PR as). Any other App-authored PR
+#     (the fleet's) cannot self-waive.
+# The switch ships OFF so merging this change cannot freeze anything before the
+# release route is deployed. Turn it on (repository variable of the same name)
+# only after the route answers on the live control plane.
+#
+# KNOWN RESIDUAL BYPASS -- DO NOT SET THE SWITCH UNTIL BOTH HALVES ARE CLOSED.
+# This script reads GitHub only. It holds no control-plane credential, so it
+# cannot ask which card owns a PR. Both inputs to the refusal are therefore ones
+# the PR author controls:
+#   1. Card binding is judged from the head ref (`SUP-<n>...`). A card work item
+#      pushed to any other branch name reads as cardless and keeps its waiver.
+#   2. Author type is GitHub's label, not an identity proof. A machine token that
+#      is a GitHub `User` (the fleet's shared operator token is one) reads as a person.
+# So with the switch on this closes the honest mistake and the `SUP-` branch path
+# only; it does not stop an agent that renames its branch or pushes as a User.
+# Closing it needs control-plane data (the card's recorded delivery PR/branch)
+# fed to this check by a path the author cannot write, plus a fleet token that is
+# not a User. Every waiver honoured with the switch on is logged `UNVERIFIED`.
+#
 # COUNTERSIGNATURE on fold-sync heads -- ADVISORY SINCE 2026-09-07, NOT ENFORCED.
 # A PR whose head ref starts with `fold-sync/` cannot earn `paperclip/approved`
 # at all -- the head must stay `fold-sync/*` for pr.yml's lockfile exemption,
@@ -496,6 +526,15 @@ PR_LABELS="$(jq -c '(.labels // []) | map(.name)' <<<"$PR_JSON")"
 
 PR_HEAD_REF="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
 PR_AUTHOR="$(jq -r '.user.login // ""' <<<"$PR_JSON")"
+PR_AUTHOR_TYPE="$(jq -r '.user.type // ""' <<<"$PR_JSON")"
+PR_AUTHOR_ID="$(jq -r '.user.id // ""' <<<"$PR_JSON")"
+
+# A card-bound head is `SUP-<n>` or `SUP-<n>-...` (the execution-workspace
+# branch). Case-insensitive so `sup-123-x` cannot step round the rule. This is
+# judged from a name the PR author chooses, so it is NOT proof a PR has no card;
+# see KNOWN RESIDUAL BYPASS in the header.
+CARD_BOUND=0
+[[ "$PR_HEAD_REF" =~ ^[Ss][Uu][Pp]-[0-9]+(-|$) ]] && CARD_BOUND=1
 
 # --- fold-sync heads: a waiver must be countersigned by a human ---------------
 # A fold PR cannot earn `paperclip/approved` at all. `isDeliveredByCard()`
@@ -694,13 +733,50 @@ evaluate_override() {
   return 0
 }
 
+# waiver_unverified <what>: say, in the log, that a waiver was honoured on
+# author-controlled evidence only (branch name and author type).
+waiver_unverified() {
+  note "UNVERIFIED: ${1} honoured on head '${PR_HEAD_REF}' by author ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — no card binding was checked against the control plane, and a card work item on a non-SUP branch or a machine token typed User passes this check"
+}
+
+# waiver_retirement_on: the single reading of PAPERCLIP_CARD_WAIVER_RETIRED.
+# Only the exact value 1 arms it. Everything that exists because of the board
+# release (the waiver refusal, the description column, the release log line and
+# the denial hint) is gated on this, so with the switch off the script's output
+# is the output it had before SUP-20772.
+waiver_retirement_on() {
+  [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ]
+}
+
+# waiver_honoured <what>
+#   0 -> the waiver counts
+#   1 -> refused (SUP-20772): the gate falls through to the status check
+# Always 0 until PAPERCLIP_CARD_WAIVER_RETIRED=1; see the header, including
+# KNOWN RESIDUAL BYPASS: neither the branch name nor the author type below is
+# control-plane data, so a honoured waiver is logged UNVERIFIED, never trusted.
+waiver_honoured() {
+  local what="$1"
+  waiver_retirement_on || return 0
+  if [ "$CARD_BOUND" = "1" ]; then
+    note "REFUSED: ${what} on card-bound head '${PR_HEAD_REF}' — a card-bound PR lands on a control-plane paperclip/approved or a board release (POST /api/issues/:id/merge-arming/release), never a waiver"
+    return 1
+  fi
+  case "${PR_AUTHOR_TYPE}:${PR_AUTHOR}" in
+    User:*|Bot:github-actions\[bot\]) waiver_unverified "$what"; return 0 ;;
+  esac
+  [ "$PR_AUTHOR_TYPE" = "Bot" ] && [ "$PR_AUTHOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ] && { waiver_unverified "$what"; return 0; }
+  note "REFUSED: ${what} on PR #${PR_NUMBER} authored by ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — only a person, github-actions[bot] or ${APPROVED_STATUS_CREATOR_LOGIN} may waive a cardless PR"
+  return 1
+}
+
 # Waiver 1: body line "Paperclip-Approved-Waiver: <reason>" with a non-empty
 # reason (a cardless PR never gets a paperclip/approved status, so the
 # waiver is checked before the status lookup).
 reason_line="$(grep -E '^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*[^[:space:]]' <<<"$PR_BODY" | head -1 || true)"
 if [ -n "$reason_line" ]; then
   reason="$(sed -E 's/^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*//' <<<"$reason_line")"
-  if require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
+  if waiver_honoured "body waiver 'Paperclip-Approved-Waiver: ${reason}'" \
+    && require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
     note "waived: PR body declares 'Paperclip-Approved-Waiver: ${reason}' (no Paperclip card)"
     exit 0
   fi
@@ -712,7 +788,8 @@ fi
 # label to its own PR. Leaving one of the two waiver forms uncountersigned would
 # leave the gate exactly as open as before.
 if [ -n "$PR_LABELS" ] && printf '%s' "$PR_LABELS" | jq -e --arg l 'no-paperclip-card' 'index($l)' >/dev/null 2>&1; then
-  if require_countersignature "the 'no-paperclip-card' label"; then
+  if waiver_honoured "the 'no-paperclip-card' label" \
+    && require_countersignature "the 'no-paperclip-card' label"; then
     note "waived: PR carries the 'no-paperclip-card' label (no Paperclip card)"
     exit 0
   fi
@@ -731,19 +808,28 @@ fi
 # unpaginated read sees `missing` and — this leg being fail-closed — blocks an
 # approved entry out of the queue. Pagination preserves order across pages, so
 # the first matching row is still the newest.
+# The description column exists only to name a board release in the log, so it
+# is requested only with the switch on; off, the query and the parse are the
+# ones this script had before SUP-20772.
+STATUS_ROW='(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")'
+if waiver_retirement_on; then
+  STATUS_ROW="${STATUS_ROW}, ((.description // \"\") | if . == \"\" then \"-\" else . end)"
+fi
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-  --jq '.[] | [(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")] | @tsv')" \
+  --jq ".[] | [${STATUS_ROW}] | @tsv")" \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
 APPROVAL_CREATOR_ID=""
 APPROVAL_CREATOR_LOGIN=""
-while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login; do
+APPROVAL_DESCRIPTION=""
+while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description; do
   [ "$status_context" = "$CONTEXT" ] || continue
   APPROVAL_STATE="${status_state:-missing}"
   APPROVAL_CREATOR_ID="$status_creator_id"
   APPROVAL_CREATOR_LOGIN="$status_creator_login"
+  APPROVAL_DESCRIPTION="$status_description"
   break
 done <<<"$STATUSES_TSV"
 
@@ -763,6 +849,11 @@ if [ "$APPROVAL_STATE" = "$STATE" ]; then
     fail "${CONTEXT} on ${HEAD_SHA} was not published by the control plane"
   fi
   note "pass: ${CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA} (published by ${APPROVAL_CREATOR_LOGIN})"
+  if waiver_retirement_on; then
+    case "$APPROVAL_DESCRIPTION" in
+      "released by "*) note "board release: ${APPROVAL_DESCRIPTION}" ;;
+    esac
+  fi
   if [ "$MODE" = "advisory" ]; then
     advisory_summary_present
   fi
@@ -798,6 +889,9 @@ fi
 err "FAIL: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE} — PR #${PR_NUMBER} head ${HEAD_SHA} is not approved"
 err "  an approval is produced by the control plane when the card's review stage records 'approved'"
 err "  (a hand PATCH of the card status skips publishApprovalStatus — no status is ever published)"
+if waiver_retirement_on; then
+  err "  a card-bound PR can also be released by the board: POST /api/issues/:id/merge-arming/release {headSha, reason}"
+fi
 err "  or waive a cardless PR: body line 'Paperclip-Approved-Waiver: <reason>' or the 'no-paperclip-card' label"
 err "  or have a person with write access apply the '${OVERRIDE_LABEL}' label AFTER the last push${OVERRIDE_REFUSAL:+ — override not honored: ${OVERRIDE_REFUSAL}}"
 exit 1

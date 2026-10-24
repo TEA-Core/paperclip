@@ -39,6 +39,7 @@ import {
   createIssueSchema,
   updateIssueObjectSchema,
   approveIssueHeadSchema,
+  releaseIssueHeadSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
@@ -1424,6 +1425,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/merge-arming/republish",
   "GET /api/issues/{id}/merge-arming/head-review",
   "POST /api/issues/{id}/merge-arming/approve-head",
+  "POST /api/issues/{id}/merge-arming/release",
   "POST /api/issues/{id}/execution-stage/board-decision",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
@@ -7676,6 +7678,35 @@ registry.registerPath({
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(approveIssueHeadSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/merge-arming/release",
+  tags: ["issues"],
+  summary: "Release the card's linked PR head to merge: publish paperclip/approved bound to exactly headSha",
+  description:
+    "Board-only (company owner/admin). The audited replacement for the Paperclip-Approved-Waiver body " +
+    "line on a card-bound PR. Publishes paperclip/approved with the control-plane App token only (no fallback " +
+    "credential) and the description 'released by <actor> for <sha>: <reason>' for exactly headSha, whatever " +
+    "the card's ladder state. 409 when the card has no verified delivery PR binding (a merely cited PR is never a " +
+    "target), the bound PR is not the card's certified approvalStatus.finalDelivery, the PR is not open and " +
+    "non-draft or left the bound branch, or headSha is not the PR's live head (a different, stale or moved " +
+    "head: refused before the write and before each retry). Idempotent: a head whose newest paperclip/approved is a control-plane success " +
+    "returns 200 already_approved without a second write. Audited: issue.merge_release_requested before the " +
+    "write, then issue.merge_release (fresh write) or issue.merge_release_outcome.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(releaseIssueHeadSchema),
   },
   responses: {
     200: r.ok(),

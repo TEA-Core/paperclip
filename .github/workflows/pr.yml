@@ -86,6 +86,10 @@ jobs:
         # whether an entry is admissible. The difference is only when it runs:
         # there, in parallel with 98 runner-minutes of work; here, before any of
         # it starts.
+        env:
+          # Same value the required enforcer receives (paperclip-approved.yml),
+          # so the two calls cannot disagree once the switch is turned on.
+          PAPERCLIP_CARD_WAIVER_RETIRED: ${{ vars.PAPERCLIP_CARD_WAIVER_RETIRED }}
         run: bash scripts/ci/check-paperclip-approved.sh merge_group
 
   policy:
@@ -331,6 +335,13 @@ jobs:
         # pushed after the label, a bot labeler, a fork and a branch name all
         # fail closed.
         run: node --test ./scripts/__tests__/paperclip-approved-override.test.mjs
+
+      - name: Test paperclip-approved card waiver retirement
+        # SUP-20772: pins the PAPERCLIP_CARD_WAIVER_RETIRED switch. On, a
+        # waiver on a SUP-<n> head is refused and a board release lands the PR;
+        # off (the shipped default) the script behaves, and prints, exactly as
+        # before. Also pins the documented residual bypass.
+        run: node --test ./scripts/__tests__/paperclip-approved-card-waiver.test.mjs
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
