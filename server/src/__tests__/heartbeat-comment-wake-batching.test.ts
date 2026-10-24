@@ -2179,13 +2179,12 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             eq(issueRecoveryActions.companyId, companyId),
             eq(issueRecoveryActions.sourceIssueId, issueId),
           ));
-          // Fork divergence (D9 deferred, slice 2c): upstream's wake-queue release records a board
-          // `native_continuation_requires_reconciliation` incident for this cancelled native source
-          // (recordNativeTerminalRecoveryIfNeeded in the module glue). The fork's in-file release,
-          // kept live by the D9 deferral (operator decision 2026-09-15), releases the execution lock
-          // without that incident. Nothing is woken or dispatched on either path. Restore upstream's
-          // incident assertion in the change that makes the module release live.
-          expect(incidents).toEqual([]);
+          // The in-file release takes upstream's native exit (recordNativeTerminalRecoveryIfNeeded):
+          // a cancelled native source records one board reconciliation incident. Nothing is woken
+          // or dispatched.
+          expect(incidents.map((incident) => ({ cause: incident.cause, ownerType: incident.ownerType }))).toEqual([
+            { cause: "native_continuation_requires_reconciliation", ownerType: "board" },
+          ]);
           expect(
             await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId)),
           ).toEqual([{ executionRunId: null }]);
