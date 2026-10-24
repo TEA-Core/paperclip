@@ -2381,6 +2381,7 @@ describe("company portability", () => {
         status: "paused",
         concurrencyPolicy: "always_enqueue",
         catchUpPolicy: "enqueue_missed_with_cap",
+        executionWorkspacePreference: "shared_workspace",
         createdByAgentId: null,
         createdByUserId: null,
         updatedByAgentId: null,
@@ -2460,6 +2461,7 @@ describe("company portability", () => {
     expect(extension).toContain("monday-review:");
     expect(extension).toContain('cronExpression: "0 9 * * 1"');
     expect(extension).toContain('signingMode: "hmac_sha256"');
+    expect(extension).toContain('executionWorkspacePreference: "shared_workspace"');
     expect(extension).not.toContain("secretId");
     expect(extension).not.toContain("publicId");
     expect(exported.manifest.issues).toEqual([
@@ -2471,6 +2473,7 @@ describe("company portability", () => {
         routine: expect.objectContaining({
           concurrencyPolicy: "always_enqueue",
           catchUpPolicy: "enqueue_missed_with_cap",
+          executionWorkspacePreference: "shared_workspace",
           triggers: expect.arrayContaining([
             expect.objectContaining({ kind: "schedule", cronExpression: "0 9 * * 1", timezone: "America/Chicago" }),
             expect.objectContaining({ kind: "webhook", enabled: false, signingMode: "hmac_sha256", replayWindowSec: 120 }),
@@ -2658,6 +2661,7 @@ describe("company portability", () => {
         '    priority: "high"',
         '    concurrencyPolicy: "always_enqueue"',
         '    catchUpPolicy: "enqueue_missed_with_cap"',
+        '    executionWorkspacePreference: "shared_workspace"',
         "    triggers:",
         "      - kind: schedule",
         '        cronExpression: "0 9 * * 1"',
@@ -2702,6 +2706,7 @@ describe("company portability", () => {
       status: "paused",
       concurrencyPolicy: "always_enqueue",
       catchUpPolicy: "enqueue_missed_with_cap",
+      executionWorkspacePreference: "shared_workspace",
     }), expect.any(Object));
     expect(result.warnings).not.toContain(
       "Task monday-review assignee claudecoder is pending_approval; imported work was left unassigned.",

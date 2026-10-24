@@ -888,4 +888,137 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       executionWorkspaceSettings: { mode: "isolated_workspace" },
     });
   });
+
+  async function seedIsolatedByDefaultProject(companyId: string, projectId: string) {
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+      sharedWorkspaceKey: "routine-primary",
+    });
+    await db
+      .update(projects)
+      .set({
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          defaultProjectWorkspaceId: projectWorkspaceId,
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      })
+      .where(eq(projects.id, projectId));
+    await db
+      .insert(instanceSettings)
+      .values({ experimental: { enableIsolatedWorkspaces: true } })
+      .onConflictDoUpdate({
+        target: instanceSettings.singletonKey,
+        set: { experimental: { enableIsolatedWorkspaces: true } },
+      });
+  }
+
+  it("creates issues in the shared workspace when the routine sets executionWorkspacePreference (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Shared-workspace routine",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    expect(createRes.body.executionWorkspacePreference).toBe("shared_workspace");
+
+    const detailRes = await request(app).get(`/api/routines/${createRes.body.id}`);
+    expect(detailRes.status).toBe(200);
+    expect(detailRes.body.executionWorkspacePreference).toBe("shared_workspace");
+
+    const runRes = await postRoutineRun(app, createRes.body.id, { source: "manual" });
+    expect(runRes.status).toBe(202);
+
+    const [issue] = await db
+      .select({
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+        executionWorkspaceSettings: issues.executionWorkspaceSettings,
+      })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+    expect(issue?.executionWorkspacePreference).toBe("shared_workspace");
+    expect(issue?.executionWorkspaceSettings).toEqual({ mode: "shared_workspace" });
+  }, 15_000);
+
+  it("keeps the project workspace default for routines without executionWorkspacePreference (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Default-workspace routine", assigneeAgentId: agentId });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    expect(createRes.body.executionWorkspacePreference ?? null).toBeNull();
+
+    const runRes = await postRoutineRun(app, createRes.body.id, { source: "manual" });
+    expect(runRes.status).toBe(202);
+
+    const [issue] = await db
+      .select({
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+        executionWorkspaceSettings: issues.executionWorkspaceSettings,
+      })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+    expect(issue?.executionWorkspacePreference ?? null).toBeNull();
+    expect(issue?.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
+  }, 15_000);
+
+  it("lets a routine PATCH set and clear executionWorkspacePreference and rejects reuse_existing (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Patched routine", assigneeAgentId: agentId });
+    expect([200, 201]).toContain(createRes.status);
+
+    const setRes = await request(app)
+      .patch(`/api/routines/${createRes.body.id}`)
+      .send({ executionWorkspacePreference: "shared_workspace" });
+    expect(setRes.status, JSON.stringify(setRes.body)).toBe(200);
+    expect(setRes.body.executionWorkspacePreference).toBe("shared_workspace");
+
+    const badRes = await request(app)
+      .patch(`/api/routines/${createRes.body.id}`)
+      .send({ executionWorkspacePreference: "reuse_existing" });
+    expect(badRes.status).toBe(400);
+
+    const clearRes = await request(app)
+      .patch(`/api/routines/${createRes.body.id}`)
+      .send({ executionWorkspacePreference: null });
+    expect(clearRes.status).toBe(200);
+    expect(clearRes.body.executionWorkspacePreference ?? null).toBeNull();
+  }, 15_000);
 });

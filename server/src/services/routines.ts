@@ -557,6 +557,38 @@ function createRoutineDispatchFingerprint(input: {
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
+const ROUTINE_WORKSPACE_PREFERENCE_MODES = new Set([
+  "shared_workspace",
+  "isolated_workspace",
+  "operator_branch",
+  "agent_default",
+]);
+
+function resolveRoutineWorkspaceSelection(input: {
+  routine: { executionWorkspacePreference?: string | null };
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: Record<string, unknown> | null;
+}) {
+  const runSuppliedSelection =
+    input.executionWorkspaceId != null ||
+    input.executionWorkspacePreference != null ||
+    input.executionWorkspaceSettings != null;
+  const preference = input.routine.executionWorkspacePreference ?? null;
+  if (runSuppliedSelection || !preference) {
+    return {
+      executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+      executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+    };
+  }
+  // Issue creation resolves the workspace from executionWorkspaceSettings.mode,
+  // so the preference is mirrored there ("inherit" leaves the project default).
+  return {
+    executionWorkspacePreference: preference,
+    executionWorkspaceSettings: ROUTINE_WORKSPACE_PREFERENCE_MODES.has(preference) ? { mode: preference } : null,
+  };
+}
+
 function createRoutineEnvFingerprint(env: unknown) {
   const canonical = JSON.stringify(normalizeRoutineDispatchFingerprintValue(env ?? null));
   return crypto.createHash("sha256").update(canonical).digest("hex");
@@ -596,6 +628,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     executionPolicy: routine.executionPolicy ?? null,
+    executionWorkspacePreference: routine.executionWorkspacePreference ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
   };
 }
@@ -1898,6 +1931,9 @@ export function routineService(
     }
     await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
     const automaticVariables: Record<string, string | number | boolean> = {};
+    // SUP-21022: a routine-level preference only applies when the run supplies
+    // no workspace selection of its own, so manual/API overrides still win.
+    const routineWorkspace = resolveRoutineWorkspaceSelection(input);
     if (input.executionWorkspaceId && routineUsesWorkspaceBranch(input.routine)) {
       const workspace = await db
         .select({
@@ -1943,8 +1979,8 @@ export function routineService(
       routineRevisionId: input.routine.latestRevisionId,
       routineEnvFingerprint: createRoutineEnvFingerprint(input.routine.env),
       executionWorkspaceId: input.executionWorkspaceId ?? null,
-      executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-      executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+      executionWorkspacePreference: routineWorkspace.executionWorkspacePreference,
+      executionWorkspaceSettings: routineWorkspace.executionWorkspaceSettings,
       title,
       description,
     });
@@ -2084,8 +2120,8 @@ export function routineService(
             // instead of collapsing to null and inheriting the project default.
             trustExplicitExecutionPolicy: input.routine.executionPolicy != null,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
-            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            executionWorkspacePreference: routineWorkspace.executionWorkspacePreference,
+            executionWorkspaceSettings: routineWorkspace.executionWorkspaceSettings,
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2398,6 +2434,7 @@ export function routineService(
             variables,
             env,
             executionPolicy: input.executionPolicy ?? null,
+            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2514,6 +2551,10 @@ export function routineService(
           variables: nextVariables,
           env: nextEnv,
           executionPolicy: patch.executionPolicy === undefined ? locked.executionPolicy : patch.executionPolicy,
+          executionWorkspacePreference:
+            patch.executionWorkspacePreference === undefined
+              ? locked.executionWorkspacePreference
+              : patch.executionWorkspacePreference,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2580,6 +2621,7 @@ export function routineService(
             variables: candidate.variables,
             env: candidate.env,
             executionPolicy: candidate.executionPolicy,
+            executionWorkspacePreference: candidate.executionWorkspacePreference,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2919,6 +2961,7 @@ export function routineService(
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
             executionPolicy: routineSnapshot.executionPolicy ?? null,
+            executionWorkspacePreference: routineSnapshot.executionWorkspacePreference ?? null,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
