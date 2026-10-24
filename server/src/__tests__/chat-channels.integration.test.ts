@@ -26,6 +26,7 @@ import {
   asc,
   desc,
   eq,
+  gte,
   inArray,
   isNotNull,
   like,
@@ -1592,6 +1593,128 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   }
 
+  async function setupRoundTripQualified(
+    endpointId: string,
+    setupFollowUpMessageId: string,
+  ) {
+    const endpoint = await db
+      .select({
+        assignedAgentId: chatEndpoints.assignedAgentId,
+        companyId: chatEndpoints.companyId,
+        lastEventAt: chatEndpoints.lastEventAt,
+        provider: chatEndpoints.provider,
+        setup: chatEndpoints.setup,
+      })
+      .from(chatEndpoints)
+      .where(eq(chatEndpoints.id, endpointId))
+      .then((rows) => rows[0] ?? null);
+    if (!endpoint) {
+      return false;
+    }
+    const testStartedAt = endpoint.setup.testStartedAt
+      ? new Date(endpoint.setup.testStartedAt)
+      : null;
+    if (
+      !endpoint.lastEventAt ||
+      !testStartedAt ||
+      Number.isNaN(testStartedAt.getTime()) ||
+      endpoint.lastEventAt < testStartedAt
+    ) {
+      return false;
+    }
+    const requiredTrigger =
+      endpoint.provider === "telegram" || endpoint.provider === "imessage-photon"
+        ? "direct_message"
+        : "subscribed_message";
+    const qualifyingDelivery = await db
+      .select({
+        id: chatDeliveries.id,
+        conversationId: chatDeliveries.conversationId,
+        processedAt: chatDeliveries.processedAt,
+      })
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.companyId, endpoint.companyId),
+          eq(chatDeliveries.endpointId, endpointId),
+          sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${setupFollowUpMessageId}`,
+          eq(chatDeliveries.state, "processed"),
+          gte(chatDeliveries.processedAt, testStartedAt),
+          sql`${chatDeliveries.normalizedEvent}->>'trigger' = ${requiredTrigger}`,
+        ),
+      )
+      .orderBy(desc(chatDeliveries.processedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!qualifyingDelivery?.conversationId || !qualifyingDelivery.processedAt) {
+      return false;
+    }
+    const finalPublication = await db
+      .select({
+        commentId: chatPublications.commentId,
+        payload: chatPublications.payload,
+      })
+      .from(chatPublications)
+      .innerJoin(
+        issueComments,
+        and(
+          eq(issueComments.id, chatPublications.commentId),
+          eq(issueComments.companyId, chatPublications.companyId),
+          eq(issueComments.issueId, chatPublications.issueId),
+          eq(issueComments.authorType, "agent"),
+          eq(issueComments.authorAgentId, endpoint.assignedAgentId),
+        ),
+      )
+      .innerJoin(
+        chatMessageLinks,
+        and(
+          eq(chatMessageLinks.companyId, chatPublications.companyId),
+          eq(chatMessageLinks.endpointId, chatPublications.endpointId),
+          eq(chatMessageLinks.conversationId, chatPublications.conversationId),
+          eq(chatMessageLinks.deliveryId, qualifyingDelivery.id),
+          eq(chatMessageLinks.direction, "inbound"),
+          isNotNull(chatMessageLinks.commentId),
+        ),
+      )
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.id, issueComments.createdByRunId),
+          eq(heartbeatRuns.companyId, chatPublications.companyId),
+          eq(heartbeatRuns.agentId, endpoint.assignedAgentId),
+          eq(heartbeatRuns.status, "succeeded"),
+          eq(
+            sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+            sql<string>`${chatPublications.issueId}::text`,
+          ),
+          or(
+            sql`${chatMessageLinks.commentId}::text = ${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
+            sql`${chatMessageLinks.commentId}::text = ${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
+            sql`coalesce(${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds', '[]'::jsonb) ? ${chatMessageLinks.commentId}::text`,
+          ),
+        ),
+      )
+      .where(
+        and(
+          eq(chatPublications.companyId, endpoint.companyId),
+          eq(chatPublications.endpointId, endpointId),
+          eq(chatPublications.conversationId, qualifyingDelivery.conversationId),
+          eq(chatPublications.state, "published"),
+          gte(chatPublications.publishedAt, qualifyingDelivery.processedAt),
+        ),
+      )
+      .orderBy(desc(chatPublications.publishedAt))
+      .then((rows) =>
+        rows.find(
+          (row) =>
+            row.payload.interactionId === undefined &&
+            row.payload.progressState === undefined &&
+            row.commentId !== null,
+        ),
+      );
+    return Boolean(finalPublication);
+  }
+
   async function qualifySetupRoundTrip(
     service: ChatChannelService,
     endpointId: string,
@@ -1604,7 +1727,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .select()
         .from(chatConversations)
         .where(eq(chatConversations.endpointId, endpointId))
-        .orderBy(asc(chatConversations.createdAt)).limit(1).then((rows) => rows[0]);
+        .orderBy(asc(chatConversations.createdAt))
+        .limit(1)
+        .then((rows) => rows[0]);
       expect(conversation).toBeDefined();
     });
     if (!conversation) throw new Error("Expected setup conversation");
@@ -1628,9 +1753,32 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         userId,
       }),
       trigger:
-        endpoint.provider === "telegram"
+        endpoint.provider === "telegram" || endpoint.provider === "imessage-photon"
           ? "direct_message"
           : "subscribed_message",
+    });
+    await waitFor(async () => {
+      for (let turn = 0; turn < 4; turn += 1) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+      }
+      await service.processPendingDeliveries(25);
+      const [delivery] = await db
+        .select({
+          processedAt: chatDeliveries.processedAt,
+          state: chatDeliveries.state,
+        })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpointId),
+            sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${setupFollowUpMessageId}`,
+          ),
+        );
+      if (delivery?.state !== "processed" || !delivery.processedAt) {
+        throw new Error("Setup follow-up delivery is not processed yet");
+      }
     });
     const contextSnapshot = await chatWakeContext({
       endpointId,
@@ -1654,6 +1802,27 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       runId,
     });
     await service.processPendingPublications();
+    await waitFor(async () => {
+      for (let turn = 0; turn < 4; turn += 1) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+      }
+      const [followUp] = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpointId),
+            sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${setupFollowUpMessageId}`,
+          ),
+        );
+      if (followUp) await service.processPendingDeliveries(25, followUp.id);
+      await service.processPendingPublications();
+      expect(
+        await setupRoundTripQualified(endpointId, setupFollowUpMessageId),
+      ).toBe(true);
+    });
     const providerRuntime = fakeRuntime.endpoints.get(endpointId);
     if (providerRuntime) providerRuntime.posts.length = 0;
   }
