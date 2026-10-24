@@ -1194,8 +1194,23 @@ The current app also exposes V1-supporting surfaces for:
   they do not inspect Git. The dedicated close-readiness route derives `deliveryState` as
   `merged_via_pr | merged_by_ancestry | unmerged | unknown` from a live scan. The terminal workspace
   sweep selects terminal source issues in SQL before inspecting Git, and still requires a terminal
-  subtree, clean worktree, merged delivery, cooldown, and no active run. Eligible workspaces are
-  archived with reason `issue_terminal`. A worktree directory that is already gone counts as removed:
+  subtree, cooldown, and no active run. A row with a recorded merged pull request also needs a clean
+  worktree; it is archived with reason `issue_terminal` and its worktree is cleaned up. Every other
+  archive changes the database row and no work-tree file: no worktree removal, file removal, branch
+  deletion or runtime-service stop, and the issues are detached from the closed row. A no-PR row whose
+  recorded branch is gone is still inspected with the existing default-branch fetch first, which
+  updates remote-tracking refs, their reflog and `FETCH_HEAD`. These are a shared-workspace
+  session (`issue_terminal | shared session record`, no delivery verdict and no Git), a row with no
+  `pull_request` work product, no tracked change and no commit missing from the remote
+  (`issue_terminal | terminal, clean, nothing unique`, or `issue_terminal | untracked files`), and a
+  cwd that is missing or not a git repository (`issue_terminal | cwd does not exist` or
+  `issue_terminal | cwd is not a git repository`, no Git). Unpushed commits or tracked modifications
+  keep a no-PR row active. `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN` runs the sweep read-only and
+  fetch-free: it spawns read-only git inspection commands but changes no file, ref, reflog, index,
+  `FETCH_HEAD` or database row, and logs each candidate's action and reason; `doc/DEVELOPING.md` owns its
+  semantics. It is not an exact forecast of the live result. A later run never restores a record-only archived row; it is provisioned again, and a run
+  that names the archived workspace but lands in a different checkout gets a run-log warning that the
+  archived checkout is still on disk. A worktree directory that is already gone counts as removed:
   cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
   of leaving it in `cleanup_failed`. The sweep also retries `cleanup_failed` rows whose reason is
   `issue_terminal | spawn <git> ENOENT` under the same safety gates. Reopening the source issue

@@ -1256,10 +1256,48 @@ Environment overrides:
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace and deletes the worktree. A person can reopen
+  archives the execution workspace. Only a row with a recorded merged pull
+  request also has its worktree deleted. Every other archive (shared sessions,
+  rows with no pull request, missing or non-git cwds) changes the database row and
+  no work-tree file, and leaves the directory and branch on disk. One live case
+  also touches git metadata: a no-PR row whose recorded branch is gone is first
+  inspected with a default-branch fetch, which updates remote-tracking refs, their
+  reflog and `FETCH_HEAD`; that fetch predates the record-only archive. Archiving
+  also detaches the row's issues, and a later run never restores the archived row: the run is
+  provisioned again from the project's policy. When a run names the archived
+  workspace and lands in a different checkout, its run log warns that the
+  archived checkout is still on disk. A person can reopen
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) runs the reaper
+  read-only and fetch-free. It changes no file, ref, reflog, index, `FETCH_HEAD`
+  or database row, and stops nothing. To classify the record-only archives it
+  still spawns the sweep's read-only git inspection commands (`rev-parse`,
+  `status`, `rev-list`, `merge-base`, `show-ref`). It logs
+  `terminal issue workspace reaper dry run` once per candidate with `action`
+  and `reason`. The actions are:
+  - `archive_record_only`: the row would be archived as a record only, with no
+    work-tree change.
+  - `not_previewed`: a row with a recorded merged pull request, or a retried
+    `spawn git ENOENT` row, goes through the existing cleanup path. The dry run
+    does not preview it (`inherited cleanup path`) and spawns no git command and
+    no readiness or cleanup helper for it. It logs these rows before the cooldown
+    and active-run checks and counts them in no skip counter, so the dry run's
+    skip counters cover previewed rows only and can be lower than the live pass's.
+  - `clear_reopen_pending`: the live sweep clears a reopen fence and keeps the
+    row.
+  - `keep`: the row stays as it is. `reason` says why. One exception is not a
+    live keep: a clean, pushed no-PR row whose recorded branch is gone is logged
+    `keep` with a `not previewed` reason and counted nowhere. The live sweep first
+    fetches the default branch for it, which updates remote-tracking refs, their
+    reflog and `FETCH_HEAD` but no work-tree file, and then archives it as a
+    record only when no commit is missing from the remote.
+
+  The dry run is not an exact forecast of the live result. A `terminal issue
+  workspace reaper dry run summary` line follows. Its `wouldArchive` counts the
+  record-only archives it previewed, and its skip counters cover previewed rows
+  only.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,
