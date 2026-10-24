@@ -270,8 +270,8 @@ gh label create "override:paperclip-approval" --repo TEA-Core/paperclip \
 
 The enforcer consults the label only when the head has no valid
 `paperclip/approved` stamp. A forged stamp still fails; the waivers
-(`Paperclip-Approved-Waiver`, `no-paperclip-card`) are checked first and are
-unchanged. The override is honored only when **all** of these hold, and the
+(`Paperclip-Approved-Waiver`, `no-paperclip-card`) are checked first (card-bound
+heads lose them once `PAPERCLIP_CARD_WAIVER_RETIRED=1`, see below). The override is honored only when **all** of these hold, and the
 enforcer fails closed (merge_group exit 1, pull_request advisory) on any doubt:
 
 - **Authority.** The most recent `labeled` event for the label has an actor of
