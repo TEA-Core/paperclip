@@ -494,6 +494,7 @@ interface IssuesListProps {
   mutedIssueIds?: Set<string>;
   issueBadgeById?: Map<string, string>;
   onLoadMoreIssues?: () => void;
+  onStatusFilterChange?: (statuses: string[]) => void;
   onSearchChange?: (search: string) => void;
   onUpdateIssue: (id: string, data: Record<string, unknown>) => void;
 }
@@ -705,6 +706,7 @@ export function IssuesList({
   mutedIssueIds,
   issueBadgeById,
   onLoadMoreIssues,
+  onStatusFilterChange,
   onSearchChange,
   onUpdateIssue,
 }: IssuesListProps) {
@@ -805,6 +807,10 @@ export function IssuesList({
       return next;
     });
   }, [scopedKey]);
+
+  useEffect(() => {
+    onStatusFilterChange?.(viewState.statuses);
+  }, [onStatusFilterChange, viewState.statuses]);
 
   useEffect(() => {
     if (!experimentalSettingsLoaded || externalObjectsEnabled || viewState.externalObjectStatuses.length === 0) return;
