@@ -1970,6 +1970,9 @@ type IssueListRowWithLabels = IssueListRow & IssueLabelEnrichment;
 type IssueListRowWithLabelsAndRun = IssueListRowWithLabels & {
   activeRun: IssueActiveRunRow | null;
 };
+type IssueListResponseRow = IssueListRowWithLabelsAndRun & {
+  reviewAttention?: IssueReviewAttention;
+};
 type IssueUserCommentStats = {
   issueId: string;
   myLastCommentAt: Date | null;
@@ -8511,7 +8514,10 @@ export function issueService(db: Db) {
     clearCheckoutRunIfTerminal,
     addStopRelayCommentIfNeeded,
 
-    list: async (companyId: string, filters?: IssueFilters) => {
+    list: async (
+      companyId: string,
+      filters?: IssueFilters,
+    ): Promise<IssueListResponseRow[]> => {
       if (filters?.sortField === "id" && filters.attention) {
         throw unprocessable("ID ordering is not supported for blocked attention lists");
       }
