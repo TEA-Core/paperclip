@@ -592,10 +592,10 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. If any subsequent startup step fails, the process exits nonzero
-instead of closing the listener and returning to a caller that might leave
-an unreachable process alive. This deliberately delegates restart to the
-supervisor rather than serving with partially initialized recovery state.
+reconnect. If any subsequent startup step fails, `startServer()` closes the
+listener and the database clients, then rejects. The server entrypoint reports
+the failure and exits nonzero, delegating restart to the supervisor rather
+than serving with partially initialized recovery state.
 
 There are two distinct failure modes.
 
