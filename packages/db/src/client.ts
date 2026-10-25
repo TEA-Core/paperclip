@@ -298,11 +298,14 @@ export interface RequestScopedDb {
 /**
  * One dedicated connection for one request, so the request's whole database work (reads, the lock
  * transaction, audit rows) can really be cancelled when its deadline passes. Returns null for a client
- * that was not made by `createDb`, which has no connection settings to reuse.
+ * that was not made by `createDb` (no connection settings to reuse) or that connects through a
+ * transaction-mode pooler (`prepare: false`), where a server session cannot be addressed.
  */
 export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits): RequestScopedDb | null {
   const origin = scopeOrigins.get(parent);
-  if (!origin) return null;
+  // A transaction-mode pooler (prepare === false) rejects startup parameters and maps no client to one
+  // backend, so the session cannot be found or ended: the caller falls back to the shared pool.
+  if (!origin || origin.options.prepare === false) return null;
   const driverOptions = postgresJsOptions(origin.options);
   // A name only this request's backend has, so the server session can be found and ended from outside.
   const applicationName = `paperclip-request-${randomUUID()}`;

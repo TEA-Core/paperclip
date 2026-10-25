@@ -4155,7 +4155,12 @@ export async function publishHeadBoundRelease(
   const abandon = () => {
     if (phase !== "open") return;
     phase = "abandoned";
+    // A success status that may be on the head is voided while the session, and with it the publication
+    // lock, is still held, so a concurrent release of the head cannot write its own success before this
+    // release's failure lands. Only then is the session ended.
     Promise.resolve()
+      .then(() => (statusMayExist ? voidSuccess(`the deadline passed (${deadlines.totalMs}ms)`) : undefined))
+      .catch(() => undefined)
       .then(() => input.abandon?.())
       .catch(() => undefined);
   };
@@ -4257,11 +4262,14 @@ export async function publishHeadBoundRelease(
   // `conn` is the lock's own connection: eligibility is read on it, never on a second pool connection.
   const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => (await liveRefusal()) ?? (await eligibilityRefusal(conn));
   // A success that cannot be confirmed is voided by a failure status; the answer says whether that worked.
-  const voidSuccess = async (why: string): Promise<string> => {
-    const voided = await failureStatusWrite(input.headSha, `voided: ${why}`);
-    if (voided.success) statusMayExist = false;
-    return voided.success ? "it was voided by a failure status" : `it could NOT be voided (${voided.error ?? `HTTP ${voided.status}`}), and is not consumable without a recorded confirmation`;
-  };
+  // Single-flight: the deadline's void and the release's own never both write a failure status.
+  let voiding: Promise<string> | undefined;
+  const voidSuccess = (why: string): Promise<string> =>
+    (voiding ??= (async () => {
+      const voided = await failureStatusWrite(input.headSha, `voided: ${why}`);
+      if (voided.success) statusMayExist = false;
+      return voided.success ? "it was voided by a failure status" : `it could NOT be voided (${voided.error ?? `HTTP ${voided.status}`}), and is not consumable without a recorded confirmation`;
+    })());
   // The marker CI requires beside a release success (RELEASE_CONFIRMED_CONTEXT). It is written only after
   // the confirmation is committed, on the compensation clock.
   const writeConfirmationMarker = (statusId: string) =>
