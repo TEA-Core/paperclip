@@ -178,6 +178,23 @@ describe("github-external-object-provider", () => {
   });
 
   describe("pull_request resolver", () => {
+    it("preserves live head repository for fork ownership checks", async () => {
+      const mockFetch = makeFetchMock({
+        state: "open", draft: true, title: "SUP-123: work",
+        head: { ref: "SUP-123-work", repo: { full_name: "fork/repo" } },
+      });
+      const { resolvers } = createGitHubExternalObjectProvider({} as Db, {
+        fetch: mockFetch.fetch,
+        tokenProvider: vi.fn().mockResolvedValue(null),
+      });
+      const result = await resolvers.find((r) => r.objectType === "pull_request")!.resolve({
+        companyId: "test-company",
+        object: makeObject("owner/repo#pull/123"),
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.snapshot.data?.headRepoFullName).toBe("fork/repo");
+    });
+
     it("carries merged_at on the snapshot data when the GitHub PR body has it", async () => {
       const tokenProvider = vi.fn().mockResolvedValue(null);
       const mockFetch = makeFetchMock({

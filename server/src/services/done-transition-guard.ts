@@ -516,12 +516,18 @@ async function hydrateLinkedPrState(
       // probe, and any probe failure degrades to null (fail open).
       const reviewDecision =
         state === "open" ? await fetchPullRequestReviewDecision(pr, token) : null;
+      const head = body.head as Record<string, unknown> | null | undefined;
+      const headRepo = head?.repo as Record<string, unknown> | null | undefined;
+      const headRepoFullName = typeof headRepo?.full_name === "string" ? headRepo.full_name : null;
       return {
         ...pr,
         cachedState: state,
         lastErrorCode: null,
         reviewDecision,
         draft: typeof body.draft === "boolean" ? body.draft : pr.draft,
+        headRefName: typeof head?.ref === "string" ? head.ref : null,
+        title: typeof body.title === "string" ? body.title : null,
+        headRepoFullName,
       };
     }
     return pr;
@@ -691,21 +697,32 @@ export async function loadOwnDraftPredicate(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
   prs: LinkedPullRequest[],
+  requireDeliveryRepo = false,
 ): Promise<(pr: LinkedPullRequest) => boolean> {
   const identifier = issue.identifier?.toLowerCase() ?? null;
-  const cachedDrafts = prs.some((pr) => pr.draft && !pr.id.startsWith("live:"));
-  if (!identifier || !cachedDrafts) return () => true;
+  if (!identifier || !prs.some((pr) => pr.draft)) return () => false;
   let deliveryBranch: string | null = null;
   let branchIsOwn = false;
+  let deliveryRepo: string | null = null;
   try {
+    const fields = await loadTier1RepoFields(db, issue);
+    const ctx = await resolveIssueRepoContext(db, { companyId: issue.companyId, ...fields });
+    const parsed = parseRepoUrl(ctx?.repoUrl ?? null);
+    if (parsed?.hostname === "github.com") {
+      deliveryRepo = `${parsed.owner}/${parsed.repo}`.toLowerCase();
+    }
     const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
     if (ownership.legitimate && ownership.branch !== null) deliveryBranch = ownership.branch.toLowerCase();
     branchIsOwn = ownership.branchIsOwn;
   } catch {
-    // Ownership unresolved: fall back to the identifier-anchored head ref / title match.
+    // An unresolved delivery identity is not proof that a linked draft belongs to this card.
   }
   return (pr) =>
-    pr.id.startsWith("live:") ||
+    (!requireDeliveryRepo || deliveryRepo !== null) &&
+    (deliveryRepo === null || `${pr.owner}/${pr.repo}`.toLowerCase() === deliveryRepo) &&
+    (pr.headRepoFullName == null
+      ? !requireDeliveryRepo
+      : pr.headRepoFullName.toLowerCase() === deliveryRepo) &&
     isAnchoredCardPullRequest(
       (pr.headRefName ?? "").toLowerCase(),
       (pr.title ?? "").toLowerCase(),
@@ -749,7 +766,7 @@ async function proveLandingDelegated(
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     if (tokenResult.token !== null) {
       const live = await hydrateLinkedPrState(pr, tokenResult.token);
-      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
+      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live], true))(live)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
@@ -2340,7 +2357,7 @@ async function evaluateDoneTransitionGuardCore(
       prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
     });
   }
-  const isOwnDraft = await loadOwnDraftPredicate(db, issue, resolvedPrs);
+  const isOwnDraft = await loadOwnDraftPredicate(db, issue, resolvedPrs, true);
   const openPrs = resolvedPrs.filter(
     (p) =>
       p.cachedState === "open" &&
@@ -2359,15 +2376,17 @@ async function evaluateDoneTransitionGuardCore(
     const draftPrs = decisionCarried ? [] : openPrs.filter((p) => p.draft);
     if (draftPrs.length > 0) {
       const draftNames = draftPrs.map((p) => p.displayName).join(", ");
+      const draftRemedy = `Promote ${draftPrs.length === 1 ? "it" : "them"} out of draft before closing done or publishing approval.`;
       return {
         allowed: false,
-        reason: `head_draft: ${draftNames} ${draftPrs.length === 1 ? "is an" : "are"} open draft PR${draftPrs.length === 1 ? "" : "s"}; promote ${draftPrs.length === 1 ? "it" : "them"} out of draft before closing done.`,
+        reason: `head_draft: ${draftNames} ${draftPrs.length === 1 ? "is an" : "are"} open draft PR${draftPrs.length === 1 ? "" : "s"}; ${draftRemedy}`,
         aheadBy: null,
         branch: null,
         defaultRef: null,
         owner: null,
         repo: null,
         mechanism: "delivery",
+        remedy: draftRemedy,
         skipped: false,
         skipReason: "head_draft",
       };

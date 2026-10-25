@@ -5095,9 +5095,9 @@ export function issueRoutes(
         guardResult.mechanism ?? (guardResult.ladderUnsatisfied ? "C" : "delivery");
       const remedy =
         mechanism === "delivery"
-          ? decisionCarried
+          ? guardResult.remedy ?? (decisionCarried
             ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
-            : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+            : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.")
           : guardResult.remedy ??
             "Record the outstanding execution-policy decision, or repair this issue's execution ladder, before marking the issue done.";
       // Board ruling 2026-10-02 (F1 server half): mechanism D is a seat-authority

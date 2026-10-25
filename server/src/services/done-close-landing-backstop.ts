@@ -608,7 +608,7 @@ export function createDoneCloseLandingBackstopService(
 
     for (const pr of prs) {
       const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
-      if (alreadyConfirmed.has(prKey) || alreadyFailed.has(prKey)) continue;
+      if (alreadyFailed.has(prKey)) continue;
 
       if (!deps.resolver) {
         counts.deferred += 1;
@@ -645,7 +645,18 @@ export function createDoneCloseLandingBackstopService(
             ? readString(data?.closed_at)
             : null;
 
-      measured.push({ pr, prKey, state, draft, closedAt });
+      measured.push({
+        pr: state === "open" && draft === true
+          ? {
+              ...pr,
+              draft: true,
+              headRefName: readString(data?.headRef) ?? pr.headRefName,
+              title: readString(data?.title) ?? pr.title,
+              headRepoFullName: readString(data?.headRepoFullName),
+            }
+          : pr,
+        prKey, state, draft, closedAt,
+      });
     }
 
     // Did ANY linked PR on this card merge? If so, a closed-unmerged sibling is a
@@ -660,10 +671,13 @@ export function createDoneCloseLandingBackstopService(
     const isOwnDraft = await loadOwnDraftPredicate(
       db,
       issue,
-      measured.map((m) => ({ ...m.pr, draft: m.draft === true })),
+      measured.map((m) => m.pr),
     );
 
     for (const { pr, prKey, state, draft, closedAt } of measured) {
+      // Confirmed siblings still participate in this pass's merged verdict,
+      // but their earlier audit row must not be re-emitted.
+      if (alreadyConfirmed.has(prKey)) continue;
       const foreignDraft = state === "open" && draft === true && !isOwnDraft(pr);
       const isSupersededCarrier = state === "closed" && hasMergedSibling;
 
@@ -771,6 +785,17 @@ export function createDoneCloseLandingBackstopService(
           continue;
         }
         const alreadyReported = alreadyDraftStranded.has(prKey);
+        if (!hasMergedSibling) {
+          // Persist the park before the audit marker: a failed update must let
+          // the next sweep retry the audit, comment and assignee wake together.
+          await deps.svc.update(issue.id, {
+            status: "blocked",
+            unblockDescriptor: {
+              owner: "board",
+              action: `Run gh pr ready ${pr.number} for ${prKey}, then republish approval at the ready head via the board merge-arming/republish action; verify the PR lands before closing this card done`,
+            },
+          });
+        }
         if (!alreadyReported) {
           await logActivity(db, {
             companyId: issue.companyId,
@@ -797,17 +822,9 @@ export function createDoneCloseLandingBackstopService(
           });
         }
         if (hasMergedSibling) {
-          // The card's work provably landed via the merged sibling: audit only,
-          // no park, comment, wake, or draftStranded count.
+          // The card's work landed via the merged sibling: audit only.
           continue;
         }
-        await deps.svc.update(issue.id, {
-          status: "blocked",
-          unblockDescriptor: {
-            owner: "board",
-            action: `Run gh pr ready ${pr.number} for ${prKey}, then republish approval at the ready head via the board merge-arming/republish action; verify the PR lands before closing this card done`,
-          },
-        });
         if (!alreadyReported) {
           await deps.svc.addComment(
             issue.id,

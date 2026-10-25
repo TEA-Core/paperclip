@@ -528,6 +528,35 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     expect(comments.some((r) => r.body.includes("Tier 1"))).toBe(true);
   });
 
+  it("returns the draft promotion remedy in both the 409 and thread refusal", async () => {
+    const { companyId, agentId, issueId, identifier, branchName } = await seedIssue("DRAFTREM");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 4161, state: "open", draft: true },
+    ]);
+    await db.update(externalObjects)
+      .set({ data: { state: "open", draft: true, headRef: branchName, title: `${identifier}: fix` } })
+      .where(and(eq(externalObjects.companyId, companyId), eq(externalObjects.externalId, "TEA-Core/paperclip#pull/4161")));
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) =>
+      new Response(JSON.stringify(url.includes("/pulls/4161")
+        ? { state: "open", draft: true, title: `${identifier}: fix`, head: { ref: branchName, repo: { full_name: "TEA-Core/paperclip" } } }
+        : {}), { status: 200 }),
+    );
+
+    const response = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closed at Tier 2 (live): endpoint responds." });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.error).toContain("head_draft");
+    expect(response.body.details.remedy).toContain("out of draft");
+    expect(response.body.details.remedy).not.toContain("deliver.sh");
+    const comments = await db.select({ body: issueComments.body })
+      .from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((row) => row.body.includes("out of draft") && !row.body.includes("deliver.sh"))).toBe(true);
+  });
+
   it("SUP-13152 fixture: 5 open linked PRs block done with 409 even when GitHub token is 401 (token_missing path)", async () => {
     const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13152");
     currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));

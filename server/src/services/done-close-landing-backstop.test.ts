@@ -2887,6 +2887,91 @@ describe("SUP-16689: draft-stranded done cards", () => {
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { label: "other base repository", owner: "paperclipai", repo: "other", liveRef: "SUP-13326-branch", liveRepo: "paperclipai/other" },
+    { label: "fork head", owner: "paperclipai", repo: "paperclip", liveRef: "SUP-13326-branch", liveRepo: "other/paperclip" },
+    { label: "moved foreign branch", owner: "paperclipai", repo: "paperclip", liveRef: "SUP-99999-branch", liveRepo: "paperclipai/paperclip" },
+  ])("does not park a card for a live foreign draft: $label", async ({ owner, repo, liveRef, liveRepo }) => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+      deliveryIdentity: { identifier: "SUP-13326", executionWorkspaceId: "ws-draft" },
+      workspaceRows: [{ branchName: "SUP-13326-branch", repoUrl: "https://github.com/paperclipai/paperclip", sourceIssueId: null, mode: "isolated_workspace" }],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ owner, repo, draft: true, headRefName: "SUP-13326-branch" }),
+    ]);
+    mockResolver(async () => ({
+      ok: true,
+      snapshot: {
+        statusKey: "draft",
+        statusCategory: "waiting",
+        statusTone: "warning",
+        data: { state: "open", draft: true, headRef: liveRef, headRepoFullName: liveRepo },
+      },
+    } as ExternalObjectResolveResult));
+    const result = await service.sweep();
+    expect(result.draftStranded).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+    }));
+  });
+
+  it("does not park a draft when a sibling was confirmed merged on an earlier sweep", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [{
+        action: "issue.done_close_landing_confirmed",
+        entityId: ISSUE,
+        details: { pr: "paperclipai/paperclip#368" },
+      }],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ draft: true, headRefName: "SUP-13326-branch" }),
+      linkedPr({ id: "eo-368", number: 368, displayName: "paperclipai/paperclip#368" }),
+    ]);
+    mockResolver(async (input: unknown) => {
+      const object = input && typeof input === "object" && "object" in input ? input.object : null;
+      return object && typeof object === "object" && "externalId" in object &&
+        typeof object.externalId === "string" && object.externalId.endsWith("pull/368")
+        ? mergedSnapshot
+        : draftOpenSnapshot;
+    });
+    const result = await service.sweep();
+    expect(result.draftStranded).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+      details: expect.objectContaining({ supersededBy: "paperclipai/paperclip#368" }),
+    }));
+  });
+
+  it("retries the audit and assignee notification after a failed draft park", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const state: DbState = { candidates: [candidateRow()], existingLandingRows: [] };
+    const { service } = makeService(state, { wakeup });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ draft: true, headRefName: "SUP-13326-branch" }),
+    ]);
+    mockResolver(async () => draftOpenSnapshot);
+    mockUpdate.mockRejectedValueOnce(new Error("park failed"));
+    mockLogActivity.mockImplementation(async (_db, row) => {
+      state.existingLandingRows.push({ action: row.action, entityId: row.entityId, details: row.details });
+      return { id: "activity-row" };
+    });
+    await service.sweep();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(state.existingLandingRows).toEqual([]);
+    const second = await service.sweep();
+    expect(second.draftStranded).toBe(1);
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("does not re-report a draft-stranded card+PR on a later sweep (idempotent)", async () => {
     const state: DbState = {
       candidates: [candidateRow()],

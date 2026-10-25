@@ -2,12 +2,14 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, externalObjectMentions, externalObjects, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
-  fetchGitHubNodeId,
   isGitHubTokenResolution,
   markPullRequestReadyForReview,
+  parseRepoUrl,
+  resolveIssueRepoContext,
   resolveGitHubTokenCandidatesForRepo,
   resolveGitHubTokenForRepo,
 } from "./merge-arming.js";
@@ -23,10 +25,12 @@ import {
  * tick fires the call every 30 s and the min-interval gate inside `sweep`
  * makes every non-due tick a no-op, as in `done-close-landing-backstop.ts`.
  *
- * A PR only counts as the parent's carrier when its head branch starts with
- * the parent's identifier (the carrier branch is the parent's
- * `{{identifier}}-{{slug}}` name, no prefix). The sequencing guard holds
- * carrier N+1 while carrier N's external object still reads `open` —
+ * A PR only counts as the parent's carrier when its cached head branch starts
+ * with the parent's identifier (the carrier branch is the parent's
+ * `{{identifier}}-{{slug}}` name, no prefix) and its base repository is the
+ * parent's delivery repo. Immediately before promotion, a live read must
+ * confirm that repository, head repository, exact branch and unchanged SHA.
+ * The sequencing guard holds carrier N+1 while carrier N's external object still reads `open` —
  * merge-queue membership is unobservable, and a queued PR is still open.
  * Idempotence rides an activity row per (parent, PR): a carrier an earlier
  * sweep dispositioned is never re-promoted.
@@ -69,9 +73,9 @@ interface DraftCarrierRow {
   owner: string;
   repo: string;
   number: number;
-  nodeId: string | null;
   headRefName: string | null;
   prCreatedAt: string | null;
+  headSha: string | null;
 }
 
 interface SiblingPullRequest {
@@ -181,8 +185,8 @@ export function createCarrierPromotionSweepService(
         owner: parsed.owner,
         repo: parsed.repo,
         number: parsed.number,
-        nodeId: readString(row.data.node_id),
         headRefName: headRefFromData(row.data),
+        headSha: readString(row.data.headSha),
         prCreatedAt: readString(row.data.created_at),
       });
     }
@@ -235,6 +239,9 @@ export function createCarrierPromotionSweepService(
         companyId: issues.companyId,
         status: issues.status,
         identifier: issues.identifier,
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspaceId: issues.executionWorkspaceId,
       })
       .from(issues)
       .where(eq(issues.id, parentId));
@@ -243,6 +250,9 @@ export function createCarrierPromotionSweepService(
     // available. Cancelled parents are the cancelled-parent case (PR-CARRIER-7), out of scope.
     if (parent.status === "cancelled") return;
     const prefix = (parent.identifier ?? "").toLowerCase();
+    const repoContext = await resolveIssueRepoContext(db, parent);
+    const deliveryRepo = parseRepoUrl(repoContext?.repoUrl ?? null);
+    if (deliveryRepo?.hostname !== "github.com") return;
     if (!prefix) return;
     const carrierBranchPrefix = `${prefix}-`;
     const isCarrierBranch = (headRefName: string | null) =>
@@ -280,7 +290,10 @@ export function createCarrierPromotionSweepService(
     }
 
     const candidates = parentDrafts
-      .filter((draft) => isCarrierBranch(draft.headRefName))
+      .filter((draft) =>
+        isCarrierBranch(draft.headRefName)
+        && draft.owner.toLowerCase() === deliveryRepo.owner.toLowerCase()
+        && draft.repo.toLowerCase() === deliveryRepo.repo.toLowerCase())
       .sort((a, b) => a.number - b.number);
     if (candidates.length === 0) return;
     result.candidates += candidates.length;
@@ -348,7 +361,7 @@ export function createCarrierPromotionSweepService(
     }
   }
 
-  /** Promotes one carrier PR: resolve a working token candidate, resolve the node id if cached, flip to ready, log the activity row. */
+  /** Promotes one verified carrier PR: read live identity and head, flip to ready, log the activity row. */
   async function promoteCarrier(
     draft: DraftCarrierRow,
     prKey: string,
@@ -367,24 +380,40 @@ export function createCarrierPromotionSweepService(
 
     for (const candidate of candidates) {
       const token = candidate.token;
-
-      let nodeId = draft.nodeId;
-      if (!nodeId) {
-        const nodeIdResult = await fetchGitHubNodeId(token, draft.owner, draft.repo, draft.number);
-        if (!nodeIdResult.ok || !nodeIdResult.nodeId) {
-          if (nodeIdResult.status === 401 || nodeIdResult.status === 403) {
-            if (candidate !== candidates[candidates.length - 1]) continue;
-          }
-          logger.warn(
-            { pr: prKey, status: nodeIdResult.status },
-            "carrier promotion sweep: could not resolve PR node id",
-          );
-          return "failed";
-        }
-        nodeId = nodeIdResult.nodeId;
+      // The external-object row is a discovery hint, not permission to mutate:
+      // read the live target immediately before the GraphQL write. The cached
+      // head SHA is a compare-before-write anchor; a moved head retries only
+      // after the provider refreshes the snapshot on a later sweep.
+      const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(draft.owner)}/${encodeURIComponent(draft.repo)}/pulls/${draft.number}`;
+      let response: Response;
+      try {
+        response = await ghFetch(url, {
+          headers: {
+            accept: "application/vnd.github+json",
+            "user-agent": "paperclip-carrier-promotion-sweep",
+            "x-github-api-version": "2022-11-28",
+            authorization: `Bearer ${token}`,
+          },
+        });
+      } catch {
+        return "failed";
       }
-
-      const outcome = await markPullRequestReadyForReview(token, nodeId);
+      if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
+        return "failed";
+      }
+      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+      const head = body?.head as Record<string, unknown> | null | undefined;
+      const headRepo = head?.repo as Record<string, unknown> | null | undefined;
+      const deliveryRepo = `${draft.owner}/${draft.repo}`.toLowerCase();
+      if (
+        body?.state !== "open" || body.draft !== true ||
+        typeof head?.ref !== "string" || head.ref !== draft.headRefName ||
+        typeof headRepo?.full_name !== "string" || headRepo.full_name.toLowerCase() !== deliveryRepo ||
+        typeof head?.sha !== "string" || !draft.headSha || head.sha !== draft.headSha ||
+        typeof body.node_id !== "string" || !body.node_id
+      ) return "failed";
+      const outcome = await markPullRequestReadyForReview(token, body.node_id);
       if (outcome.success) {
         await logActivity(db, {
           companyId: parent.companyId,

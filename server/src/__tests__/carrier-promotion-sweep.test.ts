@@ -51,6 +51,11 @@ function jsonResponse(body: unknown, ok = true, status = 200) {
 
 const GRAPHQL_OK = () => jsonResponse({ data: { markPullRequestReadyForReview: { clientMutationId: "abc" } } });
 
+const LIVE_PR_OK = (nodeId = "PR_node_400") => jsonResponse({
+  node_id: nodeId, state: "open", draft: true,
+  head: { ref: CARRIER_BRANCH, sha: "sha-reviewed", repo: { full_name: "TEA-Core/paperclip" } },
+});
+
 /** Builds a cached draft pull-request discovery row with sensible defaults and per-test overrides. */
 function draftRow(overrides: {
   number?: number;
@@ -65,6 +70,7 @@ function draftRow(overrides: {
     state: "open",
     draft: true,
     node_id: overrides.nodeId === undefined ? `PR_node_${number}` : overrides.nodeId,
+    headSha: "sha-reviewed",
     created_at: overrides.prCreatedAt === undefined ? YOUNG_ISO : overrides.prCreatedAt,
   };
   if (headRef) data.headRef = headRef;
@@ -86,9 +92,9 @@ function siblingRow(number: number, state: string, branch = CARRIER_BRANCH) {
 /**
  * Builds a cached row in the exact data shape the GitHub external-object
  * provider writes (`pullRequestSnapshot` in
- * `github-external-object-provider.ts`): flat `headRef` key, no nested
- * `head`, no cached `node_id` or `created_at` (age anchor falls back to
- * mentionCreatedAt; node id falls back to the REST lookup).
+ * `github-external-object-provider.ts`): flat `headRef` and `headSha` keys, no
+ * nested `head`, no cached `node_id` or `created_at` (age anchors on the
+ * mention time; every promotion reads the node ID from live REST).
  */
 function providerDraftRow(overrides: { number?: number; branch?: string | null } = {}) {
   const number = overrides.number ?? 400;
@@ -103,7 +109,7 @@ function providerDraftRow(overrides: { number?: number; branch?: string | null }
     draft: true,
   };
   if (headRef) data.headRef = headRef;
-  data.headSha = "7d1f8a2c0b3e4f5a6c7d8e9f0a1b2c3d4e5f6071";
+  data.headSha = "sha-reviewed";
   data.baseRef = "fold/tea-patches-v2026.722.0";
   return {
     sourceIssueId: CHILD,
@@ -120,10 +126,12 @@ interface TestState {
   children: Array<Record<string, unknown>>;
   siblingRows: Array<Record<string, unknown>>;
   activityRows: Array<Record<string, unknown>>;
+  repoRows: Array<Record<string, unknown>>;
 }
 
 /** Maps a drizzle select column set to the matching fake-db row list, by column fingerprint. */
-function selectRows(cols: Record<string, unknown>, state: TestState) {
+function selectRows(cols: Record<string, unknown> | undefined, state: TestState) {
+  if (!cols) return state.repoRows;
   if ("mentionCreatedAt" in cols) return state.draftRows;
   if ("parentId" in cols) return state.sourceIssues;
   if ("identifier" in cols) return state.parentRow ? [state.parentRow] : [];
@@ -135,7 +143,7 @@ function selectRows(cols: Record<string, unknown>, state: TestState) {
 /** Builds a fake drizzle db whose select() serves rows from the given test state. */
 function makeDb(state: TestState) {
   return {
-    select: vi.fn((cols: Record<string, unknown>) => {
+    select: vi.fn((cols?: Record<string, unknown>) => {
       const rows = selectRows(cols, state);
       return {
         from: () => ({
@@ -165,11 +173,17 @@ function state(overrides: Partial<TestState> = {}): TestState {
   return {
     draftRows: [],
     sourceIssues: [{ id: CHILD, parentId: PARENT }],
-    parentRow: { id: PARENT, companyId: COMPANY, status: "in_progress", identifier: PARENT_IDENTIFIER },
+    parentRow: { id: PARENT, companyId: COMPANY, status: "in_progress", identifier: PARENT_IDENTIFIER, projectId: "project-1", projectWorkspaceId: "workspace-1", executionWorkspaceId: null },
     children: [{ id: CHILD }],
     siblingRows: [],
     activityRows: [],
+    repoRows: [{ repoUrl: "https://github.com/TEA-Core/paperclip" }],
     ...overrides,
+    ...(overrides.parentRow ? { parentRow: {
+      id: PARENT, companyId: COMPANY, status: "in_progress", identifier: PARENT_IDENTIFIER,
+      projectId: "project-1", projectWorkspaceId: "workspace-1", executionWorkspaceId: null,
+      ...overrides.parentRow,
+    } } : {}),
   };
 }
 
@@ -181,6 +195,9 @@ const wakeableParent = {
 
 beforeEach(() => {
   mockGhFetch.mockReset();
+  mockGhFetch.mockImplementation(async (url: string) =>
+    String(url).includes("/pulls/") ? LIVE_PR_OK(String(url).endsWith("/401") ? "PR_node_401" : "PR_node_400") : GRAPHQL_OK(),
+  );
   mockLogActivity.mockClear();
   mockResolveCandidates.mockReset().mockResolvedValue([TOKEN_CANDIDATE]);
   mockResolveToken.mockReset().mockResolvedValue({ kind: "unavailable", reason: "no token configured" });
@@ -244,7 +261,6 @@ describe("createCarrierPromotionSweepService", () => {
       draftRows: [draftRow()],
       siblingRows: [siblingRow(400, "open")],
     }));
-    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -257,9 +273,11 @@ describe("createCarrierPromotionSweepService", () => {
     });
 
     expect(mockGetWakeable).toHaveBeenCalledWith(PARENT);
-    const [url, init] = mockGhFetch.mock.calls[0]!;
+    const [restUrl, restInit] = mockGhFetch.mock.calls[0]!;
+    expect(restUrl).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
+    expect(restInit.headers.authorization).toBe(`Bearer ${TOKEN_CANDIDATE.token}`);
+    const [url, init] = mockGhFetch.mock.calls[1]!;
     expect(url).toBe("https://api.github.com/graphql");
-    expect(init.headers.authorization).toBe(`Bearer ${TOKEN_CANDIDATE.token}`);
     expect(JSON.parse(init.body).query).toContain("PR_node_400");
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -284,7 +302,6 @@ describe("createCarrierPromotionSweepService", () => {
       draftRows: [draftRow({ prCreatedAt: STALE_ISO })],
       siblingRows: [siblingRow(400, "open")],
     }));
-    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -306,16 +323,53 @@ describe("createCarrierPromotionSweepService", () => {
       draftRows: [draftRow({ prCreatedAt: STALE_ISO })],
       siblingRows: [siblingRow(400, "open")],
     }));
-    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
 
     const result = await service.sweep();
     expect(result.promoted).toBe(1);
-    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: CARRIER_PROMOTION_READY_ACTION,
       entityId: PARENT,
       details: expect.objectContaining({ pr: "TEA-Core/paperclip#400" }),
     }));
+  });
+
+  it.each([
+    { label: "other delivery repository", externalId: "TEA-Core/other#pull/400", liveRepo: "TEA-Core/other", liveRef: CARRIER_BRANCH, liveSha: "sha-reviewed", state: "open", draft: true },
+    { label: "forked head repository", externalId: "TEA-Core/paperclip#pull/400", liveRepo: "Other/paperclip", liveRef: CARRIER_BRANCH, liveSha: "sha-reviewed", state: "open", draft: true },
+    { label: "moved branch", externalId: "TEA-Core/paperclip#pull/400", liveRepo: "TEA-Core/paperclip", liveRef: "SUP-99999-other", liveSha: "sha-reviewed", state: "open", draft: true },
+    { label: "case-changed branch", externalId: "TEA-Core/paperclip#pull/400", liveRepo: "TEA-Core/paperclip", liveRef: `${PARENT_IDENTIFIER.toLowerCase()}-one-carrier-branch-per-parent`, liveSha: "sha-reviewed", state: "open", draft: true },
+    { label: "changed head SHA", externalId: "TEA-Core/paperclip#pull/400", liveRepo: "TEA-Core/paperclip", liveRef: CARRIER_BRANCH, liveSha: "sha-moved", state: "open", draft: true },
+    { label: "missing cached head SHA", externalId: "TEA-Core/paperclip#pull/400", liveRepo: "TEA-Core/paperclip", liveRef: CARRIER_BRANCH, liveSha: "sha-reviewed", state: "open", draft: true, cachedSha: null },
+    { label: "closed draft", externalId: "TEA-Core/paperclip#pull/400", liveRepo: "TEA-Core/paperclip", liveRef: CARRIER_BRANCH, liveSha: "sha-reviewed", state: "closed", draft: true },
+    { label: "already ready", externalId: "TEA-Core/paperclip#pull/400", liveRepo: "TEA-Core/paperclip", liveRef: CARRIER_BRANCH, liveSha: "sha-reviewed", state: "open", draft: false },
+  ])("does not promote an unverified cached draft: $label", async ({ label, externalId, liveRepo, liveRef, liveSha, state: liveState, draft, cachedSha }) => {
+    const row = draftRow({ prCreatedAt: STALE_ISO });
+    row.externalId = externalId;
+    row.data.headSha = cachedSha === undefined ? "sha-reviewed" : cachedSha;
+    const { service } = makeService(state({
+      parentRow: { id: PARENT, companyId: COMPANY, status: "done", identifier: PARENT_IDENTIFIER },
+      draftRows: [row],
+      siblingRows: [siblingRow(400, "open")],
+    }));
+    mockGhFetch.mockImplementation(async (url: string) =>
+      String(url).includes("/pulls/400")
+        ? jsonResponse({
+          node_id: "PR_node_400", state: liveState, draft,
+          head: { ref: liveRef, sha: liveSha, repo: { full_name: liveRepo } },
+        })
+        : GRAPHQL_OK(),
+    );
+    const result = await service.sweep();
+    expect(result.promoted).toBe(0);
+    expect(mockGhFetch.mock.calls.some(([url]) => url === "https://api.github.com/graphql")).toBe(false);
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    if (label === "other delivery repository") {
+      // A matching branch in another repo is rejected before resolving the
+      // foreign repository's GitHub credential, killing the repo-gate mutant.
+      expect(mockResolveCandidates).not.toHaveBeenCalled();
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    }
   });
 
   it("leaves a cancelled parent's draft carrier untouched even past the age cap", async () => {
@@ -376,7 +430,6 @@ describe("createCarrierPromotionSweepService", () => {
       draftRows: [draftRow({ number: 401 })],
       siblingRows: [siblingRow(400, "closed"), siblingRow(401, "open")],
     }));
-    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -453,15 +506,15 @@ describe("createCarrierPromotionSweepService", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("resolves the node id over REST when the cached row has none", async () => {
+  it("uses the live node id instead of a stale cached node id", async () => {
     mockGetWakeable.mockResolvedValue(null);
     const { service } = makeService(state({
-      draftRows: [draftRow({ nodeId: null, prCreatedAt: STALE_ISO })],
+      draftRows: [draftRow({ nodeId: "PR_node_stale_400", prCreatedAt: STALE_ISO })],
       siblingRows: [siblingRow(400, "open")],
     }));
-    mockGhFetch
-      .mockResolvedValueOnce(jsonResponse({ node_id: "PR_node_live_400" }))
-      .mockResolvedValueOnce(GRAPHQL_OK());
+    mockGhFetch.mockImplementation(async (url: string) =>
+      String(url).includes("/pulls/") ? LIVE_PR_OK("PR_node_live_400") : GRAPHQL_OK(),
+    );
 
     await expect(service.sweep()).resolves.toMatchObject({ due: true, promoted: 1 });
     expect(mockGhFetch).toHaveBeenCalledTimes(2);
@@ -478,9 +531,9 @@ describe("createCarrierPromotionSweepService", () => {
       draftRows: [providerDraftRow()],
       siblingRows: [siblingRow(400, "open")],
     }));
-    mockGhFetch
-      .mockResolvedValueOnce(jsonResponse({ node_id: "PR_node_live_400" }))
-      .mockResolvedValueOnce(GRAPHQL_OK());
+    mockGhFetch.mockImplementation(async (url: string) =>
+      String(url).includes("/pulls/") ? LIVE_PR_OK("PR_node_live_400") : GRAPHQL_OK(),
+    );
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -509,14 +562,13 @@ describe("createCarrierPromotionSweepService", () => {
         sourceIssueId: CHILD,
         mentionCreatedAt: new Date(YOUNG_ISO),
         externalId: "TEA-Core/paperclip#pull/400",
-        data: { state: "open", draft: true, node_id: "PR_node_400", created_at: YOUNG_ISO, head: { ref: CARRIER_BRANCH } },
+        data: { state: "open", draft: true, headSha: "sha-reviewed", node_id: "PR_node_400", created_at: YOUNG_ISO, head: { ref: CARRIER_BRANCH } },
       }],
       siblingRows: [{
         externalId: "TEA-Core/paperclip#pull/400",
         data: { state: "open", head: { ref: CARRIER_BRANCH } },
       }],
     }));
-    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
 
     await expect(service.sweep()).resolves.toMatchObject({ due: true, candidates: 1, promoted: 1 });
   });
@@ -544,7 +596,6 @@ describe("createCarrierPromotionSweepService", () => {
       state({ draftRows: [draftRow()], siblingRows: [siblingRow(400, "open")] }),
       { sweepIntervalMs: 60 * 60 * 1000, now: () => new Date(clock) },
     );
-    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
 
     await expect(service.sweep()).resolves.toMatchObject({ due: true, promoted: 1 });
     const selectCallsAfterFirst = db.select.mock.calls.length;
