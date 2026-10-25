@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -612,6 +612,125 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
     expect(row.status).toBe("resolved");
     expect(row.outcome).toBe("restored");
     expect(row.resolutionNote).toBe("new_source_execution_path");
+  });
+
+  it("skips an action whose resolution fails and processes the next one", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "codex_local");
+    const firstIssueId = await seedCard(companyId, agentId, { status: "done", issueNumber: 1 });
+    const secondIssueId = await seedCard(companyId, agentId, { status: "done", issueNumber: 2 });
+    const firstActionId = randomUUID();
+    const secondActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values([
+      {
+        id: firstActionId, companyId, sourceIssueId: firstIssueId,
+        kind: "stranded_assigned_issue", status: "escalated", ownerType: "board",
+        cause: "stranded_assigned_issue", fingerprint: "fail-on-resolve",
+        evidence: {}, nextAction: "Restore source", wakePolicy: { type: "board_escalation" },
+      },
+      {
+        id: secondActionId, companyId, sourceIssueId: secondIssueId,
+        kind: "stranded_assigned_issue", status: "escalated", ownerType: "board",
+        cause: "stranded_assigned_issue", fingerprint: "resolve-next-action",
+        evidence: {}, nextAction: "Restore source", wakePolicy: { type: "board_escalation" },
+      },
+    ]);
+    // Disposable DB: force a real persistence failure only for the first action.
+    await db.execute(sql`
+      CREATE FUNCTION fail_first_recovery_resolution() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.fingerprint = 'fail-on-resolve' AND NEW.status = 'resolved' THEN
+          RAISE EXCEPTION 'injected recovery action write failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER fail_first_recovery_resolution
+      BEFORE UPDATE ON issue_recovery_actions
+      FOR EACH ROW EXECUTE FUNCTION fail_first_recovery_resolution()
+    `);
+
+    const result = await makeSweep().reconcileActiveRecoveryActions();
+    expect(result).toMatchObject({ skipped: 1, resolved: 1, issueIds: [secondIssueId] });
+    const actions = await db.select().from(issueRecoveryActions);
+    expect(actions.find((row) => row.id === firstActionId)?.status).toBe("escalated");
+    expect(actions.find((row) => row.id === secondActionId)?.status).toBe("resolved");
+  });
+
+  it("resolves an action even when every healthy child would create a blocker cycle", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "codex_local");
+    const sourceId = await seedCard(companyId, agentId, { status: "blocked", issueNumber: 1 });
+    const childId = await seedCard(companyId, agentId, { issueNumber: 2 });
+    await db.update(issues).set({ parentId: sourceId }).where(eq(issues.id, childId));
+    await db.insert(issueRelations).values({
+      companyId, issueId: sourceId, relatedIssueId: childId, type: "blocks",
+    });
+    await seedQueuedWakeup(companyId, agentId, childId);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId, companyId, sourceIssueId: sourceId, kind: "stranded_assigned_issue",
+      status: "escalated", ownerType: "board", cause: "stranded_assigned_issue",
+      fingerprint: `only-cycle:${actionId}`, evidence: {}, nextAction: "Restore source",
+      wakePolicy: { type: "board_escalation" },
+    });
+
+    const result = await makeSweep().reconcileActiveRecoveryActions();
+    expect(result).toMatchObject({ resolved: 1, skipped: 0 });
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+    expect(action.resolutionNote).toBe("durable_path_restored:healthy_child;skipped_cyclic_child_blockers");
+    const blockers = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, sourceId));
+    expect(blockers).toHaveLength(0);
+  });
+
+  it("resolves healthy children without creating a blocker cycle and continues to the next action", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "codex_local");
+    const sourceId = await seedCard(companyId, agentId, { status: "blocked", issueNumber: 1 });
+    const cyclicChildId = await seedCard(companyId, agentId, { issueNumber: 2 });
+    const indirectChildId = await seedCard(companyId, agentId, { issueNumber: 3 });
+    const intermediateId = await seedCard(companyId, agentId, { issueNumber: 4 });
+    const safeChildId = await seedCard(companyId, agentId, { issueNumber: 5 });
+    const otherSourceId = await seedCard(companyId, agentId, { status: "done", issueNumber: 6 });
+    await db.update(issues).set({ parentId: sourceId }).where(eq(issues.id, cyclicChildId));
+    await db.update(issues).set({ parentId: sourceId }).where(eq(issues.id, indirectChildId));
+    await db.update(issues).set({ parentId: sourceId }).where(eq(issues.id, safeChildId));
+    await db.insert(issueRelations).values([
+      { companyId, issueId: sourceId, relatedIssueId: cyclicChildId, type: "blocks" },
+      { companyId, issueId: sourceId, relatedIssueId: intermediateId, type: "blocks" },
+      { companyId, issueId: intermediateId, relatedIssueId: indirectChildId, type: "blocks" },
+    ]);
+    for (const childId of [cyclicChildId, indirectChildId, safeChildId]) {
+      await seedQueuedWakeup(companyId, agentId, childId);
+    }
+    const cyclicActionId = randomUUID();
+    const otherActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values([
+      {
+        id: cyclicActionId, companyId, sourceIssueId: sourceId, kind: "stranded_assigned_issue",
+        status: "escalated", ownerType: "board", cause: "stranded_assigned_issue",
+        fingerprint: `cycle:${cyclicActionId}`, evidence: {}, nextAction: "Restore source",
+        wakePolicy: { type: "board_escalation" },
+      },
+      {
+        id: otherActionId, companyId, sourceIssueId: otherSourceId, kind: "stranded_assigned_issue",
+        status: "escalated", ownerType: "board", cause: "stranded_assigned_issue",
+        fingerprint: `other:${otherActionId}`, evidence: {}, nextAction: "Restore source",
+        wakePolicy: { type: "board_escalation" },
+      },
+    ]);
+
+    const result = await makeSweep().reconcileActiveRecoveryActions();
+    expect(result).toMatchObject({ resolved: 2, skipped: 0 });
+    const [sourceAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, cyclicActionId));
+    expect(sourceAction.status).toBe("resolved");
+    expect(sourceAction.resolutionNote).toContain("skipped_cyclic_child_blockers");
+    const blockers = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, sourceId));
+    expect(blockers.map((row) => row.issueId)).toEqual([safeChildId]);
+    const [otherAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, otherActionId));
+    expect(otherAction.status).toBe("resolved");
   });
 
   it("survives two mint->resolve sweep pairs as one stable action (flap regression)", async () => {

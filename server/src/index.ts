@@ -2652,28 +2652,12 @@ async function startServerWithDatabaseTeardown(
   };
   } catch (error) {
     if (startupListenerBound) {
-      await new Promise<void>((resolveClose) => {
-        try {
-          server.close((closeError?: Error) => {
-            if (
-              closeError &&
-              (closeError as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
-            ) {
-              logger.error(
-                { err: closeError },
-                "failed to close HTTP listener after startup failure",
-              );
-            }
-            resolveClose();
-          });
-        } catch (closeError) {
-          logger.error(
-            { err: closeError },
-            "failed to close HTTP listener after startup failure",
-          );
-          resolveClose();
-        }
-      });
+      // The listener is already serving reconnecting runners. A rejected
+      // startup with a closed listener leaves a live but unreachable process
+      // when an embedding caller handles the rejection; force a supervisor
+      // restart instead of returning to that caller with a half-started server.
+      logger.error({ err: error }, "startup failed after HTTP listener bound; exiting for restart");
+      process.exit(1);
     }
     throw error;
   }
