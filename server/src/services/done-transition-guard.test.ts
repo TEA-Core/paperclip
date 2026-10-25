@@ -291,6 +291,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     ...actual,
     resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
     fetchOpenPullRequests: mockFetchOpenPullRequests,
+    resolveCardDeliveryBranchOwnership: vi.fn(actual.resolveCardDeliveryBranchOwnership),
   };
 });
 
@@ -301,6 +302,11 @@ vi.mock("node:child_process", () => ({
 
 import { ghFetch } from "./github-fetch.js";
 import { resolveGitHubToken } from "./github-credential.js";
+import { resolveCardDeliveryBranchOwnership } from "./merge-arming.js";
+
+const ownDeliveryBranch = (branch: string) => ({
+  branch, branchIsOwn: true, carrier: false, legitimate: true, ownerIssueId: null, refusalReason: null,
+});
 
 const ghFetchMock = vi.mocked(ghFetch);
 
@@ -3334,6 +3340,20 @@ describe("evaluateDoneTransitionGuard", () => {
       }
     });
 
+    it("refuses a done close over a cached draft on the card's own non-prefixed delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("fm/fleet-fix"));
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-own", owner: "TEA-Core", repo: "paperclip", number: 4162, nodeId: null,
+          headRefName: "fm/fleet-fix", title: "Add x", displayName: "TEA-Core/paperclip#4162",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("4162");
+    });
+
     // SUP-14429 (mechanism B): the decisionCarried carve-out must not waive an
     // open linked PR held by an undismissed external CHANGES_REQUESTED review.
     // The hydration pass now resolves the live GraphQL reviewDecision; only that
@@ -5481,6 +5501,14 @@ describe("evaluateDoneTierDeclaration", () => {
       ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: false }), { status: 200 }));
       const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-12345-work" });
       expect(result.allowed).toBe(true);
+    });
+
+    it("refuses a draft on the card's own non-prefixed delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("fm/fleet-fix"));
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, headRefName: "fm/fleet-fix", title: "Add x" });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
     });
 
     it("does not refuse a draft carrier owned by another card", async () => {

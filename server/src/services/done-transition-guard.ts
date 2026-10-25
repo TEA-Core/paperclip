@@ -687,15 +687,32 @@ async function loadTier1RepoFields(
   };
 }
 
-function isOwnDraftCandidate(identifier: string | null, pr: LinkedPullRequest): boolean {
-  if (!identifier) return true;
-  return isAnchoredCardPullRequest(
-    (pr.headRefName ?? "").toLowerCase(),
-    (pr.title ?? "").toLowerCase(),
-    identifier.toLowerCase(),
-    null,
-    false,
-  );
+async function loadOwnDraftPredicate(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  prs: LinkedPullRequest[],
+): Promise<(pr: LinkedPullRequest) => boolean> {
+  const identifier = issue.identifier?.toLowerCase() ?? null;
+  const cachedDrafts = prs.some((pr) => pr.draft && !pr.id.startsWith("live:"));
+  if (!identifier || !cachedDrafts) return () => true;
+  let deliveryBranch: string | null = null;
+  let branchIsOwn = false;
+  try {
+    const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+    if (ownership.legitimate && ownership.branch !== null) deliveryBranch = ownership.branch.toLowerCase();
+    branchIsOwn = ownership.branchIsOwn;
+  } catch {
+    // Ownership unresolved: fall back to the identifier-anchored head ref / title match.
+  }
+  return (pr) =>
+    pr.id.startsWith("live:") ||
+    isAnchoredCardPullRequest(
+      (pr.headRefName ?? "").toLowerCase(),
+      (pr.title ?? "").toLowerCase(),
+      identifier,
+      deliveryBranch,
+      branchIsOwn,
+    );
 }
 
 async function proveLandingDelegated(
@@ -732,7 +749,7 @@ async function proveLandingDelegated(
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     if (tokenResult.token !== null) {
       const live = await hydrateLinkedPrState(pr, tokenResult.token);
-      if (live !== pr && live.cachedState === "open" && live.draft && isOwnDraftCandidate(issue.identifier, pr)) {
+      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [pr]))(pr)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
@@ -2321,11 +2338,12 @@ async function evaluateDoneTransitionGuardCore(
       prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
     });
   }
+  const isOwnDraft = await loadOwnDraftPredicate(db, issue, resolvedPrs);
   const openPrs = resolvedPrs.filter(
     (p) =>
       p.cachedState === "open" &&
       p.lastErrorCode !== "github_auth_required" &&
-      (!p.draft || isOwnDraftCandidate(issue.identifier, p)),
+      (!p.draft || isOwnDraft(p)),
   );
   const unhydratedCount = resolvedPrs.filter((p) => p.cachedState === null).length;
   if (unhydratedCount > 0) {
