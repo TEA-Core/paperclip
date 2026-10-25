@@ -651,6 +651,21 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     }).where(eq(issues.id, issueId));
   }
 
+  // The publisher's record that it confirmed exactly this release status (approvalStatus.releaseConfirmation).
+  async function confirmRelease(issueId: string, statusId = "7001", headSha = NEW_HEAD, number = 42) {
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    const state = row!.executionState as Record<string, unknown>;
+    await db.update(issues).set({
+      executionState: {
+        ...state,
+        approvalStatus: {
+          ...(state.approvalStatus as Record<string, unknown>),
+          releaseConfirmation: { owner: "TEA-Core", repo: "paperclip", number, headSha, statusId },
+        },
+      },
+    }).where(eq(issues.id, issueId));
+  }
+
   /**
    * SUP-14715 D-B: give the card a resolvable delivery identity (its execution
    * workspace's branch + repo) so the ADR-091 D1 delivery-identity gate that a
@@ -3251,6 +3266,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     });
 
     const RELEASE_STATUS = {
+      id: 7001,
       context: PAPERCLIP_APPROVED,
       state: "success",
       description: `released by user:u1 for ${NEW_HEAD}: stamp cannot be published`,
@@ -3275,7 +3291,29 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(graphqlCalls()).toHaveLength(0);
     });
 
-    it("SUP-20772: a board-release success on a certified card at its certified head still re-arms, as before", async () => {
+    it("SUP-20772: a board-release success on a certified card at its certified head, confirmed by the publisher, re-arms bound to that head", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(1);
+      const mutations = graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query));
+      expect(mutations).toHaveLength(1);
+      expect(mutations[0]).toContain(`expectedHeadOid: "${NEW_HEAD}"`);
+    });
+
+    it("SUP-20772: a board-release success whose confirmation was never recorded does not re-arm", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);
       await insertMention(issueId);
@@ -3289,8 +3327,65 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
-      expect(summary.skipped["already-success"]).toBe(1);
-      expect(summary.rearmed).toBe(1);
+      expect(summary.rearmed).toBe(0);
+      expect(graphqlCalls()).toHaveLength(0);
+    });
+
+    it("SUP-20772: a newer release status than the confirmed one (a duplicate whose answer was lost) is not consumed", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId, "7001");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ ...RELEASE_STATUS, id: 7002 }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.rearmed).toBe(0);
+      expect(graphqlCalls()).toHaveLength(0);
+    });
+
+    it("SUP-20772: the arm is bound to the verified head, so a head that moves to an uncertified one afterwards is refused by GitHub, not armed", async () => {
+      const MOVED_HEAD = "f".repeat(40);
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId);
+      let live = NEW_HEAD;
+      let statusReads = 0;
+      // GitHub's head check: a mutation naming a head other than the live one is refused.
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const respond = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as unknown as Response;
+        if (url === PR_URL) return respond({ ...OPEN_PR_BODY, head: { ...OPEN_PR_BODY.head, sha: live } });
+        if (url === COMBINED_STATUS_URL) {
+          // The head moves right after the arm boundary's own read of the stamp (the second one) and before the arm.
+          statusReads += 1;
+          const body = respond({ state: "success", statuses: [RELEASE_STATUS] });
+          if (statusReads === 2) live = MOVED_HEAD;
+          return body;
+        }
+        if (url === GRAPHQL_URL) {
+          const query = String(JSON.parse(String(init?.body)).query);
+          const expected = /expectedHeadOid: "([0-9a-f]+)"/.exec(query)?.[1];
+          if (expected !== undefined && expected !== live) return respond({ errors: [{ message: "Head branch was modified" }] });
+          return respond(GRAPHQL_ARM_OK_BODY);
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.rearmDetails.join("\n")).not.toContain("armed: Auto-merge enabled");
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect((approvalStatus.armOutcome as { kind?: string } | undefined)?.kind).toBe("failed");
+      expect(graphqlCalls().every((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query).includes(`expectedHeadOid: "${NEW_HEAD}"`))).toBe(true);
     });
 
     it("an already-success head with a recorded armed armOutcome is not re-armed (no arm actuator I/O)", async () => {

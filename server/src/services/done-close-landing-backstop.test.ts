@@ -1256,54 +1256,70 @@ describe("createDoneCloseLandingBackstopService", () => {
     });
 
     // SUP-20772: a board release (paperclip/approved with a "released by" description) is a human
-    // decision, not a review, so it may re-enqueue a card only when the card is certified at that head.
+    // decision, not a review, so it may re-enqueue a card only when the card is certified at that head AND
+    // the publisher confirmed that very status (executionState.approvalStatus.releaseConfirmation).
+    const certifiedAt = (headSha: string, over: Record<string, unknown> = {}) => ({
+      owner: "paperclipai", repo: "paperclip", number: 514, headSha, decisionId: "decision-1", ...over,
+    });
+    const confirmedAt = (headSha: string, over: Record<string, unknown> = {}) => ({
+      owner: "paperclipai", repo: "paperclip", number: 514, headSha, statusId: "7001", ...over,
+    });
     it.each([
-      ["an uncertified card ignores a board-release status", { approvalStatus: { approvedHeadSha: LIVE_SHA } }, true],
+      ["an uncertified card ignores a board-release status", { approvalStatus: { approvedHeadSha: LIVE_SHA } }, null],
       [
-        "a card certified at the live head still counts a board-release status",
+        "a card certified at the live head with a confirmed release counts that status",
         {
           lastDecisionId: "decision-1",
-          approvalStatus: {
-            approvedHeadSha: LIVE_SHA,
-            finalDelivery: { owner: "paperclipai", repo: "paperclip", number: 514, headSha: LIVE_SHA, decisionId: "decision-1" },
-          },
+          approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: certifiedAt(LIVE_SHA), releaseConfirmation: confirmedAt(LIVE_SHA) },
         },
-        false,
+        "7001",
+      ],
+      [
+        "a card certified at the live head whose release was never confirmed ignores a board-release status",
+        { lastDecisionId: "decision-1", approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: certifiedAt(LIVE_SHA) } },
+        null,
+      ],
+      [
+        "a confirmation recorded for another head is not a confirmation of this one",
+        {
+          lastDecisionId: "decision-1",
+          approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: certifiedAt(LIVE_SHA), releaseConfirmation: confirmedAt("e".repeat(40)) },
+        },
+        null,
+      ],
+      [
+        "a confirmation recorded for another PR is not a confirmation of this one",
+        {
+          lastDecisionId: "decision-1",
+          approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: certifiedAt(LIVE_SHA), releaseConfirmation: confirmedAt(LIVE_SHA, { number: 999 }) },
+        },
+        null,
       ],
       [
         "a card certified for another PR at the same head ignores a board-release status",
         {
           lastDecisionId: "decision-1",
-          approvalStatus: {
-            approvedHeadSha: LIVE_SHA,
-            finalDelivery: { owner: "paperclipai", repo: "paperclip", number: 999, headSha: LIVE_SHA, decisionId: "decision-1" },
-          },
+          approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: certifiedAt(LIVE_SHA, { number: 999 }), releaseConfirmation: confirmedAt(LIVE_SHA) },
         },
-        true,
+        null,
       ],
       [
         "a card certified for another repository at the same head ignores a board-release status",
         {
           lastDecisionId: "decision-1",
-          approvalStatus: {
-            approvedHeadSha: LIVE_SHA,
-            finalDelivery: { owner: "paperclipai", repo: "other-repo", number: 514, headSha: LIVE_SHA, decisionId: "decision-1" },
-          },
+          approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: certifiedAt(LIVE_SHA, { repo: "other-repo" }), releaseConfirmation: confirmedAt(LIVE_SHA) },
         },
-        true,
+        null,
       ],
       [
         "a card certified at another head ignores a board-release status",
         {
           lastDecisionId: "decision-1",
-          approvalStatus: {
-            approvedHeadSha: LIVE_SHA,
-            finalDelivery: { owner: "paperclipai", repo: "paperclip", number: 514, headSha: "e".repeat(40), decisionId: "decision-1" },
-          },
+          approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: certifiedAt("e".repeat(40)), releaseConfirmation: confirmedAt(LIVE_SHA) },
         },
-        true,
+        null,
       ],
-    ])("%s when it re-reads the head's approval", async (_name, issueExecutionState, ignoreRelease) => {
+    ])("%s when it re-reads the head's approval", async (_name, issueExecutionState, confirmedReleaseStatusId) => {
       const { service } = makeService(
         {
           candidates: [candidateRow()],
@@ -1324,7 +1340,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       await service.sweep();
 
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), expect.anything(), "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease },
+        expect.anything(), expect.anything(), "paperclipai", "paperclip", LIVE_SHA, { strict: true, confirmedReleaseStatusId },
       );
     });
 
@@ -1758,7 +1774,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       }));
       // The status reader WAS consulted because the stamp did not cover the live head.
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease: true },
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, confirmedReleaseStatusId: null },
       );
     });
 
@@ -1975,7 +1991,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
       // The status reader IS consulted (the anchor is not trusted as a stamp).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease: true },
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, confirmedReleaseStatusId: null },
       );
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
     });
@@ -2099,7 +2115,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       // The gate consulted the live head's real stamp (the moved anchor alone does
       // not authorize; the new head's success status does).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
-        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, ignoreRelease: true },
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA, { strict: true, confirmedReleaseStatusId: null },
       );
       // No refusal row / no escalation: this head is approvable, so it quiesces by
       // landing, not by a board action.

@@ -6,6 +6,7 @@ import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
+  authUsers,
   companies,
   companyMemberships,
   createDb,
@@ -143,6 +144,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companyMemberships);
+    await db.delete(authUsers);
     await db.delete(companies);
   });
 
@@ -414,7 +416,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       // refuses any completed stage that has none, so a multi-stage terminal
       // fixture has to carry a real verdict for every stage it claims completed.
       const completedForDecisions = (executionState.completedStageIds as string[]) ?? [STAGE_ID];
-      await db.insert(issueExecutionDecisions).values(
+      const decisionRows = await db.insert(issueExecutionDecisions).values(
         completedForDecisions.map((stageId) => ({
           companyId,
           issueId,
@@ -427,7 +429,13 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
           createdAt: now,
           updatedAt: now,
         })),
-      );
+      ).returning({ id: issueExecutionDecisions.id });
+      if (opts.certifiedDelivery && opts.pr && decisionRows[0]) {
+        // The certificate names a real decision of this card, as a certified card's does.
+        const state = executionState as { approvalStatus: { finalDelivery: Record<string, unknown> } };
+        state.approvalStatus.finalDelivery.decisionId = decisionRows[0].id;
+        await db.update(issues).set({ executionState: { ...executionState, lastDecisionId: decisionRows[0].id } }).where(eq(issues.id, issueId));
+      }
     }
 
     if (opts.pr) {
@@ -1780,6 +1788,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       postStatus?: (call: number) => { ok: boolean; status: number };
       /** Every PR GET after the first status POST fails with a 502. */
       prReadFailsAfterWrite?: boolean;
+      /** Body of an accepted status POST (default `{ id: 1 }`, as GitHub answers). */
+      postBody?: unknown;
     } = {}) {
       let posts = 0;
       mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
@@ -1793,7 +1803,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         if (url.includes("/statuses/") && init?.method === "POST") {
           posts += 1;
           const response = opts.postStatus?.(posts) ?? { ok: true, status: 201 };
-          return createMockResponse({ id: 1 }, response.ok, response.status);
+          return createMockResponse(opts.postBody ?? { id: 1 }, response.ok, response.status);
         }
         if (url.includes("/statuses/")) {
           await opts.onStatusRead?.();
@@ -2206,13 +2216,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     async function certifyDelivery(issueId: string, number: number) {
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
       const state = issue!.executionState as Record<string, unknown>;
+      // The certificate names a real decision of the card, as a certified card's does.
+      const [decision] = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
       await db.update(issues).set({
         executionState: {
           ...state,
-          lastDecisionId: "decision-certified",
+          lastDecisionId: decision!.id,
           approvalStatus: {
             ...((state.approvalStatus as Record<string, unknown> | undefined) ?? {}),
-            finalDelivery: { decisionId: "decision-certified", owner: OWNER, repo: REPO, number, headSha: HEAD_SHA },
+            finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number, headSha: HEAD_SHA },
           },
         },
       }).where(eq(issues.id, issueId));
@@ -2796,7 +2808,12 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     // ---- Round 5: decision provenance ----
 
     const stageDecisionOf = async (issueId: string) => (await stageDecisionRows(issueId))[0]!;
-    async function addMember(companyId: string, userId: string, status = "active") {
+    async function addUser(userId: string) {
+      const now = new Date();
+      await db.insert(authUsers).values({ id: userId, name: userId, email: `${userId}@example.test`, emailVerified: true, createdAt: now, updatedAt: now }).onConflictDoNothing();
+    }
+    async function addMember(companyId: string, userId: string, status = "active", opts: { withUser?: boolean } = {}) {
+      if (opts.withUser !== false) await addUser(userId);
       await db.insert(companyMemberships).values({
         companyId, principalType: "user", principalId: userId, status, membershipRole: "member", updatedAt: new Date(),
       });
@@ -2885,6 +2902,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       publishHeadBoundRelease(db, companyId, { owner: OWNER, repo: REPO, number: PR_NUMBER }, {
         headSha: HEAD_SHA, description: "released by user:u for x: reason", expectedBranch: DELIVERY_BRANCH,
         revalidate: async () => ({ ok: true, target: { owner: OWNER, repo: REPO, number: PR_NUMBER, branch: DELIVERY_BRANCH } }),
+        confirmedStatusId: async () => null,
+        recordConfirmation: async () => undefined,
         ...extra,
       } as never);
 
@@ -2955,7 +2974,13 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(outcome.kind).toBe("failed");
       expect(outcome.message).toContain("status_write");
       expect(outcome.message).toContain("may have been written");
-      expect(statusWrites()).toHaveLength(1);
+      // The success is never retried, but because it may have been accepted it is voided (here the void
+      // does not answer either, which the outcome says).
+      const writes = statusWrites();
+      expect(writes).toHaveLength(2);
+      expect(JSON.parse(String((writes[0]![1] as RequestInit).body)).state).toBe("success");
+      expect(JSON.parse(String((writes[1]![1] as RequestInit).body)).state).toBe("failure");
+      expect(outcome.message).toContain("could NOT be voided");
     }, 20_000);
 
     it("answers stale within the deadline when the superseding failure status never answers", async () => {
@@ -3005,6 +3030,275 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(outcome.message).toContain("post_write_pr_read");
       expect(outcome.message).toContain("could NOT be voided");
       expect(statusWrites()).toHaveLength(2);
+    }, 20_000);
+
+    // ---- Round 6: decider provenance (active user, no id tie-break, certificate not exempt) ----
+
+    it("refuses an approval by a user with an active membership but no user row", async () => {
+      const { issueId, companyId } = await seedReleasable("ladder");
+      await addMember(companyId, "ghost-member", "active", { withUser: false });
+      await decideBy(issueId, { actorUserId: "ghost-member" });
+      await expectLadderRefused(issueId);
+    });
+
+    it.each([
+      ["the ineligible approval has the larger id", "ffffffff-ffff-4fff-8fff-ffffffffffff", "00000000-0000-4000-8000-000000000001"],
+      ["the ineligible approval has the smaller id", "00000000-0000-4000-8000-000000000001", "ffffffff-ffff-4fff-8fff-ffffffffffff"],
+    ])("refuses two approvals of a stage at the same instant when one decider is ineligible, whatever the ids (%s)", async (_name, ineligibleId, eligibleId) => {
+      const { issueId, companyId, reviewerAgentId } = await seedReleasable("ladder");
+      const seeded = await stageDecisionOf(issueId);
+      await db.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+      const at = new Date(seeded.createdAt);
+      const terminatedAgent = randomUUID();
+      await db.insert(agents).values({
+        id: terminatedAgent, companyId, name: "Gone", role: "engineer", status: "terminated", adapterType: "codex_local",
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      const base = { companyId, issueId, stageId: STAGE_ID, stageType: "approval", actorUserId: null, outcome: "approved", body: "Approved", createdAt: at, updatedAt: at };
+      await db.insert(issueExecutionDecisions).values([
+        { ...base, id: ineligibleId, actorAgentId: terminatedAgent },
+        { ...base, id: eligibleId, actorAgentId: reviewerAgentId },
+      ]);
+      await expectLadderRefused(issueId);
+    });
+
+    it("releases when every approval of a stage at the same instant is eligible", async () => {
+      const { issueId, companyId, reviewerAgentId } = await seedReleasable("ladder");
+      const seeded = await stageDecisionOf(issueId);
+      await db.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+      const at = new Date(seeded.createdAt);
+      await addMember(companyId, "second-reviewer");
+      const base = { companyId, issueId, stageId: STAGE_ID, stageType: "approval", outcome: "approved", body: "Approved", createdAt: at, updatedAt: at };
+      await db.insert(issueExecutionDecisions).values([
+        { ...base, actorAgentId: reviewerAgentId, actorUserId: null },
+        { ...base, actorAgentId: null, actorUserId: "second-reviewer" },
+      ]);
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("released");
+    });
+
+    describe("a certified delivery is not exempt from who decided", () => {
+      const certifiedRefused = async (issueId: string) => {
+        installReleaseTransport();
+        const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+        expect(res.status).toBe(409);
+        expect(JSON.stringify(res.body)).toMatch(/certified delivery's decision/);
+        expect(mockGhFetch).not.toHaveBeenCalled();
+        expect(await requestRows()).toEqual([]);
+      };
+
+      it("releases when the certifying decision was an eligible approval", async () => {
+        const { issueId } = await seedReleasable();
+        installReleaseTransport();
+        const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+        expect(res.status).toBe(200);
+        expect(res.body.outcome).toBe("released");
+      });
+
+      it("refuses when the decider has no user row, has been removed, or belongs to another company", async () => {
+        const { issueId, companyId } = await seedReleasable();
+        await addMember(companyId, "ghost-member", "active", { withUser: false });
+        await decideBy(issueId, { actorUserId: "ghost-member" });
+        await certifiedRefused(issueId);
+        await addMember(companyId, "former-reviewer", "removed");
+        await decideBy(issueId, { actorUserId: "former-reviewer" });
+        await certifiedRefused(issueId);
+        const otherCompanyId = randomUUID();
+        await db.insert(companies).values({ id: otherCompanyId, name: "Other Co", issuePrefix: "OTH", requireBoardApprovalForNewAgents: false });
+        await addMember(otherCompanyId, "foreign-reviewer");
+        await decideBy(issueId, { actorUserId: "foreign-reviewer" });
+        await certifiedRefused(issueId);
+      });
+
+      it("refuses when the decider is the card's creator, a terminated agent, or no one", async () => {
+        const { issueId, companyId } = await seedReleasable();
+        await decideBy(issueId, { actorUserId: USER_ID });
+        await certifiedRefused(issueId);
+        const terminatedAgent = randomUUID();
+        await db.insert(agents).values({
+          id: terminatedAgent, companyId, name: "Gone", role: "engineer", status: "terminated", adapterType: "codex_local",
+          adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        });
+        await decideBy(issueId, { actorAgentId: terminatedAgent });
+        await certifiedRefused(issueId);
+        await decideBy(issueId, {});
+        await certifiedRefused(issueId);
+      });
+
+      it("refuses when the decision the certificate names does not exist or did not approve", async () => {
+        const { issueId } = await seedReleasable();
+        await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId));
+        await certifiedRefused(issueId);
+      });
+    });
+
+    // ---- Round 6: only a confirmed release is consumable ----
+
+    const releaseConfirmationOf = async (issueId: string) => {
+      const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+      return ((row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown> | undefined)?.releaseConfirmation;
+    };
+
+    it("records the confirmed status id, PR and head on the card once the release is confirmed", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postBody: { id: 4242 } });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("released");
+      expect(await releaseConfirmationOf(issueId)).toMatchObject({ owner: OWNER, repo: REPO, number: PR_NUMBER, headSha: HEAD_SHA, statusId: "4242" });
+    });
+
+    it("records no confirmation, and voids the status, when the head cannot be re-read after the write", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ prReadFailsAfterWrite: true });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("failed");
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+      expect(JSON.parse(statusWrites()[1]![1].body as string)).toMatchObject({ state: "failure" });
+    });
+
+    it("records no confirmation when the void itself fails, so the success is not consumable", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ prReadFailsAfterWrite: true, postStatus: (call) => (call === 1 ? { ok: true, status: 201 } : { ok: false, status: 403 }) });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("failed");
+      expect(res.body.message).toContain("could NOT be voided");
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+    });
+
+    it("voids a status whose id GitHub did not return, and records no confirmation", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postBody: {} });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("failed");
+      expect(res.body.message).toContain("unconfirmed");
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+      expect(JSON.parse(statusWrites()[1]![1].body as string)).toMatchObject({ state: "failure" });
+    });
+
+    it("does not call an existing release status published, when this card never confirmed it: it writes a confirmed one", async () => {
+      const { issueId } = await seedReleasable();
+      const unconfirmed = { ...approvedRow("success", CONTROL_PLANE_CREATOR), id: 99, description: `released by user:u for ${HEAD_SHA}: earlier` };
+      installReleaseTransport({ statuses: [unconfirmed], postBody: { id: 100 } });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("released");
+      expect(statusWrites()).toHaveLength(1);
+      expect(await releaseConfirmationOf(issueId)).toMatchObject({ statusId: "100" });
+    });
+
+    it("answers already_approved, with no second write, for the release status this card confirmed", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postBody: { id: 100 } });
+      await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      mockGhFetch.mockReset();
+      const confirmed = { ...approvedRow("success", CONTROL_PLANE_CREATOR), id: 100, description: `released by user:u for ${HEAD_SHA}: earlier` };
+      installReleaseTransport({ statuses: [confirmed] });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("already_approved");
+      expect(statusWrites()).toEqual([]);
+    });
+
+    // ---- Round 6: one end-to-end deadline, with real cancellation ----
+
+    const deadlineApp = (mergeReleaseDeadlines: Record<string, number>) => {
+      const timed = express();
+      timed.use(express.json());
+      timed.use((req, _res, next) => { req.actor = currentActor; next(); });
+      timed.use("/api", issueRoutes(db, {} as any, { mergeReleaseDeadlines }));
+      timed.use(errorHandler);
+      return timed;
+    };
+
+    it("answers within the deadline when the credential lookup never answers, with a failed outcome row and no GitHub call", async () => {
+      const { issueId } = await seedReleasable();
+      mockResolveControlPlaneToken.mockImplementation(() => new Promise(() => {}));
+      const started = Date.now();
+
+      const res = await request(deadlineApp({ totalMs: 300, compensationMs: 200, fetchMs: 100 }))
+        .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(Date.now() - started).toBeLessThan(3000);
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("failed");
+      expect(res.body.message).toContain("deadline");
+      expect(res.body.auditRecorded).toBe(true);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect((await outcomeRows())).toHaveLength(1);
+    }, 20_000);
+
+    it("cancels the GitHub request in flight when the deadline passes", async () => {
+      const { issueId } = await seedReleasable();
+      const signals: AbortSignal[] = [];
+      mockGhFetch.mockImplementation((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+        signals.push(init!.signal!);
+        init!.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }));
+
+      const res = await request(deadlineApp({ totalMs: 300, compensationMs: 200, fetchMs: 5000 }))
+        .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("failed");
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.aborted).toBe(true);
+    }, 20_000);
+
+    it("does not retry a read after the release has given up on it", async () => {
+      const { companyId } = await seedReleasable();
+      let prReads = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.endsWith(`/pulls/${PR_NUMBER}`)) { prReads += 1; return createMockResponse({ message: "bad gateway" }, false, 502); }
+        throw new Error(`Unexpected release request: ${url}`);
+      });
+
+      const outcome = await directRelease(companyId, { deadlines: { fetchMs: 150 } });
+      await new Promise((resolve) => setTimeout(resolve, 1600));
+
+      expect(outcome.kind).toBe("failed");
+      expect(prReads).toBe(1);
+    }, 20_000);
+
+    it("answers within the deadline, and publishes nothing, when the intent row cannot be written in time", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      let unlock!: () => void;
+      const unlocked = new Promise<void>((resolve) => { unlock = resolve; });
+      let locked!: () => void;
+      const isLocked = new Promise<void>((resolve) => { locked = resolve; });
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(sql`lock table activity_log in access exclusive mode`);
+        locked();
+        await unlocked;
+      });
+      await isLocked;
+      try {
+        const started = Date.now();
+        const res = await request(deadlineApp({ totalMs: 400, compensationMs: 200, fetchMs: 100 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+        expect(Date.now() - started).toBeLessThan(3000);
+        expect(res.status).toBe(409);
+        expect(res.body.message).toContain("nothing was published");
+        expect(res.body.auditRecorded).toBe(false);
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      } finally {
+        unlock();
+        await holder;
+      }
     }, 20_000);
 
     it("rejects a malformed body with 400 before any GitHub I/O", async () => {
@@ -3057,6 +3351,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(companyMemberships);
+    await db.delete(authUsers);
     await db.delete(companies);
   });
 

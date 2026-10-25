@@ -23,6 +23,7 @@ import {
   narrowToDelivered,
   postPullRequestComment,
   publishApprovalStatus,
+  consumableReleaseStatusId,
   isHeadBoundReleaseDescription,
   readCertifiedFinalDelivery,
   resolveCardPullRequest,
@@ -2585,16 +2586,18 @@ async function reserveRearmSlot(
 }
 
 /**
- * A board release (SUP-20772) is a human decision on one head, not a review. When the card has no
- * certified final delivery, it must not stand in for the approval that lets the reconciler re-arm the
- * merge; a certified card keeps counting it, as before.
+ * A board release (SUP-20772) is a human decision on one head, not a review. It stands in for the
+ * approval that lets the reconciler re-arm the merge only when it is the very status the publisher
+ * confirmed on a card whose review certified this PR and head (`confirmedReleaseStatusId`); a card
+ * without that, or a release whose confirmation is unknown or voided, never counts.
  */
-function hasApprovedSuccess(statuses: Array<Record<string, unknown>>, releaseCounts: boolean): boolean {
+function hasApprovedSuccess(statuses: Array<Record<string, unknown>>, confirmedReleaseStatusId: string | null): boolean {
   return statuses.some(
     (s) =>
       s.context === PAPERCLIP_APPROVED_CONTEXT &&
       s.state === "success" &&
-      (releaseCounts || !isHeadBoundReleaseDescription(s.description)),
+      (!isHeadBoundReleaseDescription(s.description) ||
+        (confirmedReleaseStatusId !== null && s.id !== undefined && s.id !== null && String(s.id) === confirmedReleaseStatusId)),
   );
 }
 
@@ -2619,7 +2622,6 @@ async function verifyLiveHeadStillStamped(
   headSha: string,
   pr: LinkedPullRequest,
   requireStamped: boolean,
-  releaseCounts: boolean,
 ): Promise<boolean> {
   const prRead = await ghReadJson(db, row.companyId, pr.owner, pr.repo, `/pulls/${pr.number}`);
   if (!prRead.ok) return false;
@@ -2640,7 +2642,15 @@ async function verifyLiveHeadStillStamped(
   const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
     ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
-  return hasApprovedSuccess(statuses, releaseCounts);
+  // The certificate and the confirmed release are read last, after the head and the status: the answer
+  // is the card as it is at the arm boundary, not as it was when the sweep started.
+  const [fresh] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, row.id));
+  return hasApprovedSuccess(
+    statuses,
+    consumableReleaseStatusId(fresh?.executionState as Record<string, unknown> | null | undefined, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, headSha,
+    }),
+  );
 }
 
 /**
@@ -2690,7 +2700,7 @@ async function attemptRearmOnHealedStamp(
   row: CandidateRow,
   headSha: string,
   certifiedPr: LinkedPullRequest | null,
-  opts: { requireStamped?: boolean; releaseStampCounts?: boolean } = {},
+  opts: { requireStamped?: boolean } = {},
 ): Promise<string | undefined> {
   const liveRows = await db
     .select({ executionState: issues.executionState })
@@ -2745,7 +2755,7 @@ async function attemptRearmOnHealedStamp(
   if (!certifiedPr) {
     return undefined;
   }
-  if (!(await verifyLiveHeadStillStamped(db, row, headSha, certifiedPr, opts.requireStamped ?? true, opts.releaseStampCounts ?? false))) {
+  if (!(await verifyLiveHeadStillStamped(db, row, headSha, certifiedPr, opts.requireStamped ?? true))) {
     return undefined;
   }
 
@@ -2764,7 +2774,8 @@ async function attemptRearmOnHealedStamp(
 
   let outcome: ArmingOutcome;
   try {
-    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr);
+    // Bound to the head just verified: GitHub refuses to enable auto-merge on a PR that has moved on.
+    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha });
   } catch (err) {
     outcome = {
       kind: "failed",
@@ -2980,7 +2991,12 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
     ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
-  const alreadyStamped = hasApprovedSuccess(statuses, certified !== undefined);
+  const alreadyStamped = hasApprovedSuccess(
+    statuses,
+    consumableReleaseStatusId(row.executionState as Record<string, unknown> | null | undefined, {
+      owner: target.owner, repo: target.repo, number: target.number, headSha,
+    }),
+  );
   if (alreadyStamped && (!certified || headSha === certified.headSha)) {
     // SUP-17274: the stamp is on the live head, but the decision-time arm may
     // have never succeeded (it failed, the first publish was refused before the
@@ -2989,10 +3005,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     // already records an armed/queued armOutcome or the per-head cap is reached,
     // and re-validates the live head + stamp at the arm boundary (the stamp was
     // only confirmed at scan time, so a force-push can have since landed).
-    const rearm = await attemptRearmOnHealedStamp(db, row, headSha, target, {
-      requireStamped: true,
-      releaseStampCounts: certified !== undefined,
-    });
+    const rearm = await attemptRearmOnHealedStamp(db, row, headSha, target, { requireStamped: true });
     return {
       kind: "skipped",
       reason: "already-success",
@@ -3095,7 +3108,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // A status on a changed head of the certified PR cannot bypass Guard A.
   // Re-arm only after the same-substance comparison has accepted that head.
   if (alreadyStamped) {
-    const rearm = await attemptRearmOnHealedStamp(db, row, headSha, target, { requireStamped: true, releaseStampCounts: true });
+    const rearm = await attemptRearmOnHealedStamp(db, row, headSha, target, { requireStamped: true });
     return {
       kind: "skipped",
       reason: "already-success",

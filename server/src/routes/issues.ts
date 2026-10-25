@@ -212,6 +212,10 @@ import {
   resolveCardDeliveryBranchOwnership,
   resolveLinkedPullRequestsWithState,
   publishHeadBoundRelease,
+  DEFAULT_RELEASE_DEADLINES,
+  readConfirmedRelease,
+  recordReleaseConfirmation,
+  type ReleaseDeadlines,
   type HeadBoundReleaseOutcome,
   resolveReleaseDeliveryTarget,
   headBoundReleaseDescription,
@@ -223,7 +227,7 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
-import { evaluateApprovingLadder } from "../services/release-ladder.js";
+import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../services/release-ladder.js";
 import {
   evaluateStageIntegrity,
   latestDecisionPerStage,
@@ -4154,6 +4158,8 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     bulkIssueRateLimiter?: CompanySearchRateLimiter;
+    /** Test seam: deadlines for the board merge-release routes (defaults to DEFAULT_RELEASE_DEADLINES). */
+    mergeReleaseDeadlines?: Partial<ReleaseDeadlines>;
     pluginWorkerManager?: PluginWorkerManager;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
     recoveryActionEnqueueWakeup?: (
@@ -4877,7 +4883,12 @@ export function issueRoutes(
         // `errored` outcome so the miss is diagnosable from GET /api/issues/{id} alone.
         let armingOutcome: ArmingOutcome | { kind: "errored"; message: string };
         try {
-          armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr);
+          // Bound to the head the stamp was just published on, when the publisher named one: GitHub then
+          // refuses to enable auto-merge if the PR has moved on since.
+          armingOutcome = await armMergeOnApproval(
+            db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr,
+            /^[0-9a-f]{40}$/.test(statusOutcome.headSha ?? "") ? { expectedHeadOid: statusOutcome.headSha as string } : {},
+          );
         } catch (armingErr) {
           logger.warn({ err: armingErr, issueId: issue.id }, "armMergeOnApproval threw; recording errored outcome");
           armingOutcome = {
@@ -11550,17 +11561,36 @@ export function issueRoutes(
     // A completed APPROVING ladder: the approval path's integrity check plus, for every stage, a latest
     // decision that is an attributed approval by someone who did not author the work. It runs on the
     // connection it is given (the publication lock's own), so a revalidation never needs a second one.
-    const ladderIntegrity = async (conn: Db, issueId: string): Promise<string | null> => {
-      try {
+    const checkCard = (conn: Db, issueId: string, check: (row: CandidateRow) => Promise<string | null>) =>
+      (async () => {
         const [row] = await conn.select().from(issueRows).where(and(eq(issueRows.id, issueId), eq(issueRows.companyId, existing.companyId)));
         if (!row) return "card not found";
-        return await evaluateApprovingLadder(conn, { ...row, executionState: row.executionState ?? {} } as CandidateRow);
-      } catch (error) {
-        return `stage integrity could not be verified: ${error instanceof Error ? error.message : String(error)}`;
-      }
+        return await check({ ...row, executionState: row.executionState ?? {} } as CandidateRow);
+      })().catch((error) => `stage integrity could not be verified: ${error instanceof Error ? error.message : String(error)}`);
+    const ladderIntegrity = (conn: Db, issueId: string) => checkCard(conn, issueId, (row) => evaluateApprovingLadder(conn, row));
+    const certificateProvenance = (conn: Db, issueId: string, decisionId: string) =>
+      checkCard(conn, issueId, (row) => evaluateCertificateProvenance(conn, row, decisionId));
+    const resolveTarget = (conn: Db) =>
+      resolveReleaseDeliveryTarget(conn, existing.companyId, existing.id, { headSha, mode, ladderIntegrity, certificateProvenance });
+    // One clock for the whole request, from here: the card check, the audit rows and the publication all
+    // answer within it (the publication also cancels its GitHub requests on it), so no wait outside the
+    // publisher keeps the request open past the deadline.
+    const deadlines = { ...DEFAULT_RELEASE_DEADLINES, ...opts.mergeReleaseDeadlines };
+    const envelope = AbortSignal.timeout(deadlines.totalMs);
+    const expired = Symbol("expired");
+    // `work` that cannot be cancelled (a database wait) is abandoned when the clock runs out, not awaited.
+    const within = <T>(work: Promise<T>, signal: AbortSignal): Promise<T | typeof expired> => {
+      work.catch(() => undefined);
+      return Promise.race([
+        work,
+        new Promise<typeof expired>((resolve) => {
+          if (signal.aborted) resolve(expired);
+          else signal.addEventListener("abort", () => resolve(expired), { once: true });
+        }),
+      ]);
     };
-    const resolveTarget = (conn: Db) => resolveReleaseDeliveryTarget(conn, existing.companyId, existing.id, { headSha, mode, ladderIntegrity });
-    const resolved = await resolveTarget(db);
+    const resolved = await within(resolveTarget(db), envelope);
+    if (resolved === expired) throw conflict("Card cannot be released: the deadline passed before the card could be checked");
     if (!resolved.ok) throw conflict(`Card cannot be released: ${resolved.reason}`);
     const { target, basis } = resolved;
     const kinds = MERGE_RELEASE_AUDIT[mode];
@@ -11570,16 +11600,40 @@ export function issueRoutes(
     );
     // The intent is durable before the GitHub write: if this insert fails nothing is published, and if
     // the outcome insert below fails the intent row still names who asked to release which head.
-    const intent = await persistActivity(db, {
-      companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
-      action: kinds.requested, entityType: "issue", entityId: existing.id,
-      details: { headSha, [reasonKey]: reason, pr: target.displayName, branch: target.branch, basis, description },
-    });
+    const intent = await within(
+      persistActivity(db, {
+        companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
+        action: kinds.requested, entityType: "issue", entityId: existing.id,
+        details: { headSha, [reasonKey]: reason, pr: target.displayName, branch: target.branch, basis, description },
+      }),
+      envelope,
+    );
+    if (intent === expired) {
+      res.status(409).json({
+        outcome: "failed", headSha, auditRecorded: false,
+        message: "status:failed:deadline: the release request could not be recorded in time; nothing was published",
+      });
+      return;
+    }
     publishActivity(intent.publication);
+    // The status the card has confirmed for this head and PR, read on the lock's own connection.
+    const confirmedStatusId = async (conn: Db): Promise<string | null> => {
+      const [row] = await conn.select({ executionState: issueRows.executionState }).from(issueRows)
+        .where(and(eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId)));
+      const confirmed = readConfirmedRelease(row?.executionState as Record<string, unknown> | null | undefined);
+      return confirmed && confirmed.headSha === headSha && confirmed.number === target.number &&
+        confirmed.owner.toLowerCase() === target.owner.toLowerCase() && confirmed.repo.toLowerCase() === target.repo.toLowerCase()
+        ? confirmed.statusId : null;
+    };
+    const recordConfirmation = (conn: Db, statusId: string) =>
+      recordReleaseConfirmation(conn, existing.companyId, existing.id, {
+        owner: target.owner, repo: target.repo, number: target.number, headSha, statusId,
+      });
     let outcome: HeadBoundReleaseOutcome;
     try {
       outcome = await publishHeadBoundRelease(db, existing.companyId, target, {
         headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
+        deadlines: opts.mergeReleaseDeadlines, signal: envelope, confirmedStatusId, recordConfirmation,
       });
     } catch (error) {
       // A throwing prerequisite (secret lookup, token resolver, lock) must still leave a failed outcome
@@ -11592,15 +11646,20 @@ export function issueRoutes(
     }
     let auditRecorded = true;
     try {
-      const entry = await persistActivity(db, {
-        companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
-        action: outcome.kind === "released" ? kinds.released : kinds.outcome,
-        entityType: "issue", entityId: existing.id,
-        details: {
-          headSha, [reasonKey]: reason, pr: target.displayName, basis, description,
-          outcome: outcome.kind, message: outcome.message, intentId: intent.activity.id,
-        },
-      });
+      // The status is already out, so the outcome row gets only a short, separate wait.
+      const entry = await within(
+        persistActivity(db, {
+          companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
+          action: outcome.kind === "released" ? kinds.released : kinds.outcome,
+          entityType: "issue", entityId: existing.id,
+          details: {
+            headSha, [reasonKey]: reason, pr: target.displayName, basis, description,
+            outcome: outcome.kind, message: outcome.message, intentId: intent.activity.id,
+          },
+        }),
+        AbortSignal.timeout(deadlines.compensationMs),
+      );
+      if (entry === expired) throw new Error(`the outcome row was not written within ${deadlines.compensationMs}ms`);
       publishActivity(entry.publication);
     } catch (error) {
       // The status is already out and cannot be un-written, so this cannot fail the request; the caller is

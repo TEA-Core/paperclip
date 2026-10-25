@@ -470,6 +470,21 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     expect(comments[1]!.body).toContain("armed:");
   });
 
+  it("SUP-20772: the decision-time arm is bound to the head the stamp was published on", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF3B", { preCompleted: 1 });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    const head = "d".repeat(40);
+    mockResolveApprovalDecisionHead.mockResolvedValue({ kind: "resolved", headSha: head, displayName: "TEA-Core/paperclip#437" });
+    mockPublishApprovalStatus.mockResolvedValue({ kind: "armed", message: "status:published: written", headSha: head });
+    mockArmMergeOnApproval.mockResolvedValue({ kind: "armed", message: "armed: Auto-merge enabled for TEA-Core/paperclip#437" });
+
+    const res = await approveCurrentStage(identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(1);
+    expect(mockArmMergeOnApproval.mock.calls[0]![5]).toEqual({ expectedHeadOid: head });
+  });
+
   it("SUP-16088 route regression (final-stage done, fold base): the hook persists armOutcome kind=armed on the card", async () => {
     // The SUP-16050 shape driven end-to-end through the REAL route hook: a terminal
     // card on a fold base whose final review stage is approved resolves to `done`,
