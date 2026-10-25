@@ -5288,6 +5288,7 @@ export function issueRoutes(
       commentBody,
       runId,
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
+      { allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable" },
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -5303,18 +5304,22 @@ export function issueRoutes(
       // closing actor writes in the comment they are already writing, and D6 makes
       // a Tier-1 substitution always writable, so a missing declaration is a 422,
       // never a deadlock.
+      const tierDeclarationAlternatives =
+        `"Closed at Tier 2 (live): <probe evidence>"` +
+        ` or ${TIER1_FORM}` +
+        (override?.disposition === "decision-only-no-repository-deliverable"
+          ? ` or "Closed at Tier 0 (decision-only): <reason>"`
+          : "");
       const remedy = input.createDoor
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
           `${DONE_TIER_STRUCTURED_FORMS}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
-          `"Closed at Tier 2 (live): <probe evidence>"` +
-          ` or ${TIER1_FORM}` +
+          `${tierDeclarationAlternatives}` +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
           `${DONE_TIER_STRUCTURED_FORMS}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
-          `"Closed at Tier 2 (live): <probe evidence>"` +
-          ` or ${TIER1_FORM}` +
+          `${tierDeclarationAlternatives}` +
           ` — per SUP-12693.`;
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
