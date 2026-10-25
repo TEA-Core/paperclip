@@ -1788,6 +1788,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       postStatus?: (call: number) => { ok: boolean; status: number };
       /** Every PR GET after the first status POST fails with a 502. */
       prReadFailsAfterWrite?: boolean;
+      /** Replaces the PR as read after the first status POST. */
+      afterWrite?: { state?: string; merged?: boolean; sha?: string; ref?: string };
       /** Body of an accepted status POST (default `{ id: 1 }`, as GitHub answers). */
       postBody?: unknown;
     } = {}) {
@@ -1795,9 +1797,10 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
           if (opts.prReadFailsAfterWrite && posts > 0) return createMockResponse({ message: "bad gateway" }, false, 502);
+          const after = posts > 0 ? opts.afterWrite : undefined;
           return createMockResponse({
-            state: opts.state ?? "open", merged: opts.merged ?? false, draft: opts.draftNow?.() ?? opts.draft ?? false,
-            head: { sha: opts.liveHeadNow?.() ?? opts.liveHead ?? HEAD_SHA, ref: opts.liveBranch ?? DELIVERY_BRANCH },
+            state: after?.state ?? opts.state ?? "open", merged: after?.merged ?? opts.merged ?? false, draft: opts.draftNow?.() ?? opts.draft ?? false,
+            head: { sha: after?.sha ?? opts.liveHeadNow?.() ?? opts.liveHead ?? HEAD_SHA, ref: after?.ref ?? opts.liveBranch ?? DELIVERY_BRANCH },
           });
         }
         if (url.includes("/statuses/") && init?.method === "POST") {
@@ -2511,6 +2514,39 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(JSON.parse(writes[1]![1].body as string)).toMatchObject({ state: "failure", context: "paperclip/approved" });
       expect(await releaseLogRows()).toEqual([]);
       expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "stale" } });
+    });
+
+    it("answers released when the PR merged at the released head right after the write: confirmed, no failure status", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ afterWrite: { state: "closed", merged: true } });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ outcome: "released", headSha: HEAD_SHA });
+      const writes = statusWrites();
+      expect(writes).toHaveLength(1);
+      expect(JSON.parse(writes[0]![1].body as string)).toMatchObject({ state: "success", context: "paperclip/approved" });
+      expect(await releaseLogRows()).toHaveLength(1);
+      expect(await releaseConfirmationOf(issueId)).toMatchObject({ headSha: HEAD_SHA, statusId: "1" });
+    });
+
+    it.each([
+      ["a different head", { state: "closed", merged: true, sha: OTHER_HEAD }],
+      ["a different branch", { state: "closed", merged: true, ref: FOREIGN_BRANCH }],
+    ])("still reports stale when the PR merged right after the write at %s", async (_name, afterWrite) => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ afterWrite });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("stale");
+      const writes = statusWrites();
+      expect(writes).toHaveLength(2);
+      expect(JSON.parse(writes[1]![1].body as string)).toMatchObject({ state: "failure", context: "paperclip/approved" });
+      expect(await releaseLogRows()).toEqual([]);
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
     });
 
     it("fails closed when the head cannot be re-read after the write: failed outcome, no release row", async () => {

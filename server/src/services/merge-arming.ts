@@ -4169,9 +4169,10 @@ export async function publishHeadBoundRelease(
       { ...timedOut("the PR read"), headSha: null, headRef: null, open: null, draft: null, merged: null } as HeadShaResult,
     );
   // Re-read the live PR and refuse unless it is still the open PR on the bound branch at `headSha`.
-  const liveRefusal = async (): Promise<HeadBoundReleaseOutcome | null> => {
+  const liveRefusal = async (afterWrite = false): Promise<HeadBoundReleaseOutcome | null> => {
     const live = await readPullRequest();
     if (!live.ok) return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
+    if (afterWrite && live.merged && live.headRef === input.expectedBranch && live.headSha === input.headSha) return null;
     if (live.merged || live.draft || live.state !== "open") {
       return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
     }
@@ -4256,7 +4257,7 @@ export async function publishHeadBoundRelease(
       );
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
-        const after = await liveRefusal();
+        const after = await liveRefusal(true);
         if (after && after.kind === "failed") {
           // The success cannot be confirmed to cover the live head, so it is voided: nothing may consume it.
           // The board can release again, which writes a fresh success (the newest status then decides).
