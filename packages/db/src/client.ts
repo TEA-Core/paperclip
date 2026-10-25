@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
@@ -263,7 +263,85 @@ export function createDb(url: string, options?: DatabaseClientOptions) {
   // The registry keeps the real client (teardown must end the actual pool);
   // drizzle gets the retrying face so a pooler-recycled socket replays the
   // query instead of failing the request that happened to draw it.
-  return drizzlePg(withTransientWriteRetry(sql), { schema });
+  const db = drizzlePg(withTransientWriteRetry(sql), { schema });
+  scopeOrigins.set(db, { url, options: resolved });
+  return db;
+}
+
+// What `createDb` was given, per client, so a request can open a connection of its own to the same
+// database. In memory only: the URL carries credentials and is never logged or exposed.
+const scopeOrigins = new WeakMap<object, { url: string; options: DatabaseClientOptions }>();
+
+export interface RequestScopedDbLimits {
+  /** Server-side `statement_timeout` for every statement on the connection. */
+  statementTimeoutMs: number;
+  /** Server-side `lock_timeout`: how long a statement waits for a lock (advisory locks included). */
+  lockTimeoutMs: number;
+  /** Server-side `idle_in_transaction_session_timeout`. */
+  idleInTransactionMs: number;
+  /** How long opening the connection may take. */
+  connectTimeoutMs: number;
+}
+
+export interface RequestScopedDb {
+  /** A client of one dedicated connection: it never queues behind, and never borrows from, the shared pool. */
+  db: Db;
+  /**
+   * Gives up on the request now: the connection is destroyed, so a statement or a wait for the connection
+   * rejects at once, and the server rolls the open transaction back and frees its locks.
+   */
+  cancel(): Promise<void>;
+  /** Ends the connection after the request finished. */
+  close(): Promise<void>;
+}
+
+/**
+ * One dedicated connection for one request, so the request's whole database work (reads, the lock
+ * transaction, audit rows) can really be cancelled when its deadline passes. Returns null for a client
+ * that was not made by `createDb`, which has no connection settings to reuse.
+ */
+export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits): RequestScopedDb | null {
+  const origin = scopeOrigins.get(parent);
+  if (!origin) return null;
+  const driverOptions = postgresJsOptions(origin.options);
+  // A name only this request's backend has, so the server session can be found and ended from outside.
+  const applicationName = `paperclip-request-${randomUUID()}`;
+  const sql = postgres(origin.url, {
+    ...driverOptions,
+    max: 1,
+    idle_timeout: undefined,
+    max_lifetime: undefined,
+    connect_timeout: Math.max(1, Math.ceil(limits.connectTimeoutMs / 1000)),
+    onnotice: () => {},
+    connection: {
+      ...((driverOptions.connection as Record<string, string> | undefined) ?? {}),
+      application_name: applicationName,
+      statement_timeout: Math.max(1, Math.floor(limits.statementTimeoutMs)),
+      lock_timeout: Math.max(1, Math.floor(limits.lockTimeoutMs)),
+      idle_in_transaction_session_timeout: Math.max(1, Math.floor(limits.idleInTransactionMs)),
+    },
+  });
+  // No retrying wrapper: a cancelled request must not replay its statements on a fresh connection.
+  const db = drizzlePg(sql, { schema }) as unknown as Db;
+  return {
+    db,
+    // Destroying the socket is not enough: a backend waiting for a lock or running a statement does not
+    // notice a closed client until it next reads from it. Its session is ended on the server, which
+    // cancels the statement, rolls the transaction back and frees every lock it held, and then the client
+    // side is torn down. The server-side end goes over a short-lived connection of its own, never the pool.
+    cancel: async () => {
+      const killer = postgres(origin.url, { max: 1, connect_timeout: 3, onnotice: () => {}, connection: { application_name: "paperclip-request-cancel" } });
+      try {
+        await killer`select pg_terminate_backend(pid) from pg_stat_activity where application_name = ${applicationName} and pid <> pg_backend_pid()`;
+      } catch {
+        // The statement and lock timeouts on the connection still bound what is left running.
+      } finally {
+        await killer.end({ timeout: 1 }).catch(() => {});
+        await sql.end({ timeout: 0 }).catch(() => {});
+      }
+    },
+    close: () => sql.end({ timeout: 1 }).catch(() => {}),
+  };
 }
 
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {

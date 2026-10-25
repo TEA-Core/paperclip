@@ -92,7 +92,9 @@ const UNKNOWN_BOT = { login: "mystery[bot]", type: "Bot", id: 42 };
 const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
 const CARD_BRANCH = "SUP-20772-stamp-merge-release-d";
 const CARDLESS_BRANCH = "doctrine-sync-2026-10-22";
-const release = { context: "paperclip/approved", state: "success", creator: TEA_CORE, description: `released by user:u1 for ${HEAD_SHA}: no receipt` };
+const release = { id: 7001, context: "paperclip/approved", state: "success", creator: TEA_CORE, description: `released by user:u1 for ${HEAD_SHA}: no receipt` };
+// The control plane writes this after it has committed the confirmation of the release above (newest first).
+const confirmedMarker = { id: 7002, context: "paperclip/release-confirmed", state: "success", creator: TEA_CORE, description: "confirms status 7001" };
 
 test("a body waiver on a SUP-prefixed branch is refused", () => {
   const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, body: WAIVER_BODY });
@@ -118,10 +120,60 @@ test("a branch that merely contains SUP- is cardless and keeps its waiver", () =
 });
 
 test("a board release on the head lands a SUP-prefixed PR and is named in the log", () => {
-  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, body: WAIVER_BODY, statuses: [release] });
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, body: WAIVER_BODY, statuses: [confirmedMarker, release] });
   assert.equal(code, 0);
   assert.match(out, /pass: paperclip\/approved = success/);
   assert.match(out, new RegExp(`board release: released by user:u1 for ${HEAD_SHA}`));
+});
+
+// Round 8: CI consumes a release only beside the control plane's confirmation marker, switch on or off.
+test("a release the control plane has not marked confirmed is not an approval", () => {
+  for (const retired of [true, false]) {
+    const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retired });
+    assert.equal(code, 1, `retired=${retired}`);
+    assert.match(out, /UNCONFIRMED RELEASE/);
+    assert.match(out, /FAIL: paperclip\/approved is unconfirmed-release/);
+  }
+});
+
+test("a marker written by anyone but the control plane does not confirm a release", () => {
+  const forgedMarker = { ...confirmedMarker, creator: { id: 1, login: "fleet-only[bot]", type: "Bot" } };
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [forgedMarker, release] });
+  assert.equal(code, 1);
+  assert.match(out, /UNCONFIRMED RELEASE/);
+});
+
+test("a marker that names another status does not confirm this release", () => {
+  const other = { ...confirmedMarker, description: "confirms status 9999" };
+  assert.equal(run({ ref: CARD_BRANCH, author: PERSON, statuses: [other, release] }).code, 1);
+});
+
+test("a marker whose description is not a bare status id confirms nothing", () => {
+  for (const description of ["confirms status 7001 and more", "confirms status 70x1", "confirms status ", "7001"]) {
+    const marker = { ...confirmedMarker, description };
+    assert.equal(run({ ref: CARD_BRANCH, author: PERSON, statuses: [marker, release] }).code, 1, description);
+  }
+});
+
+test("a failure written after the release voids it, marker or not", () => {
+  const voided = { id: 7003, context: "paperclip/approved", state: "failure", creator: TEA_CORE, description: "voided: x" };
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [voided, confirmedMarker, release] });
+  assert.equal(code, 1);
+  assert.match(out, /paperclip\/approved is failure/);
+});
+
+test("a success that is not a board release needs no marker, as before", () => {
+  const ordinary = { id: 5, context: "paperclip/approved", state: "success", creator: TEA_CORE, description: "SUP-1 approved via Paperclip" };
+  for (const retired of [true, false]) {
+    assert.equal(run({ ref: CARD_BRANCH, author: PERSON, statuses: [ordinary], retired }).code, 0, `retired=${retired}`);
+  }
+});
+
+test("a release status written by another creator is still refused as forged, not as unconfirmed", () => {
+  const forged = { ...release, creator: { id: 1, login: "fleet-only[bot]", type: "Bot" } };
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [confirmedMarker, forged] });
+  assert.equal(code, 1);
+  assert.match(out, /FORGED/);
 });
 
 test("a waiver on a SUP-prefixed branch does not hide a forged status", () => {
@@ -165,7 +217,7 @@ test("a cardless PR authored by the fleet App cannot waive itself", () => {
 });
 
 test("with the switch off a genuine board release is not announced, and the denial has no board hint", () => {
-  const passed = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retired: false });
+  const passed = run({ ref: CARD_BRANCH, author: PERSON, statuses: [confirmedMarker, release], retired: false });
   assert.equal(passed.code, 0);
   assert.match(passed.out, /pass: paperclip\/approved = success/);
   assert.doesNotMatch(passed.out, /board release/);
@@ -177,10 +229,10 @@ test("with the switch off a genuine board release is not announced, and the deni
 
 test("only the exact value 1 arms the switch (and its board-release output)", () => {
   for (const value of ["", "0", "true", "TRUE", "false", " 1 ", "yes"]) {
-    const { out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retiredValue: value });
+    const { out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [confirmedMarker, release], retiredValue: value });
     assert.doesNotMatch(out, /board release/, JSON.stringify(value));
   }
-  assert.match(run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retiredValue: "1" }).out, /board release/);
+  assert.match(run({ ref: CARD_BRANCH, author: PERSON, statuses: [confirmedMarker, release], retiredValue: "1" }).out, /board release/);
 });
 
 test("with the switch on the denial points at the board release route", () => {

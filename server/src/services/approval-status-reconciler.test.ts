@@ -81,6 +81,12 @@ vi.mock("./secrets.js", () => ({
   }),
 }));
 
+const mockResolveControlPlaneToken = vi.hoisted(() => vi.fn());
+vi.mock("./github-credential.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./github-credential.js")>()),
+  resolveControlPlaneGitHubToken: mockResolveControlPlaneToken,
+}));
+
 vi.mock("./github-fetch.js", () => ({
   ghFetch: mockGhFetch,
   gitHubApiBase: (hostname: string) =>
@@ -489,6 +495,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
     mockGhFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) } as unknown as Response);
+    mockResolveControlPlaneToken.mockResolvedValue({ token: "ghs_control_plane_app_token", scope: "app_installation", secretName: "GITHUB_APP_PRIVATE_KEY" });
 
     // SUP-15211: the reconciler's approvalStatus writes now emit an activity_log
     // row; clear it first so the company delete isn't blocked by the FK.
@@ -3311,6 +3318,64 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const mutations = graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query));
       expect(mutations).toHaveLength(1);
       expect(mutations[0]).toContain(`expectedHeadOid: "${NEW_HEAD}"`);
+    });
+
+    // Round 8: CI accepts a release only beside the control plane's marker; the reconciler writes a lost one again.
+    const markerPosts = () => postStatusCalls().filter((call) => JSON.parse(String((call[1] as RequestInit).body)).context === "paperclip/release-confirmed");
+
+    it("round 8: re-writes the CI confirmation marker of a confirmed release when the head does not show it", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId);
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: POST_STATUS_URL, body: { id: 7002 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      await runApprovalStatusReconcilerTick(db);
+
+      expect(markerPosts()).toHaveLength(1);
+      expect(JSON.parse(String((markerPosts()[0]![1] as RequestInit).body))).toMatchObject({
+        state: "success", context: "paperclip/release-confirmed", description: "confirms status 7001",
+      });
+    });
+
+    it("round 8: writes no second marker when the head already shows it", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId);
+      const marker = { id: 7002, context: "paperclip/release-confirmed", state: "success", description: "confirms status 7001" };
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS, marker] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      await runApprovalStatusReconcilerTick(db);
+
+      expect(markerPosts()).toEqual([]);
+    });
+
+    it("round 8: writes no marker for a release the card never confirmed", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      await runApprovalStatusReconcilerTick(db);
+
+      expect(markerPosts()).toEqual([]);
     });
 
     it("SUP-20772: a board-release success whose confirmation was never recorded does not re-arm", async () => {

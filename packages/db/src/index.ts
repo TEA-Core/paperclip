@@ -1,6 +1,9 @@
 export {
   createDb,
   closeRegisteredClients,
+  createRequestScopedDb,
+  type RequestScopedDb,
+  type RequestScopedDbLimits,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
   resetPostgresDatabase,

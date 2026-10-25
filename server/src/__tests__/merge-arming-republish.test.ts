@@ -1816,7 +1816,10 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       });
     }
 
-    const statusWrites = () => mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+    const postedContext = (init: RequestInit | undefined) => JSON.parse(String(init?.body)).context as string;
+    // The paperclip/approved writes; the CI confirmation marker has its own helper.
+    const statusWrites = () => mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST" && postedContext(init) === "paperclip/approved");
+    const markerWrites = () => mockGhFetch.mock.calls.filter(([, init]) => init?.method === "POST" && postedContext(init) === "paperclip/release-confirmed");
 
     const RECORDED_HEAD = "a".repeat(40);
 
@@ -2932,6 +2935,48 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       await expectLadderRefused(issueId);
     });
 
+    // Round 8: same-instant decisions are ordered by the card's recorded last-decision pointer, never by id.
+    describe.each([
+      ["the approval has the larger id", "ffffffff-ffff-4fff-8fff-ffffffffffff", "00000000-0000-4000-8000-000000000001"],
+      ["the approval has the smaller id", "00000000-0000-4000-8000-000000000001", "ffffffff-ffff-4fff-8fff-ffffffffffff"],
+    ])("a rejection and an approval of a stage at the same instant (%s)", (_name, approvalId, rejectionId) => {
+      const seedTie = async (lastDecisionId: string | null) => {
+        const { issueId, companyId, reviewerAgentId } = await seedReleasable("ladder");
+        const seeded = await stageDecisionOf(issueId);
+        await db.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+        const at = new Date(seeded.createdAt);
+        const base = { companyId, issueId, stageId: STAGE_ID, stageType: "approval", actorAgentId: reviewerAgentId, actorUserId: null, createdAt: at, updatedAt: at };
+        await db.insert(issueExecutionDecisions).values([
+          { ...base, id: approvalId, outcome: "approved", body: "Approved" },
+          { ...base, id: rejectionId, outcome: "changes_requested", body: "Rejected" },
+        ]);
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        await db.update(issues).set({ executionState: { ...row!.executionState, lastDecisionId } }).where(eq(issues.id, issueId));
+        return issueId;
+      };
+
+      it("releases when the card records the approval as the last decision", async () => {
+        const issueId = await seedTie(approvalId);
+        installReleaseTransport();
+        const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+        expect(res.status).toBe(200);
+        expect(res.body.outcome).toBe("released");
+      });
+
+      it("refuses when the card records the rejection as the last decision", async () => {
+        const issueId = await seedTie(rejectionId);
+        await expectLadderRefused(issueId);
+      });
+
+      it("refuses, naming the missing order, when the card records no last decision", async () => {
+        const issueId = await seedTie(null);
+        installReleaseTransport();
+        const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+        expect(res.status).toBe(409);
+        expect(JSON.stringify(res.body)).toContain("does not record which came last");
+      });
+    });
+
     // ---- Round 5: bounded deadlines on the release path ----
 
     const directRelease = async (companyId: string, extra: Record<string, unknown> = {}) =>
@@ -2942,6 +2987,28 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         recordConfirmation: async () => undefined,
         ...extra,
       } as never);
+
+    // Round 8 (R7-AUTH): the card's authority is checked again after the status is written.
+    it("voids the status and records nothing when the card stops being eligible while the write is in flight", async () => {
+      const { companyId } = await seedReleasable();
+      installReleaseTransport();
+      let checks = 0;
+      let confirmed = 0;
+      const outcome = await directRelease(companyId, {
+        // Eligible at the two pre-write checks, revoked at the one after the write.
+        revalidate: async () => (++checks <= 2
+          ? { ok: true, target: { owner: OWNER, repo: REPO, number: PR_NUMBER, branch: DELIVERY_BRANCH } }
+          : { ok: false, reason: "the review decision was reversed" }),
+        recordConfirmation: async () => { confirmed += 1; },
+      });
+
+      expect(outcome.kind).toBe("stale");
+      expect(outcome.message).toContain("eligibility-changed-after-write");
+      expect(outcome.message).toContain("voided by a failure status");
+      expect(confirmed).toBe(0);
+      const bodies = statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state);
+      expect(bodies).toEqual(["success", "failure"]);
+    });
 
     it("applies statement, lock and idle-in-transaction timeouts to the lock connection", async () => {
       const { companyId } = await seedReleasable();
@@ -3335,6 +3402,250 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         unlock();
         await holder;
       }
+    }, 20_000);
+
+    // ---- Round 8: the deadline cancels database work on the server, and a failed release never commits ----
+
+    // Sessions this request opened (they carry a name of their own) that are still alive.
+    const requestBackends = async () => {
+      const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where application_name like 'paperclip-request-%' and application_name <> 'paperclip-request-cancel'`);
+      return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
+    };
+    const eventually = async (check: () => Promise<boolean>, ms = 3000) => {
+      const until = Date.now() + ms;
+      while (Date.now() < until) {
+        if (await check()) return true;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return check();
+    };
+    // Holds `statement` (a lock) in another session until released.
+    async function holdLock(statement: ReturnType<typeof sql>) {
+      let unlock!: () => void;
+      const unlocked = new Promise<void>((resolve) => { unlock = resolve; });
+      let locked!: () => void;
+      const isLocked = new Promise<void>((resolve) => { locked = resolve; });
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(statement);
+        locked();
+        await unlocked;
+      });
+      await isLocked;
+      return async () => { unlock(); await holder; };
+    }
+
+    it("cancels a database wait before the access check on the server, and answers within the deadline", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      const release = await holdLock(sql`lock table issues in access exclusive mode`);
+      try {
+        const started = Date.now();
+        const res = await request(deadlineApp({ totalMs: 400, compensationMs: 200, fetchMs: 100 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+        expect(Date.now() - started).toBeLessThan(3000);
+        expect(res.status).toBe(409);
+        expect(res.body.message).toContain("nothing was published");
+        expect(mockGhFetch).not.toHaveBeenCalled();
+        // The blocked session is ended while the lock is still held: the wait was cancelled, not abandoned.
+        expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+      } finally {
+        await release();
+      }
+    }, 20_000);
+
+    it("cancels a credential lookup that is waiting on the database", async () => {
+      const { issueId } = await seedReleasable();
+      mockResolveControlPlaneToken.mockImplementation((conn: Db) => conn.execute(sql`select pg_sleep(30)`));
+      const started = Date.now();
+
+      const res = await request(deadlineApp({ totalMs: 400, compensationMs: 200, fetchMs: 100 }))
+        .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(Date.now() - started).toBeLessThan(3000);
+      expect(res.body.outcome).toBe("failed");
+      expect(res.body.message).toContain("deadline");
+      expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+      const sleeping = await db.execute(sql`select count(*)::int as n from pg_stat_activity where query like '%pg_sleep(30)%' and state = 'active' and pid <> pg_backend_pid()`);
+      expect(Number((sleeping as unknown as Array<{ n: number }>)[0]?.n)).toBe(0);
+    }, 20_000);
+
+    it("cancels the wait for the publication lock on the server, and frees the lock", async () => {
+      const { issueId, companyId } = await seedReleasable();
+      installReleaseTransport();
+      const release = await holdLock(sql`select pg_advisory_xact_lock(hashtextextended(${releaseLockKey(companyId, OWNER, REPO, HEAD_SHA)}, 0))`);
+      try {
+        const started = Date.now();
+        const res = await request(deadlineApp({ totalMs: 500, compensationMs: 200, fetchMs: 100 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+        expect(Date.now() - started).toBeLessThan(3000);
+        expect(res.body.outcome).toBe("failed");
+        expect(res.body.message).toContain("deadline");
+        expect(statusWrites()).toEqual([]);
+        const waiting = async () => Number(((await db.execute(sql`select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted`)) as unknown as Array<{ n: number }>)[0]?.n);
+        expect(await eventually(async () => (await waiting()) === 0)).toBe(true);
+      } finally {
+        await release();
+      }
+    }, 20_000);
+
+    it("cancels the outcome audit write on its own short clock, leaving no session behind", async () => {
+      const { issueId } = await seedReleasable();
+      const held: { release?: () => Promise<void> } = {};
+      installReleaseTransport({
+        // The intent row is already written: from the first status read on, the audit table is locked.
+        onStatusRead: async () => { held.release ??= await holdLock(sql`lock table activity_log in access exclusive mode`); },
+      });
+      try {
+        const started = Date.now();
+        const res = await request(deadlineApp({ totalMs: 5000, compensationMs: 300, fetchMs: 1000 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+        expect(Date.now() - started).toBeLessThan(4000);
+        expect(res.body.outcome).toBe("released");
+        expect(res.body.auditRecorded).toBe(false);
+        expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+      } finally {
+        await held.release?.();
+      }
+    }, 20_000);
+
+    it("leaves no database session behind after an ordinary release", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("released");
+      expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+    });
+
+    // A release that is answered failed must never commit a confirmation afterwards.
+    it("never commits a confirmation after answering failed when the confirmation write is stuck", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      // Another writer holds the card's row, so the confirmation UPDATE has to wait for it.
+      const release = await holdLock(sql`select 1 from issues where id = ${issueId} for update`);
+      let res: request.Response;
+      try {
+        res = await request(deadlineApp({ totalMs: 300, compensationMs: 300, fetchMs: 100 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      } finally {
+        await release();
+      }
+      // Let anything that was merely abandoned run to its end.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      expect(res.status).toBe(409);
+      expect(res.body.outcome).toBe("failed");
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as { approvalStatus?: Record<string, unknown> } | null)?.approvalStatus ?? {};
+      expect(approvalStatus.releaseConfirmation).toBeUndefined();
+      // The unconfirmed success is voided, and CI is never told it was confirmed.
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state)).toEqual(["success", "failure"]);
+      expect(markerWrites()).toEqual([]);
+    }, 20_000);
+
+    it("never commits a confirmation when the deadline passes before the confirmation write begins", async () => {
+      const { companyId } = await seedReleasable();
+      installReleaseTransport();
+      const abort = new AbortController();
+      let confirmed = 0;
+      const outcome = await directRelease(companyId, {
+        signal: abort.signal,
+        // The deadline passes while the card is re-checked after the status write.
+        revalidate: (() => {
+          let calls = 0;
+          return async () => {
+            if (++calls === 3) abort.abort();
+            return { ok: true, target: { owner: OWNER, repo: REPO, number: PR_NUMBER, branch: DELIVERY_BRANCH } };
+          };
+        })(),
+        recordConfirmation: async () => { confirmed += 1; },
+      });
+
+      expect(outcome.kind).toBe("failed");
+      expect(confirmed).toBe(0);
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state)).toEqual(["success", "failure"]);
+      expect(markerWrites()).toEqual([]);
+    }, 20_000);
+
+    // ---- Round 8: the CI confirmation marker (paperclip/release-confirmed) ----
+
+    it("writes the CI marker only after the confirmation is committed, naming the status it confirms", async () => {
+      const { issueId } = await seedReleasable();
+      let confirmationAtMarkerTime: unknown = "unread";
+      installReleaseTransport({ postBody: { id: 7 } });
+      const base = mockGhFetch.getMockImplementation()!;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === "POST" && postedContext(init) === "paperclip/release-confirmed") {
+          const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+          confirmationAtMarkerTime = (row!.executionState as { approvalStatus?: { releaseConfirmation?: unknown } } | null)?.approvalStatus?.releaseConfirmation;
+        }
+        return base(url, init);
+      });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("released");
+      expect(markerWrites()).toHaveLength(1);
+      const marker = JSON.parse(String(markerWrites()[0]![1]!.body));
+      expect(marker).toMatchObject({ state: "success", context: "paperclip/release-confirmed", description: "confirms status 7" });
+      expect(markerWrites()[0]![0]).toContain(`/statuses/${HEAD_SHA}`);
+      expect(confirmationAtMarkerTime).toMatchObject({ statusId: "7", headSha: HEAD_SHA });
+    });
+
+    it("answers released, says CI is not yet told, and re-writes the marker on the next release", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postBody: { id: 7 } });
+      const base = mockGhFetch.getMockImplementation()!;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === "POST" && postedContext(init) === "paperclip/release-confirmed") return createMockResponse({ message: "boom" }, false, 500);
+        return base(url, init);
+      });
+
+      const first = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(first.status).toBe(200);
+      expect(first.body.outcome).toBe("released");
+      expect(first.body.message).toContain("CI confirmation marker could NOT be written");
+
+      // The success is on the head, confirmed in the database, but the marker never landed.
+      const confirmed = { ...approvedRow("success", CONTROL_PLANE_CREATOR), id: 7, description: `released by user:u for ${HEAD_SHA}: earlier` };
+      mockGhFetch.mockClear();
+      installReleaseTransport({ statuses: [confirmed], postBody: { id: 8 } });
+      const second = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(second.body.outcome).toBe("already_approved");
+      expect(second.body.message).toContain("marker was re-written");
+      expect(statusWrites()).toEqual([]);
+      expect(JSON.parse(String(markerWrites()[0]![1]!.body)).description).toBe("confirms status 7");
+    });
+
+    it("does not re-write the marker when it is already on the head", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postBody: { id: 7 } });
+      await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      const confirmed = { ...approvedRow("success", CONTROL_PLANE_CREATOR), id: 7, description: `released by user:u for ${HEAD_SHA}: earlier` };
+      const marker = { ...approvedRow("success", CONTROL_PLANE_CREATOR), id: 8, context: "paperclip/release-confirmed", description: "confirms status 7" };
+      mockGhFetch.mockClear();
+      installReleaseTransport({ statuses: [marker, confirmed] });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("already_approved");
+      expect(markerWrites()).toEqual([]);
+    });
+
+    it("writes no marker when the release is not confirmed", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ prReadFailsAfterWrite: true });
+
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(markerWrites()).toEqual([]);
     }, 20_000);
 
     it("rejects a malformed body with 400 before any GitHub I/O", async () => {
