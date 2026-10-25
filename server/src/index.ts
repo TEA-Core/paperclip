@@ -2652,28 +2652,10 @@ async function startServerWithDatabaseTeardown(
   };
   } catch (error) {
     if (startupListenerBound) {
-      await new Promise<void>((resolveClose) => {
-        try {
-          server.close((closeError?: Error) => {
-            if (
-              closeError &&
-              (closeError as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
-            ) {
-              logger.error(
-                { err: closeError },
-                "failed to close HTTP listener after startup failure",
-              );
-            }
-            resolveClose();
-          });
-        } catch (closeError) {
-          logger.error(
-            { err: closeError },
-            "failed to close HTTP listener after startup failure",
-          );
-          resolveClose();
-        }
-      });
+      logger.error(
+        { err: error },
+        "startup failed after the HTTP listener bound; leaving the listener open and rethrowing so the entrypoint exits",
+      );
     }
     throw error;
   }

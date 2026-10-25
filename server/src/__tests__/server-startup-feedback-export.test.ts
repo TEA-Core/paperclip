@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -835,7 +836,7 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
   });
 
-  it("closes the bound listener when native startup recovery fails", async () => {
+  it("never closes the bound listener when native startup recovery fails", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
@@ -847,7 +848,35 @@ describe("startServer feedback export wiring", () => {
     await expect(startServer()).rejects.toThrow("native recovery unavailable");
 
     expect(fakeServer.listen).toHaveBeenCalledTimes(1);
-    expect(fakeServer.close).toHaveBeenCalledTimes(1);
+    expect(fakeServer.close).not.toHaveBeenCalled();
+  });
+
+  it("exits nonzero from the main module when startup recovery fails after the listener binds", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.recoverNativeRunsAfterRestart.mockRejectedValueOnce(
+      new Error("native recovery unavailable"),
+    );
+    const originalArgv1 = process.argv[1];
+    let exitSpy: ReturnType<typeof vi.spyOn> | undefined;
+    const exited = new Promise<number | undefined>((resolveExit) => {
+      exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        resolveExit(code);
+        return undefined as never;
+      }) as typeof process.exit);
+    });
+    process.argv[1] = fileURLToPath(new URL("../index.ts", import.meta.url));
+    try {
+      vi.resetModules();
+      await import("../index.ts");
+      await expect(exited).resolves.toBe(1);
+      expect(fakeServer.close).not.toHaveBeenCalled();
+    } finally {
+      process.argv[1] = originalArgv1;
+      exitSpy?.mockRestore();
+    }
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {
