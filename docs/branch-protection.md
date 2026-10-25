@@ -44,18 +44,29 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
 
 ### The consume-contract (pinned)
 
-- `context: "paperclip/approved"`, `state: "success"` on the PR head.
-- Produced only by the control plane (`publishApprovalStatus`) when a card's
-  `review` stage records `approved` **and** the card has exactly one linked,
-  open PR. **Nothing in this repository may create, mock or backfill that
-  status** — a local write is a contract violation that manufactures a fake
-  approval. The enforcer is read-only (GETs only; the endpoints it calls are listed in
-  the script header).
-- Behaviour by event: `pull_request` → advisory (exit 0, green — the status
-  only exists after the review stage approves); `merge_group` → **fail-closed**
-  (missing/pending/failed/unresolvable/API-error all block the merge); `push`
-  → no-op success (never `skipped`, so the context can be required without
-  deadlocking the queue — SUP-13500).
+- On the current PR head, `paperclip/approved = success` from the control-plane
+  App remains the normal path. The alternative is
+  `release-assurance/approved = success` from the same App (creator user ID
+  `317012809`), with description `released by release-assurance for <40-hex-head>`.
+  The RA status target must be HTTPS
+  `/api/issues/<card-uuid>/release-decisions?repo=<URI-encoded-owner/repo>&pr=<number>&head=<40-hex-head>&decision=<decision-uuid>&evidence=<64-hex-digest>`.
+  The enforcer reads the latest entry in each context from the paginated
+  `/commits/<head>/statuses` list, which includes creator attribution.
+  A present RA HOLD/NO-GO, untrusted producer, stale head or malformed target
+  blocks both approval alternatives and both cardless waivers/override.
+- The RA producer remains **shadow-only**: it records decisions and plans
+  statuses but does not write to GitHub. Its current generic planned target is
+  not an admitting RA stamp; a future publisher must emit the bound target
+  above and its separate App-pinned `release-assurance/go` veto check before
+  production enrollment can be enabled. This CI change publishes neither.
+- Normal `paperclip/approved` is produced by `publishApprovalStatus` only when
+  the card has an approved review stage and exactly one linked open PR. Nothing
+  in this CI job writes either approval context.
+- By event, `pull_request` is advisory (exit 0), `merge_group` fails closed
+  (missing/pending/failed/unresolvable/API-error block), and `push` is a no-op.
+  Both `.github/workflows/paperclip-approved.yml` and the early `Approval
+  precondition` in `.github/workflows/pr.yml` invoke the same shell script on
+  merge groups.
 - **Override label** (SUP-20897): `override:paperclip-approval` lets a person
   approve one PR when the reviewer pipeline cannot publish the stamp. See
   [Override label](#override-label-sup-20897).
@@ -269,11 +280,13 @@ gh label create "override:paperclip-approval" --repo TEA-Core/paperclip \
 ```
 
 The enforcer consults the label only when the head has no valid
-`paperclip/approved` stamp. A forged stamp still fails; the waivers
-(`Paperclip-Approved-Waiver`, `no-paperclip-card`) are checked first (card-bound
-heads lose them once `PAPERCLIP_CARD_WAIVER_RETIRED=1`, see below). The override
-is honored only when **all** of these hold, and the enforcer fails closed
-(merge_group exit 1, pull_request advisory) on any doubt:
+`paperclip/approved` stamp and no RA status. A forged board stamp still fails;
+the waivers (`Paperclip-Approved-Waiver`, `no-paperclip-card`) remain available
+on normal-lane PRs and are checked first (card-bound heads lose them once
+`PAPERCLIP_CARD_WAIVER_RETIRED=1`, see below), but neither waiver nor override
+bypasses an RA HOLD/NO-GO. The override is honored only when **all** of these
+hold, and the enforcer fails closed (merge_group exit 1, pull_request advisory)
+on any doubt:
 
 - **Authority.** The most recent `labeled` event for the label has an actor of
   type `User` (the machine-identity rejection the fold countersignature applies

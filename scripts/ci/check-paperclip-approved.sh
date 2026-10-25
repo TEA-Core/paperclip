@@ -2,20 +2,14 @@
 # Paperclip-approved enforcer (SUP-13589 / SUP-13590; ported to the
 # TEA-Core/paperclip fold under SUP-13629).
 #
-# Approval gate: an approving review from an identity other than the pusher
-# is required before a PR can merge. The signal is the control-plane
-# `paperclip/approved` commit status on the PR head; this script CONSUMES it
-# (read-only) and enforces it at the merge boundary.
+# Approval gate: consume either the normal `paperclip/approved` stamp or a
+# distinct, head-bound `release-assurance/approved` GO from the control-plane
+# App. A present RA status takes precedence: HOLD/NO-GO, malformed or untrusted
+# RA status cannot fall back to a normal stamp, waiver or override.
 #
-# Consume-contract (pinned — do not change, do not write this status):
-#   context: "paperclip/approved"
-#   state:   "success"
-#
-# The producer is the CONTROL PLANE (publishApprovalStatus), which fires when
-# a card's `review` stage records an `approved` decision AND the card has
-# exactly one linked, open PR. Nothing in this repository may create, mock,
-# or write that context — a local write is a contract violation that
-# manufactures a fake signal. This script makes two read-only API calls:
+# The normal producer is publishApprovalStatus; the RA control plane is still
+# shadow-only and does not publish any status. Neither status is written here.
+# This script makes read-only API calls:
 #   GET repos/{owner}/{repo}/pulls/{n}
 #   GET repos/{owner}/{repo}/commits/{head-sha}/statuses
 #   GET repos/{owner}/{repo}/pulls/{n}/reviews   (only when a waiver is
@@ -30,14 +24,10 @@
 # never on a 4xx. See the long note at that function for why a 403 is excluded
 # and for the incident that motivated it.
 #
-# ATTRIBUTION. `paperclip/approved` is a plain commit status and the
-# `fleet-only` installation grants `statuses:write` to every Paperclip-assigned
-# agent, so possession of the signal proves nothing on its own — any agent could
-# publish a success on its own head SHA. A `success` is therefore accepted only
-# when its `creator` is the control-plane App's bot user (id
-# $APPROVED_STATUS_CREATOR_ID). The LIST endpoint is used rather than the
-# combined `/status` one because the combined endpoint omits `creator`
-# entirely, which is why this hole stood open.
+# ATTRIBUTION. Both approvals are plain commit statuses and the `fleet-only`
+# installation grants `statuses:write` to every Paperclip-assigned agent.
+# Only the control-plane App bot (id $APPROVED_STATUS_CREATOR_ID) can approve.
+# The paginated LIST endpoint carries `creator`, unlike combined `/status`.
 #
 # Behaviour, by event:
 #   pull_request -> advisory: log the observed state, exit 0 (green). The
@@ -171,6 +161,7 @@
 set -euo pipefail
 
 CONTEXT="paperclip/approved"
+RA_CONTEXT="release-assurance/approved"
 STATE="success"
 
 # A literal backtick, so the job-summary blocks below can render inline code
@@ -748,20 +739,6 @@ arm_gate_refusal() {
   ARM_GATE_REFUSAL="ARM GATE OPEN: ${ARM_GATE_CONTEXT} on ${HEAD_SHA} is ${1} (${2:-no description}); an auto-merge arm of this head is unsettled, so it is not mergeable until the control plane writes ${ARM_GATE_CONTEXT} = ${STATE}"
   return 0
 }
-# waiver_arm_gate: a waiver exits before the status list is read, so it reads the gate itself. A read that fails changes
-# nothing here (the waiver was honoured without any status read before this existed).
-waiver_arm_gate() {
-  local gate
-  gate="$(gh_api_retry --paginate "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-    --jq "[.[] | select(.context == \"${ARM_GATE_CONTEXT}\" and ((.creator.id // \"\") | tostring) == \"${APPROVED_STATUS_CREATOR_ID}\")] | (.[0] // empty) | [.state, (.description // \"\")] | @tsv" 2>/dev/null | grep -m1 . || true)"
-  [ -n "$gate" ] || return 0
-  local gate_state="${gate%%$'\t'*}" gate_description="${gate#*$'\t'}"
-  if arm_gate_refusal "$gate_state" "$gate_description"; then
-    fail "$ARM_GATE_REFUSAL"
-  fi
-  return 0
-}
-
 # waiver_unverified <what>: say, in the log, that a waiver was honoured on
 # author-controlled evidence only (branch name and author type).
 waiver_unverified() {
@@ -799,33 +776,33 @@ waiver_honoured() {
   return 1
 }
 
+# Cardless waivers are evaluated only after the release-assurance context:
+# an enrolled PR's HOLD/NO-GO must not be cleared by a body line or label.
 # Waiver 1: body line "Paperclip-Approved-Waiver: <reason>" with a non-empty
-# reason (a cardless PR never gets a paperclip/approved status, so the
-# waiver is checked before the status lookup).
-reason_line="$(grep -E '^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*[^[:space:]]' <<<"$PR_BODY" | head -1 || true)"
-if [ -n "$reason_line" ]; then
-  reason="$(sed -E 's/^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*//' <<<"$reason_line")"
-  if waiver_honoured "body waiver 'Paperclip-Approved-Waiver: ${reason}'" \
-    && require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
-    waiver_arm_gate
-    note "waived: PR body declares 'Paperclip-Approved-Waiver: ${reason}' (no Paperclip card)"
-    exit 0
+# reason (a cardless PR never gets a paperclip/approved status).
+# Waiver 2: exact "no-paperclip-card" label (whole-element match; no substrings),
+# countersigned on a fold head for the same reason as the body waiver: the
+# `fleet-only` grant carries `pull_requests:write`, so an agent can apply it.
+waive_cardless_pr() {
+  local reason_line reason
+  reason_line="$(grep -E '^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*[^[:space:]]' <<<"$PR_BODY" | head -1 || true)"
+  if [ -n "$reason_line" ]; then
+    reason="$(sed -E 's/^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*//' <<<"$reason_line")"
+    if waiver_honoured "body waiver 'Paperclip-Approved-Waiver: ${reason}'" \
+      && require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
+      note "waived: PR body declares 'Paperclip-Approved-Waiver: ${reason}' (no Paperclip card)"
+      return 0
+    fi
   fi
-fi
-
-# Waiver 2: exact "no-paperclip-card" label (whole-element match; no substrings).
-# Countersigned on a fold head for the same reason as the body waiver: the
-# `fleet-only` grant carries `pull_requests:write`, so an agent can apply this
-# label to its own PR. Leaving one of the two waiver forms uncountersigned would
-# leave the gate exactly as open as before.
-if [ -n "$PR_LABELS" ] && printf '%s' "$PR_LABELS" | jq -e --arg l 'no-paperclip-card' 'index($l)' >/dev/null 2>&1; then
-  if waiver_honoured "the 'no-paperclip-card' label" \
-    && require_countersignature "the 'no-paperclip-card' label"; then
-    waiver_arm_gate
-    note "waived: PR carries the 'no-paperclip-card' label (no Paperclip card)"
-    exit 0
+  if [ -n "$PR_LABELS" ] && printf '%s' "$PR_LABELS" | jq -e --arg l 'no-paperclip-card' 'index($l)' >/dev/null 2>&1; then
+    if waiver_honoured "the 'no-paperclip-card' label" \
+      && require_countersignature "the 'no-paperclip-card' label"; then
+      note "waived: PR carries the 'no-paperclip-card' label (no Paperclip card)"
+      return 0
+    fi
   fi
-fi
+  return 1
+}
 
 # --- the consume-contract itself ----------------------------------------------
 # Read the LIST endpoint, not the combined one. `GET /commits/{sha}/status`
@@ -860,7 +837,7 @@ STATUS_DEF='def f: if . == "" then "-" else . end; '
 STATUS_ROW='((.context // "") | f), ((.state // "") | f), (((.creator.id // "") | tostring) | f), ((.creator.login // "") | f), ((.description // "") | f), ((.id // "-") | tostring)'
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-  --jq "${STATUS_DEF}.[] | [${STATUS_ROW}] | @tsv")" \
+  --jq "${STATUS_DEF}.[] | [${STATUS_ROW}, ((.target_url // \"\") | f)] | @tsv")" \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
@@ -871,11 +848,18 @@ APPROVAL_STATUS_ID=""
 CONFIRMED_RELEASE_IDS=" "
 ARM_GATE_STATE=""
 ARM_GATE_DESCRIPTION=""
-while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id; do
+RA_SEEN=0
+RA_STATE="missing"
+RA_CREATOR_ID=""
+RA_CREATOR_LOGIN=""
+RA_DESCRIPTION=""
+RA_TARGET=""
+while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id status_target; do
   [ "$status_context" = "-" ] && status_context=""
   [ "$status_state" = "-" ] && status_state=""
   [ "$status_creator_id" = "-" ] && status_creator_id=""
   [ "$status_creator_login" = "-" ] && status_creator_login=""
+  [ "$status_target" = "-" ] && status_target=""
   if [ "$status_context" = "$RELEASE_CONFIRMED_CONTEXT" ]; then
     # Only the control plane's own marker counts, and only one that names a numeric status id.
     if [ "$status_state" = "$STATE" ] && [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ]; then
@@ -892,6 +876,18 @@ while IFS=$'\t' read -r status_context status_state status_creator_id status_cre
       arm_gate_seen=1
       ARM_GATE_STATE="$status_state"
       ARM_GATE_DESCRIPTION="$status_description"
+    fi
+    continue
+  fi
+  if [ "$status_context" = "$RA_CONTEXT" ]; then
+    # The newest release-assurance status decides (the list is newest first).
+    if [ "$RA_SEEN" = "0" ]; then
+      RA_SEEN=1
+      RA_STATE="${status_state:-missing}"
+      RA_CREATOR_ID="$status_creator_id"
+      RA_CREATOR_LOGIN="$status_creator_login"
+      RA_DESCRIPTION="$status_description"
+      RA_TARGET="$status_target"
     fi
     continue
   fi
@@ -928,6 +924,39 @@ if [ "$APPROVAL_STATE" = "$STATE" ] && [ "$APPROVAL_CREATOR_ID" = "$APPROVED_STA
       ;;
   esac
 fi
+
+# The latest RA status for this commit takes precedence over every board
+# stamp, waiver and override. A pending/failure is a veto, not a fallback to
+# an older GO or to the ordinary lane. Only the control-plane App can publish
+# a GO, and the status must identify one card, decision, repo, PR, evidence
+# digest and live head. The App-pinned required release-assurance/go check
+# remains the durable enforcement boundary when this script is PR-controlled.
+if [ "$RA_SEEN" = "1" ]; then
+  if [ "$RA_CREATOR_ID" != "$APPROVED_STATUS_CREATOR_ID" ]; then
+    err "FORGED: ${RA_CONTEXT} on ${HEAD_SHA} was written by ${RA_CREATOR_LOGIN:-<unknown>} (id ${RA_CREATOR_ID:-<none>})"
+    fail "${RA_CONTEXT} was not published by the control plane"
+  fi
+  [ "$RA_STATE" = "$STATE" ] || fail "${RA_CONTEXT} is ${RA_STATE}, expected ${STATE}; RA HOLD/NO-GO blocks every alternative"
+  encoded_repo="$(jq -rn --arg repo "$REPO" '$repo | @uri')"
+  uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+  ra_target_pattern="^https://[^/?#]+/api/issues/(${uuid})/release-decisions\\?repo=([^&]+)&pr=([0-9]+)&head=([0-9a-f]{40})&decision=(${uuid})&evidence=([0-9a-f]{64})$"
+  if [[ ! "$RA_TARGET" =~ $ra_target_pattern ]] \
+    || [ "${BASH_REMATCH[2]:-}" != "$encoded_repo" ] \
+    || [ "${BASH_REMATCH[3]:-}" != "$PR_NUMBER" ] \
+    || [ "${BASH_REMATCH[4]:-}" != "$HEAD_SHA" ] \
+    || [ "$RA_DESCRIPTION" != "released by release-assurance for ${HEAD_SHA}" ]; then
+    fail "${RA_CONTEXT} has no exact card/decision/repo/PR/head-bound release target"
+  fi
+  note "pass: ${RA_CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA} (published by ${RA_CREATOR_LOGIN})"
+  if [ "$MODE" = "advisory" ]; then
+    CONTEXT="$RA_CONTEXT"
+    APPROVAL_CREATOR_LOGIN="$RA_CREATOR_LOGIN"
+    advisory_summary_present
+  fi
+  exit 0
+fi
+
+if waive_cardless_pr; then exit 0; fi
 
 if [ "$APPROVAL_STATE" = "$STATE" ]; then
   # `paperclip/approved` is a plain commit status, and the `fleet-only`
