@@ -72,11 +72,14 @@ export class GitHubBranchNotFoundError extends Error {
   }
 }
 
+const DECISION_ONLY_NO_REPOSITORY_DELIVERABLE = "decision-only-no-repository-deliverable";
+
 const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
   "child-delivery-parent-close",
   "merged-elsewhere",
   "control-plane-operation-no-deliverable",
+  DECISION_ONLY_NO_REPOSITORY_DELIVERABLE,
 ]);
 
 // SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
@@ -112,6 +115,7 @@ const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
 // SUP-24299: refusal code for a Tier 2 declaration that also carries TIER_1_SUFFIX.
 export const DONE_TRANSITION_TIER_CONFLICT_CODE = "done_transition_tier_conflict";
+const TIER_0_PREFIX = "Closed at Tier 0 (decision-only):";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 // SUP-21902: the Tier 2 form is self-verifying — the evidence must name the probe
@@ -134,6 +138,7 @@ export const TIER1_FORM =
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+const TIER0_FORM = '"Closed at Tier 0 (decision-only): <reason>"';
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -315,7 +320,7 @@ interface DoneTier2CloseAuditDetails {
 export interface DoneTierDeclarationResult {
   allowed: boolean;
   reason: string;
-  tier: "tier1" | "tier2" | null;
+  tier: "tier0" | "tier1" | "tier2" | null;
   skipped: boolean;
   skipReason: string | null;
   tier2Audit?: DoneTier2CloseAuditDetails;
@@ -332,6 +337,10 @@ export interface DoneTierDeclarationResult {
   // refused declaration to done_transition_missing_tier_declaration uses this one
   // instead when it is set.
   code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
+}
+
+interface DoneTierDeclarationOptions {
+  allowTier0DecisionOnly?: boolean;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -1061,6 +1070,28 @@ type Tier1Parse =
   | { kind: "not_at_line_start"; offendingLine: string }
   | { kind: "missing_suffix" }
   | { kind: "absent" };
+
+type Tier0Parse =
+  | { kind: "matched"; reason: string }
+  | { kind: "not_at_line_start"; offendingLine: string }
+  | { kind: "absent" };
+
+function parseTier0Declaration(body: string): Tier0Parse {
+  const lines = body.split(/\r?\n/);
+  let notAtLineStart: string | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(TIER_0_PREFIX)) {
+      return { kind: "matched", reason: trimmed.slice(TIER_0_PREFIX.length).trim() };
+    }
+    if (notAtLineStart === null && trimmed.includes(TIER_0_PREFIX)) {
+      notAtLineStart = trimmed;
+    }
+  }
+  return notAtLineStart !== null
+    ? { kind: "not_at_line_start", offendingLine: notAtLineStart }
+    : { kind: "absent" };
+}
 
 function parseTier2Declaration(body: string): Tier2Parse {
   const lines = body.split(/\r?\n/);
@@ -3171,6 +3202,7 @@ export async function evaluateDoneTierDeclaration(
   // closing run or it refuses — an agent can otherwise drop the run id header
   // and skip the closing-run lifetime gate entirely.
   closingAgentId: string | null = null,
+  options: DoneTierDeclarationOptions = {},
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: a record_only card's primary accepted Tier 2 form is the
   // record-only live-evidence grammar (no merge head by design); the merge-head
@@ -3190,6 +3222,46 @@ export async function evaluateDoneTierDeclaration(
   const tier1Forms = `${TIER1_FORM}${noRepositoryTier1FormSuffix(issue)}`;
 
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
+    if (options.allowTier0DecisionOnly) {
+      const tier0 = parseTier0Declaration(accompanyingComment);
+      if (tier0.kind === "matched") {
+        if (tier0.reason.length === 0) {
+          return {
+            allowed: false,
+            reason: `Tier 0 decision-only declaration found but <reason> is empty. Use: ${TIER0_FORM}`,
+            tier: null,
+            skipped: false,
+            skipReason: null,
+          };
+        }
+        return {
+          allowed: true,
+          reason: `Tier 0 decision-only declaration found: ${tier0.reason.slice(0, 200)}`,
+          tier: "tier0",
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      if (tier0.kind === "not_at_line_start") {
+        return {
+          allowed: false,
+          reason:
+            "A Tier 0 decision-only declaration was found but it does not begin its own line — the guard " +
+            "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
+            `Offending line: "${tier0.offendingLine.slice(0, 200)}". Accepted form: ${TIER0_FORM}.`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: false,
+        reason: `Decision-only close requires ${TIER0_FORM}.`,
+        tier: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
       const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
@@ -3281,6 +3353,35 @@ export async function evaluateDoneTierDeclaration(
         `Accepted forms: ${tier2Forms}` +
         ` or ${tier1Forms}` +
         ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  if (options.allowTier0DecisionOnly) {
+    const tier0 = parseTier0Declaration(sameRunComment.body);
+    if (tier0.kind === "matched") {
+      if (tier0.reason.length === 0) {
+        return {
+          allowed: false,
+          reason: `Tier 0 decision-only declaration found in same-run comment but <reason> is empty. Use: ${TIER0_FORM}`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: true,
+        reason: `Tier 0 decision-only declaration found in same-run comment: ${tier0.reason.slice(0, 200)}`,
+        tier: "tier0",
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    return {
+      allowed: false,
+      reason: `Decision-only close requires ${TIER0_FORM}.`,
       tier: null,
       skipped: false,
       skipReason: null,
