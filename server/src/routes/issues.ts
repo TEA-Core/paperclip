@@ -5183,6 +5183,7 @@ export function issueRoutes(
       commentBody,
       runId,
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
+      { allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable" },
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -5202,6 +5203,9 @@ export function issueRoutes(
         "Include a done-tier declaration in the close comment: " +
         `"Closed at Tier 2 (live): <probe evidence>"` +
         ` or ${TIER1_FORM.slice(1, -1)}` +
+        (override?.disposition === "decision-only-no-repository-deliverable"
+          ? ` or "Closed at Tier 0 (decision-only): <reason>"`
+          : "") +
         ` — per SUP-12693.`;
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than

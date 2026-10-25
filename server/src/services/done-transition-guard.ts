@@ -44,10 +44,13 @@ export class GitHubBranchNotFoundError extends Error {
   }
 }
 
+const DECISION_ONLY_NO_REPOSITORY_DELIVERABLE = "decision-only-no-repository-deliverable";
+
 const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
   "child-delivery-parent-close",
   "merged-elsewhere",
+  DECISION_ONLY_NO_REPOSITORY_DELIVERABLE,
 ]);
 
 // SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
@@ -81,6 +84,7 @@ const ADR072_CLOSE_LADDER: {
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
+const TIER_0_PREFIX = "Closed at Tier 0 (decision-only):";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 const TIER2_FORM = '"Closed at Tier 2 (live): <probe evidence>"';
@@ -88,6 +92,7 @@ export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+const TIER0_FORM = '"Closed at Tier 0 (decision-only): <reason>"';
 
 /**
  * ADR-103 M3: the gate that produced a refusal, carried so the route can speak
@@ -163,9 +168,13 @@ export interface DoneTransitionOverride {
 export interface DoneTierDeclarationResult {
   allowed: boolean;
   reason: string;
-  tier: "tier1" | "tier2" | null;
+  tier: "tier0" | "tier1" | "tier2" | null;
   skipped: boolean;
   skipReason: string | null;
+}
+
+interface DoneTierDeclarationOptions {
+  allowTier0DecisionOnly?: boolean;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -536,6 +545,28 @@ type Tier1Parse =
   | { kind: "missing_suffix" }
   | { kind: "absent" };
 
+type Tier0Parse =
+  | { kind: "matched"; reason: string }
+  | { kind: "not_at_line_start"; offendingLine: string }
+  | { kind: "absent" };
+
+function parseTier0Declaration(body: string): Tier0Parse {
+  const lines = body.split(/\r?\n/);
+  let notAtLineStart: string | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(TIER_0_PREFIX)) {
+      return { kind: "matched", reason: trimmed.slice(TIER_0_PREFIX.length).trim() };
+    }
+    if (notAtLineStart === null && trimmed.includes(TIER_0_PREFIX)) {
+      notAtLineStart = trimmed;
+    }
+  }
+  return notAtLineStart !== null
+    ? { kind: "not_at_line_start", offendingLine: notAtLineStart }
+    : { kind: "absent" };
+}
+
 function parseTier2Declaration(body: string): Tier2Parse {
   const lines = body.split(/\r?\n/);
   let notAtLineStart: string | null = null;
@@ -872,6 +903,7 @@ export async function evaluateDoneTierDeclaration(
   accompanyingComment: string | null,
   runId: string | null,
   listComments: (issueId: string) => Promise<IssueComment[]>,
+  options: DoneTierDeclarationOptions = {},
 ): Promise<DoneTierDeclarationResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTierDeclarationResult => ({
     allowed: true,
@@ -882,6 +914,46 @@ export async function evaluateDoneTierDeclaration(
   });
 
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
+    if (options.allowTier0DecisionOnly) {
+      const tier0 = parseTier0Declaration(accompanyingComment);
+      if (tier0.kind === "matched") {
+        if (tier0.reason.length === 0) {
+          return {
+            allowed: false,
+            reason: `Tier 0 decision-only declaration found but <reason> is empty. Use: ${TIER0_FORM}`,
+            tier: null,
+            skipped: false,
+            skipReason: null,
+          };
+        }
+        return {
+          allowed: true,
+          reason: `Tier 0 decision-only declaration found: ${tier0.reason.slice(0, 200)}`,
+          tier: "tier0",
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      if (tier0.kind === "not_at_line_start") {
+        return {
+          allowed: false,
+          reason:
+            "A Tier 0 decision-only declaration was found but it does not begin its own line — the guard " +
+            "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
+            `Offending line: "${tier0.offendingLine.slice(0, 200)}". Accepted form: ${TIER0_FORM}.`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: false,
+        reason: `Decision-only close requires ${TIER0_FORM}.`,
+        tier: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
       return {
@@ -964,6 +1036,35 @@ export async function evaluateDoneTierDeclaration(
         `Accepted forms: ${TIER2_FORM}` +
         ` or ${TIER1_FORM}` +
         ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  if (options.allowTier0DecisionOnly) {
+    const tier0 = parseTier0Declaration(sameRunComment.body);
+    if (tier0.kind === "matched") {
+      if (tier0.reason.length === 0) {
+        return {
+          allowed: false,
+          reason: `Tier 0 decision-only declaration found in same-run comment but <reason> is empty. Use: ${TIER0_FORM}`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: true,
+        reason: `Tier 0 decision-only declaration found in same-run comment: ${tier0.reason.slice(0, 200)}`,
+        tier: "tier0",
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    return {
+      allowed: false,
+      reason: `Decision-only close requires ${TIER0_FORM}.`,
       tier: null,
       skipped: false,
       skipReason: null,
