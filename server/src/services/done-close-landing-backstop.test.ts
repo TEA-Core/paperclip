@@ -2664,13 +2664,18 @@ describe("SUP-16689: draft-stranded done cards", () => {
         refusal: false,
       }),
     }));
-    // A draft cannot be armed: no re-enqueue (mockEnableAutoMerge) and no board
-    // block (mockUpdate).
-    expect(mockUpdate).not.toHaveBeenCalled();
+    // A draft cannot be armed or re-enqueued, but the done card must be parked
+    // with an actionable board-owned descriptor before its 7-day window expires.
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, {
+      status: "blocked",
+      unblockDescriptor: {
+        owner: "board",
+        action: expect.stringMatching(/gh pr ready 3158.*merge-arming\/republish/),
+      },
+    });
+    expect(hasUsableUnblockDescriptor(mockUpdate.mock.calls[0]![1].unblockDescriptor)).toBe(true);
     expect(mockAddComment).toHaveBeenCalledTimes(1);
-    const [commentIssueId, commentBody] = mockAddComment.mock.calls[0]!;
-    expect(commentIssueId).toBe(ISSUE);
-    expect(commentBody).toContain("still an open DRAFT");
     expect(wakeup).toHaveBeenCalledTimes(1);
     expect(wakeup).toHaveBeenCalledWith(AGENT, {
       source: "automation",
@@ -2769,7 +2774,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
     }));
     // The draft never touches the re-enqueue lane.
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
-    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({ status: "blocked" }));
   });
 
   it("a draft PR does not consume the MAX_REENQUEUE_ATTEMPTS cap or escalate — it reports draft-stranded", async () => {
@@ -2803,9 +2808,10 @@ describe("SUP-16689: draft-stranded done cards", () => {
       draftStranded: 1,
     });
 
-    // No re-enqueue attempt and no board escalation: a draft is un-armable.
+    // No re-enqueue attempt and no re-enqueue-cap escalation: the draft gets a
+    // board-owned park independently of prior queue attempts.
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
-    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({ status: "blocked" }));
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "issue.done_close_landing_draft_stranded",
       details: expect.objectContaining({ pr: "paperclipai/paperclip#3158", draft: true }),
@@ -2843,6 +2849,27 @@ describe("SUP-16689: draft-stranded done cards", () => {
       escalated: 0,
       draftStranded: 0,
     });
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+  });
+
+  it("retries the blocked park after a logged draft strand whose update failed", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [{
+        action: "issue.done_close_landing_draft_stranded",
+        entityId: ISSUE,
+        details: { pr: "paperclipai/paperclip#3158" },
+      }],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    await service.sweep();
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+      status: "blocked",
+      unblockDescriptor: expect.objectContaining({ owner: "board" }),
+    }));
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
   });

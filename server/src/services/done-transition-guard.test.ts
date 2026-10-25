@@ -3304,6 +3304,22 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("refuses a decision-carrying done close while its linked PR is a draft", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-draft", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-20810-work", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("4161");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb, issue.companyId, issue.id, { includeDrafts: true },
+      );
+    });
+
     // SUP-14429 (mechanism B): the decisionCarried carve-out must not waive an
     // open linked PR held by an undismissed external CHANGES_REQUESTED review.
     // The hydration pass now resolves the live GraphQL reviewDecision; only that
@@ -4989,6 +5005,23 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("refuses a decision-carrying close when the live-discovered PR is a draft", async () => {
+      setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+      mockFetchOpenPullRequests.mockResolvedValue({
+        ok: true, status: 200, message: null,
+        items: [{ ...prItems[0], draft: true }],
+      });
+      ghFetchMock.mockImplementation(async (url: string) =>
+        new Response(JSON.stringify(url.includes("/pulls/3264")
+          ? { state: "open", draft: true }
+          : { ahead_by: 0 }), { status: 200 }),
+      );
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("3264");
+    });
+
     it("blocks a plain close on the live-discovered open PR", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
@@ -5042,30 +5075,6 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(mockFetchOpenPullRequests).toHaveBeenCalledTimes(1);
     });
 
-    it("excludes draft and non-matching PRs from the live list", async () => {
-      setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
-      });
-      mockFetchOpenPullRequests.mockResolvedValue({
-        ok: true,
-        status: 200,
-        message: null,
-        items: [
-          { number: 1, draft: true, headRef: "SUP-12345-draft", title: "draft", body: null },
-          { number: 2, draft: false, headRef: "feature/unrelated", title: "unrelated change", body: null },
-        ],
-      });
-      ghFetchMock.mockImplementation(async (url: string) => {
-        if (url.includes("/compare/")) {
-          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
-        }
-        return new Response(JSON.stringify({}), { status: 200 });
-      });
-      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
-      expect(result.allowed).toBe(true);
-      expect(result.aheadBy).toBe(0);
-      expect(result.skipReason).toBeNull();
-    });
 
     // SUP-17162 second symptom: the live-discovery path must consume the SAME
     // anchored ownership predicate as discovery (merge-arming.ts), not a second
@@ -5426,7 +5435,29 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier1");
-      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb, "company-1", "issue-1", { includeDrafts: true },
+      );
+    });
+
+    it("refuses a linked open draft by name instead of treating it as an unrelated PR", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { ...linkedPr(4161), draft: true },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("PR #4161");
+      expect(result.reason).toContain("promote");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb, "company-1", "issue-1", { includeDrafts: true },
+      );
     });
 
     it("refuses landed-at-tip when GitHub credential resolution fails, and does not accept", async () => {

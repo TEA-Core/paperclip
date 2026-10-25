@@ -16,6 +16,12 @@ An approval comment that interrupts an active run reloads the issue after cancel
 
 The check runs on the PATCH verdict, board stage-decision, auto-approval comment, recovery decision, and final escalation-accept routes. Repository-free doc/gate cards retain their existing close semantics. Sanctioned no-deliverable-head overrides remain subject to the existing done guard; they do not bypass ladder or tier requirements.
 
+## Done-close draft safety
+
+The done-transition guard includes linked drafts when checking Tier-1 `landing-delegated` declarations and decision-carried closes. An open draft is a named `head_draft` refusal, not an unlinked PR or an eligible merge-arming exemption; the owner must mark the PR ready before submitting the close again. Live discovery and PR-state hydration retain the draft flag, so an owned draft not yet mentioned on the card and a PR converted to draft after caching are both checked.
+
+For older cards already closed `done` over a draft, the hourly done-close landing backstop parks the card `blocked` after its 24-hour grace with a board-owned action to mark the PR ready and republish approval at the ready head. Its draft audit row bounds duplicate comments, not the park: if the status update failed after logging, another sweep retries it before the 7-day discovery window expires. The carrier promotion sweep also keeps terminal parents eligible for its three-day age-cap trigger while their carrier PR is still an open draft. These paths do not publish approval or arm a draft merge.
+
 ## Certification and publication
 
 The decision transaction persists `executionState.approvalStatus.approvedHeadSha` and `finalDelivery` (`owner`, `repo`, `number`, `headSha`, `displayName`) from the preflight. Credentials are never persisted in that anchor. The post-commit hook uses this certification instead of certifying a later live head. `finalDelivery` is tagged with the decision id and every decision patch clears any prior-cycle `finalDelivery` first, so the hook only trusts a certification whose `decisionId` equals the card's `lastDecisionId`; a terminal approval that skips the preflight (sanctioned override accepted, repository-free) re-resolves the live head instead. The escalation-accept door mints its decision id inside the shared decision helper, so it re-tags the preflight certification with that id before running the hook. Publication remains delivery-identity-gated and pinned to both the reviewed SHA and repo/PR identity.

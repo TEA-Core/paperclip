@@ -516,7 +516,13 @@ async function hydrateLinkedPrState(
       // probe, and any probe failure degrades to null (fail open).
       const reviewDecision =
         state === "open" ? await fetchPullRequestReviewDecision(pr, token) : null;
-      return { ...pr, cachedState: state, lastErrorCode: null, reviewDecision };
+      return {
+        ...pr,
+        cachedState: state,
+        lastErrorCode: null,
+        reviewDecision,
+        draft: typeof body.draft === "boolean" ? body.draft : pr.draft,
+      };
     }
     return pr;
   } catch {
@@ -701,13 +707,19 @@ async function proveLandingDelegated(
   const number = Number(named[1]);
   let linked: LinkedPullRequest[];
   try {
-    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
-  if (!linked.some((pr) => pr.number === number)) {
+  const pr = linked.find((candidate) => candidate.number === number);
+  if (!pr) {
     return refuseTier1(
       `Tier 1 declaration using "landing-delegated" names PR #${number}, which is not a linked pull request.`,
+    );
+  }
+  if (pr.draft) {
+    return refuseTier1(
+      `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
     );
   }
   return acceptTier1(reason, sameRun);
@@ -1077,7 +1089,8 @@ async function liveDiscoverOpenLinkedPullRequests(
   const seen = new Set<string>();
   const prs: LinkedPullRequest[] = [];
   for (const item of listResult.items) {
-    if (item.draft === true) continue;
+    // Drafts must be visible to the done guard even though merge arming cannot
+    // act on them. The owned-PR predicate below still excludes mere citations.
     const headRef = (item.headRef ?? "").toLowerCase();
     const title = (item.title ?? "").toLowerCase();
     if (!isAnchoredCardPullRequest(headRef, title, needle, deliveryBranch, deliveryBranchIsOwn)) {
@@ -1097,6 +1110,7 @@ async function liveDiscoverOpenLinkedPullRequests(
       displayName: `${parsed.owner}/${parsed.repo}#${item.number}`,
       cachedState: "open",
       lastErrorCode: null,
+      draft: item.draft === true,
       reviewDecision: null,
     });
   }
@@ -2224,7 +2238,9 @@ async function evaluateDoneTransitionGuardCore(
     return cachedCtx;
   };
 
-  let resolvedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+  let resolvedPrs = await resolveLinkedPullRequestsWithState(
+    db, issue.companyId, issue.id, { includeDrafts: true },
+  );
 
   // SUP-13831: zero cached mention rows is a false negative when the PR was
   // never posted with its full URL. Live-discover open PRs carrying the issue
@@ -2296,6 +2312,22 @@ async function evaluateDoneTransitionGuardCore(
 
   if (openPrs.length > 0) {
     const prNames = openPrs.map((p) => p.displayName).join(", ");
+    const draftPrs = openPrs.filter((p) => p.draft);
+    if (draftPrs.length > 0) {
+      const draftNames = draftPrs.map((p) => p.displayName).join(", ");
+      return {
+        allowed: false,
+        reason: `head_draft: ${draftNames} ${draftPrs.length === 1 ? "is an" : "are"} open draft PR${draftPrs.length === 1 ? "" : "s"}; promote ${draftPrs.length === 1 ? "it" : "them"} out of draft before closing done or publishing approval.`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        mechanism: "delivery",
+        skipped: false,
+        skipReason: "head_draft",
+      };
+    }
     if (decisionCarried) {
       // SUP-14429 (mechanism B): narrow the D6 waiver to what it actually covers.
       // An open linked PR held by an undismissed external CHANGES_REQUESTED review

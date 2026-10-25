@@ -300,6 +300,24 @@ describe("createCarrierPromotionSweepService", () => {
     }));
   });
 
+  it.each(["done", "cancelled"])("promotes an open draft carrier even after its parent becomes %s", async (status) => {
+    const { service } = makeService(state({
+      parentRow: { id: PARENT, companyId: COMPANY, status, identifier: PARENT_IDENTIFIER },
+      draftRows: [draftRow({ prCreatedAt: STALE_ISO })],
+      siblingRows: [siblingRow(400, "open")],
+    }));
+    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
+
+    const result = await service.sweep();
+    expect(result.promoted).toBe(1);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: CARRIER_PROMOTION_READY_ACTION,
+      entityId: PARENT,
+      details: expect.objectContaining({ pr: "TEA-Core/paperclip#400" }),
+    }));
+  });
+
   it("leaves a young draft untouched when no trigger has fired", async () => {
     mockGetWakeable.mockResolvedValue(null);
     const { service } = makeService(state({

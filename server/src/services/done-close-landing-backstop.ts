@@ -85,11 +85,8 @@ export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed
 export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
 export const DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION = "issue.done_close_landing_reenqueue_refused";
 export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
-// SUP-16689: a decision-carried `done` card whose (only) linked PR is a still-open
-// DRAFT. A draft can never auto-merge, so the re-enqueue / confirmed / failed legs
-// all miss it, and the resolvers are draft-blind by default — leaving the card
-// silently unaudited until the 7-day discovery window ages its skip row out. This
-// row makes the strand visible and owned (report only: no re-enqueue, no quota).
+// An open draft cannot be armed. The audit row bounds comments, while a board
+// park keeps the issue actionable after the discovery window expires.
 export const DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION = "issue.done_close_landing_draft_stranded";
 // SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by the
 // prefix predicate cannot land through its own card. Instead of re-opening it
@@ -546,9 +543,9 @@ export function createDoneCloseLandingBackstopService(
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
-    // SUP-16689: per-card draft-stranded ledger. A draft PR is un-mergeable, so a
-    // `done` card whose only linked PR is an open draft is reported once per card;
-    // the per-card scope (entityId = issue.id) bounds the report like confirmed/failed.
+    // Per-card draft-stranded ledger bounds comments, not the required park.
+    // If an earlier update failed after logging, the next sweep must still
+    // repair the done card before the 7-day discovery window expires.
     const alreadyDraftStranded = new Set(
       existing
         .filter(
@@ -750,19 +747,10 @@ export function createDoneCloseLandingBackstopService(
         continue;
       }
 
-      // SUP-16689: a still-OPEN DRAFT can never land on its own — GitHub will not
-      // auto-merge a draft, so the re-enqueue / confirmed / failed legs all miss
-      // it. The resolvers are draft-blind by default; this sweep now passes
-      // `includeDrafts: true` specifically to SEE these, and reports the strand
-      // explicitly instead of letting the card age silently out of the 7-day
-      // discovery window. Report only: no re-enqueue, no escalation, and no
-      // MAX_REENQUEUE_ATTEMPTS quota consumed (a draft cannot be armed).
-      //
-      // The draft flag is read from the LIVE snapshot (`data.draft`), never the
-      // cached mention: a PR promoted out of draft must not be reported stranded,
-      // and a PR converted into draft must not enter the re-enqueue/escalate lane.
-      // When the live flag is unreadable, fail closed and defer — guessing either
-      // way would mis-disposition an open PR.
+      // A live open draft cannot enter the merge queue. Park the done card with
+      // an explicit board action; the audit row only suppresses repeated comments,
+      // never the park if an earlier update failed.
+      // Use the LIVE draft flag, not the cached mention. Unknown flags defer.
       if (draft === "unknown") {
         counts.deferred += 1;
         continue;
@@ -774,45 +762,53 @@ export function createDoneCloseLandingBackstopService(
           counts.deferred += 1;
           continue;
         }
-        if (alreadyDraftStranded.has(prKey)) {
-          // This card+PR was already reported as draft-stranded on a prior sweep.
-          continue;
-        }
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: "system",
-          actorId: DONE_CLOSE_LANDING_ACTOR_ID,
-          agentId: null,
-          runId: null,
-          agentApiKeyId: null,
-          action: DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
-          entityType: "issue",
-          entityId: issue.id,
-          issueId: issue.id,
-          details: {
-            identifier: issue.identifier ?? null,
-            pr: prKey,
-            prState: state,
-            draft: true,
-            skipReason: skipReason ?? null,
-            refusal: isArmingRefusal,
-          },
-        });
-        await deps.svc.addComment(
-          issue.id,
-          `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still an open DRAFT past the done-close grace window. A draft cannot be auto-merged, so this card cannot land until the PR is un-drafted (or merged another way). Promote the PR out of draft and re-verify the deliverable.`,
-          {},
-          { authorType: "system" },
-        );
-        if (opts.wakeup && issue.assigneeAgentId) {
-          await opts.wakeup(issue.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_commented",
-            payload: { issueId: issue.id, mutation: "comment" },
+        const alreadyReported = alreadyDraftStranded.has(prKey);
+        if (!alreadyReported) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              pr: prKey,
+              prState: state,
+              draft: true,
+              skipReason: skipReason ?? null,
+              refusal: isArmingRefusal,
+            },
           });
         }
-        counts.draftStranded += 1;
+        await deps.svc.update(issue.id, {
+          status: "blocked",
+          unblockDescriptor: {
+            owner: "board",
+            action: `Run gh pr ready ${pr.number} for ${prKey}, then republish approval at the ready head via the board merge-arming/republish action; verify the PR lands before closing this card done`,
+          },
+        });
+        if (!alreadyReported) {
+          await deps.svc.addComment(
+            issue.id,
+            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still an open DRAFT past the done-close grace window. This card is parked blocked until the PR is ready, approval is republished, and the deliverable lands.`,
+            {},
+            { authorType: "system" },
+          );
+          if (opts.wakeup && issue.assigneeAgentId) {
+            await opts.wakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: { issueId: issue.id, mutation: "comment" },
+            });
+          }
+          counts.draftStranded += 1;
+        }
         continue;
       }
 

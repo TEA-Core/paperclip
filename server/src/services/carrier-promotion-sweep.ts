@@ -15,14 +15,13 @@ import {
 /**
  * Carrier promotion sweep (PR-CARRIER-3).
  *
- * The control plane never creates or promotes pull requests. This sweep flips
- * a parent's draft carrier PR to ready-for-review when one of two triggers
- * fires: the parent's last child reaching terminal, via the EXISTING
- * `getWakeableParentAfterChildCompletion` (this sweep is its third consumer,
- * not a new predicate) — or three-day age-cap expiry. Cadence is the 1 h
- * sweep slot: the heartbeat tick fires the call every 30 s and the
- * min-interval gate inside `sweep` makes every non-due tick a no-op, shaped
- * exactly like `done-close-landing-backstop.ts`.
+ * This sweep flips a parent's draft carrier PR to ready-for-review when one
+ * of two triggers fires: the parent's last child reaching terminal, via the
+ * existing `getWakeableParentAfterChildCompletion`, or three-day age-cap
+ * expiry. The age cap also covers parents that became done or cancelled before
+ * their linked draft was promoted. Cadence is the 1 h sweep slot: the heartbeat
+ * tick fires the call every 30 s and the min-interval gate inside `sweep`
+ * makes every non-due tick a no-op, as in `done-close-landing-backstop.ts`.
  *
  * A PR only counts as the parent's carrier when its head branch starts with
  * the parent's identifier (the carrier branch is the parent's
@@ -240,8 +239,8 @@ export function createCarrierPromotionSweepService(
       .from(issues)
       .where(eq(issues.id, parentId));
     if (!parent) return;
-    // Terminal parents are the cancelled-parent case (PR-CARRIER-7), out of scope.
-    if (parent.status === "done" || parent.status === "cancelled") return;
+    // Terminal parents can still own a linked open draft carrier. The child
+    // wakeability trigger excludes them, but the age cap must remain available.
     const prefix = (parent.identifier ?? "").toLowerCase();
     if (!prefix) return;
     const carrierBranchPrefix = `${prefix}-`;
