@@ -2354,12 +2354,14 @@ async function evaluateDoneTransitionGuardCore(
 
   if (openPrs.length > 0) {
     const prNames = openPrs.map((p) => p.displayName).join(", ");
-    const draftPrs = openPrs.filter((p) => p.draft);
+    // Decision-carried closes are an approval: preflightTerminalApproval owns
+    // their draft refusal (approval_final_delivery_preflight), so only plain closes refuse here.
+    const draftPrs = decisionCarried ? [] : openPrs.filter((p) => p.draft);
     if (draftPrs.length > 0) {
       const draftNames = draftPrs.map((p) => p.displayName).join(", ");
       return {
         allowed: false,
-        reason: `head_draft: ${draftNames} ${draftPrs.length === 1 ? "is an" : "are"} open draft PR${draftPrs.length === 1 ? "" : "s"}; promote ${draftPrs.length === 1 ? "it" : "them"} out of draft before closing done or publishing approval.`,
+        reason: `head_draft: ${draftNames} ${draftPrs.length === 1 ? "is an" : "are"} open draft PR${draftPrs.length === 1 ? "" : "s"}; promote ${draftPrs.length === 1 ? "it" : "them"} out of draft before closing done.`,
         aheadBy: null,
         branch: null,
         defaultRef: null,

@@ -3310,7 +3310,23 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("refuses a decision-carrying done close while its linked PR is a draft", async () => {
+    it("refuses a plain done close while its linked PR is a draft", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-draft", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-12345-work", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("4161");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb, issue.companyId, issue.id, { includeDrafts: true },
+      );
+    });
+
+    it("leaves a decision-carrying close over a draft to the approval preflight", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
         { id: "pr-draft", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
           headRefName: "SUP-12345-work", displayName: "TEA-Core/paperclip#4161",
@@ -3318,12 +3334,8 @@ describe("evaluateDoneTransitionGuard", () => {
       ]);
       mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
-      expect(result.allowed).toBe(false);
-      expect(result.reason).toContain("head_draft");
-      expect(result.reason).toContain("4161");
-      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
-        mockDb, issue.companyId, issue.id, { includeDrafts: true },
-      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason ?? "").not.toContain("head_draft");
     });
 
     it("lets a decomposition child close while it merely mentions the parent's draft carrier", async () => {
@@ -3348,7 +3360,7 @@ describe("evaluateDoneTransitionGuard", () => {
           cachedState: "open", lastErrorCode: null, draft: true },
       ]);
       mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
-      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("head_draft");
       expect(result.reason).toContain("4162");
@@ -5039,7 +5051,7 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("refuses a decision-carrying close when the live-discovered PR is a draft", async () => {
+    it("refuses a plain close when the live-discovered PR is a draft", async () => {
       setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
       mockFetchOpenPullRequests.mockResolvedValue({
         ok: true, status: 200, message: null,
@@ -5050,7 +5062,7 @@ describe("evaluateDoneTransitionGuard", () => {
           ? { state: "open", draft: true }
           : { ahead_by: 0 }), { status: 200 }),
       );
-      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("head_draft");
       expect(result.reason).toContain("3264");
