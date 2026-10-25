@@ -18,8 +18,8 @@ import {
  * This sweep flips a parent's draft carrier PR to ready-for-review when one
  * of two triggers fires: the parent's last child reaching terminal, via the
  * existing `getWakeableParentAfterChildCompletion`, or three-day age-cap
- * expiry. The age cap also covers parents that became done or cancelled before
- * their linked draft was promoted. Cadence is the 1 h sweep slot: the heartbeat
+ * expiry. The age cap also covers parents that became done before their linked
+ * draft was promoted. Cadence is the 1 h sweep slot: the heartbeat
  * tick fires the call every 30 s and the min-interval gate inside `sweep`
  * makes every non-due tick a no-op, as in `done-close-landing-backstop.ts`.
  *
@@ -239,8 +239,9 @@ export function createCarrierPromotionSweepService(
       .from(issues)
       .where(eq(issues.id, parentId));
     if (!parent) return;
-    // Terminal parents can still own a linked open draft carrier. The child
-    // wakeability trigger excludes them, but the age cap must remain available.
+    // Done parents can still own a stranded draft carrier, so the age cap stays
+    // available. Cancelled parents are the cancelled-parent case (PR-CARRIER-7), out of scope.
+    if (parent.status === "cancelled") return;
     const prefix = (parent.identifier ?? "").toLowerCase();
     if (!prefix) return;
     const carrierBranchPrefix = `${prefix}-`;

@@ -300,9 +300,9 @@ describe("createCarrierPromotionSweepService", () => {
     }));
   });
 
-  it.each(["done", "cancelled"])("promotes an open draft carrier even after its parent becomes %s", async (status) => {
+  it("promotes an open draft carrier even after its parent becomes done", async () => {
     const { service } = makeService(state({
-      parentRow: { id: PARENT, companyId: COMPANY, status, identifier: PARENT_IDENTIFIER },
+      parentRow: { id: PARENT, companyId: COMPANY, status: "done", identifier: PARENT_IDENTIFIER },
       draftRows: [draftRow({ prCreatedAt: STALE_ISO })],
       siblingRows: [siblingRow(400, "open")],
     }));
@@ -316,6 +316,18 @@ describe("createCarrierPromotionSweepService", () => {
       entityId: PARENT,
       details: expect.objectContaining({ pr: "TEA-Core/paperclip#400" }),
     }));
+  });
+
+  it("leaves a cancelled parent's draft carrier untouched even past the age cap", async () => {
+    const { service } = makeService(state({
+      parentRow: { id: PARENT, companyId: COMPANY, status: "cancelled", identifier: PARENT_IDENTIFIER },
+      draftRows: [draftRow({ prCreatedAt: STALE_ISO })],
+      siblingRows: [siblingRow(400, "open")],
+    }));
+
+    const result = await service.sweep();
+    expect(result.promoted).toBe(0);
+    expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
   it("leaves a young draft untouched when no trigger has fired", async () => {

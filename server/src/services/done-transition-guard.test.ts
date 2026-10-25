@@ -5440,17 +5440,20 @@ describe("evaluateDoneTierDeclaration", () => {
       );
     });
 
-    it("refuses a linked open draft by name instead of treating it as an unrelated PR", async () => {
-      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
-        { ...linkedPr(4161), draft: true },
-      ]);
-      const result = await evaluateDoneTierDeclaration(
+    async function declareDelegated(prNumber: number, cached: Record<string, unknown>) {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...linkedPr(prNumber), ...cached }]);
+      return evaluateDoneTierDeclaration(
         mockDb,
         landedIssue(),
-        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        tier1Line(`landing-delegated PR #${prNumber}; post-merge carrier done-close-landing-backstop.`),
         null,
         () => Promise.resolve([]),
       );
+    }
+
+    it("refuses a linked PR that is live open and draft, by name", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true });
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("head_draft");
       expect(result.reason).toContain("PR #4161");
@@ -5458,6 +5461,24 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
         mockDb, "company-1", "issue-1", { includeDrafts: true },
       );
+    });
+
+    it("accepts once the PR was promoted, even though the cached row still reads draft", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: false }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true });
+      expect(result.allowed).toBe(true);
+    });
+
+    it("does not call a closed draft an open draft", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "closed", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, cachedState: "closed" });
+      expect(result.reason ?? "").not.toContain("head_draft");
+    });
+
+    it("does not refuse on a stale cached draft flag when live state is unavailable", async () => {
+      ghFetchMock.mockResolvedValue(new Response("{}", { status: 500 }));
+      const result = await declareDelegated(4161, { draft: true });
+      expect(result.allowed).toBe(true);
     });
 
     it("refuses landed-at-tip when GitHub credential resolution fails, and does not accept", async () => {

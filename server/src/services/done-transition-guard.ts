@@ -717,10 +717,18 @@ async function proveLandingDelegated(
       `Tier 1 declaration using "landing-delegated" names PR #${number}, which is not a linked pull request.`,
     );
   }
-  if (pr.draft) {
-    return refuseTier1(
-      `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
-    );
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    if (tokenResult.token !== null) {
+      const live = await hydrateLinkedPrState(pr, tokenResult.token);
+      if (live !== pr && live.cachedState === "open" && live.draft) {
+        return refuseTier1(
+          `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
+        );
+      }
+    }
+  } catch {
+    // Credential resolution failed: draft state is unverifiable, so do not refuse on a stale cached flag.
   }
   return acceptTier1(reason, sameRun);
 }
