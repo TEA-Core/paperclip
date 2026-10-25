@@ -674,6 +674,21 @@ export function createDoneCloseLandingBackstopService(
       measured.map((m) => m.pr),
     );
 
+    // The park is per card, not per PR: one blocked update names every own
+    // draft that needs `gh pr ready`, and one comment/wake covers the newly
+    // reported ones (sent on the last own draft's iteration).
+    const ownOpenDrafts = verdictEligible
+      ? measured.filter(
+          (m) =>
+            !alreadyConfirmed.has(m.prKey) &&
+            m.state === "open" &&
+            m.draft === true &&
+            isOwnDraft(m.pr),
+        )
+      : [];
+    const newlyStrandedDrafts: string[] = [];
+    let draftParked = false;
+
     for (const { pr, prKey, state, draft, closedAt } of measured) {
       // Confirmed siblings still participate in this pass's merged verdict,
       // but their earlier audit row must not be re-emitted.
@@ -785,16 +800,17 @@ export function createDoneCloseLandingBackstopService(
           continue;
         }
         const alreadyReported = alreadyDraftStranded.has(prKey);
-        if (!hasMergedSibling) {
+        if (!hasMergedSibling && !draftParked) {
           // Persist the park before the audit marker: a failed update must let
           // the next sweep retry the audit, comment and assignee wake together.
           await deps.svc.update(issue.id, {
             status: "blocked",
             unblockDescriptor: {
               owner: "board",
-              action: `Run gh pr ready ${pr.number} for ${prKey}, then republish approval at the ready head via the board merge-arming/republish action; verify the PR lands before closing this card done`,
+              action: `Run ${ownOpenDrafts.map((d) => `gh pr ready ${d.pr.number} for ${d.prKey}`).join("; ")}, then republish approval at the ready head via the board merge-arming/republish action; verify the PR lands before closing this card done`,
             },
           });
+          draftParked = true;
         }
         if (!alreadyReported) {
           await logActivity(db, {
@@ -825,10 +841,14 @@ export function createDoneCloseLandingBackstopService(
           // The card's work landed via the merged sibling: audit only.
           continue;
         }
-        if (!alreadyReported) {
+        if (!alreadyReported) newlyStrandedDrafts.push(prKey);
+        if (
+          newlyStrandedDrafts.length > 0 &&
+          prKey === ownOpenDrafts[ownOpenDrafts.length - 1]!.prKey
+        ) {
           await deps.svc.addComment(
             issue.id,
-            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still an open DRAFT past the done-close grace window. This card is parked blocked until the PR is ready, approval is republished, and the deliverable lands.`,
+            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${newlyStrandedDrafts.join(", ")} ${newlyStrandedDrafts.length === 1 ? "is" : "are"} still an open DRAFT past the done-close grace window. This card is parked blocked until ${newlyStrandedDrafts.length === 1 ? "the PR is" : "the PRs are"} ready, approval is republished, and the deliverable lands.`,
             {},
             { authorType: "system" },
           );

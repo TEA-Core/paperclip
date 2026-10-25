@@ -2685,6 +2685,37 @@ describe("SUP-16689: draft-stranded done cards", () => {
     });
   });
 
+  it("parks once for two own open drafts, naming both, with one comment and one wake", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const { service } = makeService(
+      { candidates: [candidateRow()], existingLandingRows: [] },
+      { wakeup },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ draft: true, headRefName: "SUP-13326-a" }),
+      linkedPr({
+        id: "eo-3159",
+        number: 3159,
+        displayName: "paperclipai/paperclip#3159",
+        draft: true,
+        headRefName: "SUP-13326-b",
+      }),
+    ]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    await expect(service.sweep()).resolves.toMatchObject({ draftStranded: 1 });
+
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const action = mockUpdate.mock.calls[0]![1].unblockDescriptor.action as string;
+    expect(action).toMatch(/gh pr ready 3158/);
+    expect(action).toMatch(/gh pr ready 3159/);
+    expect(mockLogActivity).toHaveBeenCalledTimes(2);
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    expect(mockAddComment.mock.calls[0]![1]).toContain("paperclipai/paperclip#3158");
+    expect(mockAddComment.mock.calls[0]![1]).toContain("paperclipai/paperclip#3159");
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("reports a draft PR discovered from the shared workspace (zero cached mentions) as draft-stranded (AC2)", async () => {
     const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
     const { service } = makeService(
