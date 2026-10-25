@@ -687,9 +687,20 @@ async function loadTier1RepoFields(
   };
 }
 
+function isOwnDraftCandidate(identifier: string | null, pr: LinkedPullRequest): boolean {
+  if (!identifier) return true;
+  return isAnchoredCardPullRequest(
+    (pr.headRefName ?? "").toLowerCase(),
+    (pr.title ?? "").toLowerCase(),
+    identifier.toLowerCase(),
+    null,
+    false,
+  );
+}
+
 async function proveLandingDelegated(
   db: Db,
-  issue: { id: string; companyId: string },
+  issue: { id: string; companyId: string; identifier: string | null },
   reason: string,
   sameRun: boolean,
 ): Promise<DoneTierDeclarationResult> {
@@ -721,7 +732,7 @@ async function proveLandingDelegated(
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     if (tokenResult.token !== null) {
       const live = await hydrateLinkedPrState(pr, tokenResult.token);
-      if (live !== pr && live.cachedState === "open" && live.draft) {
+      if (live !== pr && live.cachedState === "open" && live.draft && isOwnDraftCandidate(issue.identifier, pr)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
@@ -2311,7 +2322,10 @@ async function evaluateDoneTransitionGuardCore(
     });
   }
   const openPrs = resolvedPrs.filter(
-    (p) => p.cachedState === "open" && p.lastErrorCode !== "github_auth_required",
+    (p) =>
+      p.cachedState === "open" &&
+      p.lastErrorCode !== "github_auth_required" &&
+      (!p.draft || isOwnDraftCandidate(issue.identifier, p)),
   );
   const unhydratedCount = resolvedPrs.filter((p) => p.cachedState === null).length;
   if (unhydratedCount > 0) {

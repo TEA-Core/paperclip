@@ -3307,7 +3307,7 @@ describe("evaluateDoneTransitionGuard", () => {
     it("refuses a decision-carrying done close while its linked PR is a draft", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
         { id: "pr-draft", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
-          headRefName: "SUP-20810-work", displayName: "TEA-Core/paperclip#4161",
+          headRefName: "SUP-12345-work", displayName: "TEA-Core/paperclip#4161",
           cachedState: "open", lastErrorCode: null, draft: true },
       ]);
       mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
@@ -3318,6 +3318,20 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
         mockDb, issue.companyId, issue.id, { includeDrafts: true },
       );
+    });
+
+    it("lets a decomposition child close while it merely mentions the parent's draft carrier", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-carrier", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-99999-carrier", title: "SUP-99999: carrier", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      for (const decisionCarried of [true, false]) {
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, decisionCarried);
+        expect(result.reason ?? "").not.toContain("head_draft");
+        expect(result.reason ?? "").not.toContain("open linked PR");
+      }
     });
 
     // SUP-14429 (mechanism B): the decisionCarried carve-out must not waive an
@@ -5453,7 +5467,7 @@ describe("evaluateDoneTierDeclaration", () => {
 
     it("refuses a linked PR that is live open and draft, by name", async () => {
       ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
-      const result = await declareDelegated(4161, { draft: true });
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-12345-work" });
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("head_draft");
       expect(result.reason).toContain("PR #4161");
@@ -5465,19 +5479,25 @@ describe("evaluateDoneTierDeclaration", () => {
 
     it("accepts once the PR was promoted, even though the cached row still reads draft", async () => {
       ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: false }), { status: 200 }));
-      const result = await declareDelegated(4161, { draft: true });
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-12345-work" });
+      expect(result.allowed).toBe(true);
+    });
+
+    it("does not refuse a draft carrier owned by another card", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-99999-carrier" });
       expect(result.allowed).toBe(true);
     });
 
     it("does not call a closed draft an open draft", async () => {
       ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "closed", draft: true }), { status: 200 }));
-      const result = await declareDelegated(4161, { draft: true, cachedState: "closed" });
+      const result = await declareDelegated(4161, { draft: true, cachedState: "closed", headRefName: "SUP-12345-work" });
       expect(result.reason ?? "").not.toContain("head_draft");
     });
 
     it("does not refuse on a stale cached draft flag when live state is unavailable", async () => {
       ghFetchMock.mockResolvedValue(new Response("{}", { status: 500 }));
-      const result = await declareDelegated(4161, { draft: true });
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-12345-work" });
       expect(result.allowed).toBe(true);
     });
 

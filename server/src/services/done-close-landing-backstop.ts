@@ -782,8 +782,16 @@ export function createDoneCloseLandingBackstopService(
               draft: true,
               skipReason: skipReason ?? null,
               refusal: isArmingRefusal,
+              ...(hasMergedSibling
+                ? { supersededBy: mergedSiblingKeys.join(", ") }
+                : {}),
             },
           });
+        }
+        if (hasMergedSibling) {
+          // The card's work provably landed via the merged sibling: audit only,
+          // no park, comment, wake, or draftStranded count.
+          continue;
         }
         await deps.svc.update(issue.id, {
           status: "blocked",

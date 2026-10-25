@@ -2736,7 +2736,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
-  it("reports a draft PR as draft-stranded while a merged sibling is confirmed on the same card", async () => {
+  it("audits a stale draft as superseded without parking when a sibling merged on the same card", async () => {
     const { service } = makeService({
       candidates: [candidateRow()],
       existingLandingRows: [],
@@ -2759,10 +2759,10 @@ describe("SUP-16689: draft-stranded done cards", () => {
       deferred: 0,
       reenqueued: 0,
       escalated: 0,
-      draftStranded: 1,
+      draftStranded: 0,
     });
 
-    // Two audit rows: the merged sibling confirmed, the draft reported as stranded.
+    // Two audit rows: the merged sibling confirmed, the draft audited against the merged sibling.
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "issue.done_close_landing_confirmed",
@@ -2770,11 +2770,14 @@ describe("SUP-16689: draft-stranded done cards", () => {
     }));
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "issue.done_close_landing_draft_stranded",
-      details: expect.objectContaining({ pr: "paperclipai/paperclip#3158", prState: "open", draft: true }),
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#3158", prState: "open", draft: true, supersededBy: "paperclipai/paperclip#368",
+      }),
     }));
     // The draft never touches the re-enqueue lane.
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
-    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({ status: "blocked" }));
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
   });
 
   it("a draft PR does not consume the MAX_REENQUEUE_ATTEMPTS cap or escalate — it reports draft-stranded", async () => {
