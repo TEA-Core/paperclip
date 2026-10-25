@@ -632,7 +632,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(resumedIssue?.executionRunId).toBe(scheduled.run.id);
 
     claimRetryExecution.release.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await heartbeat.waitForRunExecutionDrain(scheduled.run.id);
   });
 
   it("leaves the issue execution pointer unset until a scheduled retry is claimed", async () => {
@@ -829,7 +829,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }
 
     claimRetryExecution.release.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await heartbeat.waitForRunExecutionDrain(scheduled.run.id);
   });
 
   it("binds a promoted retry to the issue and retires queued retry siblings atomically", async () => {
@@ -2109,7 +2109,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(issue?.executionRunId).toBe(scheduled.run.id);
 
     claimRetryExecution.release.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await heartbeat.waitForRunExecutionDrain(scheduled.run.id);
   });
 
   it("promotes duplicate max-turn continuations and retires the loser at claim", async () => {

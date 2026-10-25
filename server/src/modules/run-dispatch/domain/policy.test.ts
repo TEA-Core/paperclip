@@ -516,14 +516,14 @@ describe("native replacement execution authority", () => {
 
 
 describe("AI subscription wait ownership", () => {
-  it.each([null, "another-run"])("preserves assignee lock guards and admits only recorded non-assignee waits: %s", (issueExecutionRunId) => {
+  it.each([null, "another-run"])("does not require stale predecessor ownership at either retry gate: %s", (issueExecutionRunId) => {
     const gate = {
       ...baseGateFacts(), retryReasonKind: "ai_connection_wait" as const,
       enforceIssueExecutionLock: true, issueExecutionRunId,
     };
     const queued = { ...baseStalenessFacts(), retryReasonKind: "ai_connection_wait" as const, issueExecutionRunId };
-    expect(decideScheduledRetryGate(gate, NOW)).toMatchObject({ allowed: false, errorCode: "issue_execution_lock_changed" });
-    expect(decideQueuedRunStaleness(queued, NOW)).toMatchObject({ stale: true, errorCode: "issue_execution_lock_changed" });
+    expect(decideScheduledRetryGate(gate, NOW)).toEqual({ allowed: true });
+    expect(decideQueuedRunStaleness(queued, NOW)).toEqual({ stale: false });
     const nonAssignee = { issueAssigneeAgentId: "another-agent", isNonAssigneeWorkspaceBusyRetry: true };
     expect(decideScheduledRetryGate({ ...gate, ...nonAssignee }, NOW)).toEqual({ allowed: true });
     expect(decideQueuedRunStaleness({ ...queued, ...nonAssignee }, NOW)).toEqual({ stale: false });
