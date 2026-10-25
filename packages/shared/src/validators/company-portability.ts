@@ -149,6 +149,7 @@ export const portabilityIssueRoutineTriggerManifestEntrySchema = z.object({
 export const portabilityIssueRoutineManifestEntrySchema = z.object({
   concurrencyPolicy: z.string().nullable(),
   catchUpPolicy: z.string().nullable(),
+  executionWorkspacePreference: z.string().nullable().optional(),
   variables: z.array(routineVariableSchema).nullable().optional(),
   triggers: z.array(portabilityIssueRoutineTriggerManifestEntrySchema).default([]),
 });

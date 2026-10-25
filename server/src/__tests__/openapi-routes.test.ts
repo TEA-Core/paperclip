@@ -1758,3 +1758,27 @@ describe("openapi auth parity (SUP-14798)", () => {
     }
   });
 });
+
+describe("routine executionWorkspacePreference contract (SUP-21022)", () => {
+  const routineSpec = buildOpenApiSpec() as any;
+  const bodyProperty = (routePath: string, method: "post" | "patch") =>
+    routineSpec.paths[routePath][method].requestBody.content["application/json"].schema.properties
+      .executionWorkspacePreference;
+
+  it("omits reuse_existing from the create and update enums", () => {
+    for (const [routePath, method] of [
+      ["/api/companies/{companyId}/routines", "post"],
+      ["/api/routines/{id}", "patch"],
+    ] as const) {
+      const property = bodyProperty(routePath, method);
+      const values = JSON.stringify(property);
+      expect(values, `${method} ${routePath}`).toContain("shared_workspace");
+      expect(values, `${method} ${routePath}`).not.toContain("reuse_existing");
+    }
+  });
+
+  it("documents the policy 422 on create and update", () => {
+    expect(routineSpec.paths["/api/companies/{companyId}/routines"].post.responses["422"]).toBeDefined();
+    expect(routineSpec.paths["/api/routines/{id}"].patch.responses["422"]).toBeDefined();
+  });
+});

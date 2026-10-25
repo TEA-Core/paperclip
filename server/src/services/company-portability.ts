@@ -40,6 +40,7 @@ import type {
   CompanyPortabilitySidebarOrder,
   CompanyPortabilitySkillManifestEntry,
   CompanySkill,
+  CreateRoutine,
   AgentEnvConfig,
   PermissionKey,
   RoutineVariable,
@@ -55,6 +56,7 @@ import {
   ROUTINE_STATUSES,
   ROUTINE_TRIGGER_KINDS,
   ROUTINE_TRIGGER_SIGNING_MODES,
+  createRoutineSchema,
   deriveProjectUrlKey,
   envConfigSchema,
   issueCommentAuthorTypeSchema,
@@ -1261,6 +1263,7 @@ function normalizeRoutineExtension(value: unknown): CompanyPortabilityIssueRouti
   const routine = {
     concurrencyPolicy: asString(value.concurrencyPolicy),
     catchUpPolicy: asString(value.catchUpPolicy),
+    executionWorkspacePreference: asString(value.executionWorkspacePreference),
     variables,
     triggers,
   };
@@ -1271,6 +1274,7 @@ function buildRoutineManifestFromLiveRoutine(routine: RoutineLike): CompanyPorta
   return {
     concurrencyPolicy: routine.concurrencyPolicy,
     catchUpPolicy: routine.catchUpPolicy,
+    executionWorkspacePreference: routine.executionWorkspacePreference ?? null,
     variables: routine.variables,
     triggers: routine.triggers.map((trigger) => ({
       kind: trigger.kind,
@@ -1799,12 +1803,14 @@ function resolvePortableRoutineDefinition(
     ? {
       concurrencyPolicy: issue.routine.concurrencyPolicy,
       catchUpPolicy: issue.routine.catchUpPolicy,
+      executionWorkspacePreference: issue.routine.executionWorkspacePreference ?? null,
       variables: issue.routine.variables ?? null,
       triggers: [...issue.routine.triggers],
     }
     : {
       concurrencyPolicy: null,
       catchUpPolicy: null,
+      executionWorkspacePreference: null,
       variables: null,
       triggers: [] as CompanyPortabilityIssueRoutineTriggerManifestEntry[],
     };
@@ -1814,6 +1820,12 @@ function resolvePortableRoutineDefinition(
   }
   if (routine.catchUpPolicy && !ROUTINE_CATCH_UP_POLICIES.includes(routine.catchUpPolicy as any)) {
     errors.push(`Recurring task ${issue.slug} uses unsupported routine catchUpPolicy "${routine.catchUpPolicy}".`);
+  }
+  if (
+    routine.executionWorkspacePreference &&
+    !createRoutineSchema.shape.executionWorkspacePreference.safeParse(routine.executionWorkspacePreference).success
+  ) {
+    errors.push(`Recurring task ${issue.slug} uses unsupported routine executionWorkspacePreference "${routine.executionWorkspacePreference}".`);
   }
 
   for (const trigger of routine.triggers) {
@@ -4617,6 +4629,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         priority: routine.priority !== "medium" ? routine.priority : undefined,
         concurrencyPolicy: routine.concurrencyPolicy !== "coalesce_if_active" ? routine.concurrencyPolicy : undefined,
         catchUpPolicy: routine.catchUpPolicy !== "skip_missed" ? routine.catchUpPolicy : undefined,
+        executionWorkspacePreference: routine.executionWorkspacePreference ?? undefined,
         variables: (routine.variables ?? []).length > 0 ? routine.variables : undefined,
         triggers: routine.triggers.map((trigger) => stripEmptyValues({
           kind: trigger.kind,
@@ -6042,6 +6055,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             const routineDefinition = resolvedRoutine.routine ?? {
               concurrencyPolicy: null,
               catchUpPolicy: null,
+              executionWorkspacePreference: null,
               variables: null,
               triggers: [],
             };
@@ -6068,6 +6082,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
                 routineDefinition.catchUpPolicy && ROUTINE_CATCH_UP_POLICIES.includes(routineDefinition.catchUpPolicy as any)
                   ? routineDefinition.catchUpPolicy as typeof ROUTINE_CATCH_UP_POLICIES[number]
                   : "skip_missed",
+              executionWorkspacePreference: (routineDefinition.executionWorkspacePreference ??
+                null) as CreateRoutine["executionWorkspacePreference"],
               variables: routineDefinition.variables ?? [],
             }, {
               agentId: null,

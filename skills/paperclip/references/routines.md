@@ -56,6 +56,7 @@ POST /api/companies/{companyId}/routines
 | `status` | no | `active` (default) `paused` `archived` |
 | `concurrencyPolicy` | no | See below |
 | `catchUpPolicy` | no | See below |
+| `executionWorkspacePreference` | no | Workspace for run issues: `inherit`, `shared_workspace`, `isolated_workspace`, `operator_branch`, `agent_default` (not `reuse_existing`). Unset = project default. `shared_workspace` avoids provisioning a worktree per run. With isolated workspaces enabled and a project policy of `allowIssueOverride: false`, any value other than `inherit` is refused with 422 (`details.code` `workspace_issue_override_disallowed`) |
 | `activityGatePolicy` | no | `always` (default) or `require_external_activity`; see below |
 | `activityGateScope` | no | `company` (default) or `project`; see below |
 

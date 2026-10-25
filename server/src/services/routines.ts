@@ -58,11 +58,12 @@ import {
   syncRoutineVariablesWithTemplate,
 } from "@paperclipai/shared";
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
+import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { issueService } from "./issues.js";
+import { assertIssueExecutionWorkspaceOverrideAllowed, issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -557,6 +558,39 @@ function createRoutineDispatchFingerprint(input: {
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
+const ROUTINE_WRITE_LOCK_TIMEOUT_MS = 15_000;
+const ROUTINE_WORKSPACE_PREFERENCE_MODES = new Set([
+  "shared_workspace",
+  "isolated_workspace",
+  "operator_branch",
+  "agent_default",
+]);
+
+function resolveRoutineWorkspaceSelection(input: {
+  routine: { executionWorkspacePreference?: string | null };
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: Record<string, unknown> | null;
+}) {
+  const runSuppliedSelection =
+    input.executionWorkspaceId != null ||
+    input.executionWorkspacePreference != null ||
+    input.executionWorkspaceSettings != null;
+  const preference = input.routine.executionWorkspacePreference ?? null;
+  if (runSuppliedSelection || !preference) {
+    return {
+      executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+      executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+    };
+  }
+  // Issue creation resolves the workspace from executionWorkspaceSettings.mode,
+  // so the preference is mirrored there ("inherit" leaves the project default).
+  return {
+    executionWorkspacePreference: preference,
+    executionWorkspaceSettings: ROUTINE_WORKSPACE_PREFERENCE_MODES.has(preference) ? { mode: preference } : null,
+  };
+}
+
 function createRoutineEnvFingerprint(env: unknown) {
   const canonical = JSON.stringify(normalizeRoutineDispatchFingerprintValue(env ?? null));
   return crypto.createHash("sha256").update(canonical).digest("hex");
@@ -596,6 +630,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     executionPolicy: routine.executionPolicy ?? null,
+    executionWorkspacePreference: routine.executionWorkspacePreference ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
   };
 }
@@ -1189,6 +1224,47 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
     if (!project) throw notFound("Project not found");
     if (project.companyId !== companyId) throw unprocessable("Project must belong to same company");
+  }
+
+  async function loadIsolatedWorkspacesEnabled() {
+    return (await instanceSettings.getExperimental()).enableIsolatedWorkspaces === true;
+  }
+
+  // Inside a transaction, pass the transaction's executor and a pre-read flag so no read leaves the
+  // transaction's connection, plus lockProject so a concurrent policy change waits for this write.
+  async function assertRoutineWorkspacePreferenceAllowed(
+    projectId: string | null | undefined,
+    preference: string | null | undefined,
+    options: { executor?: Db; isolatedWorkspacesEnabled?: boolean; lockProject?: boolean } = {},
+  ) {
+    if (!projectId || !preference) return;
+    const enabled = options.isolatedWorkspacesEnabled ?? (await loadIsolatedWorkspacesEnabled());
+    if (!enabled) return;
+    const query = (options.executor ?? db)
+      .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+      .from(projects)
+      .where(eq(projects.id, projectId));
+    const project = await (options.lockProject ? query.for("share") : query).then((rows) => rows[0] ?? null);
+    assertIssueExecutionWorkspaceOverrideAllowed({
+      projectPolicy: parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy),
+      suppliedExecutionWorkspaceId: null,
+      suppliedExecutionWorkspacePreference: preference,
+    });
+  }
+
+  // Bounds how long a routine write may wait on a row lock, and reports a timeout as a retryable conflict.
+  async function runRoutineWriteTransaction<T>(fn: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<T>) {
+    try {
+      return await db.transaction(async (tx) => {
+        await tx.execute(sql`select set_config('lock_timeout', ${`${ROUTINE_WRITE_LOCK_TIMEOUT_MS}ms`}, true)`);
+        return fn(tx);
+      });
+    } catch (error) {
+      const code = (error as { code?: string; cause?: { code?: string } } | null)?.code
+        ?? (error as { cause?: { code?: string } } | null)?.cause?.code;
+      if (code === "55P03") throw conflict("Routine is busy; retry the request");
+      throw error;
+    }
   }
 
   async function assertGoal(companyId: string, goalId: string) {
@@ -1898,6 +1974,9 @@ export function routineService(
     }
     await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
     const automaticVariables: Record<string, string | number | boolean> = {};
+    // SUP-21022: a routine-level preference only applies when the run supplies
+    // no workspace selection of its own, so manual/API overrides still win.
+    const routineWorkspace = resolveRoutineWorkspaceSelection(input);
     if (input.executionWorkspaceId && routineUsesWorkspaceBranch(input.routine)) {
       const workspace = await db
         .select({
@@ -1943,8 +2022,8 @@ export function routineService(
       routineRevisionId: input.routine.latestRevisionId,
       routineEnvFingerprint: createRoutineEnvFingerprint(input.routine.env),
       executionWorkspaceId: input.executionWorkspaceId ?? null,
-      executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-      executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+      executionWorkspacePreference: routineWorkspace.executionWorkspacePreference,
+      executionWorkspaceSettings: routineWorkspace.executionWorkspaceSettings,
       title,
       description,
     });
@@ -2084,8 +2163,8 @@ export function routineService(
             // instead of collapsing to null and inheriting the project default.
             trustExplicitExecutionPolicy: input.routine.executionPolicy != null,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
-            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            executionWorkspacePreference: routineWorkspace.executionWorkspacePreference,
+            executionWorkspaceSettings: routineWorkspace.executionWorkspaceSettings,
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2356,6 +2435,7 @@ export function routineService(
 
     create: async (companyId: string, input: CreateRoutine, actor: Actor): Promise<Routine> => {
       await assertProject(companyId, input.projectId ?? null);
+      await assertRoutineWorkspacePreferenceAllowed(input.projectId, input.executionWorkspacePreference);
       await assertRoutineFolder(companyId, input.folderId ?? null);
       await assertAssignableAgent(db, companyId, input.assigneeAgentId ?? null, { kind: "routine" });
       if (input.goalId) await assertGoal(companyId, input.goalId);
@@ -2376,8 +2456,16 @@ export function routineService(
       if (!responsibleUserId) {
         throw unprocessable("Routine requires a responsible user");
       }
-      const createdRoutine = await db.transaction(async (tx) => {
+      const isolatedWorkspacesEnabled = input.executionWorkspacePreference
+        ? await loadIsolatedWorkspacesEnabled()
+        : false;
+      const createdRoutine = await runRoutineWriteTransaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await assertRoutineWorkspacePreferenceAllowed(input.projectId, input.executionWorkspacePreference, {
+          executor: txDb,
+          isolatedWorkspacesEnabled,
+          lockProject: true,
+        });
         const [created] = await txDb
           .insert(routines)
           .values({
@@ -2398,6 +2486,7 @@ export function routineService(
             variables,
             env,
             executionPolicy: input.executionPolicy ?? null,
+            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2449,6 +2538,14 @@ export function routineService(
         patch.variables === undefined ? existing.variables : sanitizeRoutineVariableInputs(patch.variables),
       );
       if (patch.projectId !== undefined) await assertProject(existing.companyId, nextProjectId);
+      if (patch.projectId !== undefined || patch.executionWorkspacePreference !== undefined) {
+        await assertRoutineWorkspacePreferenceAllowed(
+          nextProjectId,
+          patch.executionWorkspacePreference === undefined
+            ? existing.executionWorkspacePreference
+            : patch.executionWorkspacePreference,
+        );
+      }
       if (patch.folderId !== undefined) await assertRoutineFolder(existing.companyId, nextFolderId);
       if (patch.assigneeAgentId !== undefined || patch.status === "active") {
         await assertAssignableAgent(db, existing.companyId, nextAssigneeAgentId, { kind: "routine" });
@@ -2480,7 +2577,10 @@ export function routineService(
       if (!responsibleUserId) {
         throw unprocessable("Routine requires a responsible user");
       }
-      const updatedRoutine = await db.transaction(async (tx) => {
+      const isolatedWorkspacesEnabled = patch.projectId !== undefined || patch.executionWorkspacePreference !== undefined
+        ? await loadIsolatedWorkspacesEnabled()
+        : false;
+      const updatedRoutine = await runRoutineWriteTransaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${id} for update`);
         const locked = await txDb
@@ -2496,9 +2596,22 @@ export function routineService(
           });
         }
 
+        // The pre-lock policy check used a stale row; re-run it on the final (project, preference) pair.
+        const finalProjectId = patch.projectId === undefined ? locked.projectId : patch.projectId;
+        const finalPreference = patch.executionWorkspacePreference === undefined
+          ? locked.executionWorkspacePreference
+          : patch.executionWorkspacePreference;
+        if (patch.projectId !== undefined || patch.executionWorkspacePreference !== undefined) {
+          await assertRoutineWorkspacePreferenceAllowed(finalProjectId, finalPreference, {
+            executor: txDb,
+            isolatedWorkspacesEnabled,
+            lockProject: true,
+          });
+        }
+
         const candidate: RoutineRow = {
           ...locked,
-          projectId: nextProjectId,
+          projectId: finalProjectId,
           folderId: nextFolderId,
           goalId: patch.goalId === undefined ? locked.goalId : patch.goalId,
           parentIssueId: patch.parentIssueId === undefined ? locked.parentIssueId : patch.parentIssueId,
@@ -2514,6 +2627,7 @@ export function routineService(
           variables: nextVariables,
           env: nextEnv,
           executionPolicy: patch.executionPolicy === undefined ? locked.executionPolicy : patch.executionPolicy,
+          executionWorkspacePreference: finalPreference,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2580,6 +2694,7 @@ export function routineService(
             variables: candidate.variables,
             env: candidate.env,
             executionPolicy: candidate.executionPolicy,
+            executionWorkspacePreference: candidate.executionWorkspacePreference,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2862,8 +2977,15 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      await assertRoutineWorkspacePreferenceAllowed(
+        routineSnapshot.projectId,
+        routineSnapshot.executionWorkspacePreference,
+      );
 
-      const result = await db.transaction(async (tx) => {
+      const isolatedWorkspacesEnabled = routineSnapshot.executionWorkspacePreference
+        ? await loadIsolatedWorkspacesEnabled()
+        : false;
+      const result = await runRoutineWriteTransaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existingRoutine.id} for update`);
         const locked = await txDb
@@ -2872,6 +2994,11 @@ export function routineService(
           .where(eq(routines.id, existingRoutine.id))
           .then((rows) => rows[0] ?? null);
         if (!locked) throw notFound("Routine not found");
+        await assertRoutineWorkspacePreferenceAllowed(
+          routineSnapshot.projectId,
+          routineSnapshot.executionWorkspacePreference,
+          { executor: txDb, isolatedWorkspacesEnabled, lockProject: true },
+        );
         if (locked.latestRevisionId === targetRevision.id) {
           throw conflict("Selected revision is already the latest revision", {
             currentRevisionId: locked.latestRevisionId,
@@ -2919,6 +3046,7 @@ export function routineService(
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
             executionPolicy: routineSnapshot.executionPolicy ?? null,
+            executionWorkspacePreference: routineSnapshot.executionWorkspacePreference ?? null,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,

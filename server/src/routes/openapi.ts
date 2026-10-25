@@ -4705,11 +4705,13 @@ registry.registerPath({
   path: "/api/companies/{companyId}/routines",
   tags: ["routines"],
   summary: "Create a routine",
+  description:
+    "executionWorkspacePreference is refused with 422 workspace_issue_override_disallowed (details.code) when the routine's project policy has allowIssueOverride=false.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createRoutineSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 422: r.unprocessable },
 });
 
 registry.registerPath({
@@ -4726,11 +4728,13 @@ registry.registerPath({
   path: "/api/routines/{id}",
   tags: ["routines"],
   summary: "Update a routine",
+  description:
+    "executionWorkspacePreference is refused with 422 workspace_issue_override_disallowed (details.code) when the routine's resulting project policy has allowIssueOverride=false.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateRoutineSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 422: r.unprocessable },
 });
 
 registry.registerPath({

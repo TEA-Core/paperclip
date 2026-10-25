@@ -63,6 +63,11 @@ export const routineVariableSchema = z.object({
   }
 });
 
+// "reuse_existing" needs an execution workspace id, which a routine cannot carry.
+const routineExecutionWorkspacePreferenceSchema = z
+  .enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES)
+  .exclude(["reuse_existing"]);
+
 export const createRoutineSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   folderId: z.string().guid().optional().nullable(),
@@ -80,6 +85,7 @@ export const createRoutineSchema = z.object({
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
   executionPolicy: issueExecutionPolicySchema.optional().nullable(),
+  executionWorkspacePreference: routineExecutionWorkspacePreferenceSchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -108,6 +114,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   variables: z.array(routineVariableSchema),
   env: envConfigSchema.nullable().default(null),
   executionPolicy: issueExecutionPolicySchema.nullable().default(null),
+  executionWorkspacePreference: routineExecutionWorkspacePreferenceSchema.nullable().optional(),
   responsibleUserId: z.string().nullable().default(null),
 }).strict();
 

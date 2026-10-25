@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +16,7 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  folders,
   heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
@@ -152,7 +153,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     vi.clearAllMocks();
   });
 
-  async function createApp(actor: Record<string, unknown>) {
+  async function createApp(actor: Record<string, unknown>, database: typeof db = db) {
     const { routineRoutes } = await import("../routes/routines.js");
     const { errorHandler } = await import("../middleware/index.js");
     const app = express();
@@ -161,7 +162,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       (req as any).actor = actor;
       next();
     });
-    app.use("/api", routineRoutes(db));
+    app.use("/api", routineRoutes(database));
     app.use(reportUnexpectedRouteError("routines-e2e"));
     app.use(errorHandler);
     return app;
@@ -888,4 +889,494 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       executionWorkspaceSettings: { mode: "isolated_workspace" },
     });
   });
+
+  async function seedIsolatedByDefaultProject(companyId: string, projectId: string) {
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+      sharedWorkspaceKey: "routine-primary",
+    });
+    await db
+      .update(projects)
+      .set({
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          defaultProjectWorkspaceId: projectWorkspaceId,
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      })
+      .where(eq(projects.id, projectId));
+    await db
+      .insert(instanceSettings)
+      .values({ experimental: { enableIsolatedWorkspaces: true } })
+      .onConflictDoUpdate({
+        target: instanceSettings.singletonKey,
+        set: { experimental: { enableIsolatedWorkspaces: true } },
+      });
+  }
+
+  it("creates issues in the shared workspace when the routine sets executionWorkspacePreference (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Shared-workspace routine",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    expect(createRes.body.executionWorkspacePreference).toBe("shared_workspace");
+
+    const detailRes = await request(app).get(`/api/routines/${createRes.body.id}`);
+    expect(detailRes.status).toBe(200);
+    expect(detailRes.body.executionWorkspacePreference).toBe("shared_workspace");
+
+    const runRes = await postRoutineRun(app, createRes.body.id, { source: "manual" });
+    expect(runRes.status).toBe(202);
+
+    const [issue] = await db
+      .select({
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+        executionWorkspaceSettings: issues.executionWorkspaceSettings,
+      })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+    expect(issue?.executionWorkspacePreference).toBe("shared_workspace");
+    expect(issue?.executionWorkspaceSettings).toEqual({ mode: "shared_workspace" });
+  }, 15_000);
+
+  it("keeps the project workspace default for routines without executionWorkspacePreference (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Default-workspace routine", assigneeAgentId: agentId });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    expect(createRes.body.executionWorkspacePreference ?? null).toBeNull();
+
+    const runRes = await postRoutineRun(app, createRes.body.id, { source: "manual" });
+    expect(runRes.status).toBe(202);
+
+    const [issue] = await db
+      .select({
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+        executionWorkspaceSettings: issues.executionWorkspaceSettings,
+      })
+      .from(issues)
+      .where(eq(issues.id, runRes.body.linkedIssueId));
+    expect(issue?.executionWorkspacePreference ?? null).toBeNull();
+    expect(issue?.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
+  }, 15_000);
+
+  it("lets a routine PATCH set and clear executionWorkspacePreference and rejects reuse_existing (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Patched routine", assigneeAgentId: agentId });
+    expect([200, 201]).toContain(createRes.status);
+
+    const setRes = await request(app)
+      .patch(`/api/routines/${createRes.body.id}`)
+      .send({ executionWorkspacePreference: "shared_workspace" });
+    expect(setRes.status, JSON.stringify(setRes.body)).toBe(200);
+    expect(setRes.body.executionWorkspacePreference).toBe("shared_workspace");
+
+    const badRes = await request(app)
+      .patch(`/api/routines/${createRes.body.id}`)
+      .send({ executionWorkspacePreference: "reuse_existing" });
+    expect(badRes.status).toBe(400);
+
+    const clearRes = await request(app)
+      .patch(`/api/routines/${createRes.body.id}`)
+      .send({ executionWorkspacePreference: null });
+    expect(clearRes.status).toBe(200);
+    expect(clearRes.body.executionWorkspacePreference ?? null).toBeNull();
+  }, 15_000);
+
+  async function setAllowIssueOverride(projectId: string, allowIssueOverride: boolean) {
+    const [project] = await db
+      .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+      .from(projects)
+      .where(eq(projects.id, projectId));
+    await db
+      .update(projects)
+      .set({
+        executionWorkspacePolicy: {
+          ...((project?.executionWorkspacePolicy as Record<string, unknown> | null) ?? {}),
+          allowIssueOverride,
+        },
+      })
+      .where(eq(projects.id, projectId));
+  }
+
+  it("enforces project allowIssueOverride on routine executionWorkspacePreference at create and PATCH (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    await setAllowIssueOverride(projectId, false);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const refusedCreate = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Override-disallowed routine",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect(refusedCreate.status, JSON.stringify(refusedCreate.body)).toBe(422);
+    expect(refusedCreate.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    const inheritCreate = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Inherit routine",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "inherit",
+      });
+    expect([200, 201], JSON.stringify(inheritCreate.body)).toContain(inheritCreate.status);
+
+    const unsetCreate = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Unset routine", assigneeAgentId: agentId });
+    expect([200, 201], JSON.stringify(unsetCreate.body)).toContain(unsetCreate.status);
+
+    const refusedPatch = await request(app)
+      .patch(`/api/routines/${unsetCreate.body.id}`)
+      .send({ executionWorkspacePreference: "shared_workspace" });
+    expect(refusedPatch.status, JSON.stringify(refusedPatch.body)).toBe(422);
+    expect(refusedPatch.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    await setAllowIssueOverride(projectId, true);
+    const allowedCreate = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Override-allowed routine",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect([200, 201], JSON.stringify(allowedCreate.body)).toContain(allowedCreate.status);
+    const allowedPatch = await request(app)
+      .patch(`/api/routines/${unsetCreate.body.id}`)
+      .send({ executionWorkspacePreference: "shared_workspace" });
+    expect(allowedPatch.status, JSON.stringify(allowedPatch.body)).toBe(200);
+  }, 30_000);
+
+  it("refuses moving a preference-bearing routine into a project that disallows overrides (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const strictProjectId = randomUUID();
+    await db.insert(projects).values({
+      id: strictProjectId,
+      companyId,
+      name: "Strict project",
+      status: "in_progress",
+      executionWorkspacePolicy: { enabled: true, allowIssueOverride: false },
+    });
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Movable routine",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+
+    const moveRes = await request(app)
+      .patch(`/api/routines/${createRes.body.id}`)
+      .send({ projectId: strictProjectId });
+    expect(moveRes.status, JSON.stringify(moveRes.body)).toBe(422);
+    expect(moveRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+  }, 30_000);
+
+  it("revalidates the final project and preference under the routine lock when PATCHes race (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const strictProjectId = randomUUID();
+    await db.insert(projects).values({
+      id: strictProjectId,
+      companyId,
+      name: "Strict project",
+      status: "in_progress",
+      executionWorkspacePolicy: { enabled: true, allowIssueOverride: false },
+    });
+    const folderId = randomUUID();
+    await db.insert(folders).values({
+      id: folderId,
+      companyId,
+      kind: "routine",
+      name: "Race folder",
+      slug: "race-folder",
+    });
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Racing routine", assigneeAgentId: agentId });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    const routineId = createRes.body.id as string;
+
+    // Park request 1 after its pre-lock policy check by holding a lock on the folder lookup it does next.
+    let releaseFolderLock!: () => void;
+    const folderLockHeld = new Promise<void>((resolve) => {
+      releaseFolderLock = resolve;
+    });
+    let folderLockAcquired!: () => void;
+    const folderLockReady = new Promise<void>((resolve) => {
+      folderLockAcquired = resolve;
+    });
+    const lockHolder = db.transaction(async (tx) => {
+      await tx.execute(sql`lock table folders in access exclusive mode`);
+      folderLockAcquired();
+      await folderLockHeld;
+    });
+    await folderLockReady;
+
+    const moveRequest = request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ projectId: strictProjectId, folderId })
+      .then((res) => res);
+    for (let i = 0; i < 100; i += 1) {
+      const waiting = await db.execute(
+        sql`select 1 from pg_stat_activity where wait_event_type = 'Lock' and query ilike '%folders%'`,
+      );
+      if (waiting.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    const preferenceRes = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ executionWorkspacePreference: "shared_workspace" });
+    expect(preferenceRes.status, JSON.stringify(preferenceRes.body)).toBe(200);
+
+    releaseFolderLock();
+    await lockHolder;
+    const moveRes = await moveRequest;
+    expect(moveRes.status, JSON.stringify(moveRes.body)).toBe(422);
+    expect(moveRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    const [stored] = await db
+      .select({
+        projectId: routines.projectId,
+        executionWorkspacePreference: routines.executionWorkspacePreference,
+      })
+      .from(routines)
+      .where(eq(routines.id, routineId));
+    expect(stored).toEqual({ projectId, executionWorkspacePreference: "shared_workspace" });
+  }, 30_000);
+
+  describe.each([1, 2, 5])("with a connection pool of %i (SUP-21022)", (maxConnections) => {
+    it("completes concurrent routine PATCHes without stalling on the pool", async () => {
+      const { companyId, agentId, projectId, userId } = await seedFixture();
+      await seedIsolatedByDefaultProject(companyId, projectId);
+      const limitedDb = createDb(tempDb!.connectionString, { maxConnections });
+      const actor = {
+        type: "board",
+        userId,
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      };
+      const app = await createApp(actor, limitedDb);
+      const createRes = await request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({ projectId, title: "Pool routine", assigneeAgentId: agentId });
+      expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+
+      const preferences = ["shared_workspace", "isolated_workspace", "inherit", "agent_default"];
+      const burst = Promise.all(
+        Array.from({ length: Math.max(maxConnections * 2, 3) }, (_, i) =>
+          request(app)
+            .patch(`/api/routines/${createRes.body.id}`)
+            .send({ executionWorkspacePreference: preferences[i % preferences.length] })
+            .then((res) => res.status),
+        ),
+      );
+      const timedOut = Symbol("timed out");
+      const outcome = await Promise.race([
+        burst,
+        new Promise<symbol>((resolve) => setTimeout(() => resolve(timedOut), 20_000)),
+      ]);
+      expect(outcome).not.toBe(timedOut);
+      expect(outcome).toEqual(Array.from({ length: Math.max(maxConnections * 2, 3) }, () => 200));
+    }, 40_000);
+  });
+
+  // Holds an uncommitted policy flip so the request under test sees the old, permissive policy until the flip commits.
+  async function withPendingPolicyFlip(projectId: string, run: () => Promise<unknown>) {
+    let commitFlip!: () => void;
+    const flipHeld = new Promise<void>((resolve) => {
+      commitFlip = resolve;
+    });
+    let flipStaged!: () => void;
+    const flipReady = new Promise<void>((resolve) => {
+      flipStaged = resolve;
+    });
+    const flip = db.transaction(async (tx) => {
+      await tx.execute(sql`
+        update projects
+        set execution_workspace_policy = jsonb_set(execution_workspace_policy, '{allowIssueOverride}', 'false'::jsonb)
+        where id = ${projectId}
+      `);
+      flipStaged();
+      await flipHeld;
+    });
+    await flipReady;
+    const pending = run();
+    for (let i = 0; i < 100; i += 1) {
+      const waiting = await db.execute(
+        sql`select 1 from pg_stat_activity where wait_event_type = 'Lock' and query ilike '%projects%'`,
+      );
+      if (waiting.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    commitFlip();
+    await flip;
+    return pending;
+  }
+
+  it("serializes the policy check with the save when the project policy flips (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    await setAllowIssueOverride(projectId, true);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const baseRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Revision source",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect([200, 201], JSON.stringify(baseRes.body)).toContain(baseRes.status);
+    const sourceRevisionId = baseRes.body.latestRevisionId as string;
+    const clearRes = await request(app)
+      .patch(`/api/routines/${baseRes.body.id}`)
+      .send({ executionWorkspacePreference: null });
+    expect(clearRes.status, JSON.stringify(clearRes.body)).toBe(200);
+
+    const patchRes = (await withPendingPolicyFlip(projectId, () =>
+      request(app)
+        .patch(`/api/routines/${baseRes.body.id}`)
+        .send({ executionWorkspacePreference: "shared_workspace" })
+        .then((res) => res),
+    )) as request.Response;
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(422);
+    expect(patchRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    await setAllowIssueOverride(projectId, true);
+    const createdRes = (await withPendingPolicyFlip(projectId, () =>
+      request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({
+          projectId,
+          title: "Flipped create",
+          assigneeAgentId: agentId,
+          executionWorkspacePreference: "shared_workspace",
+        })
+        .then((res) => res),
+    )) as request.Response;
+    expect(createdRes.status, JSON.stringify(createdRes.body)).toBe(422);
+    expect(createdRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    await setAllowIssueOverride(projectId, true);
+    const restoreRes = (await withPendingPolicyFlip(projectId, () =>
+      request(app)
+        .post(`/api/routines/${baseRes.body.id}/revisions/${sourceRevisionId}/restore`)
+        .send({})
+        .then((res) => res),
+    )) as request.Response;
+    expect(restoreRes.status, JSON.stringify(restoreRes.body)).toBe(422);
+    expect(restoreRes.body.details?.code).toBe("workspace_issue_override_disallowed");
+
+    const stored = await db
+      .select({ executionWorkspacePreference: routines.executionWorkspacePreference })
+      .from(routines)
+      .where(eq(routines.projectId, projectId));
+    expect(stored.every((row) => row.executionWorkspacePreference === null)).toBe(true);
+  }, 60_000);
+
+  it("fails the run with the override-disallowed reason when project policy flips after the routine is saved (SUP-21022)", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    await seedIsolatedByDefaultProject(companyId, projectId);
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Flipped-policy routine",
+        assigneeAgentId: agentId,
+        executionWorkspacePreference: "shared_workspace",
+      });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+
+    await setAllowIssueOverride(projectId, false);
+    const runRes = await postRoutineRun(app, createRes.body.id, { source: "manual" });
+    expect(runRes.status, JSON.stringify(runRes.body)).toBe(202);
+    expect(runRes.body.status).toBe("failed");
+    expect(runRes.body.failureReason).toContain("allowIssueOverride is false");
+    expect(runRes.body.linkedIssueId ?? null).toBeNull();
+  }, 30_000);
 });
