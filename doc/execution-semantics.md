@@ -592,14 +592,15 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. If any subsequent startup step fails, `startServer()` never closes
-the bound listener, because a process that stays alive with a closed listener
-leaves the control plane unreachable. It logs the failure loudly, closes the
-database clients through its existing teardown, and rejects. When the server
-runs as the main module, the entrypoint handler reports the failure to Sentry
-and exits nonzero so the supervisor restarts it. Embedding callers such as the
-CLI receive the rejection and decide for themselves; the server never
-hard-kills them.
+reconnect. Recovery-action reconciliation logs and skips an individual failed
+action, allowing the other actions and startup to continue. A fatal startup
+failure after binding instead closes the HTTP listener before ending database
+clients: a rejected `startServer()` must not leave a port accepting requests
+against a closed pool. The failure is logged and rethrown. When the server runs
+as the main module, the entrypoint reports eligible failures to Sentry and exits
+nonzero so the supervisor restarts it. Embedding callers such as the CLI receive
+the rejection with no leaked listener and decide how to recover; the server does
+not hard-kill them.
 
 There are two distinct failure modes.
 

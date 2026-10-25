@@ -659,6 +659,104 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
     expect(actions.find((row) => row.id === secondActionId)?.status).toBe("resolved");
   });
 
+  it("isolates a healthy-child blocker write failure from the next action", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "codex_local");
+    const sourceId = await seedCard(companyId, agentId, {
+      status: "blocked", issueNumber: 101, prefix: "REC",
+    });
+    const childId = await seedCard(companyId, agentId, { issueNumber: 102, prefix: "REC" });
+    const nextId = await seedCard(companyId, agentId, { status: "done", issueNumber: 103, prefix: "REC" });
+    await db.update(issues).set({ parentId: sourceId }).where(eq(issues.id, childId));
+    await seedQueuedWakeup(companyId, agentId, childId);
+    const firstActionId = randomUUID();
+    const nextActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values([
+      {
+        id: firstActionId, companyId, sourceIssueId: sourceId,
+        kind: "stranded_assigned_issue", status: "escalated", ownerType: "board",
+        cause: "stranded_assigned_issue", fingerprint: "child-write-failure",
+        evidence: {}, nextAction: "Restore source", wakePolicy: { type: "board_escalation" },
+      },
+      {
+        id: nextActionId, companyId, sourceIssueId: nextId,
+        kind: "stranded_assigned_issue", status: "escalated", ownerType: "board",
+        cause: "stranded_assigned_issue", fingerprint: "child-write-next",
+        evidence: {}, nextAction: "Restore source", wakePolicy: { type: "board_escalation" },
+      },
+    ]);
+    await db.execute(sql`
+      CREATE FUNCTION fail_healthy_child_recovery_update() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.identifier = 'REC-101' AND NEW.status = 'blocked' THEN
+          RAISE EXCEPTION 'injected healthy child blocker write failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER fail_healthy_child_recovery_update
+      BEFORE UPDATE ON issues
+      FOR EACH ROW EXECUTE FUNCTION fail_healthy_child_recovery_update()
+    `);
+
+    const result = await makeSweep().reconcileActiveRecoveryActions();
+    expect(result).toMatchObject({ skipped: 1, resolved: 1, issueIds: [nextId] });
+    const actions = await db.select().from(issueRecoveryActions);
+    expect(actions.find((row) => row.id === firstActionId)?.status).toBe("escalated");
+    expect(actions.find((row) => row.id === nextActionId)?.status).toBe("resolved");
+    expect(await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, sourceId)))
+      .toHaveLength(0);
+  });
+
+  it("isolates a bounded disposition repair failure from the next action", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "process");
+    const sourceId = await seedCard(companyId, agentId, { issueNumber: 201, prefix: "REC" });
+    const nextId = await seedCard(companyId, agentId, {
+      status: "done", issueNumber: 202, prefix: "REC",
+    });
+    const firstActionId = randomUUID();
+    const nextActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values([
+      {
+        id: firstActionId, companyId, sourceIssueId: sourceId,
+        kind: "stranded_assigned_issue", status: "active", ownerType: "agent", ownerAgentId: agentId,
+        cause: "stranded_assigned_issue", fingerprint: "repair-write-failure",
+        evidence: {}, nextAction: "Restore source",
+        wakePolicy: { type: "bounded_owner_disposition_repair", attempt: 0 },
+      },
+      {
+        id: nextActionId, companyId, sourceIssueId: nextId,
+        kind: "stranded_assigned_issue", status: "escalated", ownerType: "board",
+        cause: "stranded_assigned_issue", fingerprint: "repair-write-next",
+        evidence: {}, nextAction: "Restore source", wakePolicy: { type: "board_escalation" },
+      },
+    ]);
+    await db.execute(sql`
+      CREATE FUNCTION fail_bounded_repair_recovery_update() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.fingerprint = 'repair-write-failure' AND NEW.status = 'cancelled' THEN
+          RAISE EXCEPTION 'injected bounded repair action cancellation failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER fail_bounded_repair_recovery_update
+      BEFORE UPDATE ON issue_recovery_actions
+      FOR EACH ROW EXECUTE FUNCTION fail_bounded_repair_recovery_update()
+    `);
+
+    const result = await makeSweep().reconcileActiveRecoveryActions();
+    expect(result).toMatchObject({ skipped: 1, resolved: 1, issueIds: [nextId] });
+    const actions = await db.select().from(issueRecoveryActions);
+    expect(actions.find((row) => row.id === firstActionId)?.status).toBe("active");
+    expect(actions.find((row) => row.id === nextActionId)?.status).toBe("resolved");
+  });
+
   it("resolves an action even when every healthy child would create a blocker cycle", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId, "codex_local");
