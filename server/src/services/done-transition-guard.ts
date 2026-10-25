@@ -687,7 +687,7 @@ async function loadTier1RepoFields(
   };
 }
 
-async function loadOwnDraftPredicate(
+export async function loadOwnDraftPredicate(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
   prs: LinkedPullRequest[],

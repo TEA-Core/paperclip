@@ -2575,7 +2575,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       candidates: [candidateRow()],
       existingLandingRows: [],
     });
-    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true, headRefName: "SUP-13326-branch" })]);
     mockResolver(async () => ({
       ok: true,
       snapshot: {
@@ -2635,7 +2635,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       { candidates: [candidateRow()], existingLandingRows: [] },
       { wakeup },
     );
-    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true, headRefName: "SUP-13326-branch" })]);
     mockResolver(async () => draftOpenSnapshot);
 
     await expect(service.sweep()).resolves.toEqual({
@@ -2700,7 +2700,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       repo: "paperclip",
       number: 455,
       displayName: "paperclipai/paperclip#455",
-      headRefName: "SUP-branch",
+      headRefName: "SUP-13326-branch",
       source: "workspace",
       draft: true,
     });
@@ -2742,7 +2742,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       existingLandingRows: [],
     });
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([
-      linkedPr({ draft: true }),
+      linkedPr({ draft: true, headRefName: "SUP-13326-branch" }),
       linkedPr({ id: "eo-368", number: 368, displayName: "paperclipai/paperclip#368" }),
     ]);
     mockResolver(async (input: unknown) =>
@@ -2797,7 +2797,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       },
       { wakeup },
     );
-    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true, headRefName: "SUP-13326-branch" })]);
     mockResolver(async () => draftOpenSnapshot);
 
     await expect(service.sweep()).resolves.toEqual({
@@ -2823,6 +2823,51 @@ describe("SUP-16689: draft-stranded done cards", () => {
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
+  it("does not park a shared-carrier child for the parent's draft carrier; keeps the SUP-15381 attribution", async () => {
+    mockResolveCarrierOwner.mockResolvedValue({ ownerId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", identifier: "SUP-15000" });
+    mockIssueInBlockerClosure.mockResolvedValue(false);
+    const { service } = makeService({
+      candidates: [sharedCarrierRefusalCandidateRow({ identifier: "SUP-15099" })],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 455, displayName: "paperclipai/paperclip#455", headRefName: "SUP-15098-branch", draft: true }),
+    ]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    const result = await service.sweep();
+
+    expect(result.draftStranded).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+    }));
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_attributed",
+    }));
+  });
+
+  it("does not park a decision-carried card for a draft PR owned by another card", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ draft: true, headRefName: "SUP-99999-carrier" }),
+    ]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    const result = await service.sweep();
+
+    expect(result.draftStranded).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+  });
+
   it("does not re-report a draft-stranded card+PR on a later sweep (idempotent)", async () => {
     const state: DbState = {
       candidates: [candidateRow()],
@@ -2835,7 +2880,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
       ],
     };
     const { service } = makeService(state);
-    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true, headRefName: "SUP-13326-branch" })]);
     mockResolver(async () => draftOpenSnapshot);
 
     const result = await service.sweep();
@@ -2865,7 +2910,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
         details: { pr: "paperclipai/paperclip#3158" },
       }],
     });
-    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true })]);
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr({ draft: true, headRefName: "SUP-13326-branch" })]);
     mockResolver(async () => draftOpenSnapshot);
 
     await service.sweep();

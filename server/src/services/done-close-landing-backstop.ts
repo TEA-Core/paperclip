@@ -19,6 +19,7 @@ import {
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
+import { loadOwnDraftPredicate } from "./done-transition-guard.js";
 import { createGitHubExternalObjectProvider } from "./github-external-object-provider.js";
 import {
   isSharedCarrierRefusal,
@@ -656,7 +657,10 @@ export function createDoneCloseLandingBackstopService(
       .map((m) => m.prKey);
     const hasMergedSibling = mergedSiblingKeys.length > 0;
 
+    const isOwnDraft = await loadOwnDraftPredicate(db, issue, prs);
+
     for (const { pr, prKey, state, draft, closedAt } of measured) {
+      const foreignDraft = state === "open" && draft === true && !isOwnDraft(pr);
       const isSupersededCarrier = state === "closed" && hasMergedSibling;
 
       if (state === "merged") {
@@ -755,7 +759,7 @@ export function createDoneCloseLandingBackstopService(
         counts.deferred += 1;
         continue;
       }
-      if (state === "open" && draft === true) {
+      if (state === "open" && draft === true && !foreignDraft) {
         if (!verdictEligible) {
           // A freshly-closed card gets the landing grace before naming a draft
           // stranded (same conservatism as _failed); defer to a later sweep.
@@ -955,6 +959,8 @@ export function createDoneCloseLandingBackstopService(
           continue;
         }
       }
+
+      if (foreignDraft) continue;
 
       // state === "open" past the grace window: re-enqueue (bounded) or escalate.
       // A prior re-enqueue does NOT mean the PR will land: the merge queue ejects
