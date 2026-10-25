@@ -361,6 +361,15 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(true);
     });
 
+    it("allows transition with decision-only-no-repository-deliverable override", async () => {
+      const override: DoneTransitionOverride = {
+        disposition: "decision-only-no-repository-deliverable",
+        reason: "The recorded decision has no repository deliverable.",
+      };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+    });
+
     it("does not treat unknown disposition as override", async () => {
       const override: DoneTransitionOverride = { disposition: "some-unknown-disposition" };
       setupDbMock({
@@ -5221,6 +5230,46 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(false);
       expect(result.tier).toBe(null);
+    });
+  });
+
+  describe("Tier 0 decision-only via accompanying comment", () => {
+    it("allows a non-empty decision-only declaration only when the decision-only override is active", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier0");
+    });
+
+    it("does not allow a Tier 0 declaration without the decision-only override", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+
+    it("rejects Tier 1 evidence when the decision-only override requires Tier 0", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): There is nothing to land. Liveness unverified.",
+        null,
+        () => Promise.resolve([]),
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Tier 0");
     });
   });
 
