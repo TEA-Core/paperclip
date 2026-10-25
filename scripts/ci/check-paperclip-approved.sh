@@ -740,10 +740,12 @@ waiver_unverified() {
 }
 
 # waiver_retirement_on: the single reading of PAPERCLIP_CARD_WAIVER_RETIRED.
-# Only the exact value 1 arms it. Everything that exists because of the board
-# release (the waiver refusal, the description column, the release log line and
-# the denial hint) is gated on this, so with the switch off the script's output
-# is the output it had before SUP-20772.
+# Only the exact value 1 arms it. The waiver refusal, the release log line and the
+# denial hint are gated on this, so with the switch off their output is what it was
+# before SUP-20772. The one rule that is NOT gated is the release confirmation marker
+# (see RELEASE_CONFIRMED_CONTEXT below): it applies to a success whose description
+# starts "released by ", which only the board release route writes, so no status that
+# existed before the route is judged differently.
 waiver_retirement_on() {
   [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ]
 }
@@ -808,13 +810,16 @@ fi
 # unpaginated read sees `missing` and — this leg being fail-closed — blocks an
 # approved entry out of the queue. Pagination preserves order across pages, so
 # the first matching row is still the newest.
-# The description column exists only to name a board release in the log, so it
-# is requested only with the switch on; off, the query and the parse are the
-# ones this script had before SUP-20772.
-STATUS_ROW='(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")'
-if waiver_retirement_on; then
-  STATUS_ROW="${STATUS_ROW}, ((.description // \"\") | if . == \"\" then \"-\" else . end)"
-fi
+# A board release (POST /api/issues/:id/merge-arming/release) is a control-plane success whose
+# description starts "released by ". This script holds no control-plane credential and cannot ask the
+# database whether the release was CONFIRMED, so the control plane says so on GitHub: after it commits the
+# confirmation it writes a second status, `paperclip/release-confirmed`, whose description is
+# "confirms status <id of the success>". A release-described success counts only when that marker, written
+# by the same control-plane creator, names it; a release with no marker (a write that timed out, a release
+# the control plane voided or never confirmed) is treated as not approved. Every other success, which has no
+# such description, is judged exactly as it always was. The description and id columns are read for this.
+RELEASE_CONFIRMED_CONTEXT="paperclip/release-confirmed"
+STATUS_ROW='(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // ""), ((.description // "") | if . == "" then "-" else . end), ((.id // "-") | tostring)'
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
   --jq ".[] | [${STATUS_ROW}] | @tsv")" \
@@ -824,14 +829,46 @@ APPROVAL_STATE="missing"
 APPROVAL_CREATOR_ID=""
 APPROVAL_CREATOR_LOGIN=""
 APPROVAL_DESCRIPTION=""
-while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description; do
+APPROVAL_STATUS_ID=""
+CONFIRMED_RELEASE_IDS=" "
+approval_seen=""
+while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id; do
+  if [ "$status_context" = "$RELEASE_CONFIRMED_CONTEXT" ]; then
+    # Only the control plane's own marker counts, and only one that names a numeric status id.
+    if [ "$status_state" = "$STATE" ] && [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ]; then
+      confirmed_id="${status_description#confirms status }"
+      case "$status_description" in
+        "confirms status "*) case "$confirmed_id" in ''|*[!0-9]*) ;; *) CONFIRMED_RELEASE_IDS="${CONFIRMED_RELEASE_IDS}${confirmed_id} " ;; esac ;;
+      esac
+    fi
+    continue
+  fi
   [ "$status_context" = "$CONTEXT" ] || continue
+  # The newest paperclip/approved status decides (the list is newest first); later rows are only read for markers.
+  [ -z "$approval_seen" ] || continue
+  approval_seen=1
   APPROVAL_STATE="${status_state:-missing}"
   APPROVAL_CREATOR_ID="$status_creator_id"
   APPROVAL_CREATOR_LOGIN="$status_creator_login"
   APPROVAL_DESCRIPTION="$status_description"
-  break
+  APPROVAL_STATUS_ID="$status_id"
 done <<<"$STATUSES_TSV"
+
+# A release success the control plane has not confirmed is not an approval. A success from any other
+# creator is left to the FORGED refusal below.
+if [ "$APPROVAL_STATE" = "$STATE" ] && [ "$APPROVAL_CREATOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ]; then
+  case "$APPROVAL_DESCRIPTION" in
+    "released by "*)
+      case "$CONFIRMED_RELEASE_IDS" in
+        *" ${APPROVAL_STATUS_ID} "*) ;;
+        *)
+          err "UNCONFIRMED RELEASE: ${CONTEXT} on ${HEAD_SHA} is a board release (status ${APPROVAL_STATUS_ID}) that the control plane has not marked confirmed (${RELEASE_CONFIRMED_CONTEXT})"
+          APPROVAL_STATE="unconfirmed-release"
+          ;;
+      esac
+      ;;
+  esac
+fi
 
 if [ "$APPROVAL_STATE" = "$STATE" ]; then
   # `paperclip/approved` is a plain commit status, and the `fleet-only`

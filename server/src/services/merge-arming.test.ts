@@ -2570,6 +2570,110 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(graphqlCalls).toBe(2);
     });
 
+    // Round 8 (R7-F1): the direct merge is a CAS on one head; it must be the head the caller VERIFIED.
+    const cleanStatusThenMerge = (opts: { onFirst?: () => Promise<void>; mergeQueries: string[] }) =>
+      async (url: string, init?: RequestInit) => {
+        if (url === GRAPHQL_URL) {
+          const query = String(JSON.parse((init?.body as string) ?? "{}").query ?? "");
+          if (query.includes("mergePullRequest")) {
+            opts.mergeQueries.push(query);
+            return { ok: true, status: 200, json: async () => ({ data: { mergePullRequest: { pullRequest: { merged: true } } } }) } as unknown as Response;
+          }
+          await opts.onFirst?.();
+          return { ok: true, status: 200, json: async () => ({ errors: [{ message: "Pull request Pull request is in clean status" }] }) } as unknown as Response;
+        }
+        if (url === REPO_URL) return { ok: true, status: 200, json: async () => ({ default_merge_method: "merge" }) } as unknown as Response;
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      };
+    const VERIFIED_HEAD = "e".repeat(40);
+
+    it("does not direct-merge a stale published head when the caller verified another head", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(PUBLISHED_HEAD);
+      const mergeQueries: string[] = [];
+      mockGhFetch.mockImplementation(cleanStatusThenMerge({ mergeQueries }));
+
+      const armingOutcome = await armMergeOnApproval(
+        db, companyId, issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+        { expectedHeadOid: VERIFIED_HEAD },
+      );
+
+      expect(armingOutcome.kind).toBe("skipped");
+      expect(armingOutcome.message).toContain("skipped:head-mismatch");
+      expect(mergeQueries).toEqual([]);
+    });
+
+    it("direct-merges exactly the verified head when it is also the published head", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(VERIFIED_HEAD);
+      const mergeQueries: string[] = [];
+      mockGhFetch.mockImplementation(cleanStatusThenMerge({ mergeQueries }));
+
+      const armingOutcome = await armMergeOnApproval(
+        db, companyId, issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+        { expectedHeadOid: VERIFIED_HEAD },
+      );
+
+      expect(armingOutcome.kind).toBe("armed");
+      expect(mergeQueries).toHaveLength(1);
+      expect(mergeQueries[0]).toContain(`expectedHeadOid: "${VERIFIED_HEAD}"`);
+    });
+
+    it("does not direct-merge when the card's approval is revoked after the auto-merge attempt", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(VERIFIED_HEAD);
+      const mergeQueries: string[] = [];
+      mockGhFetch.mockImplementation(cleanStatusThenMerge({
+        mergeQueries,
+        // The reviewer reverses the decision while the clean-status refusal is in flight.
+        onFirst: async () => {
+          await db.update(issues).set({
+            executionState: {
+              completedStageIds: [], lastDecisionOutcome: "changes_requested",
+              approvalStatus: { publishedHeadSha: VERIFIED_HEAD },
+            },
+          }).where(eq(issues.id, issueId));
+        },
+      }));
+
+      const armingOutcome = await armMergeOnApproval(
+        db, companyId, issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+        { expectedHeadOid: VERIFIED_HEAD },
+      );
+
+      expect(armingOutcome.kind).toBe("skipped");
+      expect(armingOutcome.message).toContain("skipped:authority-changed");
+      expect(mergeQueries).toEqual([]);
+    });
+
+    it("does not enable auto-merge when the approval record changes before the call", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(VERIFIED_HEAD);
+      let graphqlCalls = 0;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.endsWith("/pulls/125")) {
+          // The PR node-id lookup: the card is cancelled while it runs.
+          await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+          return { ok: true, status: 200, json: async () => ({ node_id: "PR_node_125" }) } as unknown as Response;
+        }
+        if (url === GRAPHQL_URL) graphqlCalls += 1;
+        throw new Error(`unexpected ghFetch URL: ${url}`);
+      });
+
+      const armingOutcome = await armMergeOnApproval(
+        db, companyId, issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        { ...certifiedPr, nodeId: null } as unknown as typeof certifiedPr,
+        { expectedHeadOid: VERIFIED_HEAD },
+      );
+
+      expect(armingOutcome.kind).toBe("skipped");
+      expect(armingOutcome.message).toContain("skipped:authority-changed");
+      expect(graphqlCalls).toBe(0);
+    });
+
     it("returns skipped:no-approved-head when publishedHeadSha is null and does not call mergePullRequest", async () => {
       const issueId = await insertApprovedCardWithPublishedHead(null);
 

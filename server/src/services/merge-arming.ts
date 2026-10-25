@@ -3399,6 +3399,8 @@ interface HeadStatusRead {
   controlPlaneApproved: boolean;
   /** The newest status, when it is a control-plane success: its id, and whether it is a board release. */
   newest: { id: string | null; release: boolean } | null;
+  /** Ids of the release statuses the control plane has marked confirmed on this head (see RELEASE_CONFIRMED_CONTEXT). */
+  confirmedMarkers: string[];
   status: number;
   message: string | null;
 }
@@ -3424,17 +3426,18 @@ async function fetchHeadCommitStatusesOnce(
   try {
     response = await ghFetch(url, { headers, signal: options.signal });
   } catch {
-    return { ok: false, approved: false, controlPlaneApproved: false, newest: null, status: 0, message: "network_error" };
+    return { ok: false, approved: false, controlPlaneApproved: false, newest: null, confirmedMarkers: [], status: 0, message: "network_error" };
   }
 
   if (!response.ok) {
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     const message = body?.message as string | undefined;
-    return { ok: false, approved: false, controlPlaneApproved: false, newest: null, status: response.status, message: message ?? null };
+    return { ok: false, approved: false, controlPlaneApproved: false, newest: null, confirmedMarkers: [], status: response.status, message: message ?? null };
   }
 
   const body = await response.json().catch(() => null);
   const list = Array.isArray(body) ? body : [];
+  const confirmedMarkers: string[] = [];
   let approved = false;
   let newestSeen = false;
   let controlPlaneApproved = false;
@@ -3442,6 +3445,12 @@ async function fetchHeadCommitStatusesOnce(
   for (const raw of list) {
     if (typeof raw !== "object" || raw === null) continue;
     const status = raw as Record<string, unknown>;
+    if (status.context === RELEASE_CONFIRMED_CONTEXT) {
+      const markerCreator = status.creator as Record<string, unknown> | null | undefined;
+      const confirmed = typeof status.description === "string" ? /^confirms status (\d+)$/.exec(status.description)?.[1] : undefined;
+      if (status.state === "success" && String(markerCreator?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID && confirmed) confirmedMarkers.push(confirmed);
+      continue;
+    }
     if (status.context !== "paperclip/approved") continue;
     if (!options.strict && status.state === "success") approved = true;
     if (!newestSeen) {
@@ -3461,7 +3470,7 @@ async function fetchHeadCommitStatusesOnce(
       }
     }
   }
-  return { ok: true, approved, controlPlaneApproved, newest, status: response.status, message: null };
+  return { ok: true, approved, controlPlaneApproved, newest, confirmedMarkers, status: response.status, message: null };
 }
 
 /**
@@ -3705,6 +3714,7 @@ async function writeCommitStatus(
   description?: string,
   state: "success" | "failure" = "success",
   signal?: AbortSignal,
+  context: string = "paperclip/approved",
 ): Promise<{ success: boolean; error: string | null; status: number; transient: boolean; statusId?: string | null }> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/statuses/${encodeURIComponent(headSha)}`;
   const headers: Record<string, string> = {
@@ -3716,7 +3726,7 @@ async function writeCommitStatus(
 
   const body = JSON.stringify({
     state,
-    context: "paperclip/approved",
+    context,
     description: description ?? `${issueIdentifier} approved via Paperclip`,
     ...(issueIdentifier ? { target_url: `https://paperclip.example.com/issues/${issueIdentifier}` } : {}),
   });
@@ -3870,6 +3880,8 @@ export interface WriteCommitStatusRetryOptions {
   state?: "success" | "failure";
   /** A caller's deadline: cancels the request in flight and stops further attempts. */
   signal?: AbortSignal;
+  /** The status context to write (default `paperclip/approved`). */
+  context?: string;
 }
 
 export interface WriteCommitStatusResult {
@@ -3905,12 +3917,12 @@ export async function writeCommitStatusWithRetry(
   const delayMs = options.delayMs ?? 1000;
   const delay = options.delay ?? ((ms: number) => abortableDelay(ms, options.signal));
 
-  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal);
+  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
   let made = 1;
   while (!result.success && result.transient && made < attempts && !options.signal?.aborted) {
     await delay(delayMs);
     if (options.signal?.aborted) break;
-    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal);
+    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
     made += 1;
   }
   return { ...result, attempts: made };
@@ -3927,13 +3939,24 @@ export function headBoundReleaseDescription(actor: string, headSha: string, reas
   return `${prefix}${text.length > room ? `${text.slice(0, Math.max(room - 1, 0))}…` : text}`.slice(0, COMMIT_STATUS_DESCRIPTION_MAX);
 }
 
+/**
+ * The second control-plane status of a board release. The CI check holds no control-plane credential, so
+ * it cannot ask the database which release was confirmed; the control plane tells it, on GitHub, by
+ * writing this status AFTER the confirmation is committed. CI accepts a release-described success only
+ * when this marker names that very status (fail closed). Nothing else writes it.
+ */
+export const RELEASE_CONFIRMED_CONTEXT = "paperclip/release-confirmed";
+export function releaseConfirmedDescription(statusId: string): string {
+  return `confirms status ${statusId}`;
+}
+
 /** True for a status description written by {@link headBoundReleaseDescription}. */
 export function isHeadBoundReleaseDescription(description: unknown): boolean {
   return typeof description === "string" && description.startsWith("released by ");
 }
 
 export type HeadBoundReleaseOutcome =
-  | { kind: "released" | "already_approved"; headSha: string; message: string }
+  | { kind: "released" | "already_approved"; headSha: string; message: string; confirmationMarker?: "written" | "pending" }
   /** The status was written, but the PR head had moved on by the time the write was confirmed. */
   | { kind: "stale"; headSha: string; message: string }
   | { kind: "refused" | "failed"; message: string };
@@ -4101,6 +4124,12 @@ export async function publishHeadBoundRelease(
       | { ok: true; target: { owner: string; repo: string; number: number; branch: string } }
       | { ok: false; reason: string }
     >;
+    /**
+     * Destroys the request's database connection (see createRequestScopedDb). Called when the release is
+     * abandoned: an open transaction then rolls back on the server and its lock is freed, so work that was
+     * waiting on the database cannot commit after the answer. Absent for a shared-pool client.
+     */
+    abandon?: () => void | Promise<void>;
     /** The id of the release status the card has CONFIRMED for this head, as it is now, or null. */
     confirmedStatusId: (conn: Db) => Promise<string | null>;
     /**
@@ -4116,6 +4145,22 @@ export async function publishHeadBoundRelease(
   // One clock for the whole release. Its signal is handed to every GitHub request, so a request that
   // outlives the deadline is cancelled and a retry loop stops instead of running on after we return.
   const envelope = AbortSignal.any([...(input.signal ? [input.signal] : []), AbortSignal.timeout(deadlines.totalMs)]);
+  // Where the release is. `open`: nothing is committed and the deadline abandons it. `sealing`: the
+  // confirmation is being written and committed; the deadline no longer abandons it (the write is bounded
+  // by the connection's statement timeout), so the answer and the committed state cannot disagree.
+  // `abandoned`: the deadline fired first; the connection is destroyed and nothing may commit.
+  let phase: "open" | "sealing" | "abandoned" | "done" = "open";
+  // A success status may be on the head and has not been voided or confirmed (and committed) yet.
+  let statusMayExist = false;
+  const abandon = () => {
+    if (phase !== "open") return;
+    phase = "abandoned";
+    Promise.resolve()
+      .then(() => input.abandon?.())
+      .catch(() => undefined);
+  };
+  if (envelope.aborted) abandon();
+  else envelope.addEventListener("abort", abandon, { once: true });
   const deadlineOutcome = (): HeadBoundReleaseOutcome => ({
     kind: "failed",
     message: `status:failed:deadline: the release did not finish within ${deadlines.totalMs}ms; a status write that was in flight has an unknown outcome and is not consumable`,
@@ -4134,8 +4179,12 @@ export async function publishHeadBoundRelease(
     ]);
   };
   const credential = await raceEnvelope(resolveControlPlaneGitHubToken(db, companyId, owner, repo, envelope));
-  if (credential === aborted || (!credential && envelope.aborted)) return deadlineOutcome();
+  if (credential === aborted || (!credential && envelope.aborted)) {
+    phase = "done";
+    return deadlineOutcome();
+  }
   if (!credential) {
+    phase = "done";
     return { kind: "failed", message: `status:failed:auth_required: control-plane GitHub App credential unavailable for ${owner}/${repo}` };
   }
   // One GitHub call, cancelled and given up on after `fetchMs` or when `parent` fires.
@@ -4210,8 +4259,24 @@ export async function publishHeadBoundRelease(
   // A success that cannot be confirmed is voided by a failure status; the answer says whether that worked.
   const voidSuccess = async (why: string): Promise<string> => {
     const voided = await failureStatusWrite(input.headSha, `voided: ${why}`);
+    if (voided.success) statusMayExist = false;
     return voided.success ? "it was voided by a failure status" : `it could NOT be voided (${voided.error ?? `HTTP ${voided.status}`}), and is not consumable without a recorded confirmation`;
   };
+  // The marker CI requires beside a release success (RELEASE_CONFIRMED_CONTEXT). It is written only after
+  // the confirmation is committed, on the compensation clock.
+  const writeConfirmationMarker = (statusId: string) =>
+    bounded(
+      (signal) => writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+        description: releaseConfirmedDescription(statusId),
+        context: RELEASE_CONFIRMED_CONTEXT,
+        attempts: 2,
+        delayMs: input.retryDelayMs ?? 1000,
+        signal,
+      }),
+      { success: false, error: `timeout: the marker write did not answer within ${deadlines.fetchMs}ms`, status: 0, transient: false, attempts: 1 },
+      compensation(),
+    );
+  let confirmedStatusId: string | null = null;
   const publishLocked = async (conn: Db): Promise<HeadBoundReleaseOutcome> => {
     if (envelope.aborted) return deadlineOutcome();
     // The live PR is checked before anything else, so an "already approved" answer is never given for a
@@ -4220,7 +4285,7 @@ export async function publishHeadBoundRelease(
     if (firstRefusal) return firstRefusal;
     const existing = await bounded(
       (signal) => fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal }),
-      { ...timedOut("the status read"), approved: false, controlPlaneApproved: false, newest: null } as Awaited<ReturnType<typeof fetchHeadCommitStatuses>>,
+      { ...timedOut("the status read"), approved: false, controlPlaneApproved: false, newest: null, confirmedMarkers: [] } as Awaited<ReturnType<typeof fetchHeadCommitStatuses>>,
     );
     if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
     if (existing.controlPlaneApproved) {
@@ -4233,7 +4298,14 @@ export async function publishHeadBoundRelease(
         // The status lookup took time: look at the head again before answering that it is approved.
         const stillLive = await recheck(conn);
         if (stillLive) return stillLive;
-        return { kind: "already_approved", headSha: input.headSha, message: "paperclip/approved already published by the control plane on this head" };
+        // A release this card confirmed whose marker never reached GitHub (the write failed after the
+        // commit) gets it now, so CI can accept it. The write is idempotent.
+        let markerNote = "";
+        if (existing.newest?.release && existing.newest.id && !existing.confirmedMarkers.includes(existing.newest.id)) {
+          const marker = await writeConfirmationMarker(existing.newest.id);
+          markerNote = marker.success ? "; the confirmation marker was re-written" : `; the confirmation marker could NOT be re-written (${marker.error ?? `HTTP ${marker.status}`})`;
+        }
+        return { kind: "already_approved", headSha: input.headSha, message: `paperclip/approved already published by the control plane on this head${markerNote}` };
       }
     }
     // GitHub has no compare-and-swap on a commit status, so a push landing between the last live read and
@@ -4247,6 +4319,7 @@ export async function publishHeadBoundRelease(
       if (refusal) return refusal;
       // Nothing is written once the release's clock has run out.
       if (envelope.aborted) return deadlineOutcome();
+      statusMayExist = true;
       const write = await bounded(
         (signal) => writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
           description: input.description,
@@ -4269,6 +4342,7 @@ export async function publishHeadBoundRelease(
         }
         if (after) {
           const marked = await failureStatusWrite(input.headSha, `superseded: ${number} is no longer the live head ${input.headSha.slice(0, 12)} the release covered`);
+          if (marked.success) statusMayExist = false;
           return {
             kind: "stale",
             headSha: input.headSha,
@@ -4279,6 +4353,13 @@ export async function publishHeadBoundRelease(
                 : `a failure status on ${input.headSha} could NOT be written (${marked.error ?? `HTTP ${marked.status}`})`),
           };
         }
+        // The head is still live, but the card's authority is read once more: a decision reversed, a card
+        // cancelled or a delivery retargeted while the write was in flight must not stay released.
+        const revoked = await eligibilityRefusal(conn);
+        if (revoked) {
+          const outcome = await voidSuccess("the card's eligibility changed while the release was written");
+          return { kind: "stale", headSha: input.headSha, message: `status:stale:eligibility-changed-after-write: ${revoked.message}; ${outcome}` };
+        }
         // Confirmed: the live head is still the one released. Record that, last, so only a confirmed
         // status is ever consumable.
         const statusId = "statusId" in write && typeof write.statusId === "string" ? write.statusId : null;
@@ -4286,8 +4367,19 @@ export async function publishHeadBoundRelease(
           const outcome = await voidSuccess("GitHub did not say which status it accepted");
           return { kind: "failed", message: `status:failed:unconfirmed: GitHub did not return the id of the status it accepted on ${input.headSha}; ${outcome}` };
         }
+        // Past this point the deadline does not abandon the release: either the confirmation commits and
+        // the answer says released, or it does not and the answer says failed. A release the deadline
+        // already abandoned never reaches the write.
+        if (phase !== "open") {
+          const outcome = await voidSuccess("the release was abandoned before it was confirmed");
+          return { kind: "failed", message: `status:failed:deadline: the release was abandoned before it could be confirmed; ${outcome}` };
+        }
+        phase = "sealing";
         try {
+          // The deadline does not reach this write, so it gets a shorter statement bound of its own.
+          await conn.execute(sql`select set_config('statement_timeout', ${`${Math.min(deadlines.statementMs, deadlines.compensationMs)}ms`}, true)`);
           await input.recordConfirmation(conn, statusId);
+          confirmedStatusId = statusId;
         } catch (error) {
           const outcome = await voidSuccess("the release could not be recorded as confirmed");
           return {
@@ -4304,8 +4396,10 @@ export async function publishHeadBoundRelease(
           const outcome = await voidSuccess("the release's status write did not answer");
           return { kind: "failed", message: `status:failed:status_write: ${write.error ?? "no answer"}; the status may have been written; ${outcome}` };
         }
+        statusMayExist = false;
         return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
       }
+      statusMayExist = false;
       await new Promise<void>((resolve) => setTimeout(resolve, input.retryDelayMs ?? 1000));
     }
   };
@@ -4316,24 +4410,56 @@ export async function publishHeadBoundRelease(
   // by `totalMs` plus the compensation window; the abandoned work ends at its next checkpoint.
   let hardStop: ReturnType<typeof setTimeout> | undefined;
   const stopped = new Promise<HeadBoundReleaseOutcome>((resolve) => {
-    const arm = () => { hardStop = setTimeout(() => resolve(deadlineOutcome()), deadlines.compensationMs); };
+    // A release that is sealing (writing its confirmation) is never answered as failed from here: its
+    // own result decides, and the statement timeout on its connection bounds it.
+    const arm = () => { hardStop = setTimeout(() => { if (phase !== "sealing") resolve(deadlineOutcome()); }, deadlines.compensationMs); };
     if (envelope.aborted) arm();
     else envelope.addEventListener("abort", arm, { once: true });
   });
   try {
-    const run = db.transaction(async (tx) => {
-      if (envelope.aborted) return deadlineOutcome();
-      // Bounded: a waiter gives up instead of queueing for ever, a hung statement is cancelled, and a
-      // release that stalls while idle in its transaction is cut off by the server, which frees the lock.
-      await tx.execute(sql`select
-        set_config('lock_timeout', ${`${deadlines.lockMs}ms`}, true),
-        set_config('statement_timeout', ${`${deadlines.statementMs}ms`}, true),
-        set_config('idle_in_transaction_session_timeout', ${`${deadlines.idleInTransactionMs}ms`}, true)`);
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
-      return publishLocked(tx as unknown as Db);
-    });
+    const run = db
+      .transaction(async (tx) => {
+        if (envelope.aborted) return deadlineOutcome();
+        // Bounded: a waiter gives up instead of queueing for ever, a hung statement is cancelled, and a
+        // release that stalls while idle in its transaction is cut off by the server, which frees the lock.
+        await tx.execute(sql`select
+          set_config('lock_timeout', ${`${deadlines.lockMs}ms`}, true),
+          set_config('statement_timeout', ${`${deadlines.statementMs}ms`}, true),
+          set_config('idle_in_transaction_session_timeout', ${`${deadlines.idleInTransactionMs}ms`}, true)`);
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        return publishLocked(tx as unknown as Db);
+      })
+      .catch(async (error): Promise<HeadBoundReleaseOutcome> => {
+        // The transaction ended abnormally (the deadline destroyed its connection, a statement timed out,
+        // the commit failed): nothing it wrote is committed. A success that may already be on the head is
+        // voided, since no confirmation will ever exist for it.
+        if (!statusMayExist) {
+          if (phase === "abandoned") return deadlineOutcome();
+          throw error;
+        }
+        const outcome = await voidSuccess("the release did not complete");
+        const why = phase === "abandoned" ? `the deadline passed (${deadlines.totalMs}ms)` : (error instanceof Error ? error.message : String(error));
+        return {
+          kind: "failed",
+          message: `status:failed:deadline: the release was interrupted: ${why}; a status on ${input.headSha} may have been written; ${outcome}`,
+        };
+      });
     run.catch(() => undefined);
-    return await Promise.race([run, stopped]);
+    const outcome = await Promise.race([run, stopped]);
+    // Only a release that really committed its confirmation tells CI so: the marker is written after the
+    // commit, never before, and a failed marker write leaves the release unconfirmed for CI (fail closed).
+    if (outcome.kind === "released" && confirmedStatusId) {
+      statusMayExist = false;
+      const marker = await writeConfirmationMarker(confirmedStatusId);
+      return {
+        ...outcome,
+        confirmationMarker: marker.success ? "written" : "pending",
+        message: marker.success
+          ? outcome.message
+          : `${outcome.message} (the CI confirmation marker could NOT be written: ${marker.error ?? `HTTP ${marker.status}`}; CI does not accept this release until it is, and a repeat release or the reconciler writes it)`,
+      };
+    }
+    return outcome;
   } catch (error) {
     // The transaction is rolled back (which frees the lock) before we get here.
     const code = (error as { code?: string }).code ?? (error as { cause?: { code?: string } }).cause?.code;
@@ -4345,6 +4471,7 @@ export async function publishHeadBoundRelease(
     }
     throw error;
   } finally {
+    phase = "done";
     if (hardStop) clearTimeout(hardStop);
   }
 }
@@ -4583,6 +4710,23 @@ export async function postPullRequestComment(
   return { success: false, status: response.status, error: message ?? `HTTP ${response.status}` };
 }
 
+/** The parts of a card's record that say what was approved and for which head, for a before/after compare. */
+function authorityFingerprint(row: { status?: unknown; executionPolicy: unknown; executionState: unknown }): string {
+  const state = (row.executionState && typeof row.executionState === "object" ? row.executionState : {}) as Record<string, unknown>;
+  const approval = (state.approvalStatus && typeof state.approvalStatus === "object" ? state.approvalStatus : {}) as Record<string, unknown>;
+  const policy = (row.executionPolicy && typeof row.executionPolicy === "object" ? row.executionPolicy : {}) as { stages?: Array<{ id?: unknown; phase?: unknown }> };
+  return JSON.stringify([
+    row.status === "cancelled",
+    (policy.stages ?? []).map((stage) => [stage?.id, stage?.phase ?? null]),
+    state.completedStageIds ?? null,
+    state.lastDecisionId ?? null,
+    state.lastDecisionOutcome ?? null,
+    approval.publishedHeadSha ?? null,
+    approval.approvedHeadSha ?? null,
+    (approval.releaseConfirmation as { statusId?: unknown } | undefined)?.statusId ?? null,
+  ]);
+}
+
 export async function armMergeOnApproval(
   db: Db,
   companyId: string,
@@ -4684,6 +4828,7 @@ export async function armMergeOnApproval(
     const [candidateRow] = await db
       .select({
         id: issues.id,
+        status: issues.status,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
       })
@@ -4720,6 +4865,27 @@ export async function armMergeOnApproval(
       message: `skipped:owner-not-approved: incomplete review/approval stages: ${ladderIncompleteStageIds(policy, state).join(", ")}`,
     };
   }
+
+  // The authority this call acts on, as the card records it now. Token resolution, the node-id lookup
+  // and the retries take time, and a card whose decision, ladder, head or release changed in that time
+  // is not what was authorized: it is read again right before the merge lever is pulled.
+  const authoritySnapshot = authorityFingerprint(ownerRow);
+  const authorityChanged = async (): Promise<string | null> => {
+    const [fresh] = await db
+      .select({ id: issues.id, status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, ownerRow.id)))
+      .limit(1);
+    if (!fresh) return "the card no longer exists";
+    if (fresh.status === "cancelled") return "the card was cancelled";
+    if (!ladderIsTerminallyApproved(
+      fresh.executionPolicy as Parameters<typeof ladderIsTerminallyApproved>[0],
+      fresh.executionState as Parameters<typeof ladderIsTerminallyApproved>[1],
+    )) {
+      return "the card's ladder is no longer approved";
+    }
+    return authorityFingerprint(fresh) === authoritySnapshot ? null : "the card's approval record changed";
+  };
 
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
   if (candidates.length === 0) {
@@ -4764,6 +4930,10 @@ export async function armMergeOnApproval(
       nodeId = nodeIdResult.nodeId;
     }
 
+    const changedBeforeArm = await authorityChanged();
+    if (changedBeforeArm) {
+      return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedBeforeArm}; nothing was armed` };
+    }
     const result = await enableAutoMerge(token, nodeId, options.expectedHeadOid ? { expectedHeadOid: options.expectedHeadOid } : {});
     if (result.success) {
       if (result.alreadyQueued) {
@@ -4809,14 +4979,27 @@ export async function armMergeOnApproval(
           message: `skipped:no-approved-head: ${pr.displayName} — publishedHeadSha is null, cannot pin the direct merge`,
         };
       }
+      // A caller that verified a head (the live head, with a current approval) merges THAT head and no
+      // other: the card's recorded head can be an older one, and a direct merge has no second chance.
+      if (options.expectedHeadOid && options.expectedHeadOid !== publishedHeadSha) {
+        return {
+          kind: "skipped",
+          message: `skipped:head-mismatch: ${pr.displayName} — the verified head ${options.expectedHeadOid} is not the card's published head ${publishedHeadSha}; no direct merge`,
+        };
+      }
+      const mergeHead = options.expectedHeadOid ?? publishedHeadSha;
 
       const defaultMergeMethod = await fetchDefaultMergeMethod(token, pr.owner, pr.repo) ?? "MERGE";
-      const mergeResult = await mergePullRequest(token, nodeId, publishedHeadSha, defaultMergeMethod);
+      const changedBeforeMerge = await authorityChanged();
+      if (changedBeforeMerge) {
+        return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedBeforeMerge}; no direct merge` };
+      }
+      const mergeResult = await mergePullRequest(token, nodeId, mergeHead, defaultMergeMethod);
 
       if (mergeResult.success) {
         return {
           kind: "armed",
-          message: `armed:direct-merge: ${pr.displayName} (head ${publishedHeadSha})`,
+          message: `armed:direct-merge: ${pr.displayName} (head ${mergeHead})`,
         };
       }
 

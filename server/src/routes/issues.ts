@@ -50,6 +50,7 @@ import {
   documents,
   executionWorkspaces,
   heartbeatRuns,
+  createRequestScopedDb,
   issueApprovals,
   issueComments,
   issueDocuments,
@@ -11426,9 +11427,9 @@ export function issueRoutes(
     });
   });
 
-  async function assertCompanyOwnerOrAdmin(req: Request, companyId: string, message: string) {
+  async function assertCompanyOwnerOrAdmin(req: Request, companyId: string, message: string, accessSvc = access) {
     if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;
-    const membership = req.actor.userId ? await access.getMembership(companyId, "user", req.actor.userId) : null;
+    const membership = req.actor.userId ? await accessSvc.getMembership(companyId, "user", req.actor.userId) : null;
     if (membership?.status !== "active"
       || (membership.membershipRole !== "owner" && membership.membershipRole !== "admin")) {
       throw forbidden(message);
@@ -11551,10 +11552,58 @@ export function issueRoutes(
 
   async function releaseIssueHead(req: Request, res: Response, mode: "standard" | "override") {
     assertBoard(req);
-    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    // One clock from the first line, and one dedicated database connection for everything the request
+    // reads or writes, so the deadline really cancels it: destroying that connection ends a statement or
+    // a wait for it at once, and the server rolls back an open transaction and frees its lock. The
+    // request never queues for, or holds, a connection of the shared pool.
+    const deadlines = { ...DEFAULT_RELEASE_DEADLINES, ...opts.mergeReleaseDeadlines };
+    const envelope = AbortSignal.timeout(deadlines.totalMs);
+    const scope = createRequestScopedDb(db, {
+      statementTimeoutMs: Math.min(deadlines.statementMs, deadlines.totalMs),
+      lockTimeoutMs: Math.min(deadlines.lockMs, deadlines.totalMs),
+      idleInTransactionMs: deadlines.idleInTransactionMs,
+      connectTimeoutMs: deadlines.fetchMs,
+    });
+    const rdb = scope?.db ?? db;
+    const cancelScope = () => { void scope?.cancel(); };
+    envelope.addEventListener("abort", cancelScope, { once: true });
+    let publishStarted = false;
+    try {
+      await releaseIssueHeadWithin(req, res, mode, { deadlines, envelope, rdb, scope, cancelScope, markPublishStarted: () => { publishStarted = true; } });
+    } catch (error) {
+      // The deadline ended a wait before anything was published: say so, and that nothing was.
+      if (envelope.aborted && !publishStarted && !res.headersSent) {
+        res.status(409).json({
+          outcome: "failed", auditRecorded: false,
+          message: "status:failed:deadline: the release request did not finish within its deadline; nothing was published",
+        });
+        return;
+      }
+      throw error;
+    } finally {
+      envelope.removeEventListener("abort", cancelScope);
+      await scope?.close();
+    }
+  }
+
+  async function releaseIssueHeadWithin(
+    req: Request,
+    res: Response,
+    mode: "standard" | "override",
+    ctx: {
+      deadlines: typeof DEFAULT_RELEASE_DEADLINES;
+      envelope: AbortSignal;
+      rdb: Db;
+      scope: ReturnType<typeof createRequestScopedDb>;
+      cancelScope: () => void;
+      markPublishStarted: () => void;
+    },
+  ) {
+    const { deadlines, envelope, rdb, scope } = ctx;
+    const existing = await getAccessibleResource(req, res, issueService(rdb).getById(req.params.id as string), "Issue not found");
     if (!existing) return;
     const actor = getActorInfo(req);
-    await assertCompanyOwnerOrAdmin(req, existing.companyId, "Company owner or admin required to release a PR head");
+    await assertCompanyOwnerOrAdmin(req, existing.companyId, "Company owner or admin required to release a PR head", accessService(rdb));
     const { headSha, reason } = mode === "override"
       ? (({ headSha, overrideReason }) => ({ headSha, reason: overrideReason }))(overrideReleaseIssueHeadSchema.parse(req.body))
       : releaseIssueHeadSchema.parse(req.body);
@@ -11575,8 +11624,6 @@ export function issueRoutes(
     // One clock for the whole request, from here: the card check, the audit rows and the publication all
     // answer within it (the publication also cancels its GitHub requests on it), so no wait outside the
     // publisher keeps the request open past the deadline.
-    const deadlines = { ...DEFAULT_RELEASE_DEADLINES, ...opts.mergeReleaseDeadlines };
-    const envelope = AbortSignal.timeout(deadlines.totalMs);
     const expired = Symbol("expired");
     // `work` that cannot be cancelled (a database wait) is abandoned when the clock runs out, not awaited.
     const within = <T>(work: Promise<T>, signal: AbortSignal): Promise<T | typeof expired> => {
@@ -11589,7 +11636,7 @@ export function issueRoutes(
         }),
       ]);
     };
-    const resolved = await within(resolveTarget(db), envelope);
+    const resolved = await within(resolveTarget(rdb), envelope);
     if (resolved === expired) throw conflict("Card cannot be released: the deadline passed before the card could be checked");
     if (!resolved.ok) throw conflict(`Card cannot be released: ${resolved.reason}`);
     const { target, basis } = resolved;
@@ -11601,7 +11648,7 @@ export function issueRoutes(
     // The intent is durable before the GitHub write: if this insert fails nothing is published, and if
     // the outcome insert below fails the intent row still names who asked to release which head.
     const intent = await within(
-      persistActivity(db, {
+      persistActivity(rdb, {
         companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
         action: kinds.requested, entityType: "issue", entityId: existing.id,
         details: { headSha, [reasonKey]: reason, pr: target.displayName, branch: target.branch, basis, description },
@@ -11630,10 +11677,15 @@ export function issueRoutes(
         owner: target.owner, repo: target.repo, number: target.number, headSha, statusId,
       });
     let outcome: HeadBoundReleaseOutcome;
+    // From here the publisher owns the deadline: it abandons the connection only while nothing is
+    // committed, and never once it is sealing its confirmation.
+    envelope.removeEventListener("abort", ctx.cancelScope);
+    ctx.markPublishStarted();
     try {
-      outcome = await publishHeadBoundRelease(db, existing.companyId, target, {
+      outcome = await publishHeadBoundRelease(rdb, existing.companyId, target, {
         headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
         deadlines: opts.mergeReleaseDeadlines, signal: envelope, confirmedStatusId, recordConfirmation,
+        abandon: scope ? ctx.cancelScope : undefined,
       });
     } catch (error) {
       // A throwing prerequisite (secret lookup, token resolver, lock) must still leave a failed outcome
@@ -11645,10 +11697,19 @@ export function issueRoutes(
       };
     }
     let auditRecorded = true;
+    // The outcome row has its own short clock and its own connection: the request's connection may be
+    // gone, and the shared pool is not waited on.
+    const auditClock = AbortSignal.timeout(deadlines.compensationMs);
+    const auditScope = createRequestScopedDb(db, {
+      statementTimeoutMs: deadlines.compensationMs, lockTimeoutMs: deadlines.compensationMs,
+      idleInTransactionMs: deadlines.compensationMs, connectTimeoutMs: deadlines.compensationMs,
+    });
+    const cancelAudit = () => { void auditScope?.cancel(); };
+    auditClock.addEventListener("abort", cancelAudit, { once: true });
     try {
       // The status is already out, so the outcome row gets only a short, separate wait.
       const entry = await within(
-        persistActivity(db, {
+        persistActivity(auditScope?.db ?? db, {
           companyId: existing.companyId, ...actor, boardApiKeyId: actor.boardApiKeyId,
           action: outcome.kind === "released" ? kinds.released : kinds.outcome,
           entityType: "issue", entityId: existing.id,
@@ -11657,7 +11718,7 @@ export function issueRoutes(
             outcome: outcome.kind, message: outcome.message, intentId: intent.activity.id,
           },
         }),
-        AbortSignal.timeout(deadlines.compensationMs),
+        auditClock,
       );
       if (entry === expired) throw new Error(`the outcome row was not written within ${deadlines.compensationMs}ms`);
       publishActivity(entry.publication);
@@ -11669,6 +11730,9 @@ export function issueRoutes(
         { err: error, issueId: existing.id, headSha, outcome: outcome.kind, intentId: intent.activity.id },
         "merge release outcome could not be recorded; the release intent row is the audit trail",
       );
+    } finally {
+      auditClock.removeEventListener("abort", cancelAudit);
+      await auditScope?.close();
     }
     res.status(outcome.kind === "released" || outcome.kind === "already_approved" ? 200 : 409).json({
       outcome: outcome.kind, headSha, message: outcome.message, auditRecorded,

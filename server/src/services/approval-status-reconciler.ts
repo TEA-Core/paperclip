@@ -11,6 +11,7 @@ import { and, desc, eq, ilike, ne, sql, type SQL } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import {
+  resolveControlPlaneGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenResolution,
 } from "./github-credential.js";
@@ -25,6 +26,8 @@ import {
   publishApprovalStatus,
   consumableReleaseStatusId,
   isHeadBoundReleaseDescription,
+  RELEASE_CONFIRMED_CONTEXT,
+  releaseConfirmedDescription,
   readCertifiedFinalDelivery,
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
@@ -32,6 +35,7 @@ import {
   type ArmingOutcome,
   type LinkedPullRequest,
   type MergeArmingDecision,
+  writeCommitStatusWithRetry,
 } from "./merge-arming.js";
 
 // SUP-13535. The paperclip/approved commit status is written exactly once, on
@@ -2602,6 +2606,38 @@ function hasApprovedSuccess(statuses: Array<Record<string, unknown>>, confirmedR
 }
 
 /**
+ * A board release this card CONFIRMED carries a second control-plane status, the marker CI requires beside it
+ * (RELEASE_CONFIRMED_CONTEXT). The marker is written after the confirmation commits; when that write failed
+ * the release is confirmed here and still unaccepted by CI. This writes it again, idempotently, only for a
+ * status the card confirmed and only when the head's statuses do not already show it. Best effort: a failure
+ * is reported, never thrown.
+ */
+async function repairReleaseConfirmationMarker(
+  db: Db,
+  row: CandidateRow,
+  target: { owner: string; repo: string },
+  headSha: string,
+  statuses: Array<Record<string, unknown>>,
+  confirmedReleaseStatusId: string | null,
+): Promise<string | null> {
+  if (confirmedReleaseStatusId === null) return null;
+  const approved = statuses.find((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success");
+  if (!approved || approved.id === undefined || approved.id === null || String(approved.id) !== confirmedReleaseStatusId) return null;
+  const description = releaseConfirmedDescription(confirmedReleaseStatusId);
+  if (statuses.some((s) => s.context === RELEASE_CONFIRMED_CONTEXT && s.state === "success" && s.description === description)) return null;
+  try {
+    const credential = await resolveControlPlaneGitHubToken(db, row.companyId, target.owner, target.repo);
+    if (!credential) return "release-marker: no control-plane credential";
+    const written = await writeCommitStatusWithRetry(credential.token, target.owner, target.repo, headSha, "", {
+      description, context: RELEASE_CONFIRMED_CONTEXT, attempts: 2, delayMs: 500,
+    });
+    return written.success ? `release-marker: re-wrote ${RELEASE_CONFIRMED_CONTEXT}` : `release-marker: write failed (${written.error ?? `HTTP ${written.status}`})`;
+  } catch (error) {
+    return `release-marker: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+/**
  * SUP-17274 finding-1 (stale-live-head-authorization-race): re-validate the
  * live head at the arm boundary — immediately before the actuator — not just at
  * candidate scan. The call site read the PR head a few operations earlier; a
@@ -2991,13 +3027,12 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
     ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
-  const alreadyStamped = hasApprovedSuccess(
-    statuses,
-    consumableReleaseStatusId(row.executionState as Record<string, unknown> | null | undefined, {
-      owner: target.owner, repo: target.repo, number: target.number, headSha,
-    }),
-  );
+  const confirmedRelease = consumableReleaseStatusId(row.executionState as Record<string, unknown> | null | undefined, {
+    owner: target.owner, repo: target.repo, number: target.number, headSha,
+  });
+  const alreadyStamped = hasApprovedSuccess(statuses, confirmedRelease);
   if (alreadyStamped && (!certified || headSha === certified.headSha)) {
+    const markerNote = await repairReleaseConfirmationMarker(db, row, target, headSha, statuses, confirmedRelease);
     // SUP-17274: the stamp is on the live head, but the decision-time arm may
     // have never succeeded (it failed, the first publish was refused before the
     // arm and the stamp was later healed, or the card was stamped before arming
@@ -3009,7 +3044,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     return {
       kind: "skipped",
       reason: "already-success",
-      detail: `already-success: ${target.displayName} head ${headSha.slice(0, 7)} already carries ${PAPERCLIP_APPROVED_CONTEXT}=success`,
+      detail: `already-success: ${target.displayName} head ${headSha.slice(0, 7)} already carries ${PAPERCLIP_APPROVED_CONTEXT}=success${markerNote ? `; ${markerNote}` : ""}`,
       rearm,
     };
   }
