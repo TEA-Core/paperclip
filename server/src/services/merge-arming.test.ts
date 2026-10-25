@@ -1384,9 +1384,9 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     describe("SUP-20772: strict reading of the approval for arming decisions", () => {
       const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]" };
       const FLEET = { id: 555, login: "fleet-agent[bot]" };
-      const release = { context: "paperclip/approved", state: "success", creator: CONTROL_PLANE, description: `released by user:u1 for ${APPROVED_HEAD}: ladder cannot complete` };
-      const review = { context: "paperclip/approved", state: "success", creator: CONTROL_PLANE, description: "SUP-42 approved via Paperclip" };
-      const read = async (statuses: unknown[], options?: { strict?: boolean; ignoreRelease?: boolean }) => {
+      const release = { id: 7001, context: "paperclip/approved", state: "success", creator: CONTROL_PLANE, description: `released by user:u1 for ${APPROVED_HEAD}: ladder cannot complete` };
+      const review = { id: 7002, context: "paperclip/approved", state: "success", creator: CONTROL_PLANE, description: "SUP-42 approved via Paperclip" };
+      const read = async (statuses: unknown[], options?: { strict?: boolean; confirmedReleaseStatusId?: string | null }) => {
         mockGhFetch.mockImplementation(async (url: string) => {
           if (String(url) === HEAD_STATUSES_URL(APPROVED_HEAD)) {
             return { ok: true, status: 200, json: async () => statuses } as unknown as Response;
@@ -1401,24 +1401,27 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(await read([{ context: "paperclip/approved", state: "success" }])).toMatchObject({ ok: true, approved: true });
       });
 
-      it("ignoreRelease: a board-release success is not an approval, an ordinary control-plane success is", async () => {
-        expect(await read([release], { strict: true, ignoreRelease: true })).toMatchObject({ approved: false });
-        expect(await read([review], { strict: true, ignoreRelease: true })).toMatchObject({ approved: true });
-        expect(await read([release], { strict: true, ignoreRelease: false })).toMatchObject({ approved: true });
+      it("a board-release success is an approval only when it is the status the publisher confirmed; an ordinary control-plane success is one regardless", async () => {
+        expect(await read([release], { strict: true, confirmedReleaseStatusId: null })).toMatchObject({ approved: false });
+        expect(await read([review], { strict: true, confirmedReleaseStatusId: null })).toMatchObject({ approved: true });
+        expect(await read([release], { strict: true, confirmedReleaseStatusId: "7001" })).toMatchObject({ approved: true });
+        // A release status the publisher did not confirm (another id, e.g. a write whose answer was lost) never counts.
+        expect(await read([release], { strict: true, confirmedReleaseStatusId: "9999" })).toMatchObject({ approved: false });
+        expect(await read([{ ...release, id: undefined }], { strict: true, confirmedReleaseStatusId: "7001" })).toMatchObject({ approved: false });
       });
 
       it("strict: a success written by anyone but the control plane is not an approval", async () => {
         const forged = { ...review, creator: FLEET };
-        expect(await read([forged], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
-        expect(await read([forged, release], { strict: true, ignoreRelease: true })).toMatchObject({ approved: false });
-        expect(await read([{ context: "paperclip/approved", state: "success" }], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
+        expect(await read([forged], { strict: true })).toMatchObject({ approved: false });
+        expect(await read([forged, release], { strict: true, confirmedReleaseStatusId: null })).toMatchObject({ approved: false });
+        expect(await read([{ context: "paperclip/approved", state: "success" }], { strict: true })).toMatchObject({ approved: false });
       });
 
       it("strict: only the newest paperclip/approved status decides, so a failure after a success revokes it", async () => {
-        const failure = { context: "paperclip/approved", state: "failure", creator: CONTROL_PLANE, description: "superseded" };
-        expect(await read([failure, review], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
-        expect(await read([failure, release], { strict: true, ignoreRelease: false })).toMatchObject({ approved: false });
-        expect(await read([review, failure], { strict: true, ignoreRelease: false })).toMatchObject({ approved: true });
+        const failure = { id: 7003, context: "paperclip/approved", state: "failure", creator: CONTROL_PLANE, description: "superseded" };
+        expect(await read([failure, review], { strict: true })).toMatchObject({ approved: false });
+        expect(await read([failure, release], { strict: true, confirmedReleaseStatusId: "7001" })).toMatchObject({ approved: false });
+        expect(await read([review, failure], { strict: true })).toMatchObject({ approved: true });
       });
     });
 

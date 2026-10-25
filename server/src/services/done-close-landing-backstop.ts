@@ -15,7 +15,7 @@ import {
   fetchHeadViaTokenCandidates,
   fetchHeadApprovedStatusViaTokenCandidates,
   fetchLastMergeQueueEjectionViaTokenCandidates,
-  readCertifiedFinalDelivery,
+  consumableReleaseStatusId,
   narrowToDelivered,
   notDeliveredReasonForPr,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
@@ -625,7 +625,7 @@ export function createDoneCloseLandingBackstopService(
     // merge on a head the merge boundary has not authorized. Fetch the card's
     // pinned approval stamp once per candidate so the per-PR gate can compare
     // the live head against it. Only needed when the re-enqueue lane is open.
-    const certifiedTarget = mergeArmingEnabled ? await readCertifiedTarget(db, issue.id) : null;
+    const cardState = mergeArmingEnabled ? await readCardExecutionState(db, issue.id) : null;
     const approvedHeadSha = mergeArmingEnabled
       ? await readApprovedHeadSha(db, issue.id)
       : null;
@@ -1090,7 +1090,7 @@ export function createDoneCloseLandingBackstopService(
           ejectionRefusal = ejectionGate;
           await recordEjectionRefusal(issue, prKey, ejectionGate, alreadyRefused);
         } else {
-          const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha, certifiedTarget);
+          const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha, cardState);
           if (gate.kind === "deferred") {
             // AC4: unresolvable head or approval status — fail closed, never
             // re-enqueue and never report; retry on a later sweep.
@@ -1112,7 +1112,7 @@ export function createDoneCloseLandingBackstopService(
                 issue.companyId,
                 pr,
                 approvedHeadSha,
-                mergeArmingEnabled ? await readCertifiedTarget(db, issue.id) : null,
+                mergeArmingEnabled ? await readCardExecutionState(db, issue.id) : null,
               ),
             );
             if (reenqueueSucceeded) {
@@ -1253,17 +1253,13 @@ export function createDoneCloseLandingBackstopService(
     }
   }
 
-  /**
-   * Reads the card's pinned approval-stamp head
-   * (`executionState.approvalStatus.approvedHeadSha`), or null when the card has
-   * no stamped head (e.g. an arming-refusal candidate).
-   */
-  async function readCertifiedTarget(db: Db, issueId: string) {
+  /** The card's execution state as it is now (its certified delivery and any confirmed board release). */
+  async function readCardExecutionState(db: Db, issueId: string) {
     const row = await db
       .select({ executionState: issues.executionState })
       .from(issues)
       .where(eq(issues.id, issueId));
-    return readCertifiedFinalDelivery(row[0]?.executionState as Record<string, unknown> | null | undefined) ?? null;
+    return (row[0]?.executionState as Record<string, unknown> | null | undefined) ?? null;
   }
 
   async function readApprovedHeadSha(
@@ -1307,7 +1303,7 @@ export function createDoneCloseLandingBackstopService(
     companyId: string,
     pr: LinkedPullRequest,
     approvedHeadSha: string | null,
-    certifiedTarget: { owner: string; repo: string; number: number; headSha: string } | null,
+    cardState: Record<string, unknown> | null,
   ): Promise<RequeueAuthorization> {
     const head = await fetchHeadViaTokenCandidates(
       db,
@@ -1330,16 +1326,14 @@ export function createDoneCloseLandingBackstopService(
       liveHeadSha,
       // Strict reading (SUP-20772): the newest paperclip/approved status must be a control-plane success,
       // never a forged or historical one. A board release is a human decision, not a review, so it
-      // re-enqueues a card only when the card's own review certified this exact repository, PR and head.
+      // re-enqueues a card only when the card's own review certified this exact repository, PR and head
+      // AND the publisher confirmed that very status: a release whose confirmation is unknown or voided
+      // is never consumed.
       {
         strict: true,
-        ignoreRelease: !(
-          certifiedTarget !== null &&
-          certifiedTarget.headSha === liveHeadSha &&
-          certifiedTarget.number === pr.number &&
-          certifiedTarget.owner.toLowerCase() === pr.owner.toLowerCase() &&
-          certifiedTarget.repo.toLowerCase() === pr.repo.toLowerCase()
-        ),
+        confirmedReleaseStatusId: cardState
+          ? consumableReleaseStatusId(cardState, { owner: pr.owner, repo: pr.repo, number: pr.number, headSha: liveHeadSha })
+          : null,
       },
     );
     if (!status.ok) return { kind: "deferred", reason: status.reason };

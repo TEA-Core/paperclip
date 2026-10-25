@@ -624,6 +624,25 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       expect(body.query).toContain(NODE_ID);
     });
 
+    it("binds the arm to the head the caller authorized, and leaves it unbound when none is given", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+      const head = "c".repeat(40);
+      mockGhFetch.mockResolvedValue(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+
+      expect((await armMergeOnApproval(db, companyId, issueId, DECISION, undefined, { expectedHeadOid: head })).kind).toBe("armed");
+      expect((await armMergeOnApproval(db, companyId, issueId, DECISION)).kind).toBe("armed");
+
+      const queries = mockGhFetch.mock.calls.map((call) => String(JSON.parse(call[1]!.body as string).query));
+      expect(queries[0]).toContain(`expectedHeadOid: "${head}"`);
+      expect(queries[1]).not.toContain("expectedHeadOid");
+    });
+
     it("resolves node_id via REST API when not present in external object data", async () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 7, {
