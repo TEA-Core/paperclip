@@ -5537,6 +5537,12 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).toContain("head_draft");
     });
 
+    it("does not refuse a foreign PR cached non-draft that is live draft", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: false, headRefName: "SUP-99999-carrier" });
+      expect(result.allowed).toBe(true);
+    });
+
     it("does not refuse a draft carrier owned by another card", async () => {
       ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
       const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-99999-carrier" });
