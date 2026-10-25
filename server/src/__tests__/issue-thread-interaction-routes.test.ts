@@ -55,7 +55,7 @@ const mockInteractionService = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
-  wakeup: vi.fn(async () => undefined),
+  wakeup: vi.fn(async (..._args: [string, Record<string, unknown>]) => undefined),
   cancelRun: vi.fn(async () => null),
 }));
 const mockRequestNativeQuestionRunCancellation = vi.hoisted(() =>
@@ -162,6 +162,7 @@ vi.mock("../telemetry.js", () => ({
 vi.mock("../services/task-watchdog-scope.js", () => ({
   TASK_WATCHDOG_ORIGIN_KIND: "task_watchdog",
   resolveTaskWatchdogMutationScope: mockResolveTaskWatchdogMutationScope,
+  issueIsInTaskWatchdogSubtree: vi.fn(async () => true),
   taskWatchdogScopeAllowsIssueMutation: vi.fn(async (_db, scope) => scope),
 }));
 
@@ -241,6 +242,7 @@ function registerModuleMocks() {
       upsertForIssue: vi.fn(),
       disableForIssue: vi.fn(async () => null),
       revalidateMutationScope: vi.fn(async (scope: unknown) => ({ allowed: true, scope })),
+      advanceWatchdogRunStopFingerprint: vi.fn(async () => null),
     }),
     logActivity: mockLogActivity,
     projectService: () => ({}),
@@ -1155,6 +1157,7 @@ describe.sequential("issue thread interaction routes", () => {
       watchedIssueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       watchdogIssueId: null,
       stopFingerprint: "stop-1",
+      runId: RUN_WATCHDOG,
     });
     const app = await createApp({ type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", runId: RUN_WATCHDOG });
     const res = await request(app)
@@ -3654,6 +3657,7 @@ describe.sequential("issue thread interaction routes", () => {
       watchedIssueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       watchdogIssueId: null,
       stopFingerprint: "stop-1",
+      runId: RUN_2,
     });
     const watchdogApp = await createApp(actor);
     const watchdog = await request(watchdogApp)
