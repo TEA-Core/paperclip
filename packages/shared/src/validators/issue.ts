@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  ISSUE_APPROVAL_AUTHORITIES,
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
   ISSUE_EXECUTION_MONITOR_KINDS,
@@ -453,6 +454,7 @@ export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
+  approvalAuthority: z.enum(ISSUE_APPROVAL_AUTHORITIES).optional(),
   returnAssigneeAgentId: z.string().trim().uuid().optional().nullable(),
   // Optional PR-base override for delivery (read first by deliver.sh Phase 2c).
   // A stacked carrier-child bases its PR on this ref instead of the repository
@@ -1065,6 +1067,40 @@ export const approveIssueHeadSchema = z.object({
   reason: z.string().trim().min(1).max(4000),
 }).strict();
 export type ApproveIssueHead = z.infer<typeof approveIssueHeadSchema>;
+
+const releaseAssuranceEventIdSchema = z.string().uuid();
+const releaseAssuranceHeadShaSchema = z.string().regex(/^[0-9a-f]{40}$/);
+const releaseAssuranceRepoSchema = z.string().trim().min(1).max(100);
+
+/** Board enrollment of a card + exact PR in release assurance (records a HOLD). */
+export const enrollReleaseAssuranceSchema = z.object({
+  eventId: releaseAssuranceEventIdSchema,
+  owner: releaseAssuranceRepoSchema,
+  repo: releaseAssuranceRepoSchema,
+  pullRequestNumber: z.number().int().positive(),
+  raAgentId: z.string().uuid(),
+  reason: z.string().trim().min(1).max(4000),
+}).strict();
+export type EnrollReleaseAssurance = z.infer<typeof enrollReleaseAssuranceSchema>;
+
+/** A head-bound release decision for an enrolled card. GO carries its evidence. */
+export const releaseAssuranceDecisionSchema = z.discriminatedUnion("decision", [
+  z.object({
+    decision: z.literal("go"),
+    eventId: releaseAssuranceEventIdSchema,
+    headSha: releaseAssuranceHeadShaSchema,
+    evidenceDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    ciRunIds: z.array(z.number().int().positive()).min(1).max(200),
+    reason: z.string().trim().min(1).max(4000),
+  }).strict(),
+  z.object({
+    decision: z.literal("no_go"),
+    eventId: releaseAssuranceEventIdSchema,
+    headSha: releaseAssuranceHeadShaSchema,
+    reason: z.string().trim().min(1).max(4000),
+  }).strict(),
+]);
+export type ReleaseAssuranceDecision = z.infer<typeof releaseAssuranceDecisionSchema>;
 
 export const stalledReviewDecisionSchema = z
   .object({

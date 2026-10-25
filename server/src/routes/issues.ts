@@ -18283,7 +18283,8 @@ export function issueRoutes(
       const recordedBranchMismatch =
         (!canRecordProjectPrimaryBranch && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
-          && requestedDeliveryIdentity.branch.toLowerCase() !== branchOwnership.branch.toLowerCase());
+          // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
+          && requestedDeliveryIdentity.branch !== branchOwnership.branch);
       if (!canRecordProjectPrimaryBranch && (!branchOwnership.legitimate || recordedBranchMismatch)) {
         const branchReason =
           branchOwnership.branch === null

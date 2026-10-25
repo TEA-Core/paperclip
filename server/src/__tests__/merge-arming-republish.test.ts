@@ -2077,6 +2077,33 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect((row!.executionState ?? {})?.delivery).toBeUndefined();
   });
 
+  it("rejects deliveryIdentity whose branch differs from the card's workspace branch only by case (SUP-20771)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    // Git refs are case-sensitive: "sup-14824-branch" is not the workspace's "SUP-14824-branch".
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "sup-14824-branch",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
   it("rejects deliveryIdentity when the recorded branch is owned by an unrelated (non-ancestor) issue (SUP-15909)", async () => {
     const runId = randomUUID();
     const { companyId, issueId, agentId } = await seedIssue({

@@ -34,7 +34,8 @@ import {
   routineRevisions,
   routines,
 } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { isForeignKeyViolation } from "../db-errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import {
   MAX_ISSUE_PREFIX_ATTEMPTS,
@@ -527,6 +528,9 @@ export function companyService(db: Db) {
     },
 
     remove: (id: string) =>
+      // The release-assurance ledger keeps its rows on purpose (its foreign keys have no
+      // delete policy) and blocks this delete; answer 409, not a bare 500. Any other
+      // foreign-key failure keeps its existing behavior.
       db.transaction(async (tx) => {
         // Delete from child tables in dependency order
         const companyRunIds = await tx
@@ -575,6 +579,11 @@ export function companyService(db: Db) {
           .where(eq(companies.id, id))
           .returning();
         return rows[0] ?? null;
+      }).catch((err) => {
+        if (isForeignKeyViolation(err, "release_assurance_events_")) {
+          throw conflict("Company cannot be deleted because release-assurance records still reference it.");
+        }
+        throw err;
       }),
 
     stats: () =>

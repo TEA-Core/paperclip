@@ -39,6 +39,8 @@ import {
   createIssueSchema,
   updateIssueObjectSchema,
   approveIssueHeadSchema,
+  enrollReleaseAssuranceSchema,
+  releaseAssuranceDecisionSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
@@ -1424,6 +1426,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/merge-arming/republish",
   "GET /api/issues/{id}/merge-arming/head-review",
   "POST /api/issues/{id}/merge-arming/approve-head",
+  "GET /api/issues/{id}/release-decisions",
+  "POST /api/issues/{id}/release-assurance/enroll",
+  "POST /api/issues/{id}/release-decisions",
   "POST /api/issues/{id}/execution-stage/board-decision",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
@@ -7685,6 +7690,59 @@ registry.registerPath({
     404: r.notFound,
     409: r.conflict,
   },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/release-decisions",
+  tags: ["issues"],
+  summary: "Read the release-assurance ledger and per-head verdicts for a card (shadow mode)",
+  description:
+    "Board-only. Returns the append-only HOLD / GO / NO-GO events, the enrollment binding, and the " +
+    "durable verdict (not_enrolled, held, go, no_go) for every head with a decision. publicationMode " +
+    "is always shadow: no release-assurance/approved status is written.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/release-assurance/enroll",
+  tags: ["issues"],
+  summary: "Enroll a card and its exact recorded-delivery PR in release assurance (records a HOLD)",
+  description:
+    "Board-only (company owner/admin). The PR must be the card's authoritative recorded delivery " +
+    "(repository, branch and PR number from the recorded delivery identity, checked again under the issue " +
+    "lock) on a github.com repository. The live PR must be open, not merged and not a draft, with its head " +
+    "branch exactly equal (case-sensitive) to the recorded delivery branch and its repository equal to the recorded " +
+    "delivery repository. A PR that is only mentioned on the card never " +
+    "binds. raAgentId must be an agent of the company. Idempotent by eventId: an identical replay returns 200, a different payload under " +
+    "the same eventId or a second enrollment of the card or PR is 409. Shadow mode: this installs no " +
+    "execution policy and admits no PR.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(enrollReleaseAssuranceSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/release-decisions",
+  tags: ["issues"],
+  summary: "Record a head-bound release-assurance GO or NO-GO (shadow mode)",
+  description:
+    "Board-only (company owner/admin). The card must be enrolled and headSha must equal the live PR head, " +
+    "otherwise 409. A GO also needs an evidence digest and CI run ids; a head with a recorded NO-GO " +
+    "rejects any GO. A GO is refused on a draft PR, when the live PR's head branch or repository is not the " +
+    "recorded delivery, or when the card's recorded delivery no longer matches the enrolled PR. A NO-GO skips the " +
+    "delivery and live-branch binding on purpose. Branch existence and the base ref are not checked. Idempotent by eventId. The response carries the planned status with publication kind " +
+    "shadow: no GitHub status is written and no PR is admitted.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(releaseAssuranceDecisionSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

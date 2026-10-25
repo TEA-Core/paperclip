@@ -1603,13 +1603,14 @@ interface DeliveryBinding {
   sourceIssueId?: string;
 }
 
-async function resolveDeliveryIdentity(
+export async function resolveDeliveryIdentity(
   db: Db,
   companyId: string,
   issueId: string,
 ): Promise<{
    branch: string | null;
-   repo: { owner: string; repo: string } | null;
+   // `hostname` is the project repository host (parseRepoUrl); callers that must stay on github.com check it.
+   repo: { owner: string; repo: string; hostname?: string } | null;
    binding?: DeliveryBinding;
    recordedUnusable?: string;
    /**
@@ -1767,7 +1768,8 @@ async function resolveDeliveryIdentity(
     const branchOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
     if (
       branchOwnership.branch === null ||
-      branch.toLowerCase() !== branchOwnership.branch.toLowerCase()
+      // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
+      branch !== branchOwnership.branch
     ) {
       return {
         branch: null,
