@@ -142,6 +142,74 @@ describeEmbeddedPostgres("issue review attention", () => {
     });
   });
 
+  it("does not treat an exhausted review recovery action as a maintained path", async () => {
+    const { companyId, agentId } = await seed();
+    const deadAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: deadAgentId,
+      companyId,
+      name: "Dead Reviewer",
+      role: "engineer",
+      status: "paused",
+    });
+    const deadParticipantState = {
+      status: "pending",
+      currentStageType: "review",
+      currentStageIndex: 0,
+      completedStageIds: [],
+      currentParticipant: { type: "agent", agentId: deadAgentId },
+    };
+    const exhaustedIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-EXHAUSTED",
+      executionState: deadParticipantState,
+    });
+    const activeIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-ACTIVE",
+      executionState: deadParticipantState,
+    });
+    await db.insert(issueRecoveryActions).values([
+      {
+        companyId,
+        sourceIssueId: exhaustedIssueId,
+        kind: "review_stage_unarmed",
+        status: "escalated",
+        outcome: "exhausted",
+        ownerType: "agent",
+        ownerAgentId: deadAgentId,
+        cause: "review_stage_armed_stranded",
+        fingerprint: "review-stage-exhausted",
+        evidence: {},
+        nextAction: "Restore review path",
+      },
+      {
+        companyId,
+        sourceIssueId: activeIssueId,
+        kind: "review_stage_unarmed",
+        status: "active",
+        outcome: null,
+        ownerType: "agent",
+        ownerAgentId: deadAgentId,
+        cause: "review_stage_armed_stranded",
+        fingerprint: "review-stage-active",
+        evidence: {},
+        nextAction: "Restore review path",
+      },
+    ]);
+
+    const rows = await svc.list(companyId, { status: "in_review" });
+    const byId = new Map(rows.map((row) => [row.id, row.reviewAttention]));
+    expect(byId.get(exhaustedIssueId)).toMatchObject({ state: "stalled", paths: [] });
+    expect(byId.get(exhaustedIssueId)?.reason).toContain("paused");
+    expect(byId.get(activeIssueId)).toMatchObject({
+      state: "covered",
+      paths: [expect.objectContaining({ kind: "recovery" })],
+    });
+  });
+
   it("reports every healthy review path as covered", async () => {
     const { companyId, agentId } = await seed();
     const interactionIssueId = await insertReview({ companyId, agentId, identifier: "RVA-2" });
