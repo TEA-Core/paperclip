@@ -73,6 +73,7 @@ type LoadGateFactsInput = {
   contextSnapshot: Record<string, unknown>;
   scheduledRetryReason: string | null;
   retryReasonOverride?: string | null;
+  retryIsAlreadyScheduled?: boolean;
   wakeupRequestId: string | null;
 };
 type LoadGateFactsResult =
@@ -301,6 +302,7 @@ export function createPostgresRunDispatchAdapter(
       retryReasonKind,
       enforceIssueExecutionLock:
         retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
+      retryIsAlreadyScheduled: input.retryIsAlreadyScheduled,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
       budgetBlock: null,
       agentInvokable: true,
@@ -749,6 +751,7 @@ export function createPostgresRunDispatchAdapter(
           contextSnapshot: parseObject(run.contextSnapshot),
           scheduledRetryReason: run.scheduledRetryReason,
           retryReasonOverride: run.scheduledRetryReason,
+          retryIsAlreadyScheduled: true,
           wakeupRequestId: run.wakeupRequestId,
         },
         now,

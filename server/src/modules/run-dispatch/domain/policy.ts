@@ -81,6 +81,7 @@ export type ScheduledRetryFacts = {
   issueId: string | null;
   retryReasonKind: RetryReasonKind;
   enforceIssueExecutionLock: boolean;
+  retryIsAlreadyScheduled?: boolean;
 
   budgetBlock: BudgetBlockFacts | null;
 
@@ -412,7 +413,12 @@ export function decideScheduledRetryGate(
   }
 
   const lockOutcome = decideExecutionLock({
-    requiresExecutionLock: requiresInProgress && facts.enforceIssueExecutionLock,
+    requiresExecutionLock:
+      (requiresInProgress ||
+        (facts.retryReasonKind === "ai_connection_wait" &&
+          !facts.isNonAssigneeWorkspaceBusyRetry &&
+          !facts.retryIsAlreadyScheduled)) &&
+      facts.enforceIssueExecutionLock,
     allowVacantExecutionLock:
       facts.retryReasonKind === "max_turn_continuation" &&
       !facts.isNonAssigneeWorkspaceBusyRetry,

@@ -2027,7 +2027,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
   it.each(["schedule", "transaction", "promote", "dispatch"] as const)(
-    "suppresses a busy-subscription retry whose task lock was cleared before %s",
+    "requires a busy-subscription retry predecessor lock when scheduling and rebinds after release",
     async (phase) => {
       const { companyId, issueId, runId, now } = await seedMaxTurnFixture();
       await db.update(heartbeatRuns).set({
@@ -2059,19 +2059,18 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       if (scheduled.outcome !== "scheduled") return;
       if (phase === "promote") await clearLock();
       const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
-      if (phase === "promote" || phase === "dispatch") {
-        expect(promotion).toEqual({ promoted: 0, runIds: [] });
+      expect(promotion.runIds).toContain(scheduled.run.id);
+      if (phase === "promote") {
+        expect(await heartbeat.getRun(scheduled.run.id)).toMatchObject({ status: "queued" });
+      } else if (phase === "dispatch") {
+        expect(await heartbeat.getRun(scheduled.run.id)).toMatchObject({ status: "queued" });
       } else {
-        expect(promotion.runIds).toContain(scheduled.run.id);
         await clearLock();
         const adapter = createPostgresRunDispatchAdapter(db);
         expect(await adapter.cancelStaleQueuedRun({
           companyId, runId: scheduled.run.id, expectedStatus: "queued", now: scheduled.dueAt,
         })).toMatchObject({ outcome: "cancelled", errorCode: "issue_execution_lock_changed" });
       }
-      expect(await heartbeat.getRun(scheduled.run.id)).toMatchObject({
-        status: "cancelled", errorCode: "issue_execution_lock_changed",
-      });
     },
   );
 
@@ -2213,7 +2212,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(duplicateWakeup?.status).toBe("cancelled");
 
     claimRetryExecution?.release.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await heartbeat.waitForRunExecutionDrain(scheduled.run.id);
   });
 
   it.each(["blocked", "todo", "backlog"] as const)(
