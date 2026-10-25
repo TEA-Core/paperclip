@@ -1880,7 +1880,7 @@ export interface IssueFilters {
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "updated" | "id";
+  sortField?: "created" | "updated" | "id";
   afterId?: string;
   sortDir?: "asc" | "desc";
   /** ISO 8601 timestamp — only return issues with updatedAt strictly after this value. */
@@ -3629,19 +3629,22 @@ function issueListOrderBy(
   companyId: string,
   {
     hasSearch,
-    priorityOrder,
     searchOrder,
     sortField,
     sortDir,
   }: {
     hasSearch: boolean;
-    priorityOrder: SQL;
     searchOrder: SQL;
     sortField?: IssueFilters["sortField"];
     sortDir?: IssueFilters["sortDir"];
   },
 ) {
   if (sortField === "id") return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
+  if (sortField === "created") {
+    const createdOrder = sortDir === "asc" ? asc(issues.createdAt) : desc(issues.createdAt);
+    const idOrder = sortDir === "asc" ? asc(issues.id) : desc(issues.id);
+    return hasSearch ? [asc(searchOrder), createdOrder, idOrder] : [createdOrder, idOrder];
+  }
   const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
   if (sortField === "updated") {
     const activityOrder =
@@ -3657,10 +3660,8 @@ function issueListOrderBy(
   }
 
   return [
-    hasSearch ? asc(searchOrder) : asc(priorityOrder),
-    asc(priorityOrder),
-    desc(canonicalLastActivityAt),
-    desc(issues.updatedAt),
+    hasSearch ? asc(searchOrder) : desc(issues.createdAt),
+    desc(issues.createdAt),
     desc(issues.id),
   ];
 }
@@ -8666,7 +8667,6 @@ export function issueService(db: Db) {
       ) {
         conditions.push(ne(issues.originKind, "routine_execution"));
       }
-      const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
       const searchOrder = sql<number>`-task_search.score`;
       const issueSource = db.select(issueListSelect).from(issues);
       const searchedSource = hasSearch
@@ -8680,7 +8680,6 @@ export function issueService(db: Db) {
         .orderBy(
           ...issueListOrderBy(companyId, {
             hasSearch,
-            priorityOrder,
             searchOrder,
             sortField: filters?.sortField,
             sortDir: filters?.sortDir,

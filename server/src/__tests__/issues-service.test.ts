@@ -1430,6 +1430,104 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(withoutPlan.map((issue) => issue.id)).toEqual([withoutPlanId]);
   });
 
+  it("keeps the next offset page stable when an earlier issue receives a comment", async () => {
+    const companyId = randomUUID();
+    const firstIssueId = "00000000-0000-0000-0000-000000000001";
+    const secondIssueId = "00000000-0000-0000-0000-000000000002";
+    const thirdIssueId = "00000000-0000-0000-0000-000000000003";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: firstIssueId,
+        companyId,
+        title: "First issue",
+        status: "todo",
+        priority: "medium",
+        createdAt: new Date("2026-05-01T10:00:00.000Z"),
+        updatedAt: new Date("2026-05-01T10:00:00.000Z"),
+      },
+      {
+        id: secondIssueId,
+        companyId,
+        title: "Second issue",
+        status: "todo",
+        priority: "medium",
+        createdAt: new Date("2026-05-02T10:00:00.000Z"),
+        updatedAt: new Date("2026-05-02T10:00:00.000Z"),
+      },
+      {
+        id: thirdIssueId,
+        companyId,
+        title: "Third issue",
+        status: "todo",
+        priority: "medium",
+        createdAt: new Date("2026-05-03T10:00:00.000Z"),
+        updatedAt: new Date("2026-05-03T10:00:00.000Z"),
+      },
+    ]);
+
+    const firstPage = await svc.list(companyId, { limit: 2 });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: firstIssueId,
+      body: "Activity after the first page was read",
+      createdAt: new Date("2026-05-04T10:00:00.000Z"),
+      updatedAt: new Date("2026-05-04T10:00:00.000Z"),
+    });
+    const secondPage = await svc.list(companyId, { limit: 2, offset: 2 });
+
+    expect(firstPage.map((issue) => issue.id)).toEqual([thirdIssueId, secondIssueId]);
+    expect(secondPage.map((issue) => issue.id)).toEqual([firstIssueId]);
+
+    const explicitCreatedOrder = await svc.list(companyId, {
+      limit: 3,
+      sortField: "created",
+      sortDir: "desc",
+    });
+    expect(explicitCreatedOrder.map((issue) => issue.id)).toEqual([
+      thirdIssueId,
+      secondIssueId,
+      firstIssueId,
+    ]);
+
+    const equalCreatedAt = new Date("2026-05-02T10:00:00.000Z");
+    await db.insert(issues).values({
+      id: "00000000-0000-0000-0000-000000000004",
+      companyId,
+      title: "Equal created issue",
+      status: "todo",
+      priority: "medium",
+      createdAt: equalCreatedAt,
+      updatedAt: equalCreatedAt,
+    });
+    const equalCreatedFirstPage = await svc.list(companyId, {
+      limit: 2,
+      sortField: "created",
+      sortDir: "asc",
+    });
+    const equalCreatedSecondPage = await svc.list(companyId, {
+      limit: 2,
+      offset: 2,
+      sortField: "created",
+      sortDir: "asc",
+    });
+    expect(equalCreatedFirstPage.map((issue) => issue.id)).toEqual([
+      firstIssueId,
+      secondIssueId,
+    ]);
+    expect(equalCreatedSecondPage.map((issue) => issue.id)).toEqual([
+      "00000000-0000-0000-0000-000000000004",
+      thirdIssueId,
+    ]);
+  });
+
   it("can page issues by most recently updated before priority", async () => {
     const companyId = randomUUID();
     const oldCriticalIssueId = randomUUID();
@@ -2373,7 +2471,10 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       },
     ]);
 
-    const result = await svc.list(companyId, {});
+    const result = await svc.list(companyId, {
+      sortField: "updated",
+      sortDir: "desc",
+    });
 
     expect(result.map((issue) => issue.id)).toEqual([
       activityIssueId,
