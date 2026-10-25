@@ -1211,6 +1211,7 @@ export function isRecoveryBounceTargetLive(
 
 export type RecoveryReassignmentRefusalReason =
   | "review_stage_self_satisfy"
+  | "pending_stage_participant_displaced"
   | "reassignment_target_not_live";
 
 export interface RecoveryReassignmentDecision {
@@ -1219,6 +1220,43 @@ export interface RecoveryReassignmentDecision {
   refusalReason: RecoveryReassignmentRefusalReason | null;
   refusedAssigneeAgentId: string | null;
   keptAssigneeAgentId: string | null;
+}
+
+/**
+ * Would a recovery reassignment move a card OFF the agent that is the current
+ * participant of its pending review/approval stage?
+ *
+ * A pending stage can only be advanced by its participant, and the participant
+ * can only act while it holds the card. Re-seating the card under a recovery
+ * owner while the stage still names someone else produces the orphaned-stage
+ * deadlock: the participant cannot transition the stage (it is not the
+ * assignee), the new assignee cannot reach it (it is not the participant), and
+ * every recovery wake on either side is refused until the attempt ceiling
+ * escalates to the board. Observed on 24 of 27 live cards on 2026-10-24, all
+ * minted by `recovery.reconcile_execution_review_participant`.
+ *
+ * Only an agent participant that currently holds the card is protected; a
+ * user-held escalation hold and a card whose assignee already differs from the
+ * participant are unaffected (no new orphan can be created there).
+ */
+export function wouldDisplacePendingStageParticipant(input: {
+  executionState: unknown;
+  currentAssigneeAgentId: string | null;
+  candidateAgentId: string | null;
+}): boolean {
+  const { currentAssigneeAgentId, candidateAgentId } = input;
+  if (!currentAssigneeAgentId || !candidateAgentId) return false;
+  if (candidateAgentId === currentAssigneeAgentId) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (
+    !state ||
+    state.status !== "pending" ||
+    !state.currentStageId ||
+    (state.currentStageType !== "review" && state.currentStageType !== "approval")
+  ) return false;
+  const participant = state.currentParticipant;
+  if (!participant || participant.type !== "agent") return false;
+  return participant.agentId === currentAssigneeAgentId;
 }
 
 /**
@@ -1237,6 +1275,8 @@ export function decideRecoveryReassignment(input: {
   currentAssigneeAgentId: string | null;
   recoveryOwnerAgentId: string | null;
   reviewStageSelfSatisfies: boolean;
+  /** Optional so existing callers keep compiling; defaults to "does not displace". */
+  pendingStageParticipantDisplaced?: boolean;
   recoveryOwnerLive: boolean;
 }): RecoveryReassignmentDecision {
   const effectiveCurrent = input.currentAssigneeAgentId;
@@ -1255,6 +1295,15 @@ export function decideRecoveryReassignment(input: {
       assigneeAgentId: effectiveCurrent,
       refused: true,
       refusalReason: "review_stage_self_satisfy",
+      refusedAssigneeAgentId: candidate,
+      keptAssigneeAgentId: effectiveCurrent,
+    };
+  }
+  if (input.pendingStageParticipantDisplaced) {
+    return {
+      assigneeAgentId: effectiveCurrent,
+      refused: true,
+      refusalReason: "pending_stage_participant_displaced",
       refusedAssigneeAgentId: candidate,
       keptAssigneeAgentId: effectiveCurrent,
     };
@@ -1321,16 +1370,17 @@ async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: strin
 export async function blockIssueWithUnresolvedBlockers(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null; status: string },
-  opts: { source: string; previousStatus: string; extraUpdate?: Record<string, unknown> },
+  opts: { source: string; previousStatus: string; extraUpdate?: Record<string, unknown>; tx?: Db },
 ) {
-  const blockedByIssueIds = (await unresolvedBlockerIssues(db, issue.companyId, issue.id)).map((row) => row.id);
+  const runner = opts.tx ?? db;
+  const blockedByIssueIds = (await unresolvedBlockerIssues(runner, issue.companyId, issue.id)).map((row) => row.id);
   if (blockedByIssueIds.length === 0) {
     logger.info(
       { issueId: issue.id, identifier: issue.identifier, source: opts.source, previousStatus: opts.previousStatus },
       "recovery blocked-write has an empty blocker set; zero-blocker heal or recovery owner will wake it",
     );
   }
-  return (await issueService(db).update(issue.id, { status: "blocked", blockedByIssueIds, ...opts.extraUpdate })) ?? null;
+  return (await issueService(runner).update(issue.id, { status: "blocked", blockedByIssueIds, ...opts.extraUpdate, companyGuard: issue.companyId }, runner)) ?? null;
 }
 
 /**
@@ -1477,20 +1527,20 @@ export function recoveryService(
   // unaffected by the restart.
   const undispatchableAssignedSightCounts = new Map<string, number>();
 
-  async function getAgent(agentId: string) {
-    return db
+  async function getAgent(agentId: string, runner: Db = db) {
+    return runner
       .select()
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined): Promise<AgentInvokability> {
-    return evaluateAgentInvokabilityFromDb(db, agent);
+  async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined, runner: Db = db): Promise<AgentInvokability> {
+    return evaluateAgentInvokabilityFromDb(runner, agent);
   }
 
-  async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
-    return (await getAgentInvokability(agent)).invokable;
+  async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined, runner: Db = db) {
+    return (await getAgentInvokability(agent, runner)).invokable;
   }
 
   // SUP-17884 C2 liveness read: the agent's K most recent wake-request outcomes,
@@ -1500,8 +1550,9 @@ export function recoveryService(
   async function hasConsecutiveWakeFailuresForAgent(
     agentId: string,
     consecutiveFailures: number,
+    runner: Db = db,
   ): Promise<boolean> {
-    const statuses = await db
+    const statuses = await runner
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId))
@@ -2778,8 +2829,9 @@ export function recoveryService(
   async function isInvocationBudgetBlocked(
     issue: typeof issues.$inferSelect,
     agentId: string,
+    budgetRunner: ReturnType<typeof budgetService> = budgets,
   ) {
-    const budgetBlock = await budgets.getInvocationBlock(
+    const budgetBlock = await budgetRunner.getInvocationBlock(
       issue.companyId,
       agentId,
       {
@@ -2889,16 +2941,29 @@ export function recoveryService(
       // SUP-13526: route this recovery reassignment through the same gate as
       // the PATCH handler and the other recovery paths. A refusal keeps the
       // blocker unassigned instead of making its review stage self-satisfiable.
-      const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(candidate, nextAgent.id);
-      if (!nextAssigneeAgentId) {
+      const updated = await db.transaction(async (tx) => {
+        // Drizzle's transaction omits $client from Db's type, but its queries
+        // use the same reserved connection as the issue-row lock.
+        const txDb = tx as unknown as Db;
+        const [current] = await tx.select().from(issues)
+          .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId)))
+          .for("update").limit(1);
+        if (!current) return null;
+        if (current.assigneeAgentId || current.assigneeUserId) return null;
+        const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, nextAgent.id, txDb);
+        if (!nextAssigneeAgentId) return null;
+        return issueService(txDb).update(candidate.id, {
+          assigneeAgentId: nextAssigneeAgentId,
+          assigneeUserId: null,
+          companyGuard: candidate.companyId,
+        }, tx);
+      });
+      if (!updated) {
         skipped += 1;
         continue;
       }
-      const updated = await issuesSvc.update(candidate.id, {
-        assigneeAgentId: nextAssigneeAgentId,
-        assigneeUserId: null,
-      });
-      if (!updated) {
+      const nextAssigneeAgentId = updated.assigneeAgentId;
+      if (!nextAssigneeAgentId) {
         skipped += 1;
         continue;
       }
@@ -4398,10 +4463,10 @@ export function recoveryService(
       executionState: unknown;
     },
     recoveryOwnerAgentId: string | null,
-    currentAssigneeAgentId?: string | null,
+    runner: Db = db,
   ): Promise<string | null> {
     const candidate = recoveryOwnerAgentId ?? issue.assigneeAgentId;
-    const effectiveCurrent = currentAssigneeAgentId ?? issue.assigneeAgentId;
+    const effectiveCurrent = issue.assigneeAgentId;
     if (!candidate || candidate === effectiveCurrent) return candidate;
 
     let reviewStageSelfSatisfies = false;
@@ -4421,17 +4486,22 @@ export function recoveryService(
     // it fresh so a live agent that started failing between selection and
     // write is still refused here (this is also the backstop for the
     // original-agent routing path, which does not run the C2 filter).
-    const targetAgent = await getAgent(candidate);
+    const targetAgent = await getAgent(candidate, runner);
     const recoveryOwnerLive =
       targetAgent != null &&
       targetAgent.companyId === issue.companyId &&
-      (await isAgentInvokable(targetAgent)) &&
-      !(await hasConsecutiveWakeFailuresForAgent(candidate, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES));
+      (await isAgentInvokable(targetAgent, runner)) &&
+      !(await hasConsecutiveWakeFailuresForAgent(candidate, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, runner));
 
     const decision = decideRecoveryReassignment({
       currentAssigneeAgentId: effectiveCurrent,
       recoveryOwnerAgentId,
       reviewStageSelfSatisfies,
+      pendingStageParticipantDisplaced: wouldDisplacePendingStageParticipant({
+        executionState: issue.executionState,
+        currentAssigneeAgentId: effectiveCurrent,
+        candidateAgentId: candidate,
+      }),
       recoveryOwnerLive,
     });
     if (decision.refused && decision.refusalReason === "review_stage_self_satisfy") {
@@ -4444,6 +4514,16 @@ export function recoveryService(
           error: reviewStageError,
         },
         "recovery reassignment refused: assignee write would make an incomplete review stage self-satisfiable",
+      );
+    } else if (decision.refused && decision.refusalReason === "pending_stage_participant_displaced") {
+      logger.warn(
+        {
+          issueId: issue.id,
+          identifier: issue.identifier,
+          refusedAssigneeAgentId: decision.refusedAssigneeAgentId,
+          keptAssigneeAgentId: decision.keptAssigneeAgentId,
+        },
+        "recovery reassignment refused: it would move the card off its pending review stage participant (orphaned-stage deadlock); keeping current assignee",
       );
     } else if (decision.refused && decision.refusalReason === "reassignment_target_not_live") {
       logger.warn(
@@ -5285,7 +5365,9 @@ export function recoveryService(
       : input.recoveryCause === "stillborn_assigned_backlog"
         ? "recovery.reconcile_stillborn_assigned_backlog"
       : "recovery.reconcile_stranded_assigned_issue";
-    const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
+    // Create the action before locking the issue: its source foreign key needs
+    // a row lock of its own. Locking first with a different connection deadlocks.
+    const routedAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
       latestRun: input.latestRun,
@@ -5294,43 +5376,92 @@ export function recoveryService(
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
       agentInvokability: input.agentInvokability,
     });
+    // Recheck the stage and assignee under the issue-row lock and write through
+    // the same transaction. A concurrent transition into review cannot be
+    // displaced by the earlier sweep snapshot.
+    const escalation = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const [current] = await tx.select().from(issues)
+        .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+        .for("update").limit(1);
+      if (!current) return null;
+      const pendingParticipant = parseIssueExecutionState(current.executionState)?.currentParticipant;
+      const participantAgent = pendingParticipant?.type === "agent" &&
+        pendingParticipant.agentId &&
+        pendingParticipant.agentId === current.assigneeAgentId
+        ? await getAgent(pendingParticipant.agentId, txDb)
+        : null;
+      const boardOnlyPendingParticipant =
+        wouldDisplacePendingStageParticipant({
+          executionState: current.executionState,
+          currentAssigneeAgentId: current.assigneeAgentId,
+          candidateAgentId: routedAction.ownerAgentId ?? "__recovery_owner__",
+        }) &&
+        (!participantAgent ||
+          !isAgentStatusInvokable(participantAgent.status) ||
+          !(await isAgentInvokable(participantAgent, txDb)) ||
+          (await isInvocationBudgetBlocked(current, participantAgent.id, budgetService(txDb))) ||
+          (await hasConsecutiveWakeFailuresForAgent(participantAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, txDb)));
+      let recoveryAction = routedAction;
+      if (boardOnlyPendingParticipant) {
+        // A participant that cannot run cannot complete its pending stage.
+        // Even an authorized replacement worker cannot decide that stage on
+        // behalf of the participant; require explicit board repair instead.
+        const [boardAction] = await tx.update(issueRecoveryActions).set({
+          ownerType: "board",
+          ownerAgentId: null,
+          wakePolicy: { type: "board_escalation", reason: "pending_participant_unavailable" },
+          nextAction: `${recoveryAction.nextAction} The pending participant is unavailable. Restore or replace the participant and re-arm the stage, or reset the workflow on the board.`,
+          evidence: {
+            ...recoveryAction.evidence,
+            routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
+            routingFallbackReason: "pending_participant_unavailable",
+          },
+          updatedAt: new Date(),
+        }).where(and(
+          eq(issueRecoveryActions.id, recoveryAction.id),
+          eq(issueRecoveryActions.companyId, current.companyId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        )).returning();
+        if (!boardAction) return null;
+        recoveryAction = {
+          ...recoveryAction, ownerType: "board", ownerAgentId: null,
+          wakePolicy: boardAction.wakePolicy, nextAction: boardAction.nextAction,
+          evidence: boardAction.evidence,
+        };
+      }
+      const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, recoveryAction.ownerAgentId, txDb);
+      const updated = await blockIssueWithUnresolvedBlockers(db, current, {
+        source: escalationSource,
+        previousStatus: input.previousStatus,
+        // An unchanged assignee must not be validated again: the participant
+        // may be terminated or paused, but the board still needs the blocked card.
+        extraUpdate: nextAssigneeAgentId === current.assigneeAgentId
+          ? {}
+          : { assigneeAgentId: nextAssigneeAgentId },
+        tx: txDb,
+      });
+      return updated ? { recoveryAction, updated, current } : null;
+    });
+    if (!escalation) return null;
+    const { recoveryAction, updated, current } = escalation;
     const isProviderQuotaWait =
       recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
       Boolean(recoveryAction.returnOwnerAgentId);
     if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
       await ensureProviderQuotaWaitRecoveryMonitor({
-        issue: input.issue,
+        issue: current,
         latestRun: input.latestRun,
         actionId: recoveryAction.id,
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
-    const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(input.issue, recoveryAction.ownerAgentId);
-    const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
-      source: escalationSource,
-      previousStatus: input.previousStatus,
-      // Restamp the assignee only when recovery routing actually moves it.
-      // Re-writing the identical id is a value no-op -- issues.update's own
-      // side effects here are all gated on the value CHANGING -- but the mere
-      // PRESENCE of the key flips `shouldValidateNextAssignee`, which runs
-      // assertAssignableAgent and throws 409 for a terminated (or
-      // pending_approval) assignee. That turned "park this card on the board
-      // and preserve its source assignee" into a thrown conflict that aborted
-      // the whole sweep precisely when the owner was un-invokable -- the case
-      // this escalation exists to handle. Omitting the key preserves the source
-      // assignee exactly, which is what the path wants anyway.
-      extraUpdate:
-        nextAssigneeAgentId === input.issue.assigneeAgentId
-          ? {}
-          : { assigneeAgentId: nextAssigneeAgentId },
-    });
-    if (!updated) return null;
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
-      updated.assigneeAgentId === input.issue.assigneeAgentId &&
-      updated.assigneeUserId === input.issue.assigneeUserId;
+      updated.assigneeAgentId === current.assigneeAgentId &&
+      updated.assigneeUserId === current.assigneeUserId;
 
     const recoveryOwner = recoveryAction.ownerAgentId
       ? await getAgent(recoveryAction.ownerAgentId)
@@ -5521,16 +5652,21 @@ export function recoveryService(
         (currentIssue.status !== "blocked" ||
           currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
       ) {
-        const reblocked = await blockIssueWithUnresolvedBlockers(db, input.issue, {
-          source: escalationSource,
-          previousStatus: input.previousStatus,
-          extraUpdate: {
-            assigneeAgentId: await resolveRecoveryReassignedAssignee(
-              input.issue,
-              recoveryAction.ownerAgentId,
-              currentIssue.assigneeAgentId,
-            ),
-          },
+        const reblocked = await db.transaction(async (tx) => {
+          const txDb = tx as unknown as Db;
+          const [latest] = await tx.select().from(issues)
+            .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+            .for("update").limit(1);
+          if (!latest) return null;
+          const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(latest, recoveryAction.ownerAgentId, txDb);
+          return blockIssueWithUnresolvedBlockers(db, latest, {
+            source: escalationSource,
+            previousStatus: input.previousStatus,
+            extraUpdate: nextAssigneeAgentId === latest.assigneeAgentId
+              ? {}
+              : { assigneeAgentId: nextAssigneeAgentId },
+            tx: txDb,
+          });
         });
         if (reblocked) return reblocked;
       }
@@ -10018,8 +10154,8 @@ export function recoveryService(
   //   - terminal/missing source issues are dropped (nothing left to recover)
   //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
   //     causes are skipped without burning an attempt
-  //   - `board_escalation` actions are rerouted to an invokable agent owner when
-  //     one can be resolved, instead of waiting on a human forever
+  //   - ordinary `board_escalation` actions may be rerouted to an invokable
+  //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
   //     pre-image, so concurrent sweeps cannot double-fire
   //   - at `maxAttempts` the action is escalated to the board with a comment on
@@ -10114,6 +10250,19 @@ export function recoveryService(
         continue;
       }
       if (!candidate.ownerAgentId && wakePolicyType !== "board_escalation") {
+        result.nonWakeableSkipped += 1;
+        continue;
+      }
+
+      // This action was deliberately sent to the board because its pending
+      // participant cannot run. A different agent may be invokable, but
+      // reassigning the action to it recreates the failed recovery path.
+      // Board repair must explicitly restore/re-arm or reset the workflow.
+      if (
+        candidate.ownerType === "board" &&
+        wakePolicyType === "board_escalation" &&
+        readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
+      ) {
         result.nonWakeableSkipped += 1;
         continue;
       }
