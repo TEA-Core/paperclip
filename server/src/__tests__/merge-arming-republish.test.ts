@@ -10,6 +10,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  createRequestScopedDb,
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
@@ -2979,8 +2980,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
     // ---- Round 5: bounded deadlines on the release path ----
 
-    const directRelease = async (companyId: string, extra: Record<string, unknown> = {}) =>
-      publishHeadBoundRelease(db, companyId, { owner: OWNER, repo: REPO, number: PR_NUMBER }, {
+    const directRelease = async (companyId: string, { dbOverride, ...extra }: Record<string, unknown> = {}) =>
+      publishHeadBoundRelease((dbOverride as Db | undefined) ?? db, companyId, { owner: OWNER, repo: REPO, number: PR_NUMBER }, {
         headSha: HEAD_SHA, description: "released by user:u for x: reason", expectedBranch: DELIVERY_BRANCH,
         revalidate: async () => ({ ok: true, target: { owner: OWNER, repo: REPO, number: PR_NUMBER, branch: DELIVERY_BRANCH } }),
         confirmedStatusId: async () => null,
@@ -3570,6 +3571,71 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(confirmed).toBe(0);
       expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state)).toEqual(["success", "failure"]);
       expect(markerWrites()).toEqual([]);
+    }, 20_000);
+
+    it("releases on a pooled (prepare: false) client through the shared pool and leaves no request session", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      const pooled = express();
+      pooled.use(express.json());
+      pooled.use((req, _res, next) => { req.actor = currentActor; next(); });
+      pooled.use("/api", issueRoutes(createDb(tempDb!.connectionString, { prepare: false }), {} as any));
+      pooled.use(errorHandler);
+
+      const res = await request(pooled).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.body.outcome).toBe("released");
+      expect(await requestBackends()).toBe(0);
+    });
+
+    // The abandoned release voids its success while it still holds the publication lock.
+    it("keeps the publication lock until an abandoned release has written its void, so a concurrent release's success stays newest", async () => {
+      const { companyId } = await seedReleasable();
+      const scope = createRequestScopedDb(db, { statementTimeoutMs: 5000, lockTimeoutMs: 5000, idleInTransactionMs: 5000, connectTimeoutMs: 2000 })!;
+      const landed: string[] = [];
+      let arrived = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+          return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+        }
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          const body = JSON.parse(String(init?.body));
+          if (body.context !== "paperclip/approved") return createMockResponse({ id: 99 }, true, 201);
+          arrived += 1;
+          // A's success never answers; A's void takes a while to land.
+          if (body.description === "released by A") return new Promise(() => {});
+          if (String(body.description).startsWith("voided:")) await new Promise((resolve) => setTimeout(resolve, 300));
+          landed.push(String(body.description).startsWith("voided:") ? "A-void" : String(body.description));
+          return createMockResponse({ id: 2 }, true, 201);
+        }
+        if (url.includes("/statuses/")) return createMockResponse([]);
+        throw new Error(`Unexpected release request: ${url}`);
+      });
+      let confirmedB = 0;
+      try {
+        const a = directRelease(companyId, {
+          description: "released by A",
+          deadlines: { totalMs: 400, fetchMs: 2000, compensationMs: 3000 },
+          abandon: () => scope.cancel(),
+          // A runs on its own dedicated session, as the route does.
+          dbOverride: scope.db,
+        });
+        expect(await eventually(async () => arrived === 1)).toBe(true);
+        const b = directRelease(companyId, {
+          description: "released by B",
+          recordConfirmation: async () => { confirmedB += 1; },
+        });
+        const [outA, outB] = await Promise.all([a, b]);
+
+        expect(outA.kind).toBe("failed");
+        expect(outA.message).toContain("voided by a failure status");
+        expect(outB.kind).toBe("released");
+        expect("confirmationMarker" in outB && outB.confirmationMarker).toBe("written");
+        expect(confirmedB).toBe(1);
+        expect(landed).toEqual(["A-void", "released by B"]);
+      } finally {
+        await scope.close();
+      }
     }, 20_000);
 
     // ---- Round 8: the CI confirmation marker (paperclip/release-confirmed) ----

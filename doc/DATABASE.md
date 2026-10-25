@@ -115,6 +115,8 @@ DATABASE_MIGRATION_URL=postgres://postgres.[PROJECT-REF]:[PASSWORD]@aws-0-[REGIO
 
 If your hosted database requires transaction-pooling-only connections (pgbouncer transaction mode, Supavisor port 6543, Neon `-pooler` endpoints), set `DATABASE_PREPARED_STATEMENTS=false` so the client does not rely on session-scoped prepared statements, and keep `DATABASE_MIGRATION_URL` on a direct connection. Do not edit database client source files as part of deployment setup.
 
+Real cancellation of the head-release deadline (`POST /issues/:id/merge-arming/release`, `/release-override`) needs a direct or session-mode connection: the request then runs on its own dedicated session and the deadline ends that session on the server. With `DATABASE_PREPARED_STATEMENTS=false` the release uses the shared pool and its database waits are abandoned, not cancelled.
+
 ### Client tuning (optional)
 
 All of these are optional; when unset, the driver defaults apply and behavior is unchanged — typical self-hosted setups need none of them:

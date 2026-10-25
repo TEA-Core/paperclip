@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  createDb,
+  createRequestScopedDb,
   DEFAULT_DATABASE_APPLICATION_NAME,
   DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
   databaseClientOptionsFromEnv,
@@ -118,5 +120,20 @@ describe("resolveDatabaseClientOptions", () => {
     expect(postgresJsOptions(resolveDatabaseClientOptions({ idleTimeoutSeconds: 0 }))).toMatchObject({
       idle_timeout: 0,
     });
+  });
+});
+
+describe("createRequestScopedDb", () => {
+  const limits = { statementTimeoutMs: 1000, lockTimeoutMs: 1000, idleInTransactionMs: 1000, connectTimeoutMs: 1000 };
+  const url = "postgres://user:pass@127.0.0.1:1/db";
+
+  it("opens a dedicated connection for a client made by createDb", async () => {
+    const scope = createRequestScopedDb(createDb(url, {}), limits);
+    expect(scope).not.toBeNull();
+    await scope?.close();
+  });
+
+  it("returns null for a transaction-mode pooler (prepare: false), so the caller keeps the shared pool", () => {
+    expect(createRequestScopedDb(createDb(url, { prepare: false }), limits)).toBeNull();
   });
 });
