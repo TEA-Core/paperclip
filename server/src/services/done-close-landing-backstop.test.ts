@@ -2868,6 +2868,25 @@ describe("SUP-16689: draft-stranded done cards", () => {
     expect(mockEnableAutoMerge).not.toHaveBeenCalled();
   });
 
+  it("does not park for a foreign PR that was cached non-draft but is live draft", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [],
+      companyMergeArmingEnabled: true,
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ draft: false, headRefName: "SUP-99999-carrier" }),
+    ]);
+    mockResolver(async () => draftOpenSnapshot);
+
+    const result = await service.sweep();
+
+    expect(result.draftStranded).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+  });
+
   it("does not re-report a draft-stranded card+PR on a later sweep (idempotent)", async () => {
     const state: DbState = {
       candidates: [candidateRow()],

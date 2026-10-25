@@ -5075,6 +5075,32 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.skipReason).toBeNull();
     });
 
+    it("still live-discovers the card's own undisclosed PR when the only cached mention is a foreign draft carrier", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-carrier", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-99999-carrier", title: "SUP-99999: carrier", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: prItems });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/pulls/3264")) {
+          return new Response(JSON.stringify({ state: "open", draft: false }), { status: 200 });
+        }
+        if (url.includes("/pulls/4161")) {
+          return new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip#3264");
+      expect(result.reason).not.toContain("4161");
+    });
+
     it("counts a failed live list in skipReason and continues with the compare flow", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],

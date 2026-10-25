@@ -2282,7 +2282,7 @@ async function evaluateDoneTransitionGuardCore(
   // never posted with its full URL. Live-discover open PRs carrying the issue
   // identifier; failures are counted in skipReason and the compare flow below
   // still applies.
-  if (resolvedPrs.length === 0) {
+  if (!resolvedPrs.some((p) => !p.draft)) {
     let live: { prs: LinkedPullRequest[]; error: string | null } = { prs: [], error: null };
     try {
       const liveCtx = await getCtx();
@@ -2290,9 +2290,11 @@ async function evaluateDoneTransitionGuardCore(
     } catch {
       live = { prs: [], error: "ctx" };
     }
-    if (live.prs.length > 0) {
-      resolvedPrs = live.prs;
-      prSkipReason = appendSkipReason(prSkipReason, `live_linked_pr_discovered:${live.prs.length}`);
+    const known = new Set(resolvedPrs.map((p) => p.displayName.toLowerCase()));
+    const discovered = live.prs.filter((p) => !known.has(p.displayName.toLowerCase()));
+    if (discovered.length > 0) {
+      resolvedPrs = [...resolvedPrs, ...discovered];
+      prSkipReason = appendSkipReason(prSkipReason, `live_linked_pr_discovered:${discovered.length}`);
     } else if (live.error !== null) {
       prSkipReason = appendSkipReason(prSkipReason, `live_pr_discovery_failed:${live.error}`);
     }

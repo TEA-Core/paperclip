@@ -657,7 +657,11 @@ export function createDoneCloseLandingBackstopService(
       .map((m) => m.prKey);
     const hasMergedSibling = mergedSiblingKeys.length > 0;
 
-    const isOwnDraft = await loadOwnDraftPredicate(db, issue, prs);
+    const isOwnDraft = await loadOwnDraftPredicate(
+      db,
+      issue,
+      measured.map((m) => ({ ...m.pr, draft: m.draft === true })),
+    );
 
     for (const { pr, prKey, state, draft, closedAt } of measured) {
       const foreignDraft = state === "open" && draft === true && !isOwnDraft(pr);
