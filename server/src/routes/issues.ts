@@ -10623,10 +10623,15 @@ export function issueRoutes(
       res.status(400).json({ error: "offset must be a non-negative integer" });
       return;
     }
-    if (sortField !== undefined && sortField !== "updated" && sortField !== "id") {
-      res
-        .status(400)
-        .json({ error: "sortField must be 'updated' or 'id' when provided" });
+    if (
+      sortField !== undefined &&
+      sortField !== "created" &&
+      sortField !== "updated" &&
+      sortField !== "id"
+    ) {
+      res.status(400).json({
+        error: "sortField must be 'created', 'updated' or 'id' when provided",
+      });
       return;
     }
     if (sortDir !== undefined && sortDir !== "asc" && sortDir !== "desc") {
@@ -10761,7 +10766,10 @@ export function issueRoutes(
       q: req.query.q as string | undefined,
       limit,
       offset,
-      sortField: sortField === "updated" || sortField === "id" ? sortField : undefined,
+      sortField:
+        sortField === "created" || sortField === "updated" || sortField === "id"
+          ? sortField
+          : undefined,
       afterId: req.query.afterId as string | undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
       updatedSince: rawUpdatedSince,
