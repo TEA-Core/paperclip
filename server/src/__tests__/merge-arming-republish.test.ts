@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -3008,12 +3008,16 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
     // ---- Round 5: bounded deadlines on the release path ----
 
+    let lateChecks = new AbortController();
+    beforeEach(() => { lateChecks = new AbortController(); });
+    afterEach(() => { lateChecks.abort(); });
     const directRelease = async (companyId: string, { dbOverride, ...extra }: Record<string, unknown> = {}) =>
       publishHeadBoundRelease((dbOverride as Db | undefined) ?? db, companyId, { owner: OWNER, repo: REPO, number: PR_NUMBER }, {
         headSha: HEAD_SHA, description: "released by user:u for x: reason", expectedBranch: DELIVERY_BRANCH,
         revalidate: async () => ({ ok: true, target: { owner: OWNER, repo: REPO, number: PR_NUMBER, branch: DELIVERY_BRANCH } }),
         confirmedStatusId: async () => null,
         recordConfirmation: async () => undefined,
+        afterAnswerSignal: lateChecks.signal,
         ...extra,
       } as never);
 
@@ -3148,6 +3152,40 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         expect(landed[0]?.state).toBe("success");
         expect(await eventually(async () => landed[0]?.state === "failure")).toBe(true);
         expect(markerWrites()).toEqual([]);
+      }, 20_000);
+
+      it("never voids the success of a slow second attempt that goes on to confirm", async () => {
+        const { companyId } = await seedReleasable();
+        const landed: Landed[] = [];
+        let counter = 100;
+        let approvalPosts = 0;
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+            return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+          }
+          if (url.includes("/statuses/") && init?.method === "POST") {
+            const body = JSON.parse(String(init.body));
+            if (body.context !== "paperclip/approved") return createMockResponse({ id: 99 }, true, 201);
+            approvalPosts += 1;
+            if (approvalPosts === 1) throw new TypeError("fetch failed: ECONNRESET");
+            counter += 1;
+            landed.unshift({ id: counter, context: body.context, state: body.state, description: body.description, creator: CONTROL_PLANE });
+            return createMockResponse({ id: counter }, true, 201);
+          }
+          if (url.includes("/statuses/")) return createMockResponse(landed);
+          throw new Error(`Unexpected release request: ${url}`);
+        });
+
+        const outcome = await directRelease(companyId, {
+          deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 300 },
+          retryDelayMs: 10,
+          // Confirmation is slow: the 150 ms and 300 ms re-checks of a retried write would run before it.
+          recordConfirmation: async () => { await new Promise((resolve) => setTimeout(resolve, 600)); },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 700));
+
+        expect(outcome.kind).toBe("released");
+        expect(landed.map((status) => status.state)).toEqual(["success"]);
       }, 20_000);
 
       it("leaves a landed status with another description alone", async () => {
