@@ -1496,15 +1496,6 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
     if (principalsEqual(currentParticipant, actor)) {
       if (requestedStatus === "done") {
-        if (actor?.type === "agent" && resolveSelfApprovalPrincipals(
-          input.policy as unknown as Record<string, unknown>,
-          (existingState ?? {}) as Record<string, unknown>,
-          input.issue.createdByAgentId ?? null,
-        ).agentIds.has(actor.agentId ?? "")) {
-          throw unprocessable("A participant cannot approve a stage on work they created or delivered", {
-            code: "self_approval",
-          });
-        }
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
         }

@@ -285,8 +285,7 @@ The pending stage id, index, type, and agent participant must match the stored
 execution policy. Completed/skipped stages, stages with an approved decision,
 removed agent memberships, and participants who would approve their own
 created/delivered/return-assignee work or make a review stage self-satisfying
-are ineligible. Agent approval also checks creator, delivery author, and
-return-assignee independence at decision time.
+are ineligible.
 
 A row-locked compare-and-set refuses stale values or any pending interaction,
 active recovery action, live run, checkout/execution lock, or unavailable

@@ -215,7 +215,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
   );
 
   it.each(["creator", "return assignee", "delivery author"])(
-    "rejects an attributed %s approval on a preexisting self-owned review seat",
+    "leaves an attributed %s approval on a preexisting self-owned review seat unchanged",
     async (origin) => {
       const reviewer = { type: "agent", agentId: PARTICIPANT, userId: null };
       await db.update(issues).set({
@@ -235,7 +235,6 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
         id: RUN, companyId: COMPANY, agentId: PARTICIPANT, status: "running",
         contextSnapshot: { issueId: ISSUE },
       });
-      const before = await snapshot();
       actor = { type: "agent", source: "agent_jwt", agentId: PARTICIPANT, companyId: COMPANY, runId: RUN } as Express.Request["actor"];
       const decision = await request(app).patch(`/api/issues/${ISSUE}`)
         .set("X-Paperclip-Run-Id", RUN)
@@ -243,9 +242,11 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
           status: "done",
           comment: "Approved.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): verified the isolated fixture.",
         });
-      expect(decision.status, JSON.stringify(decision.body)).toBe(422);
-      expect(await snapshot()).toEqual(before);
-      expect(await db.select().from(issueExecutionDecisions)).toHaveLength(1);
+      expect(decision.status, JSON.stringify(decision.body)).toBe(200);
+      expect((await snapshot()).status).toBe("done");
+      const decisions = await db.select().from(issueExecutionDecisions);
+      expect(decisions).toHaveLength(2);
+      expect(decisions.some((row) => row.outcome === "approved" && row.actorAgentId === PARTICIPANT)).toBe(true);
     },
   );
 
