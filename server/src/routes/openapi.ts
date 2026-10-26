@@ -4005,9 +4005,11 @@ registry.registerPath({
     "with an active, undecided policy stage naming the agent; completed/skipped stages, removed agent " +
     "memberships, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
     "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
-    "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
-    "Only the assignee and updatedAt change; status, statusVersion, executionState, decision history " +
-    "and pendingSince remain unchanged. Does not wake or re-arm the stage.",
+    "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. It " +
+    "rechecks live runs after the issue lock and before changing the assignee, but a run inserted after " +
+    "that final check without the issue-row lock remains a race. Only the assignee and updatedAt change; " +
+    "status, statusVersion, executionState, decision history and pendingSince remain unchanged. " +
+    "Does not wake or re-arm the stage.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(z.object({

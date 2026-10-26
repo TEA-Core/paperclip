@@ -428,6 +428,49 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
   });
 
   it.each([
+    ["before the issue-lock wait", true],
+    ["after the first run check but before the issue-lock write", false],
+  ])("refuses a queued run inserted %s", async (_order, queueBeforeRestore) => {
+    let signalLocked!: (pid: number) => void;
+    let releaseIssue!: () => void;
+    const locked = new Promise<number>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseIssue = resolve; });
+    const blocker = db.transaction(async (tx) => {
+      const [connection] = await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid()::int AS pid`);
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, ISSUE)).for("update");
+      signalLocked(connection!.pid);
+      await release;
+    });
+    const blockerPid = await locked;
+    if (queueBeforeRestore) await seedRun("queued", { issueId: ISSUE });
+    const restoring = Promise.resolve(post());
+    let waitedForIssue = false;
+    try {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await db.execute<{ waiting: boolean }>(sql`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+              AND ${blockerPid} = ANY(pg_blocking_pids(pid))
+          ) AS waiting
+        `);
+        if (row?.waiting) { waitedForIssue = true; break; }
+        await delay(25);
+      }
+      if (!queueBeforeRestore) await seedRun("queued", { issueId: ISSUE });
+    } finally {
+      releaseIssue();
+      await blocker;
+    }
+    const response = await restoring;
+    expect({ waitedForIssue, status: response.status }).toEqual({ waitedForIssue: true, status: 409 });
+    expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+    expect(await audit()).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, RUN))).toMatchObject([{ status: "queued" }]);
+  });
+
+  it.each([
     ["native issue", { nativeIssueId: ISSUE }],
     ["nested context", { contextSnapshot: { paperclipIssue: { id: ISSUE } } }],
   ])("409s on live run with %s binding", async (_name, fields) => {

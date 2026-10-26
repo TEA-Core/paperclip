@@ -291,16 +291,17 @@ A row-locked compare-and-set refuses stale values or any pending interaction,
 active recovery action, live run, checkout/execution lock, or unavailable
 participant with 409. The transaction first row-locks the issue's queued,
 running, or scheduled-retry `heartbeat_runs` rows (ordered by id), then the
-issue row, matching the order run writers use; recovery-action upserts acquire
-the same issue-row lock before writing. No table lock is taken. A run row
-inserted concurrently, after the repair's run-row lock and without taking the
-issue row lock, is not covered by this check. The operation
-changes only the agent assignee (and `updatedAt`) and logs the before/after
-assignment atomically. The status and status version remain unchanged (the
-version advances only when status changes); execution state, stage identity,
-pendingSince, and decisions remain untouched. It never arms, approves,
-rejects, re-arms, or wakes the stage, and it does not repair cards with active
-recovery or interactions.
+issue row, matching the finalizer's lock order; recovery-action upserts acquire
+the same issue-row lock before writing. No table lock is taken. After the issue
+lock and immediately before changing the assignee, a second live-run read
+refuses a run committed while the repair waited for that lock. A run inserted
+after this final read without taking the issue-row lock remains a race. The
+operation changes only the agent assignee (and `updatedAt`) and logs the
+before/after assignment atomically. The status and status version remain
+unchanged (the version advances only when status changes); execution state,
+stage identity, pendingSince, and decisions remain untouched. It never arms,
+approves, rejects, re-arms, or wakes the stage, and it does not repair cards
+with active recovery or interactions.
 
 Invariants:
 
