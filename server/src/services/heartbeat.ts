@@ -8066,16 +8066,6 @@ function enrichWakeContextSnapshot(input: {
   const issueIdFromPayload =
     readNonEmptyString(payload?.["issueId"]) ??
     readNonEmptyString(payload?.["taskId"]);
-  const topLevelIssueId = readNonEmptyString(contextSnapshot.issueId);
-  // A nested-only binding must take the same issue-row lock as an explicit
-  // issueId; otherwise this wake can queue a run during participant restoration.
-  if (!topLevelIssueId && !issueIdFromPayload) {
-    const nestedIssue = contextSnapshot.paperclipIssue;
-    if (nestedIssue && typeof nestedIssue === "object" && "id" in nestedIssue) {
-      const nestedIssueId = readNonEmptyString(nestedIssue.id);
-      if (nestedIssueId) contextSnapshot.issueId = nestedIssueId;
-    }
-  }
   const commentIdFromPayload = readNonEmptyString(payload?.["commentId"]);
   const taskKey = deriveTaskKey(contextSnapshot, payload);
   const wakeCommentId = deriveCommentId(contextSnapshot, payload);
@@ -8087,7 +8077,7 @@ function enrichWakeContextSnapshot(input: {
   if (!readNonEmptyString(contextSnapshot["wakeReason"]) && reason) {
     contextSnapshot.wakeReason = reason;
   }
-  if (!topLevelIssueId && issueIdFromPayload) {
+  if (!readNonEmptyString(contextSnapshot["issueId"]) && issueIdFromPayload) {
     contextSnapshot.issueId = issueIdFromPayload;
   }
   if (!readNonEmptyString(contextSnapshot["taskId"]) && issueIdFromPayload) {
@@ -32807,7 +32797,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return mergedRun;
     }
 
+    // Admission-only lock key: a nested-only issue binding is not normalized into
+    // the context, so the task key and execution context stay unchanged.
+    const nestedIssueId = readNonEmptyString(parseObject(enrichedContextSnapshot.paperclipIssue).id);
     const queueOutcome = await db.transaction(async (tx) => {
+      if (nestedIssueId && isUuidLike(nestedIssueId)) {
+        await tx.execute(
+          sql`select id from issues where id = ${nestedIssueId} and company_id = ${agent.companyId} for update`,
+        );
+      }
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );

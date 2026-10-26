@@ -305,8 +305,9 @@ Other 409 eligibility conflicts do not carry that retry signal.
 After the issue lock and immediately before changing the assignee, a second
 live-run read refuses a run committed while the repair waited for that lock.
 Heartbeat wakeup requests whose only issue binding is
-`contextSnapshot.paperclipIssue.id` normalize that binding to `issueId` and
-acquire the issue-row lock before enqueuing a run. This does not make arbitrary
+`contextSnapshot.paperclipIssue.id` (a valid UUID in the agent's company) stay
+unscoped, with task key and run context unchanged, but acquire the issue-row
+lock, before the agent lock, through queued-run insertion. This does not make arbitrary
 run insertion serializable: a raw serving-role `heartbeat_runs` SQL insert,
 `server/src/services/self-declared-run.ts`'s run insert after a separate issue
 update, and `server/src/services/recovery/service.ts`'s

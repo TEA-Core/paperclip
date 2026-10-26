@@ -4009,7 +4009,7 @@ registry.registerPath({
     "Native restart recovery uses the opposite issue-then-run order and retries a lock timeout or " +
     "deadlock once in a fresh transaction; the repair's 250ms lock timeout returns 409 with " +
     "details.code=participant_restore_lock_busy, details.retryable=true, and Retry-After: 1. Nested-only " +
-    "paperclipIssue.id heartbeat wakes acquire the issue-row lock. Other writers (raw serving-role SQL " +
+    "paperclipIssue.id heartbeat wakes stay unscoped but acquire the issue-row lock for admission. Other writers (raw serving-role SQL " +
     "inserts, self-declared runs, and recovery scheduled_retry inserts) may race after the final live-run " +
     "check without that lock. Only the assignee and updatedAt change; status, statusVersion, " +
     "executionState, decision history and pendingSince remain unchanged. Does not wake or re-arm the stage.",

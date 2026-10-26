@@ -206,9 +206,25 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
     expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
     const [queued] = await setupDb.select().from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, "runId" in result ? result.runId! : ""));
-    expect(queued?.contextSnapshot).toMatchObject({
-      issueId, paperclipIssue: { id: issueId },
+    expect(queued?.contextSnapshot).toMatchObject({ paperclipIssue: { id: issueId } });
+    expect(queued?.contextSnapshot).not.toHaveProperty("issueId");
+    expect(queued?.contextSnapshot).not.toHaveProperty("taskKey");
+  }, 30_000);
+
+  it("keeps a nested-only wake with a non-UUID id unscoped and admits it", async () => {
+    const seed = await seedAgent("nested-unscoped");
+    const { wake } = onePool();
+    const result = await wake(seed.agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      contextSnapshot: { paperclipIssue: { id: "SUP-1" } },
     });
+    expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
+    const [queued] = await setupDb.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, "runId" in result ? result.runId! : ""));
+    expect(queued?.contextSnapshot).toMatchObject({ paperclipIssue: { id: "SUP-1" } });
+    for (const key of ["issueId", "taskId", "taskKey"]) {
+      expect(queued?.contextSnapshot).not.toHaveProperty(key);
+    }
   }, 30_000);
 
   it("admits a wake with no issue without reading the responsible user through the pool", async () => {
