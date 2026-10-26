@@ -651,6 +651,18 @@ const ErrorSchema = registry.register("Error", z.object({
   }).optional(),
 }));
 
+// PATCH also emits unrelated 403s, so keep its general Error alternative while
+// exposing the exact record-only selection reasons to generated clients.
+const IssuePatchRecordOnlyForbiddenSchema = registry.register(
+  "IssuePatchRecordOnlyForbidden",
+  z.object({
+    error: z.string(),
+    details: z.object({
+      reason: z.enum(["record_only_self_assignee", "record_only_not_authorized"]),
+    }),
+  }),
+);
+
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.string(), z.unknown())) => ({
     description: "Success",
@@ -3971,7 +3983,14 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
-    403: r.forbidden,
+    403: {
+      description: "Forbidden; record-only selection refusals expose a named reason",
+      content: {
+        "application/json": {
+          schema: { anyOf: [IssuePatchRecordOnlyForbiddenSchema, ErrorSchema] },
+        },
+      },
+    },
     404: r.notFound,
     422: r.unprocessable,
   },
