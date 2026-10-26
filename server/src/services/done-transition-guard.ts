@@ -102,16 +102,20 @@ export function renderDoneTierDeclaration(
       trimmed.startsWith(TIER_1_PREFIX) ||
       trimmed.startsWith("Closed at Tier 0 (decision-only):");
   };
-  const withoutCanonicalTierDeclaration = lines
-    .filter((line) => !isCanonicalTierDeclaration(line))
-    .join("\n")
-    .trim();
 
   const rendered = declaration.tier === "tier2"
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
       : `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
+  if (lines.some((line) => line.trim() === rendered)) {
+    return current;
+  }
+
+  const withoutCanonicalTierDeclaration = lines
+    .filter((line) => !isCanonicalTierDeclaration(line))
+    .join("\n")
+    .trim();
   return withoutCanonicalTierDeclaration.length > 0
     ? `${withoutCanonicalTierDeclaration}\n\n${rendered}`
     : rendered;

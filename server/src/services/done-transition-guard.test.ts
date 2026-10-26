@@ -5355,6 +5355,23 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
+    it("preserves the body when the existing Tier 2 declaration matches", () => {
+      const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
+      expect(renderDoneTierDeclaration(body, {
+        tier: "tier2",
+        probeEvidence: "existing evidence",
+      })).toBe(body);
+    });
+
+    it("preserves the body when the existing Tier 1 declaration matches", () => {
+      const body = "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.\n\nFollow-up";
+      expect(renderDoneTierDeclaration(body, {
+        tier: "tier1",
+        reason: "Merged change is ready",
+        landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+      })).toBe(body);
+    });
+
     it("replaces an existing same-tier declaration with the supplied declaration", () => {
       expect(renderDoneTierDeclaration("Closed at Tier 2 (live): stale evidence", {
         tier: "tier2",
