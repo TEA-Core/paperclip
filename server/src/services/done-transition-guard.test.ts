@@ -5383,11 +5383,18 @@ describe("evaluateDoneTierDeclaration", () => {
       const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
       const patchStatus = route.indexOf("const effectiveStatus =");
       const patchRender = route.indexOf('if (doneTier !== undefined && effectiveStatus === "done") {');
+      const transitionComment = route.indexOf("const transitionCommentBody =");
+      const transition = route.indexOf(
+        "const transition = applyIssueExecutionPolicyTransition({",
+        transitionComment,
+      );
       const commentStatus = route.indexOf("const autoApproveEffectiveStatus =");
       const commentRender = route.indexOf('if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {');
 
       expect(patchStatus).toBeGreaterThan(-1);
       expect(patchRender).toBeGreaterThan(patchStatus);
+      expect(transitionComment).toBeGreaterThan(-1);
+      expect(transitionComment).toBeLessThan(transition);
       expect(commentStatus).toBeGreaterThan(patchRender);
       expect(commentRender).toBeGreaterThan(commentStatus);
       expect(route).not.toContain('if (doneTier !== undefined && updateFields.status === "done")');

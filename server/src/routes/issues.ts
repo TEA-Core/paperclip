@@ -18057,6 +18057,11 @@ export function issueRoutes(
 
     const requestedTransitionStatus =
       typeof updateFields.status === "string" ? updateFields.status : undefined;
+    const originalCommentBody = commentBody;
+    const transitionCommentBody =
+      doneTier !== undefined && requestedTransitionStatus === "done"
+        ? renderDoneTierDeclaration(originalCommentBody, doneTier)
+        : originalCommentBody;
     // A summary-generation issue must always bounce back to the Summarizer
     // agent, never to a policy `returnAssigneeAgentId` (SUP-15768). The
     // forced-return lookup is only meaningful when this PATCH is an active
@@ -18086,7 +18091,7 @@ export function issueRoutes(
       },
       allowBoardOverride: req.actor.type === "board",
       actorViaAncestorHatch: writeViaAncestorHatch,
-      commentBody,
+      commentBody: transitionCommentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
       forcedReturnAssignee: summaryForcedReturnAssignee,
