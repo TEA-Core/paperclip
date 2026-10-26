@@ -3916,7 +3916,7 @@ registry.registerPath({
   summary: "Update an issue",
   description:
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
-    "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; an assigned agent may not select it, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for the agent assignee or record_only_not_authorized when issue-mutation authority is missing. " +
+    "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; an agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee in that case, or record_only_not_authorized for any earlier authorization refusal. " +
     "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
   request: {
     params: z.object({ id: z.string() }),

@@ -17381,6 +17381,20 @@ export function issueRoutes(
       return;
     }
     healAgentDefaultProjectWorkspacePair(existing, req.body);
+    // Every 403 up to and including the record_only selection guard below is a
+    // record_only refusal; name it once here instead of at each denial site.
+    let recordOnlyRefusalPhase = req.body.deliveryRequirement === "record_only";
+    const respondJson = res.json.bind(res);
+    res.json = ((body: unknown) => {
+      if (recordOnlyRefusalPhase && res.statusCode === 403 && body && typeof body === "object") {
+        const { details, ...rest } = body as { details?: Record<string, unknown> };
+        return respondJson({
+          ...rest,
+          details: { reason: "record_only_not_authorized", ...details },
+        } as never);
+      }
+      return respondJson(body as never);
+    }) as typeof res.json;
     const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
     let mutationAccess:
       | boolean
@@ -17424,15 +17438,7 @@ export function issueRoutes(
           // Authorization denial, not a run-lease conflict (which is a 409
           // issue_write_assignee_run_lock): answer with the shared issue-write
           // denial copy so the boundary and the sanctioned path are named.
-          await denyIssueWrite(
-            req,
-            res,
-            existing,
-            issueWriteDenialCodeForDecision(boundaryDecision),
-            req.body.deliveryRequirement === "record_only"
-              ? { reason: "record_only_not_authorized" }
-              : {},
-          );
+          await denyIssueWrite(req, res, existing, issueWriteDenialCodeForDecision(boundaryDecision));
           return;
         }
       }
@@ -17485,7 +17491,8 @@ export function issueRoutes(
     if (
       req.body.deliveryRequirement === "record_only" &&
       req.actor.type === "agent" &&
-      req.actor.agentId === existing.assigneeAgentId
+      (req.actor.agentId === existing.assigneeAgentId ||
+        req.actor.agentId === normalizedAssigneeAgentId)
     ) {
       res.status(403).json({
         error: "Only the board or an authorized non-assignee may select record_only delivery",
@@ -17493,6 +17500,7 @@ export function issueRoutes(
       });
       return;
     }
+    recordOnlyRefusalPhase = false;
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)
