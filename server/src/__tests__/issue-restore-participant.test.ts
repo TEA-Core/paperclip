@@ -1,11 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
-  activityLog, agentWakeupRequests, agents, companies, companyMemberships, createDb, heartbeatRuns, issueExecutionDecisions,
-  issueRecoveryActions, issueThreadInteractions, issues, type Db,
+  activityLog, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, heartbeatRuns,
+  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, toolApplications, toolConnections, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
@@ -56,6 +57,10 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.delete(issueExecutionDecisions);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
+    await db.delete(chatConversations);
+    await db.delete(chatEndpoints);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -153,6 +158,45 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     const ordinary = await request(app).patch(`/api/issues/${ISSUE}`).send({ assigneeAgentId: PARTICIPANT });
     expect(ordinary.status, JSON.stringify(ordinary.body)).toBe(422);
     expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("409s without changes for a fixed conversation identity", async () => {
+    await db.update(issues).set({ conversationAgentId: ASSIGNEE, conversationUserId: "human", conversationState: "active" })
+      .where(eq(issues.id, ISSUE));
+    const before = await snapshot();
+    expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("409s without changes for an issue bound to an external chat channel", async () => {
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    const endpointId = randomUUID();
+    await db.insert(toolApplications).values({
+      id: applicationId, companyId: COMPANY, applicationKey: `chat:slack:${endpointId}`, name: "Slack", type: "chat", status: "active",
+    });
+    await db.insert(toolConnections).values({
+      id: connectionId, companyId: COMPANY, applicationId, name: "Slack channel", uid: `chat-slack-${endpointId}`,
+      connectionPurpose: "channel", transport: "chat_sdk", status: "active", enabled: true,
+    });
+    await db.insert(chatEndpoints).values({
+      id: endpointId, companyId: COMPANY, connectionId, provider: "slack", publicId: randomUUID(), assignedAgentId: ASSIGNEE, status: "active",
+      capabilities: {
+        threads: true, directMessages: true, nativeStreaming: false, messageEdits: true, messageDeletes: false, reactions: true,
+        files: true, cards: true, actions: true, modals: true, slashCommands: true, ephemeralMessages: true, proactiveDirectMessages: true,
+      },
+    });
+    await db.insert(chatConversations).values({
+      companyId: COMPANY, endpointId, issueId: ISSUE, externalConversationId: "conversation", externalThreadId: "thread",
+      externalLabel: "thread", state: "active",
+    });
+    const before = await snapshot();
+    const result = await post();
+    expect(result.status).toBe(409);
+    expect(result.body.details).toMatchObject({ code: "chat_binding_agent_locked" });
     expect(await snapshot()).toEqual(before);
     expect(await audit()).toHaveLength(0);
   });

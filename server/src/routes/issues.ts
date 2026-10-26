@@ -12771,6 +12771,17 @@ export function issueRoutes(
           issue.checkoutRunId !== null || issue.executionRunId !== null ||
           issue.executionLockedAt !== null || issue.executionAgentNameKey !== null
         ) throw conflict("Issue is not eligible for participant restoration");
+        if (issue.conversationAgentId) throw conflict("Conversation identity is fixed");
+        const [externalBinding] = await tx.select({ id: chatConversations.id })
+          .from(chatConversations)
+          .where(and(eq(chatConversations.companyId, issue.companyId), eq(chatConversations.issueId, issue.id)))
+          .limit(1);
+        if (externalBinding) {
+          throw conflict("Agent assignment cannot change while this task is bound to an external channel", {
+            code: "chat_binding_agent_locked",
+            conversationId: externalBinding.id,
+          });
+        }
         const parsedState = parseIssueExecutionState(state);
         let policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
         try {

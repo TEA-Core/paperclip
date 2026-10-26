@@ -283,9 +283,10 @@ that participant may call `POST /api/issues/{id}/restore-participant` with
 must be `in_review` or `blocked`; `blocked` keeps its pending stage intact.
 The pending stage id, index, type, and agent participant must match the stored
 execution policy. Completed/skipped stages, stages with an approved decision,
-removed agent memberships, and participants who would approve their own
-created/delivered/return-assignee work or make a review stage self-satisfying
-are ineligible.
+removed agent memberships, issues with a fixed conversation identity or a
+bound external chat channel (as ordinary assignment refuses), and participants
+who would approve their own created/delivered/return-assignee work or make a
+review stage self-satisfying are ineligible.
 
 A row-locked compare-and-set refuses stale values or any pending interaction,
 active recovery action, live run, checkout/execution lock, or unavailable

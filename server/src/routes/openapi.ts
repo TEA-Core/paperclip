@@ -4003,7 +4003,7 @@ registry.registerPath({
     "Board-only compare-and-set repair requiring assignment authority for the pending participant. " +
     "All four expected values must match the locked issue row. The issue must be in_review or blocked " +
     "with an active, undecided policy stage naming the agent; completed/skipped stages, removed agent " +
-    "memberships, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
+    "memberships, fixed conversation identities, external chat channel bindings, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
     "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
     "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
     "Native restart recovery uses the opposite issue-then-run order; the repair's 250ms lock timeout " +
