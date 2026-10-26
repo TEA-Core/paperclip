@@ -1,5 +1,5 @@
 import subprocess, shutil, json, os, re, sys
-root='/home/kronik/.treehouse/paperclip-8ca417/3/paperclip'
+root=os.environ.get('REPO_ROOT', '.')  # checkout the controls run against
 sp=sys.argv[1]
 def run(files_filters):
     out=[]
