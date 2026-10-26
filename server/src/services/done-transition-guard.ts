@@ -19,7 +19,7 @@ import {
   type LinkedPullRequest,
 } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
-import type { IssueComment } from "@paperclipai/shared";
+import type { IssueComment, UpdateIssue } from "@paperclipai/shared";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
@@ -88,6 +88,28 @@ export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+
+export function renderDoneTierDeclaration(
+  body: string | null | undefined,
+  declaration: DoneTierDeclaration,
+): string {
+  const current = body ?? "";
+  if (current.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    return trimmed.startsWith(TIER_2_PREFIX) ||
+      trimmed.startsWith(TIER_1_PREFIX) ||
+      trimmed.startsWith("Closed at Tier 0 (decision-only):");
+  })) {
+    return body ?? "";
+  }
+
+  const rendered = declaration.tier === "tier2"
+    ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
+    : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
+      ? `landed-at-tip ${declaration.landing.mergeCommit}`
+      : `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
+  return current.length > 0 ? `${body}\n\n${rendered}` : rendered;
+}
 
 /**
  * ADR-103 M3: the gate that produced a refusal, carried so the route can speak

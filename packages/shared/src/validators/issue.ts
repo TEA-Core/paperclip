@@ -1020,6 +1020,48 @@ export function stripCreateOnlyIssueAttribution<Schema extends z.ZodObject<z.Zod
  * `.partial()` — those methods do not exist on the transformed schema. Anything that parses a real
  * update payload must wrap this with `stripCreateOnlyIssueAttribution`.
  */
+const doneTierTextSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => !/[\r\n]/.test(value));
+
+const doneTierLandedAtTipSchema = z
+  .object({
+    mode: z.literal("landedAtTip"),
+    mergeCommit: z.string().regex(/^[0-9a-f]{7,40}$/i),
+  })
+  .strict();
+
+const doneTierLandingDelegatedSchema = z
+  .object({
+    mode: z.literal("landingDelegated"),
+    prNumber: z.number().int().positive(),
+    carrier: z.literal("done-close-landing-backstop"),
+  })
+  .strict();
+
+export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
+  z
+    .object({
+      tier: z.literal("tier2"),
+      probeEvidence: doneTierTextSchema,
+    })
+    .strict(),
+  z
+    .object({
+      tier: z.literal("tier1"),
+      reason: doneTierTextSchema,
+      landing: z.discriminatedUnion("mode", [
+        doneTierLandedAtTipSchema,
+        doneTierLandingDelegatedSchema,
+      ]),
+    })
+    .strict(),
+]);
+
+export type DoneTierDeclaration = z.infer<typeof doneTierDeclarationSchema>;
+
 export const updateIssueObjectSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     watchdog: true,
@@ -1031,6 +1073,7 @@ export const updateIssueObjectSchema = objectWithoutDefaults(
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
+    doneTier: doneTierDeclarationSchema.optional(),
     commentClientRequestId: z.string().uuid().optional(),
     /** Only valid with a comment; the route binds these in the update transaction. */
     attachmentIds: issueCommentAttachmentIdsSchema.optional(),
@@ -1263,6 +1306,7 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 export const addIssueCommentSchema = z.object({
   clientRequestId: z.string().uuid().optional(),
   body: multilineTextSchema.pipe(z.string().min(1)),
+  doneTier: doneTierDeclarationSchema.optional(),
   attachmentIds: issueCommentAttachmentIdsSchema.optional(),
   onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
   authorType: issueCommentAuthorTypeSchema.optional(),

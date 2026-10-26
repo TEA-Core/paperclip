@@ -254,6 +254,7 @@ import {
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
   findMissingAdr072CloseLadderStages,
+  renderDoneTierDeclaration,
   TIER1_FORM,
   writeAuditLog,
   type DoneTransitionOverride,
@@ -17486,7 +17487,7 @@ export function issueRoutes(
       Array.isArray(req.body.blockedByIssueIds)
         ? await svc.getRelationSummaries(existing.id)
         : null;
-    const {
+    let {
       comment: commentBody,
       commentClientRequestId,
       attachmentIds: commentAttachmentIds,
@@ -17498,6 +17499,7 @@ export function issueRoutes(
       deferWakeForGoal,
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
+      doneTier,
       deliveryIdentity: requestedDeliveryIdentity,
       // SUP-16525 §4: request-level flag, not an issue column — keep it out of
       // `updateFields` so it never reaches svc.update as a spurious write.
@@ -18455,6 +18457,9 @@ export function issueRoutes(
       }
     }
 
+    if (doneTier !== undefined && updateFields.status === "done") {
+      commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+    }
     const requestedStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
     // Guard on the status the transition actually RESOLVES to, not on the raw request.
     // An execution-policy transition may redirect a requested `done` to `in_review`
@@ -23192,8 +23197,11 @@ export function issueRoutes(
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
 
     const actor = getActorInfo(req);
+    const commentBody = req.body.doneTier && req.body.reopen !== true && req.body.resume !== true
+      ? renderDoneTierDeclaration(req.body.body, req.body.doneTier)
+      : req.body.body;
     const commentPresentation = req.body.presentation ??
-      await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body);
+      await deriveRecoveryCommentPresentation(req, issue.companyId, commentBody);
     const reopenRequested = req.body.reopen === true;
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
@@ -23360,7 +23368,7 @@ export function issueRoutes(
           agentId: actor.agentId ?? null,
           userId: actor.actorType === "user" ? actor.actorId : null,
         },
-        commentBody: req.body.body,
+        commentBody,
       });
       if (reopenTransition.decision) {
         // A reopen moves the card back to `todo`; the transition should never mint
@@ -23503,7 +23511,7 @@ export function issueRoutes(
           agentId: actor.agentId ?? null,
           userId: actor.actorType === "user" ? actor.actorId : null,
         },
-        commentBody: req.body.body,
+        commentBody,
       });
 
       // This route is a second door onto `done` and used to run neither done-guard, so
@@ -23518,7 +23526,7 @@ export function issueRoutes(
         const outcome = await evaluateDoneTransitionGuards({
           issue: currentIssue,
           override: null,
-          commentBody: req.body.body ?? null,
+          commentBody: commentBody ?? null,
           runId: actor.runId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
@@ -23602,7 +23610,7 @@ export function issueRoutes(
 
           const insertedComment = await svc.addComment(
             id,
-            req.body.body,
+            commentBody,
             {
               agentId: actor.agentId ?? undefined,
               userId: actor.actorType === "user" ? actor.actorId : undefined,
@@ -23744,7 +23752,7 @@ export function issueRoutes(
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
       };
       const add = (dbOrTx: Db = db) =>
-        svc.addComment(id, req.body.body, {
+        svc.addComment(id, commentBody, {
           agentId: actor.agentId ?? undefined,
           userId: actor.actorType === "user" ? actor.actorId : undefined,
           runId: actor.runId,
@@ -24093,7 +24101,7 @@ export function issueRoutes(
 
       let mentionedIds: string[] = [];
       try {
-        mentionedIds = await svc.findMentionedAgents(issue.companyId, req.body.body);
+        mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
       } catch (err) {
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
