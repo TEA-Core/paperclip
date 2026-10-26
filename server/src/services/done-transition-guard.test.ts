@@ -3238,6 +3238,60 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("record_only delivery requirement (SUP-21258)", () => {
+    it("skips repository delivery for record_only without probing GitHub or linked PRs", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "record_only" },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toBe("record_only_delivery_skipped");
+      expect(result.reason).toContain("repository/PR delivery is not required");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({ skipReason: "record_only_delivery_skipped" }),
+        }),
+      );
+    });
+
+    it("does not skip repository delivery for repository_delivery", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 1, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#1", cachedState: "open", lastErrorCode: null },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "repository_delivery" },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipReason).not.toBe("record_only_delivery_skipped");
+    });
+
+    it("still refuses a record_only close whose review ladder is unsatisfied", async () => {
+      const stageA = "11111111-1111-4111-8111-111111111111";
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          deliveryRequirement: "record_only",
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: {},
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.mechanism).toBe("C");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([

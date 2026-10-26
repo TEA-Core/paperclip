@@ -15746,6 +15746,7 @@ export function issueRoutes(
             createdByAgentId: actor.agentId ?? null,
             executionPolicy,
             executionState: null,
+            deliveryRequirement: createBody.deliveryRequirement ?? "repository_delivery",
           },
           override: null,
           commentBody: null,
@@ -18554,7 +18555,7 @@ export function issueRoutes(
             }
           : null;
       const outcome = await evaluateDoneTransitionGuards({
-        issue: existing,
+        issue: finalDeliveryIssue,
         override,
         commentBody: commentBody ?? null,
         runId: actor.runId ?? null,

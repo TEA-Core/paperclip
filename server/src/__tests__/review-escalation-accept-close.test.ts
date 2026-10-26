@@ -137,6 +137,7 @@ describeEmbeddedPostgres("review-escalation accept closes the final stage done",
     returnAgentId: string;
     escalationUserId: string;
     identifier: string;
+    deliveryRequirement?: "repository_delivery" | "record_only";
   }) {
     const issueId = randomUUID();
     const escalatedStageId = randomUUID();
@@ -158,6 +159,7 @@ describeEmbeddedPostgres("review-escalation accept closes the final stage done",
       assigneeAgentId: null,
       assigneeUserId: input.escalationUserId,
       responsibleUserId: input.escalationUserId,
+      deliveryRequirement: input.deliveryRequirement ?? "repository_delivery",
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
@@ -237,6 +239,59 @@ describeEmbeddedPostgres("review-escalation accept closes the final stage done",
       isInstanceAdmin: false,
     };
   }
+
+  it("record_only escalation acceptance uses the shared guard without repository delivery (SUP-21258)", async () => {
+    for (const [prefix, deliveryRequirement] of [
+      ["R21258A", "record_only"],
+      ["R21258B", "repository_delivery"],
+    ] as const) {
+      const seeded = await seedCompany(prefix);
+      const { issueId, interactionId } = await seedRoundCapEscalation({
+        companyId: seeded.companyId,
+        reviewerAgentId: seeded.reviewerAgentId,
+        returnAgentId: seeded.returnAgentId,
+        escalationUserId: seeded.escalationUserId,
+        identifier: `${prefix}-1`,
+        deliveryRequirement,
+      });
+
+      const res = await request(app(boardActor(seeded.companyId, seeded.escalationUserId)))
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await db
+        .select({ status: issues.status, deliveryRequirement: issues.deliveryRequirement })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(row).toMatchObject({ status: "done", deliveryRequirement });
+      const guardAuditRows = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId));
+      const recordOnlyAudits = guardAuditRows.filter((row) =>
+        row.details && typeof row.details === "object" && "skipReason" in row.details && (row.details as { skipReason?: unknown }).skipReason === "record_only_delivery_skipped",
+      );
+      expect(recordOnlyAudits).toHaveLength(deliveryRequirement === "record_only" ? 2 : 0);
+      await db.delete(issueThreadInteractions);
+      await db.delete(issueExecutionDecisions);
+      await db.delete(issueApprovals);
+      await db.delete(approvals);
+      await db.delete(issueComments);
+      await db.delete(issueRecoveryActions);
+      await db.delete(activityLog);
+      await db.delete(heartbeatRunEvents);
+      await db.delete(heartbeatRuns);
+      await db.delete(agentWakeupRequests);
+      await db.delete(issueInboxArchives);
+      await db.delete(issues);
+      await db.delete(companyMemberships);
+      await db.delete(agents);
+      await db.delete(companies);
+      enqueueWakeup.mockClear();
+    }
+  });
 
   it("closes the final stage done with completedAt set (SUP-17292 regression)", async () => {
     const seeded = await seedCompany("REC");
