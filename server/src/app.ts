@@ -568,7 +568,7 @@ export async function createApp(
   applyTrustProxy(app, parseTrustProxyEnv(process.env.TRUST_PROXY));
 
   // First of everything, so the whole request is under the clock: the release routes answer within their
-  // deadline even when the body is slow or authentication is stuck (a stuck query is abandoned, not cancelled).
+  // deadline even when the body is slow or authentication is stuck (a stuck board-key lookup is cancelled, a browser-session lookup abandoned).
   app.use(releaseRequestClock({ totalMs: DEFAULT_RELEASE_DEADLINES.totalMs }));
 
   app.use(

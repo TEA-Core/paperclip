@@ -17,11 +17,12 @@ export interface ReleaseRequestClock {
 
 /**
  * One request clock for the release routes that starts BEFORE authentication (and before the body is read). The actor middleware
- * resolves the board actor on the shared connection pool, a wait nothing in the handler can cancel; if
- * it is stuck, the request is still answered when the clock runs out (409, nothing published) and the
- * handler, when it finally gets to run, does nothing: no read, no write, no audit row. The stuck
- * authentication query itself is abandoned, not cancelled. Once the handler has started it owns the
- * deadline (it is given the time that is left) and this timer is inert.
+ * resolves the board actor, a wait nothing in the handler can cancel; if it is stuck, the request is
+ * still answered when the clock runs out (409, nothing published) and the handler, when it finally gets
+ * to run, does nothing: no read, no write, no audit row. A board-key lookup runs on a dedicated
+ * connection that is cancelled (`cancelAuth`); a browser-session lookup is abandoned, not cancelled.
+ * Once the handler has started it owns the deadline (it is given the time that is left) and this timer
+ * is inert.
  */
 export function releaseRequestClock(opts: { totalMs: number }): RequestHandler {
   return (req, res, next) => {
