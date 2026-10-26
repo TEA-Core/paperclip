@@ -18070,6 +18070,9 @@ export function issueRoutes(
     })
       ? await resolveSummaryGenerationReturnAssignee(db, existing)
       : null;
+    if (doneTier !== undefined && updateFields.status === "done") {
+      commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+    }
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,

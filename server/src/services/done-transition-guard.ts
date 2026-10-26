@@ -20,6 +20,7 @@ import {
 } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment, UpdateIssue } from "@paperclipai/shared";
+import type { DoneTierDeclaration } from "@paperclipai/shared/validators/issue";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
