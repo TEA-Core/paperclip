@@ -3487,6 +3487,78 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
     });
 
+    // Round 13: the real reconciler tick (real database, real re-arm path, only the provider boundary faked) against the
+    // revocation matrix release assurance applies: 4 ways of revoking the authority x 2 moments (at the final accepted
+    // enable write, and before a transient retry). A revoked authority must never leave an accepted arm in force.
+    describe("the revocation matrix through the real re-arm path (4 revocations x 2 moments)", () => {
+      const revocations: Array<[string, (ctx: { issueId: string; agentId: string }) => Promise<void>]> = [
+        ["the decision row becomes changes_requested", async ({ issueId }) => {
+          await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId));
+        }],
+        ["the card's last decision outcome changes", async ({ issueId }) => {
+          const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+          await db.update(issues).set({ executionState: { ...(row!.executionState as object), lastDecisionOutcome: "changes_requested" } }).where(eq(issues.id, issueId));
+        }],
+        ["the certificate is removed", async ({ issueId }) => {
+          const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+          const state = row!.executionState as { approvalStatus: Record<string, unknown> };
+          const { finalDelivery: _removed, ...rest } = state.approvalStatus;
+          await db.update(issues).set({ executionState: { ...state, approvalStatus: rest } }).where(eq(issues.id, issueId));
+        }],
+        ["the decider is terminated", async ({ agentId }) => {
+          await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+        }],
+      ];
+      for (const [label, revoke] of revocations) {
+        for (const moment of ["enable", "retry"] as const) {
+          it(`${label}, at ${moment === "enable" ? "the final accepted enable" : "a transient retry"}`, async () => {
+            const agentId = randomUUID();
+            await insertAgent(agentId, "Decider");
+            const issueId = await insertIssue();
+            await insertDecision(issueId, { actorAgentId: agentId, actorUserId: null });
+            await insertMention(issueId);
+            await certifyIssue(issueId);
+            await confirmRelease(issueId);
+            let enables = 0;
+            let directMerges = 0;
+            const respond = (body: unknown, ok = true, status = 200) => ({ ok, status, json: async () => body }) as unknown as Response;
+            mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+              if (url === PR_URL) return respond(OPEN_PR_BODY);
+              if (url === COMBINED_STATUS_URL) return respond({ state: "success", statuses: [RELEASE_STATUS] });
+              if (url === GRAPHQL_URL) {
+                const query = String(JSON.parse(String(init?.body)).query);
+                if (query.includes("disablePullRequestAutoMerge")) return respond({ data: {} });
+                if (query.includes("mergePullRequest")) { directMerges += 1; return respond({ data: {} }); }
+                enables += 1;
+                await revoke({ issueId, agentId });
+                return moment === "retry" ? respond({}, false, 502) : respond(GRAPHQL_ARM_OK_BODY);
+              }
+              throw new Error(`unmocked ghFetch URL: ${url}`);
+            });
+
+            const summary = await runApprovalStatusReconcilerTick(db);
+
+            const details = summary.rearmDetails.join("\n");
+            const queries = graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query));
+            expect(details).not.toContain("armed: Auto-merge enabled");
+            expect(directMerges).toBe(0);
+            if (moment === "enable") {
+              // The enable was accepted, so the arm is taken back and the record of it is gone.
+              expect(details).toContain("authority-revoked");
+              expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(true);
+            } else {
+              // The retry never reached the provider.
+              expect(enables).toBe(1);
+              expect(details).toContain("authority-changed");
+              expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(false);
+            }
+            const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+            expect(((row!.executionState as { approvalStatus?: Record<string, unknown> }).approvalStatus ?? {}).autoMergeDisarm).toBeUndefined();
+          });
+        }
+      }
+    });
+
     it("an already-success head with a recorded armed armOutcome is not re-armed (no arm actuator I/O)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({

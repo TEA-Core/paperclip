@@ -1,4 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import express from "express";
@@ -3202,6 +3207,177 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       }, 20_000);
     });
 
+    // Round 13 (R10-DEADLINE-POST): the late-success cells, crossing the layers. The statuses the head carries at each
+    // moment (newest first) are given to the REAL consumer, scripts/ci/check-paperclip-approved.sh, in both modes
+    // (PAPERCLIP_CARD_WAIVER_RETIRED unset = OFF, 1 = ON). A success the release did not confirm must be refused at every
+    // moment, however late it lands; a confirmed release must be accepted. SUP_20772_CONTROL_SCRIPT (a script path, e.g.
+    // the previous head's) is run on the same snapshots and its exit codes recorded, to show the cells tell the two apart.
+    describe("a late provider success, judged by the real CI consumer", () => {
+      const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]", type: "Bot" };
+      const scriptPath = fileURLToPath(new URL("../../../scripts/ci/check-paperclip-approved.sh", import.meta.url));
+      const repoRoot = path.resolve(path.dirname(scriptPath), "..", "..");
+      const GH_SHIM = [
+        "#!/usr/bin/env bash", "set -euo pipefail", 'url=""', 'jqfilter=""',
+        'while [ "$#" -gt 0 ]; do', '  case "$1" in', "    api|--slurp|--paginate) ;;", "    -H) shift ;;", '    --jq|-q) shift; jqfilter="$1" ;;', '    *) [ -n "$url" ] || url="$1" ;;', "  esac", "  shift", "done",
+        'case "$url" in', '  */statuses*) jq -r "$jqfilter" "$GH_SHIM_DIR/statuses.json" ;;', "  */pulls/*/reviews*) echo '[]' ;;", '  */pulls/*) cat "$GH_SHIM_DIR/pull.json" ;;', '  *) echo "gh shim: unexpected call: $url" >&2; exit 1 ;;', "esac", "",
+      ].join("\n");
+      const consume = (statuses: unknown[], on: boolean, script = scriptPath) => {
+        const dir = mkdtempSync(path.join(tmpdir(), "pc-late-"));
+        try {
+          writeFileSync(path.join(dir, "pull.json"), JSON.stringify({ head: { sha: HEAD_SHA, ref: "SUP-20772-late" }, title: "", body: "", labels: [], user: { login: "operator", type: "User" } }));
+          writeFileSync(path.join(dir, "statuses.json"), JSON.stringify(statuses));
+          mkdirSync(path.join(dir, "bin"));
+          writeFileSync(path.join(dir, "bin", "gh"), GH_SHIM);
+          chmodSync(path.join(dir, "bin", "gh"), 0o755);
+          const queueRef = "refs/heads/gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-4242-0123456789abcdef";
+          const result = spawnSync("bash", [script, "merge_group"], {
+            cwd: repoRoot, encoding: "utf8",
+            env: {
+              ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH}`, GH_SHIM_DIR: dir, GH_REPO: `${OWNER}/${REPO}`,
+              PAPERCLIP_APPROVED_STATUS_CREATOR_ID: String(CONTROL_PLANE.id), PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN: CONTROL_PLANE.login,
+              PAPERCLIP_CARD_WAIVER_RETIRED: on ? "1" : "", GITHUB_REF: queueRef, GITHUB_REF_NAME: queueRef.replace("refs/heads/", ""),
+            },
+          });
+          return result.status;
+        } finally { rmSync(dir, { recursive: true, force: true }); }
+      };
+      const evidence: Array<Record<string, unknown>> = [];
+      const verdicts = (cell: string, statuses: unknown[], extra: Record<string, unknown> = {}) => {
+        const control = process.env.SUP_20772_CONTROL_SCRIPT;
+        const row = {
+          cell, ...extra, newest: (statuses[0] as { state?: string } | undefined)?.state ?? null,
+          switchOffExit: consume(statuses, false), switchOnExit: consume(statuses, true),
+          ...(control ? { controlSwitchOffExit: consume(statuses, false, control), controlSwitchOnExit: consume(statuses, true, control) } : {}),
+        };
+        evidence.push(row);
+        return row;
+      };
+      afterAll(async () => {
+        const dir = process.env.SUP_20772_EVIDENCE_DIR;
+        if (!dir || evidence.length === 0) return;
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        await mkdir(dir, { recursive: true });
+        await writeFile(`${dir}/late-success-cells.json`, `${JSON.stringify({ measuredAt: new Date().toISOString(), cells: evidence }, null, 2)}\n`);
+      });
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      const asStatus = (landed: Array<Record<string, unknown>>) => landed.map((status) => ({ ...status, creator: CONTROL_PLANE }));
+
+      type Landed = Record<string, unknown> & { id: number; context: string; state: string; description: string };
+      function provider(opts: { holdFirstSuccess?: "held" | "aborted"; unreadableStatusReads?: () => boolean } = {}) {
+        const landed: Landed[] = [];
+        const snapshots: Landed[][] = [];
+        let counter = 100;
+        let firstSuccess = true;
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let abortedDescription = "";
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.endsWith(`/pulls/${PR_NUMBER}`)) return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+          if (url.includes("/statuses/") && init?.method === "POST") {
+            const body = JSON.parse(String(init.body));
+            counter += 1;
+            const id = counter;
+            if (body.context === "paperclip/approved" && body.state === "success" && firstSuccess && opts.holdFirstSuccess) {
+              firstSuccess = false;
+              abortedDescription = body.description;
+              if (opts.holdFirstSuccess === "held") await held;
+              else { await new Promise((_, reject) => init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))); }
+              if (opts.holdFirstSuccess === "held") {
+                landed.unshift({ id, context: body.context, state: body.state, description: body.description, creator: CONTROL_PLANE });
+                snapshots.push(landed.map((status) => ({ ...status })));
+              }
+              return createMockResponse({ id }, true, 201);
+            }
+            landed.unshift({ id, context: body.context, state: body.state, description: body.description, creator: CONTROL_PLANE });
+            return createMockResponse({ id }, true, 201);
+          }
+          if (url.includes("/statuses/")) {
+            if (opts.unreadableStatusReads?.()) throw new TypeError("fetch failed: ECONNRESET");
+            return createMockResponse(landed);
+          }
+          throw new Error(`Unexpected release request: ${url}`);
+        });
+        const land = () => {
+          counter += 1;
+          landed.unshift({ id: counter, context: "paperclip/approved", state: "success", description: abortedDescription, creator: CONTROL_PLANE });
+          snapshots.push(landed.map((status) => ({ ...status })));
+        };
+        return { landed, snapshots, release, land };
+      }
+
+      for (const delayMs of [0, 100, 1000, 2000, 5000]) {
+        it(`a success GitHub accepted lands ${delayMs} ms after the 409: refused while newest and after the void`, async () => {
+          const { companyId } = await seedReleasable();
+          const { landed, snapshots, release } = provider({ holdFirstSuccess: "held" });
+
+          const outcome = await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 2000 }, retryDelayMs: 10 });
+          expect(outcome.kind).toBe("failed");
+          await sleep(delayMs);
+          release();
+          expect(await eventually(async () => landed.length === 3 && landed[0]?.state === "failure", 4000)).toBe(true);
+
+          const atLanding = verdicts(`late success, ${delayMs} ms after the answer, at landing`, asStatus(snapshots[0]!), { delayMs });
+          const afterVoid = verdicts(`late success, ${delayMs} ms after the answer, after the void`, asStatus(landed), { delayMs });
+          expect(markerWrites()).toEqual([]);
+          for (const row of [atLanding, afterVoid]) {
+            expect(row.switchOffExit).not.toBe(0);
+            expect(row.switchOnExit).not.toBe(0);
+          }
+        }, 30_000);
+      }
+
+      it("a success that lands after BOTH re-checks saw the void stays the newest status and is still refused (unknown state beyond the re-checks)", async () => {
+        const { companyId } = await seedReleasable();
+        const { landed, snapshots, land } = provider({ holdFirstSuccess: "aborted" });
+
+        const outcome = await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 600 }, retryDelayMs: 10 });
+        expect(outcome.kind).toBe("failed");
+        await sleep(1500); // the 150 ms and 600 ms re-checks have both run and found the void
+        land();
+        await sleep(1200);
+
+        // Nothing re-voids it (the re-checks are over): this is the stated residual, closed by the consumer, not the producer.
+        expect(landed[0]?.state).toBe("success");
+        const row = verdicts("unknown beyond the re-checks: success lands after both re-checks", asStatus(snapshots[0]!));
+        expect(row.switchOffExit).not.toBe(0);
+        expect(row.switchOnExit).not.toBe(0);
+        expect(markerWrites()).toEqual([]);
+      }, 30_000);
+
+      it("a re-check that cannot read the head's statuses fails closed, and a success landing later is still refused", async () => {
+        const { companyId } = await seedReleasable();
+        let unreadable = false;
+        const { landed, snapshots, land } = provider({ holdFirstSuccess: "aborted", unreadableStatusReads: () => unreadable });
+
+        const outcome = await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 600 }, retryDelayMs: 10 });
+        expect(outcome.kind).toBe("failed");
+        unreadable = true;
+        await sleep(1200);
+        unreadable = false;
+        land();
+        await sleep(300);
+
+        const row = verdicts("unreadable re-check, then a late success", asStatus(snapshots[0]!));
+        expect(row.switchOffExit).not.toBe(0);
+        expect(row.switchOnExit).not.toBe(0);
+        expect(landed.some((status) => status.context === "paperclip/release-confirmed")).toBe(false);
+      }, 30_000);
+
+      it("a release the control plane confirmed is accepted in both modes", async () => {
+        const { companyId } = await seedReleasable();
+        const { landed } = provider();
+
+        const outcome = await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 600 }, retryDelayMs: 10 });
+        expect(outcome.kind).toBe("released");
+        expect(markerWrites()).toHaveLength(1);
+
+        const row = verdicts("legitimate confirmed release", asStatus(landed));
+        expect(landed[0]).toMatchObject({ context: "paperclip/release-confirmed", state: "success" });
+        expect(row.switchOffExit).toBe(0);
+        expect(row.switchOnExit).toBe(0);
+      }, 30_000);
+    });
+
     it("applies statement, lock and idle-in-transaction timeouts to the lock connection", async () => {
       const { companyId } = await seedReleasable();
       installReleaseTransport();
@@ -3913,6 +4089,32 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         expect(await sleeper).toBe("cancelled");
       }
     }, 30_000);
+
+    // Round 13: a cancel that lands while the driver is still starting the connection (its type lookup is the first
+    // statement) must not leave an unhandled rejection behind (`write CONNECTION_DESTROYED`), on every pool size.
+    for (const [mode, poolMax] of [["pooled", 1], ["pooled", 2], ["pooled", 3], ["pooled", 10], ["direct", 1], ["direct", 3]] as const) {
+      it(`${mode} (pool ${poolMax}): a cancel during connection startup leaves no unhandled rejection`, async () => {
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+        process.on("unhandledRejection", onUnhandled);
+        try {
+          for (const delayMs of [0, 1, 2, 5, 10, 20, 40]) {
+            for (let round = 0; round < 4; round += 1) {
+              const parent = createDb(tempDb!.connectionString, mode === "pooled" ? { prepare: false, max: poolMax } : { max: poolMax });
+              const scope = createRequestScopedDb(parent, { statementTimeoutMs: 60_000, lockTimeoutMs: 60_000, idleInTransactionMs: 60_000, connectTimeoutMs: 2000 })!;
+              const work = (async () => await scope.db.execute(sql`select 1`))().catch(() => "cancelled");
+              if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+              await scope.cancel();
+              await work;
+            }
+          }
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        } finally {
+          process.off("unhandledRejection", onUnhandled);
+        }
+        expect(unhandled.map((reason) => String((reason as Error)?.message ?? reason))).toEqual([]);
+      }, 60_000);
+    }
 
     // Round 12: the abandoned-operation matrix (operation held past the deadline x direct or pooled connection) release
     // assurance applies, executed here against a real database and a fake provider. Whatever is held, the route answers in

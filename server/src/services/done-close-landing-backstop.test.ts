@@ -19,6 +19,11 @@ const mockResolveCardPullRequest = vi.hoisted(() => vi.fn());
 const mockResolveGitHubTokenForRepo = vi.hoisted(() => vi.fn());
 const mockEnableAutoMerge = vi.hoisted(() => vi.fn());
 const mockDisableAutoMerge = vi.hoisted(() => vi.fn());
+// The scripted rows of this fixture cannot take the take-back record (it needs a real database): a spy stands in, and
+// the arming tests assert it was opened before the enable call and forgotten after.
+const mockOpenArmRecord = vi.hoisted(() => vi.fn());
+const mockForgetArm = vi.hoisted(() => vi.fn());
+const mockSettleEnable = vi.hoisted(() => vi.fn());
 const mockFetchGitHubNodeId = vi.hoisted(() => vi.fn());
 // SUP-15315: head-authorization gate readers. Without these the gate would hit
 // the real token-credential + GitHub paths (or, worse, real network).
@@ -37,6 +42,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     resolveGitHubTokenForRepo: mockResolveGitHubTokenForRepo,
     enableAutoMerge: mockEnableAutoMerge,
     disableAutoMerge: mockDisableAutoMerge,
+    openArmRecord: mockOpenArmRecord,
     fetchGitHubNodeId: mockFetchGitHubNodeId,
     fetchHeadViaTokenCandidates: mockFetchHeadViaTokenCandidates,
     fetchHeadApprovedStatusViaTokenCandidates: mockFetchHeadApprovedStatusViaTokenCandidates,
@@ -109,6 +115,8 @@ type DbState = {
   workspaceRows?: Array<Record<string, unknown>>;
   /** Decision rows of the card, read by the authority guard (default none). */
   decisionRows?: Array<Record<string, unknown>>;
+  /** Company memberships of the users who decided, read by the authority guard (default none). */
+  memberRows?: Array<Record<string, unknown>>;
 };
 
 /**
@@ -209,7 +217,7 @@ function makeDb(state: DbState) {
         return { from: () => ({ where: () => Promise.resolve(state.decisionRows ?? []) }) };
       }
       if ("principalId" in cols) {
-        return { from: () => ({ innerJoin: () => ({ where: () => Promise.resolve([]) }) }) };
+        return { from: () => ({ innerJoin: () => ({ where: () => Promise.resolve(state.memberRows ?? []) }) }) };
       }
       if ("executionState" in cols) {
         return {
@@ -465,6 +473,9 @@ beforeEach(() => {
   mockResolveGitHubTokenForRepo.mockReset();
   mockEnableAutoMerge.mockReset();
   mockDisableAutoMerge.mockReset();
+  mockForgetArm.mockReset().mockResolvedValue(undefined);
+  mockSettleEnable.mockReset().mockResolvedValue(undefined);
+  mockOpenArmRecord.mockReset().mockResolvedValue({ ok: true, forget: mockForgetArm, settleEnable: mockSettleEnable });
   mockFetchGitHubNodeId.mockReset();
   mockFetchHeadViaTokenCandidates.mockReset();
   mockFetchHeadApprovedStatusViaTokenCandidates.mockReset();
@@ -1476,6 +1487,84 @@ describe("createDoneCloseLandingBackstopService", () => {
         const errors = vi.mocked(logger.error).mock.calls.map((call) => String(call[1]));
         expect(errors.some((message) => message.includes("could NOT be disabled"))).toBe(true);
         expect(vi.mocked(logger.warn).mock.calls.map((call) => String(call[1])).some((message) => message.includes("taken back"))).toBe(false);
+      });
+
+      it("opens the take-back record before the enable call and forgets it once the arm stands", async () => {
+        const order: string[] = [];
+        mockOpenArmRecord.mockImplementation(async () => { order.push("open"); return { ok: true, forget: async () => { order.push("forget"); }, settleEnable: async () => { order.push("settle"); } }; });
+        const service = armingFixture();
+        mockEnableAutoMerge.mockImplementation(async () => { order.push("enable"); return { success: true, alreadyQueued: false, error: null, status: 200 }; });
+
+        const counts = await service.sweep();
+
+        expect(counts.reenqueued).toBe(1);
+        expect(order).toEqual(["open", "enable", "settle", "forget"]);
+        expect(mockOpenArmRecord).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.objectContaining({ number: 514 }), expect.any(String), "PRNode_abc123", LIVE_SHA, expect.objectContaining({ stillHolds: expect.any(Function) }));
+      });
+
+      it("arms nothing when the take-back record is refused", async () => {
+        const service = armingFixture();
+        mockOpenArmRecord.mockResolvedValue({ ok: false, kind: "failed", message: "failed:disarm-backlog-full" });
+
+        const counts = await service.sweep();
+
+        expect(counts.reenqueued).toBe(0);
+        expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      });
+
+      it("keeps the record when the arm is taken back but the disable fails (the pending record takes over)", async () => {
+        const service = armingFixture();
+        mockDisableAutoMerge.mockResolvedValue({ success: false, error: "timeout after 10000ms" });
+        mockEnableAutoMerge.mockImplementation(async () => { revoke(); return { success: true, alreadyQueued: false, error: null, status: 200 }; });
+
+        await service.sweep();
+
+        expect(mockForgetArm).not.toHaveBeenCalled();
+      });
+
+      // Round 13: the 16-cell matrix (2 consumers x 2 moments x 4 revocations); this is the real done-close backstop
+      // sweep and the real authority guard over scripted rows, the provider boundary faked. The reconciler's 8 cells run
+      // through the real re-arm path in approval-status-reconciler.test.ts.
+      describe("the revocation matrix through the real backstop sweep (4 revocations x 2 moments)", () => {
+        const CERTIFICATE = { owner: "paperclipai", repo: "paperclip", number: 514, headSha: LIVE_SHA, decisionId: "d-1" };
+        const revocations: Array<[string, () => void]> = [
+          ["the decision row becomes changes_requested", () => { armingState.decisionRows = [{ ...approvedRow, outcome: "changes_requested" }]; }],
+          ["the card's last decision outcome changes", () => { armingState.issueExecutionState = { ...armingState.issueExecutionState, lastDecisionOutcome: "changes_requested" }; }],
+          ["the certificate is removed", () => { armingState.issueExecutionState = { approvalStatus: { approvedHeadSha: LIVE_SHA } , lastDecisionOutcome: "approved" }; }],
+          ["the decider's membership is revoked", () => { armingState.memberRows = [{ principalId: "reviewer", status: "suspended" }]; }],
+        ];
+        for (const [label, revokeNow] of revocations) {
+          for (const moment of ["enable", "retry"] as const) {
+            it(`${label}, at ${moment === "enable" ? "the final accepted enable" : "a transient retry"}`, async () => {
+              const service = armingFixture();
+              armingState.issueExecutionState = { approvalStatus: { approvedHeadSha: LIVE_SHA, finalDelivery: CERTIFICATE }, lastDecisionOutcome: "approved" };
+              armingState.memberRows = [{ principalId: "reviewer", status: "active" }];
+              mockDisableAutoMerge.mockResolvedValue({ success: true, error: null });
+              const mutations: number[] = [];
+              mockEnableAutoMerge.mockImplementation(async (_token: string, _node: string, options: { beforeAttempt?: () => Promise<string | null> }) => {
+                for (let attempt = 1; attempt <= 2; attempt += 1) {
+                  if (await options.beforeAttempt?.()) return { success: false, alreadyQueued: false, error: "authority_changed", status: 0 };
+                  mutations.push(attempt);
+                  if (moment === "enable") { revokeNow(); return { success: true, alreadyQueued: false, error: null, status: 200 }; }
+                  if (attempt === 1) { revokeNow(); continue; } // the first attempt answers 502 and the revocation commits
+                  return { success: true, alreadyQueued: false, error: null, status: 200 };
+                }
+                return { success: false, alreadyQueued: false, error: "unreachable", status: 0 };
+              });
+
+              const counts = await service.sweep();
+
+              expect(counts.reenqueued).toBe(0);
+              if (moment === "enable") {
+                expect(mutations).toEqual([1]);
+                expect(mockDisableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+              } else {
+                expect(mutations).toEqual([1]);
+                expect(mockDisableAutoMerge).not.toHaveBeenCalled();
+              }
+            });
+          }
+        }
       });
 
       it("leaves a quiet card armed when nothing changed", async () => {

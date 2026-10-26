@@ -1,0 +1,45 @@
+import subprocess, shutil, json, os, re, sys
+root='/home/kronik/.treehouse/paperclip-8ca417/3/paperclip'
+sp=sys.argv[1]
+def run(files_filters):
+    out=[]
+    for f,flt in files_filters:
+        cmd=['npx','vitest','run',f]+(['-t',flt] if flt else [])
+        r=subprocess.run(cmd,cwd=root+'/server',capture_output=True,text=True,timeout=900)
+        txt=r.stdout+r.stderr
+        m=re.search(r'Tests\s+(?:(\d+) failed \| )?(\d+) passed',txt)
+        failed=int(m.group(1) or 0) if m else -1
+        passed=int(m.group(2)) if m else -1
+        names=re.findall(r'^\s+×\s+(.+?)\s+\d+ms$',txt,re.M)
+        out.append({'file':f,'filter':flt,'failed':failed,'passed':passed,'failedNames':names[:12]})
+    return out
+NEW=[('src/services/merge-arming.test.ts','take-back record written before the arm|window from the provider accepting|revocation matrix'),
+     ('src/__tests__/merge-arming-republish.test.ts','cancel during connection startup|late provider success, judged'),
+     ('src/services/approval-status-reconciler.test.ts','revocation matrix through the real'),
+     ('src/services/done-close-landing-backstop.test.ts','revocation matrix through the real backstop|opens the take-back record|arms nothing when the take-back')]
+results={}
+def backup(p): shutil.copy(root+'/'+p,sp+'/bak_'+p.replace('/','_'))
+def restore(p): shutil.copy(sp+'/bak_'+p.replace('/','_'),root+'/'+p)
+mode=sys.argv[2]
+if mode=='old':
+    files=['server/src/services/merge-arming.ts','server/src/services/auto-merge-disarm.ts','packages/db/src/client.ts','server/src/services/done-close-landing-backstop.ts','server/src/index.ts']
+    for p in files: backup(p)
+    try:
+        for p in files:
+            open(root+'/'+p,'w').write(subprocess.run(['git','show','681e0d705:'+p],cwd=root,capture_output=True,text=True).stdout)
+        results['old-head 681e0d70']=run(NEW)
+    finally:
+        for p in files: restore(p)
+else:
+    mutants=json.load(open(sys.argv[3]))
+    for name,m in mutants.items():
+        p=m['file']; backup(p)
+        try:
+            s=open(root+'/'+p).read()
+            assert m['old'] in s, name
+            open(root+'/'+p,'w').write(s.replace(m['old'],m['new'],1))
+            results[name]=run([(f,flt) for f,flt in NEW] if m.get('all') else m['run'])
+        finally:
+            restore(p)
+json.dump(results,open(sp+'/controls-'+mode+'.json','w'),indent=2)
+print(json.dumps({k:[(r['file'].split('/')[-1],r['failed'],r['passed']) for r in v] for k,v in results.items()},indent=1))

@@ -7724,11 +7724,18 @@ registry.registerPath({
 
 const MergeReleaseOutcomeSchema = z.object({
   outcome: z.enum(["released", "already_approved", "refused", "failed", "stale"]),
-  headSha: z.string(),
+  // Absent on a deadline (409) or busy (503) answer: those come before the head is read.
+  headSha: z.string().optional(),
   message: z.string(),
+  // false on 200 `released` when only the outcome audit row could not be written: the status is out, the intent row is the trail.
   auditRecorded: z.boolean(),
 });
 // A card refusal ({ error }) is answered before anything is published; a publication outcome is not.
+const mergeReleaseBusy = {
+  description: "Busy: too many release requests are being authenticated (status:failed:busy); nothing was published, retry after Retry-After seconds",
+  headers: { "Retry-After": { schema: { type: "string" as const } } },
+  content: { "application/json": { schema: MergeReleaseOutcomeSchema } },
+};
 const mergeReleaseConflict = {
   description: "Conflict: a card refusal ({ error }) or a publication outcome ({ outcome, headSha, message, auditRecorded })",
   content: { "application/json": { schema: z.union([z.object({ error: z.string() }), MergeReleaseOutcomeSchema]) } },
@@ -7817,6 +7824,7 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: mergeReleaseConflict,
+    503: mergeReleaseBusy,
   },
 });
 
@@ -7844,6 +7852,7 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: mergeReleaseConflict,
+    503: mergeReleaseBusy,
   },
 });
 

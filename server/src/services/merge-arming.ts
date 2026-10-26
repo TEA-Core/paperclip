@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { IssueExecutionStage } from "@paperclipai/shared";
 import { and, eq, ilike, inArray, sql, type SQL } from "drizzle-orm";
@@ -1062,6 +1063,68 @@ export interface PendingAutoMergeDisarm {
   attempts: number;
   lastError: string | null;
   lastAttemptAt?: string | null;
+  /**
+   * `in_flight`: written BEFORE the enable call, so an arm GitHub accepts is covered even if this process dies or the
+   * database is unreachable right after (the sweep then takes it back when the authority no longer matches `baseline`,
+   * and just clears it when it does). `pending` (or absent): the arm is known to be in force without authority and
+   * is taken back unconditionally.
+   */
+  state?: "in_flight" | "pending";
+  /** Names one arm attempt, so a finished attempt clears only its own record. */
+  token?: string;
+  /** The authority fingerprint the arm was authorized against (in_flight records only). */
+  baseline?: string | null;
+  requireApprovedLadder?: boolean;
+}
+
+/**
+ * Most records (in flight or pending) the instance holds at once (a mutable object so a test can lower it). Arming is refused above it, so the backlog of
+ * take-backs stays small enough that every sweep tries all of them: a disable is never dropped and never starved.
+ */
+export const disarmBacklog: { cap: number } = { cap: 50 };
+
+const RECORD_PATH = sql`(${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm')`;
+
+/**
+ * Writes the in-flight record before an enable call, in one statement that also checks there is no record on the
+ * card yet and fewer than `disarmBacklog.cap` on the instance (concurrent admissions can overshoot by the number of
+ * arms in flight; the sweep tries every record). `exists`: a take-back or another arm already holds the card.
+ * `full`: the backlog is at its cap. In both cases nothing may be armed.
+ */
+export async function openArmInFlight(db: Db, companyId: string, issueId: string, record: PendingAutoMergeDisarm): Promise<"recorded" | "exists" | "full"> {
+  const patch = JSON.stringify({ autoMergeDisarm: record });
+  const rows = await db
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) || ${patch}::jsonb)`,
+    })
+    .where(and(
+      eq(issues.companyId, companyId),
+      eq(issues.id, issueId),
+      sql`${RECORD_PATH} is null`,
+      sql`(select count(*) from "issues" as other where other."execution_state" -> 'approvalStatus' -> 'autoMergeDisarm' is not null) < ${disarmBacklog.cap}`,
+    ))
+    .returning({ id: issues.id });
+  if (rows.length > 0) return "recorded";
+  const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  const existing = ((row?.executionState as Record<string, unknown> | null)?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
+  return existing ? "exists" : "full";
+}
+
+/** Removes the card's record; with a token, only when it is the record of that arm attempt. */
+export async function clearAutoMergeDisarmRecord(db: Db, companyId: string, issueId: string, token?: string): Promise<void> {
+  await db
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) - 'autoMergeDisarm')`,
+    })
+    .where(and(
+      eq(issues.companyId, companyId),
+      eq(issues.id, issueId),
+      ...(token ? [sql`${RECORD_PATH} ->> 'token' = ${token}`] : []),
+    ));
 }
 
 /** Writes the record into the card's approvalStatus subtree atomically (other keys are preserved). */
@@ -1074,6 +1137,59 @@ export async function recordPendingAutoMergeDisarm(db: Db, companyId: string, is
         coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) || ${patch}::jsonb)`,
     })
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+}
+
+export type ArmRecordOpening =
+  | { ok: true; forget: () => Promise<void>; settleEnable: (result: { success: boolean; error: string | null; status: number }) => Promise<void> }
+  | { ok: false; kind: "failed" | "skipped"; message: string };
+
+/**
+ * Every enable call goes through this first: it writes the in-flight take-back record (see openArmInFlight) and refuses
+ * the arm when the record cannot be written, the card already holds one, or the backlog is at its cap. `settleEnable`
+ * is told how the enable call ended: an answer that is not an acceptance drops the record (nothing is armed); no
+ * answer (a network error, a 5xx) keeps it and starts the prompt retries, because the arm may be in force. `forget`
+ * drops the record once the caller knows the arm is settled (it stands with its authority, or it was taken back).
+ */
+export async function openArmRecord(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number },
+  label: string,
+  nodeId: string,
+  headSha: string | null,
+  guard: AuthorityGuard,
+): Promise<ArmRecordOpening> {
+  const token = randomUUID();
+  let opened: "recorded" | "exists" | "full";
+  try {
+    opened = await openArmInFlight(db, companyId, issueId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha,
+      reason: "arm in flight", since: new Date().toISOString(), attempts: 0, lastError: null,
+      state: "in_flight", token, baseline: guard.baseline, requireApprovedLadder: guard.requireApprovedLadder,
+    });
+  } catch (error) {
+    return { ok: false, kind: "failed", message: `failed:disarm-record-unavailable: ${label} — the take-back record could not be written (${error instanceof Error ? error.message : String(error)}); nothing was armed` };
+  }
+  if (opened === "exists") {
+    return { ok: false, kind: "skipped", message: `skipped:arm-in-progress: ${label} — a take-back or another arm is already recorded on this card; nothing was armed, the next pass tries again` };
+  }
+  if (opened === "full") {
+    return { ok: false, kind: "failed", message: `failed:disarm-backlog-full: ${label} — ${disarmBacklog.cap} auto-merge take-backs are already waiting to be confirmed; nothing was armed` };
+  }
+  const forget = () => clearAutoMergeDisarmRecord(db, companyId, issueId, token).catch(() => undefined);
+  return {
+    ok: true,
+    forget,
+    settleEnable: async (result) => {
+      if (result.success) return;
+      if (result.error === "network_error" || isTransientArmingStatus(result.status)) {
+        try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still settles it */ }
+      } else {
+        await forget();
+      }
+    },
+  };
 }
 
 /**
@@ -1093,14 +1209,15 @@ export async function keepAutoMergeDisarmPending(
   try {
     await recordPendingAutoMergeDisarm(db, companyId, issueId, {
       owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha, reason,
-      since: new Date().toISOString(), attempts: 1, lastError: error, lastAttemptAt: new Date().toISOString(),
+      since: new Date().toISOString(), attempts: 1, lastError: error, lastAttemptAt: new Date().toISOString(), state: "pending",
     });
     // Do not wait for the first reconciler tick: retry within seconds (a restart falls back to the tick).
     // Loaded here, not at the top, because that module imports this one.
     try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still retries it */ }
     return "; the take-back is recorded on the card and retried within seconds and then on every reconciler tick until GitHub confirms auto-merge is off";
   } catch (err) {
-    return `; the take-back could NOT be recorded for retry (${err instanceof Error ? err.message : String(err)}), so it must be done by hand`;
+    // The in-flight record written before the arm is still on the card: the sweep takes the arm back from it.
+    return `; the take-back record could not be updated (${err instanceof Error ? err.message : String(err)}); the record written before the arm stays on the card and the sweep takes the arm back from it`;
   }
 }
 
@@ -5054,15 +5171,22 @@ async function decisionStandingProblem(db: Db, companyId: string, issueId: strin
  */
 export interface AuthorityGuard {
   stillHolds(): Promise<string | null>;
+  /** What the guard compares against, so a record can rebuild the same guard later (after a restart). */
+  readonly baseline: string;
+  readonly requireApprovedLadder: boolean;
+  readonly headSha: string | null;
 }
 export async function createAuthorityGuard(
   db: Db,
   companyId: string,
   issueId: string,
-  options: { requireApprovedLadder?: boolean; headSha?: string | null } = {},
+  options: { requireApprovedLadder?: boolean; headSha?: string | null; baseline?: string } = {},
 ): Promise<AuthorityGuard> {
-  const baseline = await computeAuthorityFingerprint(db, companyId, issueId, options.headSha);
+  const baseline = options.baseline ?? await computeAuthorityFingerprint(db, companyId, issueId, options.headSha);
   return {
+    baseline,
+    requireApprovedLadder: options.requireApprovedLadder === true,
+    headSha: options.headSha ?? null,
     async stillHolds() {
       const [fresh] = await db
         .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
@@ -5291,11 +5415,18 @@ export async function armMergeOnApproval(
       nodeId = nodeIdResult.nodeId;
     }
 
+    // Written BEFORE the enable call: an arm GitHub accepts is then covered even if this process dies, or the
+    // database fails, right after (see PendingAutoMergeDisarm). If it cannot be written, nothing is armed.
+    const armRecord = await openArmRecord(db, companyId, ownerRow.id, pr, pr.displayName, nodeId, options.expectedHeadOid ?? null, guard);
+    if (!armRecord.ok) return { kind: armRecord.kind, message: armRecord.message };
+    const forget = armRecord.forget;
+
     const result = await enableAutoMerge(token, nodeId, {
       ...(options.expectedHeadOid ? { expectedHeadOid: options.expectedHeadOid } : {}),
       // Before the first attempt and before every retry.
       beforeAttempt: authorityChanged,
     });
+    await armRecord.settleEnable(result);
     if (result.success) {
       // A revocation that committed while the call was in flight could not be seen before it: look again,
       // and take the arm back if the authority is no longer what was checked.
@@ -5304,6 +5435,7 @@ export async function armMergeOnApproval(
         `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changedDuringArm) {
         const disabled = await disableAutoMerge(token, nodeId);
+        if (disabled.success) await forget();
         const kept = disabled.success ? "" : await keepAutoMergeDisarmPending(db, companyId, ownerRow.id, pr, nodeId, options.expectedHeadOid ?? null, changedDuringArm, disabled.error);
         return {
           kind: "failed",
@@ -5311,6 +5443,7 @@ export async function armMergeOnApproval(
             (disabled.success ? "auto-merge was disabled again" : `auto-merge could NOT be disabled (${disabled.error ?? "unknown"}) and is STILL ENABLED${kept}`),
         };
       }
+      await forget();
       if (result.alreadyQueued) {
         return {
           kind: "skipped",
