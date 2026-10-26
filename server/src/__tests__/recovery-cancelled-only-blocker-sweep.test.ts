@@ -8,6 +8,7 @@ import {
   createDb,
   executionWorkspaces,
   issueRelations,
+  issueRecoveryActions,
   issues,
   projects,
   workspaceOperations,
@@ -178,6 +179,33 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
       .where(eq(activityLog.action, "issue.cancelled_blocker_dependent_detected"))
       .then((rows) => rows[0]);
     expect(audit?.entityId).toBe(blockedId);
+    const [recovery] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, blockedId));
+    expect(recovery).toMatchObject({ ownerType: "board", previousOwnerAgentId: agentId, status: "active" });
+  });
+
+  it("opens board-owned recovery for mixed done and cancelled blockers without satisfying the cancelled edge", async () => {
+    const { companyId, agentId } = await seed();
+    const blockedId = await createBlockedIssue(companyId, agentId, "Mixed terminal blockers");
+    const doneId = await createBlocker(companyId, "done", "Completed blocker");
+    const cancelledId = await createBlocker(companyId, "cancelled", "Cancelled blocker");
+    await addBlockerRelation(companyId, doneId, blockedId);
+    await addBlockerRelation(companyId, cancelledId, blockedId);
+    const before = await snapshotIssuesAndRelations();
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reconcileCancelledOnlyBlockerDependents();
+    await heartbeat.reconcileCancelledOnlyBlockerDependents();
+
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, blockedId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      companyId,
+      ownerType: "board",
+      previousOwnerAgentId: agentId,
+      status: "active",
+    });
+    expect(actions[0]?.nextAction).toContain("cancelled");
+    expect(await snapshotIssuesAndRelations()).toEqual(before);
   });
 
   it("reports a dependent whose blockers are all cancelled (>=2)", async () => {
@@ -386,5 +414,40 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
     expect(result.reported).toBe(0);
     expect(result.skipped).toBe(1);
     expect(result.issueIds).toEqual([]);
+  });
+
+  it("resolves the board action once the stale cancelled edges are removed, and re-opens none", async () => {
+    const { companyId, agentId } = await seed();
+    const blockedId = await createBlockedIssue(companyId, agentId, "Blocked dependent");
+    const blockerId = await createBlocker(companyId, "cancelled", "Cancelled blocker");
+    await addBlockerRelation(companyId, blockerId, blockedId);
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reconcileCancelledOnlyBlockerDependents();
+    const [opened] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, blockedId));
+    expect(opened).toMatchObject({ status: "active", cause: "cancelled_blocker_dependent" });
+
+    await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, blockedId));
+    const result = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+
+    expect(result.reported).toBe(0);
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, blockedId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ id: opened?.id, status: "resolved", outcome: "restored" });
+  });
+
+  it("resolves the board action when a cancelled blocker is reopened", async () => {
+    const { companyId, agentId } = await seed();
+    const blockedId = await createBlockedIssue(companyId, agentId, "Blocked dependent");
+    const blockerId = await createBlocker(companyId, "cancelled", "Cancelled blocker");
+    await addBlockerRelation(companyId, blockerId, blockedId);
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reconcileCancelledOnlyBlockerDependents();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerId));
+    await heartbeat.reconcileCancelledOnlyBlockerDependents();
+
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, blockedId));
+    expect(action).toMatchObject({ status: "resolved", outcome: "restored" });
   });
 });
