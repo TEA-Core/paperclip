@@ -220,9 +220,10 @@ blockers (for example when the stale edges are removed, after which the
 zero-blocker heal wakes the assignee). Resolved-dependency wake re-arm caps
 exempt only a succeeded run with no net effect on the dependent: no status
 change away from `blocked` (a checkout followed by a re-park nets out), no
-comment, and no new blocker edge. Failed, timed-out, cancelled, platform-refused,
-and run-less wakes always count. At the cap, the recovery action asks the board to distinguish platform refusal,
-all blockers terminal without a valid continuation, and an unlinked real blocker.
+comment, and no new blocker edge. Failed, timed-out, cancelled,
+platform-refused, and run-less wakes always count. At the cap, the recovery
+action asks the board to distinguish platform refusal, all blockers terminal
+without a valid continuation, and an unlinked real blocker.
 
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
 
