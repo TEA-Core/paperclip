@@ -831,9 +831,6 @@ export function summarySlotService(db: Db) {
     ) {
       throw forbidden("Generation task does not target this summary slot");
     }
-    if (issueRef.row.assigneeAgentId !== actor.agentId) {
-      throw forbidden("Generation task is not assigned to this agent");
-    }
     const runId = actor.runId ?? null;
     const runMatches =
       !!runId && (issueRef.row.checkoutRunId === runId || issueRef.row.executionRunId === runId);
