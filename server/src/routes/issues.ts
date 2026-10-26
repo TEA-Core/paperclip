@@ -19686,6 +19686,15 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    const readCommittedUpdatedAt = (issueId: string) =>
+      db
+        .select({ updatedAt: issueRows.updatedAt })
+        .from(issueRows)
+        .where(eq(issueRows.id, issueId))
+        .then((rows) => rows[0]?.updatedAt ?? null);
+    // A comment bumps the row after the field update, so the response token is
+    // read right after the last in-request write, before any post-commit work.
+    let committedUpdatedAt = commentBody ? await readCommittedUpdatedAt(issue.id) : null;
     // SUP-15257: this issue mutation just committed; if it came from a
     // task-watchdog run, re-derive and advance that run's stop fingerprint so
     // its next in-run write is not rejected as stale.
@@ -20256,6 +20265,7 @@ export function issueRoutes(
         clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
       });
+      committedUpdatedAt = await readCommittedUpdatedAt(issue.id);
       await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
@@ -20389,11 +20399,6 @@ export function issueRoutes(
       };
     }
 
-    const committedUpdatedAt = await db
-      .select({ updatedAt: issueRows.updatedAt })
-      .from(issueRows)
-      .where(eq(issueRows.id, issue.id))
-      .then((rows) => rows[0]?.updatedAt ?? null);
     if (committedUpdatedAt) {
       issueResponse = { ...issueResponse, updatedAt: committedUpdatedAt };
     }

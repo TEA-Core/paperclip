@@ -1,5 +1,10 @@
-// Applies one source mutant at a time, runs the killer assertion, and restores
-// the file. A non-zero vitest exit is a kill. Run from the repo root:
+// Release-assurance evidence, not a CI check. Applies one source mutant at a
+// time, runs the killer assertion, and restores the file. A non-zero vitest
+// exit is a kill. Every patched file is snapshotted up front and restored on
+// exit, on a signal, and after each mutant; the run fails if any file differs
+// from its snapshot at the end. A mutant whose anchor no longer matches the
+// source reports ERROR and counts as not killed, so refactors fail loudly.
+// Run from the repo root:
 //   node server/src/__tests__/issue-patch-expected-updated-at-mutants.harness.mjs
 import { readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -133,12 +138,28 @@ function abs(file) {
   return new URL(file, root);
 }
 
+const snapshots = new Map();
+for (const mutant of mutants) {
+  for (const { file } of [mutant, ...(mutant.also ? [mutant.also] : [])]) {
+    if (!snapshots.has(file)) snapshots.set(file, readFileSync(abs(file), "utf8"));
+  }
+}
+
+function restoreAll() {
+  for (const [file, original] of snapshots) writeFileSync(abs(file), original);
+}
+
+process.on("exit", restoreAll);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => process.exit(130));
+}
+
 function apply(file, from, to) {
   const path = abs(file);
   const original = readFileSync(path, "utf8");
   const count = original.split(from).length - 1;
   if (count !== 1) {
-    throw new Error(`${file} anchor count ${count} for mutant snippet`);
+    throw new Error(`${file}: mutant anchor matched ${count} times (expected 1); update the snippet to the current source`);
   }
   writeFileSync(path, original.replace(from, to));
   return original;
@@ -170,6 +191,13 @@ for (const mutant of mutants) {
   } finally {
     for (const [file, original] of originals) writeFileSync(abs(file), original);
   }
+}
+
+const drifted = [...snapshots].filter(([file, original]) => readFileSync(abs(file), "utf8") !== original);
+if (drifted.length > 0) {
+  process.stdout.write(`ERROR files differ from their pre-run snapshot: ${drifted.map(([file]) => file).join(", ")}\n`);
+  restoreAll();
+  process.exitCode = 1;
 }
 
 const killed = results.filter((row) => row.killed).length;
