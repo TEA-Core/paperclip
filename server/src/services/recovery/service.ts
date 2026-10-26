@@ -10890,9 +10890,63 @@ export function recoveryService(
     return true;
   }
 
+  async function unresolvedBlockersAllCancelled(
+    companyId: string,
+    unresolvedBlockerIssueIds: string[],
+  ) {
+    if (unresolvedBlockerIssueIds.length === 0) return false;
+    const statuses = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, unresolvedBlockerIssueIds)))
+      .then((rows) => new Map(rows.map((r) => [r.id, r.status])));
+    return unresolvedBlockerIssueIds.every((blockerId) => statuses.get(blockerId) === "cancelled");
+  }
+
   async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
     const seen = new Set<string>();
+
+    // Resolve board actions whose condition has cleared (edges removed or
+    // replaced, blocker reopened, dependent left blocked) so the zero-blocker
+    // heal wake and the blocked_without_blockers sweep are no longer
+    // suppressed by a stale action.
+    const openCancelledBlockerActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.cause, "cancelled_blocker_dependent"),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      );
+    for (const action of openCancelledBlockerActions) {
+      const [source] = await db.select().from(issues).where(eq(issues.id, action.sourceIssueId));
+      let resolutionNote: string | null = null;
+      if (!source) {
+        resolutionNote = "Recovery action became stale because the source issue no longer exists.";
+      } else if (source.status !== "blocked") {
+        resolutionNote = `Recovery action became stale because the source issue is now ${source.status}.`;
+      } else {
+        const readiness = (await listIssueDependencyReadinessMap(db, action.companyId, [source.id])).get(source.id);
+        if (
+          readiness &&
+          !(await unresolvedBlockersAllCancelled(action.companyId, readiness.unresolvedBlockerIssueIds))
+        ) {
+          resolutionNote =
+            "Recovery action became stale because the source issue no longer has only cancelled unresolved blockers.";
+        }
+      }
+      if (!resolutionNote) continue;
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: action.companyId,
+        sourceIssueId: action.sourceIssueId,
+        actionId: action.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote,
+      });
+    }
 
     const candidates = await db
       .select({
@@ -10956,21 +11010,7 @@ export function recoveryService(
         continue;
       }
 
-      const unresolvedStatuses = await db
-        .select({ id: issues.id, status: issues.status })
-        .from(issues)
-        .where(
-          and(
-            eq(issues.companyId, candidate.companyId),
-            inArray(issues.id, readiness.unresolvedBlockerIssueIds),
-          ),
-        )
-        .then((rows) => new Map(rows.map((r) => [r.id, r.status])));
-
-      const allCancelled =
-        readiness.unresolvedBlockerIssueIds.length > 0 &&
-        readiness.unresolvedBlockerIssueIds.every((blockerId) => unresolvedStatuses.get(blockerId) === "cancelled");
-      if (!allCancelled) {
+      if (!(await unresolvedBlockersAllCancelled(candidate.companyId, readiness.unresolvedBlockerIssueIds))) {
         result.skipped += 1;
         continue;
       }

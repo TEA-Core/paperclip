@@ -214,10 +214,14 @@ Blocked issues should stay idle while blockers remain unresolved. Paperclip shou
 When reconciliation finds a `blocked` dependent with only terminal blockers
 and at least one cancelled edge, it opens a board-owned recovery action to
 decide whether to replace cancelled work or remove the edge; it does not treat
-the cancellation as a satisfied dependency. Resolved-dependency wake re-arm
-caps count runs that write the dependent's status, add a comment, or add a
-blocker edge. A run with none of those writes does not consume the budget. At
-the cap, the recovery action asks the board to distinguish platform refusal,
+the cancellation as a satisfied dependency. The action is resolved
+automatically once the dependent no longer has only cancelled unresolved
+blockers (for example when the stale edges are removed, after which the
+zero-blocker heal wakes the assignee). Resolved-dependency wake re-arm caps
+exempt only a succeeded run with no net effect on the dependent: no status
+change away from `blocked` (a checkout followed by a re-park nets out), no
+comment, and no new blocker edge. Failed, timed-out, cancelled, platform-refused,
+and run-less wakes always count. At the cap, the recovery action asks the board to distinguish platform refusal,
 all blockers terminal without a valid continuation, and an unlinked real blocker.
 
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
