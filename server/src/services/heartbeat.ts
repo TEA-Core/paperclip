@@ -22344,6 +22344,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
+    if (cutoff) {
+      const legacyQueuedRuns = await db
+        .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+        .from(heartbeatRuns)
+        .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+        .where(
+          and(
+            eq(heartbeatRuns.status, "queued"),
+            eq(companies.status, "active"),
+            lt(heartbeatRuns.createdAt, cutoff),
+          ),
+        );
+      for (const run of legacyQueuedRuns) {
+        const result = await runDispatch.cancelStaleQueuedRun({
+          runId: run.id,
+          companyId: run.companyId,
+          expectedStatus: "queued",
+          worktreeExecutionCutoff: cutoff,
+        });
+        if (result.outcome === "cancelled") {
+          applyRunDispatchPostCommitEffects(result.postCommitEffects);
+        }
+      }
+    }
+
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)

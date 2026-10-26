@@ -39,6 +39,7 @@ export type CancelStaleQueuedRunInput = {
   companyId: string;
   now: Date;
   expectedStatus: "queued" | "running";
+  worktreeExecutionCutoff?: Date | null;
 };
 
 export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {

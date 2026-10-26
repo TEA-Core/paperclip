@@ -85,6 +85,8 @@ type LoadStalenessFactsInput = {
   issueId: string;
   contextSnapshot: Record<string, unknown>;
   scheduledRetryReason: string | null;
+  runCreatedAt?: Date | null;
+  worktreeExecutionCutoff?: Date | null;
 };
 type CancelSuppressedRetryInput = {
   runId: string;
@@ -177,6 +179,7 @@ export function createPostgresRunDispatchAdapter(
     input: { runId: string; companyId: string },
     onMissing: () => T,
     operation: (tx: Db, run: HeartbeatRun) => Promise<T>,
+    lockCheckoutIssue = false,
   ): Promise<T> {
     // Queue editing and claiming already use issue -> wake -> run. Read the
     // immutable issue reference without a lock first, then acquire issue ->
@@ -198,11 +201,20 @@ export function createPostgresRunDispatchAdapter(
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } =
         await db.transaction(async (tx) => {
           const typedTx = tx as unknown as Db;
-          if (hintedIssueId) {
+          if (hintedIssueId || lockCheckoutIssue) {
             await typedTx
               .select({ id: issues.id })
               .from(issues)
-              .where(and(eq(issues.id, hintedIssueId), eq(issues.companyId, input.companyId)))
+              .where(
+                and(
+                  eq(issues.companyId, input.companyId),
+                  or(
+                    hintedIssueId ? eq(issues.id, hintedIssueId) : undefined,
+                    lockCheckoutIssue ? eq(issues.checkoutRunId, input.runId) : undefined,
+                  ),
+                ),
+              )
+              .orderBy(asc(issues.id))
               .for("update");
           } else if (hintedTaskKey) {
             await typedTx.execute(
@@ -211,6 +223,7 @@ export function createPostgresRunDispatchAdapter(
           }
 
           const run = await typedTx
+
             .select()
             .from(heartbeatRuns)
             .where(
@@ -567,6 +580,8 @@ export function createPostgresRunDispatchAdapter(
       runId: input.runId,
       runAgentId: input.agentId,
       issueId,
+      runCreatedAt: input.runCreatedAt ?? null,
+      worktreeExecutionCutoff: input.worktreeExecutionCutoff ?? null,
       retryReasonKind,
       dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
         unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
@@ -831,7 +846,7 @@ export function createPostgresRunDispatchAdapter(
   async function cancelStaleRunInTx(
     tx: Db,
     run: HeartbeatRun,
-    issueId: string,
+    issueId: string | null,
     decision: Extract<ReturnType<typeof decideQueuedRunStaleness>, { stale: true }>,
     expectedStatus: "queued" | "running",
     now: Date,
@@ -881,19 +896,31 @@ export function createPostgresRunDispatchAdapter(
           );
       }
 
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.companyId, row.companyId),
+              eq(issues.id, issueId),
+              eq(issues.executionRunId, row.id),
+            ),
+          );
+      }
+
       await tx
         .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: now,
-        })
+        .set({ checkoutRunId: null, updatedAt: now })
         .where(
           and(
             eq(issues.companyId, row.companyId),
-            eq(issues.id, issueId),
-            eq(issues.executionRunId, row.id),
+            eq(issues.checkoutRunId, row.id),
           ),
         );
 
@@ -916,10 +943,35 @@ export function createPostgresRunDispatchAdapter(
       };
   }
 
-  async function decideCurrentRunStaleness(tx: Db, run: HeartbeatRun, now: Date) {
+  async function decideCurrentRunStaleness(
+    tx: Db,
+    run: HeartbeatRun,
+    now: Date,
+    worktreeExecutionCutoff?: Date | null,
+  ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
-    if (!issueId) return { issueId: null, facts: null, decision: { stale: false as const } };
+    if (!issueId) {
+      const predatesCutoff =
+        worktreeExecutionCutoff && run.createdAt && run.createdAt.getTime() < worktreeExecutionCutoff.getTime();
+      return {
+        issueId: null,
+        facts: null,
+        decision: predatesCutoff
+          ? {
+              stale: true as const,
+              errorCode: "execution_reconciliation_required" as const,
+              reason:
+                "Cancelled because the queued run predates the armed worktree execution cutoff and has no valid issue reference",
+              details: {
+                createdAt: run.createdAt.toISOString(),
+                cutoff: worktreeExecutionCutoff.toISOString(),
+                issueId: null,
+              },
+            }
+          : { stale: false as const },
+      };
+    }
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
     if (recovery) return { issueId, facts: null, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
@@ -933,6 +985,8 @@ export function createPostgresRunDispatchAdapter(
         issueId,
         contextSnapshot,
         scheduledRetryReason: run.scheduledRetryReason,
+        runCreatedAt: run.createdAt,
+        worktreeExecutionCutoff,
       },
       now,
       tx,
@@ -945,8 +999,13 @@ export function createPostgresRunDispatchAdapter(
   ): Promise<CancelStaleQueuedRunOutcome> {
     const cancelLockedRun = async (tx: Db, run: HeartbeatRun) => {
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
-      const { issueId, facts, decision } = await decideCurrentRunStaleness(tx, run, input.now);
-      if (!decision.stale || !issueId) {
+      const { issueId, facts, decision } = await decideCurrentRunStaleness(
+        tx,
+        run,
+        input.now,
+        input.worktreeExecutionCutoff,
+      );
+      if (!decision.stale) {
         if (input.expectedStatus === "queued" && facts?.isInteractionWake) {
           // Preserve the authority accepted under the issue/run locks. Later
           // preflight reads can observe a reassignment; they must not turn an
@@ -972,6 +1031,7 @@ export function createPostgresRunDispatchAdapter(
         );
       },
       cancelLockedRun,
+      true,
     );
   }
 
