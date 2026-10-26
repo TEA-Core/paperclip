@@ -95,21 +95,30 @@ export function renderDoneTierDeclaration(
   declaration: DoneTierDeclaration,
 ): string {
   const current = body ?? "";
-  if (current.split(/\r?\n/).some((line) => {
+  const lines = current.split(/\r?\n/);
+  const isCanonicalTierDeclaration = (line: string): boolean => {
     const trimmed = line.trim();
     return trimmed.startsWith(TIER_2_PREFIX) ||
       trimmed.startsWith(TIER_1_PREFIX) ||
       trimmed.startsWith("Closed at Tier 0 (decision-only):");
-  })) {
-    return body ?? "";
-  }
+  };
 
   const rendered = declaration.tier === "tier2"
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
       : `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
-  return current.length > 0 ? `${body}\n\n${rendered}` : rendered;
+  if (lines.some((line) => line.trim() === rendered)) {
+    return current;
+  }
+
+  const withoutCanonicalTierDeclaration = lines
+    .filter((line) => !isCanonicalTierDeclaration(line))
+    .join("\n")
+    .trim();
+  return withoutCanonicalTierDeclaration.length > 0
+    ? `${withoutCanonicalTierDeclaration}\n\n${rendered}`
+    : rendered;
 }
 
 /**

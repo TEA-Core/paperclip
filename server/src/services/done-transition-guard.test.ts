@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   agents as agentsTable,
@@ -5360,6 +5361,41 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closing now\n\nClosed at Tier 2 (live): Health check returned 200");
     });
 
+    it("replaces conflicting canonical tier declarations", () => {
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 0 (decision-only): stale reason",
+        {
+          tier: "tier2",
+          probeEvidence: "Health check returned 200",
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 2 (live): Health check returned 200",
+      );
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 2 (live): stale evidence",
+        {
+          tier: "tier1",
+          reason: "Merged change is ready",
+          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.",
+      );
+    });
+
+    it("replaces a conflicting declaration even when the requested tier is also present", () => {
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 2 (live): stale evidence\nClosed at Tier 1 (landed, not liveness-probed): valid declaration. Liveness unverified.",
+        {
+          tier: "tier1",
+          reason: "Updated reason",
+          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Updated reason. Liveness unverified.",
+      );
+    });
+
     it("renders both Tier 1 landing states with exactly one landing token", () => {
       expect(renderDoneTierDeclaration(null, {
         tier: "tier1",
@@ -5373,12 +5409,50 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
-    it("does not duplicate an existing valid declaration", () => {
-      const body = "Closed at Tier 2 (live): already rendered";
+    it("preserves the body when the existing Tier 2 declaration matches", () => {
+      const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
       expect(renderDoneTierDeclaration(body, {
         tier: "tier2",
-        probeEvidence: "new evidence",
+        probeEvidence: "existing evidence",
       })).toBe(body);
+    });
+
+    it("preserves the body when the existing Tier 1 declaration matches", () => {
+      const body = "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.\n\nFollow-up";
+      expect(renderDoneTierDeclaration(body, {
+        tier: "tier1",
+        reason: "Merged change is ready",
+        landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+      })).toBe(body);
+    });
+
+    it("replaces an existing same-tier declaration with the supplied declaration", () => {
+      expect(renderDoneTierDeclaration("Closed at Tier 2 (live): stale evidence", {
+        tier: "tier2",
+        probeEvidence: "new evidence",
+      })).toBe("Closed at Tier 2 (live): new evidence");
+    });
+
+    it("renders structured declarations only after both close doors resolve to done", () => {
+      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
+      const patchStatus = route.indexOf("const effectiveStatus =");
+      const patchRender = route.indexOf('if (doneTier !== undefined && effectiveStatus === "done") {');
+      const transitionComment = route.indexOf("const transitionCommentBody =");
+      const transition = route.indexOf(
+        "const transition = applyIssueExecutionPolicyTransition({",
+        transitionComment,
+      );
+      const commentStatus = route.indexOf("const autoApproveEffectiveStatus =");
+      const commentRender = route.indexOf('if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {');
+
+      expect(patchStatus).toBeGreaterThan(-1);
+      expect(patchRender).toBeGreaterThan(patchStatus);
+      expect(transitionComment).toBeGreaterThan(-1);
+      expect(transitionComment).toBeLessThan(transition);
+      expect(commentStatus).toBeGreaterThan(patchRender);
+      expect(commentRender).toBeGreaterThan(commentStatus);
+      expect(route).not.toContain('if (doneTier !== undefined && updateFields.status === "done")');
+      expect(route).not.toContain("req.body.doneTier && req.body.reopen !== true");
     });
   });
 
