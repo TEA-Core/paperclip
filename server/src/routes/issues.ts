@@ -17424,7 +17424,15 @@ export function issueRoutes(
           // Authorization denial, not a run-lease conflict (which is a 409
           // issue_write_assignee_run_lock): answer with the shared issue-write
           // denial copy so the boundary and the sanctioned path are named.
-          await denyIssueWrite(req, res, existing, issueWriteDenialCodeForDecision(boundaryDecision));
+          await denyIssueWrite(
+            req,
+            res,
+            existing,
+            issueWriteDenialCodeForDecision(boundaryDecision),
+            req.body.deliveryRequirement === "record_only"
+              ? { reason: "record_only_not_authorized" }
+              : {},
+          );
           return;
         }
       }
@@ -17474,12 +17482,14 @@ export function issueRoutes(
     const normalizedAssigneeAgentId = normalizedAssigneeAgentRef.id;
     const effectiveDeliveryRequirement =
       req.body.deliveryRequirement ?? existing.deliveryRequirement;
-    const isCurrentAssignee =
-      (req.actor.type === "agent" && req.actor.agentId === existing.assigneeAgentId) ||
-      (req.actor.type !== "agent" && req.actor.userId === existing.assigneeUserId);
-    if (req.body.deliveryRequirement === "record_only" && isCurrentAssignee) {
+    if (
+      req.body.deliveryRequirement === "record_only" &&
+      req.actor.type === "agent" &&
+      req.actor.agentId === existing.assigneeAgentId
+    ) {
       res.status(403).json({
         error: "Only the board or an authorized non-assignee may select record_only delivery",
+        details: { reason: "record_only_self_assignee" },
       });
       return;
     }

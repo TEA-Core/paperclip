@@ -373,6 +373,7 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
       .send({ deliveryRequirement: "record_only", assigneeAgentId: reviewerAgentId });
 
     expect(patched.status, JSON.stringify(patched.body)).toBe(403);
+    expect(patched.body.details?.reason).toBe("record_only_self_assignee");
     expect(patched.body.error).toMatch(/authorized non-assignee/);
 
     const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
@@ -380,8 +381,42 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     expect(stored[0]?.assigneeAgentId).toBe(closerAgentId);
   });
 
-  it("rejects an assigned user selecting record-only delivery", async () => {
-    const { companyId, closerAgentId } = await seedCompanyWithAgents();
+  it("reports a distinct reason when a non-assignee lacks mutation authority", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Other agent's issue", status: "todo", assigneeAgentId: closerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId,
+        companyIds: [companyId],
+        memberships: [],
+        isInstanceAdmin: false,
+        source: "session",
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, heartbeatStub));
+    app.use(errorHandler);
+
+    const patched = await request(app)
+      .patch(`/api/issues/${created.body.id}`)
+      .send({ deliveryRequirement: "record_only" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(403);
+    expect(patched.body.details?.reason).toBe("record_only_not_authorized");
+    const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    expect(stored[0]?.deliveryRequirement).toBe("repository_delivery");
+  });
+
+  it("allows the board assignee to select record-only delivery without reassignment", async () => {
+    const { companyId } = await seedCompanyWithAgents();
     const created = await request(createApp(companyId))
       .post(`/api/companies/${companyId}/issues`)
       .send({
@@ -395,12 +430,64 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
       .patch(`/api/issues/${created.body.id}`)
       .send({ deliveryRequirement: "record_only" });
 
-    expect(patched.status, JSON.stringify(patched.body)).toBe(403);
-    expect(patched.body.error).toMatch(/authorized non-assignee/);
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(patched.body.deliveryRequirement).toBe("record_only");
 
     const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
-    expect(stored[0]?.deliveryRequirement).toBe("repository_delivery");
+    expect(stored[0]?.deliveryRequirement).toBe("record_only");
     expect(stored[0]?.assigneeUserId).toBe("board-user");
+  });
+
+  it("repairs a drifted pending review stage when the board classifies delivery", async () => {
+    const { companyId, reviewerAgentId } = await seedCompanyWithAgents();
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Pending human-action review",
+        status: "todo",
+        assigneeUserId: "board-user",
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [stageGatedBy("review", reviewerAgentId)],
+        },
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const stageId = created.body.executionPolicy.stages[0].id as string;
+    await db.update(issues).set({
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "user", agentId: null, userId: "board-user" },
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, created.body.id));
+
+    const patched = await request(createApp(companyId))
+      .patch(`/api/issues/${created.body.id}`)
+      .send({ deliveryRequirement: "record_only" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(patched.body).toMatchObject({
+      deliveryRequirement: "record_only",
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      assigneeUserId: null,
+      executionState: { status: "pending", currentStageId: stageId },
+    });
+    const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    expect(stored[0]).toMatchObject({
+      deliveryRequirement: "record_only",
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      assigneeUserId: null,
+    });
   });
 
   it("accepts a create where the assignee is not the sole participant", async () => {
