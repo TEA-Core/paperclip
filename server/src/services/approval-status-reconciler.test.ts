@@ -3320,23 +3320,30 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mutations[0]).toContain(`expectedHeadOid: "${NEW_HEAD}"`);
     });
 
-    // Round 8: CI accepts a release only beside the control plane's marker; the reconciler writes a lost one again.
+    // Round 8/9: CI accepts a release only beside the control plane's marker; the reconciler writes a lost one again,
+    // judging an existing marker by its creator as CI does.
     const markerPosts = () => postStatusCalls().filter((call) => JSON.parse(String((call[1] as RequestInit).body)).context === "paperclip/release-confirmed");
-
-    it("round 8: re-writes the CI confirmation marker of a confirmed release when the head does not show it", async () => {
+    const LIST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/statuses?per_page=100`;
+    const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]" };
+    const marker = (creator: { id: number; login: string }) => ({ id: 7002, context: "paperclip/release-confirmed", state: "success", description: "confirms status 7001", creator });
+    async function tickWithMarkers(listed: unknown[], confirm = true) {
       const issueId = await insertIssue();
       await insertDecision(issueId);
       await insertMention(issueId);
       await certifyIssue(issueId);
-      await confirmRelease(issueId);
+      if (confirm) await confirmRelease(issueId);
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
-        { url: POST_STATUS_URL, body: { id: 7002 } },
+        { url: LIST_STATUS_URL, body: listed },
+        { url: POST_STATUS_URL, body: { id: 7003 } },
         { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
       ]);
-
       await runApprovalStatusReconcilerTick(db);
+    }
+
+    it("round 8: re-writes the CI confirmation marker of a confirmed release when the head does not show it", async () => {
+      await tickWithMarkers([]);
 
       expect(markerPosts()).toHaveLength(1);
       expect(JSON.parse(String((markerPosts()[0]![1] as RequestInit).body))).toMatchObject({
@@ -3344,36 +3351,20 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
     });
 
-    it("round 8: writes no second marker when the head already shows it", async () => {
-      const issueId = await insertIssue();
-      await insertDecision(issueId);
-      await insertMention(issueId);
-      await certifyIssue(issueId);
-      await confirmRelease(issueId);
-      const marker = { id: 7002, context: "paperclip/release-confirmed", state: "success", description: "confirms status 7001" };
-      installRoutes([
-        { url: PR_URL, body: OPEN_PR_BODY },
-        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS, marker] } },
-        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
-      ]);
-
-      await runApprovalStatusReconcilerTick(db);
+    it("round 8: writes no second marker when the control plane's own marker is already on the head", async () => {
+      await tickWithMarkers([marker(CONTROL_PLANE)]);
 
       expect(markerPosts()).toEqual([]);
     });
 
-    it("round 8: writes no marker for a release the card never confirmed", async () => {
-      const issueId = await insertIssue();
-      await insertDecision(issueId);
-      await insertMention(issueId);
-      await certifyIssue(issueId);
-      installRoutes([
-        { url: PR_URL, body: OPEN_PR_BODY },
-        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
-        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
-      ]);
+    it("round 9: a marker-named status from anyone but the control plane does not suppress the repair", async () => {
+      await tickWithMarkers([marker({ id: 42, login: "fleet-only[bot]" })]);
 
-      await runApprovalStatusReconcilerTick(db);
+      expect(markerPosts()).toHaveLength(1);
+    });
+
+    it("round 8: writes no marker for a release the card never confirmed", async () => {
+      await tickWithMarkers([], false);
 
       expect(markerPosts()).toEqual([]);
     });
@@ -3451,6 +3442,49 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
       expect((approvalStatus.armOutcome as { kind?: string } | undefined)?.kind).toBe("failed");
       expect(graphqlCalls().every((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query).includes(`expectedHeadOid: "${NEW_HEAD}"`))).toBe(true);
+    });
+
+    // Round 9 (R7-AUTH): the card's authority is read again around the enable call on the same head.
+    describe("an approval revoked on the same head", () => {
+      async function seedAndTick(opts: { revokeOn: "enable" | "first-attempt-502" }) {
+        const issueId = await insertIssue();
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await certifyIssue(issueId);
+        await confirmRelease(issueId);
+        let enables = 0;
+        const respond = (body: unknown, ok = true, status = 200) => ({ ok, status, json: async () => body }) as unknown as Response;
+        const revoke = () => db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId));
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url === PR_URL) return respond(OPEN_PR_BODY);
+          if (url === COMBINED_STATUS_URL) return respond({ state: "success", statuses: [RELEASE_STATUS] });
+          if (url === GRAPHQL_URL) {
+            const query = String(JSON.parse(String(init?.body)).query);
+            if (query.includes("disablePullRequestAutoMerge")) return respond({ data: {} });
+            enables += 1;
+            await revoke();
+            return opts.revokeOn === "first-attempt-502" ? respond({}, false, 502) : respond(GRAPHQL_ARM_OK_BODY);
+          }
+          throw new Error(`unmocked ghFetch URL: ${url}`);
+        });
+        const summary = await runApprovalStatusReconcilerTick(db);
+        return { summary, enables: () => enables, queries: () => graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query)) };
+      }
+
+      it("is taken back when it is revoked while the enable call is in flight", async () => {
+        const { summary, queries } = await seedAndTick({ revokeOn: "enable" });
+
+        expect(queries().some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(true);
+        expect(summary.rearmDetails.join("\n")).toContain("authority-revoked");
+        expect(summary.rearmDetails.join("\n")).not.toContain("armed: Auto-merge enabled");
+      });
+
+      it("is not armed by the retry after a transient failure", async () => {
+        const { enables, summary } = await seedAndTick({ revokeOn: "first-attempt-502" });
+
+        expect(enables()).toBe(1);
+        expect(summary.rearmDetails.join("\n")).toContain("authority-changed");
+      });
     });
 
     it("an already-success head with a recorded armed armOutcome is not re-armed (no arm actuator I/O)", async () => {

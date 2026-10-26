@@ -18,6 +18,7 @@ const mockResolveLinkedPullRequestsWithState = vi.hoisted(() => vi.fn());
 const mockResolveCardPullRequest = vi.hoisted(() => vi.fn());
 const mockResolveGitHubTokenForRepo = vi.hoisted(() => vi.fn());
 const mockEnableAutoMerge = vi.hoisted(() => vi.fn());
+const mockDisableAutoMerge = vi.hoisted(() => vi.fn());
 const mockFetchGitHubNodeId = vi.hoisted(() => vi.fn());
 // SUP-15315: head-authorization gate readers. Without these the gate would hit
 // the real token-credential + GitHub paths (or, worse, real network).
@@ -35,6 +36,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     resolveCardPullRequest: mockResolveCardPullRequest,
     resolveGitHubTokenForRepo: mockResolveGitHubTokenForRepo,
     enableAutoMerge: mockEnableAutoMerge,
+    disableAutoMerge: mockDisableAutoMerge,
     fetchGitHubNodeId: mockFetchGitHubNodeId,
     fetchHeadViaTokenCandidates: mockFetchHeadViaTokenCandidates,
     fetchHeadApprovedStatusViaTokenCandidates: mockFetchHeadApprovedStatusViaTokenCandidates,
@@ -104,6 +106,8 @@ type DbState = {
   };
   /** Execution-workspace rows read by `resolveIssueRepoContext` / branch-ownership. */
   workspaceRows?: Array<Record<string, unknown>>;
+  /** Decision rows of the card, read by the authority guard (default none). */
+  decisionRows?: Array<Record<string, unknown>>;
 };
 
 /**
@@ -189,6 +193,22 @@ function makeDb(state: DbState) {
               ]),
           }),
         };
+      }
+      // Round 9: the authority guard reads the card (status, policy, state) and its decision rows.
+      if ("executionPolicy" in cols) {
+        return {
+          from: () => ({
+            where: () => ({
+              limit: () => Promise.resolve([{ status: "done", executionPolicy: null, executionState: state.issueExecutionState ?? null }]),
+            }),
+          }),
+        };
+      }
+      if ("actorAgentId" in cols) {
+        return { from: () => ({ where: () => Promise.resolve(state.decisionRows ?? []) }) };
+      }
+      if ("principalId" in cols) {
+        return { from: () => ({ innerJoin: () => ({ where: () => Promise.resolve([]) }) }) };
       }
       if ("executionState" in cols) {
         return {
@@ -443,6 +463,7 @@ beforeEach(() => {
   mockResolveCardPullRequest.mockReset();
   mockResolveGitHubTokenForRepo.mockReset();
   mockEnableAutoMerge.mockReset();
+  mockDisableAutoMerge.mockReset();
   mockFetchGitHubNodeId.mockReset();
   mockFetchHeadViaTokenCandidates.mockReset();
   mockFetchHeadApprovedStatusViaTokenCandidates.mockReset();
@@ -1242,7 +1263,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
 
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA, beforeAttempt: expect.any(Function) });
       expect(mockLogActivity).toHaveBeenCalledTimes(1);
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: "issue.done_close_landing_reenqueued",
@@ -1348,13 +1369,17 @@ describe("createDoneCloseLandingBackstopService", () => {
     // expected head, and the head and the approval are read again right before it.
     describe("binds the arm to the authorized head", () => {
       const OTHER_HEAD = "f".repeat(40);
+      let armingState: DbState;
+      const approvedRow = { id: "d-1", stageId: "stage-1", outcome: "approved", actorAgentId: null, actorUserId: "reviewer", createdAt: new Date("2026-10-01T00:00:00Z") };
       function armingFixture() {
-        const { service } = makeService({
+        const { service, state } = makeService({
           candidates: [candidateRow()],
           existingLandingRows: [],
           companyMergeArmingEnabled: true,
           issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+          decisionRows: [approvedRow],
         });
+        armingState = state;
         mockResolveLinkedPullRequestsWithState.mockResolvedValue([
           linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
         ]);
@@ -1370,7 +1395,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         await armingFixture().sweep();
 
         expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
-        expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
+        expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA, beforeAttempt: expect.any(Function) });
       });
 
       it("does not arm when the PR head moved between the authorization and the arm", async () => {
@@ -1382,6 +1407,65 @@ describe("createDoneCloseLandingBackstopService", () => {
         await service.sweep();
 
         expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      });
+
+      // Round 9: the card's authority is the authority the head is armed under, not only the head's stamp.
+      const revoke = () => { armingState.decisionRows = [{ ...approvedRow, outcome: "changes_requested" }]; };
+
+      it("does not send the mutation when the approval is revoked after the final read, before the first attempt", async () => {
+        const service = armingFixture();
+        mockEnableAutoMerge.mockImplementation(async (_token: string, _node: string, options: { beforeAttempt?: () => Promise<string | null> }) => {
+          revoke();
+          const refusal = await options.beforeAttempt?.();
+          return refusal ? { success: false, alreadyQueued: false, error: `authority_changed: ${refusal}`, status: 0 } : { success: true, alreadyQueued: false, error: null, status: 200 };
+        });
+
+        const counts = await service.sweep();
+
+        expect(counts.reenqueued).toBe(0);
+        expect(mockDisableAutoMerge).not.toHaveBeenCalled();
+      });
+
+      it("checks the authority again before a retry", async () => {
+        const service = armingFixture();
+        const mutations: number[] = [];
+        mockEnableAutoMerge.mockImplementation(async (_token: string, _node: string, options: { beforeAttempt?: () => Promise<string | null> }) => {
+          for (let attempt = 1; attempt <= 2; attempt += 1) {
+            if (await options.beforeAttempt?.()) return { success: false, alreadyQueued: false, error: "authority_changed", status: 0 };
+            mutations.push(attempt);
+            if (attempt === 1) { revoke(); continue; } // the first attempt answers 502 and the revocation commits
+            return { success: true, alreadyQueued: false, error: null, status: 200 };
+          }
+          return { success: false, alreadyQueued: false, error: "unreachable", status: 0 };
+        });
+
+        const counts = await service.sweep();
+
+        expect(mutations).toEqual([1]);
+        expect(counts.reenqueued).toBe(0);
+      });
+
+      it("takes the arm back when the approval is revoked while the mutation is in flight", async () => {
+        const service = armingFixture();
+        mockDisableAutoMerge.mockResolvedValue({ success: true, error: null });
+        mockEnableAutoMerge.mockImplementation(async () => {
+          revoke(); // commits inside the GitHub call, which then accepts
+          return { success: true, alreadyQueued: false, error: null, status: 200 };
+        });
+
+        const counts = await service.sweep();
+
+        expect(mockDisableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+        expect(counts.reenqueued).toBe(0);
+      });
+
+      it("leaves a quiet card armed when nothing changed", async () => {
+        const service = armingFixture();
+
+        const counts = await service.sweep();
+
+        expect(counts.reenqueued).toBe(1);
+        expect(mockDisableAutoMerge).not.toHaveBeenCalled();
       });
 
       it("does not arm when the approval is gone by the time of the arm", async () => {
@@ -1482,7 +1566,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
 
       expect(mockFetchGitHubNodeId).toHaveBeenCalledWith("ghp_fetched", "paperclipai", "paperclip", 514);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_fetched", "PRNode_fetched", { expectedHeadOid: expect.stringMatching(/^[0-9a-f]{40}$/) });
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_fetched", "PRNode_fetched", { expectedHeadOid: expect.stringMatching(/^[0-9a-f]{40}$/), beforeAttempt: expect.any(Function) });
     });
 
     it("re-examines and re-enqueues again on a later sweep while the cap is unexhausted (SUP-15073)", async () => {
@@ -1768,7 +1852,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         reenqueued: 1,
         escalated: 0, draftStranded: 0,
       });
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA, beforeAttempt: expect.any(Function) });
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: "issue.done_close_landing_reenqueued",
       }));
@@ -3621,7 +3705,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
         draftStranded: 0,
       });
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA, beforeAttempt: expect.any(Function) });
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
@@ -3677,7 +3761,7 @@ describe("SUP-16689: draft-stranded done cards", () => {
 
       // Re-enqueue proceeded through the pre-existing path (guard inert).
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
-      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA });
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA, beforeAttempt: expect.any(Function) });
       // No delivery-refusal / escalation was emitted and the card was not blocked.
       expect(mockUpdate).not.toHaveBeenCalled();
       for (const call of mockLogActivity.mock.calls) {

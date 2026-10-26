@@ -19,12 +19,14 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { issueService } from "./issues.js";
 import {
   armMergeOnApproval,
+  createAuthorityGuard,
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   narrowToDelivered,
   postPullRequestComment,
   publishApprovalStatus,
   consumableReleaseStatusId,
+  CONTROL_PLANE_STATUS_CREATOR_ID,
   isHeadBoundReleaseDescription,
   RELEASE_CONFIRMED_CONTEXT,
   releaseConfirmedDescription,
@@ -2624,8 +2626,17 @@ async function repairReleaseConfirmationMarker(
   const approved = statuses.find((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success");
   if (!approved || approved.id === undefined || approved.id === null || String(approved.id) !== confirmedReleaseStatusId) return null;
   const description = releaseConfirmedDescription(confirmedReleaseStatusId);
-  if (statuses.some((s) => s.context === RELEASE_CONFIRMED_CONTEXT && s.state === "success" && s.description === description)) return null;
   try {
+    // The combined status omits who wrote each status, so the marker is looked for on the list, with the
+    // same creator check CI applies: a status of that name from anyone but the control plane is not the
+    // marker, and does not stand in for it.
+    const listed = await ghReadJson(db, row.companyId, target.owner, target.repo, `/commits/${encodeURIComponent(headSha)}/statuses?per_page=100`);
+    if (!listed.ok) return `release-marker: statuses list unreadable (HTTP ${listed.status}); marker not checked`;
+    const list = Array.isArray(listed.body) ? (listed.body as Array<Record<string, unknown>>) : [];
+    const trusted = list.some((s) =>
+      s.context === RELEASE_CONFIRMED_CONTEXT && s.state === "success" && s.description === description &&
+      String((s.creator as { id?: unknown } | null | undefined)?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID);
+    if (trusted) return null;
     const credential = await resolveControlPlaneGitHubToken(db, row.companyId, target.owner, target.repo);
     if (!credential) return "release-marker: no control-plane credential";
     const written = await writeCommitStatusWithRetry(credential.token, target.owner, target.repo, headSha, "", {
@@ -2791,6 +2802,9 @@ async function attemptRearmOnHealedStamp(
   if (!certifiedPr) {
     return undefined;
   }
+  // The card's authority, captured before the arm boundary's own reads: a decision reversed, a certificate
+  // removed or a reviewer terminated after this point stops the arm, on every attempt.
+  const authorityGuard = await createAuthorityGuard(db, row.companyId, row.id, { requireApprovedLadder: true });
   if (!(await verifyLiveHeadStillStamped(db, row, headSha, certifiedPr, opts.requireStamped ?? true))) {
     return undefined;
   }
@@ -2811,7 +2825,7 @@ async function attemptRearmOnHealedStamp(
   let outcome: ArmingOutcome;
   try {
     // Bound to the head just verified: GitHub refuses to enable auto-merge on a PR that has moved on.
-    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha });
+    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha, authorityGuard });
   } catch (err) {
     outcome = {
       kind: "failed",

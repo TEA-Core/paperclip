@@ -26,6 +26,8 @@ import type { InspectDatabaseBackupHealthOptions } from "./services/database-bac
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
+import { releaseRequestClock } from "./middleware/release-request-clock.js";
+import { DEFAULT_RELEASE_DEADLINES } from "./services/merge-arming.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -603,6 +605,9 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
+  // Before anything that waits on the database for the caller's identity: the release routes answer within
+  // their deadline even when authentication is stuck (the stuck query is abandoned, not cancelled).
+  app.use(releaseRequestClock({ totalMs: DEFAULT_RELEASE_DEADLINES.totalMs }));
   app.use(cloudRuntimeIdentityMiddleware(db));
   // Connection-intent tools carry their own short-lived, run-bound bearer and
   // must be reachable by remote adapters that intentionally do not receive an

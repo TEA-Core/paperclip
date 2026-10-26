@@ -127,12 +127,18 @@ test("a board release on the head lands a SUP-prefixed PR and is named in the lo
 });
 
 // Round 8: CI consumes a release only beside the control plane's confirmation marker, switch on or off.
-test("a release the control plane has not marked confirmed is not an approval", () => {
-  for (const retired of [true, false]) {
-    const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retired });
-    assert.equal(code, 1, `retired=${retired}`);
-    assert.match(out, /UNCONFIRMED RELEASE/);
-    assert.match(out, /FAIL: paperclip\/approved is unconfirmed-release/);
+test("with the switch on, a release the control plane has not marked confirmed is not an approval", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release] });
+  assert.equal(code, 1);
+  assert.match(out, /UNCONFIRMED RELEASE/);
+  assert.match(out, /FAIL: paperclip\/approved is unconfirmed-release/);
+});
+
+test("with the switch off, a release-described success is judged like any other success, marker or not", () => {
+  for (const statuses of [[release], [confirmedMarker, release]]) {
+    const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses, retired: false });
+    assert.equal(code, 0);
+    assert.doesNotMatch(out, /UNCONFIRMED|board release/);
   }
 });
 
@@ -162,7 +168,7 @@ test("a failure written after the release voids it, marker or not", () => {
   assert.match(out, /paperclip\/approved is failure/);
 });
 
-test("a success that is not a board release needs no marker, as before", () => {
+test("with the switch on, a success that is not a board release needs no marker, as before", () => {
   const ordinary = { id: 5, context: "paperclip/approved", state: "success", creator: TEA_CORE, description: "SUP-1 approved via Paperclip" };
   for (const retired of [true, false]) {
     assert.equal(run({ ref: CARD_BRANCH, author: PERSON, statuses: [ordinary], retired }).code, 0, `retired=${retired}`);
