@@ -355,4 +355,112 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
       expect(await storedTitle(seeded.issue.id)).toMatchObject({ priority: "medium" });
     });
   });
+
+  describe("authorization never writes when expectedUpdatedAt is present", () => {
+    async function seedStaleCheckout() {
+      const seeded = await seed({ assignee: true });
+      const staleRun = await db.insert(heartbeatRuns).values({
+        companyId: seeded.company.id,
+        agentId: seeded.agent!.id,
+        status: "failed",
+        contextSnapshot: { issueId: seeded.issue.id },
+      }).returning().then((rows) => rows[0]!);
+      await db.update(issues).set({
+        status: "in_progress",
+        checkoutRunId: staleRun.id,
+        executionRunId: staleRun.id,
+      }).where(eq(issues.id, seeded.issue.id));
+      const actor: Express.Request["actor"] = {
+        type: "agent",
+        agentId: seeded.agent!.id,
+        companyId: seeded.company.id,
+        runId: seeded.run!.id,
+        source: "agent_jwt",
+      };
+      const seen = await wireUpdatedAt(actor, seeded.issue.id);
+      return { ...seeded, staleRun, actor, seen };
+    }
+
+    async function lockState(issueId: string) {
+      return db.select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        updatedAt: issues.updatedAt,
+        priority: issues.priority,
+      }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    }
+
+    async function adoptionActivity(issueId: string) {
+      return (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)))
+        .filter((row) => row.action === "issue.checkout_lock_adopted");
+    }
+
+    it("returns 409 checkout_adoption_required with no adoption, activity row or updatedAt bump", async () => {
+      const seeded = await seedStaleCheckout();
+      const res = await request(await appFor(seeded.actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ priority: "high", expectedUpdatedAt: seeded.seen });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("checkout_adoption_required");
+      expect(res.body.details).toMatchObject({ retryable: true, updatedAt: seeded.seen });
+      const state = await lockState(seeded.issue.id);
+      expect(state.checkoutRunId).toBe(seeded.staleRun.id);
+      expect(state.executionRunId).toBe(seeded.staleRun.id);
+      expect(state.updatedAt.toISOString()).toBe(seeded.seen);
+      expect(state.priority).toBe("medium");
+      expect(await adoptionActivity(seeded.issue.id)).toEqual([]);
+    });
+
+    it("still adopts as before when expectedUpdatedAt is absent", async () => {
+      const seeded = await seedStaleCheckout();
+      const res = await request(await appFor(seeded.actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ priority: "high" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const state = await lockState(seeded.issue.id);
+      expect(state.checkoutRunId).toBe(seeded.run!.id);
+      expect(state.priority).toBe("high");
+    });
+
+    it("succeeds on retry with the fresh token after a normal checkout", async () => {
+      const seeded = await seedStaleCheckout();
+      const app = await appFor(seeded.actor);
+      const refused = await request(app)
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ priority: "high", expectedUpdatedAt: seeded.seen });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      const checkout = await request(app)
+        .post(`/api/issues/${seeded.issue.id}/checkout`)
+        .send({ agentId: seeded.agent!.id, expectedStatuses: ["in_progress"] });
+      expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+      const fresh = await wireUpdatedAt(seeded.actor, seeded.issue.id);
+      const retried = await request(app)
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ priority: "high", expectedUpdatedAt: fresh });
+      expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+      expect(retried.body.priority).toBe("high");
+    });
+
+    it("lets the lock holder write with a fresh token without adoption", async () => {
+      const seeded = await seed({ assignee: true });
+      await db.update(issues).set({
+        status: "in_progress",
+        checkoutRunId: seeded.run!.id,
+        executionRunId: seeded.run!.id,
+      }).where(eq(issues.id, seeded.issue.id));
+      const actor: Express.Request["actor"] = {
+        type: "agent",
+        agentId: seeded.agent!.id,
+        companyId: seeded.company.id,
+        runId: seeded.run!.id,
+        source: "agent_jwt",
+      };
+      const seen = await wireUpdatedAt(actor, seeded.issue.id);
+      const res = await request(await appFor(actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ priority: "high", expectedUpdatedAt: seen });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await adoptionActivity(seeded.issue.id)).toEqual([]);
+    });
+  });
 });

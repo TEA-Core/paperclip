@@ -7546,6 +7546,7 @@ export function issueRoutes(
       allowVisibleIssueWrite?: boolean;
       bypassCheckoutOwnership?: boolean;
       allowCreatorDocumentWrite?: boolean;
+      noCheckoutAdoption?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -7664,11 +7665,9 @@ export function issueRoutes(
     }
     const runId = await requireAgentRunId(req, res, { checkoutRunId: issue.checkoutRunId });
     if (!runId) return false;
-    const ownership = await svc.assertCheckoutOwner(
-      issue.id,
-      actorAgentId,
-      runId,
-    );
+    const ownership = options.noCheckoutAdoption
+      ? await svc.assertCheckoutOwner(issue.id, actorAgentId, runId, { noAdoption: true })
+      : await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -17709,6 +17708,7 @@ export function issueRoutes(
         if (boundaryDecision.allowed) {
           mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing, {
             allowVisibleIssueWrite: true,
+            noCheckoutAdoption: req.body.expectedUpdatedAt !== undefined,
           });
           if (!mutationAccess) return;
         } else if (
