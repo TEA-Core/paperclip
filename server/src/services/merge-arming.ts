@@ -1139,6 +1139,11 @@ export async function recordPendingAutoMergeDisarm(db: Db, companyId: string, is
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
 }
 
+/** True for the outcome of an arm that `openArmRecord` refused: nothing was sent to GitHub. */
+export function isArmRecordRefusal(message: string): boolean {
+  return /^(?:failed:disarm-record-unavailable|skipped:arm-in-progress|failed:disarm-backlog-full):/.test(message);
+}
+
 export type ArmRecordOpening =
   | { ok: true; forget: () => Promise<void>; settleEnable: (result: { success: boolean; error: string | null; status: number }) => Promise<void> }
   | { ok: false; kind: "failed" | "skipped"; message: string };

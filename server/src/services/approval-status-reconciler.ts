@@ -28,6 +28,7 @@ import {
   publishApprovalStatus,
   consumableReleaseStatusId,
   CONTROL_PLANE_STATUS_CREATOR_ID,
+  isArmRecordRefusal,
   isHeadBoundReleaseDescription,
   RELEASE_CONFIRMED_CONTEXT,
   releaseConfirmedDescription,
@@ -2594,6 +2595,25 @@ async function reserveRearmSlot(
   return reserved.length > 0;
 }
 
+/** Gives back a slot reserved by reserveRearmSlot when the arm was refused before anything reached GitHub. */
+async function releaseRearmSlot(db: Db, row: CandidateRow, headSha: string): Promise<void> {
+  await db
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(
+        ${issues.executionState},
+        '{approvalStatus,armReattempt,attempts}',
+        to_jsonb(greatest((${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'attempts')::int - 1, 0))
+      )`,
+    })
+    .where(
+      and(
+        eq(issues.id, row.id),
+        sql`${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'headSha' = ${headSha}`,
+      ),
+    );
+}
+
 /**
  * A board release (SUP-20772) is a human decision on one head, not a review. It stands in for the
  * approval that lets the reconciler re-arm the merge only when it is the very status the publisher
@@ -2834,6 +2854,12 @@ async function attemptRearmOnHealedStamp(
       kind: "failed",
       message: `failed:internal: re-arm actuator threw: ${err instanceof Error ? err.message : String(err)}`,
     };
+  }
+
+  if (isArmRecordRefusal(outcome.message)) {
+    await releaseRearmSlot(db, row, headSha).catch((err) => {
+      logger.warn({ err, issueId: row.id, headSha }, "re-arm slot could not be given back after a refused arm");
+    });
   }
 
   const at = new Date().toISOString();
