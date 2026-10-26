@@ -4761,7 +4761,7 @@ export async function postPullRequestComment(
  * Everything that is the authority for arming one card, as a string to compare before and after: the
  * card's own record (cancelled, stage ladder, completed stages, last decision, approved and published
  * heads, the certified delivery, the recorded release confirmation), every decision row of the card
- * (outcome, decider) and the standing of each decider (an agent's company and status, a user's
+ * (outcome, decider) and the standing of each decider (whether an agent is a current agent of the company, a user's
  * membership and existence). A decision reversed, a certificate removed, a reviewer terminated or a
  * member removed after it was taken changes the answer. Two reads of it that differ mean the authority a
  * caller acted on is not the authority that exists now.
@@ -4810,7 +4810,10 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
       eq(companyMemberships.principalType, "user"),
       inArray(companyMemberships.principalId, userIds),
     ));
-  agentRows.sort((a, b) => a.id.localeCompare(b.id));
+  const agentStanding = agentIds.map((id) => {
+    const agent = agentRows.find((candidate) => candidate.id === id);
+    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "pending_approval"];
+  });
   memberRows.sort((a, b) => a.principalId.localeCompare(b.principalId));
   return JSON.stringify([
     row.status === "cancelled",
@@ -4823,7 +4826,7 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
     certificate,
     (approval.releaseConfirmation as { statusId?: unknown } | undefined)?.statusId ?? null,
     decisions,
-    agentRows,
+    agentStanding,
     memberRows,
   ]);
 }
