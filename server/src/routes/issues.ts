@@ -17527,7 +17527,11 @@ export function issueRoutes(
       });
       return;
     }
-    if (commentAttachmentIds !== undefined && !commentBody) {
+    if (
+      commentAttachmentIds !== undefined &&
+      !commentBody &&
+      !(doneTier !== undefined && updateFields.status === "done")
+    ) {
       res.status(400).json({ error: "Attachment ids require a comment" });
       return;
     }
@@ -18460,9 +18464,6 @@ export function issueRoutes(
       }
     }
 
-    if (doneTier !== undefined && updateFields.status === "done") {
-      commentBody = renderDoneTierDeclaration(commentBody, doneTier);
-    }
     const requestedStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
     // Guard on the status the transition actually RESOLVES to, not on the raw request.
     // An execution-policy transition may redirect a requested `done` to `in_review`

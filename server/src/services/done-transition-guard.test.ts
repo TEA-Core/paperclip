@@ -5306,6 +5306,41 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closing now\n\nClosed at Tier 2 (live): Health check returned 200");
     });
 
+    it("replaces conflicting canonical tier declarations", () => {
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 0 (decision-only): stale reason",
+        {
+          tier: "tier2",
+          probeEvidence: "Health check returned 200",
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 2 (live): Health check returned 200",
+      );
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 2 (live): stale evidence",
+        {
+          tier: "tier1",
+          reason: "Merged change is ready",
+          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.",
+      );
+    });
+
+    it("replaces a conflicting declaration even when the requested tier is also present", () => {
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 2 (live): stale evidence\nClosed at Tier 1 (landed, not liveness-probed): valid declaration. Liveness unverified.",
+        {
+          tier: "tier1",
+          reason: "Updated reason",
+          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Updated reason. Liveness unverified.",
+      );
+    });
+
     it("renders both Tier 1 landing states with exactly one landing token", () => {
       expect(renderDoneTierDeclaration(null, {
         tier: "tier1",
