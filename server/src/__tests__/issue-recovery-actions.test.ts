@@ -76,11 +76,14 @@ describe("issueRecoveryActionService", () => {
   it("does not reactivate an action resolved between the active read and update", async () => {
     const existingRow = makeRecoveryActionRow({ id: "existing-action", attemptCount: 1 });
     const createdRow = makeRecoveryActionRow({ id: "new-action", attemptCount: 1 });
-    const selectResults = [[existingRow], []];
+    const selectResults = [[{ id: "source-1" }], [existingRow], []];
 
     const makeSelectQuery = (rows: unknown[]) => ({
       from() {
         return this;
+      },
+      for() {
+        return Promise.resolve(rows);
       },
       where() {
         return this;
@@ -98,7 +101,7 @@ describe("issueRecoveryActionService", () => {
       },
     });
 
-    const fakeDb = {
+    const fakeTx = {
       select: vi.fn(() => makeSelectQuery(selectResults.shift() ?? [])),
       update: vi.fn(() => ({
         set: vi.fn(() => ({
@@ -113,6 +116,10 @@ describe("issueRecoveryActionService", () => {
         })),
       })),
     };
+    const fakeDb = {
+      ...fakeTx,
+      transaction: vi.fn(async (callback: (tx: typeof fakeTx) => Promise<unknown>) => callback(fakeTx)),
+    };
 
     const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
       companyId: "company-1",
@@ -126,8 +133,8 @@ describe("issueRecoveryActionService", () => {
     });
 
     expect(result).toMatchObject({ id: "new-action", status: "active" });
-    expect(fakeDb.update).toHaveBeenCalledTimes(1);
-    expect(fakeDb.insert).toHaveBeenCalledTimes(1);
+    expect(fakeTx.update).toHaveBeenCalledTimes(1);
+    expect(fakeTx.insert).toHaveBeenCalledTimes(1);
   });
 });
 

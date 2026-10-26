@@ -12717,6 +12717,13 @@ export function issueRoutes(
       const id = req.params.id as string;
       const visible = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!visible) return;
+      await assertCanAssignTasks(req, visible.companyId, {
+        issueId: visible.id,
+        projectId: visible.projectId ?? null,
+        parentIssueId: visible.parentId ?? null,
+        assigneeAgentId: expected.expectedPendingParticipantAgentId,
+        assigneeUserId: null,
+      });
       const actor = getActorInfo(req);
       const postCommitActivityPublications: ActivityPublication[] = [];
 

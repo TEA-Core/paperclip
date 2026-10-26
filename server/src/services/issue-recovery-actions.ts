@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueRecoveryActions } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -145,6 +145,10 @@ function isUniqueRecoveryActionConflict(error: unknown) {
 }
 
 export function issueRecoveryActionService(db: Db) {
+  return createIssueRecoveryActionService(db, false);
+}
+
+function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
   const upsertQueues = new Map<string, Promise<void>>();
 
   async function runExclusiveUpsert<T>(
@@ -483,6 +487,7 @@ export function issueRecoveryActionService(db: Db) {
     retryCount: number,
     error?: unknown,
   ): Promise<IssueRecoveryAction> {
+    if (issueRowLocked && error) throw error; // Retry only after the surrounding transaction rolls back.
     if (retryCount >= MAX_UPSERT_RETRIES) {
       if (error) throw error;
       throw new Error(
@@ -964,7 +969,24 @@ export function issueRecoveryActionService(db: Db) {
   async function upsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
   ): Promise<IssueRecoveryAction> {
-    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
+    if (issueRowLocked) return upsertSourceScopedUnlocked(input);
+    return runExclusiveUpsert(input, async () => {
+      let retryCount = 0;
+      while (true) {
+        try {
+          return await db.transaction(async (tx) => {
+            // Serialize action creation with restore-participant's issue-row lock.
+            const [source] = await tx.select({ id: issues.id }).from(issues)
+              .where(and(eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId)))
+              .for("update");
+            if (!source) throw new Error("Recovery action source issue does not exist");
+            return createIssueRecoveryActionService(tx as unknown as Db, true).upsertSourceScoped(input);
+          });
+        } catch (error) {
+          if (!isUniqueRecoveryActionConflict(error) || ++retryCount >= MAX_UPSERT_RETRIES) throw error;
+        }
+      }
+    });
   }
 
   async function resolveActiveForIssue(

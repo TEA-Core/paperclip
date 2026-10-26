@@ -1,14 +1,16 @@
+import { setTimeout as delay } from "node:timers/promises";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
-  activityLog, agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueExecutionDecisions,
+  activityLog, agentWakeupRequests, agents, companies, companyMemberships, createDb, heartbeatRuns, issueExecutionDecisions,
   issueRecoveryActions, issueThreadInteractions, issues, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe.sequential : describe.skip;
@@ -56,6 +58,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.insert(companies).values([
       { id: COMPANY, name: "Restore Co", issuePrefix: "RES" },
@@ -181,6 +184,72 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
   });
 
+  it("returns 409 when a recovery action acquires the issue lock before restoration", async () => {
+    // This package's TypeScript lib predates Promise.withResolvers.
+    let signalLocked!: () => void;
+    let releaseLock!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const blocker = db.transaction(async (tx) => {
+      await tx.execute(sql`LOCK TABLE issue_recovery_actions IN SHARE MODE`);
+      signalLocked();
+      await release;
+    });
+    await locked;
+
+    const write = issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: COMPANY, sourceIssueId: ISSUE, kind: "review_stage_unarmed",
+      cause: "pending_stage_stranded", fingerprint: `pending-stage:${ISSUE}`,
+      nextAction: "Board review",
+    });
+    let restore: Promise<{ status: number }> | null = null;
+    let responseStatus: number | undefined;
+    let blockedWrite = false;
+    let blockedRestore = false;
+    async function waitingFor(fragment: string, statement: string) {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await db.execute<{ waiting: boolean }>(sql`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity
+            WHERE datname = current_database() AND state = 'active'
+              AND wait_event_type = 'Lock'
+              AND query ILIKE ${`%${fragment}%`}
+              AND query ILIKE ${`%${statement}%`}
+          ) AS waiting
+        `);
+        if (row?.waiting) return true;
+        // PostgreSQL lock waits occur outside the JS clock; fake timers cannot advance them.
+        await delay(25);
+      }
+      return false;
+    }
+    try {
+      blockedWrite = await waitingFor("issue_recovery_actions", "insert");
+      restore = Promise.resolve(post());
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await db.execute<{ count: number }>(sql`
+          SELECT count(*)::int AS count FROM pg_stat_activity
+          WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'
+        `);
+        // The writer waits on the recovery table; a second waiter is the restore request on the issue row.
+        if ((row?.count ?? 0) >= 2) { blockedRestore = true; break; }
+        await delay(25);
+      }
+    } finally {
+      releaseLock();
+      await blocker;
+      const [, response] = await Promise.all([write, restore]);
+      responseStatus = response?.status;
+    }
+
+    expect({ blockedWrite, blockedRestore, responseStatus }).toEqual({
+      blockedWrite: true, blockedRestore: true, responseStatus: 409,
+    });
+    expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+    expect(await audit()).toHaveLength(0);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+  });
+
   it("409s on pending interaction", async () => {
     await db.insert(issueThreadInteractions).values({ companyId: COMPANY, issueId: ISSUE, kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "Continue?" } });
     expect((await post()).status).toBe(409);
@@ -225,6 +294,31 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect((await post({ ...body(), expectedStatusVersion: -1 })).status).toBe(400);
     expect((await post({ expectedStatus: "blocked" })).status).toBe(400);
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+  });
+
+  it("refuses a non-viewer board member without assignment permission for a private participant", async () => {
+    const userId = "operator-without-assignment-grant";
+    await db.update(agents).set({
+      permissions: {
+        authorizationPolicy: {
+          agentVisibility: { mode: "private", hiddenFromDefaultDirectory: true },
+          assignmentPolicy: { mode: "company_default" },
+          protectedAgent: { requiresApproval: false },
+          managedBy: "permissions-extension",
+        },
+      },
+    }).where(eq(agents.id, PARTICIPANT));
+    await db.insert(companyMemberships).values({
+      companyId: COMPANY, principalType: "user", principalId: userId,
+      status: "active", membershipRole: "operator",
+    });
+    actor = {
+      type: "board", source: "cloud_tenant", userId, companyIds: [COMPANY],
+      memberships: [{ companyId: COMPANY, status: "active", membershipRole: "operator" }],
+    } as Express.Request["actor"];
+    expect((await post()).status).toBe(403);
+    expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+    expect(await audit()).toHaveLength(0);
   });
 
   it("refuses agent and out-of-company board actors without changes", async () => {
