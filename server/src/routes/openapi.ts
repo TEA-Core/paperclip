@@ -642,14 +642,7 @@ const registry = new OpenAPIRegistry();
 
 // ─── Common schemas ──────────────────────────────────────────────────────────
 
-const ErrorSchema = registry.register("Error", z.object({
-  error: z.string(),
-  details: z.object({
-    reason: z.string().optional().describe(
-      "Machine-readable refusal reason; PATCH /api/issues/{id} selecting record_only returns record_only_self_assignee for an assigned agent or record_only_not_authorized for an authorization refusal. Other errors may use other reason codes.",
-    ),
-  }).optional(),
-}));
+const ErrorSchema = registry.register("Error", z.object({ error: z.string() }));
 
 // PATCH also emits unrelated 403s, so keep its general Error alternative while
 // exposing the exact record-only selection reasons to generated clients.

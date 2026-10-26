@@ -1802,6 +1802,6 @@ describe("issue PATCH record-only OpenAPI contract", () => {
       type: "string",
       enum: ["record_only_self_assignee", "record_only_not_authorized"],
     });
-    expect(res.body.components.schemas.Error.properties.details.properties.reason.type).toBe("string");
+    expect(res.body.components.schemas.Error.properties).toEqual({ error: { type: "string" } });
   });
 });
