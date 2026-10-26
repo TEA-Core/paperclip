@@ -4006,9 +4006,10 @@ registry.registerPath({
     "memberships, fixed conversation identities, external chat channel bindings, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
     "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
     "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
-    "Native restart recovery uses the opposite issue-then-run order and retries a lock timeout or " +
-    "deadlock once in a fresh transaction; the repair's 250ms lock timeout returns 409 with " +
-    "details.code=participant_restore_lock_busy, details.retryable=true, and Retry-After: 1. Nested-only " +
+    "Native restart recovery uses the opposite issue-then-run order: it retries a lock timeout or " +
+    "deadlock once in a fresh transaction, then logs and defers that issue to the next pass if contention persists; " +
+    "the repair's 250ms lock timeout returns 409 with details.code=participant_restore_lock_busy, " +
+    "details.retryable=true, and Retry-After: 1. Nested-only " +
     "paperclipIssue.id heartbeat wakes stay unscoped but acquire the issue-row lock for admission. Other writers (raw serving-role SQL " +
     "inserts, self-declared runs, and recovery scheduled_retry inserts) may race after the final live-run " +
     "check without that lock. Only the assignee and updatedAt change; status, statusVersion, " +
@@ -4037,6 +4038,7 @@ registry.registerPath({
         "application/json": {
           schema: z.object({
             error: z.string(),
+            code: z.string().optional(),
             details: z.object({ code: z.string().optional(), retryable: z.boolean().optional() }).passthrough().optional(),
           }),
         },

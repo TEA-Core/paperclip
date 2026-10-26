@@ -5,13 +5,14 @@ import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
-  activityLog, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, heartbeatRuns,
-  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, toolApplications, toolConnections, type Db,
+  activityLog, agentSessionGoalActions, agentTaskSessions, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, heartbeatRuns,
+  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolApplications, toolConnections, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe.sequential : describe.skip;
@@ -61,6 +62,9 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.delete(chatEndpoints);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
+    await db.delete(nativeRunFinalizations);
+    await db.delete(agentSessionGoalActions);
+    await db.delete(agentTaskSessions);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -169,6 +173,46 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect((await post()).status).toBe(409);
     expect(await snapshot()).toEqual(before);
     expect(await audit()).toHaveLength(0);
+  });
+
+  it.each(["active", "paused"])("refuses restoration while the prior assignee has a %s runner goal, without waking", async (status) => {
+    await db.insert(agentTaskSessions).values({
+      companyId: COMPANY, agentId: ASSIGNEE, adapterType: "codex_local", taskKey: ISSUE,
+      goalJson: { objective: "Finish current work", status },
+    });
+    const before = await snapshot();
+    const goalsBefore = await db.select().from(agentTaskSessions);
+    expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await db.select().from(agentTaskSessions)).toEqual(goalsBefore);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("refuses a pending goal control even without an observed goal, without waking", async () => {
+    const [session] = await db.insert(agentTaskSessions).values({
+      companyId: COMPANY, agentId: ASSIGNEE, adapterType: "codex_local", taskKey: ISSUE,
+    }).returning({ id: agentTaskSessions.id });
+    await db.insert(agentSessionGoalActions).values({
+      companyId: COMPANY, sessionId: session!.id, requestId: "prior-control",
+      action: "create", payloadJson: { objective: "Queued control" }, status: "pending",
+    });
+    const before = await snapshot();
+    expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await db.select().from(agentSessionGoalActions)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("restores when the former assignee's goal has completed", async () => {
+    await db.insert(agentTaskSessions).values({
+      companyId: COMPANY, agentId: ASSIGNEE, adapterType: "codex_local", taskKey: ISSUE,
+      goalJson: { objective: "Finished work", status: "complete" },
+    });
+    expect((await post()).status).toBe(200);
+    expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
   });
 
   it("409s without changes for an issue bound to an external chat channel", async () => {
@@ -526,7 +570,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     });
     await locked;
     const restoring = Promise.resolve(post());
-    let response: { status: number; body: { details?: { code?: string; retryable?: boolean } }; headers: Record<string, string> } | null = null;
+    let response: { status: number; body: { code?: string; details?: { code?: string; retryable?: boolean } }; headers: Record<string, string> } | null = null;
     try {
       response = await Promise.race([restoring, delay(1500).then(() => null)]);
     } finally {
@@ -537,7 +581,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect(response).toMatchObject({
       status: 409,
       headers: { "retry-after": "1" },
-      body: { details: { code: "participant_restore_lock_busy", retryable: true } },
+      body: { code: "participant_restore_lock_busy", details: { code: "participant_restore_lock_busy", retryable: true } },
     });
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
     expect(await audit()).toHaveLength(0);
@@ -625,6 +669,97 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect(await audit()).toHaveLength(0);
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
   });
+
+  it.each(["restore-first", "recovery-first"] as const)(
+    "bounds the %s restore/recovery lock order on a two-connection pool",
+    async (order) => {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } })
+        .where(eq(agents.id, ASSIGNEE));
+      await db.insert(heartbeatRuns).values({
+        id: RUN, companyId: COMPANY, agentId: ASSIGNEE, status: "running",
+        runtimeMode: "native", nativeIssueId: ISSUE, contextSnapshot: { issueId: ISSUE },
+      });
+      await db.insert(nativeRunFinalizations).values({
+        runId: RUN, companyId: COMPANY, issueId: ISSUE, phase: "observed",
+      });
+      const raceDb = createDb(tempDb!.connectionString, { maxConnections: 2 });
+      const raceApp = express();
+      raceApp.use(express.json());
+      raceApp.use((req, _res, next) => { req.actor = actor; next(); });
+      raceApp.use("/api", issueRoutes(raceDb, {} as Parameters<typeof issueRoutes>[1], {} as Parameters<typeof issueRoutes>[2]));
+      raceApp.use(errorHandler);
+      const blockedRow = order === "restore-first" ? issues : heartbeatRuns;
+      let signalLocked!: (pid: number) => void;
+      let releaseBlocker!: () => void;
+      const locked = new Promise<number>((resolve) => { signalLocked = resolve; });
+      const release = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+      const blocker = db.transaction(async (tx) => {
+        const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid()::int as pid`);
+        if (blockedRow === issues) {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, ISSUE)).for("update");
+        } else {
+          await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, RUN)).for("update");
+        }
+        signalLocked(connection!.pid);
+        await release;
+      });
+      const blockerPid = await locked;
+      const restore = () => request(raceApp).post(`/api/issues/${ISSUE}/restore-participant`).send(body());
+      const recover = () => claimNativeRestartRecoveries({
+        db: raceDb, controller: { bootId: randomUUID(), pid: process.pid, processStartedAt: new Date() },
+        restartKind: "hard", runIds: [RUN],
+      });
+      async function blockedCount() {
+        const [row] = await db.execute<{ count: number }>(sql`
+          select count(*)::int as count from pg_stat_activity
+          where datname = current_database() and pid <> pg_backend_pid()
+            and ${blockerPid} = any(pg_blocking_pids(pid))
+        `);
+        return row?.count ?? 0;
+      }
+      async function waitForBlocked(count: number) {
+        for (let poll = 0; poll < 80; poll += 1) {
+          if (await blockedCount() >= count) return true;
+          await delay(10);
+        }
+        return false;
+      }
+      let restoring: Promise<{ status: number }> | null = null;
+      let recovering: ReturnType<typeof recover> | null = null;
+      let firstBlocked = false;
+      // The second contender may reach its lock only after the 250ms restore timeout.
+      try {
+        if (order === "restore-first") {
+          restoring = Promise.resolve(restore());
+          firstBlocked = await waitForBlocked(1);
+          recovering = recover();
+        } else {
+          recovering = recover();
+          firstBlocked = await waitForBlocked(1);
+          restoring = Promise.resolve(restore());
+        }
+        await delay(30);
+      } finally {
+        releaseBlocker();
+        await blocker;
+      }
+      try {
+        const completed = await Promise.race([
+          Promise.allSettled([restoring!, recovering!]),
+          delay(5_000).then(() => null),
+        ]);
+        expect(completed).not.toBeNull();
+        expect(firstBlocked).toBe(true);
+        expect(completed?.[0]).toMatchObject({ status: "fulfilled", value: { status: 409 } });
+        expect(completed?.[1]).toMatchObject({ status: "fulfilled" });
+        expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+        expect(await audit()).toHaveLength(0);
+      } finally {
+        await raceDb.$client.end({ timeout: 1 });
+      }
+    },
+    20_000,
+  );
 
   it.each(["paused", "terminated", "pending_approval"])("409s on %s participant", async (status) => {
     await db.update(agents).set({ status }).where(eq(agents.id, PARTICIPANT));

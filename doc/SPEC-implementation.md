@@ -283,10 +283,13 @@ that participant may call `POST /api/issues/{id}/restore-participant` with
 must be `in_review` or `blocked`; `blocked` keeps its pending stage intact.
 The pending stage id, index, type, and agent participant must match the stored
 execution policy. Completed/skipped stages, stages with an approved decision,
-removed agent memberships, issues with a fixed conversation identity or a
-bound external chat channel (as ordinary assignment refuses), and participants
-who would approve their own created/delivered/return-assignee work or make a
-review stage self-satisfying are ineligible.
+removed agent memberships, issues with a fixed conversation identity (409) or
+a bound external chat channel (409, as ordinary assignment refuses), and
+participants who would approve their own created/delivered/return-assignee work
+or make a review stage self-satisfying are ineligible. An unfinished goal or
+pending goal-control action for the previous assignee also returns 409: the
+ordinary goal-stop helper may enqueue an offline wake and cannot be called by
+this no-wake repair. Goal actions recheck ownership under the issue-row lock.
 
 A row-locked compare-and-set refuses stale values or any pending interaction,
 active recovery action, live run, checkout/execution lock, or unavailable
@@ -296,25 +299,36 @@ issue row, matching the finalizer's lock order; recovery-action upserts acquire
 the same issue-row lock before writing. No table lock is taken. Native restart
 recovery locks the issue before a run and has a 1-second per-lock timeout; an
 overlap may invert these orders. If recovery times out or deadlocks on a lock,
-it retries that candidate once in a fresh transaction, so a bounded restore
-lock wait does not abort the startup recovery pass. Restore sets a 250ms
-transaction-local lock timeout. On SQLSTATE `55P03` or `40P01`, it returns 409
-with `details.code = "participant_restore_lock_busy"`, `details.retryable = true`,
-and `Retry-After: 1` (seconds), with no partial assignment.
+it retries that candidate once in a fresh transaction. A second lock conflict
+logs and defers only that issue until the next recovery pass; it never escapes
+to abort the startup pass, and a rolled-back attempt never reports a run failure.
+Restore sets a 250ms transaction-local lock timeout. On SQLSTATE `55P03` or
+`40P01`, it returns 409 with top-level `code` and `details.code` both equal to
+`"participant_restore_lock_busy"`, `details.retryable = true`, and
+`Retry-After: 1` (seconds), with no partial assignment.
 Other 409 eligibility conflicts do not carry that retry signal.
 After the issue lock and immediately before changing the assignee, a second
 live-run read refuses a run committed while the repair waited for that lock.
 Heartbeat wakeup requests whose only issue binding is
 `contextSnapshot.paperclipIssue.id` (a valid UUID in the agent's company) stay
 unscoped, with task key and run context unchanged, but acquire the issue-row
-lock, before the agent lock, through queued-run insertion. This does not make arbitrary
-run insertion serializable: a raw serving-role `heartbeat_runs` SQL insert,
-`server/src/services/self-declared-run.ts`'s run insert after a separate issue
-update, and `server/src/services/recovery/service.ts`'s
-`scheduled_retry` inserts in provider-quota and disposition recovery do not
-hold the issue-row lock through insertion. Those writers can insert after the
-final live-run check and remain residual races. The operation changes only
-the agent assignee (and `updatedAt`) and logs the before/after assignment
+lock, before the agent lock, through queued-run insertion. Other paths remain
+outside that admission lock. `scheduleBoundedRetryForRun` in `heartbeat.ts`
+derives its issue id only from top-level `contextSnapshot.issueId`; a failed
+run with only `paperclipIssue.id` can insert its `scheduled_retry` successor
+without the issue-row lock. The unscoped `enqueueWakeup` same-scope coalescing
+branch updates an existing run's context snapshot before the nested-only
+queued-run lock branch; it can add a nested binding after restore's final
+live-run read without taking the issue-row lock. These are residual races,
+not claims of coverage by the nested-only queue lock. A raw serving-role
+`heartbeat_runs` SQL insert and the provider-quota and delayed disposition
+`scheduled_retry` inserts in `server/src/services/recovery/service.ts` likewise
+do not hold the issue-row lock through insertion. `self-declared-run.ts`
+updates the issue status to `in_progress` before its separate run insert:
+that update serializes with restore's row and defeats the restore status CAS
+if it wins first, but there is no continuous issue-row lock across its insert.
+The operation changes only the agent assignee (and `updatedAt`) and logs the
+before/after assignment
 atomically. The status and status version remain unchanged (the version
 advances only when status changes); execution state, stage identity,
 pendingSince, and decisions remain untouched. It never arms, approves,

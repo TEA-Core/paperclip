@@ -36,6 +36,7 @@ import {
 } from "../../realtime/runner-prp-ws.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
+import { logger } from "../../middleware/logger.js";
 
 const mockCaptureRunFailure = vi.hoisted(() => vi.fn());
 vi.mock("../../sentry.js", async () => {
@@ -955,6 +956,86 @@ describeEmbeddedPostgres("native runner restart recovery with real processes", (
     expect(await recovering).toMatchObject([
       { kind: "bootstrap_incomplete", runId: fixture.runId },
     ]);
+  }, 20_000);
+
+  it("defers twenty 900 ms delayed recovery attempts without a rethrow", async () => {
+    const fixture = await seedRun("LOCK-DEFER");
+    let signalLocked!: () => void;
+    let releaseRun!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseRun = resolve; });
+    const holder = fixture.db.transaction(async (tx) => {
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    const warnings = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      const failures: unknown[] = [];
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await delay(900);
+        try {
+          expect(await claimNativeRestartRecoveries({
+            db: fixture.db, controller: successor, restartKind: "hard", runIds: [fixture.runId],
+          })).toEqual([]);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      expect(failures).toEqual([]);
+      expect(warnings).toHaveBeenCalledTimes(20);
+    } finally {
+      warnings.mockRestore();
+      releaseRun();
+      await holder;
+    }
+    expect(await claimNativeRestartRecoveries({
+      db: fixture.db, controller: successor, restartKind: "hard", runIds: [fixture.runId],
+    })).toMatchObject([{ kind: "bootstrap_incomplete", runId: fixture.runId }]);
+  }, 90_000);
+
+  it("observes a real PostgreSQL 40P01 when issue and run row locks invert", async () => {
+    const fixture = await seedRun("DEADLOCK");
+    let signalRun!: () => void;
+    let signalIssue!: () => void;
+    const runLocked = new Promise<void>((resolve) => { signalRun = resolve; });
+    const issueLocked = new Promise<void>((resolve) => { signalIssue = resolve; });
+    const runFirst = fixture.db.transaction(async (tx) => {
+      await tx.execute(sql`set local deadlock_timeout = '50ms'`);
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+      signalRun();
+      await issueLocked;
+      await tx.select({ id: issues.id }).from(issues)
+        .where(eq(issues.id, fixture.issueId)).for("update");
+    });
+    const issueFirst = fixture.db.transaction(async (tx) => {
+      await tx.execute(sql`set local deadlock_timeout = '50ms'`);
+      await tx.select({ id: issues.id }).from(issues)
+        .where(eq(issues.id, fixture.issueId)).for("update");
+      signalIssue();
+      await runLocked;
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+    });
+    const outcomes = await Promise.allSettled([runFirst, issueFirst]);
+    const errors = outcomes.flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason as unknown] : []);
+    const codes = errors.map((error) => {
+      let cause = error;
+      for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth += 1) {
+        if ("code" in cause && typeof cause.code === "string") return cause.code;
+        cause = "cause" in cause ? cause.cause : null;
+      }
+      return null;
+    });
+    expect(codes).toEqual(["40P01"]);
+    expect(await fixture.db.select({ assignee: issues.assigneeAgentId }).from(issues)
+      .where(eq(issues.id, fixture.issueId))).toEqual([{ assignee: agentId }]);
+    expect(await fixture.db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.runId))).toEqual([{ status: "running" }]);
   }, 20_000);
 
   it("allows only one of two concurrent successor controllers to claim a dead session", async () => {

@@ -12,6 +12,7 @@ import {
 import { readProcessStartedAt } from "../hot-restart.js";
 import { getServerInfoSnapshot } from "../../server-info.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { logger } from "../../middleware/logger.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { reportRunFailure } from "../run-failure-report.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
@@ -412,6 +413,15 @@ function appendBoundedRecoveryHistory(entry: Record<string, unknown>) {
       0
     )
   )`;
+}
+
+function isRecoveryClaimLockConflict(error: unknown): boolean {
+  let cause = error;
+  for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth += 1) {
+    if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) return true;
+    cause = "cause" in cause ? cause.cause : null;
+  }
+  return false;
 }
 
 /**
@@ -967,22 +977,27 @@ export async function claimNativeRestartRecoveries(input: {
         ...common,
       } satisfies NativeRestartRecoveryClaim;
     });
-    // Restore can hold a run row while its own 250ms issue-row wait expires.
-    // A recovery lock timeout can precede that expiry; retry with a fresh
-    // transaction so startup does not fail over this bounded contention.
-    const disposition = await claimCandidate().catch(async (error: unknown) => {
-      for (
-        let cause: unknown = error;
-        cause && typeof cause === "object";
-        cause = "cause" in cause ? cause.cause : null
-      ) {
-        if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) {
-          terminalRunToReport = null;
-          return claimCandidate();
-        }
+    // Restore can hold a run row while waiting for the issue row. Retry one
+    // lock conflict in a fresh transaction, then defer only this candidate;
+    // a second lock conflict must not abort the rest of the recovery pass.
+    let disposition: NativeRestartRecoveryDisposition;
+    try {
+      disposition = await claimCandidate();
+    } catch (error) {
+      if (!isRecoveryClaimLockConflict(error)) throw error;
+      terminalRunToReport = null;
+      try {
+        disposition = await claimCandidate();
+      } catch (retryError) {
+        if (!isRecoveryClaimLockConflict(retryError)) throw retryError;
+        terminalRunToReport = null;
+        logger.warn(
+          { err: retryError, runId: candidate.runId, issueId: candidate.issueId },
+          "Native restart recovery deferred after lock contention; next pass will retry",
+        );
+        continue;
       }
-      throw error;
-    });
+    }
     if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport);
     dispositions.push(disposition);
   }

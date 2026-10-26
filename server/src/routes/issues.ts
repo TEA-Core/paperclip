@@ -40,6 +40,8 @@ import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
+  agentSessionGoalActions,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
@@ -12851,6 +12853,35 @@ export function issueRoutes(
             inArray(issueRecoveryActions.status, ["active", "escalated"]),
           )).limit(1);
         if (recovery) throw conflict("Issue has an active recovery action");
+        // An unfinished goal can later issue offline control for the old owner.
+        // This repair cannot call the ordinary stop helper: it may enqueue a wake.
+        const priorSessions = issue.assigneeAgentId
+          ? await tx.select({ id: agentTaskSessions.id, goalJson: agentTaskSessions.goalJson })
+              .from(agentTaskSessions)
+              .where(and(
+                eq(agentTaskSessions.companyId, issue.companyId),
+                eq(agentTaskSessions.agentId, issue.assigneeAgentId),
+                eq(agentTaskSessions.taskKey, issue.id),
+              ))
+              .orderBy(asc(agentTaskSessions.id))
+              .for("share")
+          : [];
+        if (priorSessions.some((session) => session.goalJson && session.goalJson.status !== "complete")) {
+          throw conflict("Previous assignee has an unfinished runner goal", { code: "runner_goal_active" });
+        }
+        if (priorSessions.length > 0) {
+          const [pendingGoalAction] = await tx.select({ id: agentSessionGoalActions.id })
+            .from(agentSessionGoalActions)
+            .where(and(
+              eq(agentSessionGoalActions.companyId, issue.companyId),
+              inArray(agentSessionGoalActions.sessionId, priorSessions.map((session) => session.id)),
+              inArray(agentSessionGoalActions.status, ["pending", "delivering", "delivered"]),
+            ))
+            .limit(1);
+          if (pendingGoalAction) {
+            throw conflict("Previous assignee has a pending runner goal action", { code: "runner_goal_action_pending" });
+          }
+        }
         if (liveRuns.length > 0) throw conflict("Issue has a live run");
         // A wakeup can insert a new run while this transaction waits for the issue row.
         // This plain read avoids reversing the run-row/issue-row lock order with finalizers.
