@@ -4007,7 +4007,8 @@ registry.registerPath({
     "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
     "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
     "Native restart recovery uses the opposite issue-then-run order: it retries a lock timeout or " +
-    "deadlock once in a fresh transaction, then logs and defers that issue to the next pass if contention persists; " +
+    "deadlock once in a fresh transaction, then defers that issue and schedules up to three bounded backoff retry passes; " +
+    "exhaustion logs an error and emits an error-level native.recovery.transition run event (reason lock_retry_exhausted); " +
     "the repair's 250ms lock timeout returns 409 with details.code=participant_restore_lock_busy, " +
     "details.retryable=true, and Retry-After: 1. Nested-only " +
     "paperclipIssue.id heartbeat wakes stay unscoped but acquire the issue-row lock for admission. Other writers (raw serving-role SQL " +
