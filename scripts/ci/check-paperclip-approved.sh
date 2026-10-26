@@ -841,6 +841,7 @@ STATUSES_TSV="$(gh_api_retry --paginate \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
+APPROVAL_SEEN=0
 APPROVAL_CREATOR_ID=""
 APPROVAL_CREATOR_LOGIN=""
 APPROVAL_DESCRIPTION=""
@@ -894,8 +895,8 @@ while IFS=$'\t' read -r status_context status_state status_creator_id status_cre
   [ "$status_context" = "$CONTEXT" ] || continue
   # The newest paperclip/approved status decides (the list is newest first). The rest of the list is
   # still read, for markers.
-  if [ -z "${approval_seen:-}" ]; then
-    approval_seen=1
+  if [ "$APPROVAL_SEEN" = "0" ]; then
+    APPROVAL_SEEN=1
     APPROVAL_STATE="${status_state:-missing}"
     APPROVAL_CREATOR_ID="$status_creator_id"
     APPROVAL_CREATOR_LOGIN="$status_creator_login"

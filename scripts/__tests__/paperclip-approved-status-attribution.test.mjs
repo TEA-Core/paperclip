@@ -159,6 +159,18 @@ test("the newest status for the context decides, even when an older one is genui
   assert.match(err, /FORGED/);
 });
 
+for (const [latestState, olderState, expectedCode] of [
+  ["success", "failure", 0],
+  ["pending", "success", 1],
+  ["failure", "success", 1],
+  ["missing", "success", 1], // Invalid GitHub state must not expose an older success.
+]) {
+  test(`the latest ordinary ${latestState} state decides ahead of an older ${olderState}`, () => {
+    const { code } = run([status(latestState, TEA_CORE), status(olderState, TEA_CORE)]);
+    assert.equal(code, expectedCode);
+  });
+}
+
 test("an older forged status does not taint a current genuine one", () => {
   const { code } = run([status("success", TEA_CORE), status("success", FLEET_ONLY)]);
   assert.equal(code, 0);
