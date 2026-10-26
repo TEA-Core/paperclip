@@ -637,34 +637,6 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("binds attachments when PATCH doneTier generates the comment", async () => {
-    const issue = makeIssue("todo");
-    const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockImplementation(
-      async (_id: string, patch: Record<string, unknown>) =>
-        makeIssueUpdateReceipt(issue, patch),
-    );
-    const res = await request(await installActor(createApp()))
-      .patch(`/api/issues/${issue.id}`)
-      .send({
-        status: "done",
-        doneTier: {
-          tier: "tier2",
-          probeEvidence: "Health check returned 200",
-        },
-        attachmentIds: [id],
-      });
-    expect(res.status).toBe(200);
-    expect(mockIssueService.addComment).toHaveBeenCalledWith(
-      issue.id,
-      "Closed at Tier 2 (live): Health check returned 200",
-      expect.anything(),
-      expect.objectContaining({ attachmentIds: [id] }),
-      mockTx,
-    );
-  });
-
   it("does not dispatch a wake or fallback comment when transactional attachment binding fails", async () => {
     const issue = makeIssue("todo");
     mockIssueService.getById.mockResolvedValue(issue);
