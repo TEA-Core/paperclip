@@ -52,6 +52,8 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
   `/api/issues/<card-uuid>/release-decisions?repo=<URI-encoded-owner/repo>&pr=<number>&head=<40-hex-head>&decision=<decision-uuid>&evidence=<64-hex-digest>`.
   The enforcer reads the latest entry in each context from the paginated
   `/commits/<head>/statuses` list, which includes creator attribution.
+  Empty status fields are mapped to a `-` placeholder before parsing: a missing or null
+  creator cannot inherit a description or target URL as its App identity.
   A present RA HOLD/NO-GO, untrusted producer, stale head or malformed target
   blocks both approval alternatives and both cardless waivers/override.
 - The RA producer remains **shadow-only**: it records decisions and plans

@@ -150,6 +150,34 @@ test("a success with no creator at all is refused, not trusted", () => {
   assert.match(err, /FORGED/);
 });
 
+for (const [label, row] of [
+  ["null creator and numeric description", status("success", null, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["missing creator and numeric description", { context: "paperclip/approved", state: "success", description: String(TEA_CORE.id) }],
+  ["empty creator and numeric description", status("success", {}, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["null creator ID and numeric description", status("success", { id: null }, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["empty creator ID and numeric description", status("success", { id: "" }, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["null creator and numeric target", status("success", null, "paperclip/approved", { target_url: String(TEA_CORE.id) })],
+  ["missing creator and numeric target", { context: "paperclip/approved", state: "success", target_url: String(TEA_CORE.id) }],
+  ["schema-complete null creator", status("success", null, "paperclip/approved", { description: String(TEA_CORE.id), target_url: null, id: 1, url: "https://api.github.com/statuses/1", created_at: "2026-10-26T00:00:00Z", updated_at: "2026-10-26T00:00:00Z" })],
+]) {
+  test(`unattributed ordinary success is refused with ${label}`, () => {
+    const { code, err } = run([row]);
+    assert.equal(code, 1);
+    assert.match(err, /FORGED/);
+  });
+}
+
+for (const [label, row] of [
+  ["null creator", raStatus("success", null)],
+  ["missing creator", { context: "release-assurance/approved", state: "success", description: `released by release-assurance for ${HEAD_SHA}`, target_url: raTarget() }],
+]) {
+  test(`unattributed release-assurance success is refused with ${label}`, () => {
+    const { code, err } = run([row, status("success", TEA_CORE)]);
+    assert.equal(code, 1);
+    assert.match(err, /FORGED/);
+  });
+}
+
 test("the newest status for the context decides, even when an older one is genuine", () => {
   // The list endpoint returns entries newest-first, which is what makes the
   // first match equivalent to the combined endpoint's reported value. A forged
