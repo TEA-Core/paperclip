@@ -2342,6 +2342,12 @@ async function startServerWithDatabaseTeardown(
   // reconciler re-publishes on the live head, gated by content identity
   // (Guard A) and stage integrity (Guard B); idempotent re-runs perform zero
   // writes.
+  {
+    // SUP-20772: take-backs of auto-merge arms recorded before this process started are tried now, not at the first tick
+    // (the in-process retry timers died with the last process), whether or not the reconciler is enabled.
+    const { resumePendingAutoMergeDisarms } = await import("./services/auto-merge-disarm.js");
+    void resumePendingAutoMergeDisarms(db);
+  }
   if (config.approvalStatusReconcilerEnabled) {
     const { startApprovalStatusReconciler } = await import("./services/approval-status-reconciler.js");
     logger.info(

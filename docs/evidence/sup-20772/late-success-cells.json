@@ -1,0 +1,119 @@
+{
+  "measuredAt": "2026-10-26T21:24:57.400Z",
+  "cells": [
+    {
+      "cell": "late success, 0 ms after the answer, at landing",
+      "delayMs": 0,
+      "newest": "success",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 0 ms after the answer, after the void",
+      "delayMs": 0,
+      "newest": "failure",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 1,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 100 ms after the answer, at landing",
+      "delayMs": 100,
+      "newest": "success",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 100 ms after the answer, after the void",
+      "delayMs": 100,
+      "newest": "failure",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 1,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 1000 ms after the answer, at landing",
+      "delayMs": 1000,
+      "newest": "success",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 1000 ms after the answer, after the void",
+      "delayMs": 1000,
+      "newest": "failure",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 1,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 2000 ms after the answer, at landing",
+      "delayMs": 2000,
+      "newest": "success",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 2000 ms after the answer, after the void",
+      "delayMs": 2000,
+      "newest": "failure",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 1,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 5000 ms after the answer, at landing",
+      "delayMs": 5000,
+      "newest": "success",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "late success, 5000 ms after the answer, after the void",
+      "delayMs": 5000,
+      "newest": "failure",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 1,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "unknown beyond the re-checks: success lands after both re-checks",
+      "newest": "success",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "unreadable re-check, then a late success",
+      "newest": "success",
+      "switchOffExit": 1,
+      "switchOnExit": 1,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 1
+    },
+    {
+      "cell": "legitimate confirmed release",
+      "newest": "success",
+      "switchOffExit": 0,
+      "switchOnExit": 0,
+      "controlSwitchOffExit": 0,
+      "controlSwitchOnExit": 0
+    }
+  ]
+}

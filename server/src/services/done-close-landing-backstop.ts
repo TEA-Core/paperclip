@@ -7,6 +7,7 @@ import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
   createAuthorityGuard,
+  openArmRecord,
   disableAutoMerge,
   keepAutoMergeDisarmPending,
   enableAutoMerge,
@@ -1494,12 +1495,20 @@ export function createDoneCloseLandingBackstopService(
       );
       return false;
     }
+    // The take-back record goes on the card BEFORE the enable call (an arm GitHub accepts is then covered even if this
+    // process dies right after); nothing is armed when it cannot be written.
+    const armRecord = await openArmRecord(db, companyId, issueId, pr, `${pr.owner}/${pr.repo}#${pr.number}`, nodeId, authorizedHeadSha, guard);
+    if (!armRecord.ok) {
+      logger.warn({ companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, message: armRecord.message }, "done-close backstop: re-enqueue skipped — the take-back record could not be opened");
+      return false;
+    }
     // GitHub refuses the mutation if the PR's head is not the one authorized.
     const result = await enableAutoMerge(tokenResult.token, nodeId, {
       expectedHeadOid: authorizedHeadSha,
       // Before the first attempt and before every retry.
       beforeAttempt: () => guard.stillHolds(),
     });
+    await armRecord.settleEnable(result);
     if (result.success) {
       // A revocation that committed while the call was in flight could not be seen before it.
       // A recheck that cannot be completed is treated as a change: an arm that cannot be re-verified is taken back.
@@ -1507,6 +1516,7 @@ export function createDoneCloseLandingBackstopService(
         `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changed) {
         const disabled = await disableAutoMerge(tokenResult.token, nodeId);
+        if (disabled.success) await armRecord.forget();
         // An accepted arm that could not be turned off stays on the card and is retried every reconciler tick.
         const kept = disabled.success ? "" : await keepAutoMergeDisarmPending(db, companyId, issueId, pr, nodeId, authorizedHeadSha, changed, disabled.error);
         const where = { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, changed, disabled: disabled.success, disableError: disabled.error, kept };
@@ -1517,6 +1527,7 @@ export function createDoneCloseLandingBackstopService(
         }
         return false;
       }
+      await armRecord.forget();
     }
     if (!result.success) {
       logger.info(

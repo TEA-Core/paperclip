@@ -3,17 +3,12 @@ import type { Db } from "@paperclipai/db";
 import { issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
-import { disableAutoMerge, recordPendingAutoMergeDisarm, resolveGitHubTokenCandidatesForRepo, type PendingAutoMergeDisarm } from "./merge-arming.js";
+import {
+  clearAutoMergeDisarmRecord, createAuthorityGuard, disarmBacklog, disableAutoMerge, recordPendingAutoMergeDisarm,
+  resolveGitHubTokenCandidatesForRepo, type PendingAutoMergeDisarm,
+} from "./merge-arming.js";
 
-async function clearRecord(db: Db, companyId: string, issueId: string): Promise<void> {
-  await db
-    .update(issues)
-    .set({
-      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
-        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) - 'autoMergeDisarm')`,
-    })
-    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
-}
+const clearRecord = (db: Db, companyId: string, issueId: string) => clearAutoMergeDisarmRecord(db, companyId, issueId);
 
 function readRecord(executionState: unknown): PendingAutoMergeDisarm | null {
   const raw = ((executionState as Record<string, unknown> | null)?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
@@ -28,6 +23,10 @@ function readRecord(executionState: unknown): PendingAutoMergeDisarm | null {
     attempts: typeof r.attempts === "number" ? r.attempts : 0,
     lastError: typeof r.lastError === "string" ? r.lastError : null,
     lastAttemptAt: typeof r.lastAttemptAt === "string" ? r.lastAttemptAt : null,
+    state: r.state === "in_flight" ? "in_flight" : "pending",
+    ...(typeof r.token === "string" ? { token: r.token } : {}),
+    baseline: typeof r.baseline === "string" ? r.baseline : null,
+    requireApprovedLadder: r.requireApprovedLadder === true,
   };
 }
 
@@ -43,7 +42,11 @@ export interface DisarmSweepSummary {
  * When a take-back that failed at once is tried again without waiting for the first reconciler tick (which can be
  * minutes away). Lives in process memory: a restart falls back to the tick. Tests set it to `[]`.
  */
-export const disarmTiming: { promptDelaysMs: number[] } = { promptDelaysMs: [2_000, 5_000, 15_000, 30_000, 60_000, 120_000] };
+export const disarmTiming: { promptDelaysMs: number[]; inFlightGraceMs: number } = {
+  promptDelaysMs: [2_000, 5_000, 15_000, 30_000, 60_000, 120_000],
+  // An in-flight record younger than this belongs to an arm call that may still be running (its enable call is bounded well under it).
+  inFlightGraceMs: 120_000,
+};
 
 /** Activity rows for a failing record: every round at first, then about hourly, so a record GitHub never accepts does not grow the log without end. */
 function worthARow(attempts: number): boolean {
@@ -58,9 +61,25 @@ function worthARow(attempts: number): boolean {
 async function attemptDisarm(
   db: Db,
   row: { id: string; companyId: string; identifier: string | null; executionState: unknown },
-): Promise<"disabled" | "still-armed" | "moot" | "none"> {
-  const record = readRecord(row.executionState);
+): Promise<"disabled" | "still-armed" | "moot" | "waiting" | "none"> {
+  let record = readRecord(row.executionState);
   if (!record) return "none";
+  if (record.state === "in_flight") {
+    // Written before an enable call. While its arm call may still be running it is left alone; after that it is
+    // settled from the authority: still what the arm was authorized against means the arm (if any) stands and the
+    // record is dropped, anything else means the arm must come off, so it becomes a pending take-back.
+    if (Date.now() - Date.parse(record.since) < disarmTiming.inFlightGraceMs) return "waiting";
+    const guard = await createAuthorityGuard(db, row.companyId, row.id, {
+      requireApprovedLadder: record.requireApprovedLadder === true, headSha: record.headSha, baseline: record.baseline ?? "",
+    }).then((g) => g, () => null);
+    const changed = guard && record.baseline ? await guard.stillHolds().catch((error) => `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`) : "the record has no baseline to compare";
+    if (!changed) {
+      await clearAutoMergeDisarmRecord(db, row.companyId, row.id, record.token);
+      return "none";
+    }
+    record = { ...record, state: "pending", reason: `${changed} (arm interrupted before it was settled)` };
+    await recordPendingAutoMergeDisarm(db, row.companyId, row.id, record);
+  }
   const where = { issueId: row.id, identifier: row.identifier, pr: `${record.owner}/${record.repo}#${record.number}`, since: record.since };
   let error: string | null = "no GitHub token candidate";
   try {
@@ -115,18 +134,26 @@ export async function retryPendingAutoMergeDisarms(db: Db, options: { limit?: nu
     .from(issues)
     .where(pendingOnly)
     .orderBy(sql`coalesce(${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm' ->> 'lastAttemptAt', '')`, issues.id)
-    .limit(options.limit ?? 50);
+    // Arming is refused above the backlog cap, so this takes all of them (twice the cap covers admissions that raced it).
+    .limit(options.limit ?? disarmBacklog.cap * 2);
   const [{ n }] = await db.select({ n: sql<number>`count(*)::int` }).from(issues).where(pendingOnly);
   const summary: DisarmSweepSummary = { checked: 0, disabled: 0, stillArmed: 0, pending: n };
-  for (const row of rows) {
-    const result = await attemptDisarm(db, row);
-    if (result === "none") continue;
-    summary.checked += 1;
-    if (result === "disabled") summary.disabled += 1;
-    if (result === "still-armed") summary.stillArmed += 1;
+  // A few at a time, so one provider that never answers (each try is bounded) cannot hold up the rest of the backlog.
+  const CONCURRENCY = 10;
+  for (let from = 0; from < rows.length; from += CONCURRENCY) {
+    const results = await Promise.all(rows.slice(from, from + CONCURRENCY).map((row) => attemptDisarm(db, row).catch((err) => {
+      logger.error({ err, issueId: row.id }, "pending auto-merge disarm attempt threw");
+      return "still-armed" as const;
+    })));
+    for (const result of results) {
+      if (result === "none" || result === "waiting") continue;
+      summary.checked += 1;
+      if (result === "disabled") summary.disabled += 1;
+      if (result === "still-armed") summary.stillArmed += 1;
+    }
   }
-  if (n > summary.checked) {
-    logger.error({ pending: n, checked: summary.checked }, "pending auto-merge disarms exceed one sweep: the rest are tried on the next ticks, least recently tried first");
+  if (n > rows.length) {
+    logger.error({ pending: n, taken: rows.length }, "pending auto-merge disarms exceed one sweep: the rest are tried on the next ticks, least recently tried first");
   }
   return summary;
 }
@@ -150,7 +177,7 @@ export function startPromptDisarmRetries(db: Db, companyId: string, issueId: str
             .from(issues)
             .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
           const result = row ? await attemptDisarm(db, row) : "none";
-          done = result !== "still-armed" || index + 1 >= delaysMs.length;
+          done = (result !== "still-armed" && result !== "waiting") || index + 1 >= delaysMs.length;
         } catch (err) {
           logger.error({ err, issueId }, "prompt auto-merge disarm retry failed");
           done = index + 1 >= delaysMs.length;
@@ -162,4 +189,24 @@ export function startPromptDisarmRetries(db: Db, companyId: string, issueId: str
     timer.unref?.();
   };
   step(0);
+}
+
+/**
+ * At boot: tries every record on the cards once now (the in-process retry timers of the last run died with it), and
+ * starts the prompt retries for the ones still waiting. Never throws.
+ */
+export async function resumePendingAutoMergeDisarms(db: Db): Promise<DisarmSweepSummary | null> {
+  try {
+    const summary = await retryPendingAutoMergeDisarms(db);
+    const rows = await db
+      .select({ id: issues.id, companyId: issues.companyId })
+      .from(issues)
+      .where(sql`${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm' is not null`);
+    for (const row of rows) startPromptDisarmRetries(db, row.companyId, row.id);
+    if (rows.length > 0) logger.warn({ ...summary, resumed: rows.length }, "resumed pending auto-merge take-backs after boot");
+    return summary;
+  } catch (err) {
+    logger.error({ err }, "could not resume pending auto-merge take-backs at boot; the reconciler tick still tries them");
+    return null;
+  }
 }

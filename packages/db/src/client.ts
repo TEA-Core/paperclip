@@ -312,6 +312,11 @@ export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits)
     max_lifetime: undefined,
     connect_timeout: Math.max(1, Math.ceil(limits.connectTimeoutMs / 1000)),
     onnotice: () => {},
+    // The driver's own array-type lookup is its first statement on a new connection. A cancel that lands while it is
+    // in flight destroys the socket and the lookup rejects with nobody listening (`write CONNECTION_DESTROYED`). A
+    // request-scoped connection runs a handful of typed queries and needs no array parsers beyond the ones drizzle
+    // sets itself, so it does not make the lookup.
+    fetch_types: false,
   };
   // A transaction-mode pooler (prepare === false) rejects startup parameters and maps no client to one
   // backend, so its session cannot be found by name or timed out by the server. The requests it runs are
