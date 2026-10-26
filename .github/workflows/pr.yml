@@ -340,7 +340,9 @@ jobs:
         # SUP-20772: pins the PAPERCLIP_CARD_WAIVER_RETIRED switch. On, a
         # waiver on a SUP-<n> head is refused and a board release lands the PR;
         # off (the shipped default) the script behaves, and prints, exactly as
-        # before. Also pins the documented residual bypass.
+        # before, except that a success described "released by " needs the
+        # control plane's release-confirmed marker with the switch on or off.
+        # Also pins the documented residual bypass.
         run: node --test ./scripts/__tests__/paperclip-approved-card-waiver.test.mjs
 
       - name: Test no-git-push check
