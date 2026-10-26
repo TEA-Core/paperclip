@@ -370,6 +370,7 @@ import {
   ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   isTerminalOrMissingHeartbeatRun,
+  issueVersionConflict,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -501,6 +502,9 @@ const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObject
   // INV-LADDER-1); opting in here — and only here — sanctions the rewrite and
   // re-seats both halves of the pointer from the written policy.
   rearmExecutionPolicy: z.boolean().optional(),
+  // Request-level compare-and-set token, not an issue column. Stripped before
+  // the column update. Absent leaves the write unconditional.
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 }));
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -17736,7 +17740,7 @@ export function issueRoutes(
       mutationAccess.reason === "allow_manager_chain"
     ) {
       const forbidden = Object.keys(req.body).filter(
-        (k) => !ANCESTOR_ALLOWED_FIELDS.has(k) && !ANCESTOR_WORKSPACE_CORRECTION_FIELDS.has(k),
+        (k) => k !== "expectedUpdatedAt" && !ANCESTOR_ALLOWED_FIELDS.has(k) && !ANCESTOR_WORKSPACE_CORRECTION_FIELDS.has(k),
       );
       if (forbidden.length > 0) {
         // Board ruling 2026-10-02 (F1 server half): caller-aware. The prefix is
@@ -17805,8 +17809,15 @@ export function issueRoutes(
       // SUP-16525 §4: request-level flag, not an issue column — keep it out of
       // `updateFields` so it never reaches svc.update as a spurious write.
       rearmExecutionPolicy: rearmExecutionPolicyRaw,
+      expectedUpdatedAt: expectedUpdatedAtRaw,
       ...updateFields
     } = req.body;
+    if (
+      expectedUpdatedAtRaw !== undefined &&
+      existing.updatedAt.getTime() !== new Date(expectedUpdatedAtRaw).getTime()
+    ) {
+      throw issueVersionConflict(existing.updatedAt);
+    }
     if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
       throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
     }
@@ -17819,6 +17830,7 @@ export function issueRoutes(
               "assigneeAgentId",
               "assigneeUserId",
               "deferWakeForGoal",
+              "expectedUpdatedAt",
             ].includes(key),
         ))
     ) {
@@ -19072,6 +19084,9 @@ export function issueRoutes(
       actorAgentId: actor.agentId ?? null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
+      ...(expectedUpdatedAtRaw !== undefined
+        ? { expectedUpdatedAt: new Date(expectedUpdatedAtRaw) }
+        : {}),
     };
     const shouldCollectCompletionPublication =
       actor.actorType === "user" && existing.status !== "done" && updateFields.status === "done";

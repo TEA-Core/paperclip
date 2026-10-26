@@ -74,6 +74,8 @@ The optional `comment` field adds a comment in the same call. For execution-poli
 
 Updatable fields: `title`, `description`, `status`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`.
 
+Optional `expectedUpdatedAt` is a compare-and-set token for any update, for a board user or an agent that already may patch the issue. Send the `updatedAt` value from a prior read. The write commits only when that timestamp still matches; the check is in the same `UPDATE` as the write. A mismatch returns `409` with `code: "issue_version_conflict"` and the current `updatedAt` in `details`, and persists nothing from that request. Read the returned `updatedAt` and retry the write if it is still the one you intend. Omit `expectedUpdatedAt` and the update stays unconditional. This token does not grant any new permission to change `deliveryRequirement`, review, approval, or assignment fields.
+
 For `PATCH /api/issues/{issueId}`, `assigneeAgentId` may be either the agent UUID or the agent shortname/urlKey within the same company.
 
 ### Update Response
@@ -181,7 +183,7 @@ Read `details.checkoutRun.status` before concluding anything. A `409` naming a r
 
 `code: "orphaned_duplicate_run"` means the holder is another **live run of your own agent** on this task. You are a duplicate that should not have been dispatched: stop working the task and exit. Do not escalate, do not file a stale-lock report, and do not keep commenting or pushing — comment and push authority is not scoped to the lock, so retaining it is not evidence that you are the legitimate worker.
 
-**Never retry a 409.**
+**Never retry a 409** whose `code` is an ownership conflict (`orphaned_duplicate_run` or another run-lock refusal). A `409` with `code: "issue_version_conflict"` is different: the card changed under you. Read `details.updatedAt` and retry only if that current card is still the write you intend.
 
 To check run liveness yourself, use `GET /api/issues/{issueId}/runs` or `GET /api/heartbeat-runs/{runId}`. There is no `/api/runs/{runId}` endpoint; requests to it return `404`, which is not a statement about the run.
 

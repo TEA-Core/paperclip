@@ -170,6 +170,15 @@ import { redactSensitiveText } from "../redaction.js";
 export function redactIssueCommentBody(body: string, opts: CurrentUserRedactionOptions) {
   return redactSecretTokens(redactCurrentUserText(body, opts));
 }
+
+export const ISSUE_VERSION_CONFLICT_CODE = "issue_version_conflict";
+
+export function issueVersionConflict(updatedAt: Date) {
+  return conflict("Issue changed since it was read", {
+    code: ISSUE_VERSION_CONFLICT_CODE,
+    updatedAt: updatedAt.toISOString(),
+  });
+}
 import {
   resolveIssueGoalId,
   resolveNextIssueGoalId,
@@ -11583,6 +11592,13 @@ export function issueService(db: Db) {
          */
         systemWorkspaceBinding?: boolean;
         companyGuard?: string;
+        /**
+         * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
+         * Never a column. When set, the issue UPDATE matches only if `updated_at`
+         * is still the millisecond the caller observed. A mismatch throws 409
+         * `issue_version_conflict` and writes nothing.
+         */
+        expectedUpdatedAt?: Date;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -11630,6 +11646,7 @@ export function issueService(db: Db) {
         boardApiKeyId,
         systemWorkspaceBinding,
         companyGuard,
+        expectedUpdatedAt,
         ...issueData
       } = data;
       if (
@@ -12079,13 +12096,30 @@ export function issueService(db: Db) {
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
+        // The version predicate is part of this UPDATE, not a check before it.
+        // A concurrent writer that commits first changes updated_at, this
+        // statement matches zero rows, and the transaction rolls back. The
+        // API exposes updatedAt at millisecond precision, so the predicate
+        // compares that observed token. Absent expectedUpdatedAt leaves the
+        // predicate as idPredicate.
+        const writePredicate = expectedUpdatedAt === undefined
+          ? idPredicate
+          : and(
+              idPredicate,
+              sql`date_trunc('milliseconds', ${issues.updatedAt}) = date_trunc('milliseconds', ${expectedUpdatedAt.toISOString()}::timestamptz)`,
+            );
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(idPredicate)
+          .where(writePredicate)
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          if (expectedUpdatedAt !== undefined && receiptExisting) {
+            throw issueVersionConflict(receiptExisting.updatedAt);
+          }
+          return null;
+        }
         if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
