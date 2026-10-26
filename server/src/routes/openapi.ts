@@ -642,7 +642,14 @@ const registry = new OpenAPIRegistry();
 
 // ─── Common schemas ──────────────────────────────────────────────────────────
 
-const ErrorSchema = registry.register("Error", z.object({ error: z.string() }));
+const ErrorSchema = registry.register("Error", z.object({
+  error: z.string(),
+  details: z.object({
+    reason: z.string().optional().describe(
+      "Machine-readable refusal reason; PATCH /api/issues/{id} selecting record_only returns record_only_self_assignee for an assigned agent or record_only_not_authorized for an authorization refusal. Other errors may use other reason codes.",
+    ),
+  }).optional(),
+}));
 
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.string(), z.unknown())) => ({
@@ -3916,7 +3923,7 @@ registry.registerPath({
   summary: "Update an issue",
   description:
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
-    "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; an agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee in that case, or record_only_not_authorized for any earlier authorization refusal. " +
+    "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
     "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
   request: {
     params: z.object({ id: z.string() }),
@@ -3964,6 +3971,7 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     422: r.unprocessable,
   },

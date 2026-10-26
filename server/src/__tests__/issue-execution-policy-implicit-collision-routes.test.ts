@@ -102,7 +102,7 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     wakeup: async () => null,
   } as any;
 
-  function createApp(companyId: string) {
+  function createApp(companyId: string, membershipRole: "owner" | "viewer" = "owner") {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -110,7 +110,7 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
         type: "board",
         userId: "board-user",
         companyIds: [companyId],
-        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        memberships: [{ companyId, membershipRole, status: "active" }],
         isInstanceAdmin: false,
         source: "session",
       };
@@ -494,6 +494,29 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
 
     const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
     expect(stored[0]?.deliveryRequirement).toBe("record_only");
+    expect(stored[0]?.assigneeUserId).toBe("board-user");
+  });
+
+  it("refuses a viewer selecting record-only on their own assigned issue", async () => {
+    const { companyId } = await seedCompanyWithAgents();
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Viewer-owned delivery", status: "todo", assigneeUserId: "board-user" });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+    await db.update(companyMemberships)
+      .set({ membershipRole: "viewer" })
+      .where(eq(companyMemberships.companyId, companyId));
+
+    const patched = await request(createApp(companyId, "viewer"))
+      .patch(`/api/issues/${created.body.id}`)
+      .send({ deliveryRequirement: "record_only" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(403);
+    expect(patched.body.error).toBe("Viewer access is read-only");
+    expect(patched.body.details?.reason).toBe("record_only_not_authorized");
+    const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    expect(stored[0]?.deliveryRequirement).toBe("repository_delivery");
     expect(stored[0]?.assigneeUserId).toBe("board-user");
   });
 

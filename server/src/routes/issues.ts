@@ -17338,6 +17338,9 @@ export function issueRoutes(
           logger.error({ err }, "failed to record unhandled issues PATCH error");
         }
       };
+      // Include authorization failures raised before the PATCH handler (such as
+      // viewer read-only access) in the same record-only refusal contract.
+      res.locals.recordOnlyRefusalPhase = req.body?.deliveryRequirement === "record_only";
       res.json = ((body: unknown) => {
         const errorContext = (res as unknown as {
           __errorContext?: { error?: { name?: string } };
@@ -17358,6 +17361,18 @@ export function issueRoutes(
             () => originalJson(genericBody),
           );
           return res;
+        }
+        if (
+          res.locals.recordOnlyRefusalPhase &&
+          res.statusCode === 403 &&
+          body &&
+          typeof body === "object"
+        ) {
+          const { details, ...rest } = body as { details?: Record<string, unknown> };
+          return originalJson({
+            ...rest,
+            details: { reason: "record_only_not_authorized", ...details },
+          } as never);
         }
         return originalJson(body as never);
       }) as typeof res.json;
@@ -17381,20 +17396,6 @@ export function issueRoutes(
       return;
     }
     healAgentDefaultProjectWorkspacePair(existing, req.body);
-    // Every 403 up to and including the record_only selection guard below is a
-    // record_only refusal; name it once here instead of at each denial site.
-    let recordOnlyRefusalPhase = req.body.deliveryRequirement === "record_only";
-    const respondJson = res.json.bind(res);
-    res.json = ((body: unknown) => {
-      if (recordOnlyRefusalPhase && res.statusCode === 403 && body && typeof body === "object") {
-        const { details, ...rest } = body as { details?: Record<string, unknown> };
-        return respondJson({
-          ...rest,
-          details: { reason: "record_only_not_authorized", ...details },
-        } as never);
-      }
-      return respondJson(body as never);
-    }) as typeof res.json;
     const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
     let mutationAccess:
       | boolean
@@ -17500,7 +17501,7 @@ export function issueRoutes(
       });
       return;
     }
-    recordOnlyRefusalPhase = false;
+    res.locals.recordOnlyRefusalPhase = false;
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)

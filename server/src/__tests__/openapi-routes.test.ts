@@ -266,6 +266,23 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+
+  it("exposes record-only refusal reasons in the PATCH 403 schema", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    expect(res.status).toBe(200);
+    expect(
+      res.body.paths["/api/issues/{id}"].patch.responses["403"]
+        .content["application/json"].schema,
+    ).toEqual({ $ref: "#/components/schemas/Error" });
+    expect(res.body.components.schemas.Error.properties.details.properties.reason).toMatchObject({
+      type: "string",
+      description: expect.stringContaining("record_only_self_assignee"),
+    });
+    expect(
+      res.body.components.schemas.Error.properties.details.properties.reason.description,
+    ).toContain("record_only_not_authorized");
+  });
+
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 
