@@ -30,6 +30,7 @@ import { runApprovalStatusReconcilerTick } from "./approval-status-reconciler.js
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
+  createAuthorityGuard,
   disableAutoMerge,
   fetchBranchHeadSha,
   fetchGitHubNodeId,
@@ -2814,6 +2815,52 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(outcome.message).toContain("auto-merge was disabled again");
         expect(enables()).toHaveLength(1);
         expect(disables()).toHaveLength(1);
+      });
+
+      // Round 12: the 16-cell matrix release assurance applies (2 consumers x 2 timings x 4 revocations), run against a real
+      // database and a fake provider. Each consumer builds its guard the way it does in production (the reconciler's re-arm
+      // requires the approved ladder, the done-close backstop does not); both then hand it to the same actuator.
+      describe("the 16-cell authority matrix", () => {
+        const consumers: Array<[string, (issueId: string) => Promise<Awaited<ReturnType<typeof createAuthorityGuard>>>]> = [
+          ["reconciler re-arm", (issueId) => createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true, headSha: AUTH_HEAD })],
+          ["done-close backstop", (issueId) => createAuthorityGuard(db, companyId, issueId, { headSha: AUTH_HEAD })],
+        ];
+        const cells = consumers.flatMap(([consumer, guardFor]) =>
+          (["before a transient retry", "at the final accepted enable write"] as const).flatMap((timing) =>
+            revocations.map(([revocation, revoke]) => ({ consumer, guardFor, timing, revocation, revoke }))));
+        expect(cells).toHaveLength(16);
+
+        it.each(cells)("$consumer, change $timing, $revocation", async ({ guardFor, timing, revoke }) => {
+          const { issueId, reviewerId } = await seedAuthorityCard();
+          const authorityGuard = await guardFor(issueId);
+          mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+            if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+            const query = String(JSON.parse(String(init?.body)).query);
+            if (query.includes("disablePullRequestAutoMerge")) return { ok: true, status: 200, json: async () => ({ data: { disablePullRequestAutoMerge: { clientMutationId: "m" } } }) } as unknown as Response;
+            await revoke({ issueId, reviewerId });
+            return timing === "before a transient retry" ? ({ ok: false, status: 502, json: async () => ({}) } as unknown as Response) : okBody();
+          });
+
+          const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD, authorityGuard });
+
+          if (timing === "before a transient retry") {
+            // Refused before the retry: no enable was ever accepted, nothing to take back.
+            expect(outcome.kind).toBe("skipped");
+            expect(outcome.message).toContain("skipped:authority-changed");
+            expect(disables()).toHaveLength(0);
+          } else {
+            // The revocation committed inside the accepted call: it is accepted, seen at the recheck and taken back. The window
+            // between the guard's last read and GitHub accepting the enable is not closable (no authority compare-and-set).
+            expect(outcome.kind).toBe("failed");
+            expect(outcome.message).toContain("failed:authority-revoked");
+            expect(outcome.message).toContain("auto-merge was disabled again");
+            expect(disables()).toHaveLength(1);
+          }
+          expect(enables()).toHaveLength(1);
+          // No cell ever merges directly.
+          expect(graphqlQueries().filter((q) => /mergePullRequest/i.test(q))).toHaveLength(0);
+          expect(mockGhFetch.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === "PUT")).toHaveLength(0);
+        });
       });
 
       it("says so when the arm that was revoked could not be taken back", async () => {

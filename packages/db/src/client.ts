@@ -324,12 +324,18 @@ export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits)
     return {
       db,
       cancel: async () => {
-        // The driver's cancel answers once its cancel request has been sent to the server; waiting for that
-        // (briefly) is what lets a caller know no statement of this request is still running when it answers.
-        const sent = [...inflight].map((query) => {
-          try { return Promise.resolve(query.cancel()).catch(() => {}); } catch { return Promise.resolve(); }
-        });
-        await Promise.race([Promise.all(sent), new Promise((resolve) => setTimeout(resolve, 3000).unref?.())]);
+        // The driver's `cancel()` returns nothing to wait on, and sending the cancel request is not the server acting
+        // on it. A cancelled statement rejects when the server has stopped it (or at once, when it was never sent), so
+        // waiting (briefly) for every statement to settle is what lets a caller know none of this request's statements
+        // is still running when it answers.
+        const statements = [...inflight];
+        for (const query of statements) {
+          try { query.cancel(); } catch { /* the statement already ended */ }
+        }
+        await Promise.race([
+          Promise.allSettled(statements.map((query) => query as unknown as PromiseLike<unknown>)),
+          new Promise((resolve) => setTimeout(resolve, 3000).unref?.()),
+        ]);
         await sql.end({ timeout: 0 }).catch(() => {});
       },
       close: () => sql.end({ timeout: 1 }).catch(() => {}),

@@ -3900,6 +3900,86 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(released).toEqual([]);
     }, 20_000);
 
+    // Round 12: a pooled cancel returns only when the server has stopped the statements (the driver gives nothing else to wait on).
+    it("pooled: the cancel does not return while a running statement is still alive on the server", async () => {
+      for (let round = 0; round < 5; round += 1) {
+        const parent = createDb(tempDb!.connectionString, { prepare: false });
+        const scope = createRequestScopedDb(parent, { statementTimeoutMs: 60_000, lockTimeoutMs: 60_000, idleInTransactionMs: 60_000, connectTimeoutMs: 2000 })!;
+        const sleeper = (async () => await scope.db.execute(sql`select pg_sleep(30)`))().catch(() => "cancelled");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await scope.cancel();
+        const alive = Number(((await db.execute(sql`select count(*)::int as n from pg_stat_activity where query like '%pg_sleep(30)%' and state = 'active' and pid <> pg_backend_pid()`)) as unknown as Array<{ n: number }>)[0]?.n);
+        expect(alive).toBe(0);
+        expect(await sleeper).toBe("cancelled");
+      }
+    }, 30_000);
+
+    // Round 12: the abandoned-operation matrix (operation held past the deadline x direct or pooled connection) release
+    // assurance applies, executed here against a real database and a fake provider. Whatever is held, the route answers in
+    // time, and nothing happens afterwards: no waiting statement, no late provider write, no late confirmation, no late audit row.
+    describe("the abandoned-operation matrix", () => {
+      type Held = { release: () => Promise<void>; expect?: "failed" | "released" };
+      const operations: Array<{ name: string; hold: (ctx: { companyId: string }) => Promise<Held>; outcome: "failed" | "released"; ghCalls: boolean }> = [
+        { name: "the access check's database wait", outcome: "failed", ghCalls: false, hold: async () => ({ release: await holdLock(sql`lock table issues in access exclusive mode`) }) },
+        { name: "the publication lock wait", outcome: "failed", ghCalls: false, hold: async ({ companyId }) => ({ release: await holdLock(sql`select pg_advisory_xact_lock(hashtextextended(${releaseLockKey(companyId, OWNER, REPO, HEAD_SHA)}, 0))`) }) },
+        { name: "a credential lookup waiting on the database", outcome: "failed", ghCalls: false, hold: async () => {
+          // An awaited statement, as a real lookup issues it (a bare query builder would run once per `then`).
+          mockResolveControlPlaneToken.mockImplementation(async (conn: Db) => await conn.execute(sql`select pg_sleep(30)`));
+          return { release: async () => {} };
+        } },
+        { name: "a stuck secret provider", outcome: "failed", ghCalls: false, hold: async () => {
+          mockResolveControlPlaneToken.mockImplementation(() => new Promise((resolve) => {
+            setTimeout(() => resolve({ token: CONTROL_PLANE_TOKEN, scope: "app_installation", secretName: "GITHUB_APP_PRIVATE_KEY" }), 900);
+          }));
+          return { release: async () => {} };
+        } },
+        { name: "the provider's status read", outcome: "failed", ghCalls: true, hold: async () => ({ release: async () => {} }) },
+        { name: "the outcome audit insert", outcome: "released", ghCalls: true, hold: async () => ({ release: async () => {} }) },
+      ];
+      const modes: Array<[string, (deadlines: Record<string, number>) => express.Express]> = [["direct", deadlineApp], ["pooled", pooledApp]];
+      const cells = modes.flatMap(([mode, app]) => operations.map((operation) => ({ mode, app, ...operation })));
+
+      it.each(cells)("$mode: $name held past the deadline", async ({ mode, app, name, hold, outcome, ghCalls }) => {
+        const { issueId, companyId } = await seedReleasable();
+        const held: { release?: () => Promise<void> } = {};
+        installReleaseTransport({
+          onStatusRead: async () => {
+            if (name === "the provider's status read") await new Promise((resolve) => setTimeout(resolve, 1200));
+            if (name === "the outcome audit insert") held.release ??= await holdLock(sql`lock table activity_log in access exclusive mode`);
+          },
+        });
+        const operation = await hold({ companyId });
+        try {
+          const started = Date.now();
+          const res = await request(app({ totalMs: 500, compensationMs: 300, fetchMs: 1000 })).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+          expect(Date.now() - started).toBeLessThan(5000);
+          expect(res.body.outcome).toBe(outcome);
+          if (outcome === "failed") expect(res.body.message).toMatch(/deadline|nothing was published|status_read: HTTP 0 timeout/);
+          if (name === "the outcome audit insert") expect(res.body.auditRecorded).toBe(false);
+          if (!ghCalls) expect(mockGhFetch).not.toHaveBeenCalled();
+          // Nothing of the request is still waiting on the server while the lock is still held.
+          expect(await eventually(async () => (await waitingOnLocks()) === 0)).toBe(true);
+          const sleeping = async () => Number(((await db.execute(sql`select count(*)::int as n from pg_stat_activity where query like '%pg_sleep(30)%' and state = 'active' and pid <> pg_backend_pid()`)) as unknown as Array<{ n: number }>)[0]?.n);
+          expect(await eventually(async () => (await sleeping()) === 0)).toBe(true);
+          if (mode === "direct") expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+        } finally {
+          await operation.release();
+          await held.release?.();
+        }
+        // Whatever was held finally answers: it starts nothing.
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        if (outcome === "failed") {
+          expect(statusWrites().filter(([, init]) => JSON.parse(String(init?.body)).state === "success")).toEqual([]);
+          expect(markerWrites()).toEqual([]);
+          const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect((row!.executionState as { approvalStatus?: Record<string, unknown> } | null)?.approvalStatus?.releaseConfirmation).toBeUndefined();
+        }
+        // The outcome row whose write was held never commits afterwards.
+        if (name === "the outcome audit insert") expect((await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_outcome")).toEqual([]);
+      }, 30_000);
+    });
+
     // Round 9: one clock from the moment the request arrives, before authentication.
     describe("the request clock that starts before authentication", () => {
       const slowAuthApp = (authMs: number, totalMs: number) => {
