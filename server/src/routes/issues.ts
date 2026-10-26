@@ -17527,11 +17527,7 @@ export function issueRoutes(
       });
       return;
     }
-    if (
-      commentAttachmentIds !== undefined &&
-      !commentBody &&
-      !(doneTier !== undefined && updateFields.status === "done")
-    ) {
+    if (commentAttachmentIds !== undefined && !commentBody && doneTier === undefined) {
       res.status(400).json({ error: "Attachment ids require a comment" });
       return;
     }
@@ -18074,9 +18070,6 @@ export function issueRoutes(
     })
       ? await resolveSummaryGenerationReturnAssignee(db, existing)
       : null;
-    if (doneTier !== undefined && updateFields.status === "done") {
-      commentBody = renderDoneTierDeclaration(commentBody, doneTier);
-    }
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
@@ -18475,6 +18468,13 @@ export function issueRoutes(
     // (SUP-13185).
     const effectiveStatus =
       typeof transition.patch.status === "string" ? transition.patch.status : requestedStatus;
+    if (doneTier !== undefined && effectiveStatus === "done") {
+      commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+    }
+    if (commentAttachmentIds !== undefined && !commentBody) {
+      res.status(400).json({ error: "Attachment ids require a comment" });
+      return;
+    }
     const isDoneRequest = effectiveStatus === "done" && existing.status !== "done";
     // SUP-15878: a card with open children and no approval stage in its
     // executionPolicy can never reach a recorded approval decision. Diagnose the
@@ -23201,9 +23201,8 @@ export function issueRoutes(
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
 
     const actor = getActorInfo(req);
-    const commentBody = req.body.doneTier && req.body.reopen !== true && req.body.resume !== true
-      ? renderDoneTierDeclaration(req.body.body, req.body.doneTier)
-      : req.body.body;
+    let commentBody = req.body.body;
+    const { doneTier } = req.body;
     const commentPresentation = req.body.presentation ??
       await deriveRecoveryCommentPresentation(req, issue.companyId, commentBody);
     const reopenRequested = req.body.reopen === true;
@@ -23526,6 +23525,9 @@ export function issueRoutes(
       // unwritten.
       const autoApproveEffectiveStatus =
         typeof transition.patch.status === "string" ? transition.patch.status : "done";
+      if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {
+        commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+      }
       if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {
         const outcome = await evaluateDoneTransitionGuards({
           issue: currentIssue,

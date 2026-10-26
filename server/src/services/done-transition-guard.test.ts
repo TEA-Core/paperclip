@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   agents as agentsTable,
@@ -5354,12 +5355,26 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
-    it("does not duplicate an existing valid declaration", () => {
-      const body = "Closed at Tier 2 (live): already rendered";
-      expect(renderDoneTierDeclaration(body, {
+    it("replaces an existing same-tier declaration with the supplied declaration", () => {
+      expect(renderDoneTierDeclaration("Closed at Tier 2 (live): stale evidence", {
         tier: "tier2",
         probeEvidence: "new evidence",
-      })).toBe(body);
+      })).toBe("Closed at Tier 2 (live): new evidence");
+    });
+
+    it("renders structured declarations only after both close doors resolve to done", () => {
+      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
+      const patchStatus = route.indexOf("const effectiveStatus =");
+      const patchRender = route.indexOf('if (doneTier !== undefined && effectiveStatus === "done") {');
+      const commentStatus = route.indexOf("const autoApproveEffectiveStatus =");
+      const commentRender = route.indexOf('if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {');
+
+      expect(patchStatus).toBeGreaterThan(-1);
+      expect(patchRender).toBeGreaterThan(patchStatus);
+      expect(commentStatus).toBeGreaterThan(patchRender);
+      expect(commentRender).toBeGreaterThan(commentStatus);
+      expect(route).not.toContain('if (doneTier !== undefined && updateFields.status === "done")');
+      expect(route).not.toContain("req.body.doneTier && req.body.reopen !== true");
     });
   });
 

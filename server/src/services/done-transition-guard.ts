@@ -102,20 +102,6 @@ export function renderDoneTierDeclaration(
       trimmed.startsWith(TIER_1_PREFIX) ||
       trimmed.startsWith("Closed at Tier 0 (decision-only):");
   };
-  const isRequestedTierDeclaration = (line: string): boolean => {
-    const trimmed = line.trim();
-    return declaration.tier === "tier2"
-      ? trimmed.startsWith(TIER_2_PREFIX)
-      : trimmed.startsWith(TIER_1_PREFIX);
-  };
-  const hasRequestedDeclaration = lines.some(isRequestedTierDeclaration);
-  const hasConflictingDeclaration = lines.some((line) =>
-    isCanonicalTierDeclaration(line) && !isRequestedTierDeclaration(line)
-  );
-  if (hasRequestedDeclaration && !hasConflictingDeclaration) {
-    return body ?? "";
-  }
-
   const withoutCanonicalTierDeclaration = lines
     .filter((line) => !isCanonicalTierDeclaration(line))
     .join("\n")
