@@ -184,6 +184,15 @@ export function expectedUpdatedAtUnsupportedWithSideEffects() {
 
 export const CHECKOUT_ADOPTION_REQUIRED_CODE = "checkout_adoption_required";
 
+export const WORKSPACE_REOPEN_REQUIRED_CODE = "workspace_reopen_required";
+
+export function workspaceReopenRequired(updatedAt: Date) {
+  return conflict("This issue is linked to a closed workspace that must be reopened; retry without expectedUpdatedAt", {
+    code: WORKSPACE_REOPEN_REQUIRED_CODE,
+    updatedAt: updatedAt.toISOString(),
+  });
+}
+
 export function issueVersionConflict(updatedAt: Date) {
   return conflict("Issue changed since it was read", {
     code: ISSUE_VERSION_CONFLICT_CODE,

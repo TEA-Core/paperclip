@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
@@ -11,16 +11,16 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
+  projects,
 } from "@paperclipai/db";
-import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { HttpError } from "../errors.js";
 import { issueService } from "../services/issues.js";
-import { issueRoutes } from "../routes/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -67,6 +67,8 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentApiKeys);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(authUsers);
@@ -650,94 +652,57 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, seeded.issue.id))).toEqual([]);
   });
 
-  describe("checkout adoption 409 does not change key last-use", () => {
-    async function seedKeyedAgent(unowned: boolean) {
-      const seeded = await seed({ assignee: true });
-      const userId = `user-${randomUUID()}`;
-      const now = new Date("2024-01-01T00:00:00.000Z");
-      await db.insert(authUsers).values({
-        id: userId,
-        name: "Operator",
-        email: `${userId}@example.com`,
-        emailVerified: true,
-        createdAt: now,
-        updatedAt: now,
-      });
-      await db.insert(companyMemberships).values({
+  describe("closed isolated workspace", () => {
+    async function seedClosedWorkspace() {
+      const seeded = await seed();
+      const project = await db.insert(projects).values({
         companyId: seeded.company.id,
-        principalType: "user",
-        principalId: userId,
-        status: "active",
-        membershipRole: "member",
-      });
-      const token = `agent-key-${randomUUID()}`;
-      const key = await db.insert(agentApiKeys).values({
-        agentId: seeded.agent!.id,
-        companyId: seeded.company.id,
-        name: "cas-key",
-        keyHash: createHash("sha256").update(token).digest("hex"),
-        responsibleUserId: userId,
-        lastUsedAt: now,
+        name: "Closed workspace project",
       }).returning().then((rows) => rows[0]!);
-      if (unowned) {
-        await db.update(issues).set({
-          status: "in_progress",
-          checkoutRunId: null,
-          executionRunId: null,
-        }).where(eq(issues.id, seeded.issue.id));
-      } else {
-        const staleRun = await db.insert(heartbeatRuns).values({
-          companyId: seeded.company.id,
-          agentId: seeded.agent!.id,
-          status: "failed",
-          contextSnapshot: { issueId: seeded.issue.id },
-        }).returning().then((rows) => rows[0]!);
-        await db.update(issues).set({
-          status: "in_progress",
-          checkoutRunId: staleRun.id,
-          executionRunId: staleRun.id,
-        }).where(eq(issues.id, seeded.issue.id));
-      }
-      const app = express();
-      app.locals.paperclipDb = db;
-      app.use(express.json());
-      app.use(actorMiddleware(db, {
-        deploymentMode: "authenticated",
-        resolveSession: async () => null,
-      }));
-      app.use("/api", issueRoutes(db, {} as never));
-      app.use(errorHandler);
-      return { ...seeded, token, key, app };
+      const workspace = await db.insert(executionWorkspaces).values({
+        companyId: seeded.company.id,
+        projectId: project.id,
+        sourceIssueId: seeded.issue.id,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Closed workspace",
+        status: "archived",
+        closedAt: new Date(),
+      }).returning().then((rows) => rows[0]!);
+      await db.update(issues).set({
+        projectId: project.id,
+        executionWorkspaceId: workspace.id,
+      }).where(eq(issues.id, seeded.issue.id));
+      const actor = boardActor(seeded.company.id, seeded.userId);
+      const seen = await wireUpdatedAt(actor, seeded.issue.id);
+      return { ...seeded, workspace, actor, seen };
     }
 
-    async function expectLastUseUnchanged(unowned: boolean) {
-      const seeded = await seedKeyedAgent(unowned);
-      const seen = await request(seeded.app)
-        .get(`/api/issues/${seeded.issue.id}`)
-        .set("Authorization", `Bearer ${seeded.token}`)
-        .set("X-Paperclip-Run-Id", seeded.run!.id);
-      expect(seen.status, JSON.stringify(seen.body)).toBe(200);
-      await db.update(agentApiKeys).set({ lastUsedAt: new Date("2024-01-01T00:00:00.000Z") })
-        .where(eq(agentApiKeys.id, seeded.key.id));
-      const res = await request(seeded.app)
+    it("rejects a comment with a token before any write, without reopening", async () => {
+      const seeded = await seedClosedWorkspace();
+      const res = await request(await appFor(seeded.actor))
         .patch(`/api/issues/${seeded.issue.id}`)
-        .set("Authorization", `Bearer ${seeded.token}`)
-        .set("X-Paperclip-Run-Id", seeded.run!.id)
-        .send({ priority: "high", expectedUpdatedAt: seen.body.updatedAt });
+        .send({ title: "Changed", comment: "hello", expectedUpdatedAt: seeded.seen });
       expect(res.status, JSON.stringify(res.body)).toBe(409);
-      expect(res.body.code).toBe("checkout_adoption_required");
-      const key = await db.select({ lastUsedAt: agentApiKeys.lastUsedAt }).from(agentApiKeys)
-        .where(eq(agentApiKeys.id, seeded.key.id)).then((rows) => rows[0]!);
-      expect(key.lastUsedAt?.toISOString()).toBe("2024-01-01T00:00:00.000Z");
-      expect((await storedTitle(seeded.issue.id)).priority).toBe("medium");
-    }
-
-    it("terminal recorded run", async () => {
-      await expectLastUseUnchanged(false);
+      expect(res.body.code).toBe("workspace_reopen_required");
+      expect(res.body.details).toMatchObject({ updatedAt: seeded.seen });
+      const row = await storedTitle(seeded.issue.id);
+      expect(row.title).toBe("Original title");
+      expect(row.updatedAt.toISOString()).toBe(seeded.seen);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, seeded.issue.id))).toEqual([]);
+      expect(await db.select().from(activityLog)).toEqual([]);
+      const workspace = await db.select({ status: executionWorkspaces.status }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.workspace.id)).then((rows) => rows[0]!);
+      expect(workspace.status).toBe("archived");
     });
 
-    it("unowned checkout", async () => {
-      await expectLastUseUnchanged(true);
+    it("still allows a board field-only write with a token", async () => {
+      const seeded = await seedClosedWorkspace();
+      const res = await request(await appFor(seeded.actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ priority: "high", expectedUpdatedAt: seeded.seen });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await storedTitle(seeded.issue.id)).priority).toBe("high");
     });
   });
 });

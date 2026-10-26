@@ -39,32 +39,6 @@ function cloudTenantWriteDebounceFor(db: Db) {
   }
   return debounce;
 }
-export type AgentApiKeyTouch = {
-  keyId: string;
-  writtenAt: Date;
-  previousLastUsedAt: Date | null;
-};
-
-const agentApiKeyTouches = new WeakMap<Request, AgentApiKeyTouch>();
-
-export function noteAgentApiKeyTouch(req: Request, touch: AgentApiKeyTouch) {
-  agentApiKeyTouches.set(req, touch);
-}
-
-/** Undo this request's last-use write if no later request has touched the key. */
-export async function restoreAgentApiKeyTouch(db: Db, req: Request): Promise<void> {
-  const touch = agentApiKeyTouches.get(req);
-  if (!touch) return;
-  await db
-    .update(agentApiKeys)
-    .set({ lastUsedAt: touch.previousLastUsedAt })
-    .where(and(
-      eq(agentApiKeys.id, touch.keyId),
-      touch.writtenAt
-        ? eq(agentApiKeys.lastUsedAt, touch.writtenAt)
-        : isNull(agentApiKeys.lastUsedAt),
-    ));
-}
 
 function pruneCloudTenantWriteDebounce(
   debounce: Map<string, { fingerprint: string; syncedAt: number }>,
@@ -463,17 +437,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    const previousLastUsedAt = key.lastUsedAt ?? null;
-    const writtenAt = new Date();
     await db
       .update(agentApiKeys)
-      .set({ lastUsedAt: writtenAt })
+      .set({ lastUsedAt: new Date() })
       .where(eq(agentApiKeys.id, key.id));
-    noteAgentApiKeyTouch(req, {
-      keyId: key.id,
-      writtenAt,
-      previousLastUsedAt,
-    });
 
     const agentRecord = await db
       .select()
