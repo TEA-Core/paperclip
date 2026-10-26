@@ -298,8 +298,8 @@ export interface RequestScopedDb {
 /**
  * One dedicated connection for one request, so the request's whole database work (reads, the lock
  * transaction, audit rows) can really be cancelled when its deadline passes. Returns null for a client
- * that was not made by `createDb` (no connection settings to reuse) or that connects through a
- * transaction-mode pooler (`prepare: false`), where a server session cannot be addressed.
+ * that was not made by `createDb` (no connection settings to reuse). Behind a transaction-mode pooler
+ * (`prepare: false`) a server session cannot be addressed, so its queries are tracked and cancelled instead.
  */
 export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits): RequestScopedDb | null {
   const origin = scopeOrigins.get(parent);
