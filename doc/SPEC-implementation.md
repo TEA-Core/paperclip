@@ -282,7 +282,7 @@ agent participant is not its assignee, the board may call
 `expectedPendingParticipantAgentId`. A row-locked compare-and-set refuses
 stale values or any pending interaction, active recovery action, live run,
 checkout/execution lock, unavailable participant, or already-matched assignee
-with 409. It changes only the agent assignee and logs the before/after
+with 409. It changes only the agent assignee (and `updatedAt`) and logs the before/after
 assignment atomically. The status and status version remain
 unchanged (the version advances only when status changes); execution state,
 stage identity, pendingSince, and decisions remain untouched. This operation

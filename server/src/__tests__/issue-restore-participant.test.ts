@@ -99,7 +99,8 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect(result.status).toBe(200);
     const after = await snapshot();
     expect(after.assigneeAgentId).toBe(PARTICIPANT);
-    expect({ ...after, assigneeAgentId: before.assigneeAgentId }).toEqual(before);
+    expect({ ...after, assigneeAgentId: before.assigneeAgentId, updatedAt: before.updatedAt }).toEqual(before);
+    expect(after.updatedAt.getTime()).toBeGreaterThan(before.updatedAt.getTime());
     expect(after.executionState).toEqual(pendingState);
     expect(after.statusVersion).toBe(before.statusVersion); // DB bumps only on status transitions.
     expect(await db.select().from(issueExecutionDecisions)).toEqual(decisionsBefore);
@@ -186,7 +187,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
   });
 
-  it.each(["queued", "running"])("409s on %s live run bound to the issue", async (status) => {
+  it.each(["queued", "running", "scheduled_retry"])("409s on %s live run bound to the issue", async (status) => {
     await seedRun(status, { issueId: ISSUE });
     expect((await post()).status).toBe(409);
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);

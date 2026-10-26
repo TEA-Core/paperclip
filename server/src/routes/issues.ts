@@ -12773,7 +12773,7 @@ export function issueRoutes(
           .from(heartbeatRuns)
           .where(and(
             eq(heartbeatRuns.companyId, issue.companyId),
-            inArray(heartbeatRuns.status, ["queued", "running"]),
+            inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
             or(
               eq(heartbeatRuns.nativeIssueId, issue.id),
               sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
@@ -12783,7 +12783,7 @@ export function issueRoutes(
         if (liveRun) throw conflict("Issue has a live run");
 
         const [restored] = await tx.update(issueRows)
-          .set({ assigneeAgentId: agent.id })
+          .set({ assigneeAgentId: agent.id, updatedAt: new Date() })
           .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId)))
           .returning();
         await logActivityInTransaction(
