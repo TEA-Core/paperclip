@@ -4254,6 +4254,8 @@ export async function publishHeadBoundRelease(
     deadlines?: Partial<ReleaseDeadlines>;
     /** The caller's own end-to-end deadline, when it started the clock earlier (it is combined with `totalMs`). */
     signal?: AbortSignal;
+    /** Cancels the late-landing checks that outlive the answer (their timers are cleared and their requests aborted). */
+    afterAnswerSignal?: AbortSignal;
     /**
      * Re-resolves eligibility and target from the card as it is now. Called inside the publication
      * lock, right before the write, so a cancel, a reversed decision or a retarget after the first
@@ -4424,12 +4426,14 @@ export async function publishHeadBoundRelease(
       delayMs: input.retryDelayMs ?? 1000,
       signal,
     });
+  const afterAnswerClock = () =>
+    AbortSignal.any([AbortSignal.timeout(deadlines.compensationMs), ...(input.afterAnswerSignal ? [input.afterAnswerSignal] : [])]);
   const compensateLateSuccess = (inFlight: Promise<Awaited<ReturnType<typeof writeCommitStatusWithRetry>>>) => {
     void inFlight.then(async (landed) => {
-      if (!landed.success) return;
+      if (!landed.success || input.afterAnswerSignal?.aborted) return;
       const landedId = "statusId" in landed && typeof landed.statusId === "string" ? landed.statusId : null;
       if (landedId !== null && landedId === confirmedStatusId) return;
-      const signal = AbortSignal.timeout(deadlines.compensationMs);
+      const signal = afterAnswerClock();
       const newest = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal });
       const stillNewest = newest.ok
         ? newest.controlPlaneApproved && newest.newest?.release === true && (landedId === null || newest.newest.id === landedId)
@@ -4440,11 +4444,11 @@ export async function publishHeadBoundRelease(
   };
   const recheckAfterNoAnswer = () => {
     for (const delay of [deadlines.fetchMs, deadlines.compensationMs]) {
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         void (async () => {
-          if (confirmedStatusId) return;
+          if (confirmedStatusId || input.afterAnswerSignal?.aborted) return;
           await voiding?.catch(() => undefined);
-          const signal = AbortSignal.timeout(deadlines.compensationMs);
+          const signal = afterAnswerClock();
           const read = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal });
           // Unreadable: fail closed. Otherwise only this release's own unconfirmed success is voided.
           const ours = read.ok
@@ -4453,7 +4457,9 @@ export async function publishHeadBoundRelease(
           if (!ours || confirmedStatusId) return;
           await writeLateVoid(signal);
         })().catch(() => undefined);
-      }, delay).unref();
+      }, delay);
+      timer.unref();
+      input.afterAnswerSignal?.addEventListener("abort", () => clearTimeout(timer), { once: true });
     }
   };
   // The marker CI requires beside a release success (RELEASE_CONFIRMED_CONTEXT). It is written only after
@@ -4523,13 +4529,6 @@ export async function publishHeadBoundRelease(
         })),
         { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
       );
-      // A write that got no answer in time may still be accepted by GitHub later and then sits on top of the
-      // void. Commit statuses have no compare-and-set, so the void cannot be made to outrank it; it is
-      // voided again if it lands (see compensateLateSuccess).
-      if (!write.success && write.status === 0 && inFlight) {
-        compensateLateSuccess(inFlight);
-        recheckAfterNoAnswer();
-      }
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
         const after = await liveRefusal(true);
@@ -4595,6 +4594,13 @@ export async function publishHeadBoundRelease(
         if (write.status === 0) {
           // No answer at all (a timeout, a dropped connection, the deadline): GitHub may still have
           // accepted the write, so the success is voided rather than left for a consumer to find.
+          // GitHub may still accept that write later, and it then sits on top of the void. Commit statuses have no
+          // compare-and-set, so the void cannot be made to outrank it; it is voided again if it lands. Armed only
+          // here, where the release ends on the write, never for a failure the loop goes on to retry.
+          if (inFlight) {
+            compensateLateSuccess(inFlight);
+            recheckAfterNoAnswer();
+          }
           const outcome = await voidSuccess("the release's status write did not answer");
           return { kind: "failed", message: `status:failed:status_write: ${write.error ?? "no answer"}; the status may have been written; ${outcome}` };
         }
