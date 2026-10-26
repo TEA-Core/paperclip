@@ -6,6 +6,7 @@ import {
   issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
   issues as issuesTable,
+  issueWorkProducts as issueWorkProductsTable,
   labels as labelsTable,
 } from "@paperclipai/db";
 import {
@@ -147,7 +148,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -203,6 +204,13 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
     then: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
   };
+  // Tier-1 landed-at-tip proof reads recorded pull-request work products;
+  // dispatch by table identity, empty by default.
+  const workProductsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+    then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -238,6 +246,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
+        if (table === issueWorkProductsTable) return workProductsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -6032,6 +6041,173 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.skipped).toBe(false);
       expect(result.skipReason).toBeNull();
       expect(result.reason).not.toContain("transition allowed");
+    });
+
+    // A merged pull-request work product records the repository its delivery
+    // actually landed in. When that repository differs from the project's
+    // repository (project bound to an agent-tools repository, implementation
+    // merged into the platform repository), the recorded repository is
+    // authoritative — the named merge commit is verified against that
+    // repository's own default branch, never against the project repo.
+    describe("external work-product repository", () => {
+      const EXTERNAL_SHA = "ce6f6ecfdb703ff3a0ead248c0b6abf2c7252485";
+      const agentToolsWorkspaceRow = (repoUrl: string) =>
+        mockExecutionWorkspaceRow({ repoUrl, baseRef: "main", branchName: "external-work" });
+
+      function mergedProduct(metadata: Record<string, unknown>, status = "merged") {
+        return {
+          status,
+          metadata: {
+            repository: "TEA-Core/paperclip",
+            prNumber: "1005",
+            baseRef: "fold/tea-patches-v2026.722.0",
+            mergeCommitSha: EXTERNAL_SHA,
+            mergedAt: "2026-10-26T18:00:20Z",
+            ...metadata,
+          },
+          isPrimary: true,
+          updatedAt: new Date("2026-10-26T18:33:38.745Z"),
+        };
+      }
+
+      function runLandedDeclaration(sha: string) {
+        return evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${sha}.`),
+          null,
+          () => Promise.resolve([]),
+        );
+      }
+
+      function mockExternalGitHub(aheadBy: number) {
+        ghFetchMock.mockImplementation(async (url: string) => {
+          const u = String(url);
+          if (u.endsWith("/repos/TEA-Core/paperclip")) {
+            return new Response(JSON.stringify({ default_branch: "main" }), { status: 200 });
+          }
+          if (u.includes("/compare/")) {
+            return new Response(JSON.stringify({ ahead_by: aheadBy }), { status: 200 });
+          }
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+      }
+
+      function compareUrls() {
+        return ghFetchMock.mock.calls.map(([url]) => String(url)).filter((u) => u.includes("/compare/"));
+      }
+
+      it("verifies landed-at-tip against the external work-product repository", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({})],
+        });
+        mockExternalGitHub(0);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+        const urls = compareUrls();
+        expect(urls).toHaveLength(1);
+        expect(urls[0]).toContain("/repos/TEA-Core/paperclip/compare/main...");
+        expect(urls[0]).toContain(encodeURIComponent(EXTERNAL_SHA));
+        expect(urls.some((u) => u.includes("paperclip-agent-tools"))).toBe(false);
+      });
+
+      it("external product is ignored when its recorded repository is the project repository", async () => {
+        setupDbMock({
+          executionWorkspaces: [mockExecutionWorkspaceRow()],
+          issueWorkProducts: [mergedProduct({ mergeCommitSha: MERGE_SHA })],
+        });
+        compareAhead(0);
+        const result = await runLandedDeclaration(MERGE_SHA);
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+        const urls = compareUrls();
+        expect(urls).toHaveLength(1);
+        // Same-repository path: the project repo's own default ref, no /repos lookup.
+        expect(urls[0]).toContain("fold%2Ftea-patches-v2026.722.0");
+        expect(ghFetchMock.mock.calls.map(([url]) => String(url)).some((u) => u.endsWith("/repos/TEA-Core/paperclip"))).toBe(false);
+      });
+
+      it("non-merged external products are not authoritative; existing refusal is preserved", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({}, "ready_for_review")],
+        });
+        // The project repo is queried (no external branch): the named commit is
+        // not an ancestor of its default branch, so the legacy refusal stands.
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain(EXTERNAL_SHA);
+        expect(result.reason).toContain("ancestor");
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+      });
+
+      it("a merged product whose merge commit differs from the declaration is not authoritative", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({ mergeCommitSha: STRANGER_SHA })],
+        });
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("ancestor");
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+      });
+
+      it("a merged product without a merged-at marker is not authoritative", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({ mergedAt: undefined })],
+        });
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+      });
+
+      it("a merged product with a malformed repository is not authoritative", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({ repository: "https://github.com/TEA-Core/paperclip" })],
+        });
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+      });
+
+      it("refuses when the external repository's default branch cannot be resolved", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({})],
+        });
+        ghFetchMock.mockResolvedValue(new Response(JSON.stringify({}), { status: 404 }));
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("TEA-Core/paperclip");
+        expect(compareUrls()).toHaveLength(0);
+      });
+
+      it("refuses when the named commit is not an ancestor of the external default branch", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({})],
+        });
+        mockExternalGitHub(3);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain(EXTERNAL_SHA);
+        expect(result.reason).toContain("TEA-Core/paperclip");
+        expect(result.reason).toContain("ancestor");
+      });
     });
   });
 
