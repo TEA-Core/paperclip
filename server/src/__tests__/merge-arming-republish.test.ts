@@ -3102,6 +3102,66 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       }, 20_000);
     });
 
+    describe("a status write aborted locally that GitHub accepts later", () => {
+      const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]" };
+      type Landed = { id: number; context: string; state: string; description: string; creator: typeof CONTROL_PLANE };
+      function abortedFirstSuccess() {
+        const landed: Landed[] = [];
+        let counter = 100;
+        let aborted: { description: string } | null = null;
+        let abortedOnce = false;
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+            return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+          }
+          if (url.includes("/statuses/") && init?.method === "POST") {
+            const body = JSON.parse(String(init.body));
+            if (body.context !== "paperclip/approved") return createMockResponse({ id: 99 }, true, 201);
+            if (body.state === "success" && !abortedOnce) {
+              abortedOnce = true;
+              aborted = { description: body.description };
+              await new Promise((_, reject) => init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+            }
+            counter += 1;
+            landed.unshift({ id: counter, context: body.context, state: body.state, description: body.description, creator: CONTROL_PLANE });
+            return createMockResponse({ id: counter }, true, 201);
+          }
+          if (url.includes("/statuses/")) return createMockResponse(landed);
+          throw new Error(`Unexpected release request: ${url}`);
+        });
+        const land = (description?: string) => {
+          counter += 1;
+          landed.unshift({ id: counter, context: "paperclip/approved", state: "success", description: description ?? aborted!.description, creator: CONTROL_PLANE });
+        };
+        return { landed, land };
+      }
+
+      it("voids the release's own success that lands on top of the void after the abort", async () => {
+        const { companyId } = await seedReleasable();
+        const { landed, land } = abortedFirstSuccess();
+
+        const outcome = await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 1000 }, retryDelayMs: 10 });
+        expect(outcome.kind).toBe("failed");
+        expect(landed[0]?.state).toBe("failure");
+
+        land();
+        expect(landed[0]?.state).toBe("success");
+        expect(await eventually(async () => landed[0]?.state === "failure")).toBe(true);
+        expect(markerWrites()).toEqual([]);
+      }, 20_000);
+
+      it("leaves a landed status with another description alone", async () => {
+        const { companyId } = await seedReleasable();
+        const { landed, land } = abortedFirstSuccess();
+
+        await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 600 }, retryDelayMs: 10 });
+        land("released by user:other");
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+
+        expect(landed.map((status) => status.state)).toEqual(["success", "failure"]);
+      }, 20_000);
+    });
+
     it("applies statement, lock and idle-in-transaction timeouts to the lock connection", async () => {
       const { companyId } = await seedReleasable();
       installReleaseTransport();

@@ -3536,8 +3536,8 @@ interface HeadStatusRead {
   ok: boolean;
   approved: boolean;
   controlPlaneApproved: boolean;
-  /** The newest status, when it is a control-plane success: its id, and whether it is a board release. */
-  newest: { id: string | null; release: boolean } | null;
+  /** The newest status, when it is a control-plane success: its id, whether it is a board release, and its description. */
+  newest: { id: string | null; release: boolean; description: string | null } | null;
   /** Ids of the release statuses the control plane has marked confirmed on this head (see RELEASE_CONFIRMED_CONTEXT). */
   confirmedMarkers: string[];
   status: number;
@@ -3598,7 +3598,7 @@ async function fetchHeadCommitStatusesOnce(
       controlPlaneApproved = status.state === "success" && String(creator?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID;
       const id = status.id === undefined || status.id === null ? null : String(status.id);
       const release = isHeadBoundReleaseDescription(status.description);
-      if (controlPlaneApproved) newest = { id, release };
+      if (controlPlaneApproved) newest = { id, release, description: typeof status.description === "string" ? status.description : null };
       // Strict reading, for deciding whether to arm a merge: only the NEWEST paperclip/approved status
       // counts (a later failure revokes an earlier success), it must have been written by the control
       // plane (a success from any other identity is a forgery, not a stamp), and a board release counts
@@ -4409,10 +4409,21 @@ export async function publishHeadBoundRelease(
       if (voided.success) statusMayExist = false;
       return voided.success ? "it was voided by a failure status" : `it could NOT be voided (${voided.error ?? `HTTP ${voided.status}`}), and is not consumable without a recorded confirmation`;
     })());
-  // The one thing that may still happen after the answer: a status write the release gave up on lands as a
-  // success (answered late). If it is then still the newest status of the head and this release never
-  // confirmed it, a failure is written over it, once, on a clock of its own. Residuals: the time between the
-  // late landing and that failure, and a process that ends before it.
+  // The only things that may still happen after the answer: a status write the release gave up on lands as a
+  // success on top of the void. If it is then still the newest status of the head and this release never
+  // confirmed it, a failure is written over it, once, on a clock of its own. Two triggers: the write answers
+  // late with a success (compensateLateSuccess), or it ended with no answer, e.g. an aborted request that
+  // GitHub nevertheless accepted (recheckAfterNoAnswer: the head is read again after `fetchMs` and
+  // `compensationMs`). Residuals: the time until the landing is seen, a process that ends before it, and a
+  // concurrent release of the same user with the same description that could be voided again (availability only).
+  const writeLateVoid = (signal: AbortSignal) =>
+    writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+      description: "voided: a status write the release had given up on landed after it",
+      state: "failure",
+      attempts: 2,
+      delayMs: input.retryDelayMs ?? 1000,
+      signal,
+    });
   const compensateLateSuccess = (inFlight: Promise<Awaited<ReturnType<typeof writeCommitStatusWithRetry>>>) => {
     void inFlight.then(async (landed) => {
       if (!landed.success) return;
@@ -4424,14 +4435,26 @@ export async function publishHeadBoundRelease(
         ? newest.controlPlaneApproved && newest.newest?.release === true && (landedId === null || newest.newest.id === landedId)
         : true; // unreadable: fail closed
       if (!stillNewest) return;
-      await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
-        description: "voided: a status write the release had given up on landed after it",
-        state: "failure",
-        attempts: 2,
-        delayMs: input.retryDelayMs ?? 1000,
-        signal,
-      });
+      await writeLateVoid(signal);
     }).catch(() => undefined);
+  };
+  const recheckAfterNoAnswer = () => {
+    for (const delay of [deadlines.fetchMs, deadlines.compensationMs]) {
+      setTimeout(() => {
+        void (async () => {
+          if (confirmedStatusId) return;
+          await voiding?.catch(() => undefined);
+          const signal = AbortSignal.timeout(deadlines.compensationMs);
+          const read = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal });
+          // Unreadable: fail closed. Otherwise only this release's own unconfirmed success is voided.
+          const ours = read.ok
+            ? read.newest?.release === true && read.newest.description === input.description && read.newest.id !== confirmedStatusId
+            : true;
+          if (!ours || confirmedStatusId) return;
+          await writeLateVoid(signal);
+        })().catch(() => undefined);
+      }, delay).unref();
+    }
   };
   // The marker CI requires beside a release success (RELEASE_CONFIRMED_CONTEXT). It is written only after
   // the confirmation is committed, on the compensation clock.
@@ -4503,7 +4526,10 @@ export async function publishHeadBoundRelease(
       // A write that got no answer in time may still be accepted by GitHub later and then sits on top of the
       // void. Commit statuses have no compare-and-set, so the void cannot be made to outrank it; it is
       // voided again if it lands (see compensateLateSuccess).
-      if (!write.success && write.status === 0 && inFlight) compensateLateSuccess(inFlight);
+      if (!write.success && write.status === 0 && inFlight) {
+        compensateLateSuccess(inFlight);
+        recheckAfterNoAnswer();
+      }
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
         const after = await liveRefusal(true);
