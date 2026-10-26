@@ -1,5 +1,6 @@
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
@@ -7,7 +8,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -913,6 +914,48 @@ describeEmbeddedPostgres("native runner restart recovery with real processes", (
       await stopOwnedProcessGroup(pid, stateDirectory).catch(() => undefined);
     }
   });
+
+  it("retries a run-row lock timeout rather than failing the restart recovery pass", async () => {
+    const fixture = await seedRun("LOCK-RETRY");
+    let signalLocked!: (pid: number) => void;
+    let releaseRun!: () => void;
+    const locked = new Promise<number>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseRun = resolve; });
+    const holder = fixture.db.transaction(async (tx) => {
+      const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid()::int as pid`);
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+      signalLocked(connection!.pid);
+      await release;
+    });
+    const holderPid = await locked;
+    const recovering = claimNativeRestartRecoveries({
+      db: fixture.db, controller: successor, restartKind: "hard", runIds: [fixture.runId],
+    });
+    let waitedForRun = false;
+    try {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await fixture.db.execute<{ waiting: boolean }>(sql`
+          select exists (
+            select 1 from pg_stat_activity
+            where datname = current_database() and pid <> pg_backend_pid()
+              and ${holderPid} = any(pg_blocking_pids(pid))
+          ) as waiting
+        `);
+        if (row?.waiting) { waitedForRun = true; break; }
+        await delay(25);
+      }
+      // The first 1s lock budget expires while the holder is still active.
+      if (waitedForRun) await delay(1100);
+    } finally {
+      releaseRun();
+      await holder;
+    }
+    expect(waitedForRun).toBe(true);
+    expect(await recovering).toMatchObject([
+      { kind: "bootstrap_incomplete", runId: fixture.runId },
+    ]);
+  }, 20_000);
 
   it("allows only one of two concurrent successor controllers to claim a dead session", async () => {
     const fixture = await seedRun("CONCURRENT");

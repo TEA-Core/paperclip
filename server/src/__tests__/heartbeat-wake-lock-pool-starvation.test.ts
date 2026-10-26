@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agentTaskSessions,
   agentWakeupRequests,
@@ -158,6 +158,57 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
     });
 
     expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
+  }, 30_000);
+
+  it("serializes a nested-only issue wake with the issue row before queuing a run", async () => {
+    const seed = await seedAgent("nested");
+    const issueId = await seedIssue(seed);
+    const { wake } = onePool();
+    let signalLocked!: (pid: number) => void;
+    let releaseIssue!: () => void;
+    const locked = new Promise<number>((resolveLocked) => { signalLocked = resolveLocked; });
+    const release = new Promise<void>((resolveRelease) => { releaseIssue = resolveRelease; });
+    const holder = setupDb.transaction(async (tx) => {
+      const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid()::int as pid`);
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      signalLocked(connection!.pid);
+      await release;
+    });
+    const holderPid = await locked;
+    const waking = wake(seed.agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      contextSnapshot: { paperclipIssue: { id: issueId } },
+    });
+    let waitedForIssue = false;
+    let queuedBeforeRelease = false;
+    try {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await setupDb.execute<{ waiting: boolean }>(sql`
+          select exists (
+            select 1 from pg_stat_activity
+            where datname = current_database() and pid <> pg_backend_pid()
+              and ${holderPid} = any(pg_blocking_pids(pid))
+          ) as waiting
+        `);
+        if (row?.waiting) { waitedForIssue = true; break; }
+        await sleep(25);
+      }
+      queuedBeforeRelease = (await setupDb.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, seed.companyId))).length > 0;
+    } finally {
+      releaseIssue();
+      await holder;
+    }
+    const result = await waking;
+    expect({ waitedForIssue, queuedBeforeRelease }).toEqual({
+      waitedForIssue: true, queuedBeforeRelease: false,
+    });
+    expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
+    const [queued] = await setupDb.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, "runId" in result ? result.runId! : ""));
+    expect(queued?.contextSnapshot).toMatchObject({
+      issueId, paperclipIssue: { id: issueId },
+    });
   }, 30_000);
 
   it("admits a wake with no issue without reading the responsible user through the pool", async () => {

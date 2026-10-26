@@ -526,7 +526,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     });
     await locked;
     const restoring = Promise.resolve(post());
-    let response: { status: number; body: unknown } | null = null;
+    let response: { status: number; body: { details?: { code?: string; retryable?: boolean } }; headers: Record<string, string> } | null = null;
     try {
       response = await Promise.race([restoring, delay(1500).then(() => null)]);
     } finally {
@@ -534,7 +534,11 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
       await blocker;
       await restoring;
     }
-    expect(response?.status).toBe(409);
+    expect(response).toMatchObject({
+      status: 409,
+      headers: { "retry-after": "1" },
+      body: { details: { code: "participant_restore_lock_busy", retryable: true } },
+    });
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
     expect(await audit()).toHaveLength(0);
   });

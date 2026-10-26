@@ -8066,6 +8066,16 @@ function enrichWakeContextSnapshot(input: {
   const issueIdFromPayload =
     readNonEmptyString(payload?.["issueId"]) ??
     readNonEmptyString(payload?.["taskId"]);
+  const topLevelIssueId = readNonEmptyString(contextSnapshot.issueId);
+  // A nested-only binding must take the same issue-row lock as an explicit
+  // issueId; otherwise this wake can queue a run during participant restoration.
+  if (!topLevelIssueId && !issueIdFromPayload) {
+    const nestedIssue = contextSnapshot.paperclipIssue;
+    if (nestedIssue && typeof nestedIssue === "object" && "id" in nestedIssue) {
+      const nestedIssueId = readNonEmptyString(nestedIssue.id);
+      if (nestedIssueId) contextSnapshot.issueId = nestedIssueId;
+    }
+  }
   const commentIdFromPayload = readNonEmptyString(payload?.["commentId"]);
   const taskKey = deriveTaskKey(contextSnapshot, payload);
   const wakeCommentId = deriveCommentId(contextSnapshot, payload);
@@ -8077,7 +8087,7 @@ function enrichWakeContextSnapshot(input: {
   if (!readNonEmptyString(contextSnapshot["wakeReason"]) && reason) {
     contextSnapshot.wakeReason = reason;
   }
-  if (!readNonEmptyString(contextSnapshot["issueId"]) && issueIdFromPayload) {
+  if (!topLevelIssueId && issueIdFromPayload) {
     contextSnapshot.issueId = issueIdFromPayload;
   }
   if (!readNonEmptyString(contextSnapshot["taskId"]) && issueIdFromPayload) {

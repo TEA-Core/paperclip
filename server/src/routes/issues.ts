@@ -12729,7 +12729,7 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
 
       const updated = await db.transaction(async (tx) => {
-        // Yield before native restart recovery's 1s lock timeout on inverse lock order.
+        // Bound restore's run-then-issue lock wait; restart recovery retries lock conflicts.
         await tx.execute(sql`set local lock_timeout = '250ms'`);
         // Finalizers can lock a run row before its issue row; preserve that order.
         const liveRunPredicate = and(
@@ -12893,7 +12893,11 @@ export function issueRoutes(
           cause = "cause" in cause ? cause.cause : null
         ) {
           if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) {
-            throw conflict("Issue is busy; retry participant restoration");
+            res.setHeader("Retry-After", "1");
+            throw conflict("Issue is busy; retry participant restoration", {
+              code: "participant_restore_lock_busy",
+              retryable: true,
+            });
           }
         }
         throw error;

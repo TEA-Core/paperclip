@@ -478,7 +478,7 @@ export async function claimNativeRestartRecoveries(input: {
     // transitions the run into "failed". Read after the transaction
     // commits, so a rolled-back write never reports a false failure.
     let terminalRunToReport: typeof heartbeatRuns.$inferSelect | null = null;
-    const disposition = await input.db.transaction(async (tx) => {
+    const claimCandidate = () => input.db.transaction(async (tx) => {
       await tx.execute(
         sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
       );
@@ -966,6 +966,22 @@ export async function claimNativeRestartRecoveries(input: {
         kind: claimKind,
         ...common,
       } satisfies NativeRestartRecoveryClaim;
+    });
+    // Restore can hold a run row while its own 250ms issue-row wait expires.
+    // A recovery lock timeout can precede that expiry; retry with a fresh
+    // transaction so startup does not fail over this bounded contention.
+    const disposition = await claimCandidate().catch(async (error: unknown) => {
+      for (
+        let cause: unknown = error;
+        cause && typeof cause === "object";
+        cause = "cause" in cause ? cause.cause : null
+      ) {
+        if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) {
+          terminalRunToReport = null;
+          return claimCandidate();
+        }
+      }
+      throw error;
     });
     if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport);
     dispositions.push(disposition);

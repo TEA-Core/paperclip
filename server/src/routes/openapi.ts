@@ -4006,11 +4006,13 @@ registry.registerPath({
     "memberships, fixed conversation identities, external chat channel bindings, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
     "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
     "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
-    "Native restart recovery uses the opposite issue-then-run order; the repair's 250ms lock timeout " +
-    "returns retryable 409 on a lock timeout or deadlock. It rechecks live runs after the issue lock " +
-    "and before changing the assignee, but a run inserted after that final check without the issue-row " +
-    "lock remains a race. Only the assignee and updatedAt change; status, statusVersion, executionState, " +
-    "decision history and pendingSince remain unchanged. Does not wake or re-arm the stage.",
+    "Native restart recovery uses the opposite issue-then-run order and retries a lock timeout or " +
+    "deadlock once in a fresh transaction; the repair's 250ms lock timeout returns 409 with " +
+    "details.code=participant_restore_lock_busy, details.retryable=true, and Retry-After: 1. Nested-only " +
+    "paperclipIssue.id heartbeat wakes acquire the issue-row lock. Other writers (raw serving-role SQL " +
+    "inserts, self-declared runs, and recovery scheduled_retry inserts) may race after the final live-run " +
+    "check without that lock. Only the assignee and updatedAt change; status, statusVersion, " +
+    "executionState, decision history and pendingSince remain unchanged. Does not wake or re-arm the stage.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(z.object({
@@ -4026,7 +4028,20 @@ registry.registerPath({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
-    409: r.conflict,
+    409: {
+      description: "Conflict. A restore lock timeout (55P03) or deadlock (40P01) returns details.code=participant_restore_lock_busy, details.retryable=true and Retry-After: 1; other eligibility conflicts are not automatically retryable.",
+      headers: {
+        "Retry-After": { description: "One second; present only on a restore lock timeout or deadlock.", schema: { type: "integer", minimum: 1 } },
+      },
+      content: {
+        "application/json": {
+          schema: z.object({
+            error: z.string(),
+            details: z.object({ code: z.string().optional(), retryable: z.boolean().optional() }).passthrough().optional(),
+          }),
+        },
+      },
+    },
   },
 });
 
