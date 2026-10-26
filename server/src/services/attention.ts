@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -50,6 +50,7 @@ import type {
 import { badRequest } from "../errors.js";
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
 import { budgetService } from "./budgets.js";
+import { TIMER_DISPATCH_PARK_RECOVERY_CAUSE, TIMER_DISPATCH_PARK_RECOVERY_KIND } from "./recovery/stranded-notice.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
   BLOCKER_ATTENTION_MAX_NODES,
@@ -1392,7 +1393,13 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         .where(and(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.status, [...OPEN_RECOVERY_STATUSES]),
-          inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
+          or(
+            inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
+            and(
+              eq(issueRecoveryActions.kind, TIMER_DISPATCH_PARK_RECOVERY_KIND),
+              eq(issueRecoveryActions.cause, TIMER_DISPATCH_PARK_RECOVERY_CAUSE),
+            ),
+          ),
         ))
         .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
       const [recoveryIssueMap, recoveryImageMap] = await Promise.all([
@@ -1430,14 +1437,16 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           },
           whyNow: recovery.status === "escalated"
             ? "Recovery action escalated to a human owner."
-            : "Recovery action is assigned to a human owner.",
+            : recovery.ownerType === "agent"
+              ? "Parked with no live continuation path; its assignee must finish, link a blocker, arm a monitor, or reassign."
+              : "Recovery action is assigned to a human owner.",
           decisionVerbs: decisionVerbs(
             { id: "resolve", label: "Resolve", description: "Record the recovery outcome." },
             { id: "reassign", label: "Reassign", description: "Move the recovery to another owner." },
             { id: "cancel", label: "Cancel", description: "Cancel the recovery action." },
           ),
           inlineResolvable: false,
-          entryRule: "issue_recovery_actions.status in ('active','escalated') and owner_type in ('user','board')",
+          entryRule: "issue_recovery_actions.status in ('active','escalated') and (owner_type in ('user','board') or kind = 'issue_graph_liveness' and cause = 'in_progress_without_live_continuation_path')",
           exitRule: "Recovery action resolves, is cancelled, or moves back to an agent/system owner.",
           dedupKey,
           severity: recovery.status === "escalated" ? "high" : "medium",

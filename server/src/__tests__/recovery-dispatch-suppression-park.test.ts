@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  agentWakeupRequests,
   activityLog,
   agents,
   companies,
   createDb,
+  heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueRelations,
+  issueWatchdogs,
   issues,
 } from "@paperclipai/db";
 import {
@@ -19,13 +23,12 @@ import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
+import { attentionService } from "../services/attention.ts";
 import { recoveryService } from "../services/recovery/service.ts";
-import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   TIMER_DISPATCH_SUPPRESSED_ACTION,
   buildTimerDispatchSuppressionDetails,
 } from "../services/issue-continuation-path.ts";
-import { buildDispatchSuppressionParkNotice } from "../services/recovery/stranded-notice.ts";
 
 // loadConfig() in recovery/service.ts validates bind mode eagerly.
 process.env.PAPERCLIP_BIND = "loopback";
@@ -41,7 +44,6 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-const SUSTAINED_WINDOW_MS = 2 * 60 * 60 * 1000;
 
 const TRUNCATE_ALL_SQL = `
   TRUNCATE TABLE
@@ -218,12 +220,28 @@ describeEmbeddedPostgres("recovery reconcileDispatchSuppressionParks", () => {
     expect((await readIssue(issueId))?.status).toBe("blocked");
     expect(await countActivity(PARKED_ACTION, issueId)).toBe(1);
     expect(await countParkNotices(issueId)).toBe(1);
+    const firstActions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(firstActions).toHaveLength(1);
+    expect(firstActions[0]).toMatchObject({
+      kind: "issue_graph_liveness",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+    });
+    for (const cure of ["finish", "link a blocker or interaction", "arm a monitor", "reassign"]) {
+      expect(firstActions[0]?.nextAction).toContain(cure);
+    }
 
     // Re-run: the card is now blocked, so it is no longer an in_progress candidate.
     const second = await svc.reconcileDispatchSuppressionParks({ now: new Date() });
     expect(second.parked).toBe(0);
     expect(await countActivity(PARKED_ACTION, issueId)).toBe(1);
     expect(await countParkNotices(issueId)).toBe(1);
+    const secondActions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(secondActions).toHaveLength(1);
+    expect(secondActions[0]?.status).toBe("active");
   });
 
   it("never parks a card that still has a live continuation path", async () => {
@@ -242,6 +260,17 @@ describeEmbeddedPostgres("recovery reconcileDispatchSuppressionParks", () => {
     expect(await countActivity(PARKED_ACTION, issueId)).toBe(0);
   });
 
+  it("does not park when a watchdog restores continuation after suppression", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedSuppressedCard({ companyId, agentId });
+    await db.insert(issueWatchdogs).values({ companyId, issueId, watchdogAgentId: agentId });
+    const result = await recovery().reconcileDispatchSuppressionParks({ now: new Date() });
+    expect(result.parked).toBe(0);
+    expect((await readIssue(issueId))?.status).toBe("in_progress");
+    expect(await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+  });
+
   it("does not park a suppressed card before the sustained window elapses", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedSuppressedCard({
@@ -258,74 +287,148 @@ describeEmbeddedPostgres("recovery reconcileDispatchSuppressionParks", () => {
     expect((await readIssue(issueId))?.status).toBe("in_progress");
   });
 
-  it("escalates a parked card onto the board surface via the existing sweep, exactly once", async () => {
+  it("keeps the agent-owned park distinct from generic blockerless escalation", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedSuppressedCard({ companyId, agentId });
     const svc = recovery();
-
     await svc.reconcileDispatchSuppressionParks({ now: new Date() });
     const parked = await readIssue(issueId);
-    expect(parked?.status).toBe("blocked");
-
-    const sweepNow = new Date(parked!.updatedAt.getTime() + 16 * 60 * 1000);
-    const escalation = await svc.reconcileBlockedWithoutBlockers({ now: sweepNow });
-    expect(escalation.escalated).toBe(1);
-    expect(escalation.issueIds).toEqual([issueId]);
-
-    const actions = await db
-      .select({
-        kind: issueRecoveryActions.kind,
-        status: issueRecoveryActions.status,
-        ownerType: issueRecoveryActions.ownerType,
-      })
-      .from(issueRecoveryActions)
+    const result = await svc.reconcileBlockedWithoutBlockers({
+      now: new Date(parked!.updatedAt.getTime() + 16 * 60 * 1000),
+    });
+    expect(result.escalated).toBe(0);
+    const actions = await db.select().from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(actions[0]).toMatchObject({
-      kind: "blocked_without_blockers",
-      status: "active",
-      ownerType: "board",
-    });
-
-    // A second pass dedupes on the active board action.
-    const again = await svc.reconcileBlockedWithoutBlockers({
-      now: new Date(parked!.updatedAt.getTime() + 20 * 60 * 1000),
-    });
-    expect(again.escalated).toBe(0);
-    expect(again.alreadyActionedSkipped).toBe(1);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ kind: "issue_graph_liveness", ownerAgentId: agentId });
   });
 
-  it("heals a parked card through the existing _healed path when auto-heal is enabled", async () => {
+  it("does not cancel another issue-graph recovery cause", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedSuppressedCard({
+      companyId, agentId, monitorNextCheckAtMsFromNow: 60_000,
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "issue_graph_liveness",
+      status: "active", ownerType: "agent", ownerAgentId: agentId,
+      cause: "other_liveness_problem", fingerprint: `other:${issueId}`,
+      nextAction: "Inspect other liveness problem.",
+    });
+    await recovery().reconcileDispatchSuppressionParks({ now: new Date() });
+    const [action] = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action?.status).toBe("active");
+  });
+
+  it("cancels the park action when a future monitor restores a live continuation path", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedSuppressedCard({ companyId, agentId });
     const svc = recovery();
-
     await svc.reconcileDispatchSuppressionParks({ now: new Date() });
-    const parked = await readIssue(issueId);
-    expect(parked?.status).toBe("blocked");
-
-    await instanceSettingsService(db).updateGeneral({ enableBlockedWithoutBlockersAutoHeal: true });
-    const sweepNow = new Date(parked!.updatedAt.getTime() + 16 * 60 * 1000);
-    const result = await svc.reconcileBlockedWithoutBlockers({ now: sweepNow });
-    expect(result.healed).toBe(1);
-    expect((await readIssue(issueId))?.status).toBe("todo");
-    expect(await countActivity("issue.blocked_without_blockers_healed", issueId)).toBe(1);
+    await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, issueId));
+    await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+    const actions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+    await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+    expect(await countActivity("issue.dispatch_suppression_park_cancelled", issueId)).toBe(1);
   });
-});
 
-describe("buildDispatchSuppressionParkNotice", () => {
-  it("names the failing §2a disjuncts and a concrete unblock action", () => {
-    const notice = buildDispatchSuppressionParkNotice({
-      disjuncts: ALL_FALSE_DISJUNCTS,
-      identifier: "SUP-1",
-      assignee: { id: "agent-1", name: "Coder" },
+  it.each(["active run", "stamped queued run", "watchdog", "scheduled retry", "handoff wake"] as const)(
+    "cancels the parked action when a %s restores continuation",
+    async (path) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedSuppressedCard({ companyId, agentId });
+      const svc = recovery();
+      await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+      if (path === "watchdog") {
+        await db.insert(issueWatchdogs).values({ companyId, issueId, watchdogAgentId: agentId });
+      } else if (path === "handoff wake") {
+        await db.insert(activityLog).values({
+          companyId, actorType: "system", actorId: "system", action: "issue.successful_run_handoff_required",
+          entityType: "issue", entityId: issueId, details: {},
+        });
+        await db.insert(agentWakeupRequests).values({
+          companyId, agentId, source: "test", status: "queued", payload: { issueId },
+        });
+      } else if (path === "stamped queued run") {
+        const [run] = await db.insert(heartbeatRuns).values({
+          companyId, agentId, status: "queued",
+        }).returning({ id: heartbeatRuns.id });
+        await db.update(issues).set({ executionRunId: run!.id }).where(eq(issues.id, issueId));
+      } else {
+        await db.insert(heartbeatRuns).values({
+          companyId, agentId, status: path === "active run" ? "running" : "scheduled_retry",
+          contextSnapshot: { issueId },
+          ...(path === "scheduled retry" ? { scheduledRetryReason: "test" } : {}),
+        });
+      }
+      await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+      const [action] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(action).toMatchObject({ kind: "issue_graph_liveness", status: "cancelled" });
+    },
+  );
+
+  it("surfaces the agent-owned park action in board attention", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedSuppressedCard({ companyId, agentId });
+    await recovery().reconcileDispatchSuppressionParks({ now: new Date() });
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const item = feed.items.find((row) =>
+      row.sourceKind === "recovery_action" && row.subject.metadata?.sourceIssueId === issueId);
+    expect(item).toBeTruthy();
+    expect(item?.subject.metadata).toMatchObject({
+      kind: "issue_graph_liveness",
+      cause: "in_progress_without_live_continuation_path",
+      ownerType: "agent",
     });
-    expect(notice.body).toContain("SUP-1");
-    expect(notice.body).toContain(NOTICE_MARKER);
-    expect(notice.body).toContain("no active or queued run");
-    expect(notice.body).toContain("Unblock it by");
-    expect(notice.body).toContain("monitor next check");
-    expect(notice.presentation).toMatchObject({ kind: "system_notice", tone: "danger" });
-    expect(JSON.stringify(notice.metadata.sections)).toContain("Unblock owner");
-    expect(JSON.stringify(notice.metadata.sections)).toContain("agent-1");
   });
+
+  it("cancels the park action when the issue returns to in_progress, so it can be re-parked later", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedSuppressedCard({ companyId, agentId });
+    const svc = recovery();
+    await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+    const actions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+  });
+
+  it.each(["done", "reassigned", "blocker linked"] as const)(
+    "cancels the park action when the %s cure is applied",
+    async (cure) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedSuppressedCard({ companyId, agentId });
+      const svc = recovery();
+      await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+      if (cure === "done") {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      } else if (cure === "reassigned") {
+        const otherAgentId = randomUUID();
+        await db.insert(agents).values({
+          id: otherAgentId, companyId, name: "Other", role: "engineer", status: "active",
+          adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        });
+        await db.update(issues).set({ assigneeAgentId: otherAgentId }).where(eq(issues.id, issueId));
+      } else {
+        const blockerId = randomUUID();
+        await db.insert(issues).values({
+          id: blockerId, companyId, title: "Blocker", status: "todo", priority: "low",
+        });
+        await db.insert(issueRelations).values({
+          companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks",
+        });
+      }
+      await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+      const [action] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(action).toMatchObject({ kind: "issue_graph_liveness", status: "cancelled" });
+    },
+  );
 });

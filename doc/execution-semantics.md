@@ -526,6 +526,19 @@ A healthy active-work state means at least one of these is true:
 
 An agent-owned `in_progress` issue is stalled when it has no active run, no queued continuation, no persisted monitor, and no explicit recovery surface. An unmanaged local/background watcher does not satisfy any of those conditions. A Paperclip-tracked run that is still running but silent is not automatically stalled; it is handled by the active-run watchdog contract.
 
+When timer dispatch has been suppressed for a sustained two-hour window because
+none of the six continuation paths is live, Paperclip parks the `in_progress`
+issue as `blocked` and opens one source-scoped `issue_graph_liveness`
+recovery action with cause `in_progress_without_live_continuation_path`,
+owned by its assignee. The action asks the owner to finish,
+link a blocker or interaction, arm a monitor, or reassign. This is not a
+`blocked_without_blockers` board escalation or an automatic retry; the open
+action is listed in board attention instead. Periodic reconciliation cancels the
+action when the issue leaves `blocked`, is reassigned, gains an unresolved
+blocker or pending interaction, or a live run, future monitor, active task
+watchdog, scheduled retry, or live successful-run handoff restores a path;
+the action itself cannot satisfy its own restoration check.
+
 ### `in_review`
 
 This is review/approval state: execution is paused because the next move belongs to a reviewer, approver, board user, or recovery owner.
