@@ -626,7 +626,7 @@ export function createDoneCloseLandingBackstopService(
 
     for (const pr of prs) {
       const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
-      if (alreadyFailed.has(prKey)) continue;
+      if (alreadyFailed.has(prKey) || alreadyConfirmed.has(prKey)) continue;
 
       if (!deps.resolver) {
         counts.deferred += 1;
@@ -681,9 +681,12 @@ export function createDoneCloseLandingBackstopService(
     // superseded carrier. The still-open-past-grace arm is intentionally left
     // unchanged (out of scope for this fix): it still takes the re-enqueue/escalate
     // path.
-    const mergedSiblingKeys = measured
-      .filter((m) => m.state === "merged")
-      .map((m) => m.prKey);
+    const mergedSiblingKeys = [
+      ...prs
+        .map((pr) => `${pr.owner}/${pr.repo}#${pr.number}`)
+        .filter((prKey) => alreadyConfirmed.has(prKey)),
+      ...measured.filter((m) => m.state === "merged").map((m) => m.prKey),
+    ];
     const hasMergedSibling = mergedSiblingKeys.length > 0;
 
     const isOwnDraft = await loadOwnDraftPredicate(
@@ -698,7 +701,6 @@ export function createDoneCloseLandingBackstopService(
     const ownOpenDrafts = verdictEligible
       ? measured.filter(
           (m) =>
-            !alreadyConfirmed.has(m.prKey) &&
             m.state === "open" &&
             m.draft === true &&
             isOwnDraft(m.pr),
@@ -709,9 +711,6 @@ export function createDoneCloseLandingBackstopService(
     let draftParked = isBackstopDraftPark(issue);
 
     for (const { pr, prKey, state, draft, closedAt } of measured) {
-      // Confirmed siblings still participate in this pass's merged verdict,
-      // but their earlier audit row must not be re-emitted.
-      if (alreadyConfirmed.has(prKey)) continue;
       const foreignDraft = state === "open" && draft === true && !isOwnDraft(pr);
       const isSupersededCarrier = state === "closed" && hasMergedSibling;
 

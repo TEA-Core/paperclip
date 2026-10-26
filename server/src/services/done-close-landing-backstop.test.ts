@@ -2895,6 +2895,35 @@ describe("SUP-16689: draft-stranded done cards", () => {
     expect(mockAddComment).not.toHaveBeenCalled();
   });
 
+  it("does not re-read a confirmed merged sibling from the provider and still treats it as the merged sibling", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [{
+        action: "issue.done_close_landing_confirmed",
+        details: { pr: "paperclipai/paperclip#368" },
+        entityId: ISSUE,
+      }],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ draft: true, headRefName: "SUP-13326-branch" }),
+      linkedPr({ id: "eo-368", number: 368, displayName: "paperclipai/paperclip#368" }),
+    ]);
+    const resolve = mockResolver(async () => draftOpenSnapshot);
+
+    await expect(service.sweep()).resolves.toMatchObject({ confirmed: 0, draftStranded: 0 });
+
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(resolve).toHaveBeenCalledWith(expect.objectContaining({
+      object: expect.objectContaining({ externalId: "paperclipai/paperclip#pull/3158" }),
+    }));
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_draft_stranded",
+      details: expect.objectContaining({ supersededBy: "paperclipai/paperclip#368" }),
+    }));
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+  });
+
   it("a draft PR does not consume the MAX_REENQUEUE_ATTEMPTS cap or escalate — it reports draft-stranded", async () => {
     const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
     // Pre-seed the cap's worth of prior re-enqueue rows for this PR: a NON-draft
