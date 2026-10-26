@@ -33,6 +33,7 @@ import {
   type ApprovalStatusReconcilerTickSummary,
   type CandidateRow,
 } from "./approval-status-reconciler.js";
+import { clearAutoMergeDisarmRecord, recordPendingAutoMergeDisarm } from "./merge-arming.js";
 
 // SUP-15851 C1: `latestDecisionPerStage` is a pure helper (rows in, one Map by
 // stage out); this probe needs no DB and runs regardless of embedded-Postgres
@@ -3838,6 +3839,49 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
       const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
       expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 3 });
+    });
+
+    it("a take-back record on the card refuses the arm without spending a re-arm slot: four ticks later the card is still re-armed once the record is gone", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "failed", message: "failed:HTTP 502 Bad Gateway", at: APPROVED_AT },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+        owner: "TEA-Core", repo: "paperclip", number: 42, nodeId: "PR_node_42", headSha: NEW_HEAD, reason: "held",
+        since: new Date().toISOString(), attempts: 0, lastError: null, state: "pending", token: "held",
+      });
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      for (let tick = 0; tick < 4; tick += 1) {
+        const summary = await runApprovalStatusReconcilerTick(db);
+        expect(summary.rearmed).toBe(1);
+        expect(summary.rearmDetails[0]).toContain("skipped:arm-in-progress");
+      }
+      expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+      const readAttempts = async () => {
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        return (approvalStatus.armReattempt as { attempts: number }).attempts;
+      };
+      expect(await readAttempts()).toBe(0);
+
+      await clearAutoMergeDisarmRecord(db, companyId, issueId);
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.rearmDetails[0]).toContain("armed:");
+      expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(1);
+      expect(await readAttempts()).toBe(1);
     });
 
     it("a recorded skipped:already-queued armOutcome is terminal, equivalent to armed — not re-armed (finding: already-queued-retried)", async () => {
