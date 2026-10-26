@@ -289,11 +289,12 @@ are ineligible.
 
 A row-locked compare-and-set refuses stale values or any pending interaction,
 active recovery action, live run, checkout/execution lock, or unavailable
-participant with 409. Recovery-action upserts acquire the same issue-row lock
-before writing. Because not all run writers lock that row, the rare board
-repair briefly takes a PostgreSQL SHARE lock on `heartbeat_runs` before
-checking the live-run predicate; concurrent run inserts/updates wait until
-the transaction commits, including writes in other companies. The operation
+participant with 409. The transaction first row-locks the issue's queued,
+running, or scheduled-retry `heartbeat_runs` rows (ordered by id), then the
+issue row, matching the order run writers use; recovery-action upserts acquire
+the same issue-row lock before writing. No table lock is taken. A run row
+inserted concurrently, after the repair's run-row lock and without taking the
+issue row lock, is not covered by this check. The operation
 changes only the agent assignee (and `updatedAt`) and logs the before/after
 assignment atomically. The status and status version remain unchanged (the
 version advances only when status changes); execution state, stage identity,

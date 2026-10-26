@@ -12729,6 +12729,20 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
 
       const updated = await db.transaction(async (tx) => {
+        // Run writers lock their heartbeat_runs row before the issue row; take the locks in that order.
+        const liveRuns = await tx.select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, visible.companyId),
+            inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            or(
+              eq(heartbeatRuns.nativeIssueId, visible.id),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${visible.id}`,
+              sql`${heartbeatRuns.contextSnapshot}->'paperclipIssue'->>'id' = ${visible.id}`,
+            ),
+          ))
+          .orderBy(asc(heartbeatRuns.id))
+          .for("update");
         const [issue] = await tx.select().from(issueRows)
           .where(and(eq(issueRows.id, visible.id), eq(issueRows.companyId, visible.companyId)))
           .for("update");
@@ -12823,22 +12837,7 @@ export function issueRoutes(
             inArray(issueRecoveryActions.status, ["active", "escalated"]),
           )).limit(1);
         if (recovery) throw conflict("Issue has an active recovery action");
-        // This rare board repair must serialize even run writers that do not
-        // acquire the issue row lock (including context-bound run inserts).
-        // SHARE permits reads but holds INSERT/UPDATE until the CAS commits.
-        await tx.execute(sql`LOCK TABLE heartbeat_runs IN SHARE MODE`);
-        const [liveRun] = await tx.select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .where(and(
-            eq(heartbeatRuns.companyId, issue.companyId),
-            inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
-            or(
-              eq(heartbeatRuns.nativeIssueId, issue.id),
-              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
-              sql`${heartbeatRuns.contextSnapshot}->'paperclipIssue'->>'id' = ${issue.id}`,
-            ),
-          )).limit(1);
-        if (liveRun) throw conflict("Issue has a live run");
+        if (liveRuns.length > 0) throw conflict("Issue has a live run");
 
         const [restored] = await tx.update(issueRows)
           .set({ assigneeAgentId: agent.id, updatedAt: new Date() })

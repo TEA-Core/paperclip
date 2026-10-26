@@ -4004,8 +4004,8 @@ registry.registerPath({
     "All four expected values must match the locked issue row. The issue must be in_review or blocked " +
     "with an active, undecided policy stage naming the agent; completed/skipped stages, removed agent " +
     "memberships, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
-    "active recovery actions, live runs and checkout/execution locks. Recovery writers share the issue-row " +
-    "lock; a brief SHARE lock on heartbeat_runs serializes other run writers during the live-run check. " +
+    "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
+    "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
     "Only the assignee and updatedAt change; status, statusVersion, executionState, decision history " +
     "and pendingSince remain unchanged. Does not wake or re-arm the stage.",
   request: {

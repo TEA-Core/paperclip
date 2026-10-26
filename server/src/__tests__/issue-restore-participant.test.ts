@@ -436,43 +436,78 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
   });
 
-  it("waits for an in-flight issue-bound run writer before testing the live-run predicate", async () => {
-    let signalInserted!: () => void;
+  async function restoreWaitingOnRunRows() {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const [row] = await db.execute<{ waiting: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND state = 'active'
+            AND wait_event_type = 'Lock'
+            AND query ILIKE '%from "heartbeat_runs"%' AND query ILIKE '%for update%'
+        ) AS waiting
+      `);
+      if (row?.waiting) return true;
+      await delay(25);
+    }
+    return false;
+  }
+
+  it("waits for an in-flight writer of the issue's live run row, then re-evaluates the live-run predicate", async () => {
+    await seedRun("running", { issueId: ISSUE });
+    let signalLocked!: () => void;
     let releaseWriter!: () => void;
-    const inserted = new Promise<void>((resolve) => { signalInserted = resolve; });
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
     const release = new Promise<void>((resolve) => { releaseWriter = resolve; });
     const writer = db.transaction(async (tx) => {
-      await tx.insert(heartbeatRuns).values({
-        id: RUN, companyId: COMPANY, agentId: ASSIGNEE, status: "running",
-        contextSnapshot: { issueId: ISSUE },
-      });
-      signalInserted();
+      await tx.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, RUN));
+      signalLocked();
       await release;
     });
-    await inserted;
+    await locked;
     const restoring = Promise.resolve(post());
     let waitedForWriter = false;
     try {
-      for (let attempt = 0; attempt < 80; attempt += 1) {
-        const [row] = await db.execute<{ waiting: boolean }>(sql`
-          SELECT EXISTS (
-            SELECT 1 FROM pg_stat_activity
-            WHERE datname = current_database() AND state = 'active'
-              AND wait_event_type = 'Lock'
-              AND query ILIKE '%LOCK TABLE heartbeat_runs IN SHARE MODE%'
-          ) AS waiting
-        `);
-        if (row?.waiting) { waitedForWriter = true; break; }
-        await delay(25);
-      }
+      waitedForWriter = await restoreWaitingOnRunRows();
     } finally {
       releaseWriter();
       await writer;
     }
     const response = await restoring;
-    expect({ waitedForWriter, status: response.status }).toEqual({ waitedForWriter: true, status: 409 });
+    expect({ waitedForWriter, status: response.status }).toEqual({ waitedForWriter: true, status: 200 });
+    expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+    expect(await audit()).toHaveLength(1);
+  });
+
+  it("does not deadlock with a finalizer that holds the run row and then upserts a recovery action", async () => {
+    await seedRun("running", { issueId: ISSUE });
+    let signalLocked!: () => void;
+    let proceed!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    const gate = new Promise<void>((resolve) => { proceed = resolve; });
+    const finalizer = db.transaction(async (tx) => {
+      await tx.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, RUN));
+      signalLocked();
+      await gate;
+      await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+        companyId: COMPANY, sourceIssueId: ISSUE, kind: "review_stage_unarmed",
+        cause: "pending_stage_stranded", fingerprint: `pending-stage:${ISSUE}`,
+        nextAction: "Board review",
+      });
+    });
+    await locked;
+    const restoring = Promise.resolve(post());
+    let waitedForRunRow = false;
+    try {
+      waitedForRunRow = await restoreWaitingOnRunRows();
+    } finally {
+      proceed();
+    }
+    await finalizer;
+    const response = await restoring;
+    expect({ waitedForRunRow, status: response.status }).toEqual({ waitedForRunRow: true, status: 409 });
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
     expect(await audit()).toHaveLength(0);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
   });
 
   it.each(["paused", "terminated", "pending_approval"])("409s on %s participant", async (status) => {
