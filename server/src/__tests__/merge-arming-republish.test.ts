@@ -7,6 +7,7 @@ import {
   activityLog,
   agents,
   authUsers,
+  boardApiKeys,
   companies,
   companyMemberships,
   createDb,
@@ -31,6 +32,9 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { publishHeadBoundRelease, releaseLockKey } from "../services/merge-arming.js";
 import { releaseRequestClock } from "../middleware/release-request-clock.js";
+import { releaseScopedActor } from "../middleware/release-scoped-actor.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import { boardAuthService } from "../services/board-auth.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -146,6 +150,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companyMemberships);
+    await db.delete(boardApiKeys);
     await db.delete(authUsers);
     await db.delete(companies);
   });
@@ -2906,6 +2911,18 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       await expectLadderRefused(issueId);
     });
 
+    // Round 11: a paused agent keeps its ordinary approval, but inside the head-bound release it lapses.
+    it("refuses a release whose approving agent is paused", async () => {
+      const { issueId, companyId } = await seedReleasable("ladder");
+      const pausedAgent = randomUUID();
+      await db.insert(agents).values({
+        id: pausedAgent, companyId, name: "Agent paused", role: "engineer", status: "paused", adapterType: "codex_local",
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      await decideBy(issueId, { actorAgentId: pausedAgent });
+      await expectLadderRefused(issueId);
+    });
+
     it("refuses an approval by the card's creator, even when that user is an active member", async () => {
       const { issueId } = await seedReleasable("ladder");
       await decideBy(issueId, { actorUserId: USER_ID });
@@ -3020,6 +3037,69 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(confirmed).toBe(0);
       const bodies = statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state);
       expect(bodies).toEqual(["success", "failure"]);
+    });
+
+    // Round 11: a commit status has no compare-and-set, so a status write that GitHub accepts after the release
+    // gave up on it can land on top of its void. When it does, it is voided again.
+    describe("a status write that lands after the release gave up on it", () => {
+      const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]" };
+      type Landed = { id: number; context: string; state: string; description: string; creator: typeof CONTROL_PLANE };
+      function heldFirstSuccess() {
+        const landed: Landed[] = [];
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let counter = 100;
+        let heldOnce = false;
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.endsWith(`/pulls/${PR_NUMBER}`)) {
+            return createMockResponse({ state: "open", merged: false, draft: false, head: { sha: HEAD_SHA, ref: DELIVERY_BRANCH } });
+          }
+          if (url.includes("/statuses/") && init?.method === "POST") {
+            const body = JSON.parse(String(init.body));
+            if (body.context !== "paperclip/approved") return createMockResponse({ id: 99 }, true, 201);
+            counter += 1;
+            const id = counter;
+            if (body.state === "success" && !heldOnce) { heldOnce = true; await held; } // accepted by GitHub, answered late
+            landed.unshift({ id, context: body.context, state: body.state, description: body.description, creator: CONTROL_PLANE });
+            return createMockResponse({ id }, true, 201);
+          }
+          if (url.includes("/statuses/")) return createMockResponse(landed);
+          throw new Error(`Unexpected release request: ${url}`);
+        });
+        return { landed, release };
+      }
+
+      it("writes a compensating failure when the abandoned success lands on top of the void", async () => {
+        const { companyId } = await seedReleasable();
+        const { landed, release } = heldFirstSuccess();
+
+        const outcome = await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 2000 }, retryDelayMs: 10 });
+        expect(outcome.kind).toBe("failed");
+        expect(landed[0]?.state).toBe("failure");
+
+        release();
+        expect(await eventually(async () => landed.length === 3 && landed[0]?.state === "failure")).toBe(true);
+        expect(landed.map((status) => status.state)).toEqual(["failure", "success", "failure"]);
+        expect(markerWrites()).toEqual([]);
+      }, 20_000);
+
+      it("leaves a newer status alone when something newer than the late success is already on the head", async () => {
+        const { companyId } = await seedReleasable();
+        const { landed, release } = heldFirstSuccess();
+
+        await directRelease(companyId, { deadlines: { totalMs: 5000, fetchMs: 150, compensationMs: 2000 }, retryDelayMs: 10 });
+        // A newer status from another release lands before the abandoned one answers, and GitHub lists it first.
+        const newer = { id: 500, context: "paperclip/approved", state: "success", description: "released by user:other", creator: CONTROL_PLANE };
+        const originalGet = mockGhFetch.getMockImplementation()!;
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.includes("/statuses/") && init?.method !== "POST") return createMockResponse([newer, ...landed]);
+          return originalGet(url, init);
+        });
+        release();
+        await new Promise((resolve) => setTimeout(resolve, 600));
+
+        expect(landed.map((status) => status.state)).toEqual(["success", "failure"]);
+      }, 20_000);
     });
 
     it("applies statement, lock and idle-in-transaction timeouts to the lock connection", async () => {
@@ -3772,6 +3852,75 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         expect(res.status).toBe(409);
         expect(res.body.message).toContain("nothing was published");
       }, 20_000);
+
+      // Round 11: authentication of a release request runs on a connection the clock can cancel.
+      describe("authentication of a release request", () => {
+        const userId = "release-board-user";
+        async function boardKeyFor(companyId: string) {
+          const now = new Date();
+          await db.insert(authUsers).values({ id: userId, name: userId, email: `${userId}@example.test`, emailVerified: true, createdAt: now, updatedAt: now }).onConflictDoNothing();
+          await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner", updatedAt: now });
+          return boardAuthService(db).createNamedBoardApiKey({ userId, name: "release test" });
+        }
+        const lastUsed = async (id: string) => (await db.select().from(boardApiKeys).where(eq(boardApiKeys.id, id)))[0]?.lastUsedAt ?? null;
+        const realAuthApp = (totalMs: number) => {
+          const real = express();
+          real.use(releaseRequestClock({ totalMs }));
+          real.use(express.json());
+          real.use(releaseScopedActor(db, { deploymentMode: "authenticated" }, totalMs));
+          real.use("/api", issueRoutes(db, {} as any));
+          real.use(errorHandler);
+          return real;
+        };
+
+        it("cancels the board-key lookup when the clock runs out, so no query is alive at the answer and no usage stamp follows", async () => {
+          const { issueId, companyId } = await seedReleasable();
+          const key = await boardKeyFor(companyId);
+          installReleaseTransport();
+          const release = await holdLock(sql`lock table board_api_keys in access exclusive mode`);
+          try {
+            const res = await request(realAuthApp(300)).post(`/api/issues/${issueId}/merge-arming/release`)
+              .set("authorization", `Bearer ${key.token}`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+            expect(res.status).toBe(409);
+            expect(res.body.message).toContain("nothing was published");
+            expect(await waitingOnLocks()).toBe(0);
+          } finally {
+            await release();
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          expect(await lastUsed(key.id)).toBeNull();
+          expect(mockGhFetch).not.toHaveBeenCalled();
+        }, 20_000);
+
+        it("authenticates an on-time release on its own connection and leaves no session behind", async () => {
+          const { issueId, companyId } = await seedReleasable();
+          const key = await boardKeyFor(companyId);
+          installReleaseTransport();
+
+          const res = await request(realAuthApp(5000)).post(`/api/issues/${issueId}/merge-arming/release`)
+            .set("authorization", `Bearer ${key.token}`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+          expect(res.status).toBe(200);
+          expect(res.body.outcome).toBe("released");
+          expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+          expect(await lastUsed(key.id)).not.toBeNull();
+        }, 20_000);
+
+        it("writes no usage stamp and hands nothing on once the request's clock has expired", async () => {
+          const { companyId } = await seedReleasable();
+          const key = await boardKeyFor(companyId);
+          const middleware = actorMiddleware(db, { deploymentMode: "authenticated" });
+          const next = vi.fn();
+          const req = { header: (name: string) => (name.toLowerCase() === "authorization" ? `Bearer ${key.token}` : undefined), method: "POST", path: "/api/issues/x/merge-arming/release" } as any;
+          const res = { locals: { releaseClock: { expired: true } } } as any;
+
+          await middleware(req, res, next);
+
+          expect(next).not.toHaveBeenCalled();
+          expect(await lastUsed(key.id)).toBeNull();
+        });
+      });
 
       it("leaves other routes alone", async () => {
         const other = express();

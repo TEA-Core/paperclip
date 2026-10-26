@@ -8,6 +8,7 @@ import { issueService } from "./issues.js";
 import {
   createAuthorityGuard,
   disableAutoMerge,
+  keepAutoMergeDisarmPending,
   enableAutoMerge,
   fetchGitHubNodeId,
   isGitHubTokenResolution,
@@ -1484,7 +1485,7 @@ export function createDoneCloseLandingBackstopService(
     }
     // The card's authority, captured just before the final read of the head and the approval: a decision
     // reversed, a certificate removed or a reviewer terminated after this point is a difference.
-    const guard = await createAuthorityGuard(db, companyId, issueId);
+    const guard = await createAuthorityGuard(db, companyId, issueId, { headSha: authorizedHeadSha });
     const again = await reauthorize();
     if (again.kind !== "authorized" || again.headSha !== authorizedHeadSha) {
       logger.info(
@@ -1506,7 +1507,9 @@ export function createDoneCloseLandingBackstopService(
         `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changed) {
         const disabled = await disableAutoMerge(tokenResult.token, nodeId);
-        const where = { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, changed, disabled: disabled.success, disableError: disabled.error };
+        // An accepted arm that could not be turned off stays on the card and is retried every reconciler tick.
+        const kept = disabled.success ? "" : await keepAutoMergeDisarmPending(db, companyId, issueId, pr, nodeId, authorizedHeadSha, changed, disabled.error);
+        const where = { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, changed, disabled: disabled.success, disableError: disabled.error, kept };
         if (disabled.success) {
           logger.warn(where, "done-close backstop: re-enqueue taken back — the card's authority changed while auto-merge was being enabled");
         } else {
