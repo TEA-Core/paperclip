@@ -7822,6 +7822,26 @@ export function recoveryService(
                 : []),
             )
           : inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys);
+        // A completed wake with a linked run spends budget only when that run
+        // wrote a status, comment, or new blocker edge on this dependent.
+        // Historical wakes without a run id remain countable: their effects
+        // cannot be attributed reliably.
+        const wakeChangedDependent = or(
+          isNull(agentWakeupRequests.runId),
+          sql`exists (
+            select 1 from ${activityLog}
+            where ${activityLog.companyId} = ${agentWakeupRequests.companyId}
+              and ${activityLog.runId} = ${agentWakeupRequests.runId}
+              and ${activityLog.entityType} = 'issue'
+              and ${activityLog.entityId} = ${candidate.id}
+              and (
+                (${activityLog.action} = 'issue.updated' and ${activityLog.details} ? 'status')
+                or ${activityLog.action} = 'issue.comment_added'
+                or (${activityLog.action} = 'issue.blockers_updated'
+                    and jsonb_array_length(coalesce(${activityLog.details}->'addedBlockedByIssueIds', '[]'::jsonb)) > 0)
+              )
+          )`,
+        );
         const consumedWakes = idempotencyKeys.length > 0 ? await db
           .select({ count: count() })
           .from(agentWakeupRequests)
@@ -7830,6 +7850,7 @@ export function recoveryService(
               eq(agentWakeupRequests.companyId, companyId),
               inArray(agentWakeupRequests.status, ["completed", "failed", "timed_out"]),
               wakeKeyPredicate,
+              wakeChangedDependent,
             ),
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
@@ -7853,7 +7874,9 @@ export function recoveryService(
               reArmMax: maxCount,
             },
             nextAction:
-              "This issue has been woken multiple times after its blockers resolved. Review and take action.",
+              "This issue has been woken multiple times after its blockers resolved. Investigate platform refusal, " +
+              "all blockers terminal without a valid continuation, or an unlinked real blocker; repair the dependency " +
+              "or assign the next action.",
             wakePolicy: null,
             monitorPolicy: null,
             maxAttempts: null,
@@ -7902,6 +7925,7 @@ export function recoveryService(
                 eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON),
                 wakeKeyPredicate,
                 gte(agentWakeupRequests.requestedAt, since),
+                wakeChangedDependent,
               ),
             )
             .then((rows) => rows[0]?.count ?? 0);
@@ -10789,7 +10813,7 @@ export function recoveryService(
     return result;
   }
 
-  // SUP-14539: edge-trigger gate shared by the report-only recovery sweeps.
+  // SUP-14539: edge-trigger gate shared by recovery sweep detection records.
   // A sweep writes one detection row when an (issue, condition) pair enters the
   // reported set, or when its `details` payload changes materially — never on a
   // timer. The state-change check is derived from the durable record: the most
@@ -10959,6 +10983,29 @@ export function recoveryService(
           source: "recovery.reconcile_cancelled_only_blocker_dependents",
         },
       });
+
+      // A cancelled blocker is terminal but does not satisfy its edge. Do not
+      // silently treat it as done: the board owns deciding whether to replace
+      // the cancelled work or remove the edge.
+      const recoveryActions = issueRecoveryActionService(db);
+      if (!(await recoveryActions.getActiveForIssue(candidate.companyId, candidate.id))) {
+        await recoveryActions.upsertSourceScoped({
+          companyId: candidate.companyId,
+          sourceIssueId: candidate.id,
+          kind: "issue_graph_liveness",
+          ownerType: "board",
+          previousOwnerAgentId: candidate.assigneeAgentId,
+          cause: "cancelled_blocker_dependent",
+          fingerprint: `cancelled_blocker_dependent:${candidate.companyId}:${candidate.id}`,
+          evidence: { identifier: candidate.identifier, cancelledBlockerIssueIds: readiness.unresolvedBlockerIssueIds },
+          nextAction:
+            "All remaining unresolved blocker edges point to cancelled issues. Board: replace the cancelled work " +
+            "or remove the stale blocker edges, then resume the dependent's assignee.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          maxAttempts: null,
+        });
+      }
     }
 
     const shouldLog =
