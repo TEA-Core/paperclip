@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { activityLog, externalObjectMentions, externalObjects, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
   isGitHubTokenResolution,
@@ -28,12 +28,14 @@ import {
  * A PR only counts as the parent's carrier when its cached head branch starts
  * with the parent's identifier (the carrier branch is the parent's
  * `{{identifier}}-{{slug}}` name, no prefix) and its base repository is the
- * parent's delivery repo. Immediately before promotion, a live read must
- * confirm that repository, head repository, exact branch and unchanged SHA.
- * The sequencing guard holds carrier N+1 while carrier N's external object still reads `open` —
- * merge-queue membership is unobservable, and a queued PR is still open.
- * Idempotence rides an activity row per (parent, PR): a carrier an earlier
- * sweep dispositioned is never re-promoted.
+ * parent's delivery repo. The live open/draft state, head repository, exact
+ * branch and unchanged SHA are checked twice, including immediately before
+ * promotion. GitHub's ready mutation has no atomic expected-head CAS: a remote
+ * head change after the final read is not preventable by this API. A per-PR
+ * transaction lock and ledger check serialize local contenders, not GitHub
+ * branch edits. The sequencing guard holds carrier N+1 while carrier N's
+ * external object still reads `open`; a queued PR is still open. An activity
+ * row per (company, PR) keeps an already-promoted carrier idempotent.
  */
 
 const DEFAULT_AGE_CAP_MS = 3 * 24 * 60 * 60 * 1000;
@@ -85,6 +87,46 @@ interface SiblingPullRequest {
 }
 
 type PromotionOutcome = "promoted" | "alreadyReady" | "failed";
+
+type CarrierLiveCheck =
+  | { kind: "verified"; nodeId: string }
+  | { kind: "unauthorized" }
+  | { kind: "invalid" };
+
+/** Live REST verification; no cached field can authorize the ready mutation. */
+async function readVerifiedCarrier(
+  token: string,
+  url: string,
+  draft: DraftCarrierRow,
+  deliveryRepo: string,
+): Promise<CarrierLiveCheck> {
+  let response: Response;
+  try {
+    response = await ghFetch(url, {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-carrier-promotion-sweep",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${token}`,
+      },
+    });
+  } catch {
+    return { kind: "invalid" };
+  }
+  if (response.status === 401 || response.status === 403) return { kind: "unauthorized" };
+  if (!response.ok) return { kind: "invalid" };
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const head = body?.head as Record<string, unknown> | null | undefined;
+  const headRepo = head?.repo as Record<string, unknown> | null | undefined;
+  if (
+    body?.state !== "open" || body.draft !== true ||
+    typeof head?.ref !== "string" || head.ref !== draft.headRefName ||
+    typeof headRepo?.full_name !== "string" || headRepo.full_name.toLowerCase() !== deliveryRepo ||
+    typeof head?.sha !== "string" || !draft.headSha || head.sha !== draft.headSha ||
+    typeof body.node_id !== "string" || !body.node_id
+  ) return { kind: "invalid" };
+  return { kind: "verified", nodeId: body.node_id };
+}
 
 /** Reads a positive-integer millisecond env var, falling back to `fallbackMs` on missing or invalid values. */
 function readMsEnv(name: string, fallbackMs: number): number {
@@ -378,75 +420,72 @@ export function createCarrierPromotionSweepService(
       return "failed";
     }
 
-    for (const candidate of candidates) {
-      const token = candidate.token;
-      // The external-object row is a discovery hint, not permission to mutate:
-      // read the live target immediately before the GraphQL write. The cached
-      // head SHA is a compare-before-write anchor; a moved head retries only
-      // after the provider refreshes the snapshot on a later sweep.
-      const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(draft.owner)}/${encodeURIComponent(draft.repo)}/pulls/${draft.number}`;
-      let response: Response;
-      try {
-        response = await ghFetch(url, {
-          headers: {
-            accept: "application/vnd.github+json",
-            "user-agent": "paperclip-carrier-promotion-sweep",
-            "x-github-api-version": "2022-11-28",
-            authorization: `Bearer ${token}`,
-          },
-        });
-      } catch {
-        return "failed";
-      }
-      if (!response.ok) {
-        if ((response.status === 401 || response.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
-        return "failed";
-      }
-      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-      const head = body?.head as Record<string, unknown> | null | undefined;
-      const headRepo = head?.repo as Record<string, unknown> | null | undefined;
-      const deliveryRepo = `${draft.owner}/${draft.repo}`.toLowerCase();
-      if (
-        body?.state !== "open" || body.draft !== true ||
-        typeof head?.ref !== "string" || head.ref !== draft.headRefName ||
-        typeof headRepo?.full_name !== "string" || headRepo.full_name.toLowerCase() !== deliveryRepo ||
-        typeof head?.sha !== "string" || !draft.headSha || head.sha !== draft.headSha ||
-        typeof body.node_id !== "string" || !body.node_id
-      ) return "failed";
-      const outcome = await markPullRequestReadyForReview(token, body.node_id);
-      if (outcome.success) {
-        await logActivity(db, {
-          companyId: parent.companyId,
-          actorType: "system",
-          actorId: CARRIER_PROMOTION_ACTOR_ID,
-          agentId: null,
-          runId: null,
-          agentApiKeyId: null,
-          action: CARRIER_PROMOTION_READY_ACTION,
-          entityType: "issue",
-          entityId: parent.id,
-          issueId: parent.id,
-          details: {
-            identifier: parent.identifier ?? null,
-            pr: prKey,
-            trigger,
-            prState: "ready",
-          },
-        });
-        return outcome.alreadyReady ? "alreadyReady" : "promoted";
-      }
+    const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(draft.owner)}/${encodeURIComponent(draft.repo)}/pulls/${draft.number}`;
+    const deliveryRepo = `${draft.owner}/${draft.repo}`.toLowerCase();
+    const publications: ActivityPublication[] = [];
+    try {
+      const result = await db.transaction(async (tx) => {
+        // The ledger's read/check/write must share the same PR-scoped lock.
+        // Resolve token candidates before acquiring it; serialize only the
+        // remote verification, ready mutation and persisted disposition.
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`carrier-promotion:${parent.companyId}:${deliveryRepo}#${draft.number}`}, 0))`);
+        const earlier = await tx
+          .select({ id: activityLog.id })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, parent.companyId),
+            eq(activityLog.action, CARRIER_PROMOTION_READY_ACTION),
+            sql`${activityLog.details}->>'pr' = ${prKey}`,
+          ));
+        if (earlier.length > 0) return "alreadyReady";
 
-      if (outcome.status === 401 || outcome.status === 403) {
-        if (candidate !== candidates[candidates.length - 1]) continue;
-      }
-      logger.warn(
-        { pr: prKey, status: outcome.status, error: outcome.error },
-        "carrier promotion sweep: markPullRequestReadyForReview failed; will retry next sweep",
-      );
+        for (const candidate of candidates) {
+          const first = await readVerifiedCarrier(candidate.token, url, draft, deliveryRepo);
+          if (first.kind === "unauthorized" && candidate !== candidates[candidates.length - 1]) continue;
+          if (first.kind !== "verified") return "failed";
+          // Re-read as the final operation before GraphQL. This shrinks the
+          // remote race but cannot make GitHub's ready mutation a head CAS.
+          const final = await readVerifiedCarrier(candidate.token, url, draft, deliveryRepo);
+          if (final.kind === "unauthorized" && candidate !== candidates[candidates.length - 1]) continue;
+          if (final.kind !== "verified" || final.nodeId !== first.nodeId) return "failed";
+
+          const outcome = await markPullRequestReadyForReview(candidate.token, final.nodeId);
+          if (!outcome.success) {
+            if ((outcome.status === 401 || outcome.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
+            logger.warn(
+              { pr: prKey, status: outcome.status, error: outcome.error },
+              "carrier promotion sweep: markPullRequestReadyForReview failed; will retry next sweep",
+            );
+            return "failed";
+          }
+          await logActivityInTransaction(tx as unknown as Db, {
+            companyId: parent.companyId,
+            actorType: "system",
+            actorId: CARRIER_PROMOTION_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: CARRIER_PROMOTION_READY_ACTION,
+            entityType: "issue",
+            entityId: parent.id,
+            issueId: parent.id,
+            details: {
+              identifier: parent.identifier ?? null,
+              pr: prKey,
+              trigger,
+              prState: "ready",
+            },
+          }, publications);
+          return outcome.alreadyReady ? "alreadyReady" : "promoted";
+        }
+        return "failed";
+      });
+      for (const publication of publications) publishActivity(publication);
+      return result;
+    } catch (err) {
+      logger.warn({ err, pr: prKey }, "carrier promotion sweep: locked promotion failed");
       return "failed";
     }
-
-    return "failed";
   }
 
   return { sweep };

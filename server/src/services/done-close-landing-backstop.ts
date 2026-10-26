@@ -1,6 +1,7 @@
 import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, companies, issues } from "@paperclipai/db";
+import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
@@ -86,8 +87,8 @@ export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed
 export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
 export const DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION = "issue.done_close_landing_reenqueue_refused";
 export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
-// An open draft cannot be armed. The audit row bounds comments, while a board
-// park keeps the issue actionable after the discovery window expires.
+// An open draft cannot be armed. A board-owned blocked park stays discoverable
+// after the seven-day done lookback; an audit follows notification and bounds retries.
 export const DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION = "issue.done_close_landing_draft_stranded";
 // SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by the
 // prefix predicate cannot land through its own card. Instead of re-opening it
@@ -129,7 +130,7 @@ export interface DoneCloseLandingBackstopOptions {
 export interface DoneCloseLandingSweepResult {
   /** False when the min-interval gate short-circuited the tick (no-op). */
   due: boolean;
-  /** Distinct done issues with an in-window latest decision-carried skip. */
+  /** Done cards in lookback plus this sweep's blocked draft parks. */
   candidates: number;
   confirmed: number;
   failed: number;
@@ -161,6 +162,7 @@ interface CandidateIssue {
   status: string;
   identifier: string | null;
   assigneeAgentId: string | null;
+  unblockDescriptor?: IssueUnblockDescriptor | null;
 }
 
 interface CandidateRow {
@@ -207,15 +209,24 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** Only this sweep's board-owned draft park may be rediscovered while blocked. */
+function isBackstopDraftPark(issue: CandidateIssue): boolean {
+  const descriptor = issue.unblockDescriptor;
+  return issue.status === "blocked" &&
+    descriptor?.owner === "board" &&
+    descriptor.action.startsWith("Run gh pr ready ") &&
+    descriptor.action.includes("merge-arming/republish");
+}
+
 /** SUP-15953: idempotency key for one (PR, head, ejection-reason) refusal. */
 function refusalKey(pr: string, headSha: string, ejectionReason: string): string {
   return `${pr}\u0000${headSha}\u0000${ejectionReason}`;
 }
 
 /**
- * Build (but do not execute) the discovery query for done cards whose linked PR
- * may not have landed. Extracted so the exact WHERE predicate can be asserted in
- * isolation (AC1) rather than only through an injected candidate set.
+ * Build (but do not execute) discovery for done cards whose linked PR may not
+ * have landed and blocked cards parked by this sweep for an open draft.
+ * Extracted so the exact WHERE predicate can be asserted in isolation (AC1).
  *
  * Two candidate sources, both first-class activity rows:
  *   1. decision-carried close: `issue.done_transition_guard_skipped` whose
@@ -237,6 +248,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
         status: issues.status,
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
+        unblockDescriptor: issues.unblockDescriptor,
       },
     })
     .from(activityLog)
@@ -257,19 +269,24 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
           ),
           eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
         ),
-        gte(activityLog.createdAt, windowStart),
         lte(activityLog.createdAt, discoveryCutoff),
-        eq(issues.status, "done"),
+        or(
+          and(eq(issues.status, "done"), gte(activityLog.createdAt, windowStart)),
+          and(
+            eq(issues.status, "blocked"),
+            sql`${issues.unblockDescriptor}->>'owner' = 'board'`,
+            sql`${issues.unblockDescriptor}->>'action' LIKE 'Run gh pr ready %merge-arming/republish%'`,
+          ),
+        ),
       ),
     );
 }
 
 /**
- * Qualify raw discovery rows into candidate cards: keep only the LATEST
- * transition-of-record per issue, require it to be `done` and inside the
- * lookback/discovery window, and require it to carry a decision-carried skip
- * reason or an arming-refusal reason. Mirrors the discovery WHERE so a row the
- * query returns is always re-validated before it is measured.
+ * Qualify raw discovery rows: retain the latest transition-of-record per issue,
+ * a done card inside lookback or this sweep's blocked draft park (retained past
+ * lookback), and a decision-carried skip or arming-refusal reason. Mirrors the
+ * SQL WHERE before measurement.
  *
  * SUP-15953: `discoveryCutoff` is the WIDER of the verdict grace and the
  * re-enqueue grace, so a recently ejected PR is a candidate here. Verdict
@@ -290,9 +307,10 @@ export function selectLandingCandidates(
     }
   }
   return [...latestByIssue.values()].filter((row) => {
-    if (row.issue.status !== "done") return false;
+    const parkedDraft = isBackstopDraftPark(row.issue);
+    if (row.issue.status !== "done" && !parkedDraft) return false;
     const createdAt = row.createdAt.getTime();
-    if (createdAt < windowStart.getTime() || createdAt > discoveryCutoff.getTime()) return false;
+    if (createdAt > discoveryCutoff.getTime() || (createdAt < windowStart.getTime() && !parkedDraft)) return false;
     const details = readRecord(row.details);
     const isDecisionCarried =
       readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
@@ -687,7 +705,8 @@ export function createDoneCloseLandingBackstopService(
         )
       : [];
     const newlyStrandedDrafts: string[] = [];
-    let draftParked = false;
+    const pendingDraftAudits: Array<Parameters<typeof logActivity>[1]> = [];
+    let draftParked = isBackstopDraftPark(issue);
 
     for (const { pr, prKey, state, draft, closedAt } of measured) {
       // Confirmed siblings still participate in this pass's merged verdict,
@@ -801,8 +820,8 @@ export function createDoneCloseLandingBackstopService(
         }
         const alreadyReported = alreadyDraftStranded.has(prKey);
         if (!hasMergedSibling && !draftParked) {
-          // Persist the park before the audit marker: a failed update must let
-          // the next sweep retry the audit, comment and assignee wake together.
+          // Persist the park before notification; a failed update leaves the
+          // card done and eligible on the next sweep.
           await deps.svc.update(issue.id, {
             status: "blocked",
             unblockDescriptor: {
@@ -813,15 +832,15 @@ export function createDoneCloseLandingBackstopService(
           draftParked = true;
         }
         if (!alreadyReported) {
-          await logActivity(db, {
+          const audit = {
             companyId: issue.companyId,
-            actorType: "system",
+            actorType: "system" as const,
             actorId: DONE_CLOSE_LANDING_ACTOR_ID,
             agentId: null,
             runId: null,
             agentApiKeyId: null,
             action: DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
-            entityType: "issue",
+            entityType: "issue" as const,
             entityId: issue.id,
             issueId: issue.id,
             details: {
@@ -835,7 +854,11 @@ export function createDoneCloseLandingBackstopService(
                 ? { supersededBy: mergedSiblingKeys.join(", ") }
                 : {}),
             },
-          });
+          };
+          // A merged sibling needs no notification. An unmerged draft's audit
+          // must follow the successful comment/wake, or it would suppress retry.
+          if (hasMergedSibling) await logActivity(db, audit);
+          else pendingDraftAudits.push(audit);
         }
         if (hasMergedSibling) {
           // The card's work landed via the merged sibling: audit only.
@@ -860,6 +883,7 @@ export function createDoneCloseLandingBackstopService(
               payload: { issueId: issue.id, mutation: "comment" },
             });
           }
+          for (const audit of pendingDraftAudits) await logActivity(db, audit);
           counts.draftStranded += 1;
         }
         continue;

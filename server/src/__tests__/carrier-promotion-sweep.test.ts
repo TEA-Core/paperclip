@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { activityLog } from "@paperclipai/db";
 import {
   CARRIER_PROMOTION_READY_ACTION,
   createCarrierPromotionSweepService,
@@ -27,7 +28,11 @@ vi.mock("../services/issues.js", () => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn().mockResolvedValue({ id: "activity-row" }));
-vi.mock("../services/activity-log.js", () => ({ logActivity: mockLogActivity }));
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+  logActivityInTransaction: (transaction: unknown, input: unknown) => mockLogActivity(transaction, input),
+  publishActivity: vi.fn(),
+}));
 
 vi.mock("../middleware/logger.js", () => ({
   logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -137,12 +142,13 @@ function selectRows(cols: Record<string, unknown> | undefined, state: TestState)
   if ("identifier" in cols) return state.parentRow ? [state.parentRow] : [];
   if ("externalId" in cols) return state.siblingRows;
   if ("details" in cols) return state.activityRows;
+  if ("id" in cols && cols.id === activityLog.id) return state.activityRows;
   return state.children;
 }
 
 /** Builds a fake drizzle db whose select() serves rows from the given test state. */
 function makeDb(state: TestState) {
-  return {
+  const tx = {
     select: vi.fn((cols?: Record<string, unknown>) => {
       const rows = selectRows(cols, state);
       return {
@@ -152,6 +158,11 @@ function makeDb(state: TestState) {
         }),
       };
     }),
+    execute: vi.fn().mockResolvedValue([]),
+  };
+  return {
+    ...tx,
+    transaction: vi.fn(async (run: (transaction: typeof tx) => Promise<unknown>) => run(tx)),
   };
 }
 
@@ -276,7 +287,9 @@ describe("createCarrierPromotionSweepService", () => {
     const [restUrl, restInit] = mockGhFetch.mock.calls[0]!;
     expect(restUrl).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
     expect(restInit.headers.authorization).toBe(`Bearer ${TOKEN_CANDIDATE.token}`);
-    const [url, init] = mockGhFetch.mock.calls[1]!;
+    const [recheckUrl] = mockGhFetch.mock.calls[1]!;
+    expect(recheckUrl).toBe(restUrl);
+    const [url, init] = mockGhFetch.mock.calls[2]!;
     expect(url).toBe("https://api.github.com/graphql");
     expect(JSON.parse(init.body).query).toContain("PR_node_400");
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -326,7 +339,7 @@ describe("createCarrierPromotionSweepService", () => {
 
     const result = await service.sweep();
     expect(result.promoted).toBe(1);
-    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    expect(mockGhFetch).toHaveBeenCalledTimes(3);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: CARRIER_PROMOTION_READY_ACTION,
       entityId: PARENT,
@@ -370,6 +383,37 @@ describe("createCarrierPromotionSweepService", () => {
       expect(mockResolveCandidates).not.toHaveBeenCalled();
       expect(mockGhFetch).not.toHaveBeenCalled();
     }
+  });
+
+  it.each([
+    { label: "head SHA changed", movedRef: CARRIER_BRANCH, movedSha: "sha-moved", movedRepo: "TEA-Core/paperclip" },
+    { label: "branch changed", movedRef: "SUP-99999-moved", movedSha: "sha-reviewed", movedRepo: "TEA-Core/paperclip" },
+    { label: "head repository changed", movedRef: CARRIER_BRANCH, movedSha: "sha-reviewed", movedRepo: "Other/paperclip" },
+  ])("does not promote a carrier whose $label after the first live read", async ({ movedRef, movedSha, movedRepo }) => {
+    const { service } = makeService(state({
+      parentRow: { id: PARENT, companyId: COMPANY, status: "done", identifier: PARENT_IDENTIFIER },
+      draftRows: [draftRow({ prCreatedAt: STALE_ISO })],
+      siblingRows: [siblingRow(400, "open")],
+    }));
+    let reads = 0;
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (String(url).includes("/pulls/400")) {
+        reads += 1;
+        return jsonResponse({
+          node_id: "PR_node_400", state: "open", draft: true,
+          head: { ref: reads === 1 ? CARRIER_BRANCH : movedRef,
+            sha: reads === 1 ? "sha-reviewed" : movedSha,
+            repo: { full_name: reads === 1 ? "TEA-Core/paperclip" : movedRepo } },
+        });
+      }
+      return GRAPHQL_OK();
+    });
+
+    const result = await service.sweep();
+    expect(reads).toBe(2);
+    expect(result.promoted).toBe(0);
+    expect(mockGhFetch.mock.calls.some(([url]) => url === "https://api.github.com/graphql")).toBe(false);
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("leaves a cancelled parent's draft carrier untouched even past the age cap", async () => {
@@ -517,10 +561,10 @@ describe("createCarrierPromotionSweepService", () => {
     );
 
     await expect(service.sweep()).resolves.toMatchObject({ due: true, promoted: 1 });
-    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    expect(mockGhFetch).toHaveBeenCalledTimes(3);
     const [restUrl] = mockGhFetch.mock.calls[0]!;
     expect(String(restUrl)).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
-    const [graphqlUrl, graphqlInit] = mockGhFetch.mock.calls[1]!;
+    const [graphqlUrl, graphqlInit] = mockGhFetch.mock.calls[2]!;
     expect(graphqlUrl).toBe("https://api.github.com/graphql");
     expect(JSON.parse(graphqlInit.body).query).toContain("PR_node_live_400");
   });
@@ -544,9 +588,9 @@ describe("createCarrierPromotionSweepService", () => {
       noTrigger: 0,
       failed: 0,
     });
-    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    expect(mockGhFetch).toHaveBeenCalledTimes(3);
     expect(String(mockGhFetch.mock.calls[0]![0])).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
-    expect(JSON.parse(mockGhFetch.mock.calls[1]![1].body).query).toContain("PR_node_live_400");
+    expect(JSON.parse(mockGhFetch.mock.calls[2]![1].body).query).toContain("PR_node_live_400");
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: CARRIER_PROMOTION_READY_ACTION,
