@@ -25,7 +25,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
-import { retryPendingAutoMergeDisarms } from "./auto-merge-disarm.js";
+import { disarmTiming, retryPendingAutoMergeDisarms } from "./auto-merge-disarm.js";
 import { runApprovalStatusReconcilerTick } from "./approval-status-reconciler.js";
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
@@ -43,6 +43,7 @@ import {
   narrowToDelivered,
   publishApprovalStatus,
   recordApprovalAnchor,
+  recordPendingAutoMergeDisarm,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   resolveCardDeliveryBranchOwnership,
@@ -2724,19 +2725,23 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         }],
       ];
 
+      const defaultPromptDelays = [...disarmTiming.promptDelaysMs];
+      // The prompt retries are timers; the tests that do not look at them keep them off.
+      beforeEach(() => { disarmTiming.promptDelaysMs = []; });
       afterEach(async () => {
+        disarmTiming.promptDelaysMs = defaultPromptDelays;
         await db.delete(activityLog);
         await db.delete(issueExecutionDecisions);
         await db.delete(agents);
       });
 
-      async function seedAuthorityCard() {
+      async function seedAuthorityCard(identifier?: string) {
         const reviewerId = randomUUID();
         await db.insert(agents).values({
           id: reviewerId, companyId, name: "Reviewer", role: "engineer", status: "active", adapterType: "codex_local",
           adapterConfig: {}, runtimeConfig: {}, permissions: {},
         });
-        const issueId = await insertIssue({ branchName: "SUP-42-branch" });
+        const issueId = await insertIssue({ branchName: "SUP-42-branch", ...(identifier ? { identifier } : {}) });
         const decisionId = randomUUID();
         await db.update(issues).set({
           executionPolicy: { mode: "normal", stages: [{ id: AUTH_STAGE, type: "review", approvalsNeeded: 1 }] },
@@ -2850,7 +2855,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
         expect(outcome.kind).toBe("failed");
         expect(outcome.message).toContain("STILL ENABLED");
-        expect(outcome.message).toContain("retried on every reconciler tick");
+        expect(outcome.message).toContain("on every reconciler tick");
         expect(await disarmRecord(issueId)).toMatchObject({ owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", attempts: 1 });
 
         mockGhFetch.mockReset();
@@ -2896,6 +2901,72 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
         expect(summary.disarm).toMatchObject({ checked: 1, disabled: 1 });
         expect(await disarmRecord(issueId)).toBeUndefined();
+      });
+
+      // Round 12 (R10-AUTH-DISABLE): the first retry does not wait for the first reconciler tick.
+      it("retries a take-back that failed at once within seconds, without a reconciler tick", async () => {
+        disarmTiming.promptDelaysMs = [30, 30, 30];
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        let disableCalls = 0;
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          const query = String(JSON.parse(String(init?.body)).query);
+          if (query.includes("disablePullRequestAutoMerge")) {
+            disableCalls += 1;
+            // The in-request disable and the first prompt retry are refused; the second prompt retry is accepted.
+            return disableCalls <= 2 ? forbidden() : ({ ok: true, status: 200, json: async () => ({ data: { disablePullRequestAutoMerge: { clientMutationId: "m" } } }) }) as unknown as Response;
+          }
+          await revocations[0]![1]({ issueId, reviewerId });
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, { ...certifiedPr, nodeId: "PR_node_125" } as typeof certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.message).toContain("STILL ENABLED");
+        expect(outcome.message).toContain("within seconds");
+        const until = Date.now() + 5000;
+        while (Date.now() < until && (await disarmRecord(issueId))) await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(await disarmRecord(issueId)).toBeUndefined();
+        expect(disableCalls).toBe(3);
+        expect((await db.select().from(activityLog)).some((row) => row.action === "issue.merge_disarm_confirmed")).toBe(true);
+      });
+
+      it("tries the records least recently tried first, so refused ones cannot starve the rest", async () => {
+        const ids: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const { issueId } = await seedAuthorityCard(`SUP-${900 + i}`);
+          await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+            owner: OWNER, repo: REPO, number: 200 + i, nodeId: `PR_node_${200 + i}`, headSha: AUTH_HEAD, reason: "test",
+            since: new Date().toISOString(), attempts: 1, lastError: "x", lastAttemptAt: new Date(Date.now() - (3 - i) * 1000).toISOString(),
+          });
+          ids.push(issueId);
+        }
+        mockGhFetch.mockImplementation(async () => forbidden());
+
+        const first = await retryPendingAutoMergeDisarms(db, { limit: 2 });
+        const second = await retryPendingAutoMergeDisarms(db, { limit: 2 });
+
+        expect(first).toMatchObject({ checked: 2, pending: 3 });
+        const attempts = await Promise.all(ids.map(async (id) => (await disarmRecord(id))?.attempts));
+        // Two sweeps of two cover all three, the one not reached by the first sweep first in the second.
+        expect(attempts.sort()).toEqual([2, 2, 3].sort());
+        expect(second.checked).toBe(2);
+      });
+
+      it("writes an activity row for a record GitHub keeps refusing only on its first rounds and then about hourly", async () => {
+        const { issueId } = await seedAuthorityCard();
+        await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+          owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", headSha: AUTH_HEAD, reason: "test",
+          since: new Date().toISOString(), attempts: 1, lastError: "x",
+        });
+        mockGhFetch.mockImplementation(async () => forbidden());
+
+        for (let i = 0; i < 14; i++) await retryPendingAutoMergeDisarms(db);
+
+        const rows = (await db.select().from(activityLog)).filter((row) => row.action === "issue.merge_disarm_failed");
+        // attempts 2 and 3, then 12 (attempts 4-11 and 13-15 write none).
+        expect(rows).toHaveLength(3);
+        expect(await disarmRecord(issueId)).toMatchObject({ attempts: 15 });
       });
 
       it("ends the record, loudly, when the PR merged before auto-merge could be turned off", async () => {
