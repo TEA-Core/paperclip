@@ -4100,7 +4100,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         try {
           for (const delayMs of [0, 1, 2, 5, 10, 20, 40]) {
             for (let round = 0; round < 4; round += 1) {
-              const parent = createDb(tempDb!.connectionString, mode === "pooled" ? { prepare: false, max: poolMax } : { max: poolMax });
+              const parent = createDb(tempDb!.connectionString, mode === "pooled" ? { prepare: false, maxConnections: poolMax } : { maxConnections: poolMax });
               const scope = createRequestScopedDb(parent, { statementTimeoutMs: 60_000, lockTimeoutMs: 60_000, idleInTransactionMs: 60_000, connectTimeoutMs: 2000 })!;
               const work = (async () => await scope.db.execute(sql`select 1`))().catch(() => "cancelled");
               if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
