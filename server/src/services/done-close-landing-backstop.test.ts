@@ -79,6 +79,7 @@ vi.mock("./blocker-closure.js", async (importOriginal) => {
 });
 
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 
 type DbState = {
   candidates: Array<Record<string, unknown>>;
@@ -1457,6 +1458,24 @@ describe("createDoneCloseLandingBackstopService", () => {
 
         expect(mockDisableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
         expect(counts.reenqueued).toBe(0);
+      });
+
+      it("says the arm could NOT be taken back when the disable fails, instead of claiming it was", async () => {
+        const service = armingFixture();
+        mockDisableAutoMerge.mockResolvedValue({ success: false, error: "timeout after 10000ms" });
+        mockEnableAutoMerge.mockImplementation(async () => {
+          revoke();
+          return { success: true, alreadyQueued: false, error: null, status: 200 };
+        });
+        vi.mocked(logger.warn).mockClear();
+        vi.mocked(logger.error).mockClear();
+
+        const counts = await service.sweep();
+
+        expect(counts.reenqueued).toBe(0);
+        const errors = vi.mocked(logger.error).mock.calls.map((call) => String(call[1]));
+        expect(errors.some((message) => message.includes("could NOT be disabled"))).toBe(true);
+        expect(vi.mocked(logger.warn).mock.calls.map((call) => String(call[1])).some((message) => message.includes("taken back"))).toBe(false);
       });
 
       it("leaves a quiet card armed when nothing changed", async () => {

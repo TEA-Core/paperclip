@@ -1501,13 +1501,17 @@ export function createDoneCloseLandingBackstopService(
     });
     if (result.success) {
       // A revocation that committed while the call was in flight could not be seen before it.
-      const changed = await guard.stillHolds();
+      // A recheck that cannot be completed is treated as a change: an arm that cannot be re-verified is taken back.
+      const changed = await guard.stillHolds().catch((error) =>
+        `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changed) {
         const disabled = await disableAutoMerge(tokenResult.token, nodeId);
-        logger.warn(
-          { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, changed, disabled: disabled.success },
-          "done-close backstop: re-enqueue taken back — the card's authority changed while auto-merge was being enabled",
-        );
+        const where = { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, changed, disabled: disabled.success, disableError: disabled.error };
+        if (disabled.success) {
+          logger.warn(where, "done-close backstop: re-enqueue taken back — the card's authority changed while auto-merge was being enabled");
+        } else {
+          logger.error(where, "done-close backstop: auto-merge could NOT be disabled after the card's authority changed while it was being enabled; it must be disabled by hand");
+        }
         return false;
       }
     }

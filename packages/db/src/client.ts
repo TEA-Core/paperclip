@@ -324,9 +324,12 @@ export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits)
     return {
       db,
       cancel: async () => {
-        for (const query of [...inflight]) {
-          try { query.cancel(); } catch { /* the connection is destroyed next */ }
-        }
+        // The driver's cancel answers once its cancel request has been sent to the server; waiting for that
+        // (briefly) is what lets a caller know no statement of this request is still running when it answers.
+        const sent = [...inflight].map((query) => {
+          try { return Promise.resolve(query.cancel()).catch(() => {}); } catch { return Promise.resolve(); }
+        });
+        await Promise.race([Promise.all(sent), new Promise((resolve) => setTimeout(resolve, 3000).unref?.())]);
         await sql.end({ timeout: 0 }).catch(() => {});
       },
       close: () => sql.end({ timeout: 1 }).catch(() => {}),

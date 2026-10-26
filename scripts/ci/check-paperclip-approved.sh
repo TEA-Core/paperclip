@@ -821,12 +821,17 @@ fi
 # other success until the switch is armed.
 RELEASE_CONFIRMED_CONTEXT="paperclip/release-confirmed"
 STATUS_ROW='(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")'
+STATUS_DEF=''
 if waiver_retirement_on; then
-  STATUS_ROW="${STATUS_ROW}, ((.description // \"\") | if . == \"\" then \"-\" else . end), ((.id // \"-\") | tostring)"
+  # Every field has a value: tab-IFS `read` collapses an empty field into its neighbour, which would shift a
+  # later column (a description, an id) into the creator columns. An empty field is "-" and is mapped back
+  # to empty after the read, so a missing or null creator stays untrusted.
+  STATUS_DEF='def f: if . == "" then "-" else . end; '
+  STATUS_ROW='((.context // "") | f), ((.state // "") | f), (((.creator.id // "") | tostring) | f), ((.creator.login // "") | f), ((.description // "") | f), ((.id // "-") | tostring)'
 fi
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-  --jq ".[] | [${STATUS_ROW}] | @tsv")" \
+  --jq "${STATUS_DEF}.[] | [${STATUS_ROW}] | @tsv")" \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
@@ -836,6 +841,12 @@ APPROVAL_DESCRIPTION=""
 APPROVAL_STATUS_ID=""
 CONFIRMED_RELEASE_IDS=" "
 while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id; do
+  if waiver_retirement_on; then
+    [ "$status_context" = "-" ] && status_context=""
+    [ "$status_state" = "-" ] && status_state=""
+    [ "$status_creator_id" = "-" ] && status_creator_id=""
+    [ "$status_creator_login" = "-" ] && status_creator_login=""
+  fi
   if waiver_retirement_on && [ "$status_context" = "$RELEASE_CONFIRMED_CONTEXT" ]; then
     # Only the control plane's own marker counts, and only one that names a numeric status id.
     if [ "$status_state" = "$STATE" ] && [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ]; then

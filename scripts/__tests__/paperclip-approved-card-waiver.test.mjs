@@ -295,3 +295,25 @@ test("UNVERIFIED is only logged for a waiver honoured with the switch on", () =>
   assert.equal(refused.code, 1);
   assert.doesNotMatch(refused.out, /UNVERIFIED/);
 });
+
+// Round 10: an empty creator field must not shift a later column into the trusted creator-id slot.
+test("a status with a null or empty creator and a numeric description is refused as forged, switch on or off", () => {
+  const numeric = String(TEA_CORE.id);
+  for (const creator of [null, { id: "", login: "" }, { login: "" }, {}]) {
+    const status = { id: 41, context: "paperclip/approved", state: "success", creator, description: numeric };
+    for (const retired of [true, false]) {
+      const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [status], retired });
+      assert.equal(code, 1, `${JSON.stringify(creator)} retired=${retired}`);
+      assert.match(out, /FORGED/);
+    }
+  }
+});
+
+test("a release by the control plane whose creator login is empty still needs its marker", () => {
+  const noLogin = { ...release, creator: { id: TEA_CORE.id, login: "" } };
+  const refused = run({ ref: CARD_BRANCH, author: PERSON, statuses: [noLogin] });
+  assert.equal(refused.code, 1);
+  assert.match(refused.out, /UNCONFIRMED RELEASE/);
+  const markerNoLogin = { ...confirmedMarker, creator: { id: TEA_CORE.id, login: "" } };
+  assert.equal(run({ ref: CARD_BRANCH, author: PERSON, statuses: [markerNoLogin, noLogin] }).code, 0);
+});
