@@ -2674,6 +2674,158 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(graphqlCalls).toBe(0);
     });
 
+    // Round 9 (R7-AUTH): the authority the arm acts on is checked before every attempt, including a retry,
+    // and again after an accepted enable. Four ways of revoking it, at three moments each.
+    describe("a revocation of the card's authority on the same head", () => {
+      const AUTH_STAGE = "11111111-1111-4111-8111-111111111111";
+      const AUTH_HEAD = "e".repeat(40);
+      const revocations: Array<[string, (ctx: { issueId: string; reviewerId: string }) => Promise<void>]> = [
+        ["the decision row becomes changes_requested", async ({ issueId }) => {
+          await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId));
+        }],
+        ["the card's last decision outcome becomes changes_requested", async ({ issueId }) => {
+          const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+          await db.update(issues).set({ executionState: { ...(row!.executionState as object), lastDecisionOutcome: "changes_requested" } }).where(eq(issues.id, issueId));
+        }],
+        ["the certificate is removed", async ({ issueId }) => {
+          const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const state = row!.executionState as { approvalStatus: Record<string, unknown> };
+          const { finalDelivery: _removed, ...rest } = state.approvalStatus;
+          await db.update(issues).set({ executionState: { ...state, approvalStatus: rest } }).where(eq(issues.id, issueId));
+        }],
+        ["the reviewer agent is terminated", async ({ reviewerId }) => {
+          await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerId));
+        }],
+      ];
+
+      afterEach(async () => {
+        await db.delete(issueExecutionDecisions);
+        await db.delete(agents);
+      });
+
+      async function seedAuthorityCard() {
+        const reviewerId = randomUUID();
+        await db.insert(agents).values({
+          id: reviewerId, companyId, name: "Reviewer", role: "engineer", status: "active", adapterType: "codex_local",
+          adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        });
+        const issueId = await insertIssue({ branchName: "SUP-42-branch" });
+        const decisionId = randomUUID();
+        await db.update(issues).set({
+          executionPolicy: { mode: "normal", stages: [{ id: AUTH_STAGE, type: "review", approvalsNeeded: 1 }] },
+          executionState: {
+            completedStageIds: [AUTH_STAGE], lastDecisionId: decisionId, lastDecisionOutcome: "approved",
+            approvalStatus: {
+              publishedHeadSha: AUTH_HEAD,
+              finalDelivery: { owner: OWNER, repo: REPO, number: 125, headSha: AUTH_HEAD, decisionId },
+            },
+          },
+        }).where(eq(issues.id, issueId));
+        await db.insert(issueExecutionDecisions).values({
+          id: decisionId, companyId, issueId, stageId: AUTH_STAGE, stageType: "review",
+          actorAgentId: reviewerId, actorUserId: null, outcome: "approved", body: "LGTM",
+        });
+        return { issueId, reviewerId };
+      }
+      const decide = { stageId: AUTH_STAGE, stageType: "review", outcome: "approved", body: "LGTM" };
+      const okBody = () => ({ ok: true, status: 200, json: async () => ({ data: { enablePullRequestAutoMerge: { clientMutationId: "m" } } }) }) as unknown as Response;
+      const graphqlQueries = () => mockGhFetch.mock.calls
+        .filter(([url]) => url === GRAPHQL_URL)
+        .map(([, init]) => String(JSON.parse(String((init as RequestInit).body)).query));
+      const enables = () => graphqlQueries().filter((q) => q.includes("enablePullRequestAutoMerge"));
+      const disables = () => graphqlQueries().filter((q) => q.includes("disablePullRequestAutoMerge"));
+
+      it.each(revocations)("is refused before the first attempt when %s", async (_name, revoke) => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url.endsWith("/pulls/125")) {
+            await revoke({ issueId, reviewerId }); // while the PR node id is looked up
+            return { ok: true, status: 200, json: async () => ({ node_id: "PR_node_125" }) } as unknown as Response;
+          }
+          throw new Error(`unexpected ghFetch URL: ${url}`);
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, { ...certifiedPr, nodeId: null } as unknown as typeof certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("skipped");
+        expect(outcome.message).toContain("skipped:authority-changed");
+        expect(enables()).toEqual([]);
+      });
+
+      it.each(revocations)("is refused before a retry when %s", async (_name, revoke) => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          await revoke({ issueId, reviewerId }); // commits as the first attempt answers 502
+          return { ok: false, status: 502, json: async () => ({}) } as unknown as Response;
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("skipped");
+        expect(outcome.message).toContain("skipped:authority-changed");
+        expect(enables()).toHaveLength(1);
+      });
+
+      it.each(revocations)("takes the arm back when %s while the enable call is in flight", async (_name, revoke) => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          if (String(JSON.parse(String(init?.body)).query).includes("enablePullRequestAutoMerge")) await revoke({ issueId, reviewerId });
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("failed");
+        expect(outcome.message).toContain("failed:authority-revoked");
+        expect(outcome.message).toContain("auto-merge was disabled again");
+        expect(enables()).toHaveLength(1);
+        expect(disables()).toHaveLength(1);
+      });
+
+      it("says so when the arm that was revoked could not be taken back", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          const query = String(JSON.parse(String(init?.body)).query);
+          if (query.includes("disablePullRequestAutoMerge")) return { ok: false, status: 502, json: async () => ({}) } as unknown as Response;
+          await revocations[0]![1]({ issueId, reviewerId });
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("failed");
+        expect(outcome.message).toContain("could NOT be disabled");
+      });
+
+      it("arms a card whose authority did not change, and sends no disable", async () => {
+        const { issueId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("armed");
+        expect(disables()).toEqual([]);
+      });
+
+      it("refuses a reviewer agent that was already terminated before the call, not only one that changes during it", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerId));
+        mockGhFetch.mockImplementation(async () => { throw new Error("no GitHub call expected"); });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("skipped");
+        expect(outcome.message).toContain("no longer a current agent");
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      });
+    });
+
     it("returns skipped:no-approved-head when publishedHeadSha is null and does not call mergePullRequest", async () => {
       const issueId = await insertApprovedCardWithPublishedHead(null);
 

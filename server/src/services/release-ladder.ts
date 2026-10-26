@@ -36,28 +36,18 @@ export async function evaluateApprovingLadder(
 
   const decisions = await loadDecisions(conn, row);
   const authors = workAuthors(row, policy, state);
-  // The stage machine's own record of which decision came last on the card. It is the only explicit
-  // order the card keeps; the decision id is random and is never used to order decisions.
-  const lastDecisionId = typeof state.lastDecisionId === "string" ? state.lastDecisionId : null;
   for (const stageId of stageIds) {
     const forStage = decisions.filter((d) => d.stageId === stageId);
     if (forStage.length === 0) return `stage ${stageId} has no decision`;
-    // The latest decision is the newest by time. Decisions that share that instant are ordered by the
-    // recorded last-decision pointer. When they all are eligible approvals the order cannot matter. When
-    // they are not, the pointer must name one of them, and that one decides; with no pointer among them
-    // there is no order, and the stage is refused rather than guessed.
+    // The latest decision of a stage is the newest by time. The database records no order among
+    // decisions that share an instant (the id is random and is never used to order them, and no pointer
+    // is trusted to), so every decision at the newest instant must be an eligible approval: a rejection
+    // or an ineligible decider among them refuses, whichever order they were really made in.
     const newest = Math.max(...forStage.map((d) => d.createdAt.getTime()));
-    const tied = forStage.filter((d) => d.createdAt.getTime() === newest);
-    const problems = new Map<string, string | null>();
-    for (const d of tied) problems.set(d.id, await decisionProblem(conn, row, authors, d));
-    if ([...problems.values()].every((problem) => problem === null)) continue;
-    if (tied.length === 1) return `the latest decision of stage ${stageId}: ${problems.get(tied[0]!.id)}`;
-    const ordered = tied.find((d) => d.id === lastDecisionId);
-    if (!ordered) {
-      return `stage ${stageId} has ${tied.length} decisions at the same instant, one of them not an eligible approval, and the card does not record which came last`;
+    for (const d of forStage.filter((candidate) => candidate.createdAt.getTime() === newest)) {
+      const problem = await decisionProblem(conn, row, authors, d);
+      if (problem) return `the latest decision of stage ${stageId}: ${problem}`;
     }
-    const problem = problems.get(ordered.id);
-    if (problem) return `the latest decision of stage ${stageId}: ${problem}`;
   }
   return null;
 }

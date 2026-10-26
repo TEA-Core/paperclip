@@ -6,6 +6,8 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
+  createAuthorityGuard,
+  disableAutoMerge,
   enableAutoMerge,
   fetchGitHubNodeId,
   isGitHubTokenResolution,
@@ -1114,6 +1116,7 @@ export function createDoneCloseLandingBackstopService(
                 approvedHeadSha,
                 mergeArmingEnabled ? await readCardExecutionState(db, issue.id) : null,
               ),
+              issue.id,
             );
             if (reenqueueSucceeded) {
               await logActivity(db, {
@@ -1460,6 +1463,7 @@ export function createDoneCloseLandingBackstopService(
     pr: LinkedPullRequest,
     authorizedHeadSha: string,
     reauthorize: () => Promise<RequeueAuthorization>,
+    issueId: string,
   ): Promise<boolean> {
     const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
     if (!isGitHubTokenResolution(tokenResult)) {
@@ -1478,6 +1482,9 @@ export function createDoneCloseLandingBackstopService(
       );
       return false;
     }
+    // The card's authority, captured just before the final read of the head and the approval: a decision
+    // reversed, a certificate removed or a reviewer terminated after this point is a difference.
+    const guard = await createAuthorityGuard(db, companyId, issueId);
     const again = await reauthorize();
     if (again.kind !== "authorized" || again.headSha !== authorizedHeadSha) {
       logger.info(
@@ -1487,7 +1494,23 @@ export function createDoneCloseLandingBackstopService(
       return false;
     }
     // GitHub refuses the mutation if the PR's head is not the one authorized.
-    const result = await enableAutoMerge(tokenResult.token, nodeId, { expectedHeadOid: authorizedHeadSha });
+    const result = await enableAutoMerge(tokenResult.token, nodeId, {
+      expectedHeadOid: authorizedHeadSha,
+      // Before the first attempt and before every retry.
+      beforeAttempt: () => guard.stillHolds(),
+    });
+    if (result.success) {
+      // A revocation that committed while the call was in flight could not be seen before it.
+      const changed = await guard.stillHolds();
+      if (changed) {
+        const disabled = await disableAutoMerge(tokenResult.token, nodeId);
+        logger.warn(
+          { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, changed, disabled: disabled.success },
+          "done-close backstop: re-enqueue taken back — the card's authority changed while auto-merge was being enabled",
+        );
+        return false;
+      }
+    }
     if (!result.success) {
       logger.info(
         { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },

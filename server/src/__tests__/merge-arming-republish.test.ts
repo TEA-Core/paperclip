@@ -30,6 +30,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { publishHeadBoundRelease, releaseLockKey } from "../services/merge-arming.js";
+import { releaseRequestClock } from "../middleware/release-request-clock.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -2936,7 +2937,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       await expectLadderRefused(issueId);
     });
 
-    // Round 8: same-instant decisions are ordered by the card's recorded last-decision pointer, never by id.
+    // Round 9: decisions of a stage that share the newest instant are never ordered by id or by a card-wide
+    // pointer: unless every one of them is an eligible approval, the stage is refused in either id order.
     describe.each([
       ["the approval has the larger id", "ffffffff-ffff-4fff-8fff-ffffffffffff", "00000000-0000-4000-8000-000000000001"],
       ["the approval has the smaller id", "00000000-0000-4000-8000-000000000001", "ffffffff-ffff-4fff-8fff-ffffffffffff"],
@@ -2956,26 +2958,35 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         return issueId;
       };
 
-      it("releases when the card records the approval as the last decision", async () => {
-        const issueId = await seedTie(approvalId);
-        installReleaseTransport();
-        const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
-        expect(res.status).toBe(200);
-        expect(res.body.outcome).toBe("released");
-      });
+      it.each([["names the approval", approvalId], ["names the rejection", rejectionId], ["is absent", null]])(
+        "is refused when the card's last-decision pointer %s", async (_label, pointer) => {
+          await expectLadderRefused(await seedTie(pointer));
+        },
+      );
+    });
 
-      it("refuses when the card records the rejection as the last decision", async () => {
-        const issueId = await seedTie(rejectionId);
-        await expectLadderRefused(issueId);
-      });
+    // The shared integrity helper picks a representative of a tie by id; the release answer must not follow it.
+    it.each([
+      ["the author's approval has the larger id", "ffffffff-ffff-4fff-8fff-ffffffffffff", "00000000-0000-4000-8000-000000000001"],
+      ["the author's approval has the smaller id", "00000000-0000-4000-8000-000000000001", "ffffffff-ffff-4fff-8fff-ffffffffffff"],
+    ])("refuses an author's approval and an eligible approval at the same instant in either id order (%s)", async (_name, authorDecisionId, reviewerDecisionId) => {
+      const { issueId, companyId, reviewerAgentId } = await seedReleasable("ladder");
+      const seeded = await stageDecisionOf(issueId);
+      await db.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+      const at = new Date(seeded.createdAt);
+      const base = { companyId, issueId, stageId: STAGE_ID, stageType: "approval", outcome: "approved", body: "Approved", createdAt: at, updatedAt: at };
+      await db.insert(issueExecutionDecisions).values([
+        { ...base, id: authorDecisionId, actorAgentId: null, actorUserId: USER_ID },
+        { ...base, id: reviewerDecisionId, actorAgentId: reviewerAgentId, actorUserId: null },
+      ]);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      await db.update(issues).set({ executionState: { ...row!.executionState, lastDecisionId: reviewerDecisionId } }).where(eq(issues.id, issueId));
+      installReleaseTransport();
 
-      it("refuses, naming the missing order, when the card records no last decision", async () => {
-        const issueId = await seedTie(null);
-        installReleaseTransport();
-        const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
-        expect(res.status).toBe(409);
-        expect(JSON.stringify(res.body)).toContain("does not record which came last");
-      });
+      const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+      expect(res.status).toBe(409);
+      expect(statusWrites()).toEqual([]);
     });
 
     // ---- Round 5: bounded deadlines on the release path ----
@@ -3456,6 +3467,27 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       }
     }, 20_000);
 
+    it("has no late effect when a stuck secret provider answers after the deadline", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      // The provider call cannot be cancelled: it answers long after the request was answered.
+      mockResolveControlPlaneToken.mockImplementation(() => new Promise((resolve) => {
+        setTimeout(() => resolve({ token: CONTROL_PLANE_TOKEN, scope: "app_installation", secretName: "GITHUB_APP_PRIVATE_KEY" }), 900);
+      }));
+
+      const res = await request(deadlineApp({ totalMs: 300, compensationMs: 200, fetchMs: 100 }))
+        .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      await new Promise((resolve) => setTimeout(resolve, 1400));
+
+      expect(res.body.outcome).toBe("failed");
+      expect(res.body.message).toContain("deadline");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(statusWrites()).toEqual([]);
+      expect(markerWrites()).toEqual([]);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect((row!.executionState as { approvalStatus?: Record<string, unknown> } | null)?.approvalStatus?.releaseConfirmation).toBeUndefined();
+    }, 20_000);
+
     it("cancels a credential lookup that is waiting on the database", async () => {
       const { issueId } = await seedReleasable();
       mockResolveControlPlaneToken.mockImplementation((conn: Db) => conn.execute(sql`select pg_sleep(30)`));
@@ -3573,19 +3605,136 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(markerWrites()).toEqual([]);
     }, 20_000);
 
-    it("releases on a pooled (prepare: false) client through the shared pool and leaves no request session", async () => {
-      const { issueId } = await seedReleasable();
-      installReleaseTransport();
+    // Behind a transaction-mode pooler (prepare: false) the request runs on a tracked connection: its queries are
+    // cancelled one by one (no startup parameters, no session found by name).
+    const pooledApp = (mergeReleaseDeadlines: Record<string, number> = {}) => {
       const pooled = express();
       pooled.use(express.json());
       pooled.use((req, _res, next) => { req.actor = currentActor; next(); });
-      pooled.use("/api", issueRoutes(createDb(tempDb!.connectionString, { prepare: false }), {} as any));
+      pooled.use("/api", issueRoutes(createDb(tempDb!.connectionString, { prepare: false }), {} as any, { mergeReleaseDeadlines }));
       pooled.use(errorHandler);
+      return pooled;
+    };
+    const waitingOnLocks = async () => {
+      const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where wait_event_type = 'Lock' and pid <> pg_backend_pid()`);
+      return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
+    };
 
-      const res = await request(pooled).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+    it("releases on a pooled (prepare: false) client", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+
+      const res = await request(pooledApp()).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
       expect(res.body.outcome).toBe("released");
-      expect(await requestBackends()).toBe(0);
+    });
+
+    it("pooled: cancels a database wait before the access check and answers within the deadline", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      const release = await holdLock(sql`lock table issues in access exclusive mode`);
+      try {
+        const started = Date.now();
+        const res = await request(pooledApp({ totalMs: 400, compensationMs: 200, fetchMs: 100 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+        expect(Date.now() - started).toBeLessThan(3000);
+        expect(res.status).toBe(409);
+        expect(res.body.message).toContain("nothing was published");
+        expect(mockGhFetch).not.toHaveBeenCalled();
+        // The blocked statement is cancelled while the lock is still held, not left waiting.
+        expect(await eventually(async () => (await waitingOnLocks()) === 0)).toBe(true);
+      } finally {
+        await release();
+      }
+    }, 20_000);
+
+    it("pooled: a cancelled intent audit write never commits after the answer", async () => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport();
+      const release = await holdLock(sql`lock table activity_log in access exclusive mode`);
+      try {
+        const res = await request(pooledApp({ totalMs: 400, compensationMs: 200, fetchMs: 100 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+        expect(res.status).toBe(409);
+        expect(res.body.message).toContain("nothing was published");
+        expect(await eventually(async () => (await waitingOnLocks()) === 0)).toBe(true);
+      } finally {
+        await release();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      expect(await requestRows()).toEqual([]);
+    }, 20_000);
+
+    it("pooled: a cancelled outcome audit write never commits after the answer", async () => {
+      const { issueId } = await seedReleasable();
+      const held: { release?: () => Promise<void> } = {};
+      installReleaseTransport({
+        onStatusRead: async () => { held.release ??= await holdLock(sql`lock table activity_log in access exclusive mode`); },
+      });
+      try {
+        const res = await request(pooledApp({ totalMs: 5000, compensationMs: 300, fetchMs: 1000 }))
+          .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+        expect(res.body.outcome).toBe("released");
+        expect(res.body.auditRecorded).toBe(false);
+        expect(await eventually(async () => (await waitingOnLocks()) === 0)).toBe(true);
+      } finally {
+        await held.release?.();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const released = (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release");
+      expect(released).toEqual([]);
+    }, 20_000);
+
+    // Round 9: one clock from the moment the request arrives, before authentication.
+    describe("the request clock that starts before authentication", () => {
+      const slowAuthApp = (authMs: number, totalMs: number) => {
+        const slow = express();
+        slow.use(express.json());
+        slow.use(releaseRequestClock({ totalMs }));
+        // A stuck actor lookup: it resolves the board actor only after `authMs`.
+        slow.use((req, _res, next) => { setTimeout(() => { req.actor = currentActor; next(); }, authMs); });
+        slow.use("/api", issueRoutes(db, {} as any));
+        slow.use(errorHandler);
+        return slow;
+      };
+
+      it("answers 409 by the deadline while authentication is stuck, and the handler then does nothing", async () => {
+        const { issueId } = await seedReleasable();
+        installReleaseTransport();
+        const started = Date.now();
+
+        const res = await request(slowAuthApp(900, 300)).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+        expect(Date.now() - started).toBeLessThan(800);
+        expect(res.status).toBe(409);
+        expect(res.body.outcome).toBe("failed");
+        expect(res.body.message).toContain("nothing was published");
+        // Authentication finally completes: no GitHub call, no audit row, no status.
+        await new Promise((resolve) => setTimeout(resolve, 1400));
+        expect(mockGhFetch).not.toHaveBeenCalled();
+        expect(await requestRows()).toEqual([]);
+        expect(await outcomeRows()).toEqual([]);
+      }, 20_000);
+
+      it("gives the handler only the time that is left, and does not interfere with a request that is on time", async () => {
+        const { issueId } = await seedReleasable();
+        installReleaseTransport();
+
+        const res = await request(slowAuthApp(100, 5000)).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+        expect(res.status).toBe(200);
+        expect(res.body.outcome).toBe("released");
+      }, 20_000);
+
+      it("leaves other routes alone", async () => {
+        const other = express();
+        other.use(releaseRequestClock({ totalMs: 50 }));
+        other.get("/api/issues/x/merge-arming/release", async (_req, res) => { await new Promise((r) => setTimeout(r, 200)); res.json({ ok: true }); });
+        const res = await request(other).get("/api/issues/x/merge-arming/release");
+        expect(res.body).toEqual({ ok: true });
+      });
     });
 
     // The abandoned release voids its success while it still holds the publication lock.

@@ -133,7 +133,9 @@ describe("createRequestScopedDb", () => {
     await scope?.close();
   });
 
-  it("returns null for a transaction-mode pooler (prepare: false), so the caller keeps the shared pool", () => {
-    expect(createRequestScopedDb(createDb(url, { prepare: false }), limits)).toBeNull();
+  it("opens a tracked connection, without startup parameters, for a transaction-mode pooler (prepare: false)", async () => {
+    const scope = createRequestScopedDb(createDb(url, { prepare: false }), limits);
+    expect(scope).not.toBeNull();
+    await scope?.close();
   });
 });

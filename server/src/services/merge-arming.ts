@@ -3,8 +3,12 @@ import { z } from "zod";
 import type { IssueExecutionStage } from "@paperclipai/shared";
 import { and, eq, ilike, inArray, sql, type SQL } from "drizzle-orm";
 import {
+  agents,
+  authUsers,
+  companyMemberships,
   externalObjectMentions,
   externalObjects,
+  issueExecutionDecisions,
   issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
   issues,
@@ -1011,6 +1015,12 @@ export interface EnableAutoMergeOptions {
    * something else, so an authorization given for one head cannot arm another (SUP-20772).
    */
   expectedHeadOid?: string;
+  /**
+   * Called before EVERY attempt, the first and each retry. A non-null answer (why the authority no longer
+   * holds) stops the call with that reason and the mutation is not sent: a retry must not be the moment an
+   * approval that was revoked in between gets armed.
+   */
+  beforeAttempt?: () => Promise<string | null>;
 }
 
 /**
@@ -1035,6 +1045,33 @@ function isTransientArmingStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/**
+ * Turns auto-merge back off. Used only to take back an arm whose authority was revoked while the
+ * enable call was in flight (a revocation that commits inside the GitHub call cannot be seen before it).
+ */
+export async function disableAutoMerge(token: string, nodeId: string): Promise<{ success: boolean; error: string | null }> {
+  const query = `mutation { disablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query }),
+    });
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const errors = body?.errors as Array<{ message?: string }> | undefined;
+    if (!response.ok) return { success: false, error: errors?.[0]?.message ?? `HTTP ${response.status}` };
+    if (errors && errors.length > 0) {
+      const message = errors[0]?.message ?? "";
+      // Nothing was queued: the state asked for already holds.
+      if (/not enabled|not.*auto.?merge|already/i.test(message)) return { success: true, error: null };
+      return { success: false, error: message };
+    }
+    return { success: true, error: null };
+  } catch {
+    return { success: false, error: "network_error" };
+  }
+}
+
 export async function enableAutoMerge(
   token: string,
   nodeId: string,
@@ -1048,6 +1085,8 @@ export async function enableAutoMerge(
     return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0 };
   }
   const attempt = async (): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> => {
+    const refusal = await options.beforeAttempt?.();
+    if (refusal) return { success: false, alreadyQueued: false, error: `authority_changed: ${refusal}`, status: 0 };
     const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
     const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
 
@@ -3373,7 +3412,7 @@ export async function fetchLastMergeQueueEjectionViaTokenCandidates(
 
 // The `tea-core` App; the only identity scripts/ci/check-paperclip-approved.sh accepts as the
 // producer of `paperclip/approved` (its APPROVED_STATUS_CREATOR_ID default).
-const CONTROL_PLANE_STATUS_CREATOR_ID = "317012809";
+export const CONTROL_PLANE_STATUS_CREATOR_ID = "317012809";
 
 /**
  * SUP-15315: reads one head SHA's commit statuses from the GitHub statuses API
@@ -4718,11 +4757,61 @@ export async function postPullRequestComment(
   return { success: false, status: response.status, error: message ?? `HTTP ${response.status}` };
 }
 
-/** The parts of a card's record that say what was approved and for which head, for a before/after compare. */
-function authorityFingerprint(row: { status?: unknown; executionPolicy: unknown; executionState: unknown }): string {
+/**
+ * Everything that is the authority for arming one card, as a string to compare before and after: the
+ * card's own record (cancelled, stage ladder, completed stages, last decision, approved and published
+ * heads, the certified delivery, the recorded release confirmation), every decision row of the card
+ * (outcome, decider) and the standing of each decider (an agent's company and status, a user's
+ * membership and existence). A decision reversed, a certificate removed, a reviewer terminated or a
+ * member removed after it was taken changes the answer. Two reads of it that differ mean the authority a
+ * caller acted on is not the authority that exists now.
+ */
+export async function computeAuthorityFingerprint(db: Db, companyId: string, issueId: string): Promise<string> {
+  const [row] = await db
+    .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+    .limit(1);
+  if (!row) return "missing";
   const state = (row.executionState && typeof row.executionState === "object" ? row.executionState : {}) as Record<string, unknown>;
   const approval = (state.approvalStatus && typeof state.approvalStatus === "object" ? state.approvalStatus : {}) as Record<string, unknown>;
   const policy = (row.executionPolicy && typeof row.executionPolicy === "object" ? row.executionPolicy : {}) as { stages?: Array<{ id?: unknown; phase?: unknown }> };
+  const decisions = await db
+    .select({
+      id: issueExecutionDecisions.id,
+      stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      actorUserId: issueExecutionDecisions.actorUserId,
+    })
+    .from(issueExecutionDecisions)
+    .where(and(eq(issueExecutionDecisions.issueId, issueId), eq(issueExecutionDecisions.companyId, companyId)));
+  decisions.sort((a, b) => a.id.localeCompare(b.id));
+  const agentIds = [...new Set(decisions.map((d) => d.actorAgentId).filter((id): id is string => !!id))].sort();
+  const userIds = [...new Set(decisions.map((d) => d.actorUserId).filter((id): id is string => !!id))].sort();
+  const certificate = approval.finalDelivery ?? null;
+  if (typeof certificate === "object" && certificate !== null) {
+    const decisionId = (certificate as { decisionId?: unknown }).decisionId;
+    if (typeof decisionId === "string" && !decisions.some((d) => d.id === decisionId)) {
+      // A certificate naming a decision that does not exist is itself a difference worth recording.
+      agentIds.push(`certificate-decision-missing:${decisionId}`);
+    }
+  }
+  const agentRows = agentIds.length === 0 ? [] : await db
+    .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+    .from(agents)
+    .where(inArray(agents.id, agentIds.filter((id) => !id.startsWith("certificate-decision-missing:"))));
+  const memberRows = userIds.length === 0 ? [] : await db
+    .select({ principalId: companyMemberships.principalId, status: companyMemberships.status })
+    .from(companyMemberships)
+    .innerJoin(authUsers, eq(authUsers.id, companyMemberships.principalId))
+    .where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      inArray(companyMemberships.principalId, userIds),
+    ));
+  agentRows.sort((a, b) => a.id.localeCompare(b.id));
+  memberRows.sort((a, b) => a.principalId.localeCompare(b.principalId));
   return JSON.stringify([
     row.status === "cancelled",
     (policy.stages ?? []).map((stage) => [stage?.id, stage?.phase ?? null]),
@@ -4731,8 +4820,97 @@ function authorityFingerprint(row: { status?: unknown; executionPolicy: unknown;
     state.lastDecisionOutcome ?? null,
     approval.publishedHeadSha ?? null,
     approval.approvedHeadSha ?? null,
+    certificate,
     (approval.releaseConfirmation as { statusId?: unknown } | undefined)?.statusId ?? null,
+    decisions,
+    agentRows,
+    memberRows,
   ]);
+}
+
+/**
+ * Why the deciders of a card no longer stand behind its approval, or null. For each pre-merge stage of
+ * the policy that has decision rows, the newest decision (every decision at the newest instant) must be an
+ * approval, and an agent that decided it must still be a current agent of the company (not terminated or
+ * awaiting approval). A stage with no decision rows (an auto-skipped one) is left to the stage-integrity
+ * checks the consumers already run, and users are not checked here (a local board has no user row).
+ */
+async function decisionStandingProblem(db: Db, companyId: string, issueId: string, policy: unknown): Promise<string | null> {
+  const stages = (policy && typeof policy === "object" && Array.isArray((policy as { stages?: unknown }).stages)
+    ? (policy as { stages: Array<{ id?: unknown; phase?: unknown }> }).stages : []);
+  const preMerge = new Set(stages.filter((st) => typeof st?.id === "string" && st.phase !== "post_merge").map((st) => st.id as string));
+  const decisions = await db
+    .select({
+      stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      createdAt: issueExecutionDecisions.createdAt,
+    })
+    .from(issueExecutionDecisions)
+    .where(and(eq(issueExecutionDecisions.issueId, issueId), eq(issueExecutionDecisions.companyId, companyId)));
+  const byStage = new Map<string, typeof decisions>();
+  for (const decision of decisions) {
+    if (!preMerge.has(decision.stageId)) continue;
+    byStage.set(decision.stageId, [...(byStage.get(decision.stageId) ?? []), decision]);
+  }
+  for (const [stageId, list] of byStage) {
+    const newest = Math.max(...list.map((d) => d.createdAt.getTime()));
+    for (const decision of list.filter((d) => d.createdAt.getTime() === newest)) {
+      if (decision.outcome !== "approved") return `the latest decision of stage ${stageId} is ${decision.outcome}, not approved`;
+      if (decision.actorAgentId) {
+        const [agent] = await db
+          .select({ companyId: agents.companyId, status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, decision.actorAgentId));
+        if (!agent || agent.companyId !== companyId || agent.status === "terminated" || agent.status === "pending_approval") {
+          return `the agent that decided stage ${stageId} is no longer a current agent of the company`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The authority a merge actuator acts on, captured when it is created and checked again whenever
+ * `stillHolds` is called: before every enable attempt (retries included), before a direct merge and
+ * after an accepted enable. A consumer creates it just before its own final read of the card, so a change
+ * after that read is a difference. `stillHolds` answers why the authority no longer holds, or null.
+ */
+export interface AuthorityGuard {
+  stillHolds(): Promise<string | null>;
+}
+export async function createAuthorityGuard(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  options: { requireApprovedLadder?: boolean } = {},
+): Promise<AuthorityGuard> {
+  const baseline = await computeAuthorityFingerprint(db, companyId, issueId);
+  return {
+    async stillHolds() {
+      const [fresh] = await db
+        .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+        .limit(1);
+      if (!fresh) return "the card no longer exists";
+      if (options.requireApprovedLadder) {
+        if (fresh.status === "cancelled") return "the card was cancelled";
+        if (!ladderIsTerminallyApproved(
+          fresh.executionPolicy as Parameters<typeof ladderIsTerminallyApproved>[0],
+          fresh.executionState as Parameters<typeof ladderIsTerminallyApproved>[1],
+        )) {
+          return "the card's ladder is no longer approved";
+        }
+      }
+      const standing = await decisionStandingProblem(db, companyId, issueId, fresh.executionPolicy);
+      if (standing) return standing;
+      return (await computeAuthorityFingerprint(db, companyId, issueId)) === baseline
+        ? null
+        : "the card's approval record, its decisions or a decider's standing changed";
+    },
+  };
 }
 
 export async function armMergeOnApproval(
@@ -4745,7 +4923,15 @@ export async function armMergeOnApproval(
    * The head the caller authorized. GitHub then refuses to enable auto-merge on a PR whose head is
    * anything else, so a push landing after the caller's last read cannot be armed by this call.
    */
-  options: { expectedHeadOid?: string } = {},
+  options: {
+    expectedHeadOid?: string;
+    /**
+     * The authority guard the caller created just before its own final read of the card. Without one, the
+     * authority as this call first reads it is the baseline. A difference before an enable attempt, a retry
+     * or a direct merge stops the arm, and one found after an accepted enable turns auto-merge back off.
+     */
+    authorityGuard?: AuthorityGuard;
+  } = {},
 ): Promise<ArmingOutcome> {
   if (decision.outcome !== "approved") {
     return { kind: "skipped", message: `skipped:not-approved: Decision outcome is "${decision.outcome}", not "approved"` };
@@ -4877,23 +5063,13 @@ export async function armMergeOnApproval(
   // The authority this call acts on, as the card records it now. Token resolution, the node-id lookup
   // and the retries take time, and a card whose decision, ladder, head or release changed in that time
   // is not what was authorized: it is read again right before the merge lever is pulled.
-  const authoritySnapshot = authorityFingerprint(ownerRow);
-  const authorityChanged = async (): Promise<string | null> => {
-    const [fresh] = await db
-      .select({ id: issues.id, status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
-      .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.id, ownerRow.id)))
-      .limit(1);
-    if (!fresh) return "the card no longer exists";
-    if (fresh.status === "cancelled") return "the card was cancelled";
-    if (!ladderIsTerminallyApproved(
-      fresh.executionPolicy as Parameters<typeof ladderIsTerminallyApproved>[0],
-      fresh.executionState as Parameters<typeof ladderIsTerminallyApproved>[1],
-    )) {
-      return "the card's ladder is no longer approved";
-    }
-    return authorityFingerprint(fresh) === authoritySnapshot ? null : "the card's approval record changed";
-  };
+  const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, ownerRow.id, { requireApprovedLadder: true });
+  const authorityChanged = () => guard.stillHolds();
+  // Right now, before anything is sent: a card whose authority already differs from what the caller checked.
+  const changedAtStart = await authorityChanged();
+  if (changedAtStart) {
+    return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedAtStart}; nothing was armed` };
+  }
 
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
   if (candidates.length === 0) {
@@ -4938,12 +5114,23 @@ export async function armMergeOnApproval(
       nodeId = nodeIdResult.nodeId;
     }
 
-    const changedBeforeArm = await authorityChanged();
-    if (changedBeforeArm) {
-      return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedBeforeArm}; nothing was armed` };
-    }
-    const result = await enableAutoMerge(token, nodeId, options.expectedHeadOid ? { expectedHeadOid: options.expectedHeadOid } : {});
+    const result = await enableAutoMerge(token, nodeId, {
+      ...(options.expectedHeadOid ? { expectedHeadOid: options.expectedHeadOid } : {}),
+      // Before the first attempt and before every retry.
+      beforeAttempt: authorityChanged,
+    });
     if (result.success) {
+      // A revocation that committed while the call was in flight could not be seen before it: look again,
+      // and take the arm back if the authority is no longer what was checked.
+      const changedDuringArm = await authorityChanged();
+      if (changedDuringArm) {
+        const disabled = await disableAutoMerge(token, nodeId);
+        return {
+          kind: "failed",
+          message: `failed:authority-revoked: ${pr.displayName} — ${changedDuringArm} while auto-merge was being enabled; ` +
+            (disabled.success ? "auto-merge was disabled again" : `auto-merge could NOT be disabled (${disabled.error ?? "unknown"}) and must be disabled by hand`),
+        };
+      }
       if (result.alreadyQueued) {
         return {
           kind: "skipped",
@@ -4954,6 +5141,9 @@ export async function armMergeOnApproval(
         kind: "armed",
         message: `armed: Auto-merge enabled for ${pr.displayName}`,
       };
+    }
+    if (result.error?.startsWith("authority_changed:")) {
+      return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${result.error.slice("authority_changed:".length).trim()}; nothing was armed` };
     }
 
     if (result.status === 401 || result.status === 403) {

@@ -11557,7 +11557,13 @@ export function issueRoutes(
     // a wait for it at once, and the server rolls back an open transaction and frees its lock. The
     // request never queues for, or holds, a connection of the shared pool.
     const deadlines = { ...DEFAULT_RELEASE_DEADLINES, ...opts.mergeReleaseDeadlines };
-    const envelope = AbortSignal.timeout(deadlines.totalMs);
+    // The clock started when the request arrived (before authentication, see releaseRequestClock). A request
+    // whose clock already ran out was answered there: the handler does nothing for it.
+    const requestClock = res.locals.releaseClock as { startedAt: number; expired: boolean; handlerStarted: boolean } | undefined;
+    if (requestClock?.expired) return;
+    if (requestClock) requestClock.handlerStarted = true;
+    const waited = requestClock ? Date.now() - requestClock.startedAt : 0;
+    const envelope = AbortSignal.timeout(Math.max(1, deadlines.totalMs - waited));
     const scope = createRequestScopedDb(db, {
       statementTimeoutMs: Math.min(deadlines.statementMs, deadlines.totalMs),
       lockTimeoutMs: Math.min(deadlines.lockMs, deadlines.totalMs),

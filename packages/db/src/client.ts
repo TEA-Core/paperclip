@@ -303,19 +303,39 @@ export interface RequestScopedDb {
  */
 export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits): RequestScopedDb | null {
   const origin = scopeOrigins.get(parent);
-  // A transaction-mode pooler (prepare === false) rejects startup parameters and maps no client to one
-  // backend, so the session cannot be found or ended: the caller falls back to the shared pool.
-  if (!origin || origin.options.prepare === false) return null;
+  if (!origin) return null;
   const driverOptions = postgresJsOptions(origin.options);
-  // A name only this request's backend has, so the server session can be found and ended from outside.
-  const applicationName = `paperclip-request-${randomUUID()}`;
-  const sql = postgres(origin.url, {
+  const common = {
     ...driverOptions,
     max: 1,
     idle_timeout: undefined,
     max_lifetime: undefined,
     connect_timeout: Math.max(1, Math.ceil(limits.connectTimeoutMs / 1000)),
     onnotice: () => {},
+  };
+  // A transaction-mode pooler (prepare === false) rejects startup parameters and maps no client to one
+  // backend, so its session cannot be found by name or timed out by the server. The requests it runs are
+  // cancelled one by one instead, with the driver's own cancel (a cancel request for the backend the
+  // statement is running on, which the pooler forwards) and then the connection is destroyed.
+  if (origin.options.prepare === false) {
+    const inflight = new Set<{ cancel(): void }>();
+    const sql = postgres(origin.url, common);
+    const db = drizzlePg(trackQueries(sql, inflight), { schema }) as unknown as Db;
+    return {
+      db,
+      cancel: async () => {
+        for (const query of [...inflight]) {
+          try { query.cancel(); } catch { /* the connection is destroyed next */ }
+        }
+        await sql.end({ timeout: 0 }).catch(() => {});
+      },
+      close: () => sql.end({ timeout: 1 }).catch(() => {}),
+    };
+  }
+  // A name only this request's backend has, so the server session can be found and ended from outside.
+  const applicationName = `paperclip-request-${randomUUID()}`;
+  const sql = postgres(origin.url, {
+    ...common,
     connection: {
       ...((driverOptions.connection as Record<string, string> | undefined) ?? {}),
       application_name: applicationName,
@@ -345,6 +365,40 @@ export function createRequestScopedDb(parent: Db, limits: RequestScopedDbLimits)
     },
     close: () => sql.end({ timeout: 1 }).catch(() => {}),
   };
+}
+
+/**
+ * Wraps a postgres.js client so every query it starts (directly or inside a transaction) is remembered
+ * until it settles, which is what lets a request cancel the ones still waiting.
+ */
+function trackQueries(sql: postgres.Sql, inflight: Set<{ cancel(): void }>): postgres.Sql {
+  // Not awaited here: a postgres.js query runs as soon as it is awaited, and the caller (drizzle) still
+  // has to set how it wants the rows. A request makes a handful of queries, and cancelling one that has
+  // already finished only reaches the one connection this request owns, so none is ever dropped from the set.
+  const track = <Q extends { cancel(): void }>(query: Q): Q => {
+    inflight.add(query);
+    return query;
+  };
+  return new Proxy(sql, {
+    apply(target, thisArg, args) {
+      return track(Reflect.apply(target as unknown as (...a: unknown[]) => never, thisArg, args));
+    },
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (prop === "unsafe" && typeof value === "function") {
+        return (...args: unknown[]) => track((value as (...a: unknown[]) => never).apply(target, args));
+      }
+      if (prop === "begin" && typeof value === "function") {
+        return (...args: unknown[]) => {
+          const last = args.length - 1;
+          const callback = args[last] as (tx: postgres.Sql) => unknown;
+          args[last] = (tx: postgres.Sql) => callback(trackQueries(tx, inflight));
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  }) as postgres.Sql;
 }
 
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {

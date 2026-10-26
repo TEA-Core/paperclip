@@ -320,17 +320,19 @@ ships **unset** so merging the change cannot freeze a merge before the release r
 is deployed: deploy the control plane, confirm the route answers, then set the
 variable. Unsetting it is the rollback.
 
-**A board release counts in CI only with its confirmation marker (SUP-20772).** The
-control plane writes a release as `paperclip/approved` = success with a description
+**A board release counts in CI only with its confirmation marker, once the switch is on (SUP-20772).**
+The control plane writes a release as `paperclip/approved` = success with a description
 starting `released by `, and, only after the release is confirmed in its database, a
 second status `paperclip/release-confirmed` whose description is `confirms status <id of
-that success>`, both as `tea-core[bot]`. The enforcer accepts a release-described success
-only beside such a marker from that creator; without one it logs `UNCONFIRMED RELEASE` and
-treats the head as not approved (a success the control plane voided, never confirmed or
-could not confirm is therefore no approval). Statuses that are not release-described are
-judged as before, with or without the switch. `paperclip/release-confirmed` is read by the
-script and is **not** a required status check: do not add it to the ruleset (this document
-changes no ruleset).
+that success>`, both as `tea-core[bot]`. With `PAPERCLIP_CARD_WAIVER_RETIRED=1` the enforcer
+accepts a release-described success only beside such a marker from that creator; without one
+it logs `UNCONFIRMED RELEASE` and treats the head as not approved (a success the control
+plane voided, never confirmed or could not confirm is therefore no approval). With the switch
+OFF, the default, the enforcer reads, judges and prints exactly what the fold's script does
+(it does not even request the description or the id), so until the switch is armed it still
+accepts a release-described success that has no marker. `paperclip/release-confirmed` is read
+by the script and is **not** a required status check: do not add it to the ruleset (this
+document changes no ruleset).
 
 **Known residual bypass — do not set `PAPERCLIP_CARD_WAIVER_RETIRED` until it is
 closed.** The enforcer reads GitHub only and has no control-plane credential, so it
