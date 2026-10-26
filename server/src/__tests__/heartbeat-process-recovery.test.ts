@@ -17071,4 +17071,96 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const run = await heartbeat.getRun(runId);
     expect(run?.error).toContain("Work session expired: no keepalive within 90 seconds");
   });
+
+  async function seedLockContendedNativeRestart() {
+    const { companyId, issueId, runId } = await seedRunFixture({
+      adapterType: "paperclip_runner",
+      runtimeMode: "native",
+    });
+    await db.update(heartbeatRuns).set({ nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(nativeRunFinalizations).values({
+      runId, companyId, issueId, phase: "observed",
+    });
+    let signalLocked!: () => void;
+    let releaseLock!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const holder = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    const heartbeat = heartbeatService(db, {
+      nativeSessionBackendFactory: () => { throw new NativeRunnerOwnershipUnverifiedError(); },
+    });
+    return { issueId, runId, heartbeat, releaseLock, holder };
+  }
+
+  it("retries a deferred native startup recovery after the competing issue transaction releases its lock", async () => {
+    await withTempPaperclipHome(async () => {
+      const { runId, heartbeat, releaseLock, holder } = await seedLockContendedNativeRestart();
+      try {
+        const initial = await heartbeat.recoverNativeRunsAfterRestart();
+        expect(initial.dispositions).toEqual([
+          expect.objectContaining({ kind: "deferred_lock_conflict", runId }),
+        ]);
+        expect(initial.claims).toEqual([]);
+      } finally {
+        releaseLock();
+        await holder;
+      }
+      try {
+        await vi.waitFor(async () => {
+          const [coordinator] = await db.select().from(nativeRunFinalizations)
+            .where(eq(nativeRunFinalizations.runId, runId));
+          expect(coordinator?.recoveryHistory).toEqual([
+            expect.objectContaining({ disposition: "bootstrap_incomplete" }),
+          ]);
+        }, { timeout: 6_000, interval: 50 });
+        await vi.waitFor(async () => {
+          const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+          expect(events.some((event) => event.eventType === "native.recovery.transition"
+            && (event.payload as Record<string, unknown>)?.runnerDisposition === "bootstrap_incomplete")).toBe(true);
+        }, { timeout: 6_000, interval: 50 });
+      } finally {
+        await heartbeat.drainActiveRunExecutions();
+      }
+    });
+  }, 20_000);
+
+  it("records an operator-visible error after the native recovery lock retry cap", async () => {
+    await withTempPaperclipHome(async () => {
+      const { runId, heartbeat, releaseLock, holder } = await seedLockContendedNativeRestart();
+      try {
+        const initial = await heartbeat.recoverNativeRunsAfterRestart();
+        expect(initial.dispositions).toEqual([
+          expect.objectContaining({ kind: "deferred_lock_conflict", runId }),
+        ]);
+        await vi.waitFor(async () => {
+          const events = await db.select().from(heartbeatRunEvents)
+            .where(eq(heartbeatRunEvents.runId, runId));
+          expect(events).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+              eventType: "native.recovery.transition",
+              level: "error",
+              payload: expect.objectContaining({
+                runnerDisposition: "deferred_lock_conflict",
+                reason: "lock_retry_exhausted",
+                retryAttempts: 3,
+              }),
+            }),
+          ]));
+        }, { timeout: 25_000, interval: 100 });
+        const [coordinator] = await db.select().from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.runId, runId));
+        expect(coordinator?.controllerGeneration).toBe(0);
+        expect(coordinator?.recoveryHistory).toEqual([]);
+      } finally {
+        releaseLock();
+        await holder;
+        await heartbeat.drainActiveRunExecutions();
+      }
+    });
+  }, 35_000);
 });

@@ -62,7 +62,7 @@ export type NativeRestartRecoveryClaim =
 export type NativeRestartRecoveryDisposition =
   | NativeRestartRecoveryClaim
   | {
-      kind: "awaiting_evidence" | "blocked" | "already_finalized";
+      kind: "awaiting_evidence" | "blocked" | "already_finalized" | "deferred_lock_conflict";
       runId: string;
       reason: string;
     };
@@ -993,9 +993,13 @@ export async function claimNativeRestartRecoveries(input: {
         terminalRunToReport = null;
         logger.warn(
           { err: retryError, runId: candidate.runId, issueId: candidate.issueId },
-          "Native restart recovery deferred after lock contention; next pass will retry",
+          "Native restart recovery deferred after lock contention",
         );
-        continue;
+        disposition = {
+          kind: "deferred_lock_conflict",
+          runId: candidate.runId,
+          reason: "native_restart_recovery_lock_conflict",
+        };
       }
     }
     if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport);

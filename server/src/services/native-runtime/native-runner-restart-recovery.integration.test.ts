@@ -979,7 +979,11 @@ describeEmbeddedPostgres("native runner restart recovery with real processes", (
         try {
           expect(await claimNativeRestartRecoveries({
             db: fixture.db, controller: successor, restartKind: "hard", runIds: [fixture.runId],
-          })).toEqual([]);
+          })).toEqual([{
+            kind: "deferred_lock_conflict",
+            runId: fixture.runId,
+            reason: "native_restart_recovery_lock_conflict",
+          }]);
         } catch (error) {
           failures.push(error);
         }

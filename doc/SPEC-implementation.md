@@ -300,8 +300,12 @@ the same issue-row lock before writing. No table lock is taken. Native restart
 recovery locks the issue before a run and has a 1-second per-lock timeout; an
 overlap may invert these orders. If recovery times out or deadlocks on a lock,
 it retries that candidate once in a fresh transaction. A second lock conflict
-logs and defers only that issue until the next recovery pass; it never escapes
-to abort the startup pass, and a rolled-back attempt never reports a run failure.
+defers only that issue and schedules up to three further recovery passes with
+1-, 2-, and 4-second delays; each pass rechecks the same run's eligibility and
+locks before claiming. Exhaustion logs an error and persists an error-level
+`native.recovery.transition` run event (`reason: lock_retry_exhausted`) for
+board inspection and operator intervention. Deferral never aborts startup, and
+a rolled-back attempt never reports a run failure or grants provider authority.
 Restore sets a 250ms transaction-local lock timeout. On SQLSTATE `55P03` or
 `40P01`, it returns 409 with top-level `code` and `details.code` both equal to
 `"participant_restore_lock_busy"`, `details.retryable = true`, and
