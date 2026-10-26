@@ -1531,6 +1531,7 @@ const nativeSessionResumeDispatchTimers = new Map<
   ReturnType<typeof setTimeout>
 >();
 const MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES = 3;
+const NATIVE_RESTART_RECOVERY_POST_CAP_RETRY_MS = 5_000;
 const nativeRestartRecoveryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 // Task drain: an operator-controlled hold on new run admission, so a caller
 // can wait for active work to finish before it stops the process. The state
@@ -16119,7 +16120,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       activeRunExecutionPromises.add(execution);
       void execution.finally(() => activeRunExecutionPromises.delete(execution));
-    }, 1000 * 2 ** (attempt - 1));
+    }, attempt > MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES
+      ? NATIVE_RESTART_RECOVERY_POST_CAP_RETRY_MS
+      : 1000 * 2 ** (attempt - 1));
     timer.unref?.();
     nativeRestartRecoveryRetryTimers.set(runId, timer);
   }
@@ -16210,9 +16213,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           scheduleNativeRestartRecoveryLockRetry(disposition.runId, attempt + 1, intent);
           continue;
         }
+        // The fast retries are capped, not recovery itself: a persistent lock
+        // must not strand this run after it eventually clears.
+        scheduleNativeRestartRecoveryLockRetry(
+          disposition.runId,
+          MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES + 1,
+          intent,
+        );
+        if (attempt > MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES) continue;
         logger.error(
           { runId: disposition.runId, attempt },
-          "native restart recovery exhausted lock retries; operator intervention required",
+          "native restart recovery exhausted fast lock retries; periodic retry scheduled, inspect persistent contention",
         );
       }
       const run = await getRun(disposition.runId);
@@ -16238,7 +16249,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     : disposition.kind === "already_finalized"
                       ? "Native restart recovery found an already-finalized result"
                       : disposition.kind === "deferred_lock_conflict"
-                        ? "Native restart recovery exhausted lock retries; operator intervention required"
+                        ? "Native restart recovery exhausted fast lock retries; periodic retry scheduled, inspect persistent contention"
                         : "Native restart recovery blocked ambiguous or conflicting ownership",
           payload: {
             restartKind: isClaim ? disposition.restartKind : restartKind,
@@ -23010,6 +23021,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await Promise.allSettled([...activeWakeupPromises]);
       await Promise.all([...activeRunExecutionPromises]);
     }
+    // A retry already firing when drain began may have scheduled its next pass
+    // while we awaited it; cancel that newly-created timer as well.
+    for (const timer of nativeRestartRecoveryRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    nativeRestartRecoveryRetryTimers.clear();
   }
 
   function scheduleNativeSessionResumeDispatch(

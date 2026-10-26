@@ -17129,7 +17129,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   }, 20_000);
 
-  it("records an operator-visible error after the native recovery lock retry cap", async () => {
+  it("records an operator-visible error at the native recovery cap and still recovers after the lock clears", async () => {
     await withTempPaperclipHome(async () => {
       const { runId, heartbeat, releaseLock, holder } = await seedLockContendedNativeRestart();
       try {
@@ -17156,11 +17156,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           .where(eq(nativeRunFinalizations.runId, runId));
         expect(coordinator?.controllerGeneration).toBe(0);
         expect(coordinator?.recoveryHistory).toEqual([]);
+        releaseLock();
+        await holder;
+        await vi.waitFor(async () => {
+          const [recovered] = await db.select().from(nativeRunFinalizations)
+            .where(eq(nativeRunFinalizations.runId, runId));
+          expect(recovered?.controllerGeneration).toBe(1);
+          expect(recovered?.recoveryHistory).toEqual([
+            expect.objectContaining({ disposition: "bootstrap_incomplete" }),
+          ]);
+        }, { timeout: 12_000, interval: 100 });
+        const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        expect(events.filter((event) => event.eventType === "native.recovery.transition"
+          && (event.payload as Record<string, unknown>)?.reason === "lock_retry_exhausted")).toHaveLength(1);
       } finally {
         releaseLock();
         await holder;
         await heartbeat.drainActiveRunExecutions();
       }
     });
-  }, 35_000);
+  }, 45_000);
 });

@@ -300,12 +300,15 @@ the same issue-row lock before writing. No table lock is taken. Native restart
 recovery locks the issue before a run and has a 1-second per-lock timeout; an
 overlap may invert these orders. If recovery times out or deadlocks on a lock,
 it retries that candidate once in a fresh transaction. A second lock conflict
-defers only that issue and schedules up to three further recovery passes with
+defers only that issue and schedules three fast recovery passes with
 1-, 2-, and 4-second delays; each pass rechecks the same run's eligibility and
-locks before claiming. Exhaustion logs an error and persists an error-level
+locks before claiming. Exhaustion logs an error and persists one error-level
 `native.recovery.transition` run event (`reason: lock_retry_exhausted`) for
-board inspection and operator intervention. Deferral never aborts startup, and
-a rolled-back attempt never reports a run failure or grants provider authority.
+board inspection. A candidate that remains lock-conflicted is retried every
+5 seconds after the fast-retry cap until it becomes eligible to claim or its
+eligibility changes; the cap alert is not a permanent liveness stop. Deferral
+never aborts startup, and a rolled-back attempt never reports a run failure
+or grants provider authority.
 Restore sets a 250ms transaction-local lock timeout. On SQLSTATE `55P03` or
 `40P01`, it returns 409 with top-level `code` and `details.code` both equal to
 `"participant_restore_lock_busy"`, `details.retryable = true`, and
@@ -327,10 +330,15 @@ live-run read without taking the issue-row lock. These are residual races,
 not claims of coverage by the nested-only queue lock. A raw serving-role
 `heartbeat_runs` SQL insert and the provider-quota and delayed disposition
 `scheduled_retry` inserts in `server/src/services/recovery/service.ts` likewise
-do not hold the issue-row lock through insertion. `self-declared-run.ts`
-updates the issue status to `in_progress` before its separate run insert:
-that update serializes with restore's row and defeats the restore status CAS
-if it wins first, but there is no continuous issue-row lock across its insert.
+do not hold the issue-row lock through insertion. Existing active recovery
+actions are refused, but a later action/scheduled run sequence is not
+serialized against restore's final live-run read. `self-declared-run.ts`
+updates the issue status to `in_progress` while requiring the old assignee
+before its separate run insert: this atomic status/assignee predicate excludes
+an eligible restore in either order, but is not a continuous issue-row lock
+across insertion. These are source-path dispositions, not measured
+interleavings or an exhaustive census; see `doc/restore-participant-assurance.md`
+for each writer and three receipt-only helpers.
 The operation changes only the agent assignee (and `updatedAt`) and logs the
 before/after assignment
 atomically. The status and status version remain unchanged (the version

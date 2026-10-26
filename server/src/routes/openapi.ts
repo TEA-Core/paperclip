@@ -4007,14 +4007,21 @@ registry.registerPath({
     "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
     "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
     "Native restart recovery uses the opposite issue-then-run order: it retries a lock timeout or " +
-    "deadlock once in a fresh transaction, then defers that issue and schedules up to three bounded backoff retry passes; " +
-    "exhaustion logs an error and emits an error-level native.recovery.transition run event (reason lock_retry_exhausted); " +
-    "the repair's 250ms lock timeout returns 409 with details.code=participant_restore_lock_busy, " +
-    "details.retryable=true, and Retry-After: 1. Nested-only " +
-    "paperclipIssue.id heartbeat wakes stay unscoped but acquire the issue-row lock for admission. Other writers (raw serving-role SQL " +
-    "inserts, self-declared runs, and recovery scheduled_retry inserts) may race after the final live-run " +
-    "check without that lock. Only the assignee and updatedAt change; status, statusVersion, " +
-    "executionState, decision history and pendingSince remain unchanged. Does not wake or re-arm the stage.",
+    "deadlock once in a fresh transaction, then defers that issue and schedules three fast backoff " +
+    "passes at 1, 2 and 4 seconds. Exhaustion logs an error and emits one error-level " +
+    "native.recovery.transition run event (reason lock_retry_exhausted); a still-lock-conflicted " +
+    "candidate continues on a 5-second periodic retry, rather than remaining stranded after the cap. " +
+    "The repair's 250ms lock timeout returns 409 with details.code=participant_restore_lock_busy, " +
+    "details.retryable=true, and Retry-After: 1. Nested-only paperclipIssue.id heartbeat wakes stay " +
+    "unscoped but acquire the issue-row lock for queued-run admission. A bounded retry deriving only " +
+    "top-level contextSnapshot.issueId and a same-scope context coalescing update before that admission " +
+    "can bypass this nested-only lock; neither is serialized by this repair. Raw serving-role SQL inserts " +
+    "and delayed recovery scheduled_retry inserts may also race after the final live-run check. " +
+    "Self-declared runs first change status/assignee under an issue-row update predicate, excluding " +
+    "eligible restore in either order, but do not hold a continuous issue-row lock through run insertion. " +
+    "This is not an exhaustive writer guarantee. Only the assignee and updatedAt change; status, " +
+    "statusVersion, executionState, decision history and pendingSince remain unchanged. " +
+    "Does not wake or re-arm the stage.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(z.object({
