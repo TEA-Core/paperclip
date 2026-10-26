@@ -249,14 +249,17 @@ async function installActor(app: express.Express, actor?: Record<string, unknown
   return app;
 }
 
-function makeIssue(status: "backlog" | "todo" | "in_progress" | "in_review" | "done" | "blocked" | "cancelled") {
+function makeIssue(
+  status: "backlog" | "todo" | "in_progress" | "in_review" | "done" | "blocked" | "cancelled",
+  createdByAgentId: string | null = "22222222-2222-4222-8222-222222222222",
+) {
   return {
     id: "11111111-1111-4111-8111-111111111111",
     companyId: "company-1",
     status,
     assigneeAgentId: "22222222-2222-4222-8222-222222222222",
     assigneeUserId: null,
-    createdByAgentId: "22222222-2222-4222-8222-222222222222",
+    createdByAgentId,
     identifier: "PAP-580",
     title: "PATCH denial copy",
   };
@@ -357,6 +360,71 @@ describe.sequential("issue PATCH authz denial copy", () => {
     expect(res.body.details.code).toBe("issue_write_actor_class_excluded");
     expect(res.body.details.code).not.toBe("issue_write_assignee_run_lock");
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows an assignee-only agent to PATCH its own issue", async () => {
+    const assigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    const creatorAgentId = "44444444-4444-4444-8444-444444444444";
+    const responsibleUserId = "responsible-user";
+    const issueId = "11111111-1111-4111-8111-111111111111";
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo", creatorAgentId));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("todo", creatorAgentId),
+      ...patch,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: {
+      action?: string;
+      actor?: Record<string, unknown>;
+      resource?: Record<string, unknown>;
+      scope?: Record<string, unknown>;
+    }) => {
+      const contextMatches =
+        input.action === "issue:mutate" &&
+        input.actor?.type === "agent" &&
+        input.actor.agentId === assigneeAgentId &&
+        input.actor.onBehalfOfUserId === responsibleUserId &&
+        input.resource?.issueId === issueId &&
+        input.resource.assigneeAgentId === assigneeAgentId &&
+        input.resource.createdByAgentId === creatorAgentId &&
+        input.scope?.issueId === issueId &&
+        input.scope.assigneeAgentId === assigneeAgentId &&
+        input.scope.createdByAgentId === creatorAgentId;
+      return {
+        allowed: contextMatches,
+        action: input.action,
+        reason: contextMatches ? "allow_self" : "deny_missing_grant",
+        explanation: contextMatches
+          ? "Allowed because the actor owns the assigned issue."
+          : "Missing issue write grant.",
+      };
+    });
+
+    const res = await request(await installActor(
+      createApp(),
+      agentActor(assigneeAgentId, responsibleUserId),
+    ))
+      .patch(`/api/issues/${issueId}`)
+      .send({ priority: "low" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:mutate",
+      actor: expect.objectContaining({
+        agentId: assigneeAgentId,
+        onBehalfOfUserId: responsibleUserId,
+      }),
+      resource: expect.objectContaining({
+        issueId,
+        assigneeAgentId,
+        createdByAgentId: creatorAgentId,
+      }),
+      scope: expect.objectContaining({
+        issueId,
+        assigneeAgentId,
+        createdByAgentId: creatorAgentId,
+      }),
+    }));
+    expect(mockIssueService.update).toHaveBeenCalled();
   });
 
   it("allows the creator-assignee agent to PATCH its own issue", async () => {
