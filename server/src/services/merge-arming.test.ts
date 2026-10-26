@@ -2813,6 +2813,23 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(disables()).toEqual([]);
       });
 
+      it.each(["running", "paused", "error", "idle"])("stays armed when the reviewer agent's status churns to %s while the enable call is in flight", async (churned) => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          if (String(JSON.parse(String(init?.body)).query).includes("enablePullRequestAutoMerge")) {
+            await db.update(agents).set({ status: churned }).where(eq(agents.id, reviewerId));
+          }
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("armed");
+        expect(enables()).toHaveLength(1);
+        expect(disables()).toEqual([]);
+      });
+
       it("refuses a reviewer agent that was already terminated before the call, not only one that changes during it", async () => {
         const { issueId, reviewerId } = await seedAuthorityCard();
         await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerId));
