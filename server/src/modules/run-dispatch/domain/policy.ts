@@ -131,6 +131,9 @@ export type StalenessDecision =
 export type QueuedRunFacts = {
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
+  /** Armed worktree cutoff; a queued run created before it must not dispatch. */
+  worktreeExecutionCutoff?: Date | null;
+  runCreatedAt?: Date | null;
   runId: string;
   runAgentId: string;
   issueId: string;
@@ -496,6 +499,23 @@ export function decideQueuedRunStaleness(
   facts: QueuedRunFacts,
   _now: Date,
 ): StalenessDecision {
+  if (
+    facts.worktreeExecutionCutoff &&
+    facts.runCreatedAt &&
+    facts.runCreatedAt.getTime() < facts.worktreeExecutionCutoff.getTime()
+  ) {
+    return {
+      stale: true,
+      errorCode: "execution_reconciliation_required",
+      reason: "Cancelled because the queued run predates the armed worktree execution cutoff",
+      details: {
+        issueId: facts.issueId,
+        createdAt: facts.runCreatedAt.toISOString(),
+        cutoff: facts.worktreeExecutionCutoff.toISOString(),
+      },
+    };
+  }
+
   if (!facts.issueFound) {
     return {
       stale: true,

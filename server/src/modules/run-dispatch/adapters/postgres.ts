@@ -85,6 +85,8 @@ type LoadStalenessFactsInput = {
   issueId: string;
   contextSnapshot: Record<string, unknown>;
   scheduledRetryReason: string | null;
+  runCreatedAt?: Date | null;
+  worktreeExecutionCutoff?: Date | null;
 };
 type CancelSuppressedRetryInput = {
   runId: string;
@@ -567,6 +569,8 @@ export function createPostgresRunDispatchAdapter(
       runId: input.runId,
       runAgentId: input.agentId,
       issueId,
+      runCreatedAt: input.runCreatedAt ?? null,
+      worktreeExecutionCutoff: input.worktreeExecutionCutoff ?? null,
       retryReasonKind,
       dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
         unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
@@ -916,7 +920,12 @@ export function createPostgresRunDispatchAdapter(
       };
   }
 
-  async function decideCurrentRunStaleness(tx: Db, run: HeartbeatRun, now: Date) {
+  async function decideCurrentRunStaleness(
+    tx: Db,
+    run: HeartbeatRun,
+    now: Date,
+    worktreeExecutionCutoff?: Date | null,
+  ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) return { issueId: null, facts: null, decision: { stale: false as const } };
@@ -933,6 +942,8 @@ export function createPostgresRunDispatchAdapter(
         issueId,
         contextSnapshot,
         scheduledRetryReason: run.scheduledRetryReason,
+        runCreatedAt: run.createdAt,
+        worktreeExecutionCutoff,
       },
       now,
       tx,
@@ -945,7 +956,12 @@ export function createPostgresRunDispatchAdapter(
   ): Promise<CancelStaleQueuedRunOutcome> {
     const cancelLockedRun = async (tx: Db, run: HeartbeatRun) => {
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
-      const { issueId, facts, decision } = await decideCurrentRunStaleness(tx, run, input.now);
+      const { issueId, facts, decision } = await decideCurrentRunStaleness(
+        tx,
+        run,
+        input.now,
+        input.worktreeExecutionCutoff,
+      );
       if (!decision.stale || !issueId) {
         if (input.expectedStatus === "queued" && facts?.isInteractionWake) {
           // Preserve the authority accepted under the issue/run locks. Later

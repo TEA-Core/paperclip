@@ -54,6 +54,7 @@ export function createCancelStaleQueuedRun(deps: { writer: RunDispatchWriter }) 
     companyId: string;
     expectedStatus: "queued" | "running";
     now?: Date;
+    worktreeExecutionCutoff?: Date | null;
   }) => deps.writer.cancelStaleQueuedRun({ ...input, now: input.now ?? new Date() });
 }
 

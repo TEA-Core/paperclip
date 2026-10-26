@@ -273,6 +273,33 @@ describe("decideQueuedRunStaleness", () => {
     });
   });
 
+  it("cancels a queued run created before an armed worktree cutoff", () => {
+    const cutoff = new Date("2026-10-26T12:00:00.000Z");
+    const decision = decideQueuedRunStaleness(
+      {
+        ...baseStalenessFacts(),
+        runCreatedAt: new Date(cutoff.getTime() - 1_000),
+        worktreeExecutionCutoff: cutoff,
+      },
+      NOW,
+    );
+    expect(decision).toMatchObject({
+      stale: true,
+      errorCode: "execution_reconciliation_required",
+      details: { createdAt: "2026-10-26T11:59:59.000Z", cutoff: cutoff.toISOString() },
+    });
+  });
+
+  it("leaves a queued run created at or after an armed worktree cutoff", () => {
+    const cutoff = new Date("2026-10-26T12:00:00.000Z");
+    expect(
+      decideQueuedRunStaleness(
+        { ...baseStalenessFacts(), runCreatedAt: cutoff, worktreeExecutionCutoff: cutoff },
+        NOW,
+      ),
+    ).toEqual({ stale: false });
+  });
+
   it.each([
     {
       name: "issue_not_found",
