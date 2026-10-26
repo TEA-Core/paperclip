@@ -1446,6 +1446,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/merge-arming/release",
   "POST /api/issues/{id}/merge-arming/release-override",
   "POST /api/issues/{id}/execution-stage/board-decision",
+  "POST /api/issues/{id}/restore-participant",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -3990,6 +3991,35 @@ registry.registerPath({
     },
     404: r.notFound,
     422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/restore-participant",
+  tags: ["issues"],
+  summary: "Restore the assignee of an already-pending agent execution stage",
+  description:
+    "Board-only compare-and-set repair. All four expected values must match the locked issue row. " +
+    "Refuses pending interactions, active recovery actions, live runs and checkout/execution locks. " +
+    "Only the assignee changes; the pending stage, status, statusVersion, executionState, decision history " +
+    "and pendingSince remain unchanged. Does not wake or re-arm the stage.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({
+      expectedAssigneeAgentId: z.string().uuid().nullable(),
+      expectedStatus: z.string().min(1),
+      expectedStatusVersion: z.number().int().nonnegative(),
+      expectedPendingParticipantAgentId: z.string().uuid(),
+    }).strict()),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
   },
 });
 

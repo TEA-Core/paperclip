@@ -275,6 +275,20 @@ bindings require a board delivery receipt. An existing receipt for the PR must
 still authorize the published head. A later head on the certified PR may be
 re-stamped only after Guard A verifies unchanged content.
 
+For a stranded pending execution-policy review/approval stage whose recorded
+agent participant is not its assignee, the board may call
+`POST /api/issues/{id}/restore-participant` with `expectedAssigneeAgentId`
+(nullable), `expectedStatus`, `expectedStatusVersion`, and
+`expectedPendingParticipantAgentId`. A row-locked compare-and-set refuses
+stale values or any pending interaction, active recovery action, live run,
+checkout/execution lock, unavailable participant, or already-matched assignee
+with 409. It changes only the agent assignee and logs the before/after
+assignment atomically. The status and status version remain
+unchanged (the version advances only when status changes); execution state,
+stage identity, pendingSince, and decisions remain untouched. This operation
+never arms, approves, rejects, re-arms, or wakes the stage. It does not repair
+cards with active recovery or interactions.
+
 Invariants:
 
 - single assignee only

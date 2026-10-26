@@ -34,6 +34,7 @@ import {
   not,
   notInArray,
   sql,
+  or,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
@@ -310,6 +311,7 @@ import {
   unprocessable,
 } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
+import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
@@ -12700,6 +12702,116 @@ export function issueRoutes(
       externalChannelBinding,
     });
   });
+
+  // A mechanical repair for a stranded, already-pending agent stage. Unlike PATCH,
+  // this never evaluates the execution policy or schedules a wake.
+  const restoreParticipantBody = z.object({
+    expectedAssigneeAgentId: z.string().uuid().nullable(),
+    expectedStatus: z.string().min(1),
+    expectedStatusVersion: z.number().int().nonnegative(),
+    expectedPendingParticipantAgentId: z.string().uuid(),
+  }).strict();
+  router.post("/issues/:id/restore-participant", async (req, res) => {
+      assertBoard(req);
+      const expected = restoreParticipantBody.parse(req.body);
+      const id = req.params.id as string;
+      const visible = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!visible) return;
+      const actor = getActorInfo(req);
+      const postCommitActivityPublications: ActivityPublication[] = [];
+
+      const updated = await db.transaction(async (tx) => {
+        const [issue] = await tx.select().from(issueRows)
+          .where(and(eq(issueRows.id, visible.id), eq(issueRows.companyId, visible.companyId)))
+          .for("update");
+        if (!issue) throw notFound("Issue not found");
+        const state = issue.executionState;
+        const participant = state?.currentParticipant;
+        const participantId = participant && typeof participant === "object" && "agentId" in participant
+          ? participant.agentId : null;
+        if (
+          issue.assigneeAgentId !== expected.expectedAssigneeAgentId ||
+          issue.status !== expected.expectedStatus ||
+          issue.statusVersion !== expected.expectedStatusVersion ||
+          participantId !== expected.expectedPendingParticipantAgentId
+        ) throw conflict("Issue changed since the restoration snapshot");
+        if (
+          issue.status === "done" || issue.status === "cancelled" ||
+          issue.assigneeAgentId === participantId || issue.assigneeUserId !== null ||
+          state?.status !== "pending" ||
+          typeof state.currentStageId !== "string" || !state.currentStageId ||
+          (state.currentStageType !== "review" && state.currentStageType !== "approval") ||
+          !participant || typeof participant !== "object" ||
+          !("type" in participant) || participant.type !== "agent" ||
+          issue.checkoutRunId !== null || issue.executionRunId !== null ||
+          issue.executionLockedAt !== null || issue.executionAgentNameKey !== null
+        ) throw conflict("Issue is not eligible for participant restoration");
+
+        const [agent] = await tx.select().from(agents)
+          .where(and(eq(agents.id, participantId as string), eq(agents.companyId, issue.companyId)))
+          .for("update");
+        if (!agent || !(await evaluateAgentInvokabilityFromDb(tx as unknown as Db, agent)).invokable) {
+          throw conflict("Pending participant is not invokable");
+        }
+        const [interaction] = await tx.select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.status, "pending"),
+          )).limit(1);
+        if (interaction) throw conflict("Issue has a pending interaction");
+        const [recovery] = await tx.select({ id: issueRecoveryActions.id })
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.companyId, issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issue.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          )).limit(1);
+        if (recovery) throw conflict("Issue has an active recovery action");
+        const [liveRun] = await tx.select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+            or(
+              eq(heartbeatRuns.nativeIssueId, issue.id),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+              sql`${heartbeatRuns.contextSnapshot}->'paperclipIssue'->>'id' = ${issue.id}`,
+            ),
+          )).limit(1);
+        if (liveRun) throw conflict("Issue has a live run");
+
+        const [restored] = await tx.update(issueRows)
+          .set({ assigneeAgentId: agent.id })
+          .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId)))
+          .returning();
+        await logActivityInTransaction(
+          tx as unknown as Db,
+          {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
+            actorId: actor.actorId,
+            action: "issue.participant_restored",
+            entityType: "issue",
+            entityId: issue.id,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            details: {
+              identifier: issue.identifier,
+              stageId: state.currentStageId,
+              before: { assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId },
+              after: { assigneeAgentId: agent.id, assigneeUserId: issue.assigneeUserId },
+            },
+          },
+          postCommitActivityPublications,
+        );
+        return restored;
+      });
+      for (const publication of postCommitActivityPublications) publishActivity(publication);
+      res.json(updated);
+    });
 
   router.get("/issues/:id/watchdog", async (req, res) => {
     const id = req.params.id as string;
