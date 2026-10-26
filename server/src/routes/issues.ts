@@ -19230,6 +19230,10 @@ export function issueRoutes(
     let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
       null;
     let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+    let committedUpdatedAt: Date | null = null;
+    const noteCommittedUpdatedAt = (updatedAt: Date) => {
+      committedUpdatedAt = updatedAt;
+    };
     let commentDeduplicated = false;
     let deduplicatedFromCommentId: string | null = null;
     let commentHandledInTransaction = false;
@@ -19490,6 +19494,7 @@ export function issueRoutes(
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                 authorizationReason: issueMutationAuthorizationReason,
                 sourceTrust: attachmentCommentSourceTrust,
+                onIssueTouched: noteCommittedUpdatedAt,
               },
               tx,
             );
@@ -19524,6 +19529,7 @@ export function issueRoutes(
                 authorizationReason: issueMutationAuthorizationReason,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                 sourceTrust: await sourceTrustForActorWrite(existing, actor),
+                onIssueTouched: noteCommittedUpdatedAt,
               }, tx);
               commentHandledInTransaction = true;
             }
@@ -19686,15 +19692,6 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-    const readCommittedUpdatedAt = (issueId: string) =>
-      db
-        .select({ updatedAt: issueRows.updatedAt })
-        .from(issueRows)
-        .where(eq(issueRows.id, issueId))
-        .then((rows) => rows[0]?.updatedAt ?? null);
-    // A comment bumps the row after the field update, so the response token is
-    // read right after the last in-request write, before any post-commit work.
-    let committedUpdatedAt = commentBody ? await readCommittedUpdatedAt(issue.id) : null;
     // SUP-15257: this issue mutation just committed; if it came from a
     // task-watchdog run, re-derive and advance that run's stop fingerprint so
     // its next in-run write is not rejected as stale.
@@ -20264,8 +20261,8 @@ export function issueRoutes(
         authorizationReason: issueMutationAuthorizationReason,
         clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
+        onIssueTouched: noteCommittedUpdatedAt,
       });
-      committedUpdatedAt = await readCommittedUpdatedAt(issue.id);
       await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
@@ -20399,8 +20396,9 @@ export function issueRoutes(
       };
     }
 
-    if (committedUpdatedAt) {
-      issueResponse = { ...issueResponse, updatedAt: committedUpdatedAt };
+    const commentTouchedUpdatedAt = committedUpdatedAt as Date | null;
+    if (commentTouchedUpdatedAt) {
+      issueResponse = { ...issueResponse, updatedAt: commentTouchedUpdatedAt };
     }
 
     const commentIsFromAssigneeRun = comment

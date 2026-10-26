@@ -13517,6 +13517,7 @@ export function issueService(db: Db) {
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
         clientRequestId?: string;
+        onIssueTouched?: (updatedAt: Date) => void;
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
@@ -13998,10 +13999,13 @@ export function issueService(db: Db) {
         await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
       }
       // Update issue's updatedAt so comment activity is reflected in recency sorting
-      await dbOrTx
+      const touched = await dbOrTx
         .update(issues)
         .set({ updatedAt: new Date() })
-        .where(eq(issues.id, issueId));
+        .where(eq(issues.id, issueId))
+        .returning({ updatedAt: issues.updatedAt })
+        .then((rows: Array<{ updatedAt: Date }>) => rows[0] ?? null);
+      if (touched) options?.onIssueTouched?.(touched.updatedAt);
 
       // Only an explicitly authored comment from the run causally woken by an
       // inbound chat message is automatically publishable. Presentation,
