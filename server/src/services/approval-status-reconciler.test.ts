@@ -3855,7 +3855,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       await insertMention(issueId);
       await recordPendingAutoMergeDisarm(db, companyId, issueId, {
         owner: "TEA-Core", repo: "paperclip", number: 42, nodeId: "PR_node_42", headSha: NEW_HEAD, reason: "held",
-        since: new Date().toISOString(), attempts: 0, lastError: null, state: "pending", token: "held",
+        since: new Date().toISOString(), attempts: 0, lastError: null, state: "in_flight", token: "held",
       });
 
       installRoutes([
@@ -3864,6 +3864,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
       ]);
 
+      // A fresh in-flight record is left alone by the tick's disarm sweep (a pending one would be disabled and cleared first).
       for (let tick = 0; tick < 4; tick += 1) {
         const summary = await runApprovalStatusReconcilerTick(db);
         expect(summary.rearmed).toBe(1);
