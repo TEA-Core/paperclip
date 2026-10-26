@@ -1421,6 +1421,40 @@ describeEmbeddedPostgres("summary slot service", () => {
       ).rejects.toMatchObject({ status: 403 });
     });
 
+    it("rejects a Summarizer write presenting another agent's run id even when that run is stamped on the generation issue", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const otherAgentId = await seedPlainAgent(companyId);
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const generationIssueId = generated.generatingIssue.id;
+      const otherRunId = await seedRun(companyId, otherAgentId, generationIssueId);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: otherRunId })
+        .where(eq(issues.id, generationIssueId));
+
+      await expect(
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown: "# Stolen run", generationIssueId },
+          { agentId: summarizerAgentId, runId: otherRunId },
+        ),
+      ).rejects.toMatchObject({ status: 403 });
+
+      const ownRunId = await seedRun(companyId, summarizerAgentId, generationIssueId);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: ownRunId })
+        .where(eq(issues.id, generationIssueId));
+      await expect(
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown: "# Own run", generationIssueId },
+          { agentId: summarizerAgentId, runId: ownRunId },
+        ),
+      ).resolves.toMatchObject({ slot: { generatingIssueId: generationIssueId } });
+    });
+
     it("rejects using one generation task to write a different slot", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
