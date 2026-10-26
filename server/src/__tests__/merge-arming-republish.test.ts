@@ -3667,6 +3667,39 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(await requestRows()).toEqual([]);
     }, 20_000);
 
+    // Round 10: the answer waits (briefly) for the cancellation it ordered, so no database wait of the request
+    // is still alive when the caller reads the 409.
+    for (const [label, makeApp] of [["direct", () => deadlineApp({ totalMs: 400, compensationMs: 200, fetchMs: 100 })], ["pooled", () => pooledApp({ totalMs: 400, compensationMs: 200, fetchMs: 100 })]] as const) {
+      it(`${label}: no database wait of the request is alive when the deadline answer arrives (intent write)`, async () => {
+        const { issueId } = await seedReleasable();
+        installReleaseTransport();
+        const release = await holdLock(sql`lock table activity_log in access exclusive mode`);
+        try {
+          const res = await request(makeApp()).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+          expect(res.status).toBe(409);
+          expect(await waitingOnLocks()).toBe(0);
+        } finally {
+          await release();
+        }
+      }, 20_000);
+
+      it(`${label}: no database wait of the request is alive when the answer follows an outcome audit timeout`, async () => {
+        const { issueId } = await seedReleasable();
+        const held: { release?: () => Promise<void> } = {};
+        installReleaseTransport({
+          onStatusRead: async () => { held.release ??= await holdLock(sql`lock table activity_log in access exclusive mode`); },
+        });
+        try {
+          const res = await request(label === "direct" ? deadlineApp({ totalMs: 5000, compensationMs: 300, fetchMs: 1000 }) : pooledApp({ totalMs: 5000, compensationMs: 300, fetchMs: 1000 }))
+            .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+          expect(res.body.auditRecorded).toBe(false);
+          expect(await waitingOnLocks()).toBe(0);
+        } finally {
+          await held.release?.();
+        }
+      }, 20_000);
+    }
+
     it("pooled: a cancelled outcome audit write never commits after the answer", async () => {
       const { issueId } = await seedReleasable();
       const held: { release?: () => Promise<void> } = {};
@@ -3726,6 +3759,18 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
         expect(res.status).toBe(200);
         expect(res.body.outcome).toBe("released");
+      }, 20_000);
+
+      it("starts the clock for any spelling of the route Express serves", async () => {
+        const { issueId } = await seedReleasable();
+        installReleaseTransport();
+        const started = Date.now();
+
+        const res = await request(slowAuthApp(900, 300)).post(`/API/ISSUES/${issueId}/MERGE-ARMING/RELEASE-OVERRIDE`).send({ headSha: HEAD_SHA, overrideReason: RELEASE_REASON });
+
+        expect(Date.now() - started).toBeLessThan(800);
+        expect(res.status).toBe(409);
+        expect(res.body.message).toContain("nothing was published");
       }, 20_000);
 
       it("leaves other routes alone", async () => {

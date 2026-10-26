@@ -11550,6 +11550,14 @@ export function issueRoutes(
     },
   } as const;
 
+  // Waits for `pending` (a cancellation) but never longer than `ms`.
+  async function settleWithin(pending: Promise<void> | undefined, ms: number): Promise<void> {
+    if (!pending) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([pending, new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); })]);
+    clearTimeout(timer);
+  }
+
   async function releaseIssueHead(req: Request, res: Response, mode: "standard" | "override") {
     assertBoard(req);
     // One clock from the first line, and one dedicated database connection for everything the request
@@ -11571,14 +11579,19 @@ export function issueRoutes(
       connectTimeoutMs: deadlines.fetchMs,
     });
     const rdb = scope?.db ?? db;
-    const cancelScope = () => { void scope?.cancel(); };
+    // The cancellation is ordered once; an answer that follows it waits (briefly) for it to take effect, so the
+    // caller never reads a deadline answer while a database wait of this request is still alive.
+    let cancelling: Promise<void> | undefined;
+    const cancelScope = () => { if (scope) cancelling ??= scope.cancel().catch(() => undefined); };
+    const cancelled = () => { cancelScope(); return settleWithin(cancelling, deadlines.compensationMs); };
     envelope.addEventListener("abort", cancelScope, { once: true });
     let publishStarted = false;
     try {
-      await releaseIssueHeadWithin(req, res, mode, { deadlines, envelope, rdb, scope, cancelScope, markPublishStarted: () => { publishStarted = true; } });
+      await releaseIssueHeadWithin(req, res, mode, { deadlines, envelope, rdb, scope, cancelScope, cancelled, markPublishStarted: () => { publishStarted = true; } });
     } catch (error) {
       // The deadline ended a wait before anything was published: say so, and that nothing was.
       if (envelope.aborted && !publishStarted && !res.headersSent) {
+        await cancelled();
         res.status(409).json({
           outcome: "failed", auditRecorded: false,
           message: "status:failed:deadline: the release request did not finish within its deadline; nothing was published",
@@ -11602,6 +11615,7 @@ export function issueRoutes(
       rdb: Db;
       scope: ReturnType<typeof createRequestScopedDb>;
       cancelScope: () => void;
+      cancelled: () => Promise<void>;
       markPublishStarted: () => void;
     },
   ) {
@@ -11662,6 +11676,7 @@ export function issueRoutes(
       envelope,
     );
     if (intent === expired) {
+      await ctx.cancelled();
       res.status(409).json({
         outcome: "failed", headSha, auditRecorded: false,
         message: "status:failed:deadline: the release request could not be recorded in time; nothing was published",
@@ -11710,7 +11725,8 @@ export function issueRoutes(
       statementTimeoutMs: deadlines.compensationMs, lockTimeoutMs: deadlines.compensationMs,
       idleInTransactionMs: deadlines.compensationMs, connectTimeoutMs: deadlines.compensationMs,
     });
-    const cancelAudit = () => { void auditScope?.cancel(); };
+    let cancellingAudit: Promise<void> | undefined;
+    const cancelAudit = () => { if (auditScope) cancellingAudit ??= auditScope.cancel().catch(() => undefined); };
     auditClock.addEventListener("abort", cancelAudit, { once: true });
     try {
       // The status is already out, so the outcome row gets only a short, separate wait.
@@ -11732,6 +11748,8 @@ export function issueRoutes(
       // The status is already out and cannot be un-written, so this cannot fail the request; the caller is
       // told instead, and the intent row is the audit trail.
       auditRecorded = false;
+      cancelAudit();
+      await settleWithin(cancellingAudit, deadlines.compensationMs);
       logger.error(
         { err: error, issueId: existing.id, headSha, outcome: outcome.kind, intentId: intent.activity.id },
         "merge release outcome could not be recorded; the release intent row is the audit trail",

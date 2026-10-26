@@ -1,7 +1,7 @@
 import type { RequestHandler } from "express";
 
-/** The release routes: a board owner/admin releasing one PR head (SUP-20772). */
-const RELEASE_ROUTE = /^\/api\/issues\/[^/]+\/merge-arming\/release(?:-override)?\/?$/;
+/** The release routes (any letter case: Express routes case-insensitively): a board owner/admin releasing one PR head (SUP-20772). */
+const RELEASE_ROUTE = /^\/api\/issues\/[^/]+\/merge-arming\/release(?:-override)?\/?$/i;
 
 /** What the route handler reads from `res.locals.releaseClock`. */
 export interface ReleaseRequestClock {
@@ -14,7 +14,7 @@ export interface ReleaseRequestClock {
 }
 
 /**
- * One request clock for the release routes that starts BEFORE authentication. The actor middleware
+ * One request clock for the release routes that starts BEFORE authentication (and before the body is read). The actor middleware
  * resolves the board actor on the shared connection pool, a wait nothing in the handler can cancel; if
  * it is stuck, the request is still answered when the clock runs out (409, nothing published) and the
  * handler, when it finally gets to run, does nothing: no read, no write, no audit row. The stuck

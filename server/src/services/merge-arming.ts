@@ -1048,28 +1048,60 @@ function isTransientArmingStatus(status: number): boolean {
 /**
  * Turns auto-merge back off. Used only to take back an arm whose authority was revoked while the
  * enable call was in flight (a revocation that commits inside the GitHub call cannot be seen before it).
+ * Every attempt is bounded (a provider call that never answers is given up on, and its request aborted),
+ * a transient failure is retried, and the answer says plainly whether auto-merge is off: `success` is
+ * true only when GitHub accepted the disable or said auto-merge was not enabled.
  */
-export async function disableAutoMerge(token: string, nodeId: string): Promise<{ success: boolean; error: string | null }> {
+export async function disableAutoMerge(
+  token: string,
+  nodeId: string,
+  options: { timeoutMs?: number; attempts?: number; retryDelayMs?: number } = {},
+): Promise<{ success: boolean; error: string | null }> {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const attempts = options.attempts ?? 3;
+  const retryDelayMs = options.retryDelayMs ?? 250;
   const query = `mutation { disablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
-  try {
-    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ query }),
+  const once = async (): Promise<{ success: boolean; error: string | null; transient: boolean }> => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => { controller.abort(); resolve("timeout"); }, timeoutMs);
     });
-    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-    const errors = body?.errors as Array<{ message?: string }> | undefined;
-    if (!response.ok) return { success: false, error: errors?.[0]?.message ?? `HTTP ${response.status}` };
-    if (errors && errors.length > 0) {
-      const message = errors[0]?.message ?? "";
-      // Nothing was queued: the state asked for already holds.
-      if (/not enabled|not.*auto.?merge|already/i.test(message)) return { success: true, error: null };
-      return { success: false, error: message };
+    try {
+      const work = (async () => {
+        const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ query }),
+          signal: controller.signal,
+        });
+        const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+        const errors = body?.errors as Array<{ message?: string }> | undefined;
+        if (!response.ok) return { success: false, error: errors?.[0]?.message ?? `HTTP ${response.status}`, transient: isTransientArmingStatus(response.status) };
+        if (errors && errors.length > 0) {
+          const message = errors[0]?.message ?? "";
+          // Nothing to take back: GitHub says auto-merge is not enabled. ("already merged" is NOT this: the
+          // merge happened, and the answer must say auto-merge was not turned off.)
+          if (/auto[- ]?merge (?:is )?not (?:currently )?enabled|is not enabled/i.test(message)) return { success: true, error: null, transient: false };
+          return { success: false, error: message, transient: false };
+        }
+        return { success: true, error: null, transient: false };
+      })();
+      work.catch(() => undefined);
+      const result = await Promise.race([work, timedOut]);
+      return result === "timeout" ? { success: false, error: `timeout after ${timeoutMs}ms`, transient: true } : result;
+    } catch {
+      return { success: false, error: "network_error", transient: true };
+    } finally {
+      clearTimeout(timer);
     }
-    return { success: true, error: null };
-  } catch {
-    return { success: false, error: "network_error" };
+  };
+  let result = await once();
+  for (let attempt = 1; attempt < attempts && !result.success && result.transient; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs * 2 ** (attempt - 1)));
+    result = await once();
   }
+  return { success: result.success, error: result.error };
 }
 
 export async function enableAutoMerge(
@@ -4759,7 +4791,7 @@ export async function postPullRequestComment(
 
 /**
  * Everything that is the authority for arming one card, as a string to compare before and after: the
- * card's own record (cancelled, stage ladder, completed stages, last decision, approved and published
+ * card's own record (cancelled, done or reopened, stage ladder, completed stages, last decision, approved and published
  * heads, the certified delivery, the recorded release confirmation), every decision row of the card
  * (outcome, decider) and the standing of each decider (whether an agent is a current agent of the company, a user's
  * membership and existence). A decision reversed, a certificate removed, a reviewer terminated or a
@@ -4816,7 +4848,8 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
   });
   memberRows.sort((a, b) => a.principalId.localeCompare(b.principalId));
   return JSON.stringify([
-    row.status === "cancelled",
+    // cancelled, done or anything else: a reopened (or cancelled) card is a different card.
+    row.status === "cancelled" ? "cancelled" : row.status === "done" ? "done" : "open",
     (policy.stages ?? []).map((stage) => [stage?.id, stage?.phase ?? null]),
     state.completedStageIds ?? null,
     state.lastDecisionId ?? null,
@@ -4939,6 +4972,12 @@ export async function armMergeOnApproval(
   if (decision.outcome !== "approved") {
     return { kind: "skipped", message: `skipped:not-approved: Decision outcome is "${decision.outcome}", not "approved"` };
   }
+
+  // The authority this call acts on is captured before its first read: the delivery, owner and token
+  // lookups take time, and a card whose decision, ladder, head, certificate or release changed in that
+  // time is not what was authorized. It is read again right before the merge lever is pulled.
+  const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true });
+  const authorityChanged = () => guard.stillHolds();
 
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   if (deliveryIdentity.recordedUnusable) {
@@ -5063,11 +5102,6 @@ export async function armMergeOnApproval(
     };
   }
 
-  // The authority this call acts on, as the card records it now. Token resolution, the node-id lookup
-  // and the retries take time, and a card whose decision, ladder, head or release changed in that time
-  // is not what was authorized: it is read again right before the merge lever is pulled.
-  const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, ownerRow.id, { requireApprovedLadder: true });
-  const authorityChanged = () => guard.stillHolds();
   // Right now, before anything is sent: a card whose authority already differs from what the caller checked.
   const changedAtStart = await authorityChanged();
   if (changedAtStart) {
@@ -5125,7 +5159,9 @@ export async function armMergeOnApproval(
     if (result.success) {
       // A revocation that committed while the call was in flight could not be seen before it: look again,
       // and take the arm back if the authority is no longer what was checked.
-      const changedDuringArm = await authorityChanged();
+      // A recheck that cannot be completed is treated as a change: an arm that cannot be re-verified is taken back.
+      const changedDuringArm = await authorityChanged().catch((error) =>
+        `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changedDuringArm) {
         const disabled = await disableAutoMerge(token, nodeId);
         return {

@@ -567,6 +567,10 @@ export async function createApp(
   // when the server may be reachable without a known reverse proxy in front.
   applyTrustProxy(app, parseTrustProxyEnv(process.env.TRUST_PROXY));
 
+  // First of everything, so the whole request is under the clock: the release routes answer within their
+  // deadline even when the body is slow or authentication is stuck (a stuck query is abandoned, not cancelled).
+  app.use(releaseRequestClock({ totalMs: DEFAULT_RELEASE_DEADLINES.totalMs }));
+
   app.use(
     COMPANY_IMPORT_API_PATH,
     express.json({
@@ -605,9 +609,6 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
-  // Before anything that waits on the database for the caller's identity: the release routes answer within
-  // their deadline even when authentication is stuck (the stuck query is abandoned, not cancelled).
-  app.use(releaseRequestClock({ totalMs: DEFAULT_RELEASE_DEADLINES.totalMs }));
   app.use(cloudRuntimeIdentityMiddleware(db));
   // Connection-intent tools carry their own short-lived, run-bound bearer and
   // must be reachable by remote adapters that intentionally do not receive an

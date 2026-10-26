@@ -28,6 +28,7 @@ import {
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
+  disableAutoMerge,
   fetchBranchHeadSha,
   fetchGitHubNodeId,
   fetchHeadApprovedStatusViaTokenCandidates,
@@ -2830,6 +2831,79 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(disables()).toEqual([]);
       });
 
+      // Round 10: the baseline the arm compares against is taken before the arm's own first read, so a
+      // revocation that commits during its early lookups (delivery, owner, node id) is still a difference.
+      it.each([2, 3, 4, 5, 6, 8, 10])("is refused when the certificate is removed during the arm's own read number %i", async (readNumber) => {
+        const { issueId } = await seedAuthorityCard();
+        let reads = 0;
+        const removeCertificate = async () => {
+          const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const state = row!.executionState as { approvalStatus: Record<string, unknown> };
+          const { finalDelivery: _removed, ...rest } = state.approvalStatus;
+          await db.update(issues).set({ executionState: { ...state, approvalStatus: rest } }).where(eq(issues.id, issueId));
+        };
+        const chain = (builder: any, fire: boolean): any => new Proxy(builder, {
+          get(target, prop) {
+            if (prop === "then") {
+              return (resolve: any, reject: any) => (fire ? removeCertificate() : Promise.resolve()).then(() => target.then(resolve, reject));
+            }
+            const value = target[prop];
+            return typeof value === "function" ? (...args: any[]) => chain(value.apply(target, args), fire) : value;
+          },
+        });
+        const watched = new Proxy(db, {
+          get(target, prop) {
+            const value = (target as any)[prop];
+            if (prop === "select") return (...args: any[]) => chain(value.apply(target, args), ++reads === readNumber);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(watched as typeof db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(reads).toBeGreaterThanOrEqual(readNumber);
+        expect(outcome.kind).not.toBe("armed");
+        expect(enables().length === 0 || disables().length === 1).toBe(true);
+      });
+
+      it("takes the arm back when the card is reopened while the enable call is in flight", async () => {
+        const { issueId } = await seedAuthorityCard();
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          if (String(JSON.parse(String(init?.body)).query).includes("enablePullRequestAutoMerge")) {
+            await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+          }
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("failed");
+        expect(outcome.message).toContain("failed:authority-revoked");
+        expect(disables()).toHaveLength(1);
+      });
+
+      it("takes the arm back when the post-arm recheck itself cannot be completed", async () => {
+        const { issueId } = await seedAuthorityCard();
+        let calls = 0;
+        const flaky = { stillHolds: async () => { calls += 1; if (calls >= 3) throw new Error("database unavailable"); return null; } };
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD, authorityGuard: flaky });
+
+        expect(outcome.kind).toBe("failed");
+        expect(outcome.message).toContain("could not be re-verified");
+        expect(disables()).toHaveLength(1);
+      });
+
       it("refuses a reviewer agent that was already terminated before the call, not only one that changes during it", async () => {
         const { issueId, reviewerId } = await seedAuthorityCard();
         await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerId));
@@ -4129,3 +4203,60 @@ describeGuardRoute(
     });
   },
 );
+
+
+describe("disableAutoMerge (SUP-20772 round 10)", () => {
+  const NODE = "PR_node_1";
+  const answer = (status: number, body: unknown = {}) => ({ ok: status >= 200 && status < 300, status, json: async () => body }) as unknown as Response;
+  beforeEach(() => { mockGhFetch.mockReset(); });
+
+  it("gives up on a call that never answers, within its bound, and says auto-merge is not off", async () => {
+    mockGhFetch.mockImplementation(() => new Promise(() => {}));
+    const started = Date.now();
+
+    const result = await disableAutoMerge("t", NODE, { timeoutMs: 80, attempts: 2, retryDelayMs: 10 });
+
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("timeout");
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts the request it gave up on", async () => {
+    const signals: AbortSignal[] = [];
+    mockGhFetch.mockImplementation((_url: string, init?: RequestInit) => { signals.push(init!.signal as AbortSignal); return new Promise(() => {}); });
+
+    await disableAutoMerge("t", NODE, { timeoutMs: 50, attempts: 1 });
+
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.aborted).toBe(true);
+  });
+
+  it("retries a transient failure and reports the disable that went through", async () => {
+    mockGhFetch.mockResolvedValueOnce(answer(502)).mockResolvedValueOnce(answer(200, { data: {} }));
+
+    const result = await disableAutoMerge("t", NODE, { retryDelayMs: 5 });
+
+    expect(result).toEqual({ success: true, error: null });
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a refusal a retry cannot clear", async () => {
+    mockGhFetch.mockResolvedValue(answer(403, { errors: [{ message: "Resource not accessible" }] }));
+
+    const result = await disableAutoMerge("t", NODE, { retryDelayMs: 5 });
+
+    expect(result.success).toBe(false);
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts 'auto-merge is not enabled' as off, but not 'already merged'", async () => {
+    mockGhFetch.mockResolvedValueOnce(answer(200, { errors: [{ message: "Pull request Auto merge is not enabled" }] }));
+    expect((await disableAutoMerge("t", NODE)).success).toBe(true);
+
+    mockGhFetch.mockResolvedValueOnce(answer(200, { errors: [{ message: "Pull request is already merged" }] }));
+    const merged = await disableAutoMerge("t", NODE);
+    expect(merged.success).toBe(false);
+    expect(merged.error).toContain("already merged");
+  });
+});
