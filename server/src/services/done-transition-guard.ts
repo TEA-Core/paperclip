@@ -697,7 +697,6 @@ export async function loadOwnDraftPredicate(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
   prs: LinkedPullRequest[],
-  requireDeliveryRepo = false,
 ): Promise<(pr: LinkedPullRequest) => boolean> {
   const identifier = issue.identifier?.toLowerCase() ?? null;
   if (!identifier || !prs.some((pr) => pr.draft)) return () => false;
@@ -718,10 +717,10 @@ export async function loadOwnDraftPredicate(
     // An unresolved delivery identity is not proof that a linked draft belongs to this card.
   }
   return (pr) =>
-    (!requireDeliveryRepo || deliveryRepo !== null) &&
-    (deliveryRepo === null || `${pr.owner}/${pr.repo}`.toLowerCase() === deliveryRepo) &&
-    (pr.headRepoFullName != null &&
-      pr.headRepoFullName.toLowerCase() === deliveryRepo) &&
+    deliveryRepo !== null &&
+    `${pr.owner}/${pr.repo}`.toLowerCase() === deliveryRepo &&
+    pr.headRepoFullName != null &&
+    pr.headRepoFullName.toLowerCase() === deliveryRepo &&
     isAnchoredCardPullRequest(
       (pr.headRefName ?? "").toLowerCase(),
       (pr.title ?? "").toLowerCase(),
@@ -765,7 +764,7 @@ async function proveLandingDelegated(
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     if (tokenResult.token !== null) {
       const live = await hydrateLinkedPrState(pr, tokenResult.token);
-      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live], true))(live)) {
+      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
@@ -2356,7 +2355,7 @@ async function evaluateDoneTransitionGuardCore(
       prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
     });
   }
-  const isOwnDraft = await loadOwnDraftPredicate(db, issue, resolvedPrs, true);
+  const isOwnDraft = await loadOwnDraftPredicate(db, issue, resolvedPrs);
   const openPrs = resolvedPrs.filter(
     (p) =>
       p.cachedState === "open" &&
