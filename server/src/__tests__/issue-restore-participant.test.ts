@@ -470,6 +470,31 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, RUN))).toMatchObject([{ status: "queued" }]);
   });
 
+  it("returns a retryable 409 when the issue row stays locked past the repair lock timeout", async () => {
+    let signalLocked!: () => void;
+    let releaseIssue!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseIssue = resolve; });
+    const blocker = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, ISSUE)).for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    const restoring = Promise.resolve(post());
+    let response: { status: number; body: unknown } | null = null;
+    try {
+      response = await Promise.race([restoring, delay(1500).then(() => null)]);
+    } finally {
+      releaseIssue();
+      await blocker;
+      await restoring;
+    }
+    expect(response?.status).toBe(409);
+    expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+    expect(await audit()).toHaveLength(0);
+  });
+
   it.each([
     ["native issue", { nativeIssueId: ISSUE }],
     ["nested context", { contextSnapshot: { paperclipIssue: { id: ISSUE } } }],

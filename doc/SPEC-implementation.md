@@ -292,16 +292,19 @@ active recovery action, live run, checkout/execution lock, or unavailable
 participant with 409. The transaction first row-locks the issue's queued,
 running, or scheduled-retry `heartbeat_runs` rows (ordered by id), then the
 issue row, matching the finalizer's lock order; recovery-action upserts acquire
-the same issue-row lock before writing. No table lock is taken. After the issue
-lock and immediately before changing the assignee, a second live-run read
-refuses a run committed while the repair waited for that lock. A run inserted
-after this final read without taking the issue-row lock remains a race. The
-operation changes only the agent assignee (and `updatedAt`) and logs the
-before/after assignment atomically. The status and status version remain
-unchanged (the version advances only when status changes); execution state,
-stage identity, pendingSince, and decisions remain untouched. It never arms,
-approves, rejects, re-arms, or wakes the stage, and it does not repair cards
-with active recovery or interactions.
+the same issue-row lock before writing. No table lock is taken. Native restart
+recovery locks the issue before a run and has a 1-second lock timeout; an
+overlap may invert these orders. Restore sets a 250ms transaction-local lock
+timeout and returns a retryable 409 on a lock timeout or deadlock, with no
+partial assignment. After the issue lock and immediately before changing the
+assignee, a second live-run read refuses a run committed while the repair
+waited for that lock. A run inserted after this final read without taking the
+issue-row lock remains a race. The operation changes only the agent assignee
+(and `updatedAt`) and logs the before/after assignment atomically. The status
+and status version remain unchanged (the version advances only when status
+changes); execution state, stage identity, pendingSince, and decisions remain
+untouched. It never arms, approves, rejects, re-arms, or wakes the stage, and
+it does not repair cards with active recovery or interactions.
 
 Invariants:
 

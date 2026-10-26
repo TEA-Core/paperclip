@@ -12729,6 +12729,8 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
 
       const updated = await db.transaction(async (tx) => {
+        // Yield before native restart recovery's 1s lock timeout on inverse lock order.
+        await tx.execute(sql`set local lock_timeout = '250ms'`);
         // Finalizers can lock a run row before its issue row; preserve that order.
         const liveRunPredicate = and(
           eq(heartbeatRuns.companyId, visible.companyId),
@@ -12873,6 +12875,17 @@ export function issueRoutes(
           postCommitActivityPublications,
         );
         return restored;
+      }).catch((error: unknown) => {
+        for (
+          let cause: unknown = error;
+          cause && typeof cause === "object";
+          cause = "cause" in cause ? cause.cause : null
+        ) {
+          if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) {
+            throw conflict("Issue is busy; retry participant restoration");
+          }
+        }
+        throw error;
       });
       for (const publication of postCommitActivityPublications) publishActivity(publication);
       res.json(updated);
