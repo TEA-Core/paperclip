@@ -1571,18 +1571,29 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     );
   });
 
-  it("does not spend the re-arm budget for completed wakes whose runs made no issue mutation", async () => {
+  it("does not spend the re-arm budget when a succeeded run checks out and re-parks the dependent as blocked", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
     const withinWindow = new Date(Date.now() - 7 * 60 * 60 * 1000);
     for (let i = 0; i < 3; i++) {
       const runId = randomUUID();
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded" });
-      await db.insert(activityLog).values({
-        companyId, actorType: "agent", actorId: agentId, agentId, runId,
-        action: "issue.updated", entityType: "issue", entityId: blockedIssueId,
-        details: { identifier: "unchanged", status: "blocked", changes: {} },
-      });
+      await db.insert(activityLog).values([
+        {
+          companyId, actorType: "agent", actorId: agentId, agentId, runId,
+          action: "issue.checked_out", entityType: "issue", entityId: blockedIssueId,
+          details: { agentId },
+        },
+        {
+          companyId, actorType: "agent", actorId: agentId, agentId, runId,
+          action: "issue.updated", entityType: "issue", entityId: blockedIssueId,
+          details: {
+            identifier: "unchanged", status: "blocked",
+            changes: { status: { from: "in_progress", to: "blocked" } },
+            _previous: { status: "in_progress" },
+          },
+        },
+      ]);
       await db.insert(agentWakeupRequests).values({
         companyId,
         agentId,
@@ -1642,7 +1653,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
     const withinWindow = new Date(Date.now() - 7 * 60 * 60 * 1000);
     for (const [action, details] of [
-      ["issue.updated", { changes: { status: { from: "in_progress", to: "blocked" } } }],
+      ["issue.updated", { changes: { status: { from: "blocked", to: "in_progress" } } }],
       ["issue.comment_added", { commentId: randomUUID() }],
       ["issue.blockers_updated", { addedBlockedByIssueIds: [blockerIssueId] }],
     ] as const) {
