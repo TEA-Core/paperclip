@@ -532,8 +532,10 @@ issue as `blocked` and opens one source-scoped `issue_graph_liveness`
 recovery action with cause `in_progress_without_live_continuation_path`,
 owned by its assignee. The action asks the owner to finish,
 link a blocker or interaction, arm a monitor, or reassign. This is not a
-`blocked_without_blockers` board escalation or an automatic retry. Periodic
-reconciliation cancels the action when a live run, future monitor, active task
+`blocked_without_blockers` board escalation or an automatic retry; the open
+action is listed in board attention instead. Periodic reconciliation cancels the
+action when the issue leaves `blocked`, is reassigned, gains an unresolved
+blocker or pending interaction, or a live run, future monitor, active task
 watchdog, scheduled retry, or live successful-run handoff restores a path;
 the action itself cannot satisfy its own restoration check.
 
