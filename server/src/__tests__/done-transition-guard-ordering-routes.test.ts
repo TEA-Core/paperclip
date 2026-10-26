@@ -93,6 +93,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let app!: express.Express;
   let currentActor!: Express.Request["actor"];
+  let seedSequence = 0;
   let previousSchedulingSuppression: string | undefined;
 
   beforeAll(async () => {
@@ -134,13 +135,15 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
   }
 
   async function seedIssue(issuePrefix: string) {
+    seedSequence += 1;
+    const uniquePrefix = `${issuePrefix}Q${seedSequence}`;
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
     const executionWorkspaceId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
-    const identifier = `${issuePrefix}-1`;
+    const identifier = `${uniquePrefix}-1`;
     const branchName = `${identifier}-test-branch`;
     const repoUrl = "https://github.com/TEA-Core/paperclip";
     const defaultRef = "fold/tea-patches-v2026.722.0";
@@ -149,7 +152,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
-      issuePrefix,
+      issuePrefix: uniquePrefix,
+      issueCounter: 1,
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(companyMemberships).values({
@@ -235,7 +239,18 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
 
-    return { companyId, agentId, issueId, identifier, branchName, repoUrl, defaultRef };
+    return {
+      companyId,
+      agentId,
+      issueId,
+      identifier,
+      branchName,
+      repoUrl,
+      defaultRef,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId,
+    };
   }
 
   async function seedLinkedPrs(
@@ -1532,6 +1547,46 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(res.body.code).not.toBe("done_transition_missing_delivery");
       const statusRows = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
       expect(statusRows[0]?.status).toBe("in_review");
+    });
+
+    it("create-with-done threads record_only into the shared guard; repository_delivery stays refused (SUP-21258)", async () => {
+      for (const [prefix, deliveryRequirement, expected] of [
+        ["C21258A", "record_only", 201],
+        ["C21258B", "repository_delivery", 409],
+      ] as const) {
+        const { companyId, identifier, projectId, projectWorkspaceId, executionWorkspaceId } = await seedIssue(prefix);
+        currentActor = { type: "board", userId: "local-board", userName: "Local Board", userEmail: null, isInstanceAdmin: true, source: "local_implicit" } as Express.Request["actor"];
+        mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+        mockResolveSecretValue.mockResolvedValue("test-token");
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+          if (url.includes("/pulls?")) return new Response(JSON.stringify([{ merged: false, merged_at: null }]), { status: 200 });
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+        const res = await request(app)
+          .post(`/api/companies/${companyId}/issues`)
+          .send({
+            title: `Create ${prefix} done`,
+            status: "done",
+            deliveryRequirement,
+            projectId,
+            projectWorkspaceId,
+            executionWorkspaceId,
+          });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(expected);
+        if (expected === 201) {
+          expect(mockEvaluateDoneTransitionGuard.mock.calls.at(-1)?.[1]).toMatchObject({
+            identifier: null,
+            projectId,
+            projectWorkspaceId,
+            executionWorkspaceId,
+            deliveryRequirement,
+          });
+          expect((await mockEvaluateDoneTransitionGuard.mock.results.at(-1)?.value).skipReason, identifier).toBe("record_only_delivery_skipped");
+        }
+        if (expected === 409) expect(res.body.code).toBe("done_transition_missing_delivery");
+      }
     });
   });
 });

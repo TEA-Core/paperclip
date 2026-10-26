@@ -213,7 +213,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     }
   }
 
-  async function seedIssueAwaitingReview(issuePrefix: string, opts: { stageCount?: 1 | 2 } = {}) {
+  async function seedIssueAwaitingReview(issuePrefix: string, opts: { stageCount?: 1 | 2; deliveryRequirement?: "repository_delivery" | "record_only" } = {}) {
     const stageCount = opts.stageCount ?? 1;
     const companyId = randomUUID();
     const reviewerAgentId = randomUUID();
@@ -332,6 +332,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       assigneeAgentId: reviewerAgentId,
       createdByUserId: "cloud-user-1",
       executionWorkspaceId,
+      deliveryRequirement: opts.deliveryRequirement ?? "repository_delivery",
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
@@ -877,6 +878,41 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
+  });
+
+  it("POST comment: record_only auto-approval closes without repository delivery (SUP-21258)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D21258A", { deliveryRequirement: "record_only" });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): wiki read-back verified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("PATCH: record_only close skips repository delivery; repository_delivery keeps it (SUP-21258)", async () => {
+    for (const [prefix, deliveryRequirement, expectedStatus] of [
+      ["D21258B", "record_only", 200],
+      ["D21258C", "repository_delivery", 409],
+    ] as const) {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview(prefix, { deliveryRequirement });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockUnmergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Closed at Tier 2 (live): probe verified." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
+      expect(await statusOf(issueId)).toBe(expectedStatus === 200 ? "done" : "in_review");
+      if (expectedStatus === 409) expect(res.body.code).toBe("done_transition_missing_delivery");
+    }
   });
 
   it("POST comment: auto-approval still closes the card when the branch has landed", async () => {

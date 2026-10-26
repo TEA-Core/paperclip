@@ -19,7 +19,7 @@ import {
   type LinkedPullRequest,
 } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
-import type { IssueComment, UpdateIssue } from "@paperclipai/shared";
+import type { IssueComment, IssueDeliveryRequirement, UpdateIssue } from "@paperclipai/shared";
 import type { DoneTierDeclaration } from "@paperclipai/shared/validators/issue";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -2008,6 +2008,7 @@ async function evaluateDoneTransitionGuardCore(
     createdByAgentId?: string | null;
     executionPolicy?: unknown;
     executionState?: unknown;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -2268,6 +2269,25 @@ async function evaluateDoneTransitionGuardCore(
       excludedChildIdentifiers: ladderShape.excludedChildIdentifiers,
       skipped: false,
       skipReason: null,
+    };
+  }
+
+  if (issue.deliveryRequirement === "record_only") {
+    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      reason: "record_only_delivery_skipped",
+      skipReason: "record_only_delivery_skipped",
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: true,
+      reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: true,
+      skipReason: "record_only_delivery_skipped",
     };
   }
 
