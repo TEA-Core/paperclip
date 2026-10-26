@@ -50,6 +50,10 @@ import type {
  * the grace window (the latter also gets a system comment + assignee wake,
  * because a comment alone never wakes a closed/done issue). Unmeasurable PRs
  * are deferred to a later sweep — nothing unmeasured is ever reported.
+ *
+ * A card's own live open draft past grace is not failed: the card is parked
+ * `blocked` with a `gh pr ready` step (see docs/approval-final-delivery-preflight.md,
+ * "Done-close draft safety").
  */
 
 const DEFAULT_GRACE_MS = 24 * 60 * 60 * 1000;
