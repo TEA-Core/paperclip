@@ -539,7 +539,19 @@ async function hydrateLinkedPrState(
       // probe, and any probe failure degrades to null (fail open).
       const reviewDecision =
         state === "open" ? await fetchPullRequestReviewDecision(pr, token) : null;
-      return { ...pr, cachedState: state, lastErrorCode: null, reviewDecision };
+      const head = body.head as Record<string, unknown> | null | undefined;
+      const headRepo = head?.repo as Record<string, unknown> | null | undefined;
+      const headRepoFullName = typeof headRepo?.full_name === "string" ? headRepo.full_name : null;
+      return {
+        ...pr,
+        cachedState: state,
+        lastErrorCode: null,
+        reviewDecision,
+        draft: typeof body.draft === "boolean" ? body.draft : pr.draft,
+        headRefName: typeof head?.ref === "string" ? head.ref : null,
+        title: typeof body.title === "string" ? body.title : null,
+        headRepoFullName,
+      };
     }
     return pr;
   } catch {
@@ -704,9 +716,46 @@ async function loadTier1RepoFields(
   };
 }
 
+export async function loadOwnDraftPredicate(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  prs: LinkedPullRequest[],
+): Promise<(pr: LinkedPullRequest) => boolean> {
+  const identifier = issue.identifier?.toLowerCase() ?? null;
+  if (!identifier || !prs.some((pr) => pr.draft)) return () => false;
+  let deliveryBranch: string | null = null;
+  let branchIsOwn = false;
+  let deliveryRepo: string | null = null;
+  try {
+    const fields = await loadTier1RepoFields(db, issue);
+    const ctx = await resolveIssueRepoContext(db, { companyId: issue.companyId, ...fields });
+    const parsed = parseRepoUrl(ctx?.repoUrl ?? null);
+    if (parsed?.hostname === "github.com") {
+      deliveryRepo = `${parsed.owner}/${parsed.repo}`.toLowerCase();
+    }
+    const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+    if (ownership.legitimate && ownership.branch !== null) deliveryBranch = ownership.branch.toLowerCase();
+    branchIsOwn = ownership.branchIsOwn;
+  } catch {
+    // An unresolved delivery identity is not proof that a linked draft belongs to this card.
+  }
+  return (pr) =>
+    deliveryRepo !== null &&
+    `${pr.owner}/${pr.repo}`.toLowerCase() === deliveryRepo &&
+    pr.headRepoFullName != null &&
+    pr.headRepoFullName.toLowerCase() === deliveryRepo &&
+    isAnchoredCardPullRequest(
+      (pr.headRefName ?? "").toLowerCase(),
+      (pr.title ?? "").toLowerCase(),
+      identifier,
+      deliveryBranch,
+      branchIsOwn,
+    );
+}
+
 async function proveLandingDelegated(
   db: Db,
-  issue: { id: string; companyId: string },
+  issue: { id: string; companyId: string; identifier: string | null },
   reason: string,
   sameRun: boolean,
 ): Promise<DoneTierDeclarationResult> {
@@ -724,14 +773,28 @@ async function proveLandingDelegated(
   const number = Number(named[1]);
   let linked: LinkedPullRequest[];
   try {
-    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
-  if (!linked.some((pr) => pr.number === number)) {
+  const pr = linked.find((candidate) => candidate.number === number);
+  if (!pr) {
     return refuseTier1(
       `Tier 1 declaration using "landing-delegated" names PR #${number}, which is not a linked pull request.`,
     );
+  }
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    if (tokenResult.token !== null) {
+      const live = await hydrateLinkedPrState(pr, tokenResult.token);
+      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
+        return refuseTier1(
+          `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
+        );
+      }
+    }
+  } catch {
+    // Credential resolution failed: draft state is unverifiable, so do not refuse on a stale cached flag.
   }
   return acceptTier1(reason, sameRun);
 }
@@ -1100,7 +1163,8 @@ async function liveDiscoverOpenLinkedPullRequests(
   const seen = new Set<string>();
   const prs: LinkedPullRequest[] = [];
   for (const item of listResult.items) {
-    if (item.draft === true) continue;
+    // Drafts must be visible to the done guard even though merge arming cannot
+    // act on them. The owned-PR predicate below still excludes mere citations.
     const headRef = (item.headRef ?? "").toLowerCase();
     const title = (item.title ?? "").toLowerCase();
     if (!isAnchoredCardPullRequest(headRef, title, needle, deliveryBranch, deliveryBranchIsOwn)) {
@@ -1120,6 +1184,7 @@ async function liveDiscoverOpenLinkedPullRequests(
       displayName: `${parsed.owner}/${parsed.repo}#${item.number}`,
       cachedState: "open",
       lastErrorCode: null,
+      draft: item.draft === true,
       reviewDecision: null,
     });
   }
@@ -2247,13 +2312,15 @@ async function evaluateDoneTransitionGuardCore(
     return cachedCtx;
   };
 
-  let resolvedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+  let resolvedPrs = await resolveLinkedPullRequestsWithState(
+    db, issue.companyId, issue.id, { includeDrafts: true },
+  );
 
   // SUP-13831: zero cached mention rows is a false negative when the PR was
   // never posted with its full URL. Live-discover open PRs carrying the issue
   // identifier; failures are counted in skipReason and the compare flow below
   // still applies.
-  if (resolvedPrs.length === 0) {
+  if (!resolvedPrs.some((p) => !p.draft)) {
     let live: { prs: LinkedPullRequest[]; error: string | null } = { prs: [], error: null };
     try {
       const liveCtx = await getCtx();
@@ -2261,9 +2328,11 @@ async function evaluateDoneTransitionGuardCore(
     } catch {
       live = { prs: [], error: "ctx" };
     }
-    if (live.prs.length > 0) {
-      resolvedPrs = live.prs;
-      prSkipReason = appendSkipReason(prSkipReason, `live_linked_pr_discovered:${live.prs.length}`);
+    const known = new Set(resolvedPrs.map((p) => p.displayName.toLowerCase()));
+    const discovered = live.prs.filter((p) => !known.has(p.displayName.toLowerCase()));
+    if (discovered.length > 0) {
+      resolvedPrs = [...resolvedPrs, ...discovered];
+      prSkipReason = appendSkipReason(prSkipReason, `live_linked_pr_discovered:${discovered.length}`);
     } else if (live.error !== null) {
       prSkipReason = appendSkipReason(prSkipReason, `live_pr_discovery_failed:${live.error}`);
     }
@@ -2309,8 +2378,12 @@ async function evaluateDoneTransitionGuardCore(
       prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
     });
   }
+  const isOwnDraft = await loadOwnDraftPredicate(db, issue, resolvedPrs);
   const openPrs = resolvedPrs.filter(
-    (p) => p.cachedState === "open" && p.lastErrorCode !== "github_auth_required",
+    (p) =>
+      p.cachedState === "open" &&
+      p.lastErrorCode !== "github_auth_required" &&
+      (!p.draft || isOwnDraft(p)),
   );
   const unhydratedCount = resolvedPrs.filter((p) => p.cachedState === null).length;
   if (unhydratedCount > 0) {
@@ -2319,6 +2392,26 @@ async function evaluateDoneTransitionGuardCore(
 
   if (openPrs.length > 0) {
     const prNames = openPrs.map((p) => p.displayName).join(", ");
+    // Decision-carried closes are an approval: preflightTerminalApproval owns
+    // their draft refusal (approval_final_delivery_preflight), so only plain closes refuse here.
+    const draftPrs = decisionCarried ? [] : openPrs.filter((p) => p.draft);
+    if (draftPrs.length > 0) {
+      const draftNames = draftPrs.map((p) => p.displayName).join(", ");
+      const draftRemedy = `Promote ${draftPrs.length === 1 ? "it" : "them"} out of draft before closing done or publishing approval.`;
+      return {
+        allowed: false,
+        reason: `head_draft: ${draftNames} ${draftPrs.length === 1 ? "is an" : "are"} open draft PR${draftPrs.length === 1 ? "" : "s"}; ${draftRemedy}`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        mechanism: "delivery",
+        remedy: draftRemedy,
+        skipped: false,
+        skipReason: "head_draft",
+      };
+    }
     if (decisionCarried) {
       // SUP-14429 (mechanism B): narrow the D6 waiver to what it actually covers.
       // An open linked PR held by an undismissed external CHANGES_REQUESTED review

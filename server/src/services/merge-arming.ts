@@ -205,6 +205,8 @@ export interface LinkedPullRequest {
    * a draft-stranded `done` card (SUP-16689); treat absent as non-draft.
    */
   draft?: boolean;
+  /** Live head repository of a hydrated PR; absent on cached mention rows. */
+  headRepoFullName?: string | null;
 }
 
 export interface IssueRepoContext {
@@ -387,6 +389,7 @@ export async function resolveLinkedPullRequests(
         lastErrorCode: row.lastErrorCode ?? null,
         reviewDecision: null,
         draft: draft === true,
+        headRepoFullName: readString(row.data?.headRepoFullName),
       });
   }
 
@@ -451,6 +454,7 @@ export async function resolveLinkedPullRequestsWithState(
         lastErrorCode: row.lastErrorCode ?? null,
         reviewDecision: null,
         draft: draft === true,
+        headRepoFullName: readString(row.data?.headRepoFullName),
       });
   }
 

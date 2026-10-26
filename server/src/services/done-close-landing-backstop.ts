@@ -1,6 +1,7 @@
 import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, companies, issues } from "@paperclipai/db";
+import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
@@ -19,6 +20,7 @@ import {
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
+import { loadOwnDraftPredicate } from "./done-transition-guard.js";
 import { createGitHubExternalObjectProvider } from "./github-external-object-provider.js";
 import {
   isSharedCarrierRefusal,
@@ -48,6 +50,10 @@ import type {
  * the grace window (the latter also gets a system comment + assignee wake,
  * because a comment alone never wakes a closed/done issue). Unmeasurable PRs
  * are deferred to a later sweep — nothing unmeasured is ever reported.
+ *
+ * A card's own live open draft past grace is not failed: the card is parked
+ * `blocked` with a `gh pr ready` step (see docs/approval-final-delivery-preflight.md,
+ * "Done-close draft safety").
  */
 
 const DEFAULT_GRACE_MS = 24 * 60 * 60 * 1000;
@@ -85,11 +91,8 @@ export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed
 export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
 export const DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION = "issue.done_close_landing_reenqueue_refused";
 export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
-// SUP-16689: a decision-carried `done` card whose (only) linked PR is a still-open
-// DRAFT. A draft can never auto-merge, so the re-enqueue / confirmed / failed legs
-// all miss it, and the resolvers are draft-blind by default — leaving the card
-// silently unaudited until the 7-day discovery window ages its skip row out. This
-// row makes the strand visible and owned (report only: no re-enqueue, no quota).
+// An open draft cannot be armed. A board-owned blocked park stays discoverable
+// after the seven-day done lookback; an audit follows notification and bounds retries.
 export const DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION = "issue.done_close_landing_draft_stranded";
 // SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by the
 // prefix predicate cannot land through its own card. Instead of re-opening it
@@ -131,7 +134,7 @@ export interface DoneCloseLandingBackstopOptions {
 export interface DoneCloseLandingSweepResult {
   /** False when the min-interval gate short-circuited the tick (no-op). */
   due: boolean;
-  /** Distinct done issues with an in-window latest decision-carried skip. */
+  /** Done cards in lookback plus this sweep's blocked draft parks. */
   candidates: number;
   confirmed: number;
   failed: number;
@@ -163,6 +166,7 @@ interface CandidateIssue {
   status: string;
   identifier: string | null;
   assigneeAgentId: string | null;
+  unblockDescriptor?: IssueUnblockDescriptor | null;
 }
 
 interface CandidateRow {
@@ -209,15 +213,24 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** Only this sweep's board-owned draft park may be rediscovered while blocked. */
+function isBackstopDraftPark(issue: CandidateIssue): boolean {
+  const descriptor = issue.unblockDescriptor;
+  return issue.status === "blocked" &&
+    descriptor?.owner === "board" &&
+    descriptor.action.startsWith("Run gh pr ready ") &&
+    descriptor.action.includes("merge-arming/republish");
+}
+
 /** SUP-15953: idempotency key for one (PR, head, ejection-reason) refusal. */
 function refusalKey(pr: string, headSha: string, ejectionReason: string): string {
   return `${pr}\u0000${headSha}\u0000${ejectionReason}`;
 }
 
 /**
- * Build (but do not execute) the discovery query for done cards whose linked PR
- * may not have landed. Extracted so the exact WHERE predicate can be asserted in
- * isolation (AC1) rather than only through an injected candidate set.
+ * Build (but do not execute) discovery for done cards whose linked PR may not
+ * have landed and blocked cards parked by this sweep for an open draft.
+ * Extracted so the exact WHERE predicate can be asserted in isolation (AC1).
  *
  * Two candidate sources, both first-class activity rows:
  *   1. decision-carried close: `issue.done_transition_guard_skipped` whose
@@ -239,6 +252,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
         status: issues.status,
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
+        unblockDescriptor: issues.unblockDescriptor,
       },
     })
     .from(activityLog)
@@ -259,19 +273,24 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
           ),
           eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
         ),
-        gte(activityLog.createdAt, windowStart),
         lte(activityLog.createdAt, discoveryCutoff),
-        eq(issues.status, "done"),
+        or(
+          and(eq(issues.status, "done"), gte(activityLog.createdAt, windowStart)),
+          and(
+            eq(issues.status, "blocked"),
+            sql`${issues.unblockDescriptor}->>'owner' = 'board'`,
+            sql`${issues.unblockDescriptor}->>'action' LIKE 'Run gh pr ready %merge-arming/republish%'`,
+          ),
+        ),
       ),
     );
 }
 
 /**
- * Qualify raw discovery rows into candidate cards: keep only the LATEST
- * transition-of-record per issue, require it to be `done` and inside the
- * lookback/discovery window, and require it to carry a decision-carried skip
- * reason or an arming-refusal reason. Mirrors the discovery WHERE so a row the
- * query returns is always re-validated before it is measured.
+ * Qualify raw discovery rows: retain the latest transition-of-record per issue,
+ * a done card inside lookback or this sweep's blocked draft park (retained past
+ * lookback), and a decision-carried skip or arming-refusal reason. Mirrors the
+ * SQL WHERE before measurement.
  *
  * SUP-15953: `discoveryCutoff` is the WIDER of the verdict grace and the
  * re-enqueue grace, so a recently ejected PR is a candidate here. Verdict
@@ -292,9 +311,10 @@ export function selectLandingCandidates(
     }
   }
   return [...latestByIssue.values()].filter((row) => {
-    if (row.issue.status !== "done") return false;
+    const parkedDraft = isBackstopDraftPark(row.issue);
+    if (row.issue.status !== "done" && !parkedDraft) return false;
     const createdAt = row.createdAt.getTime();
-    if (createdAt < windowStart.getTime() || createdAt > discoveryCutoff.getTime()) return false;
+    if (createdAt > discoveryCutoff.getTime() || (createdAt < windowStart.getTime() && !parkedDraft)) return false;
     const details = readRecord(row.details);
     const isDecisionCarried =
       readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
@@ -546,9 +566,9 @@ export function createDoneCloseLandingBackstopService(
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
-    // SUP-16689: per-card draft-stranded ledger. A draft PR is un-mergeable, so a
-    // `done` card whose only linked PR is an open draft is reported once per card;
-    // the per-card scope (entityId = issue.id) bounds the report like confirmed/failed.
+    // Per-card draft-stranded ledger bounds comments, not the required park.
+    // If an earlier update failed after logging, the next sweep must still
+    // repair the done card before the 7-day discovery window expires.
     const alreadyDraftStranded = new Set(
       existing
         .filter(
@@ -610,7 +630,7 @@ export function createDoneCloseLandingBackstopService(
 
     for (const pr of prs) {
       const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
-      if (alreadyConfirmed.has(prKey) || alreadyFailed.has(prKey)) continue;
+      if (alreadyFailed.has(prKey) || alreadyConfirmed.has(prKey)) continue;
 
       if (!deps.resolver) {
         counts.deferred += 1;
@@ -647,19 +667,55 @@ export function createDoneCloseLandingBackstopService(
             ? readString(data?.closed_at)
             : null;
 
-      measured.push({ pr, prKey, state, draft, closedAt });
+      measured.push({
+        pr: state === "open" && draft === true
+          ? {
+              ...pr,
+              draft: true,
+              headRefName: readString(data?.headRef) ?? pr.headRefName,
+              title: readString(data?.title) ?? pr.title,
+              headRepoFullName: readString(data?.headRepoFullName),
+            }
+          : pr,
+        prKey, state, draft, closedAt,
+      });
     }
 
     // Did ANY linked PR on this card merge? If so, a closed-unmerged sibling is a
     // superseded carrier. The still-open-past-grace arm is intentionally left
     // unchanged (out of scope for this fix): it still takes the re-enqueue/escalate
     // path.
-    const mergedSiblingKeys = measured
-      .filter((m) => m.state === "merged")
-      .map((m) => m.prKey);
+    const mergedSiblingKeys = [
+      ...prs
+        .map((pr) => `${pr.owner}/${pr.repo}#${pr.number}`)
+        .filter((prKey) => alreadyConfirmed.has(prKey)),
+      ...measured.filter((m) => m.state === "merged").map((m) => m.prKey),
+    ];
     const hasMergedSibling = mergedSiblingKeys.length > 0;
 
+    const isOwnDraft = await loadOwnDraftPredicate(
+      db,
+      issue,
+      measured.map((m) => m.pr),
+    );
+
+    // The park is per card, not per PR: one blocked update names every own
+    // draft that needs `gh pr ready`, and one comment/wake covers the newly
+    // reported ones (sent on the last own draft's iteration).
+    const ownOpenDrafts = verdictEligible
+      ? measured.filter(
+          (m) =>
+            m.state === "open" &&
+            m.draft === true &&
+            isOwnDraft(m.pr),
+        )
+      : [];
+    const newlyStrandedDrafts: string[] = [];
+    const pendingDraftAudits: Array<Parameters<typeof logActivity>[1]> = [];
+    let draftParked = isBackstopDraftPark(issue);
+
     for (const { pr, prKey, state, draft, closedAt } of measured) {
+      const foreignDraft = state === "open" && draft === true && !isOwnDraft(pr);
       const isSupersededCarrier = state === "closed" && hasMergedSibling;
 
       if (state === "merged") {
@@ -750,69 +806,89 @@ export function createDoneCloseLandingBackstopService(
         continue;
       }
 
-      // SUP-16689: a still-OPEN DRAFT can never land on its own — GitHub will not
-      // auto-merge a draft, so the re-enqueue / confirmed / failed legs all miss
-      // it. The resolvers are draft-blind by default; this sweep now passes
-      // `includeDrafts: true` specifically to SEE these, and reports the strand
-      // explicitly instead of letting the card age silently out of the 7-day
-      // discovery window. Report only: no re-enqueue, no escalation, and no
-      // MAX_REENQUEUE_ATTEMPTS quota consumed (a draft cannot be armed).
-      //
-      // The draft flag is read from the LIVE snapshot (`data.draft`), never the
-      // cached mention: a PR promoted out of draft must not be reported stranded,
-      // and a PR converted into draft must not enter the re-enqueue/escalate lane.
-      // When the live flag is unreadable, fail closed and defer — guessing either
-      // way would mis-disposition an open PR.
+      // A live open draft cannot enter the merge queue. Park the done card with
+      // an explicit board action; the audit row only suppresses repeated comments,
+      // never the park if an earlier update failed.
+      // Use the LIVE draft flag, not the cached mention. Unknown flags defer.
       if (draft === "unknown") {
         counts.deferred += 1;
         continue;
       }
-      if (state === "open" && draft === true) {
+      if (state === "open" && draft === true && !foreignDraft) {
         if (!verdictEligible) {
           // A freshly-closed card gets the landing grace before naming a draft
           // stranded (same conservatism as _failed); defer to a later sweep.
           counts.deferred += 1;
           continue;
         }
-        if (alreadyDraftStranded.has(prKey)) {
-          // This card+PR was already reported as draft-stranded on a prior sweep.
+        const alreadyReported = alreadyDraftStranded.has(prKey);
+        if (!hasMergedSibling && !draftParked) {
+          // Persist the park before notification; a failed update leaves the
+          // card done and eligible on the next sweep.
+          await deps.svc.update(issue.id, {
+            status: "blocked",
+            unblockDescriptor: {
+              owner: "board",
+              action: `Run ${ownOpenDrafts.map((d) => `gh pr ready ${d.pr.number} for ${d.prKey}`).join("; ")}, then republish approval at the ready head via the board merge-arming/republish action; verify the PR lands before closing this card done`,
+            },
+          });
+          draftParked = true;
+        }
+        if (!alreadyReported) {
+          const audit = {
+            companyId: issue.companyId,
+            actorType: "system" as const,
+            actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
+            entityType: "issue" as const,
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              pr: prKey,
+              prState: state,
+              draft: true,
+              skipReason: skipReason ?? null,
+              refusal: isArmingRefusal,
+              ...(hasMergedSibling
+                ? { supersededBy: mergedSiblingKeys.join(", ") }
+                : {}),
+            },
+          };
+          // A merged sibling needs no notification. An unmerged draft's audit
+          // must follow the successful comment/wake, or it would suppress retry.
+          if (hasMergedSibling) await logActivity(db, audit);
+          else pendingDraftAudits.push(audit);
+        }
+        if (hasMergedSibling) {
+          // The card's work landed via the merged sibling: audit only.
           continue;
         }
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: "system",
-          actorId: DONE_CLOSE_LANDING_ACTOR_ID,
-          agentId: null,
-          runId: null,
-          agentApiKeyId: null,
-          action: DONE_CLOSE_LANDING_DRAFT_STRANDED_ACTION,
-          entityType: "issue",
-          entityId: issue.id,
-          issueId: issue.id,
-          details: {
-            identifier: issue.identifier ?? null,
-            pr: prKey,
-            prState: state,
-            draft: true,
-            skipReason: skipReason ?? null,
-            refusal: isArmingRefusal,
-          },
-        });
-        await deps.svc.addComment(
-          issue.id,
-          `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still an open DRAFT past the done-close grace window. A draft cannot be auto-merged, so this card cannot land until the PR is un-drafted (or merged another way). Promote the PR out of draft and re-verify the deliverable.`,
-          {},
-          { authorType: "system" },
-        );
-        if (opts.wakeup && issue.assigneeAgentId) {
-          await opts.wakeup(issue.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_commented",
-            payload: { issueId: issue.id, mutation: "comment" },
-          });
+        if (!alreadyReported) newlyStrandedDrafts.push(prKey);
+        if (
+          newlyStrandedDrafts.length > 0 &&
+          prKey === ownOpenDrafts[ownOpenDrafts.length - 1]!.prKey
+        ) {
+          await deps.svc.addComment(
+            issue.id,
+            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${newlyStrandedDrafts.join(", ")} ${newlyStrandedDrafts.length === 1 ? "is" : "are"} still an open DRAFT past the done-close grace window. This card is parked blocked until ${newlyStrandedDrafts.length === 1 ? "the PR is" : "the PRs are"} ready, approval is republished, and the deliverable lands.`,
+            {},
+            { authorType: "system" },
+          );
+          if (opts.wakeup && issue.assigneeAgentId) {
+            await opts.wakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: { issueId: issue.id, mutation: "comment" },
+            });
+          }
+          for (const audit of pendingDraftAudits) await logActivity(db, audit);
+          counts.draftStranded += 1;
         }
-        counts.draftStranded += 1;
         continue;
       }
 
@@ -951,6 +1027,8 @@ export function createDoneCloseLandingBackstopService(
           continue;
         }
       }
+
+      if (foreignDraft) continue;
 
       // state === "open" past the grace window: re-enqueue (bounded) or escalate.
       // A prior re-enqueue does NOT mean the PR will land: the merge queue ejects

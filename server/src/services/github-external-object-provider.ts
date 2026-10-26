@@ -203,6 +203,7 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const authorLogin = asNestedString(body, "user", "login");
   const headRef = asNestedString(body, "head", "ref");
   const headSha = asNestedString(body, "head", "sha");
+  const headRepoFullName = asString(asRecord(asRecord(body.head)?.repo)?.full_name);
   const baseRef = asNestedString(body, "base", "ref");
   const reviewDecision = asString(body.review_decision);
   const additions = asNonNegativeInteger(body.additions);
@@ -265,6 +266,7 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(authorLogin ? { authorLogin } : {}),
       ...(headRef ? { headRef } : {}),
       ...(headSha ? { headSha } : {}),
+      ...(headRepoFullName ? { headRepoFullName } : {}),
       ...(baseRef ? { baseRef } : {}),
       ...(asString(body.merged_at) ? { merged_at: asString(body.merged_at) } : {}),
       ...(asString(body.merge_commit_sha) ? { merge_commit_sha: asString(body.merge_commit_sha) } : {}),

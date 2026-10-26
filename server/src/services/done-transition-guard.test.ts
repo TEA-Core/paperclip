@@ -292,6 +292,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     ...actual,
     resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
     fetchOpenPullRequests: mockFetchOpenPullRequests,
+    resolveCardDeliveryBranchOwnership: vi.fn(actual.resolveCardDeliveryBranchOwnership),
   };
 });
 
@@ -302,6 +303,11 @@ vi.mock("node:child_process", () => ({
 
 import { ghFetch } from "./github-fetch.js";
 import { resolveGitHubToken } from "./github-credential.js";
+import { resolveCardDeliveryBranchOwnership } from "./merge-arming.js";
+
+const ownDeliveryBranch = (branch: string) => ({
+  branch, branchIsOwn: true, carrier: false, legitimate: true, ownerIssueId: null, refusalReason: null,
+});
 
 const ghFetchMock = vi.mocked(ghFetch);
 
@@ -3305,6 +3311,104 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("refuses a plain done close while its linked PR is a draft", async () => {
+      setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-draft", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-12345-work", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true, headRepoFullName: "TEA-Core/paperclip" },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("4161");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb, issue.companyId, issue.id, { includeDrafts: true },
+      );
+    });
+
+    it("leaves a decision-carrying close over a draft to the approval preflight", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-draft", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-12345-work", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.reason ?? "").not.toContain("head_draft");
+    });
+
+    it("lets a decomposition child close while it merely mentions the parent's draft carrier", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-carrier", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-99999-carrier", title: "SUP-99999: carrier", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      for (const decisionCarried of [true, false]) {
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, decisionCarried);
+        expect(result.reason ?? "").not.toContain("head_draft");
+        expect(result.reason ?? "").not.toContain("open linked PR");
+      }
+    });
+
+    it("refuses a done close over a cached draft on the card's own non-prefixed delivery branch", async () => {
+      setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("fm/fleet-fix"));
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-own", owner: "TEA-Core", repo: "paperclip", number: 4162, nodeId: null,
+          headRefName: "fm/fleet-fix", title: "Add x", displayName: "TEA-Core/paperclip#4162",
+          cachedState: "open", lastErrorCode: null, draft: true, headRepoFullName: "TEA-Core/paperclip" },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("4162");
+    });
+
+    it.each([
+      { label: "moved foreign branch", cached: { headRefName: "SUP-12345-old", title: "SUP-12345: old" }, live: { ref: "SUP-99999-new", title: "SUP-99999: new" }, owned: false },
+      { label: "newly owned branch", cached: { headRefName: "SUP-99999-old", title: "SUP-99999: old" }, live: { ref: "SUP-12345-new", title: "SUP-12345: new" }, owned: true },
+      { label: "newly owned title", cached: { headRefName: "shared-parent", title: "SUP-99999: old" }, live: { ref: "shared-parent", title: "SUP-12345: new" }, owned: true },
+      { label: "stale owned title", cached: { headRefName: "shared-parent", title: "SUP-12345: old" }, live: { ref: "shared-parent", title: "SUP-99999: new" }, owned: false },
+    ])("uses live PR identity, not a cached mention: $label", async ({ cached, live, owned }) => {
+      setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([{
+        id: "pr-draft", owner: "TEA-Core", repo: "paperclip", number: 4161,
+        nodeId: null, displayName: "TEA-Core/paperclip#4161",
+        cachedState: "open", lastErrorCode: null, draft: true, ...cached,
+      }]);
+      ghFetchMock.mockImplementation(async (url: string) =>
+        new Response(JSON.stringify(url.includes("/pulls/4161")
+          ? { state: "open", draft: true, title: live.title, head: { ref: live.ref, repo: { full_name: "TEA-Core/paperclip" } } }
+          : { ahead_by: 0 }), { status: 200 }),
+      );
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+      expect(result.skipReason === "head_draft").toBe(owned);
+    });
+
+    it.each([
+      { label: "foreign base repository", repo: "paperclip-agent-tools", headRepo: "TEA-Core/paperclip-agent-tools" },
+      { label: "fork head repository", repo: "paperclip", headRepo: "Other/paperclip" },
+    ])("never attributes a draft to this card from a $label", async ({ repo, headRepo }) => {
+      setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([{
+        id: "pr-draft", owner: "TEA-Core", repo, number: 4161,
+        nodeId: null, headRefName: "SUP-12345-work", title: "SUP-12345: work",
+        displayName: `TEA-Core/${repo}#4161`, cachedState: "open", lastErrorCode: null, draft: true,
+      }]);
+      ghFetchMock.mockImplementation(async (url: string) =>
+        new Response(JSON.stringify(url.includes("/pulls/4161")
+          ? { state: "open", draft: true, title: "SUP-12345: work", head: { ref: "SUP-12345-work", repo: { full_name: headRepo } } }
+          : { ahead_by: 0 }), { status: 200 }),
+      );
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+      expect(result.skipReason).not.toBe("head_draft");
+    });
+
     // SUP-14429 (mechanism B): the decisionCarried carve-out must not waive an
     // open linked PR held by an undismissed external CHANGES_REQUESTED review.
     // The hydration pass now resolves the live GraphQL reviewDecision; only that
@@ -4990,6 +5094,23 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("refuses a plain close when the live-discovered PR is a draft", async () => {
+      setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+      mockFetchOpenPullRequests.mockResolvedValue({
+        ok: true, status: 200, message: null,
+        items: [{ ...prItems[0], draft: true }],
+      });
+      ghFetchMock.mockImplementation(async (url: string) =>
+        new Response(JSON.stringify(url.includes("/pulls/3264")
+          ? { state: "open", draft: true, head: { ref: "SUP-12345-work", repo: { full_name: "TEA-Core/paperclip" } } }
+          : { ahead_by: 0 }), { status: 200 }),
+      );
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("3264");
+    });
+
     it("blocks a plain close on the live-discovered open PR", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
@@ -5007,6 +5128,32 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).toContain("1 open linked PR");
       expect(result.reason).toContain("TEA-Core/paperclip#3264");
       expect(result.skipReason).toBeNull();
+    });
+
+    it("still live-discovers the card's own undisclosed PR when the only cached mention is a foreign draft carrier", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-carrier", owner: "TEA-Core", repo: "paperclip", number: 4161, nodeId: null,
+          headRefName: "SUP-99999-carrier", title: "SUP-99999: carrier", displayName: "TEA-Core/paperclip#4161",
+          cachedState: "open", lastErrorCode: null, draft: true },
+      ]);
+      mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: prItems });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/pulls/3264")) {
+          return new Response(JSON.stringify({ state: "open", draft: false }), { status: 200 });
+        }
+        if (url.includes("/pulls/4161")) {
+          return new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip#3264");
+      expect(result.reason).not.toContain("4161");
     });
 
     it("counts a failed live list in skipReason and continues with the compare flow", async () => {
@@ -5043,30 +5190,6 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(mockFetchOpenPullRequests).toHaveBeenCalledTimes(1);
     });
 
-    it("excludes draft and non-matching PRs from the live list", async () => {
-      setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
-      });
-      mockFetchOpenPullRequests.mockResolvedValue({
-        ok: true,
-        status: 200,
-        message: null,
-        items: [
-          { number: 1, draft: true, headRef: "SUP-12345-draft", title: "draft", body: null },
-          { number: 2, draft: false, headRef: "feature/unrelated", title: "unrelated change", body: null },
-        ],
-      });
-      ghFetchMock.mockImplementation(async (url: string) => {
-        if (url.includes("/compare/")) {
-          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
-        }
-        return new Response(JSON.stringify({}), { status: 200 });
-      });
-      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
-      expect(result.allowed).toBe(true);
-      expect(result.aheadBy).toBe(0);
-      expect(result.skipReason).toBeNull();
-    });
 
     // SUP-17162 second symptom: the live-discovery path must consume the SAME
     // anchored ownership predicate as discovery (merge-arming.ts), not a second
@@ -5457,7 +5580,70 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier1");
-      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb, "company-1", "issue-1", { includeDrafts: true },
+      );
+    });
+
+    async function declareDelegated(prNumber: number, cached: Record<string, unknown>) {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...linkedPr(prNumber), ...cached }]);
+      return evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landing-delegated PR #${prNumber}; post-merge carrier done-close-landing-backstop.`),
+        null,
+        () => Promise.resolve([]),
+      );
+    }
+
+    it("refuses a linked PR that is live open and draft, by name", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true, head: { ref: "SUP-12345-work", repo: { full_name: "TEA-Core/paperclip" } } }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-12345-work" });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+      expect(result.reason).toContain("PR #4161");
+      expect(result.reason).toContain("promote");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb, "company-1", "issue-1", { includeDrafts: true },
+      );
+    });
+
+    it("accepts once the PR was promoted, even though the cached row still reads draft", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: false }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-12345-work" });
+      expect(result.allowed).toBe(true);
+    });
+
+    it("refuses a draft on the card's own non-prefixed delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("fm/fleet-fix"));
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true, head: { ref: "fm/fleet-fix", repo: { full_name: "TEA-Core/paperclip" } } }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, headRefName: "fm/fleet-fix", title: "Add x" });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+    });
+
+    it("does not refuse a foreign PR cached non-draft that is live draft", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: false, headRefName: "SUP-99999-carrier" });
+      expect(result.allowed).toBe(true);
+    });
+
+    it("does not refuse a draft carrier owned by another card", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "open", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-99999-carrier" });
+      expect(result.allowed).toBe(true);
+    });
+
+    it("does not call a closed draft an open draft", async () => {
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ state: "closed", draft: true }), { status: 200 }));
+      const result = await declareDelegated(4161, { draft: true, cachedState: "closed", headRefName: "SUP-12345-work" });
+      expect(result.reason ?? "").not.toContain("head_draft");
+    });
+
+    it("does not refuse on a stale cached draft flag when live state is unavailable", async () => {
+      ghFetchMock.mockResolvedValue(new Response("{}", { status: 500 }));
+      const result = await declareDelegated(4161, { draft: true, headRefName: "SUP-12345-work" });
+      expect(result.allowed).toBe(true);
     });
 
     it("refuses landed-at-tip when GitHub credential resolution fails, and does not accept", async () => {

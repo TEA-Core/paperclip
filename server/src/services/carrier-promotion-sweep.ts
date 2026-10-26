@@ -2,12 +2,14 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, externalObjectMentions, externalObjects, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
-import { logActivity } from "./activity-log.js";
+import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
-  fetchGitHubNodeId,
   isGitHubTokenResolution,
   markPullRequestReadyForReview,
+  parseRepoUrl,
+  resolveIssueRepoContext,
   resolveGitHubTokenCandidatesForRepo,
   resolveGitHubTokenForRepo,
 } from "./merge-arming.js";
@@ -15,22 +17,25 @@ import {
 /**
  * Carrier promotion sweep (PR-CARRIER-3).
  *
- * The control plane never creates or promotes pull requests. This sweep flips
- * a parent's draft carrier PR to ready-for-review when one of two triggers
- * fires: the parent's last child reaching terminal, via the EXISTING
- * `getWakeableParentAfterChildCompletion` (this sweep is its third consumer,
- * not a new predicate) — or three-day age-cap expiry. Cadence is the 1 h
- * sweep slot: the heartbeat tick fires the call every 30 s and the
- * min-interval gate inside `sweep` makes every non-due tick a no-op, shaped
- * exactly like `done-close-landing-backstop.ts`.
+ * This sweep flips a parent's draft carrier PR to ready-for-review when one
+ * of two triggers fires: the parent's last child reaching terminal, via the
+ * existing `getWakeableParentAfterChildCompletion`, or three-day age-cap
+ * expiry. The age cap also covers parents that became done before their linked
+ * draft was promoted. Cadence is the 1 h sweep slot: the heartbeat
+ * tick fires the call every 30 s and the min-interval gate inside `sweep`
+ * makes every non-due tick a no-op, as in `done-close-landing-backstop.ts`.
  *
- * A PR only counts as the parent's carrier when its head branch starts with
- * the parent's identifier (the carrier branch is the parent's
- * `{{identifier}}-{{slug}}` name, no prefix). The sequencing guard holds
- * carrier N+1 while carrier N's external object still reads `open` —
- * merge-queue membership is unobservable, and a queued PR is still open.
- * Idempotence rides an activity row per (parent, PR): a carrier an earlier
- * sweep dispositioned is never re-promoted.
+ * A PR only counts as the parent's carrier when its cached head branch starts
+ * with the parent's identifier (the carrier branch is the parent's
+ * `{{identifier}}-{{slug}}` name, no prefix) and its base repository is the
+ * parent's delivery repo. The live open/draft state, head repository, exact
+ * branch and unchanged SHA are checked twice, including immediately before
+ * promotion. GitHub's ready mutation has no atomic expected-head CAS: a remote
+ * head change after the final read is not preventable by this API. A per-PR
+ * transaction lock and ledger check serialize local contenders, not GitHub
+ * branch edits. The sequencing guard holds carrier N+1 while carrier N's
+ * external object still reads `open`; a queued PR is still open. An activity
+ * row per (company, PR) keeps an already-promoted carrier idempotent.
  */
 
 const DEFAULT_AGE_CAP_MS = 3 * 24 * 60 * 60 * 1000;
@@ -70,9 +75,9 @@ interface DraftCarrierRow {
   owner: string;
   repo: string;
   number: number;
-  nodeId: string | null;
   headRefName: string | null;
   prCreatedAt: string | null;
+  headSha: string | null;
 }
 
 interface SiblingPullRequest {
@@ -82,6 +87,46 @@ interface SiblingPullRequest {
 }
 
 type PromotionOutcome = "promoted" | "alreadyReady" | "failed";
+
+type CarrierLiveCheck =
+  | { kind: "verified"; nodeId: string }
+  | { kind: "unauthorized" }
+  | { kind: "invalid" };
+
+/** Live REST verification; no cached field can authorize the ready mutation. */
+async function readVerifiedCarrier(
+  token: string,
+  url: string,
+  draft: DraftCarrierRow,
+  deliveryRepo: string,
+): Promise<CarrierLiveCheck> {
+  let response: Response;
+  try {
+    response = await ghFetch(url, {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-carrier-promotion-sweep",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${token}`,
+      },
+    });
+  } catch {
+    return { kind: "invalid" };
+  }
+  if (response.status === 401 || response.status === 403) return { kind: "unauthorized" };
+  if (!response.ok) return { kind: "invalid" };
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const head = body?.head as Record<string, unknown> | null | undefined;
+  const headRepo = head?.repo as Record<string, unknown> | null | undefined;
+  if (
+    body?.state !== "open" || body.draft !== true ||
+    typeof head?.ref !== "string" || head.ref !== draft.headRefName ||
+    typeof headRepo?.full_name !== "string" || headRepo.full_name.toLowerCase() !== deliveryRepo ||
+    typeof head?.sha !== "string" || !draft.headSha || head.sha !== draft.headSha ||
+    typeof body.node_id !== "string" || !body.node_id
+  ) return { kind: "invalid" };
+  return { kind: "verified", nodeId: body.node_id };
+}
 
 /** Reads a positive-integer millisecond env var, falling back to `fallbackMs` on missing or invalid values. */
 function readMsEnv(name: string, fallbackMs: number): number {
@@ -182,8 +227,8 @@ export function createCarrierPromotionSweepService(
         owner: parsed.owner,
         repo: parsed.repo,
         number: parsed.number,
-        nodeId: readString(row.data.node_id),
         headRefName: headRefFromData(row.data),
+        headSha: readString(row.data.headSha),
         prCreatedAt: readString(row.data.created_at),
       });
     }
@@ -236,13 +281,20 @@ export function createCarrierPromotionSweepService(
         companyId: issues.companyId,
         status: issues.status,
         identifier: issues.identifier,
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspaceId: issues.executionWorkspaceId,
       })
       .from(issues)
       .where(eq(issues.id, parentId));
     if (!parent) return;
-    // Terminal parents are the cancelled-parent case (PR-CARRIER-7), out of scope.
-    if (parent.status === "done" || parent.status === "cancelled") return;
+    // Done parents can still own a stranded draft carrier, so the age cap stays
+    // available. Cancelled parents are the cancelled-parent case (PR-CARRIER-7), out of scope.
+    if (parent.status === "cancelled") return;
     const prefix = (parent.identifier ?? "").toLowerCase();
+    const repoContext = await resolveIssueRepoContext(db, parent);
+    const deliveryRepo = parseRepoUrl(repoContext?.repoUrl ?? null);
+    if (deliveryRepo?.hostname !== "github.com") return;
     if (!prefix) return;
     const carrierBranchPrefix = `${prefix}-`;
     const isCarrierBranch = (headRefName: string | null) =>
@@ -280,7 +332,10 @@ export function createCarrierPromotionSweepService(
     }
 
     const candidates = parentDrafts
-      .filter((draft) => isCarrierBranch(draft.headRefName))
+      .filter((draft) =>
+        isCarrierBranch(draft.headRefName)
+        && draft.owner.toLowerCase() === deliveryRepo.owner.toLowerCase()
+        && draft.repo.toLowerCase() === deliveryRepo.repo.toLowerCase())
       .sort((a, b) => a.number - b.number);
     if (candidates.length === 0) return;
     result.candidates += candidates.length;
@@ -348,7 +403,7 @@ export function createCarrierPromotionSweepService(
     }
   }
 
-  /** Promotes one carrier PR: resolve a working token candidate, resolve the node id if cached, flip to ready, log the activity row. */
+  /** Promotes one verified carrier PR: read live identity and head, flip to ready, log the activity row. */
   async function promoteCarrier(
     draft: DraftCarrierRow,
     prKey: string,
@@ -365,59 +420,72 @@ export function createCarrierPromotionSweepService(
       return "failed";
     }
 
-    for (const candidate of candidates) {
-      const token = candidate.token;
+    const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(draft.owner)}/${encodeURIComponent(draft.repo)}/pulls/${draft.number}`;
+    const deliveryRepo = `${draft.owner}/${draft.repo}`.toLowerCase();
+    const publications: ActivityPublication[] = [];
+    try {
+      const result = await db.transaction(async (tx) => {
+        // The ledger's read/check/write must share the same PR-scoped lock.
+        // Resolve token candidates before acquiring it; serialize only the
+        // remote verification, ready mutation and persisted disposition.
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`carrier-promotion:${parent.companyId}:${deliveryRepo}#${draft.number}`}, 0))`);
+        const earlier = await tx
+          .select({ id: activityLog.id })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, parent.companyId),
+            eq(activityLog.action, CARRIER_PROMOTION_READY_ACTION),
+            sql`${activityLog.details}->>'pr' = ${prKey}`,
+          ));
+        if (earlier.length > 0) return "alreadyReady";
 
-      let nodeId = draft.nodeId;
-      if (!nodeId) {
-        const nodeIdResult = await fetchGitHubNodeId(token, draft.owner, draft.repo, draft.number);
-        if (!nodeIdResult.ok || !nodeIdResult.nodeId) {
-          if (nodeIdResult.status === 401 || nodeIdResult.status === 403) {
-            if (candidate !== candidates[candidates.length - 1]) continue;
+        for (const candidate of candidates) {
+          const first = await readVerifiedCarrier(candidate.token, url, draft, deliveryRepo);
+          if (first.kind === "unauthorized" && candidate !== candidates[candidates.length - 1]) continue;
+          if (first.kind !== "verified") return "failed";
+          // Re-read as the final operation before GraphQL. This shrinks the
+          // remote race but cannot make GitHub's ready mutation a head CAS.
+          const final = await readVerifiedCarrier(candidate.token, url, draft, deliveryRepo);
+          if (final.kind === "unauthorized" && candidate !== candidates[candidates.length - 1]) continue;
+          if (final.kind !== "verified" || final.nodeId !== first.nodeId) return "failed";
+
+          const outcome = await markPullRequestReadyForReview(candidate.token, final.nodeId);
+          if (!outcome.success) {
+            if ((outcome.status === 401 || outcome.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
+            logger.warn(
+              { pr: prKey, status: outcome.status, error: outcome.error },
+              "carrier promotion sweep: markPullRequestReadyForReview failed; will retry next sweep",
+            );
+            return "failed";
           }
-          logger.warn(
-            { pr: prKey, status: nodeIdResult.status },
-            "carrier promotion sweep: could not resolve PR node id",
-          );
-          return "failed";
+          await logActivityInTransaction(tx as unknown as Db, {
+            companyId: parent.companyId,
+            actorType: "system",
+            actorId: CARRIER_PROMOTION_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: CARRIER_PROMOTION_READY_ACTION,
+            entityType: "issue",
+            entityId: parent.id,
+            issueId: parent.id,
+            details: {
+              identifier: parent.identifier ?? null,
+              pr: prKey,
+              trigger,
+              prState: "ready",
+            },
+          }, publications);
+          return outcome.alreadyReady ? "alreadyReady" : "promoted";
         }
-        nodeId = nodeIdResult.nodeId;
-      }
-
-      const outcome = await markPullRequestReadyForReview(token, nodeId);
-      if (outcome.success) {
-        await logActivity(db, {
-          companyId: parent.companyId,
-          actorType: "system",
-          actorId: CARRIER_PROMOTION_ACTOR_ID,
-          agentId: null,
-          runId: null,
-          agentApiKeyId: null,
-          action: CARRIER_PROMOTION_READY_ACTION,
-          entityType: "issue",
-          entityId: parent.id,
-          issueId: parent.id,
-          details: {
-            identifier: parent.identifier ?? null,
-            pr: prKey,
-            trigger,
-            prState: "ready",
-          },
-        });
-        return outcome.alreadyReady ? "alreadyReady" : "promoted";
-      }
-
-      if (outcome.status === 401 || outcome.status === 403) {
-        if (candidate !== candidates[candidates.length - 1]) continue;
-      }
-      logger.warn(
-        { pr: prKey, status: outcome.status, error: outcome.error },
-        "carrier promotion sweep: markPullRequestReadyForReview failed; will retry next sweep",
-      );
+        return "failed";
+      });
+      for (const publication of publications) publishActivity(publication);
+      return result;
+    } catch (err) {
+      logger.warn({ err, pr: prKey }, "carrier promotion sweep: locked promotion failed");
       return "failed";
     }
-
-    return "failed";
   }
 
   return { sweep };
