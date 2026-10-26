@@ -4001,10 +4001,13 @@ registry.registerPath({
   summary: "Restore the assignee of an already-pending agent execution stage",
   description:
     "Board-only compare-and-set repair requiring assignment authority for the pending participant. " +
-    "All four expected values must match the locked issue row. Refuses pending interactions, active recovery " +
-    "actions, live runs and checkout/execution locks; recovery writers share the issue-row lock. " +
-    "Only the assignee and updatedAt change; the pending stage, status, statusVersion, executionState, " +
-    "decision history and pendingSince remain unchanged. Does not wake or re-arm the stage.",
+    "All four expected values must match the locked issue row. The issue must be in_review or blocked " +
+    "with an active, undecided policy stage naming the agent; completed/skipped stages, removed agent " +
+    "memberships, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
+    "active recovery actions, live runs and checkout/execution locks. Recovery writers share the issue-row " +
+    "lock; a brief SHARE lock on heartbeat_runs serializes other run writers during the live-run check. " +
+    "Only the assignee and updatedAt change; status, statusVersion, executionState, decision history " +
+    "and pendingSince remain unchanged. Does not wake or re-arm the stage.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(z.object({

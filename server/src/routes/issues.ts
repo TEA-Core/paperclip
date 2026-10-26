@@ -232,6 +232,7 @@ import {
 import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../services/release-ladder.js";
 import {
   evaluateStageIntegrity,
+  resolveSelfApprovalPrincipals,
   latestDecisionPerStage,
   readApprovalHeadDelta,
   readApprovalPullRequest,
@@ -414,7 +415,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -12743,7 +12744,7 @@ export function issueRoutes(
           participantId !== expected.expectedPendingParticipantAgentId
         ) throw conflict("Issue changed since the restoration snapshot");
         if (
-          issue.status === "done" || issue.status === "cancelled" ||
+          (issue.status !== "in_review" && issue.status !== "blocked") ||
           issue.assigneeAgentId === participantId || issue.assigneeUserId !== null ||
           state?.status !== "pending" ||
           typeof state.currentStageId !== "string" || !state.currentStageId ||
@@ -12753,6 +12754,43 @@ export function issueRoutes(
           issue.checkoutRunId !== null || issue.executionRunId !== null ||
           issue.executionLockedAt !== null || issue.executionAgentNameKey !== null
         ) throw conflict("Issue is not eligible for participant restoration");
+        const parsedState = parseIssueExecutionState(state);
+        let policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
+        try {
+          policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+        } catch {
+          throw conflict("Pending stage does not match the issue execution policy");
+        }
+        const stage = policy?.stages[parsedState?.currentStageIndex ?? -1];
+        if (
+          !parsedState || !stage ||
+          stage.id !== parsedState.currentStageId ||
+          stage.type !== parsedState.currentStageType ||
+          parsedState.completedStageIds.includes(stage.id) ||
+          parsedState.skippedStageIds?.includes(stage.id) ||
+          !stage.participants.some((candidate) => candidate.type === "agent" && candidate.agentId === participantId)
+        ) throw conflict("Pending stage does not match the issue execution policy");
+        const [priorApproval] = await tx.select({ id: issueExecutionDecisions.id })
+          .from(issueExecutionDecisions)
+          .where(and(
+            eq(issueExecutionDecisions.companyId, issue.companyId),
+            eq(issueExecutionDecisions.issueId, issue.id),
+            eq(issueExecutionDecisions.stageId, stage.id),
+            eq(issueExecutionDecisions.outcome, "approved"),
+          )).limit(1);
+        if (priorApproval) throw conflict("Pending stage has already been approved");
+        if (
+          findSelfSatisfyingReviewStage({
+            executionPolicy: issue.executionPolicy,
+            executionState: state,
+            incomingAssigneeAgentId: participantId,
+          }) ||
+          resolveSelfApprovalPrincipals(
+            (issue.executionPolicy ?? {}) as Record<string, unknown>,
+            (state ?? {}) as Record<string, unknown>,
+            issue.createdByAgentId ?? null,
+          ).agentIds.has(participantId as string)
+        ) throw conflict("Pending participant cannot approve their own work");
 
         const [agent] = await tx.select().from(agents)
           .where(and(eq(agents.id, participantId as string), eq(agents.companyId, issue.companyId)))
@@ -12760,6 +12798,15 @@ export function issueRoutes(
         if (!agent || !(await evaluateAgentInvokabilityFromDb(tx as unknown as Db, agent)).invokable) {
           throw conflict("Pending participant is not invokable");
         }
+        const [membership] = await tx.select({ id: companyMemberships.id })
+          .from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, issue.companyId),
+            eq(companyMemberships.principalType, "agent"),
+            eq(companyMemberships.principalId, agent.id),
+            eq(companyMemberships.status, "active"),
+          )).for("share");
+        if (!membership) throw conflict("Pending participant has no active company membership");
         const [interaction] = await tx.select({ id: issueThreadInteractions.id })
           .from(issueThreadInteractions)
           .where(and(
@@ -12776,6 +12823,10 @@ export function issueRoutes(
             inArray(issueRecoveryActions.status, ["active", "escalated"]),
           )).limit(1);
         if (recovery) throw conflict("Issue has an active recovery action");
+        // This rare board repair must serialize even run writers that do not
+        // acquire the issue row lock (including context-bound run inserts).
+        // SHARE permits reads but holds INSERT/UPDATE until the CAS commits.
+        await tx.execute(sql`LOCK TABLE heartbeat_runs IN SHARE MODE`);
         const [liveRun] = await tx.select({ id: heartbeatRuns.id })
           .from(heartbeatRuns)
           .where(and(

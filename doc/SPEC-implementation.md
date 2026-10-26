@@ -279,17 +279,28 @@ For a stranded pending execution-policy review/approval stage whose recorded
 agent participant is not its assignee, a board actor authorized to assign to
 that participant may call `POST /api/issues/{id}/restore-participant` with
 `expectedAssigneeAgentId` (nullable), `expectedStatus`,
-`expectedStatusVersion`, and `expectedPendingParticipantAgentId`. A row-locked
-compare-and-set refuses stale values or any pending interaction, active
-recovery action, live run, checkout/execution lock, unavailable participant,
-or already-matched assignee with 409. Recovery-action upserts acquire the same
-issue-row lock before writing, so an in-flight recovery creation cannot bypass
-the refusal. The operation changes only the agent assignee (and `updatedAt`)
-and logs the before/after assignment atomically. The status and status version
-remain unchanged (the version advances only when status changes); execution
-state, stage identity, pendingSince, and decisions remain untouched. This
-operation never arms, approves, rejects, re-arms, or wakes the stage. It does
-not repair cards with active recovery or interactions.
+`expectedStatusVersion`, and `expectedPendingParticipantAgentId`. The issue
+must be `in_review` or `blocked`; `blocked` keeps its pending stage intact.
+The pending stage id, index, type, and agent participant must match the stored
+execution policy. Completed/skipped stages, stages with an approved decision,
+removed agent memberships, and participants who would approve their own
+created/delivered/return-assignee work or make a review stage self-satisfying
+are ineligible. Agent approval also checks creator, delivery author, and
+return-assignee independence at decision time.
+
+A row-locked compare-and-set refuses stale values or any pending interaction,
+active recovery action, live run, checkout/execution lock, or unavailable
+participant with 409. Recovery-action upserts acquire the same issue-row lock
+before writing. Because not all run writers lock that row, the rare board
+repair briefly takes a PostgreSQL SHARE lock on `heartbeat_runs` before
+checking the live-run predicate; concurrent run inserts/updates wait until
+the transaction commits, including writes in other companies. The operation
+changes only the agent assignee (and `updatedAt`) and logs the before/after
+assignment atomically. The status and status version remain unchanged (the
+version advances only when status changes); execution state, stage identity,
+pendingSince, and decisions remain untouched. It never arms, approves,
+rejects, re-arms, or wakes the stage, and it does not repair cards with active
+recovery or interactions.
 
 Invariants:
 

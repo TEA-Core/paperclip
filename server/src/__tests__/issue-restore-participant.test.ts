@@ -19,6 +19,7 @@ const OTHER_COMPANY = "22222222-2222-4222-8222-222222222222";
 const ISSUE = "33333333-3333-4333-8333-333333333333";
 const ASSIGNEE = "44444444-4444-4444-8444-444444444444";
 const PARTICIPANT = "55555555-5555-4555-8555-555555555555";
+const INDEPENDENT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const STAGE = "66666666-6666-4666-8666-666666666666";
 const RUN = "77777777-7777-4777-8777-777777777777";
 const DECISION = "88888888-8888-4888-8888-888888888888";
@@ -67,11 +68,17 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.insert(agents).values([
       { id: ASSIGNEE, companyId: COMPANY, name: "Current", status: "idle", adapterType: "codex_local" },
       { id: PARTICIPANT, companyId: COMPANY, name: "Reviewer", status: "idle", adapterType: "codex_local" },
+      { id: INDEPENDENT, companyId: COMPANY, name: "Independent reviewer", status: "idle", adapterType: "codex_local" },
+    ]);
+    await db.insert(companyMemberships).values([
+      { companyId: COMPANY, principalType: "agent", principalId: ASSIGNEE, status: "active", membershipRole: "member" },
+      { companyId: COMPANY, principalType: "agent", principalId: PARTICIPANT, status: "active", membershipRole: "member" },
+      { companyId: COMPANY, principalType: "agent", principalId: INDEPENDENT, status: "active", membershipRole: "member" },
     ]);
     await db.insert(issues).values({
       id: ISSUE, companyId: COMPANY, title: "Stranded review", status: "blocked",
       assigneeAgentId: ASSIGNEE, executionState: pendingState,
-      executionPolicy: { mode: "normal", stages: [{ id: STAGE, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: PARTICIPANT }] }] },
+      executionPolicy: { mode: "normal", stages: [{ id: STAGE, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: PARTICIPANT }, { type: "agent", agentId: INDEPENDENT }] }] },
     });
     await db.insert(issueExecutionDecisions).values({
       id: DECISION, companyId: COMPANY, issueId: ISSUE, stageId: STAGE,
@@ -138,6 +145,110 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect(await db.select().from(issueExecutionDecisions)).toEqual(decisions);
   });
 
+  it("keeps a sole independent reviewer from becoming a self-satisfying assignee", async () => {
+    await db.update(issues).set({
+      executionPolicy: { mode: "normal", stages: [{ id: STAGE, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: PARTICIPANT }] }] },
+    }).where(eq(issues.id, ISSUE));
+    const before = await snapshot();
+    const ordinary = await request(app).patch(`/api/issues/${ISSUE}`).send({ assigneeAgentId: PARTICIPANT });
+    expect(ordinary.status, JSON.stringify(ordinary.body)).toBe(422);
+    expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("lets an independent restored participant decide later without a wake from restoration", async () => {
+    await db.update(issues).set({ status: "in_review", deliveryRequirement: "record_only" })
+      .where(eq(issues.id, ISSUE));
+    const before = await snapshot();
+    const decisionsBefore = await db.select().from(issueExecutionDecisions);
+    const restored = await post({ ...body(), expectedStatus: before.status, expectedStatusVersion: before.statusVersion });
+    expect(restored.status, JSON.stringify(restored.body)).toBe(200);
+    expect((await snapshot()).executionState).toEqual(before.executionState);
+    expect(await db.select().from(issueExecutionDecisions)).toEqual(decisionsBefore);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+
+    await db.insert(heartbeatRuns).values({
+      id: RUN, companyId: COMPANY, agentId: PARTICIPANT, status: "running",
+      contextSnapshot: { issueId: ISSUE },
+    });
+    actor = { type: "agent", source: "agent_jwt", agentId: PARTICIPANT, companyId: COMPANY, runId: RUN } as Express.Request["actor"];
+    const approved = await request(app).patch(`/api/issues/${ISSUE}`)
+      .set("X-Paperclip-Run-Id", RUN)
+      .send({
+        status: "done",
+        comment: "Approved.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): verified the isolated fixture.",
+      });
+    expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+    expect((await snapshot()).status).toBe("done");
+    const decisionsAfter = await db.select().from(issueExecutionDecisions);
+    expect(decisionsAfter).toHaveLength(2);
+    expect(decisionsAfter.some((row) => row.outcome === "approved" && row.actorAgentId === PARTICIPANT)).toBe(true);
+  });
+
+  it.each(["creator", "return assignee", "delivery author"])(
+    "does not grant a %s the review seat to approve its own work",
+    async (origin) => {
+      const reviewer = { type: "agent", agentId: PARTICIPANT, userId: null };
+      await db.update(issues).set({
+        status: "in_review",
+        createdByAgentId: origin === "creator" ? PARTICIPANT : null,
+        executionState: {
+          ...pendingState,
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          returnAssignee: origin === "return assignee" ? reviewer : pendingState.returnAssignee,
+          deliveryAuthor: origin === "delivery author" ? reviewer : null,
+        },
+        executionPolicy: { mode: "normal", stages: [{ id: STAGE, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: PARTICIPANT }] }] },
+      }).where(eq(issues.id, ISSUE));
+      const before = await snapshot();
+      const ordinary = await request(app).patch(`/api/issues/${ISSUE}`).send({ assigneeAgentId: PARTICIPANT });
+      expect(ordinary.status, JSON.stringify(ordinary.body)).toBe(422);
+
+      const restore = await post({ ...body(), expectedStatus: before.status, expectedStatusVersion: before.statusVersion });
+      expect(restore.status, JSON.stringify(restore.body)).toBe(409);
+      expect(await snapshot()).toEqual(before);
+      expect(await audit()).toHaveLength(0);
+      expect(await db.select().from(issueExecutionDecisions)).toHaveLength(1);
+    },
+  );
+
+  it.each(["creator", "return assignee", "delivery author"])(
+    "rejects an attributed %s approval on a preexisting self-owned review seat",
+    async (origin) => {
+      const reviewer = { type: "agent", agentId: PARTICIPANT, userId: null };
+      await db.update(issues).set({
+        status: "in_review",
+        assigneeAgentId: PARTICIPANT,
+        createdByAgentId: origin === "creator" ? PARTICIPANT : null,
+        deliveryRequirement: "record_only",
+        executionState: {
+          ...pendingState,
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          returnAssignee: origin === "return assignee" ? reviewer : pendingState.returnAssignee,
+          deliveryAuthor: origin === "delivery author" ? reviewer : null,
+        },
+      }).where(eq(issues.id, ISSUE));
+      await db.insert(heartbeatRuns).values({
+        id: RUN, companyId: COMPANY, agentId: PARTICIPANT, status: "running",
+        contextSnapshot: { issueId: ISSUE },
+      });
+      const before = await snapshot();
+      actor = { type: "agent", source: "agent_jwt", agentId: PARTICIPANT, companyId: COMPANY, runId: RUN } as Express.Request["actor"];
+      const decision = await request(app).patch(`/api/issues/${ISSUE}`)
+        .set("X-Paperclip-Run-Id", RUN)
+        .send({
+          status: "done",
+          comment: "Approved.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): verified the isolated fixture.",
+        });
+      expect(decision.status, JSON.stringify(decision.body)).toBe(422);
+      expect(await snapshot()).toEqual(before);
+      expect(await db.select().from(issueExecutionDecisions)).toHaveLength(1);
+    },
+  );
+
   it.each([
     ["assignee", { expectedAssigneeAgentId: null }],
     ["status", { expectedStatus: "in_review" }],
@@ -146,6 +257,59 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
   ])("409s on stale %s", async (_name, patch) => {
     const before = await snapshot();
     expect((await post({ ...body(), ...patch })).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it.each(["todo", "in_progress", "backlog"])("409s on a %s card carrying a pending review pointer", async (status) => {
+    await db.update(issues).set({ status }).where(eq(issues.id, ISSUE));
+    const before = await snapshot();
+    expect((await post({ ...body(), expectedStatus: status, expectedStatusVersion: before.statusVersion })).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it.each([
+    ["wrong stage id", { currentStageId: RUN }],
+    ["wrong stage index", { currentStageIndex: 1 }],
+    ["completed stage", { completedStageIds: [STAGE] }],
+    ["skipped stage", { skippedStageIds: [STAGE] }],
+  ])("409s on %s even with a matching restoration snapshot", async (_name, patch) => {
+    await db.update(issues).set({ executionState: { ...pendingState, ...patch } }).where(eq(issues.id, ISSUE));
+    const before = await snapshot();
+    expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("409s when the stored participant is absent from its original policy stage", async () => {
+    await db.update(issues).set({
+      executionPolicy: { mode: "normal", stages: [{ id: STAGE, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: INDEPENDENT }] }] },
+    }).where(eq(issues.id, ISSUE));
+    const before = await snapshot();
+    expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("409s when the stage already has an approved decision", async () => {
+    await db.insert(issueExecutionDecisions).values({
+      companyId: COMPANY, issueId: ISSUE, stageId: STAGE, stageType: "review",
+      outcome: "approved", body: "Already approved",
+    });
+    const before = await snapshot();
+    const decisions = await db.select().from(issueExecutionDecisions);
+    expect((await post()).status).toBe(409);
+    expect(await snapshot()).toEqual(before);
+    expect(await db.select().from(issueExecutionDecisions)).toEqual(decisions);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("409s when the pending agent has a removed company membership", async () => {
+    await db.update(companyMemberships).set({ status: "removed" })
+      .where(eq(companyMemberships.principalId, PARTICIPANT));
+    const before = await snapshot();
+    expect((await post()).status).toBe(409);
     expect(await snapshot()).toEqual(before);
     expect(await audit()).toHaveLength(0);
   });
@@ -269,6 +433,45 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.insert(heartbeatRuns).values({ id: RUN, companyId: COMPANY, agentId: ASSIGNEE, status: "running", ...fields });
     expect((await post()).status).toBe(409);
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+  });
+
+  it("waits for an in-flight issue-bound run writer before testing the live-run predicate", async () => {
+    let signalInserted!: () => void;
+    let releaseWriter!: () => void;
+    const inserted = new Promise<void>((resolve) => { signalInserted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseWriter = resolve; });
+    const writer = db.transaction(async (tx) => {
+      await tx.insert(heartbeatRuns).values({
+        id: RUN, companyId: COMPANY, agentId: ASSIGNEE, status: "running",
+        contextSnapshot: { issueId: ISSUE },
+      });
+      signalInserted();
+      await release;
+    });
+    await inserted;
+    const restoring = Promise.resolve(post());
+    let waitedForWriter = false;
+    try {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await db.execute<{ waiting: boolean }>(sql`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity
+            WHERE datname = current_database() AND state = 'active'
+              AND wait_event_type = 'Lock'
+              AND query ILIKE '%LOCK TABLE heartbeat_runs IN SHARE MODE%'
+          ) AS waiting
+        `);
+        if (row?.waiting) { waitedForWriter = true; break; }
+        await delay(25);
+      }
+    } finally {
+      releaseWriter();
+      await writer;
+    }
+    const response = await restoring;
+    expect({ waitedForWriter, status: response.status }).toEqual({ waitedForWriter: true, status: 409 });
+    expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+    expect(await audit()).toHaveLength(0);
   });
 
   it.each(["paused", "terminated", "pending_approval"])("409s on %s participant", async (status) => {
