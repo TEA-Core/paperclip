@@ -4956,6 +4956,7 @@ export function recoveryService(
       issueIds: [] as string[],
     };
     for (const { action, issue } of rows) {
+      try {
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
       if (
@@ -5005,32 +5006,54 @@ export function recoveryService(
           : hasNewSourcePath;
       const durablePathRestored = action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
       if (durablePathRestored || healthyChildren.length > 0 || effectiveNewSourcePath) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(
-            issue.companyId,
-            issue.id,
-          );
+      let cyclicChildBlockersSkipped = false;
+      if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
+        // Issue updates reject any blocker reachable from the source through
+        // "blocks" edges. Parentage does not imply a blocker edge, but an
+        // existing source -> child path would make child -> source a cycle.
+        const relations = await db
+          .select({ blockerId: issueRelations.issueId, blockedId: issueRelations.relatedIssueId })
+          .from(issueRelations)
+          .where(and(eq(issueRelations.companyId, issue.companyId), eq(issueRelations.type, "blocks")));
+        const dependents = new Map<string, string[]>();
+        for (const relation of relations) {
+          const list = dependents.get(relation.blockerId) ?? [];
+          list.push(relation.blockedId);
+          dependents.set(relation.blockerId, list);
+        }
+        const reachable = new Set<string>();
+        const queue = [issue.id];
+        for (let cursor = 0; cursor < queue.length; cursor += 1) {
+          for (const dependent of dependents.get(queue[cursor]) ?? []) {
+            if (reachable.has(dependent)) continue;
+            reachable.add(dependent);
+            queue.push(dependent);
+          }
+        }
+        const safeChildren = healthyChildren.filter((child) => !reachable.has(child.id));
+        cyclicChildBlockersSkipped = safeChildren.length !== healthyChildren.length;
+        if (safeChildren.length > 0) {
+          const blockerIds = await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id);
           await issuesSvc.update(issue.id, {
             status: "blocked",
             blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
+              ...new Set([...blockerIds, ...safeChildren.map((child) => child.id)]),
             ],
           });
         }
+      }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
           sourceIssueId: action.sourceIssueId,
           actionId: action.id,
           status: "resolved",
           outcome: "restored",
-          resolutionNote: durablePathRestored
+          resolutionNote: (durablePathRestored
             ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
             : healthyChildren.length > 0
               ? "durable_path_restored:healthy_child"
-              : "new_source_execution_path",
+              : "new_source_execution_path") +
+            (cyclicChildBlockersSkipped ? ";skipped_cyclic_child_blockers" : ""),
         });
         if (resolved) {
           result.resolved += 1;
@@ -5080,6 +5103,13 @@ export function recoveryService(
       // Legacy takeover actions remain readable and resolvable, but recovery no
       // longer schedules another agent-owned wake for them.
       result.skipped += 1;
+      } catch (err) {
+        logger.error(
+          { err, actionId: action.id, companyId: action.companyId },
+          "active recovery action reconciliation failed; skipping action",
+        );
+        result.skipped += 1;
+      }
     }
     return result;
   }

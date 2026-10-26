@@ -2,12 +2,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createServer } from "node:http";
+import type { Server } from "node:http";
+import { createDb, getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
+import { sql } from "drizzle-orm";
+import { bootstrapExecutionPolicyFromEnv } from "../services/index.js";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
 const ORIGINAL_PAPERCLIP_LISTEN_HOST = process.env.PAPERCLIP_LISTEN_HOST;
 const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
+const embeddedPostgresSupported = (await getEmbeddedPostgresTestSupport()).supported;
 
 const {
   createAppMock,
@@ -835,7 +842,75 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
   });
 
-  it("closes the bound listener when native startup recovery fails", async () => {
+  it.skipIf(!embeddedPostgresSupported)("closes the real listener before ending the real database pool on a fatal post-bind bootstrap failure", async () => {
+    // The suite mocks HTTP and DB; these two actual factories expose the leaked-listener regression.
+    const { createServer: realCreateServer } =
+      await vi.importActual<{ createServer: typeof createServer }>("node:http");
+    const { createDb: realCreateDb } =
+      await vi.importActual<{ createDb: typeof createDb }>("@paperclipai/db");
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-failed-startup-");
+    const database = realCreateDb(tempDb.connectionString);
+    let listener: Server | null = null;
+    let releasePolicy!: () => void;
+    const policyGate = new Promise<void>((resolve) => { releasePolicy = resolve; });
+    const originalHome = process.env.PAPERCLIP_HOME;
+    const isolatedHome = mkdtempSync(path.join(tmpdir(), "paperclip-failed-startup-home-"));
+    process.env.PAPERCLIP_HOME = isolatedHome;
+
+    try {
+      loadConfigMock.mockReturnValue(buildTestConfig({
+        port: 0,
+        databaseUrl: tempDb.connectionString,
+      }));
+      detectPortMock.mockResolvedValueOnce(0);
+      createDbMock.mockReturnValueOnce(database as never);
+      createAppMock.mockResolvedValueOnce(Object.assign(
+        (_request: unknown, response: { writeHead(status: number): void; end(body: string): void }) => {
+          void database.execute(sql`select 1`)
+            .then(() => { response.writeHead(200); response.end("database ready"); })
+            .catch(() => { response.writeHead(503); response.end("database closed"); });
+        },
+        { locals: {
+          toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+          toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
+        } },
+      ) as never);
+      vi.mocked(createServer).mockImplementationOnce((app) => {
+        listener = realCreateServer(app);
+        return listener;
+      });
+      vi.mocked(bootstrapExecutionPolicyFromEnv).mockImplementationOnce(async () => {
+        await policyGate;
+        throw new Error("forced execution policy bootstrap failed");
+      });
+
+      const startup = startServer();
+      void startup.catch(() => {});
+      await vi.waitFor(() => expect(listener?.listening).toBe(true));
+      const address = listener!.address();
+      if (!address || typeof address === "string") throw new Error("expected TCP listener");
+      const url = `http://127.0.0.1:${address.port}/api/health`;
+      expect(await (await fetch(url, { headers: { Connection: "close" } })).text()).toBe("database ready");
+
+      releasePolicy();
+      await expect(startup).rejects.toThrow("forced execution policy bootstrap failed");
+      expect(listener!.listening).toBe(false);
+      await expect(fetch(url)).rejects.toThrow();
+      await expect(database.execute(sql`select 1`)).rejects.toThrow();
+    } finally {
+      releasePolicy();
+      const activeListener = listener as Server | null;
+      if (activeListener?.listening) {
+        await new Promise<void>((resolve) => activeListener.close(() => resolve()));
+      }
+      await tempDb.cleanup();
+      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = originalHome;
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("exits nonzero from the main module when startup recovery fails after the listener binds", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
@@ -843,11 +918,24 @@ describe("startServer feedback export wiring", () => {
     heartbeatServiceMock.recoverNativeRunsAfterRestart.mockRejectedValueOnce(
       new Error("native recovery unavailable"),
     );
-
-    await expect(startServer()).rejects.toThrow("native recovery unavailable");
-
-    expect(fakeServer.listen).toHaveBeenCalledTimes(1);
-    expect(fakeServer.close).toHaveBeenCalledTimes(1);
+    const originalArgv1 = process.argv[1];
+    let exitSpy: ReturnType<typeof vi.spyOn> | undefined;
+    const exited = new Promise<number | undefined>((resolveExit) => {
+      exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        resolveExit(code);
+        return undefined as never;
+      }) as typeof process.exit);
+    });
+    process.argv[1] = fileURLToPath(new URL("../index.ts", import.meta.url));
+    try {
+      vi.resetModules();
+      await import("../index.ts");
+      await expect(exited).resolves.toBe(1);
+      expect(fakeServer.close).toHaveBeenCalledOnce();
+    } finally {
+      process.argv[1] = originalArgv1;
+      exitSpy?.mockRestore();
+    }
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {

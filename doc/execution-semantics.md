@@ -482,6 +482,15 @@ When newer source activity restores a valid live or waiting path, the recovery a
 
 Plain comments alone do not make a recovery action stale. A comment can provide evidence, but the recovery action should remain visible when the source issue is still stalled and the comment does not create a valid action-path primitive such as a wake, monitor, interaction, approval, blocker, human owner, execution participant, terminal disposition, or delegated follow-up.
 
+Startup and periodic active-action reconciliation isolate failures per action:
+the failed action remains open, its id and error are logged, and the sweep
+counts it as skipped before examining the next action. When healthy open
+children restore a path, only children that do not already depend (directly
+or transitively) on the source become source blockers. A skipped cyclic edge
+is recorded in the action's resolution note; if all children would cycle,
+the action still resolves without adding a blocker edge. Other recovery
+sweeps should be assessed separately for per-item isolation.
+
 ### Agent-assigned `todo`
 
 This is dispatch state: ready to start, not yet actively claimed.
@@ -581,6 +590,17 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 ## 9. Crash and Restart Recovery
 
 Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
+
+The HTTP listener binds before startup recovery so surviving runners can
+reconnect. Recovery-action reconciliation logs and skips an individual failed
+action, allowing the other actions and startup to continue. A fatal startup
+failure after binding instead closes the HTTP listener before ending database
+clients: a rejected `startServer()` must not leave a port accepting requests
+against a closed pool. The failure is logged and rethrown. When the server runs
+as the main module, the entrypoint reports eligible failures to Sentry and exits
+nonzero so the supervisor restarts it. Embedding callers such as the CLI receive
+the rejection with no leaked listener and decide how to recover; the server does
+not hard-kill them.
 
 There are two distinct failure modes.
 

@@ -2652,6 +2652,10 @@ async function startServerWithDatabaseTeardown(
   };
   } catch (error) {
     if (startupListenerBound) {
+      logger.error(
+        { err: error },
+        "startup failed after the HTTP listener bound; closing listener before database teardown",
+      );
       await new Promise<void>((resolveClose) => {
         try {
           server.close((closeError?: Error) => {
@@ -2659,18 +2663,12 @@ async function startServerWithDatabaseTeardown(
               closeError &&
               (closeError as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
             ) {
-              logger.error(
-                { err: closeError },
-                "failed to close HTTP listener after startup failure",
-              );
+              logger.error({ err: closeError }, "failed to close HTTP listener after startup failure");
             }
             resolveClose();
           });
         } catch (closeError) {
-          logger.error(
-            { err: closeError },
-            "failed to close HTTP listener after startup failure",
-          );
+          logger.error({ err: closeError }, "failed to close HTTP listener after startup failure");
           resolveClose();
         }
       });
