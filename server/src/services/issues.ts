@@ -1970,6 +1970,9 @@ type IssueListRowWithLabels = IssueListRow & IssueLabelEnrichment;
 type IssueListRowWithLabelsAndRun = IssueListRowWithLabels & {
   activeRun: IssueActiveRunRow | null;
 };
+type IssueListResponseRow = IssueListRowWithLabelsAndRun & {
+  reviewAttention?: IssueReviewAttention;
+};
 type IssueUserCommentStats = {
   issueId: string;
   myLastCommentAt: Date | null;
@@ -3807,6 +3810,14 @@ function lowTrustBoundaryIssueCondition(
 }
 
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
+
+function isTerminalRecoveryAction(action: {
+  status: string;
+  outcome?: string | null;
+}): boolean {
+  return action.outcome === "exhausted";
+}
+
 export const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 export const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set([
@@ -4469,10 +4480,12 @@ async function listIssueBlockerAttentionMap(
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
         ),
       );
-    const recoveryActionIds = recoveryActionRows.map((row) => row.id);
     const liveRecoveryActionIds = new Set<string>();
+    const liveRecoveryActions = recoveryActionRows.filter(
+      (row) => !isTerminalRecoveryAction(row),
+    );
     for (const chunk of chunkList(
-      recoveryActionIds,
+      liveRecoveryActions.map((row) => row.id),
       ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE,
     )) {
       const [runRows, wakeRows] = await Promise.all([
@@ -4527,8 +4540,10 @@ async function listIssueBlockerAttentionMap(
         (row.status === "escalated" && row.ownerType === "board") ||
         Boolean(row.ownerUserId) ||
         (Boolean(row.ownerAgentId) && liveRecoveryActionIds.has(row.id));
-      if (healthy) explicitWaitingIssueIds.add(row.sourceIssueId);
-      if (row.outcome !== "exhausted") zeroEdgeWaitingIssueIds.add(row.sourceIssueId);
+      if (healthy && !isTerminalRecoveryAction(row)) {
+        explicitWaitingIssueIds.add(row.sourceIssueId);
+      }
+      if (!isTerminalRecoveryAction(row)) zeroEdgeWaitingIssueIds.add(row.sourceIssueId);
     }
   }
 
@@ -5122,20 +5137,18 @@ async function listIssueReviewAttentionMap(
         companyId: issueRecoveryActions.companyId,
         issueId: issueRecoveryActions.sourceIssueId,
         status: issueRecoveryActions.status,
+        outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,
       })
       .from(issueRecoveryActions)
-      .where(and(
-        eq(issueRecoveryActions.companyId, companyId),
-        inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        inArray(issueRecoveryActions.sourceIssueId, reviewIds),
-        // SUP-15369: a `pending_review_rearm_cap_exhausted` action is the terminal
-        // "re-arming stopped, escalate to board" marker for a stuck review — it is
-        // evidence the review stage can no longer advance, not a maintained action
-        // path. Keeping it would leave a dead, undecided review stage `covered`, so
-        // it must instead surface as stalled.
-        ne(issueRecoveryActions.kind, "pending_review_rearm_cap_exhausted"),
-      )),
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          inArray(issueRecoveryActions.sourceIssueId, reviewIds),
+          ne(issueRecoveryActions.kind, "pending_review_rearm_cap_exhausted"),
+        ),
+      ),
     dbOrTx
       .select({
         id: issues.id,
@@ -5159,18 +5172,25 @@ async function listIssueReviewAttentionMap(
       ),
   ]);
 
-  const recoveryPaths = [
-    ...(recoveryActionRows as Array<{
-      id: string;
-      companyId: string;
-      issueId: string;
-      status: string;
-      createdAt: Date;
-    }>),
-  ];
+  const recoveryPaths: Array<{
+    id: string;
+    companyId: string;
+    issueId: string;
+    status: string;
+    outcome?: string | null;
+    createdAt: Date;
+  }> = (recoveryActionRows as Array<{
+    id: string;
+    companyId: string;
+    issueId: string;
+    status: string;
+    outcome: string | null;
+    createdAt: Date;
+  }>).filter((row) => !isTerminalRecoveryAction(row));
   for (const recovery of recoveryIssueRows as Array<{
     id: string;
     companyId: string;
+    issueId: string;
     originKind: string;
     originId: string | null;
     status: string;
@@ -8494,7 +8514,10 @@ export function issueService(db: Db) {
     clearCheckoutRunIfTerminal,
     addStopRelayCommentIfNeeded,
 
-    list: async (companyId: string, filters?: IssueFilters) => {
+    list: async (
+      companyId: string,
+      filters?: IssueFilters,
+    ): Promise<IssueListResponseRow[]> => {
       if (filters?.sortField === "id" && filters.attention) {
         throw unprocessable("ID ordering is not supported for blocked attention lists");
       }
