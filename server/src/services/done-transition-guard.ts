@@ -721,7 +721,7 @@ export async function loadOwnDraftPredicate(
     (!requireDeliveryRepo || deliveryRepo !== null) &&
     (deliveryRepo === null || `${pr.owner}/${pr.repo}`.toLowerCase() === deliveryRepo) &&
     (pr.headRepoFullName != null &&
-      pr.headRepoFullName.toLowerCase() === (deliveryRepo ?? `${pr.owner}/${pr.repo}`.toLowerCase())) &&
+      pr.headRepoFullName.toLowerCase() === deliveryRepo) &&
     isAnchoredCardPullRequest(
       (pr.headRefName ?? "").toLowerCase(),
       (pr.title ?? "").toLowerCase(),
