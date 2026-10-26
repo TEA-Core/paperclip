@@ -170,6 +170,8 @@ import { isExternalPullAgent } from "../agent-work-delivery.js";
 import {
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   sandboxProviderPluginRemedy,
+  TIMER_DISPATCH_PARK_RECOVERY_CAUSE,
+  TIMER_DISPATCH_PARK_RECOVERY_KIND,
   buildDispatchSuppressionParkNotice,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildExecutionReviewParticipantUnavailableNoticeSeed,
@@ -237,8 +239,6 @@ const PENDING_REVIEW_REARM_CANDIDATE_LIMIT = 500;
 const PENDING_REVIEW_REARM_REASON = "execution_review_requested";
 const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 100;
 const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
-const TIMER_DISPATCH_PARK_RECOVERY_KIND = "issue_graph_liveness" as const;
-const TIMER_DISPATCH_PARK_RECOVERY_CAUSE = "in_progress_without_live_continuation_path";
 // ADR-093 D3: after sustained dispatch suppression, park the card and open an
 // assignee-owned recovery action. The two-hour window exceeds the 5-minute
 // settle and 10-minute suppression dedup windows.
@@ -9375,7 +9375,9 @@ export function recoveryService(
     const activeParks = await db.select({
       actionId: issueRecoveryActions.id,
       companyId: issueRecoveryActions.companyId,
+      ownerAgentId: issueRecoveryActions.ownerAgentId,
       issueId: issues.id,
+      issueStatus: issues.status,
       assigneeAgentId: issues.assigneeAgentId,
       monitorNextCheckAt: issues.monitorNextCheckAt,
       executionRunId: issues.executionRunId,
@@ -9387,30 +9389,43 @@ export function recoveryService(
         eq(issueRecoveryActions.status, "active"),
         opts?.companyId ? eq(issueRecoveryActions.companyId, opts.companyId) : sql`true`));
     for (const park of activeParks) {
-      if (await hasRestoredTimerParkPath(
+      let resolutionNote: string | null = null;
+      if (park.issueStatus !== "blocked") {
+        resolutionNote = "The issue left blocked status.";
+      } else if (park.assigneeAgentId !== park.ownerAgentId) {
+        resolutionNote = "The issue was reassigned.";
+      } else if (
+        (await issuesSvc.listDependencyReadiness(park.companyId, [park.issueId]))
+          .get(park.issueId)?.unresolvedBlockerCount
+        || await hasPendingWakeInteraction(db, park.companyId, park.issueId)
+      ) {
+        resolutionNote = "A blocker or interaction was linked.";
+      } else if (await hasRestoredTimerParkPath(
         park.companyId, park.issueId, park.assigneeAgentId,
         park.monitorNextCheckAt, park.executionRunId, now,
       )) {
-        const cancelled = await recoveryActionsSvc.resolveActiveForIssue({
+        resolutionNote = "A live continuation path was restored.";
+      }
+      if (!resolutionNote) continue;
+      const cancelled = await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: park.companyId,
+        sourceIssueId: park.issueId,
+        actionId: park.actionId,
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote,
+      });
+      if (cancelled) {
+        await logActivity(db, {
           companyId: park.companyId,
-          sourceIssueId: park.issueId,
-          actionId: park.actionId,
-          status: "cancelled",
-          outcome: "cancelled",
-          resolutionNote: "A live continuation path was restored.",
+          actorType: "system",
+          actorId: source,
+          runId: opts?.runId ?? null,
+          action: "issue.dispatch_suppression_park_cancelled",
+          entityType: "issue",
+          entityId: park.issueId,
+          details: { source, recoveryActionId: park.actionId, resolutionNote },
         });
-        if (cancelled) {
-          await logActivity(db, {
-            companyId: park.companyId,
-            actorType: "system",
-            actorId: source,
-            runId: opts?.runId ?? null,
-            action: "issue.dispatch_suppression_park_cancelled",
-            entityType: "issue",
-            entityId: park.issueId,
-            details: { source, recoveryActionId: park.actionId },
-          });
-        }
       }
     }
     const windowStart = new Date(now.getTime() - DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS);
@@ -9577,7 +9592,6 @@ export function recoveryService(
       };
 
       // A typed source-scoped action records the owner and cures at park time.
-      await issuesSvc.update(candidate.id, { status: "blocked" });
       await recoveryActionsSvc.upsertSourceScoped({
         companyId: candidate.companyId,
         sourceIssueId: candidate.id,
@@ -9591,6 +9605,7 @@ export function recoveryService(
         wakePolicy: null,
         monitorPolicy: null,
       });
+      await issuesSvc.update(candidate.id, { status: "blocked" });
 
       const notice = buildDispatchSuppressionParkNotice({
         disjuncts,

@@ -263,6 +263,9 @@ const DISPATCH_SUPPRESSED_DISJUNCT_LABELS: Array<{
   { key: "successfulRunHandoffLive", label: "no live successful-run handoff" },
 ];
 
+export const TIMER_DISPATCH_PARK_RECOVERY_KIND = "issue_graph_liveness" as const;
+export const TIMER_DISPATCH_PARK_RECOVERY_CAUSE = "in_progress_without_live_continuation_path";
+
 // ADR-093 D3 — the notice posted alongside an assignee-owned recovery action
 // when a persistently dispatch-suppressed in_progress card is parked.
 export function buildDispatchSuppressionParkNotice(input: {

@@ -10,6 +10,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueRelations,
   issueWatchdogs,
   issues,
 } from "@paperclipai/db";
@@ -22,6 +23,7 @@ import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
+import { attentionService } from "../services/attention.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 import {
   TIMER_DISPATCH_SUPPRESSED_ACTION,
@@ -361,6 +363,66 @@ describeEmbeddedPostgres("recovery reconcileDispatchSuppressionParks", () => {
           companyId, agentId, status: path === "active run" ? "running" : "scheduled_retry",
           contextSnapshot: { issueId },
           ...(path === "scheduled retry" ? { scheduledRetryReason: "test" } : {}),
+        });
+      }
+      await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+      const [action] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(action).toMatchObject({ kind: "issue_graph_liveness", status: "cancelled" });
+    },
+  );
+
+  it("surfaces the agent-owned park action in board attention", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedSuppressedCard({ companyId, agentId });
+    await recovery().reconcileDispatchSuppressionParks({ now: new Date() });
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const item = feed.items.find((row) =>
+      row.sourceKind === "recovery_action" && row.subject.metadata?.sourceIssueId === issueId);
+    expect(item).toBeTruthy();
+    expect(item?.subject.metadata).toMatchObject({
+      kind: "issue_graph_liveness",
+      cause: "in_progress_without_live_continuation_path",
+      ownerType: "agent",
+    });
+  });
+
+  it("cancels the park action when the issue returns to in_progress, so it can be re-parked later", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedSuppressedCard({ companyId, agentId });
+    const svc = recovery();
+    await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+    const actions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+  });
+
+  it.each(["done", "reassigned", "blocker linked"] as const)(
+    "cancels the park action when the %s cure is applied",
+    async (cure) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedSuppressedCard({ companyId, agentId });
+      const svc = recovery();
+      await svc.reconcileDispatchSuppressionParks({ now: new Date() });
+      if (cure === "done") {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      } else if (cure === "reassigned") {
+        const otherAgentId = randomUUID();
+        await db.insert(agents).values({
+          id: otherAgentId, companyId, name: "Other", role: "engineer", status: "active",
+          adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        });
+        await db.update(issues).set({ assigneeAgentId: otherAgentId }).where(eq(issues.id, issueId));
+      } else {
+        const blockerId = randomUUID();
+        await db.insert(issues).values({
+          id: blockerId, companyId, title: "Blocker", status: "todo", priority: "low",
+        });
+        await db.insert(issueRelations).values({
+          companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks",
         });
       }
       await svc.reconcileDispatchSuppressionParks({ now: new Date() });
