@@ -11,6 +11,8 @@ export interface ReleaseRequestClock {
   expired: boolean;
   /** Set by the handler once it runs; from then on the handler owns the deadline and the answer. */
   handlerStarted: boolean;
+  /** Ends the request's authentication work on its dedicated connection (see releaseScopedActor), if it has one. */
+  cancelAuth?: () => Promise<void> | void;
 }
 
 /**
@@ -32,10 +34,18 @@ export function releaseRequestClock(opts: { totalMs: number }): RequestHandler {
     const timer = setTimeout(() => {
       if (clock.handlerStarted || res.headersSent) return;
       clock.expired = true;
-      res.status(409).json({
-        outcome: "failed",
-        auditRecorded: false,
-        message: "status:failed:deadline: the release request did not finish within its deadline while waiting to be authenticated; nothing was published",
+      // The authentication query that is still running is cancelled first (briefly awaited), so it is not
+      // alive when the caller reads the answer.
+      const cancelled = (async () => { await clock.cancelAuth?.(); })().catch(() => undefined);
+      let cap: ReturnType<typeof setTimeout> | undefined;
+      void Promise.race([cancelled, new Promise<void>((resolve) => { cap = setTimeout(resolve, 3000); })]).then(() => {
+        clearTimeout(cap);
+        if (res.headersSent) return;
+        res.status(409).json({
+          outcome: "failed",
+          auditRecorded: false,
+          message: "status:failed:deadline: the release request did not finish within its deadline while waiting to be authenticated; nothing was published",
+        });
       });
     }, opts.totalMs);
     timer.unref?.();

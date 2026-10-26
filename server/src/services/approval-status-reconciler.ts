@@ -10,6 +10,7 @@ import {
 import { and, desc, eq, ilike, ne, sql, type SQL } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { retryPendingAutoMergeDisarms, type DisarmSweepSummary } from "./auto-merge-disarm.js";
 import {
   resolveControlPlaneGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
@@ -163,6 +164,8 @@ export interface ApprovalStatusReconcilerTickOptions {
 }
 
 export interface ApprovalStatusReconcilerTickSummary {
+  /** Pending auto-merge take-backs retried this tick (SUP-20772): see auto-merge-disarm.ts. */
+  disarm?: DisarmSweepSummary;
   /** Candidates that were processed this tick. */
   scanned: number;
   /** Candidates whose paperclip/approved status was (re)published. */
@@ -2804,7 +2807,7 @@ async function attemptRearmOnHealedStamp(
   }
   // The card's authority, captured before the arm boundary's own reads: a decision reversed, a certificate
   // removed or a reviewer terminated after this point stops the arm, on every attempt.
-  const authorityGuard = await createAuthorityGuard(db, row.companyId, row.id, { requireApprovedLadder: true });
+  const authorityGuard = await createAuthorityGuard(db, row.companyId, row.id, { requireApprovedLadder: true, headSha });
   if (!(await verifyLiveHeadStillStamped(db, row, headSha, certifiedPr, opts.requireStamped ?? true))) {
     return undefined;
   }
@@ -3679,6 +3682,14 @@ export async function runApprovalStatusReconcilerTick(
 ): Promise<ApprovalStatusReconcilerTickSummary> {
   const maxCandidates = options.maxCandidates ?? DEFAULT_MAX_CANDIDATES;
   const resumeAfter = options.resumeAfter ?? null;
+  // First, and independent of the candidate scan: an arm the card's authority no longer backs, that could not
+  // be turned off when it was found, is retried until GitHub confirms it is off.
+  let disarm: DisarmSweepSummary | undefined;
+  try {
+    disarm = await retryPendingAutoMergeDisarms(db);
+  } catch (err) {
+    logger.error({ err }, "pending auto-merge disarm sweep failed; continuing tick");
+  }
   const rows = await findApprovalCandidates(db, maxCandidates + 1, resumeAfter);
   const capped = Math.max(0, rows.length - maxCandidates);
   const batch = capped > 0 ? rows.slice(0, maxCandidates) : rows;
@@ -3692,6 +3703,7 @@ export async function runApprovalStatusReconcilerTick(
     capped > 0 && batch.length > 0 ? (batch[batch.length - 1]?.identifier ?? null) : null;
 
   const summary: ApprovalStatusReconcilerTickSummary = {
+    ...(disarm ? { disarm } : {}),
     scanned: 0,
     republished: 0,
     skipped: {},

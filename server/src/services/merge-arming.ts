@@ -1046,6 +1046,61 @@ function isTransientArmingStatus(status: number): boolean {
 }
 
 /**
+ * An accepted arm that the card's authority no longer backs, and that could not be turned off at once
+ * (a 403, a 5xx, a timeout). It is kept on the card (`executionState.approvalStatus.autoMergeDisarm`) and
+ * retried on every reconciler tick until GitHub confirms auto-merge is off, so an accepted arm is never
+ * left silently in force.
+ */
+export interface PendingAutoMergeDisarm {
+  owner: string;
+  repo: string;
+  number: number;
+  nodeId: string;
+  headSha: string | null;
+  reason: string;
+  since: string;
+  attempts: number;
+  lastError: string | null;
+}
+
+/** Writes the record into the card's approvalStatus subtree atomically (other keys are preserved). */
+export async function recordPendingAutoMergeDisarm(db: Db, companyId: string, issueId: string, record: PendingAutoMergeDisarm): Promise<void> {
+  const patch = JSON.stringify({ autoMergeDisarm: record });
+  await db
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) || ${patch}::jsonb)`,
+    })
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+}
+
+/**
+ * Keeps an arm that could not be turned off on the card, to be retried every reconciler tick until GitHub
+ * confirms it is off. Answers a sentence for the outcome message. Never throws.
+ */
+export async function keepAutoMergeDisarmPending(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number },
+  nodeId: string,
+  headSha: string | null,
+  reason: string,
+  error: string | null,
+): Promise<string> {
+  try {
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha, reason,
+      since: new Date().toISOString(), attempts: 1, lastError: error,
+    });
+    return "; the take-back is recorded on the card and retried on every reconciler tick until GitHub confirms auto-merge is off";
+  } catch (err) {
+    return `; the take-back could NOT be recorded for retry (${err instanceof Error ? err.message : String(err)}), so it must be done by hand`;
+  }
+}
+
+/**
  * Turns auto-merge back off. Used only to take back an arm whose authority was revoked while the
  * enable call was in flight (a revocation that commits inside the GitHub call cannot be seen before it).
  * Every attempt is bounded (a provider call that never answers is given up on, and its request aborted),
@@ -1498,6 +1553,19 @@ export function readConfirmedRelease(executionState: Record<string, unknown> | n
     typeof f.statusId !== "string" || !f.statusId
   ) return undefined;
   return { owner: f.owner, repo: f.repo, number: f.number, headSha: f.headSha, statusId: f.statusId };
+}
+
+/**
+ * Whether the card carries a board-release confirmation for `headSha`: the head was released through the
+ * head-bound release path. `headSha` defaults to the card's published head. Inside that path (and only
+ * there) a paused agent decider no longer stands behind the approval, and a direct merge is never used.
+ */
+export function isBoardReleasedHead(executionState: Record<string, unknown> | null | undefined, headSha?: string | null): boolean {
+  const confirmed = readConfirmedRelease(executionState);
+  if (!confirmed) return false;
+  const approval = (executionState?.approvalStatus ?? {}) as Record<string, unknown>;
+  const head = headSha ?? (typeof approval.publishedHeadSha === "string" ? approval.publishedHeadSha : null);
+  return !!head && confirmed.headSha === head;
 }
 
 /**
@@ -4341,6 +4409,30 @@ export async function publishHeadBoundRelease(
       if (voided.success) statusMayExist = false;
       return voided.success ? "it was voided by a failure status" : `it could NOT be voided (${voided.error ?? `HTTP ${voided.status}`}), and is not consumable without a recorded confirmation`;
     })());
+  // The one thing that may still happen after the answer: a status write the release gave up on lands as a
+  // success (answered late). If it is then still the newest status of the head and this release never
+  // confirmed it, a failure is written over it, once, on a clock of its own. Residuals: the time between the
+  // late landing and that failure, and a process that ends before it.
+  const compensateLateSuccess = (inFlight: Promise<Awaited<ReturnType<typeof writeCommitStatusWithRetry>>>) => {
+    void inFlight.then(async (landed) => {
+      if (!landed.success) return;
+      const landedId = "statusId" in landed && typeof landed.statusId === "string" ? landed.statusId : null;
+      if (landedId !== null && landedId === confirmedStatusId) return;
+      const signal = AbortSignal.timeout(deadlines.compensationMs);
+      const newest = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal });
+      const stillNewest = newest.ok
+        ? newest.controlPlaneApproved && newest.newest?.release === true && (landedId === null || newest.newest.id === landedId)
+        : true; // unreadable: fail closed
+      if (!stillNewest) return;
+      await writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+        description: "voided: a status write the release had given up on landed after it",
+        state: "failure",
+        attempts: 2,
+        delayMs: input.retryDelayMs ?? 1000,
+        signal,
+      });
+    }).catch(() => undefined);
+  };
   // The marker CI requires beside a release success (RELEASE_CONFIRMED_CONTEXT). It is written only after
   // the confirmation is committed, on the compensation clock.
   const writeConfirmationMarker = (statusId: string) =>
@@ -4399,14 +4491,19 @@ export async function publishHeadBoundRelease(
       // Nothing is written once the release's clock has run out.
       if (envelope.aborted) return deadlineOutcome();
       statusMayExist = true;
+      let inFlight: ReturnType<typeof writeCommitStatusWithRetry> | undefined;
       const write = await bounded(
-        (signal) => writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+        (signal) => (inFlight = writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
           description: input.description,
           attempts: 1,
           signal,
-        }),
+        })),
         { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
       );
+      // A write that got no answer in time may still be accepted by GitHub later and then sits on top of the
+      // void. Commit statuses have no compare-and-set, so the void cannot be made to outrank it; it is
+      // voided again if it lands (see compensateLateSuccess).
+      if (!write.success && write.status === 0 && inFlight) compensateLateSuccess(inFlight);
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
         const after = await liveRefusal(true);
@@ -4798,7 +4895,7 @@ export async function postPullRequestComment(
  * member removed after it was taken changes the answer. Two reads of it that differ mean the authority a
  * caller acted on is not the authority that exists now.
  */
-export async function computeAuthorityFingerprint(db: Db, companyId: string, issueId: string): Promise<string> {
+export async function computeAuthorityFingerprint(db: Db, companyId: string, issueId: string, headSha?: string | null): Promise<string> {
   const [row] = await db
     .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
     .from(issues)
@@ -4807,6 +4904,8 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
   if (!row) return "missing";
   const state = (row.executionState && typeof row.executionState === "object" ? row.executionState : {}) as Record<string, unknown>;
   const approval = (state.approvalStatus && typeof state.approvalStatus === "object" ? state.approvalStatus : {}) as Record<string, unknown>;
+  // On a board-released head a paused agent has lapsed; on any other head paused is ordinary churn.
+  const lapsePaused = isBoardReleasedHead(state, headSha);
   const policy = (row.executionPolicy && typeof row.executionPolicy === "object" ? row.executionPolicy : {}) as { stages?: Array<{ id?: unknown; phase?: unknown }> };
   const decisions = await db
     .select({
@@ -4844,12 +4943,13 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
     ));
   const agentStanding = agentIds.map((id) => {
     const agent = agentRows.find((candidate) => candidate.id === id);
-    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "pending_approval"];
+    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "pending_approval" && !(lapsePaused && agent.status === "paused")];
   });
   memberRows.sort((a, b) => a.principalId.localeCompare(b.principalId));
   return JSON.stringify([
     // cancelled, done or anything else: a reopened (or cancelled) card is a different card.
     row.status === "cancelled" ? "cancelled" : row.status === "done" ? "done" : "open",
+    lapsePaused,
     (policy.stages ?? []).map((stage) => [stage?.id, stage?.phase ?? null]),
     state.completedStageIds ?? null,
     state.lastDecisionId ?? null,
@@ -4871,7 +4971,7 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
  * awaiting approval). A stage with no decision rows (an auto-skipped one) is left to the stage-integrity
  * checks the consumers already run, and users are not checked here (a local board has no user row).
  */
-async function decisionStandingProblem(db: Db, companyId: string, issueId: string, policy: unknown): Promise<string | null> {
+async function decisionStandingProblem(db: Db, companyId: string, issueId: string, policy: unknown, lapsePaused = false): Promise<string | null> {
   const stages = (policy && typeof policy === "object" && Array.isArray((policy as { stages?: unknown }).stages)
     ? (policy as { stages: Array<{ id?: unknown; phase?: unknown }> }).stages : []);
   const preMerge = new Set(stages.filter((st) => typeof st?.id === "string" && st.phase !== "post_merge").map((st) => st.id as string));
@@ -4901,6 +5001,9 @@ async function decisionStandingProblem(db: Db, companyId: string, issueId: strin
         if (!agent || agent.companyId !== companyId || agent.status === "terminated" || agent.status === "pending_approval") {
           return `the agent that decided stage ${stageId} is no longer a current agent of the company`;
         }
+        if (lapsePaused && agent.status === "paused") {
+          return `the agent that decided stage ${stageId} is paused, and a paused agent's approval does not stand on a board-released head`;
+        }
       }
     }
   }
@@ -4920,9 +5023,9 @@ export async function createAuthorityGuard(
   db: Db,
   companyId: string,
   issueId: string,
-  options: { requireApprovedLadder?: boolean } = {},
+  options: { requireApprovedLadder?: boolean; headSha?: string | null } = {},
 ): Promise<AuthorityGuard> {
-  const baseline = await computeAuthorityFingerprint(db, companyId, issueId);
+  const baseline = await computeAuthorityFingerprint(db, companyId, issueId, options.headSha);
   return {
     async stillHolds() {
       const [fresh] = await db
@@ -4940,9 +5043,10 @@ export async function createAuthorityGuard(
           return "the card's ladder is no longer approved";
         }
       }
-      const standing = await decisionStandingProblem(db, companyId, issueId, fresh.executionPolicy);
+      const lapsePaused = isBoardReleasedHead(fresh.executionState as Record<string, unknown> | null, options.headSha);
+      const standing = await decisionStandingProblem(db, companyId, issueId, fresh.executionPolicy, lapsePaused);
       if (standing) return standing;
-      return (await computeAuthorityFingerprint(db, companyId, issueId)) === baseline
+      return (await computeAuthorityFingerprint(db, companyId, issueId, options.headSha)) === baseline
         ? null
         : "the card's approval record, its decisions or a decider's standing changed";
     },
@@ -4976,7 +5080,7 @@ export async function armMergeOnApproval(
   // The authority this call acts on is captured before its first read: the delivery, owner and token
   // lookups take time, and a card whose decision, ladder, head, certificate or release changed in that
   // time is not what was authorized. It is read again right before the merge lever is pulled.
-  const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true });
+  const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true, headSha: options.expectedHeadOid });
   const authorityChanged = () => guard.stillHolds();
 
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
@@ -5164,10 +5268,11 @@ export async function armMergeOnApproval(
         `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changedDuringArm) {
         const disabled = await disableAutoMerge(token, nodeId);
+        const kept = disabled.success ? "" : await keepAutoMergeDisarmPending(db, companyId, ownerRow.id, pr, nodeId, options.expectedHeadOid ?? null, changedDuringArm, disabled.error);
         return {
           kind: "failed",
           message: `failed:authority-revoked: ${pr.displayName} — ${changedDuringArm} while auto-merge was being enabled; ` +
-            (disabled.success ? "auto-merge was disabled again" : `auto-merge could NOT be disabled (${disabled.error ?? "unknown"}) and must be disabled by hand`),
+            (disabled.success ? "auto-merge was disabled again" : `auto-merge could NOT be disabled (${disabled.error ?? "unknown"}) and is STILL ENABLED${kept}`),
         };
       }
       if (result.alreadyQueued) {
@@ -5225,6 +5330,13 @@ export async function armMergeOnApproval(
         };
       }
       const mergeHead = options.expectedHeadOid ?? publishedHeadSha;
+      // A direct merge cannot be taken back, so a head the board released is armed through auto-merge only.
+      if (isBoardReleasedHead(executionState, mergeHead)) {
+        return {
+          kind: "skipped",
+          message: `skipped:direct-merge-not-used: ${pr.displayName} — head ${mergeHead} was released by the board and auto-merge could not be enabled (clean status); a direct merge cannot be taken back, so merge it through the queue or by hand`,
+        };
+      }
 
       const defaultMergeMethod = await fetchDefaultMergeMethod(token, pr.owner, pr.repo) ?? "MERGE";
       const changedBeforeMerge = await authorityChanged();

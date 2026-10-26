@@ -25,7 +25,7 @@ import {
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
-import { actorMiddleware } from "./middleware/auth.js";
+import { releaseScopedActor } from "./middleware/release-scoped-actor.js";
 import { releaseRequestClock } from "./middleware/release-request-clock.js";
 import { DEFAULT_RELEASE_DEADLINES } from "./services/merge-arming.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
@@ -615,10 +615,10 @@ export async function createApp(
   // agent API key. Every request revalidates the active heartbeat row.
   app.use(runtimeConnectionIntentRoutes(db));
   app.use(
-    actorMiddleware(db, {
+    releaseScopedActor(db, {
       deploymentMode: opts.deploymentMode,
       resolveSession: opts.resolveSession,
-    }),
+    }, DEFAULT_RELEASE_DEADLINES.totalMs),
   );
   // After the actor middleware on purpose: a valid Cloud control assertion
   // REPLACES whatever actor the request otherwise resolved to, and only on

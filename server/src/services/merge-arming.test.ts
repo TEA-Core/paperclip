@@ -25,6 +25,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
+import { retryPendingAutoMergeDisarms } from "./auto-merge-disarm.js";
+import { runApprovalStatusReconcilerTick } from "./approval-status-reconciler.js";
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
@@ -2650,6 +2652,29 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(mergeQueries).toEqual([]);
     });
 
+    // Round 11: a direct merge has no undo, so a head the board released is never direct-merged.
+    it("does not direct-merge a head that carries a board-release confirmation", async () => {
+      const issueId = await insertApprovedCardWithPublishedHead(VERIFIED_HEAD);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const state = row!.executionState as { approvalStatus: Record<string, unknown> };
+      await db.update(issues).set({
+        executionState: { ...state, approvalStatus: { ...state.approvalStatus, releaseConfirmation: { owner: OWNER, repo: REPO, number: 125, headSha: VERIFIED_HEAD, statusId: "9001" } } },
+      }).where(eq(issues.id, issueId));
+      const mergeQueries: string[] = [];
+      mockGhFetch.mockImplementation(cleanStatusThenMerge({ mergeQueries }));
+
+      const armingOutcome = await armMergeOnApproval(
+        db, companyId, issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        certifiedPr,
+        { expectedHeadOid: VERIFIED_HEAD },
+      );
+
+      expect(armingOutcome.kind).toBe("skipped");
+      expect(armingOutcome.message).toContain("skipped:direct-merge-not-used");
+      expect(mergeQueries).toEqual([]);
+    });
+
     it("does not enable auto-merge when the approval record changes before the call", async () => {
       const issueId = await insertApprovedCardWithPublishedHead(VERIFIED_HEAD);
       let graphqlCalls = 0;
@@ -2700,6 +2725,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       ];
 
       afterEach(async () => {
+        await db.delete(activityLog);
         await db.delete(issueExecutionDecisions);
         await db.delete(agents);
       });
@@ -2799,6 +2825,91 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
         expect(outcome.kind).toBe("failed");
         expect(outcome.message).toContain("could NOT be disabled");
+      });
+
+      // Round 11: an accepted arm that could not be turned off is never left silently in force.
+      const failingDisable = (revoke: () => Promise<void>, disableAnswer: () => Response) =>
+        async (url: string, init?: RequestInit) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          const query = String(JSON.parse(String(init?.body)).query);
+          if (query.includes("disablePullRequestAutoMerge")) return disableAnswer();
+          await revoke();
+          return okBody();
+        };
+      const forbidden = () => ({ ok: false, status: 403, json: async () => ({ errors: [{ message: "Resource not accessible by integration" }] }) }) as unknown as Response;
+      const disarmRecord = async (issueId: string) => {
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        return (row!.executionState as { approvalStatus?: { autoMergeDisarm?: Record<string, unknown> } }).approvalStatus?.autoMergeDisarm;
+      };
+
+      it("keeps a failed take-back on the card, and a later tick turns auto-merge off and clears it", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(failingDisable(() => revocations[0]![1]({ issueId, reviewerId }), forbidden));
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, { ...certifiedPr, nodeId: "PR_node_125" } as typeof certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("failed");
+        expect(outcome.message).toContain("STILL ENABLED");
+        expect(outcome.message).toContain("retried on every reconciler tick");
+        expect(await disarmRecord(issueId)).toMatchObject({ owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", attempts: 1 });
+
+        mockGhFetch.mockReset();
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          return { ok: true, status: 200, json: async () => ({ data: { disablePullRequestAutoMerge: { clientMutationId: "m" } } }) } as unknown as Response;
+        });
+        const summary = await retryPendingAutoMergeDisarms(db);
+
+        expect(summary).toMatchObject({ checked: 1, disabled: 1, stillArmed: 0 });
+        expect(disables()).toHaveLength(1);
+        expect(await disarmRecord(issueId)).toBeUndefined();
+      });
+
+      it("keeps retrying every round while GitHub refuses, and says so loudly", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(failingDisable(() => revocations[0]![1]({ issueId, reviewerId }), forbidden));
+        await armMergeOnApproval(db, companyId, issueId, decide, { ...certifiedPr, nodeId: "PR_node_125" } as typeof certifiedPr, { expectedHeadOid: AUTH_HEAD });
+        mockGhFetch.mockReset();
+        mockGhFetch.mockImplementation(async () => forbidden());
+
+        const first = await retryPendingAutoMergeDisarms(db);
+        const second = await retryPendingAutoMergeDisarms(db);
+
+        expect(first).toMatchObject({ checked: 1, disabled: 0, stillArmed: 1 });
+        expect(second).toMatchObject({ checked: 1, disabled: 0, stillArmed: 1 });
+        expect(await disarmRecord(issueId)).toMatchObject({ attempts: 3, lastError: "Resource not accessible by integration" });
+        const rows = await db.select().from(activityLog);
+        expect(rows.filter((row) => row.action === "issue.merge_disarm_failed")).toHaveLength(2);
+      });
+
+      it("retries a pending take-back on every reconciler tick", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(failingDisable(() => revocations[0]![1]({ issueId, reviewerId }), forbidden));
+        await armMergeOnApproval(db, companyId, issueId, decide, { ...certifiedPr, nodeId: "PR_node_125" } as typeof certifiedPr, { expectedHeadOid: AUTH_HEAD });
+        mockGhFetch.mockReset();
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url !== GRAPHQL_URL) return { ok: true, status: 200, json: async () => ([]) } as unknown as Response;
+          return { ok: true, status: 200, json: async () => ({ data: { disablePullRequestAutoMerge: { clientMutationId: "m" } } }) } as unknown as Response;
+        });
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.disarm).toMatchObject({ checked: 1, disabled: 1 });
+        expect(await disarmRecord(issueId)).toBeUndefined();
+      });
+
+      it("ends the record, loudly, when the PR merged before auto-merge could be turned off", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        mockGhFetch.mockImplementation(failingDisable(() => revocations[0]![1]({ issueId, reviewerId }), forbidden));
+        await armMergeOnApproval(db, companyId, issueId, decide, { ...certifiedPr, nodeId: "PR_node_125" } as typeof certifiedPr, { expectedHeadOid: AUTH_HEAD });
+        mockGhFetch.mockReset();
+        mockGhFetch.mockImplementation(async () => ({ ok: true, status: 200, json: async () => ({ errors: [{ message: "Pull request is already merged" }] }) }) as unknown as Response);
+
+        const summary = await retryPendingAutoMergeDisarms(db);
+
+        expect(summary.stillArmed).toBe(0);
+        expect(await disarmRecord(issueId)).toBeUndefined();
+        expect((await db.select().from(activityLog)).some((row) => row.action === "issue.merge_disarm_moot")).toBe(true);
       });
 
       it("arms a card whose authority did not change, and sends no disable", async () => {
@@ -2902,6 +3013,59 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(outcome.kind).toBe("failed");
         expect(outcome.message).toContain("could not be re-verified");
         expect(disables()).toHaveLength(1);
+      });
+
+      // Round 11: paused lapses only on a head the board released; an ordinary approval keeps arming.
+      const confirmRelease = async (issueId: string) => {
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const state = row!.executionState as { approvalStatus: Record<string, unknown> };
+        await db.update(issues).set({
+          executionState: { ...state, approvalStatus: { ...state.approvalStatus, releaseConfirmation: { owner: OWNER, repo: REPO, number: 125, headSha: AUTH_HEAD, statusId: "9001" } } },
+        }).where(eq(issues.id, issueId));
+      };
+
+      it("refuses a board-released head whose reviewer agent is paused before the call", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        await confirmRelease(issueId);
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+        mockGhFetch.mockImplementation(async () => { throw new Error("no GitHub call expected"); });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("skipped");
+        expect(outcome.message).toContain("skipped:authority-changed");
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      });
+
+      it("takes the arm back when the reviewer of a board-released head is paused while the enable call is in flight", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        await confirmRelease(issueId);
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          if (String(JSON.parse(String(init?.body)).query).includes("enablePullRequestAutoMerge")) {
+            await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+          }
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("failed");
+        expect(outcome.message).toContain("failed:authority-revoked");
+        expect(disables()).toHaveLength(1);
+      });
+
+      it("still arms an ordinary approval whose reviewer agent is paused", async () => {
+        const { issueId, reviewerId } = await seedAuthorityCard();
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+          return okBody();
+        });
+
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+
+        expect(outcome.kind).toBe("armed");
       });
 
       it("refuses a reviewer agent that was already terminated before the call, not only one that changes during it", async () => {

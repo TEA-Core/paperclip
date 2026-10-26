@@ -118,6 +118,8 @@ async function decisionProblem(
     if (!agent || agent.companyId !== row.companyId || agent.status === "terminated" || agent.status === "pending_approval") {
       return "made by an agent that is not a current agent of this company";
     }
+    // Inside the head-bound release a paused agent's approval has lapsed (the ordinary approval path keeps it).
+    if (agent.status === "paused") return "made by an agent that is paused";
   }
   if (decision.actorUserId) {
     const [member] = await conn
