@@ -1581,7 +1581,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       await db.insert(activityLog).values({
         companyId, actorType: "agent", actorId: agentId, agentId, runId,
         action: "issue.updated", entityType: "issue", entityId: blockedIssueId,
-        details: { identifier: "unchanged", priority: "high" },
+        details: { identifier: "unchanged", status: "blocked", changes: {} },
       });
       await db.insert(agentWakeupRequests).values({
         companyId,
@@ -1612,12 +1612,37 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId))).toHaveLength(0);
   });
 
+  it("counts completed wakes whose runs did not succeed against the re-arm cap even with no writes", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const withinWindow = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    for (const runStatus of ["failed", "timed_out", "cancelled"] as const) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: runStatus });
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, runId, source: "automation", triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: { issueId: blockedIssueId, resolvedBlockerIssueId: blockerIssueId, blockerIssueIds: [blockerIssueId] },
+        status: "completed",
+        idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
+        createdAt: withinWindow, updatedAt: withinWindow, finishedAt: withinWindow,
+      });
+    }
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      now: new Date(), rearmWindowMs: 6 * 60 * 60 * 1000, rearmMaxCount: 3,
+    });
+    expect(result.reArmCapEscalated).toBe(1);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(action?.evidence).toMatchObject({ reArmCount: 3, reArmMax: 3 });
+  });
+
   it("counts genuine repeated status, comment, and blocker-edge writes against the re-arm cap", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
     const withinWindow = new Date(Date.now() - 7 * 60 * 60 * 1000);
     for (const [action, details] of [
-      ["issue.updated", { status: "blocked" }],
+      ["issue.updated", { changes: { status: { from: "in_progress", to: "blocked" } } }],
       ["issue.comment_added", { commentId: randomUUID() }],
       ["issue.blockers_updated", { addedBlockedByIssueIds: [blockerIssueId] }],
     ] as const) {

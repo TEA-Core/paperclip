@@ -7822,12 +7822,17 @@ export function recoveryService(
                 : []),
             )
           : inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys);
-        // A completed wake with a linked run spends budget only when that run
-        // wrote a status, comment, or new blocker edge on this dependent.
-        // Historical wakes without a run id remain countable: their effects
-        // cannot be attributed reliably.
+        // Only a succeeded run that wrote nothing (no status change, comment,
+        // or new blocker edge on this dependent) is exempt from the budget.
+        // Failed, timed-out, cancelled, refused, and run-less historical wakes
+        // stay countable.
         const wakeChangedDependent = or(
           isNull(agentWakeupRequests.runId),
+          sql`not exists (
+            select 1 from ${heartbeatRuns}
+            where ${heartbeatRuns.id} = ${agentWakeupRequests.runId}
+              and ${heartbeatRuns.status} = 'succeeded'
+          )`,
           sql`exists (
             select 1 from ${activityLog}
             where ${activityLog.companyId} = ${agentWakeupRequests.companyId}
@@ -7835,7 +7840,7 @@ export function recoveryService(
               and ${activityLog.entityType} = 'issue'
               and ${activityLog.entityId} = ${candidate.id}
               and (
-                (${activityLog.action} = 'issue.updated' and ${activityLog.details} ? 'status')
+                (${activityLog.action} = 'issue.updated' and ${activityLog.details}->'changes' ? 'status')
                 or ${activityLog.action} = 'issue.comment_added'
                 or (${activityLog.action} = 'issue.blockers_updated'
                     and jsonb_array_length(coalesce(${activityLog.details}->'addedBlockedByIssueIds', '[]'::jsonb)) > 0)
