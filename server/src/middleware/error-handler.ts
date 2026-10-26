@@ -16,6 +16,7 @@ import {
   redactSensitiveValueOccurrences,
 } from "./redact-sensitive.js";
 import { recordResponsibleUserDenialOnActiveRun } from "../services/responsible-user-denial-run-outcomes.js";
+import { restoreAgentApiKeyTouch } from "./auth.js";
 
 export interface ErrorContext {
   error: {
@@ -184,49 +185,65 @@ export function errorHandler(
     const secretSensitiveServerError =
       err.status >= 500 &&
       isSecretSensitiveHttpRequest(req.method, req.originalUrl);
-    res.status(err.status).json(
-      secretSensitiveServerError
-        ? { error: "Internal server error" }
-        : {
-            error: sanitizeSecretSensitiveResponse(req, err.message),
-            ...(typeof responseDetails?.code === "string"
-              ? { code: responseDetails.code }
-              : {}),
-            ...(redactedSkillPolicyDenial &&
-            typeof responseDetails?.reason === "string"
-              ? { reason: responseDetails.reason }
-              : {}),
-            ...(workspaceRepairPreconditionFailure &&
-            typeof responseDetails?.reason === "string"
-              ? { reason: responseDetails.reason }
-              : {}),
-            ...(workspaceRepairPreconditionFailure &&
-            typeof responseDetails?.repairPhase === "string"
-              ? { repairPhase: responseDetails.repairPhase }
-              : {}),
-            ...(typeof responseDetails?.remediation === "string" ||
-            (structuredConnectionError &&
-              responseDetails?.remediation &&
-              typeof responseDetails.remediation === "object")
-              ? { remediation: responseDetails.remediation }
-              : {}),
-            ...(structuredConnectionError && responseDetails?.connection
-              ? { connection: responseDetails.connection }
-              : {}),
-            ...(structuredConnectionError && responseDetails?.subject
-              ? { subject: responseDetails.subject }
-              : {}),
-            ...(structuredConnectionError &&
-            typeof responseDetails?.grantId === "string"
-              ? { grantId: responseDetails.grantId }
-              : {}),
-            ...(!redactedSkillPolicyDenial &&
-            !workspaceRepairPreconditionFailure &&
-            responseDetailsValue
-              ? { details: responseDetailsValue }
-              : {}),
-          },
-    );
+    const send = () => {
+      res.status(err.status).json(
+        secretSensitiveServerError
+          ? { error: "Internal server error" }
+          : {
+              error: sanitizeSecretSensitiveResponse(req, err.message),
+              ...(typeof responseDetails?.code === "string"
+                ? { code: responseDetails.code }
+                : {}),
+              ...(redactedSkillPolicyDenial &&
+              typeof responseDetails?.reason === "string"
+                ? { reason: responseDetails.reason }
+                : {}),
+              ...(workspaceRepairPreconditionFailure &&
+              typeof responseDetails?.reason === "string"
+                ? { reason: responseDetails.reason }
+                : {}),
+              ...(workspaceRepairPreconditionFailure &&
+              typeof responseDetails?.repairPhase === "string"
+                ? { repairPhase: responseDetails.repairPhase }
+                : {}),
+              ...(typeof responseDetails?.remediation === "string" ||
+              (structuredConnectionError &&
+                responseDetails?.remediation &&
+                typeof responseDetails.remediation === "object")
+                ? { remediation: responseDetails.remediation }
+                : {}),
+              ...(structuredConnectionError && responseDetails?.connection
+                ? { connection: responseDetails.connection }
+                : {}),
+              ...(structuredConnectionError && responseDetails?.subject
+                ? { subject: responseDetails.subject }
+                : {}),
+              ...(structuredConnectionError &&
+              typeof responseDetails?.grantId === "string"
+                ? { grantId: responseDetails.grantId }
+                : {}),
+              ...(!redactedSkillPolicyDenial &&
+              !workspaceRepairPreconditionFailure &&
+              responseDetailsValue
+                ? { details: responseDetailsValue }
+                : {}),
+            },
+      );
+    };
+    if (details?.code === "checkout_adoption_required") {
+      const db = getPaperclipDb(req);
+      if (db) {
+        void restoreAgentApiKeyTouch(db, req).then(send, (restoreErr) => {
+          logger.warn(
+            { err: restoreErr, keyTouch: "checkout_adoption_required" },
+            "failed to restore agent API key last-use after checkout adoption refusal",
+          );
+          send();
+        });
+        return;
+      }
+    }
+    send();
     return;
   }
 

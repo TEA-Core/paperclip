@@ -1,21 +1,26 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentApiKeys,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
 } from "@paperclipai/db";
+import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { HttpError } from "../errors.js";
 import { issueService } from "../services/issues.js";
+import { issueRoutes } from "../routes/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -60,8 +65,11 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
     await db.delete(issueComments);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentApiKeys);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(companyMemberships);
+    await db.delete(authUsers);
     await db.delete(companies);
   });
 
@@ -461,6 +469,275 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
         .send({ priority: "high", expectedUpdatedAt: seen });
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await adoptionActivity(seeded.issue.id)).toEqual([]);
+    });
+  });
+
+  it("done refusal persists no audit", async () => {
+    const seeded = await seed({ assignee: true });
+    await db.update(issues).set({
+      status: "in_progress",
+      executionRunId: seeded.run!.id,
+      checkoutRunId: seeded.run!.id,
+    }).where(eq(issues.id, seeded.issue.id));
+    const actor = boardActor(seeded.company.id, seeded.userId);
+    const seen = await wireUpdatedAt(actor, seeded.issue.id);
+    const res = await request(await appFor(actor))
+      .patch(`/api/issues/${seeded.issue.id}`)
+      .send({ status: "done", expectedUpdatedAt: seen });
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.code).toBe("expected_updated_at_unsupported_with_side_effects");
+    const audit = await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.issue.id));
+    expect(audit.filter((row) => row.action === "issue.done_tier_declaration_skipped")).toEqual([]);
+    const run = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.run!.id)).then((rows) => rows[0]!);
+    expect(run.status).toBe("running");
+    expect((await storedTitle(seeded.issue.id)).updatedAt.toISOString()).toBe(seen);
+  });
+
+  it("comment response updatedAt chains", async () => {
+    const { company, issue, userId } = await seed();
+    const actor = boardActor(company.id, userId);
+    const seen = await wireUpdatedAt(actor, issue.id);
+    const app = await appFor(actor);
+    const commented = await request(app)
+      .patch(`/api/issues/${issue.id}`)
+      .send({ comment: "chain me", expectedUpdatedAt: seen });
+    expect(commented.status, JSON.stringify(commented.body)).toBe(200);
+    const stored = await storedTitle(issue.id);
+    expect(commented.body.updatedAt).toBe(stored.updatedAt.toISOString());
+    expect(commented.body.updatedAt).not.toBe(seen);
+    const chained = await request(app)
+      .patch(`/api/issues/${issue.id}`)
+      .send({ title: "Chained", expectedUpdatedAt: commented.body.updatedAt });
+    expect(chained.status, JSON.stringify(chained.body)).toBe(200);
+    expect(chained.body.title).toBe("Chained");
+  });
+
+  it("accepts an equivalent offset", async () => {
+    const { company, issue, userId } = await seed();
+    await db.update(issues).set({ updatedAt: new Date("2020-01-01T00:00:00.000Z") })
+      .where(eq(issues.id, issue.id));
+    const res = await request(await appFor(boardActor(company.id, userId)))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ title: "Offset", expectedUpdatedAt: "2020-01-01T00:00:00.000+00:00" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await storedTitle(issue.id)).toMatchObject({ title: "Offset" });
+  });
+
+  it("same millisecond bucket matches and the next millisecond does not", async () => {
+    const { company, issue, userId } = await seed();
+    const actor = boardActor(company.id, userId);
+    await db.update(issues).set({ updatedAt: new Date("2020-01-01T00:00:00.123Z") })
+      .where(eq(issues.id, issue.id));
+    const sameBucket = await request(await appFor(actor))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ title: "Bucket", expectedUpdatedAt: "2020-01-01T00:00:00.123999Z" });
+    expect(sameBucket.status, JSON.stringify(sameBucket.body)).toBe(200);
+    await db.update(issues).set({
+      title: "Original title",
+      updatedAt: new Date("2020-01-01T00:00:00.123Z"),
+    }).where(eq(issues.id, issue.id));
+    const nextMillisecond = await request(await appFor(actor))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ title: "Too new", expectedUpdatedAt: "2020-01-01T00:00:00.124000Z" });
+    expect(nextMillisecond.status, JSON.stringify(nextMillisecond.body)).toBe(409);
+    expect(nextMillisecond.body.code).toBe("issue_version_conflict");
+    expect(await storedTitle(issue.id)).toMatchObject({ title: "Original title" });
+  });
+
+  it("service rejects a future expectedUpdatedAt", async () => {
+    const { issue } = await seed();
+    const stored = await storedTitle(issue.id);
+    const svc = issueService(db);
+    await expect(svc.update(issue.id, {
+      title: "Future",
+      expectedUpdatedAt: new Date(stored.updatedAt.getTime() + 60_000),
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_version_conflict" },
+    });
+    expect(await storedTitle(issue.id)).toMatchObject({ title: "Original title" });
+  });
+
+  it("produces exactly one success for five concurrent patches with the same expected value", async () => {
+    const { company, issue, userId } = await seed();
+    const actor = boardActor(company.id, userId);
+    const seen = await wireUpdatedAt(actor, issue.id);
+    const app = await appFor(actor);
+    const titles = ["One", "Two", "Three", "Four", "Five"];
+    const results = await Promise.all(titles.map((title) =>
+      request(app).patch(`/api/issues/${issue.id}`).send({ title, expectedUpdatedAt: seen }),
+    ));
+    const winners = results.filter((res) => res.status === 200);
+    const losers = results.filter((res) => res.status === 409);
+    expect(winners, JSON.stringify(results.map((res) => res.status))).toHaveLength(1);
+    expect(losers).toHaveLength(4);
+    expect(losers.every((res) => res.body.code === "issue_version_conflict")).toBe(true);
+    expect((await storedTitle(issue.id)).title).toBe(winners[0]!.body.title);
+  });
+
+  it("rejects null and empty expectedUpdatedAt before any write", async () => {
+    const { company, issue, userId } = await seed();
+    const actor = boardActor(company.id, userId);
+    for (const expectedUpdatedAt of [null, ""]) {
+      const res = await request(await appFor(actor))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ title: "Nope", expectedUpdatedAt });
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+    }
+    expect(await storedTitle(issue.id)).toMatchObject({ title: "Original title" });
+  });
+
+  it("rejects a non-assignee agent before comparing a stale token", async () => {
+    const seeded = await seed({ assignee: true });
+    const other = await db.insert(agents).values({
+      companyId: seeded.company.id,
+      name: "Other",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning().then((rows) => rows[0]!);
+    const otherRun = await db.insert(heartbeatRuns).values({
+      companyId: seeded.company.id,
+      agentId: other.id,
+      status: "running",
+      contextSnapshot: { issueId: seeded.issue.id },
+    }).returning().then((rows) => rows[0]!);
+    await db.update(issues).set({ updatedAt: new Date("2024-04-04T00:00:00.000Z") })
+      .where(eq(issues.id, seeded.issue.id));
+    const actor: Express.Request["actor"] = {
+      type: "agent",
+      agentId: other.id,
+      companyId: seeded.company.id,
+      runId: otherRun.id,
+      source: "agent_jwt",
+    };
+    const res = await request(await appFor(actor))
+      .patch(`/api/issues/${seeded.issue.id}`)
+      .send({ title: "Stolen", expectedUpdatedAt: "2020-01-01T00:00:00.000Z" });
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.code).not.toBe("issue_version_conflict");
+    expect(await storedTitle(seeded.issue.id)).toMatchObject({ title: "Original title" });
+  });
+
+  it("scheduled retry comment rejects expectedUpdatedAt before cancelling the retry", async () => {
+    const seeded = await seed({ assignee: true });
+    const retry = await db.insert(heartbeatRuns).values({
+      companyId: seeded.company.id,
+      agentId: seeded.agent!.id,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date("2026-05-06T19:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: { issueId: seeded.issue.id },
+    }).returning().then((rows) => rows[0]!);
+    await db.update(issues).set({
+      status: "in_progress",
+      assigneeAgentId: seeded.agent!.id,
+    }).where(eq(issues.id, seeded.issue.id));
+    const actor = boardActor(seeded.company.id, seeded.userId);
+    const seen = await wireUpdatedAt(actor, seeded.issue.id);
+    const res = await request(await appFor(actor))
+      .patch(`/api/issues/${seeded.issue.id}`)
+      .send({ comment: "take over", expectedUpdatedAt: seen });
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.code).toBe("expected_updated_at_unsupported_with_side_effects");
+    const storedRetry = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retry.id)).then((rows) => rows[0]!);
+    expect(storedRetry.status).toBe("scheduled_retry");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, seeded.issue.id))).toEqual([]);
+  });
+
+  describe("checkout adoption 409 does not change key last-use", () => {
+    async function seedKeyedAgent(unowned: boolean) {
+      const seeded = await seed({ assignee: true });
+      const userId = `user-${randomUUID()}`;
+      const now = new Date("2024-01-01T00:00:00.000Z");
+      await db.insert(authUsers).values({
+        id: userId,
+        name: "Operator",
+        email: `${userId}@example.com`,
+        emailVerified: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(companyMemberships).values({
+        companyId: seeded.company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "member",
+      });
+      const token = `agent-key-${randomUUID()}`;
+      const key = await db.insert(agentApiKeys).values({
+        agentId: seeded.agent!.id,
+        companyId: seeded.company.id,
+        name: "cas-key",
+        keyHash: createHash("sha256").update(token).digest("hex"),
+        responsibleUserId: userId,
+        lastUsedAt: now,
+      }).returning().then((rows) => rows[0]!);
+      if (unowned) {
+        await db.update(issues).set({
+          status: "in_progress",
+          checkoutRunId: null,
+          executionRunId: null,
+        }).where(eq(issues.id, seeded.issue.id));
+      } else {
+        const staleRun = await db.insert(heartbeatRuns).values({
+          companyId: seeded.company.id,
+          agentId: seeded.agent!.id,
+          status: "failed",
+          contextSnapshot: { issueId: seeded.issue.id },
+        }).returning().then((rows) => rows[0]!);
+        await db.update(issues).set({
+          status: "in_progress",
+          checkoutRunId: staleRun.id,
+          executionRunId: staleRun.id,
+        }).where(eq(issues.id, seeded.issue.id));
+      }
+      const app = express();
+      app.locals.paperclipDb = db;
+      app.use(express.json());
+      app.use(actorMiddleware(db, {
+        deploymentMode: "authenticated",
+        resolveSession: async () => null,
+      }));
+      app.use("/api", issueRoutes(db, {} as never));
+      app.use(errorHandler);
+      return { ...seeded, token, key, app };
+    }
+
+    async function expectLastUseUnchanged(unowned: boolean) {
+      const seeded = await seedKeyedAgent(unowned);
+      const seen = await request(seeded.app)
+        .get(`/api/issues/${seeded.issue.id}`)
+        .set("Authorization", `Bearer ${seeded.token}`)
+        .set("X-Paperclip-Run-Id", seeded.run!.id);
+      expect(seen.status, JSON.stringify(seen.body)).toBe(200);
+      await db.update(agentApiKeys).set({ lastUsedAt: new Date("2024-01-01T00:00:00.000Z") })
+        .where(eq(agentApiKeys.id, seeded.key.id));
+      const res = await request(seeded.app)
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .set("Authorization", `Bearer ${seeded.token}`)
+        .set("X-Paperclip-Run-Id", seeded.run!.id)
+        .send({ priority: "high", expectedUpdatedAt: seen.body.updatedAt });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("checkout_adoption_required");
+      const key = await db.select({ lastUsedAt: agentApiKeys.lastUsedAt }).from(agentApiKeys)
+        .where(eq(agentApiKeys.id, seeded.key.id)).then((rows) => rows[0]!);
+      expect(key.lastUsedAt?.toISOString()).toBe("2024-01-01T00:00:00.000Z");
+      expect((await storedTitle(seeded.issue.id)).priority).toBe("medium");
+    }
+
+    it("terminal recorded run", async () => {
+      await expectLastUseUnchanged(false);
+    });
+
+    it("unowned checkout", async () => {
+      await expectLastUseUnchanged(true);
     });
   });
 });

@@ -18870,6 +18870,16 @@ export function issueRoutes(
     // certify the issue until that request-owned mutation has finished.
     let deferFinalDeliveryPrefetch = false;
     let originalDeliveryBinding: string | null = null;
+    // Refuse before evaluateDoneTransitionGuards. That guard writes
+    // issue.done_tier_declaration_skipped, and the later side-effect reject
+    // would otherwise leave the audit behind on a 400.
+    if (
+      expectedUpdatedAtRaw !== undefined &&
+      isDoneRequest &&
+      existing.assigneeAgentId
+    ) {
+      throw expectedUpdatedAtUnsupportedWithSideEffects();
+    }
     if (isDoneRequest && !missingApprovalStageGap) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
@@ -19172,12 +19182,18 @@ export function issueRoutes(
       }, postCommitActivityPublications);
     };
     // Reopen the closed isolated workspace only after every access, validation,
-    // and policy gate passes, and just before the update persists. A rejected
-    // update must not rebuild and republish the workspace as active, because the
-    // issue stays terminal and the reaper then skips the leaked workspace.
+    // and policy gate passes. Absent expectedUpdatedAt keeps the historical
+    // order: reopen just before the update, so a rejected update does not
+    // republish a terminal issue's workspace. A compare-and-set token holds
+    // the reopen until the issue UPDATE commits, because that reopen is its
+    // own transaction and a later version mismatch cannot roll it back.
     let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
     let reopenedGeneration: number | null = null;
-    if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
+    if (
+      closedExecutionWorkspace &&
+      (commentBody || isAgentWorkUpdate) &&
+      expectedUpdatedAtRaw === undefined
+    ) {
       const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
         req,
         res,
@@ -19667,6 +19683,29 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+    if (
+      expectedUpdatedAtRaw !== undefined &&
+      closedExecutionWorkspace &&
+      (commentBody || isAgentWorkUpdate)
+    ) {
+      const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
+        req,
+        res,
+        existing,
+        closedExecutionWorkspace,
+      );
+      if (reopenOutcome === null) return;
+      if (reopenOutcome.outcome === "reopened") {
+        guardReopenedWorkspaceConsumption({
+          req,
+          res,
+          issue: existing,
+          workspace: closedExecutionWorkspace,
+          generation: reopenOutcome.generation,
+          finalIssueStatus: () => issue?.status,
+        });
+      }
     }
     // SUP-15257: this issue mutation just committed; if it came from a
     // task-watchdog run, re-derive and advance that run's stop fingerprint so
@@ -20860,6 +20899,14 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
+    const committedUpdatedAt = await db
+      .select({ updatedAt: issueRows.updatedAt })
+      .from(issueRows)
+      .where(eq(issueRows.id, issue.id))
+      .then((rows) => rows[0]?.updatedAt ?? null);
+    if (committedUpdatedAt) {
+      issueResponse = { ...issueResponse, updatedAt: committedUpdatedAt };
+    }
     const changes = issueResponse.changes ?? {};
     // SUP-17808: the dedup receipt is only meaningful when this PATCH actually
     // carried a comment — an append (`comment != null`) or a suppression

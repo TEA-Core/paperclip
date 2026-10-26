@@ -3931,7 +3931,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token: the update commits only when the issue's updatedAt still matches that ISO-8601 timestamp. A mismatch is 409 issue_version_conflict with the current updatedAt and no write. For an agent whose run does not yet hold the issue's checkout lock, the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock, and nothing is written; check out, re-read updatedAt and retry. expectedUpdatedAt is for field-only writes: combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) it is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and nothing is persisted. Omit expectedUpdatedAt for an unconditional update." +
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token. Equality is the millisecond bucket the API returns: instants in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue UPDATE commits only when that bucket still matches. A mismatch is 409 issue_version_conflict with code and the current updatedAt in details, and the issue write persists nothing. A successful response updatedAt is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. For an agent whose run does not yet hold the checkout lock (the recorded run is terminal or missing, or no run holds it), the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock. That refusal writes no issue, audit, or wake row and does not change the agent API key last-use; check out, re-read updatedAt, and retry. expectedUpdatedAt combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A token-bearing request reopens a closed workspace only after that UPDATE commits. Omit expectedUpdatedAt for an unconditional update. The field grants no new permission." +
     "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
     "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
   request: {
@@ -3975,13 +3975,24 @@ registry.registerPath({
           "Record this card's delivery identity (ADR-091 D1) on a transition into `in_review`. Writable only by the agent run holding the issue's lease (422 `delivery_identity_write_rejected` otherwise). `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
         ),
       expectedUpdatedAt: z.string().datetime({ offset: true }).optional().describe(
-        "Compare-and-set token for any update. Send the issue's updatedAt from a prior read. The write commits only if that timestamp still matches; otherwise the response is 409 issue_version_conflict and includes the current updatedAt. Omit the field to update unconditionally. Not supported with requests that cancel a run or stop an agent goal first (400 expected_updated_at_unsupported_with_side_effects). Matching uses the millisecond precision the API returns.",
+        "Compare-and-set token for any update. Send the issue's updatedAt from a prior read. Matching uses the millisecond bucket the API returns: a token and a stored instant in the same millisecond compare equal, and a token one millisecond newer or older does not. The write commits only if that bucket still matches; otherwise the response is 409 issue_version_conflict and includes the current updatedAt. A successful response updatedAt is the committed post-write value. Omit the field to update unconditionally. Not supported with requests that cancel a run or stop an agent goal first (400 expected_updated_at_unsupported_with_side_effects).",
       ),
     })),
   },
   responses: {
     200: r.ok(),
-    400: r.badRequest,
+    400: {
+      description: "Bad request. expectedUpdatedAt combined with a pre-write run or goal side effect is 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit.",
+      content: {
+        "application/json": {
+          schema: z.object({
+            error: z.string(),
+            code: z.string().optional(),
+            details: z.object({ code: z.string() }).optional(),
+          }),
+        },
+      },
+    },
     401: r.unauthorized,
     403: {
       description: "Forbidden; record-only selection refusals expose a named reason",
@@ -3992,7 +4003,25 @@ registry.registerPath({
       },
     },
     404: r.notFound,
-    409: r.conflict,
+    409: {
+      description: "Conflict. issue_version_conflict includes the current updatedAt and writes nothing. checkout_adoption_required is retryable, includes updatedAt, writes no issue or audit row, and does not change the agent API key last-use.",
+      content: {
+        "application/json": {
+          schema: z.object({
+            error: z.string(),
+            code: z.string().optional(),
+            details: z.object({
+              code: z.string(),
+              updatedAt: z.string().optional(),
+              retryable: z.boolean().optional(),
+              issueId: z.string().optional(),
+              checkoutRunId: z.string().nullable().optional(),
+              executionRunId: z.string().nullable().optional(),
+            }).optional(),
+          }),
+        },
+      },
+    },
     422: r.unprocessable,
   },
 });

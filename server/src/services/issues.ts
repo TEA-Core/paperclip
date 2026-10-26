@@ -12111,8 +12111,9 @@ export function issueService(db: Db) {
         // A concurrent writer that commits first changes updated_at, this
         // statement matches zero rows, and the transaction rolls back. The
         // API exposes updatedAt at millisecond precision, so the predicate
-        // compares that observed token. Absent expectedUpdatedAt leaves the
-        // predicate as idPredicate.
+        // compares that observed token. Instants inside one millisecond
+        // compare equal; a token one millisecond newer or older does not.
+        // Absent expectedUpdatedAt leaves the predicate as idPredicate.
         const writePredicate = expectedUpdatedAt === undefined
           ? idPredicate
           : and(
