@@ -527,6 +527,42 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("exposes structured done-tier declarations on update and comment tools", () => {
+    const tier2 = {
+      tier: "tier2" as const,
+      probeEvidence: "Health check returned 200",
+    };
+    const tier1 = {
+      tier: "tier1" as const,
+      reason: "Merged change is ready",
+      landing: {
+        mode: "landedAtTip" as const,
+        mergeCommit: "abcdef1234567",
+      },
+    };
+    const delegated = {
+      tier: "tier1" as const,
+      reason: "Landing delegated",
+      landing: {
+        mode: "landingDelegated" as const,
+        prNumber: 123,
+        carrier: "done-close-landing-backstop" as const,
+      },
+    };
+    const updateTool = getTool("paperclipUpdateIssue");
+    const commentTool = getTool("paperclipAddComment");
+
+    expect(updateTool.schema.shape.doneTier.parse(tier2)).toEqual(tier2);
+    expect(commentTool.schema.shape.doneTier.parse(tier1)).toEqual(tier1);
+    expect(commentTool.schema.shape.doneTier.parse(delegated)).toEqual(delegated);
+    expect(updateTool.schema.shape.doneTier.safeParse({ tier: "tier2", probeEvidence: "" }).success).toBe(false);
+    expect(commentTool.schema.shape.doneTier.safeParse({
+      tier: "tier1",
+      reason: "line 1\nline 2",
+      landing: delegated.landing,
+    }).success).toBe(false);
+  });
+
   it("exposes paperclipCreateApproval as a mergeable object schema", () => {
     const tool = getTool("paperclipCreateApproval");
 

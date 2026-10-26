@@ -11,6 +11,7 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  renderDoneTierDeclaration,
   TIER1_FORM,
   GitHubAuthError,
   type DoneTransitionOverride,
@@ -5173,6 +5174,36 @@ describe("evaluateDoneTierDeclaration", () => {
       updatedAt: new Date(),
     };
   }
+
+  describe("structured done-tier rendering", () => {
+    it("renders Tier 2 evidence and preserves the caller body", () => {
+      expect(renderDoneTierDeclaration("Closing now", {
+        tier: "tier2",
+        probeEvidence: "Health check returned 200",
+      })).toBe("Closing now\n\nClosed at Tier 2 (live): Health check returned 200");
+    });
+
+    it("renders both Tier 1 landing states with exactly one landing token", () => {
+      expect(renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "Merged change is ready",
+        landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+      })).toBe("Closed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.");
+      expect(renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "Landing delegated",
+        landing: { mode: "landingDelegated", prNumber: 123, carrier: "done-close-landing-backstop" },
+      })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
+    });
+
+    it("does not duplicate an existing valid declaration", () => {
+      const body = "Closed at Tier 2 (live): already rendered";
+      expect(renderDoneTierDeclaration(body, {
+        tier: "tier2",
+        probeEvidence: "new evidence",
+      })).toBe(body);
+    });
+  });
 
   describe("Tier 2 via accompanying comment", () => {
     it("allows transition with well-formed Tier 2 declaration and non-empty evidence", async () => {
