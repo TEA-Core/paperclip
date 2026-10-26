@@ -37,6 +37,7 @@ import {
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
+  narrowToDelivered,
   publishApprovalStatus,
   recordApprovalAnchor,
   recordApprovalPublishOutcome,
@@ -1714,6 +1715,23 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         );
         expect(result.reason).not.toContain("is not this card's delivery branch");
       }
+    });
+
+    it.each([
+      { label: "owner", owner: "other-org", repo: REPO },
+      { label: "repository name", owner: OWNER, repo: "other-repo" },
+    ])("never treats another $label's same-branch PR as this card's delivery", async ({ owner, repo }) => {
+      const issueId = await insertIssue();
+      const foreignPr = {
+        number: 42,
+        owner,
+        repo,
+        headRefName: "SUP-42-branch",
+        displayName: `${owner}/${repo}#42`,
+      };
+
+      const result = await narrowToDelivered(db, companyId, issueId, [foreignPr]);
+      expect(result.outcome).toBe("not-delivered");
     });
 
     it("keeps branch language when the head repo matches but the head ref differs", async () => {
