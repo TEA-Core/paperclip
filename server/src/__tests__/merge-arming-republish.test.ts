@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -32,7 +34,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { publishHeadBoundRelease, releaseLockKey } from "../services/merge-arming.js";
 import { releaseRequestClock } from "../middleware/release-request-clock.js";
-import { releaseScopedActor } from "../middleware/release-scoped-actor.js";
+import { RELEASE_AUTH_SCOPE_LIMIT, releaseScopedActor } from "../middleware/release-scoped-actor.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { boardAuthService } from "../services/board-auth.js";
 
@@ -4004,6 +4006,58 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
           expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
           expect(await lastUsed(key.id)).not.toBeNull();
         }, 20_000);
+
+        // Round 12 (R11-AUTH-LATE-BODY): a request the clock already answered authenticates nothing when its body finally arrives.
+        it("opens no connection and writes no stamp for a slow-body request the clock already answered", async () => {
+          const { issueId, companyId } = await seedReleasable();
+          const key = await boardKeyFor(companyId);
+          installReleaseTransport();
+          const server = http.createServer(realAuthApp(200));
+          await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+          const port = (server.address() as AddressInfo).port;
+          const body = JSON.stringify({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+          try {
+            const clientReq = http.request({
+              host: "127.0.0.1", port, method: "POST", path: `/api/issues/${issueId}/merge-arming/release`,
+              headers: { authorization: `Bearer ${key.token}`, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+            });
+            const status = new Promise<number>((resolve, reject) => {
+              clientReq.on("response", (response) => { response.resume(); resolve(response.statusCode ?? 0); });
+              clientReq.on("error", reject);
+            });
+            clientReq.flushHeaders();
+            expect(await status).toBe(409);
+            // The body only arrives after the answer.
+            clientReq.end(body);
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+
+            expect(await requestBackends()).toBe(0);
+            expect(await lastUsed(key.id)).toBeNull();
+            expect(mockGhFetch).not.toHaveBeenCalled();
+          } finally {
+            await new Promise((resolve) => server.close(resolve));
+          }
+        }, 20_000);
+
+        it("keeps dedicated authentication connections to a fixed number and refuses the rest, fail closed", async () => {
+          const { issueId, companyId } = await seedReleasable();
+          const key = await boardKeyFor(companyId);
+          installReleaseTransport();
+          const release = await holdLock(sql`lock table board_api_keys in access exclusive mode`);
+          try {
+            const app = realAuthApp(2500);
+            const results = await Promise.all(Array.from({ length: RELEASE_AUTH_SCOPE_LIMIT + 3 }, (_, i) =>
+              request(app).post(`/api/issues/${issueId}/merge-arming/release`).set("authorization", `Bearer ${key.token}`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON })
+                .then((res) => res.status)));
+            expect(results.filter((status) => status === 503)).toHaveLength(3);
+            expect(results.filter((status) => status === 409)).toHaveLength(RELEASE_AUTH_SCOPE_LIMIT);
+            expect(await requestBackends()).toBeLessThanOrEqual(RELEASE_AUTH_SCOPE_LIMIT);
+          } finally {
+            await release();
+          }
+          expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+          expect(mockGhFetch).not.toHaveBeenCalled();
+        }, 30_000);
 
         it("writes no usage stamp and hands nothing on once the request's clock has expired", async () => {
           const { companyId } = await seedReleasable();

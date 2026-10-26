@@ -134,11 +134,36 @@ test("with the switch on, a release the control plane has not marked confirmed i
   assert.match(out, /FAIL: paperclip\/approved is unconfirmed-release/);
 });
 
-test("with the switch off, a release-described success is judged like any other success, marker or not", () => {
-  for (const statuses of [[release], [confirmedMarker, release]]) {
-    const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses, retired: false });
-    assert.equal(code, 0);
-    assert.doesNotMatch(out, /UNCONFIRMED|board release/);
+// Round 12 (R10-DEADLINE-POST): a release success can land after the control plane answered that the release failed.
+// Nothing on the producer side stops it, so the consumer refuses it without the marker, switch on or off.
+test("a release-described success the control plane has not confirmed is not an approval, switch on or off", () => {
+  for (const retired of [true, false]) {
+    const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [release], retired });
+    assert.equal(code, 1, `retired=${retired}`);
+    assert.match(out, /UNCONFIRMED RELEASE/);
+  }
+});
+
+test("with the switch off a confirmed release still passes, unannounced", () => {
+  const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [confirmedMarker, release], retired: false });
+  assert.equal(code, 0);
+  assert.doesNotMatch(out, /board release/);
+});
+
+test("a late release success that lands after the control plane's failure status is refused, switch on or off", () => {
+  const voided = { id: 7002, context: "paperclip/approved", state: "failure", creator: TEA_CORE, description: "voided: release 7001 was not confirmed" };
+  const late = { ...release, id: 7003 };
+  for (const retired of [true, false]) {
+    const { code, out } = run({ ref: CARD_BRANCH, author: PERSON, statuses: [late, voided], retired });
+    assert.equal(code, 1, `retired=${retired}`);
+    assert.match(out, /UNCONFIRMED RELEASE/);
+  }
+});
+
+test("a statuses list with a very late release success after a marker for an earlier one is refused", () => {
+  const late = { ...release, id: 7005 };
+  for (const retired of [true, false]) {
+    assert.equal(run({ ref: CARD_BRANCH, author: PERSON, statuses: [late, confirmedMarker, release], retired }).code, 1, `retired=${retired}`);
   }
 });
 

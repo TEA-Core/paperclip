@@ -1061,6 +1061,7 @@ export interface PendingAutoMergeDisarm {
   since: string;
   attempts: number;
   lastError: string | null;
+  lastAttemptAt?: string | null;
 }
 
 /** Writes the record into the card's approvalStatus subtree atomically (other keys are preserved). */
@@ -1092,9 +1093,12 @@ export async function keepAutoMergeDisarmPending(
   try {
     await recordPendingAutoMergeDisarm(db, companyId, issueId, {
       owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha, reason,
-      since: new Date().toISOString(), attempts: 1, lastError: error,
+      since: new Date().toISOString(), attempts: 1, lastError: error, lastAttemptAt: new Date().toISOString(),
     });
-    return "; the take-back is recorded on the card and retried on every reconciler tick until GitHub confirms auto-merge is off";
+    // Do not wait for the first reconciler tick: retry within seconds (a restart falls back to the tick).
+    // Loaded here, not at the top, because that module imports this one.
+    try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still retries it */ }
+    return "; the take-back is recorded on the card and retried within seconds and then on every reconciler tick until GitHub confirms auto-merge is off";
   } catch (err) {
     return `; the take-back could NOT be recorded for retry (${err instanceof Error ? err.message : String(err)}), so it must be done by hand`;
   }

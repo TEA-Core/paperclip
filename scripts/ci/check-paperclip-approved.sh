@@ -741,10 +741,10 @@ waiver_unverified() {
 
 # waiver_retirement_on: the single reading of PAPERCLIP_CARD_WAIVER_RETIRED.
 # Only the exact value 1 arms it. Everything that exists because of the board
-# release (the waiver refusal, the description and id columns, the release
-# confirmation marker rule, the release log line and the denial hint) is gated on
-# this, so with the switch off the script reads, judges and prints exactly what it did
-# before SUP-20772.
+# release (the waiver refusal, the release log line and the denial hint) is gated on
+# this. The confirmation marker rule is not: it applies to the one description only the
+# release route writes (see RELEASE_CONFIRMED_CONTEXT), so with the switch off every other
+# input is read, judged and printed exactly as it was before SUP-20772.
 waiver_retirement_on() {
   [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ]
 }
@@ -815,20 +815,18 @@ fi
 # confirmation it writes a second status, `paperclip/release-confirmed`, whose description is
 # "confirms status <id of the success>". With the switch ON, a release-described success counts only when
 # that marker, written by the same control-plane creator, names it; a release with no marker (a write that
-# timed out, a release the control plane voided or never confirmed) is treated as not approved. The
-# description and id columns are requested only then. With the switch OFF the query, the parse and the
-# verdict are exactly what they were before SUP-20772, so a release-described success is judged like any
-# other success until the switch is armed.
+# timed out, a release the control plane voided or never confirmed) is treated as not approved. This holds
+# with the switch OFF as well, because a release success can land late (after the control plane answered
+# that the release failed) and nothing on the producer side can stop an HTTP request that lands late: the
+# marker is the only thing that says the control plane saw its release in time. "released by " is written
+# only by that route, so every other status is judged exactly as it was before SUP-20772; the switch gates
+# the waiver refusal, the log line and the hint, not this rule.
 RELEASE_CONFIRMED_CONTEXT="paperclip/release-confirmed"
-STATUS_ROW='(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")'
-STATUS_DEF=''
-if waiver_retirement_on; then
-  # Every field has a value: tab-IFS `read` collapses an empty field into its neighbour, which would shift a
-  # later column (a description, an id) into the creator columns. An empty field is "-" and is mapped back
-  # to empty after the read, so a missing or null creator stays untrusted.
-  STATUS_DEF='def f: if . == "" then "-" else . end; '
-  STATUS_ROW='((.context // "") | f), ((.state // "") | f), (((.creator.id // "") | tostring) | f), ((.creator.login // "") | f), ((.description // "") | f), ((.id // "-") | tostring)'
-fi
+# Every field has a value: tab-IFS `read` collapses an empty field into its neighbour, which would shift a
+# later column (a description, an id) into the creator columns. An empty field is "-" and is mapped back
+# to empty after the read, so a missing or null creator stays untrusted.
+STATUS_DEF='def f: if . == "" then "-" else . end; '
+STATUS_ROW='((.context // "") | f), ((.state // "") | f), (((.creator.id // "") | tostring) | f), ((.creator.login // "") | f), ((.description // "") | f), ((.id // "-") | tostring)'
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
   --jq "${STATUS_DEF}.[] | [${STATUS_ROW}] | @tsv")" \
@@ -841,13 +839,11 @@ APPROVAL_DESCRIPTION=""
 APPROVAL_STATUS_ID=""
 CONFIRMED_RELEASE_IDS=" "
 while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id; do
-  if waiver_retirement_on; then
-    [ "$status_context" = "-" ] && status_context=""
-    [ "$status_state" = "-" ] && status_state=""
-    [ "$status_creator_id" = "-" ] && status_creator_id=""
-    [ "$status_creator_login" = "-" ] && status_creator_login=""
-  fi
-  if waiver_retirement_on && [ "$status_context" = "$RELEASE_CONFIRMED_CONTEXT" ]; then
+  [ "$status_context" = "-" ] && status_context=""
+  [ "$status_state" = "-" ] && status_state=""
+  [ "$status_creator_id" = "-" ] && status_creator_id=""
+  [ "$status_creator_login" = "-" ] && status_creator_login=""
+  if [ "$status_context" = "$RELEASE_CONFIRMED_CONTEXT" ]; then
     # Only the control plane's own marker counts, and only one that names a numeric status id.
     if [ "$status_state" = "$STATE" ] && [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ]; then
       confirmed_id="${status_description#confirms status }"
@@ -858,8 +854,8 @@ while IFS=$'\t' read -r status_context status_state status_creator_id status_cre
     continue
   fi
   [ "$status_context" = "$CONTEXT" ] || continue
-  # The newest paperclip/approved status decides (the list is newest first). With the switch on the
-  # rest of the list is still read, for markers.
+  # The newest paperclip/approved status decides (the list is newest first). The rest of the list is
+  # still read, for markers.
   if [ -z "${approval_seen:-}" ]; then
     approval_seen=1
     APPROVAL_STATE="${status_state:-missing}"
@@ -868,12 +864,11 @@ while IFS=$'\t' read -r status_context status_state status_creator_id status_cre
     APPROVAL_DESCRIPTION="$status_description"
     APPROVAL_STATUS_ID="$status_id"
   fi
-  waiver_retirement_on || break
 done <<<"$STATUSES_TSV"
 
-# With the switch on, a release success the control plane has not confirmed is not an approval. A success
+# A release success the control plane has not confirmed is not an approval (switch on or off). A success
 # from any other creator is left to the FORGED refusal below.
-if waiver_retirement_on && [ "$APPROVAL_STATE" = "$STATE" ] && [ "$APPROVAL_CREATOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ]; then
+if [ "$APPROVAL_STATE" = "$STATE" ] && [ "$APPROVAL_CREATOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ]; then
   case "$APPROVAL_DESCRIPTION" in
     "released by "*)
       case "$CONFIRMED_RELEASE_IDS" in
