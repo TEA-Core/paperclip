@@ -275,4 +275,84 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
     expect(stored.title).toBe(winnerTitle);
     expect(stored.title === "Service left" || stored.title === "Service right").toBe(true);
   });
+
+  describe("rejects expectedUpdatedAt up front when the request has a pre-write side effect", () => {
+    async function seedActiveRun() {
+      const seeded = await seed({ assignee: true });
+      await db.update(issues).set({
+        status: "in_progress",
+        executionRunId: seeded.run!.id,
+        checkoutRunId: seeded.run!.id,
+      }).where(eq(issues.id, seeded.issue.id));
+      const actor = boardActor(seeded.company.id, seeded.userId);
+      const seen = await wireUpdatedAt(actor, seeded.issue.id);
+      return { ...seeded, actor, seen };
+    }
+
+    async function expectNothingPersisted(
+      seeded: Awaited<ReturnType<typeof seedActiveRun>>,
+      res: request.Response,
+    ) {
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(res.body.code).toBe("expected_updated_at_unsupported_with_side_effects");
+      const run = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, seeded.run!.id)).then((rows) => rows[0]!);
+      expect(run.status).toBe("running");
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, "heartbeat.cancelled"))).toEqual([]);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, seeded.issue.id))).toEqual([]);
+      const row = await db.select({
+        updatedAt: issues.updatedAt,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      }).from(issues).where(eq(issues.id, seeded.issue.id)).then((rows) => rows[0]!);
+      expect(row.updatedAt.toISOString()).toBe(seeded.seen);
+      expect(row.status).toBe("in_progress");
+      expect(row.assigneeAgentId).toBe(seeded.agent!.id);
+    }
+
+    it("interrupt cancel", async () => {
+      const seeded = await seedActiveRun();
+      const res = await request(await appFor(seeded.actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ comment: "stop", interrupt: true, expectedUpdatedAt: seeded.seen });
+      await expectNothingPersisted(seeded, res);
+    });
+
+    it("reassignment cancel", async () => {
+      const seeded = await seedActiveRun();
+      const other = await db.insert(agents).values({
+        companyId: seeded.company.id,
+        name: "Other",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      }).returning().then((rows) => rows[0]!);
+      const res = await request(await appFor(seeded.actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ assigneeAgentId: other.id, expectedUpdatedAt: seeded.seen });
+      await expectNothingPersisted(seeded, res);
+    });
+
+    it("terminalization cancel", async () => {
+      const seeded = await seedActiveRun();
+      const res = await request(await appFor(seeded.actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ status: "cancelled", expectedUpdatedAt: seeded.seen });
+      await expectNothingPersisted(seeded, res);
+    });
+
+    it("still returns 409 with no write for a stale field-only token on an active-run card", async () => {
+      const seeded = await seedActiveRun();
+      await db.update(issues).set({ updatedAt: new Date("2024-03-03T00:00:00.000Z") })
+        .where(eq(issues.id, seeded.issue.id));
+      const res = await request(await appFor(seeded.actor))
+        .patch(`/api/issues/${seeded.issue.id}`)
+        .send({ priority: "high", expectedUpdatedAt: seeded.seen });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("issue_version_conflict");
+      expect(await storedTitle(seeded.issue.id)).toMatchObject({ priority: "medium" });
+    });
+  });
 });

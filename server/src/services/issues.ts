@@ -96,7 +96,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { pendingReviewParticipantGraceMsFromEnv, pendingReviewRearmWindowMsFromEnv } from "../config.js";
 import { logger } from "../middleware/logger.js";
@@ -172,6 +172,15 @@ export function redactIssueCommentBody(body: string, opts: CurrentUserRedactionO
 }
 
 export const ISSUE_VERSION_CONFLICT_CODE = "issue_version_conflict";
+
+export const EXPECTED_UPDATED_AT_UNSUPPORTED_CODE = "expected_updated_at_unsupported_with_side_effects";
+
+export function expectedUpdatedAtUnsupportedWithSideEffects() {
+  return badRequest(
+    "expectedUpdatedAt cannot be combined with a request that cancels a run or stops an agent goal before the write",
+    { code: EXPECTED_UPDATED_AT_UNSUPPORTED_CODE },
+  );
+}
 
 export function issueVersionConflict(updatedAt: Date) {
   return conflict("Issue changed since it was read", {

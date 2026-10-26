@@ -370,6 +370,7 @@ import {
   ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   isTerminalOrMissingHeartbeatRun,
+  expectedUpdatedAtUnsupportedWithSideEffects,
   issueVersionConflict,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
@@ -17818,6 +17819,9 @@ export function issueRoutes(
     ) {
       throw issueVersionConflict(existing.updatedAt);
     }
+    const rejectExpectedUpdatedAtBeforeSideEffect = () => {
+      if (expectedUpdatedAtRaw !== undefined) throw expectedUpdatedAtUnsupportedWithSideEffects();
+    };
     if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
       throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
     }
@@ -18007,6 +18011,7 @@ export function issueRoutes(
         res.status(403).json({ error: "Only board users can interrupt active runs from issue comments" });
         return;
       }
+      rejectExpectedUpdatedAtBeforeSideEffect();
 
       const runToInterrupt = await resolveActiveIssueRun(existing);
       if (runToInterrupt) {
@@ -18062,6 +18067,7 @@ export function issueRoutes(
       shouldResumeInProgressScheduledRetry &&
       updateFields.status === "todo"
     ) {
+      rejectExpectedUpdatedAtBeforeSideEffect();
       cancelledScheduledRetryRunId = await cancelScheduledRetrySupersededByComment({
         scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
         issue: existing,
@@ -18916,6 +18922,7 @@ export function issueRoutes(
     }
 
     if (assigneeWillChange && existing.assigneeAgentId) {
+      rejectExpectedUpdatedAtBeforeSideEffect();
       await stopRunnerGoalForOwnershipChange({
         companyId: existing.companyId,
         issueId: existing.id,
@@ -18951,6 +18958,7 @@ export function issueRoutes(
       terminalizingIssue &&
       existing.assigneeAgentId
     ) {
+      rejectExpectedUpdatedAtBeforeSideEffect();
       const goalStopAction = await stopRunnerGoalForOwnershipChange({
         companyId: existing.companyId,
         issueId: existing.id,
