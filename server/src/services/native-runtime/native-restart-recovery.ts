@@ -12,6 +12,7 @@ import {
 import { readProcessStartedAt } from "../hot-restart.js";
 import { getServerInfoSnapshot } from "../../server-info.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { logger } from "../../middleware/logger.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { reportRunFailure } from "../run-failure-report.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
@@ -61,7 +62,7 @@ export type NativeRestartRecoveryClaim =
 export type NativeRestartRecoveryDisposition =
   | NativeRestartRecoveryClaim
   | {
-      kind: "awaiting_evidence" | "blocked" | "already_finalized";
+      kind: "awaiting_evidence" | "blocked" | "already_finalized" | "deferred_lock_conflict";
       runId: string;
       reason: string;
     };
@@ -414,6 +415,15 @@ function appendBoundedRecoveryHistory(entry: Record<string, unknown>) {
   )`;
 }
 
+function isRecoveryClaimLockConflict(error: unknown): boolean {
+  let cause = error;
+  for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth += 1) {
+    if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) return true;
+    cause = "cause" in cause ? cause.cause : null;
+  }
+  return false;
+}
+
 /**
  * Claims abandoned local runner executions without changing the provider retry
  * attempt. The transaction locks the run, coordinator, and issue execution
@@ -478,7 +488,7 @@ export async function claimNativeRestartRecoveries(input: {
     // transitions the run into "failed". Read after the transaction
     // commits, so a rolled-back write never reports a false failure.
     let terminalRunToReport: typeof heartbeatRuns.$inferSelect | null = null;
-    const disposition = await input.db.transaction(async (tx) => {
+    const claimCandidate = () => input.db.transaction(async (tx) => {
       await tx.execute(
         sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
       );
@@ -967,6 +977,31 @@ export async function claimNativeRestartRecoveries(input: {
         ...common,
       } satisfies NativeRestartRecoveryClaim;
     });
+    // Restore can hold a run row while waiting for the issue row. Retry one
+    // lock conflict in a fresh transaction, then defer only this candidate;
+    // a second lock conflict must not abort the rest of the recovery pass.
+    let disposition: NativeRestartRecoveryDisposition;
+    try {
+      disposition = await claimCandidate();
+    } catch (error) {
+      if (!isRecoveryClaimLockConflict(error)) throw error;
+      terminalRunToReport = null;
+      try {
+        disposition = await claimCandidate();
+      } catch (retryError) {
+        if (!isRecoveryClaimLockConflict(retryError)) throw retryError;
+        terminalRunToReport = null;
+        logger.warn(
+          { err: retryError, runId: candidate.runId, issueId: candidate.issueId },
+          "Native restart recovery deferred after lock contention",
+        );
+        disposition = {
+          kind: "deferred_lock_conflict",
+          runId: candidate.runId,
+          reason: "native_restart_recovery_lock_conflict",
+        };
+      }
+    }
     if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport);
     dispositions.push(disposition);
   }

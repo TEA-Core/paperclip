@@ -1446,6 +1446,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/merge-arming/release",
   "POST /api/issues/{id}/merge-arming/release-override",
   "POST /api/issues/{id}/execution-stage/board-decision",
+  "POST /api/issues/{id}/restore-participant",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -3990,6 +3991,67 @@ registry.registerPath({
     },
     404: r.notFound,
     422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/restore-participant",
+  tags: ["issues"],
+  summary: "Restore the assignee of an already-pending agent execution stage",
+  description:
+    "Board-only compare-and-set repair requiring assignment authority for the pending participant. " +
+    "All four expected values must match the locked issue row. The issue must be in_review or blocked " +
+    "with an active, undecided policy stage naming the agent; completed/skipped stages, removed agent " +
+    "memberships, fixed conversation identities, external chat channel bindings, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
+    "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
+    "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
+    "Native restart recovery uses the opposite issue-then-run order: it retries a lock timeout or " +
+    "deadlock once in a fresh transaction, then defers that issue and schedules three fast backoff " +
+    "passes at 1, 2 and 4 seconds. Exhaustion logs an error and emits one error-level " +
+    "native.recovery.transition run event (reason lock_retry_exhausted); a still-lock-conflicted " +
+    "candidate continues on a 5-second periodic retry, rather than remaining stranded after the cap. " +
+    "The repair's 250ms lock timeout returns 409 with details.code=participant_restore_lock_busy, " +
+    "details.retryable=true, and Retry-After: 1. Nested-only paperclipIssue.id heartbeat wakes stay " +
+    "unscoped but acquire the issue-row lock for queued-run admission, same-scope coalescing and bounded " +
+    "retry scheduling, and a former owner is refused once the pending stage belongs to another participant. " +
+    "Delayed disposition retries also lock the source issue through their receipt/run insert and recheck the current assignee. " +
+    "Raw operator SQL live-run inserts are the named residual race; see doc/restore-participant-assurance.md for the writer census. " +
+    "Self-declared runs first change status/assignee under an issue-row update predicate, excluding " +
+    "eligible restore in either order, but do not hold a continuous issue-row lock through run insertion. " +
+    "This is not an exhaustive writer guarantee. Only the assignee and updatedAt change; status, " +
+    "statusVersion, executionState, decision history and pendingSince remain unchanged. " +
+    "Does not wake or re-arm the stage.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({
+      expectedAssigneeAgentId: z.string().uuid().nullable(),
+      expectedStatus: z.string().min(1),
+      expectedStatusVersion: z.number().int().nonnegative(),
+      expectedPendingParticipantAgentId: z.string().uuid(),
+    }).strict()),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: {
+      description: "Conflict. A restore lock timeout (55P03) or deadlock (40P01) returns details.code=participant_restore_lock_busy, details.retryable=true and Retry-After: 1; other eligibility conflicts are not automatically retryable.",
+      headers: {
+        "Retry-After": { description: "One second; present only on a restore lock timeout or deadlock.", schema: { type: "integer", minimum: 1 } },
+      },
+      content: {
+        "application/json": {
+          schema: z.object({
+            error: z.string(),
+            code: z.string().optional(),
+            details: z.object({ code: z.string().optional(), retryable: z.boolean().optional() }).passthrough().optional(),
+          }),
+        },
+      },
+    },
   },
 });
 

@@ -1530,6 +1530,9 @@ const nativeSessionResumeDispatchTimers = new Map<
   string,
   ReturnType<typeof setTimeout>
 >();
+const MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES = 3;
+const NATIVE_RESTART_RECOVERY_POST_CAP_RETRY_MS = 5_000;
+const nativeRestartRecoveryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 // Task drain: an operator-controlled hold on new run admission, so a caller
 // can wait for active work to finish before it stops the process. The state
 // lives in process memory only — a process restart clears it — and it sits at
@@ -16099,16 +16102,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function recoverNativeRunsAfterRestart(now = new Date()) {
+  function scheduleNativeRestartRecoveryLockRetry(
+    runId: string,
+    attempt: number,
+    intent: Awaited<ReturnType<typeof readHotRestartIntent>>,
+  ) {
+    clearTimeout(nativeRestartRecoveryRetryTimers.get(runId));
+    const timer = setTimeout(() => {
+      if (nativeRestartRecoveryRetryTimers.get(runId) !== timer) return;
+      nativeRestartRecoveryRetryTimers.delete(runId);
+      const execution = recoverNativeRunsAfterRestart(new Date(), {
+        runId,
+        attempt,
+        intent,
+      }).catch((error) => {
+        logger.error({ err: error, runId, attempt }, "scheduled native restart recovery failed");
+      });
+      activeRunExecutionPromises.add(execution);
+      void execution.finally(() => activeRunExecutionPromises.delete(execution));
+    }, attempt > MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES
+      ? NATIVE_RESTART_RECOVERY_POST_CAP_RETRY_MS
+      : 1000 * 2 ** (attempt - 1));
+    timer.unref?.();
+    nativeRestartRecoveryRetryTimers.set(runId, timer);
+  }
+
+  async function recoverNativeRunsAfterRestart(
+    now = new Date(),
+    retry: {
+      runId: string;
+      attempt: number;
+      intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
+    } | null = null,
+  ) {
     // A result committed before the old controller stopped outranks process
     // recovery. Finish its durable workspace/status suffix before deciding
     // whether any provider authority needs to be reopened.
-    await reconcileNativeFinalizations(db, undefined, {
-      environmentRuntime,
-      onWorkspaceSettled: settleRecoveredNativeWorkspace,
-    });
-    scheduleRetainedNativeSessionCleanup();
-    const intent = await readHotRestartIntent().catch((error) => {
+    if (!retry) {
+      await reconcileNativeFinalizations(db, undefined, {
+        environmentRuntime,
+        onWorkspaceSettled: settleRecoveredNativeWorkspace,
+      });
+      scheduleRetainedNativeSessionCleanup();
+    }
+    const intent = retry ? retry.intent : await readHotRestartIntent().catch((error) => {
       logger.warn(
         { err: error },
         "failed to read hot-restart intent before native startup recovery",
@@ -16119,7 +16156,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const previousStartedAt = intent?.previousServerStartedAt
       ? new Date(intent.previousServerStartedAt)
       : null;
-    const scheduledNativeRetries = await db
+    const scheduledNativeRetries = retry ? [] : await db
       .select({
         runId: nativeRunFinalizations.runId,
         nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
@@ -16160,6 +16197,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null,
       now,
+      ...(retry ? { runIds: [retry.runId] } : {}),
     });
 
     const claims = dispositions.filter(
@@ -16169,6 +16207,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         disposition.kind === "bootstrap_incomplete",
     );
     for (const disposition of dispositions) {
+      if (disposition.kind === "deferred_lock_conflict") {
+        const attempt = retry?.attempt ?? 0;
+        if (attempt < MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES) {
+          scheduleNativeRestartRecoveryLockRetry(disposition.runId, attempt + 1, intent);
+          continue;
+        }
+        // The fast retries are capped, not recovery itself: a persistent lock
+        // must not strand this run after it eventually clears.
+        scheduleNativeRestartRecoveryLockRetry(
+          disposition.runId,
+          MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES + 1,
+          intent,
+        );
+        if (attempt > MAX_NATIVE_RESTART_RECOVERY_LOCK_RETRIES) continue;
+        logger.error(
+          { runId: disposition.runId, attempt },
+          "native restart recovery exhausted fast lock retries; periodic retry scheduled, inspect persistent contention",
+        );
+      }
       const run = await getRun(disposition.runId);
       if (run) {
         const isClaim =
@@ -16178,7 +16235,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await appendRunEvent(run, {
           eventType: "native.recovery.transition",
           stream: "system",
-          level: disposition.kind === "blocked" ? "warn" : "info",
+          level: disposition.kind === "deferred_lock_conflict" ? "error"
+            : disposition.kind === "blocked" ? "warn" : "info",
           message:
             disposition.kind === "reattach_existing_runner"
               ? "Recovering the existing native runner process after server restart"
@@ -16190,7 +16248,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     ? "Native restart recovery is waiting for safe ownership evidence"
                     : disposition.kind === "already_finalized"
                       ? "Native restart recovery found an already-finalized result"
-                      : "Native restart recovery blocked ambiguous or conflicting ownership",
+                      : disposition.kind === "deferred_lock_conflict"
+                        ? "Native restart recovery exhausted fast lock retries; periodic retry scheduled, inspect persistent contention"
+                        : "Native restart recovery blocked ambiguous or conflicting ownership",
           payload: {
             restartKind: isClaim ? disposition.restartKind : restartKind,
             recoveryRequestId: isClaim
@@ -16202,7 +16262,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   controllerGeneration: disposition.controllerGeneration,
                   providerAttempt: disposition.providerAttempt,
                 }
-              : { reason: disposition.reason }),
+              : disposition.kind === "deferred_lock_conflict"
+                ? { reason: "lock_retry_exhausted", retryAttempts: retry?.attempt ?? 0 }
+                : { reason: disposition.reason }),
             ...(disposition.kind === "reattach_existing_runner"
               ? {
                   processPid: disposition.process.pid,
@@ -16534,6 +16596,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const nestedIssueId = !issueId
+      ? readNonEmptyString(parseObject(contextSnapshot.paperclipIssue).id)
+      : null;
+    const nestedIssueLockId = nestedIssueId && isUuidLike(nestedIssueId) ? nestedIssueId : null;
 
     if (!baseSchedule) {
       const exhaustion = {
@@ -16770,6 +16836,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const scheduleResult = await db.transaction(
       async (tx): Promise<ScheduledRetryTransactionResult> => {
+        if (nestedIssueLockId) {
+          await tx.execute(
+            sql`select id from issues where company_id = ${run.companyId} and id = ${nestedIssueLockId} for update`,
+          );
+        }
         // All automatic failure paths share the same predecessor claim. A
         // duplicate monitor, restart sweep or wake must reuse its successor.
         if (
@@ -16799,6 +16870,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               run: existing,
               reusedExisting: true,
             };
+        }
+        if (nestedIssueLockId) {
+          const [lockedIssue] = await tx.select({
+            assigneeAgentId: issues.assigneeAgentId,
+            executionState: issues.executionState,
+          }).from(issues).where(and(
+            eq(issues.companyId, run.companyId),
+            eq(issues.id, nestedIssueLockId),
+          ));
+          if (!lockedIssue) return {
+            outcome: "not_scheduled",
+            reason: "Scheduled retry suppressed because the nested issue no longer exists",
+            errorCode: "issue_not_found",
+            issueId: nestedIssueLockId,
+            details: { issueId: nestedIssueLockId },
+          };
+          const state = parseObject(lockedIssue.executionState);
+          const participant = parseObject(state.currentParticipant);
+          if (
+            state.status === "pending" &&
+            lockedIssue.assigneeAgentId !== run.agentId &&
+            !(participant.type === "agent" && participant.agentId === run.agentId)
+          ) return {
+            outcome: "not_scheduled",
+            reason: "Scheduled retry suppressed because nested issue ownership changed",
+            errorCode: "issue_reassigned",
+            issueId: nestedIssueLockId,
+            details: { issueId: nestedIssueLockId, currentAssigneeAgentId: lockedIssue.assigneeAgentId },
+          };
         }
         if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
           if (issueId) {
@@ -22944,6 +23044,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // activeRunExecutionPromises, and the second await drains that run. A wakeup or
   // a run can add more entries as it settles, so loop until both sets are empty.
   async function drainActiveRunExecutions() {
+    for (const timer of nativeRestartRecoveryRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    nativeRestartRecoveryRetryTimers.clear();
     for (const timer of nativeSessionResumeDispatchTimers.values()) {
       clearTimeout(timer);
     }
@@ -22955,6 +23059,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await Promise.allSettled([...activeWakeupPromises]);
       await Promise.all([...activeRunExecutionPromises]);
     }
+    // A retry already firing when drain began may have scheduled its next pass
+    // while we awaited it; cancel that newly-created timer as well.
+    for (const timer of nativeRestartRecoveryRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    nativeRestartRecoveryRetryTimers.clear();
   }
 
   function scheduleNativeSessionResumeDispatch(
@@ -32760,44 +32870,93 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             coalescedTargetRun.status === "scheduled_retry",
         },
       );
-      const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
-        writeSite: "enqueueWakeup:same-scope-coalesce",
-        runId: coalescedTargetRun.id,
-        agentId,
-        companyId: agent.companyId,
-        write: () =>
-          db
-            .update(heartbeatRuns)
-            .set({
-              contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
-              updatedAt: new Date(),
-            })
-            .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-            .returning()
-            .then((rows) => rows[0] ?? coalescedTargetRun),
-        fallback: coalescedTargetRun,
-      });
-
-      await db.insert(agentWakeupRequests).values({
-        ...durableReceiptFields,
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
+      const persistCoalescedWake = async (executor: Db) => {
+        const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
+          writeSite: "enqueueWakeup:same-scope-coalesce",
+          runId: coalescedTargetRun.id,
+          agentId,
+          companyId: agent.companyId,
+          write: () =>
+            executor
+              .update(heartbeatRuns)
+              .set({
+                contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
+                updatedAt: new Date(),
+              })
+              .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+              .returning()
+              .then((rows) => rows[0] ?? coalescedTargetRun),
+          fallback: coalescedTargetRun,
+        });
+        await executor.insert(agentWakeupRequests).values({
+          ...durableReceiptFields,
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return mergedRun;
+      };
+      const nestedIssueId = readNonEmptyString(parseObject(mergedContextSnapshot.paperclipIssue).id);
+      const mergedRun = nestedIssueId && isUuidLike(nestedIssueId)
+        ? await db.transaction(async (tx) => {
+            // Match restore's run-then-issue lock order even when this queued run
+            // was previously unbound and therefore absent from its first scan.
+            await tx.execute(sql`select id from heartbeat_runs where company_id = ${agent.companyId} and id = ${coalescedTargetRun.id} for update`);
+            const [lockedIssue] = await tx.select({
+              assigneeAgentId: issues.assigneeAgentId,
+              executionState: issues.executionState,
+            }).from(issues).where(and(
+              eq(issues.companyId, agent.companyId),
+              eq(issues.id, nestedIssueId),
+            )).for("update");
+            const state = parseObject(lockedIssue?.executionState);
+            const participant = parseObject(state.currentParticipant);
+            if (lockedIssue &&
+              state.status === "pending" &&
+              lockedIssue.assigneeAgentId !== agentId &&
+              !(participant.type === "agent" && participant.agentId === agentId)
+            ) return null;
+            return persistCoalescedWake(tx as unknown as Db);
+          })
+        : await persistCoalescedWake(db);
+      if (!mergedRun) {
+        await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId });
+        return null;
+      }
       return mergedRun;
     }
 
+    // Admission-only lock key: a nested-only issue binding is not normalized into
+    // the context, so the task key and execution context stay unchanged.
+    const nestedIssueId = readNonEmptyString(parseObject(enrichedContextSnapshot.paperclipIssue).id);
     const queueOutcome = await db.transaction(async (tx) => {
+      if (nestedIssueId && isUuidLike(nestedIssueId)) {
+        const [nestedIssue] = await tx.select({
+          assigneeAgentId: issues.assigneeAgentId,
+          executionState: issues.executionState,
+        }).from(issues).where(and(
+          eq(issues.id, nestedIssueId),
+          eq(issues.companyId, agent.companyId),
+        )).for("update");
+        const state = parseObject(nestedIssue?.executionState);
+        const participant = parseObject(state.currentParticipant);
+        if (nestedIssue && state.status === "pending" &&
+          nestedIssue.assigneeAgentId !== agentId &&
+          !(participant.type === "agent" && participant.agentId === agentId)) {
+          await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId }, tx);
+          return { kind: "skipped" as const };
+        }
+      }
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );

@@ -275,6 +275,88 @@ bindings require a board delivery receipt. An existing receipt for the PR must
 still authorize the published head. A later head on the certified PR may be
 re-stamped only after Guard A verifies unchanged content.
 
+For a stranded pending execution-policy review/approval stage whose recorded
+agent participant is not its assignee, a board actor authorized to assign to
+that participant may call `POST /api/issues/{id}/restore-participant` with
+`expectedAssigneeAgentId` (nullable), `expectedStatus`,
+`expectedStatusVersion`, and `expectedPendingParticipantAgentId`. The issue
+must be `in_review` or `blocked`; `blocked` keeps its pending stage intact.
+The pending stage id, index, type, and agent participant must match the stored
+execution policy. Completed/skipped stages, stages with an approved decision,
+removed agent memberships, issues with a fixed conversation identity (409) or
+a bound external chat channel (409, as ordinary assignment refuses), and
+participants who would approve their own created/delivered/return-assignee work
+or make a review stage self-satisfying are ineligible. An unfinished goal or
+pending goal-control action for the previous assignee also returns 409: the
+ordinary goal-stop helper may enqueue an offline wake and cannot be called by
+this no-wake repair. Goal actions recheck ownership under the issue-row lock.
+
+A row-locked compare-and-set refuses stale values or any pending interaction,
+active recovery action, live run, checkout/execution lock, or unavailable
+participant with 409. The transaction first row-locks the issue's queued,
+running, or scheduled-retry `heartbeat_runs` rows (ordered by id), then the
+issue row, matching the finalizer's lock order; recovery-action upserts acquire
+the same issue-row lock before writing. No table lock is taken. Native restart
+recovery locks the issue before a run and has a 1-second per-lock timeout; an
+overlap may invert these orders. If recovery times out or deadlocks on a lock,
+it retries that candidate once in a fresh transaction. A second lock conflict
+defers only that issue and schedules three fast recovery passes with
+1-, 2-, and 4-second delays; each pass rechecks the same run's eligibility and
+locks before claiming. Exhaustion logs an error and persists one error-level
+`native.recovery.transition` run event (`reason: lock_retry_exhausted`) for
+board inspection. A candidate that remains lock-conflicted is retried every
+5 seconds after the fast-retry cap until it becomes eligible to claim or its
+eligibility changes; the cap alert is not a permanent liveness stop. Deferral
+never aborts startup, and a rolled-back attempt never reports a run failure
+or grants provider authority.
+
+A successful recovery claim continues through the existing `executeRun`
+dispatch path; these retry rules do not make the claim a no-work terminal step.
+
+Restore sets a 250ms transaction-local lock timeout. On SQLSTATE `55P03` or
+`40P01`, it returns 409 with top-level `code` and `details.code` both equal to
+`"participant_restore_lock_busy"`, `details.retryable = true`, and
+`Retry-After: 1` (seconds), with no partial assignment.
+Other 409 eligibility conflicts do not carry that retry signal.
+After the issue lock and immediately before changing the assignee, a second
+live-run read refuses a run committed while the repair waited for that lock.
+
+Heartbeat wakeup requests whose only issue binding is
+`contextSnapshot.paperclipIssue.id` (a valid UUID in the agent's company) stay
+unscoped, with task key and run context unchanged. Queued-run admission locks
+the issue row, before the agent lock, through insertion, then refuses the
+former owner if the pending stage now belongs to another assignee/participant.
+The same-scope coalescing branch locks the candidate run and nested issue in
+one transaction through its context update and receipt; it refuses a stale
+former-owner binding. `scheduleBoundedRetryForRun` likewise locks a valid nested
+issue id before inserting the retry and rechecks pending-stage ownership under
+that lock. Valid non-UUID nested values remain outside these issue-row locks.
+The provider-quota escalation rechecks a pending stage under the issue lock
+after its action upsert, resolves a stale action minted against a now-restored
+participant, and its monitor locks the issue through any retry insertion.
+`self-declared-run.ts` updates the issue status to `in_progress` while requiring
+the old assignee before its separate run insert; this atomic status/assignee
+predicate excludes an eligible restore in either order.
+The disposition sweep excludes delayed repair retries for a pending execution
+stage: `collectDispositionRepairSourceState` recognizes `execution_stage` as a
+durable waiting path, and an already-active action is refused by restore.
+The delayed disposition insert independently locks the issue row through its
+receipt and run write, rechecking the source assignee and terminal status so
+a stale scheduler snapshot cannot insert a former-owner run after restoration.
+A hand-run operator `heartbeat_runs` SQL insert is the named residual
+race: it bypasses issue-row admission after restore's final read, and this
+operation installs no trigger, revokes no write privileges, and promises no
+exclusivity against it or arbitrary future writers. The observed interleavings
+and admission limits are recorded in `doc/restore-participant-assurance.md`.
+
+The operation changes only the agent assignee (and `updatedAt`) and logs the
+before/after assignment
+atomically. The status and status version remain unchanged (the version
+advances only when status changes); execution state, stage identity,
+pendingSince, and decisions remain untouched. It never arms, approves,
+rejects, re-arms, or wakes the stage, and
+it does not repair cards with active recovery or interactions.
+
 Invariants:
 
 - single assignee only

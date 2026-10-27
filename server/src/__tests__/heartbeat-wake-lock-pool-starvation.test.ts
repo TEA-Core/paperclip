@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agentTaskSessions,
   agentWakeupRequests,
   agents,
+  companyMemberships,
   companies,
   createDb,
   heartbeatRuns,
@@ -15,6 +18,8 @@ import {
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 
 // SUP-17978. enqueueWakeup admits a wake inside a transaction that holds the
 // issue row (or, for a wake with no issue, the agent row) FOR UPDATE. On
@@ -133,6 +138,7 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
       await db.$client.end({ timeout: 1 });
     });
     return {
+      db,
       heartbeat,
       async wake(agentId: string, opts: Parameters<typeof heartbeat.wakeup>[1]) {
         const outcome = heartbeat.wakeup(agentId, opts).then(
@@ -160,17 +166,201 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
     expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
   }, 30_000);
 
+  it("serializes twenty nested-only wakes against held issue rows without altering their task context", async () => {
+    const { wake } = onePool();
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const seed = await seedAgent(`nested-${attempt}`);
+      const issueId = await seedIssue(seed);
+      let signalLocked!: (pid: number) => void;
+      let releaseIssue!: () => void;
+      const locked = new Promise<number>((resolveLocked) => { signalLocked = resolveLocked; });
+      const release = new Promise<void>((resolveRelease) => { releaseIssue = resolveRelease; });
+      const holder = setupDb.transaction(async (tx) => {
+        const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid()::int as pid`);
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+        signalLocked(connection!.pid);
+        await release;
+      });
+      const holderPid = await locked;
+      const waking = wake(seed.agentId, {
+        source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        contextSnapshot: { paperclipIssue: { id: issueId } },
+      });
+      let waitedForIssue = false;
+      let queuedBeforeRelease = false;
+      try {
+        for (let poll = 0; poll < 80; poll += 1) {
+          const [row] = await setupDb.execute<{ waiting: boolean }>(sql`
+            select exists (
+              select 1 from pg_stat_activity
+              where datname = current_database() and pid <> pg_backend_pid()
+                and ${holderPid} = any(pg_blocking_pids(pid))
+            ) as waiting
+          `);
+          if (row?.waiting) { waitedForIssue = true; break; }
+          await sleep(25);
+        }
+        queuedBeforeRelease = (await setupDb.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+          .where(eq(heartbeatRuns.companyId, seed.companyId))).length > 0;
+      } finally {
+        releaseIssue();
+        await holder;
+      }
+      const result = await waking;
+      expect({ attempt, waitedForIssue, queuedBeforeRelease }).toEqual({
+        attempt, waitedForIssue: true, queuedBeforeRelease: false,
+      });
+      expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
+      const [queued] = await setupDb.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, "runId" in result ? result.runId! : ""));
+      expect(queued?.contextSnapshot).toMatchObject({ paperclipIssue: { id: issueId } });
+      expect(queued?.contextSnapshot).not.toHaveProperty("issueId");
+      expect(queued?.contextSnapshot).not.toHaveProperty("taskKey");
+    }
+  }, 120_000);
+
+  it("admits twenty nested-only wakes after an actual restore releases the issue row", async () => {
+    const { db, heartbeat, wake } = onePool();
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", source: "local_implicit" } as Express.Request["actor"];
+      next();
+    });
+    app.use("/api", issueRoutes(setupDb, {} as Parameters<typeof issueRoutes>[1], {} as Parameters<typeof issueRoutes>[2]));
+    app.use(errorHandler);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const seed = await seedAgent(`restored-${attempt}`);
+      const participantId = randomUUID();
+      const independentId = randomUUID();
+      const issueId = randomUUID();
+      const stageId = randomUUID();
+      await setupDb.insert(agents).values([
+        { id: participantId, companyId: seed.companyId, name: "Participant", adapterType: "codex_local", status: "idle" },
+        { id: independentId, companyId: seed.companyId, name: "Independent", adapterType: "codex_local", status: "idle" },
+      ]);
+      await setupDb.insert(companyMemberships).values([
+        { companyId: seed.companyId, principalType: "agent", principalId: seed.agentId, status: "active", membershipRole: "member" },
+        { companyId: seed.companyId, principalType: "agent", principalId: participantId, status: "active", membershipRole: "member" },
+      ]);
+      await setupDb.insert(issues).values({
+        id: issueId, companyId: seed.companyId, projectId: seed.projectId,
+        projectWorkspaceId: seed.projectWorkspaceId, title: "Held restore wake",
+        status: "blocked", assigneeAgentId: seed.agentId,
+        executionPolicy: { mode: "normal", stages: [{
+          id: stageId, type: "review", approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: participantId }, { type: "agent", agentId: independentId }],
+        }] },
+        executionState: {
+          status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: participantId, userId: null },
+          pendingSince: "2026-10-25T04:57:54.443Z", completedStageIds: [], skippedStageIds: [],
+          lastDecisionId: randomUUID(), lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: 1, returnAssignee: { type: "agent", agentId: seed.agentId, userId: null },
+        },
+      });
+      let signalLocked!: (pid: number) => void;
+      let releaseAudit!: () => void;
+      const locked = new Promise<number>((resolve) => { signalLocked = resolve; });
+      const release = new Promise<void>((resolve) => { releaseAudit = resolve; });
+      const auditHolder = setupDb.transaction(async (tx) => {
+        const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid()::int as pid`);
+        await tx.execute(sql`lock table activity_log in access exclusive mode`);
+        signalLocked(connection!.pid);
+        await release;
+      });
+      const auditPid = await locked;
+      const restoring = Promise.resolve(request(app).post(`/api/issues/${issueId}/restore-participant`).send({
+        expectedAssigneeAgentId: seed.agentId, expectedStatus: "blocked",
+        expectedStatusVersion: 0, expectedPendingParticipantAgentId: participantId,
+      }));
+      let restorePid: number | null = null;
+      let waitedForRestore = false;
+      let queuedBeforeRelease = false;
+      let waking: ReturnType<typeof wake> | null = null;
+      try {
+        for (let poll = 0; poll < 80; poll += 1) {
+          const [row] = await setupDb.execute<{ pid: number | null }>(sql`
+            select pid from pg_stat_activity
+            where datname = current_database() and pid <> pg_backend_pid()
+              and ${auditPid} = any(pg_blocking_pids(pid))
+              and query like '%activity_log%'
+            limit 1
+          `);
+          if (row?.pid) { restorePid = row.pid; break; }
+          await sleep(5);
+        }
+        if (restorePid) {
+          waking = wake(participantId, {
+            source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+            contextSnapshot: { paperclipIssue: { id: issueId } },
+          });
+          for (let poll = 0; poll < 80; poll += 1) {
+            const [row] = await setupDb.execute<{ waiting: boolean }>(sql`
+              select exists (
+                select 1 from pg_stat_activity
+                where datname = current_database() and pid <> pg_backend_pid()
+                  and ${restorePid} = any(pg_blocking_pids(pid))
+              ) as waiting
+            `);
+            if (row?.waiting) { waitedForRestore = true; break; }
+            await sleep(5);
+          }
+          queuedBeforeRelease = (await setupDb.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+            .where(eq(heartbeatRuns.companyId, seed.companyId))).length > 0;
+        }
+      } finally {
+        releaseAudit();
+        await auditHolder;
+      }
+      const response = await restoring;
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect({ attempt, restorePid: !!restorePid, waitedForRestore, queuedBeforeRelease, status: response.status })
+        .toEqual({ attempt, restorePid: true, waitedForRestore: true, queuedBeforeRelease: false, status: 200 });
+      const result = await waking!;
+      expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
+      const [queued] = await setupDb.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, "runId" in result ? result.runId! : ""));
+      expect(queued?.contextSnapshot).toMatchObject({ paperclipIssue: { id: issueId } });
+      expect(queued?.contextSnapshot).not.toHaveProperty("issueId");
+      expect(queued?.contextSnapshot).not.toHaveProperty("taskKey");
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    }
+  }, 120_000);
+
+  it("keeps a nested-only wake with a non-UUID id unscoped and admits it", async () => {
+    const seed = await seedAgent("nested-unscoped");
+    const { wake } = onePool();
+    const result = await wake(seed.agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      contextSnapshot: { paperclipIssue: { id: "SUP-1" } },
+    });
+    expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
+    const [queued] = await setupDb.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, "runId" in result ? result.runId! : ""));
+    expect(queued?.contextSnapshot).toMatchObject({ paperclipIssue: { id: "SUP-1" } });
+    for (const key of ["issueId", "taskId", "taskKey"]) {
+      expect(queued?.contextSnapshot).not.toHaveProperty(key);
+    }
+  }, 30_000);
+
   it("admits a wake with no issue without reading the responsible user through the pool", async () => {
     const seed = await seedAgent("agent");
     const { wake } = onePool();
-
+    const executionContext = { owner: "background", scope: ["unscoped", "retry"] };
     const result = await wake(seed.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: "pool_starvation_probe",
+      contextSnapshot: { taskKey: "unscoped-operator-job", executionContext },
     });
 
     expect(result).toMatchObject({ settled: true, runId: expect.any(String) });
+    const [queued] = await setupDb.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, "runId" in result ? result.runId! : ""));
+    expect(queued?.contextSnapshot?.taskKey).toBe("unscoped-operator-job");
+    expect(JSON.stringify(queued?.contextSnapshot?.executionContext)).toBe(JSON.stringify(executionContext));
+    expect(queued?.contextSnapshot).not.toHaveProperty("issueId");
   }, 30_000);
 
   it("admits as many concurrent wakes for one issue as the pool has connections", async () => {

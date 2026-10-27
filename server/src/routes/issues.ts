@@ -34,11 +34,14 @@ import {
   not,
   notInArray,
   sql,
+  or,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
+  agentSessionGoalActions,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
@@ -231,6 +234,7 @@ import {
 import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../services/release-ladder.js";
 import {
   evaluateStageIntegrity,
+  resolveSelfApprovalPrincipals,
   latestDecisionPerStage,
   readApprovalHeadDelta,
   readApprovalPullRequest,
@@ -310,6 +314,7 @@ import {
   unprocessable,
 } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
+import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
@@ -412,7 +417,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -12700,6 +12705,237 @@ export function issueRoutes(
       externalChannelBinding,
     });
   });
+
+  // A mechanical repair for a stranded, already-pending agent stage. Unlike PATCH,
+  // this never evaluates the execution policy or schedules a wake.
+  const restoreParticipantBody = z.object({
+    expectedAssigneeAgentId: z.string().uuid().nullable(),
+    expectedStatus: z.string().min(1),
+    expectedStatusVersion: z.number().int().nonnegative(),
+    expectedPendingParticipantAgentId: z.string().uuid(),
+  }).strict();
+  router.post("/issues/:id/restore-participant", async (req, res) => {
+      assertBoard(req);
+      const expected = restoreParticipantBody.parse(req.body);
+      const id = req.params.id as string;
+      const visible = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!visible) return;
+      await assertCanAssignTasks(req, visible.companyId, {
+        issueId: visible.id,
+        projectId: visible.projectId ?? null,
+        parentIssueId: visible.parentId ?? null,
+        assigneeAgentId: expected.expectedPendingParticipantAgentId,
+        assigneeUserId: null,
+      });
+      const actor = getActorInfo(req);
+      const postCommitActivityPublications: ActivityPublication[] = [];
+
+      const updated = await db.transaction(async (tx) => {
+        // Bound restore's run-then-issue lock wait; restart recovery retries lock conflicts.
+        await tx.execute(sql`set local lock_timeout = '250ms'`);
+        // Finalizers can lock a run row before its issue row; preserve that order.
+        const liveRunPredicate = and(
+          eq(heartbeatRuns.companyId, visible.companyId),
+          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          or(
+            eq(heartbeatRuns.nativeIssueId, visible.id),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${visible.id}`,
+            sql`${heartbeatRuns.contextSnapshot}->'paperclipIssue'->>'id' = ${visible.id}`,
+          ),
+        );
+        const liveRuns = await tx.select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(liveRunPredicate)
+          .orderBy(asc(heartbeatRuns.id))
+          .for("update");
+        const [issue] = await tx.select().from(issueRows)
+          .where(and(eq(issueRows.id, visible.id), eq(issueRows.companyId, visible.companyId)))
+          .for("update");
+        if (!issue) throw notFound("Issue not found");
+        const state = issue.executionState;
+        const participant = state?.currentParticipant;
+        const participantId = participant && typeof participant === "object" && "agentId" in participant
+          ? participant.agentId : null;
+        if (
+          issue.assigneeAgentId !== expected.expectedAssigneeAgentId ||
+          issue.status !== expected.expectedStatus ||
+          issue.statusVersion !== expected.expectedStatusVersion ||
+          participantId !== expected.expectedPendingParticipantAgentId
+        ) throw conflict("Issue changed since the restoration snapshot");
+        if (
+          (issue.status !== "in_review" && issue.status !== "blocked") ||
+          issue.assigneeAgentId === participantId || issue.assigneeUserId !== null ||
+          state?.status !== "pending" ||
+          typeof state.currentStageId !== "string" || !state.currentStageId ||
+          (state.currentStageType !== "review" && state.currentStageType !== "approval") ||
+          !participant || typeof participant !== "object" ||
+          !("type" in participant) || participant.type !== "agent" ||
+          issue.checkoutRunId !== null || issue.executionRunId !== null ||
+          issue.executionLockedAt !== null || issue.executionAgentNameKey !== null
+        ) throw conflict("Issue is not eligible for participant restoration");
+        if (issue.conversationAgentId) throw conflict("Conversation identity is fixed");
+        const [externalBinding] = await tx.select({ id: chatConversations.id })
+          .from(chatConversations)
+          .where(and(eq(chatConversations.companyId, issue.companyId), eq(chatConversations.issueId, issue.id)))
+          .limit(1);
+        if (externalBinding) {
+          throw conflict("Agent assignment cannot change while this task is bound to an external channel", {
+            code: "chat_binding_agent_locked",
+            conversationId: externalBinding.id,
+          });
+        }
+        const parsedState = parseIssueExecutionState(state);
+        let policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
+        try {
+          policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+        } catch {
+          throw conflict("Pending stage does not match the issue execution policy");
+        }
+        const stage = policy?.stages[parsedState?.currentStageIndex ?? -1];
+        if (
+          !parsedState || !stage ||
+          stage.id !== parsedState.currentStageId ||
+          stage.type !== parsedState.currentStageType ||
+          parsedState.completedStageIds.includes(stage.id) ||
+          parsedState.skippedStageIds?.includes(stage.id) ||
+          !stage.participants.some((candidate) => candidate.type === "agent" && candidate.agentId === participantId)
+        ) throw conflict("Pending stage does not match the issue execution policy");
+        const [priorApproval] = await tx.select({ id: issueExecutionDecisions.id })
+          .from(issueExecutionDecisions)
+          .where(and(
+            eq(issueExecutionDecisions.companyId, issue.companyId),
+            eq(issueExecutionDecisions.issueId, issue.id),
+            eq(issueExecutionDecisions.stageId, stage.id),
+            eq(issueExecutionDecisions.outcome, "approved"),
+          )).limit(1);
+        if (priorApproval) throw conflict("Pending stage has already been approved");
+        if (
+          findSelfSatisfyingReviewStage({
+            executionPolicy: issue.executionPolicy,
+            executionState: state,
+            incomingAssigneeAgentId: participantId,
+          }) ||
+          resolveSelfApprovalPrincipals(
+            (issue.executionPolicy ?? {}) as Record<string, unknown>,
+            (state ?? {}) as Record<string, unknown>,
+            issue.createdByAgentId ?? null,
+          ).agentIds.has(participantId as string)
+        ) throw conflict("Pending participant cannot approve their own work");
+
+        const [agent] = await tx.select().from(agents)
+          .where(and(eq(agents.id, participantId as string), eq(agents.companyId, issue.companyId)))
+          .for("update");
+        if (!agent || !(await evaluateAgentInvokabilityFromDb(tx as unknown as Db, agent)).invokable) {
+          throw conflict("Pending participant is not invokable");
+        }
+        const [membership] = await tx.select({ id: companyMemberships.id })
+          .from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, issue.companyId),
+            eq(companyMemberships.principalType, "agent"),
+            eq(companyMemberships.principalId, agent.id),
+            eq(companyMemberships.status, "active"),
+          )).for("share");
+        if (!membership) throw conflict("Pending participant has no active company membership");
+        const [interaction] = await tx.select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.status, "pending"),
+          )).limit(1);
+        if (interaction) throw conflict("Issue has a pending interaction");
+        const [recovery] = await tx.select({ id: issueRecoveryActions.id })
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.companyId, issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issue.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          )).limit(1);
+        if (recovery) throw conflict("Issue has an active recovery action");
+        // An unfinished goal can later issue offline control for the old owner.
+        // This repair cannot call the ordinary stop helper: it may enqueue a wake.
+        const priorSessions = issue.assigneeAgentId
+          ? await tx.select({ id: agentTaskSessions.id, goalJson: agentTaskSessions.goalJson })
+              .from(agentTaskSessions)
+              .where(and(
+                eq(agentTaskSessions.companyId, issue.companyId),
+                eq(agentTaskSessions.agentId, issue.assigneeAgentId),
+                eq(agentTaskSessions.taskKey, issue.id),
+              ))
+              .orderBy(asc(agentTaskSessions.id))
+              .for("share")
+          : [];
+        if (priorSessions.some((session) => session.goalJson && session.goalJson.status !== "complete")) {
+          throw conflict("Previous assignee has an unfinished runner goal", { code: "runner_goal_active" });
+        }
+        if (priorSessions.length > 0) {
+          const [pendingGoalAction] = await tx.select({ id: agentSessionGoalActions.id })
+            .from(agentSessionGoalActions)
+            .where(and(
+              eq(agentSessionGoalActions.companyId, issue.companyId),
+              inArray(agentSessionGoalActions.sessionId, priorSessions.map((session) => session.id)),
+              inArray(agentSessionGoalActions.status, ["pending", "delivering", "delivered"]),
+            ))
+            .limit(1);
+          if (pendingGoalAction) {
+            throw conflict("Previous assignee has a pending runner goal action", { code: "runner_goal_action_pending" });
+          }
+        }
+        if (liveRuns.length > 0) throw conflict("Issue has a live run");
+        // A wakeup can insert a new run while this transaction waits for the issue row.
+        // This plain read avoids reversing the run-row/issue-row lock order with finalizers.
+        const [newLiveRun] = await tx.select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(liveRunPredicate)
+          .limit(1);
+        if (newLiveRun) throw conflict("Issue has a live run");
+
+        const [restored] = await tx.update(issueRows)
+          .set({ assigneeAgentId: agent.id, updatedAt: new Date() })
+          .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId)))
+          .returning();
+        await logActivityInTransaction(
+          tx as unknown as Db,
+          {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
+            actorId: actor.actorId,
+            action: "issue.participant_restored",
+            entityType: "issue",
+            entityId: issue.id,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            details: {
+              identifier: issue.identifier,
+              stageId: state.currentStageId,
+              before: { assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId },
+              after: { assigneeAgentId: agent.id, assigneeUserId: issue.assigneeUserId },
+            },
+          },
+          postCommitActivityPublications,
+        );
+        return restored;
+      }).catch((error: unknown) => {
+        for (
+          let cause: unknown = error;
+          cause && typeof cause === "object";
+          cause = "cause" in cause ? cause.cause : null
+        ) {
+          if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) {
+            res.setHeader("Retry-After", "1");
+            throw conflict("Issue is busy; retry participant restoration", {
+              code: "participant_restore_lock_busy",
+              retryable: true,
+            });
+          }
+        }
+        throw error;
+      });
+      for (const publication of postCommitActivityPublications) publishActivity(publication);
+      res.json(updated);
+    });
 
   router.get("/issues/:id/watchdog", async (req, res) => {
     const id = req.params.id as string;

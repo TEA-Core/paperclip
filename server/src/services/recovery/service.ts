@@ -4074,6 +4074,19 @@ export function recoveryService(
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
     return db.transaction(async (tx) => {
+      const [current] = await tx.select({
+        assigneeAgentId: issues.assigneeAgentId,
+        executionState: issues.executionState,
+      }).from(issues).where(and(
+        eq(issues.id, input.issue.id),
+        eq(issues.companyId, input.issue.companyId),
+      )).for("update");
+      if (!current) return null;
+      const state = parseIssueExecutionState(current.executionState);
+      const pending = state?.currentParticipant;
+      if (state?.status === "pending" && pending?.type === "agent" &&
+        pending.agentId === current.assigneeAgentId &&
+        pending.agentId !== input.agentId) return null;
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -4745,7 +4758,20 @@ export function recoveryService(
           scheduledRun = enqueuedRun ?? (await findScheduledRun());
           created = Boolean(enqueuedRun);
         } else {
-          scheduledRun = await db.transaction(async (tx) => {
+          const deferredRun = await db.transaction(async (tx) => {
+            // Match restore's issue lock through both receipt and run insertion.
+            // The sweep's earlier snapshot can become stale while restore commits.
+            const [currentIssue] = await tx
+              .select({ assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+              .from(issues)
+              .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+              .for("update");
+            if (
+              !currentIssue ||
+              currentIssue.assigneeAgentId !== agentId ||
+              currentIssue.status === "done" ||
+              currentIssue.status === "cancelled"
+            ) return null;
             const wakeup = await tx
               .insert(agentWakeupRequests)
               .values({
@@ -4797,6 +4823,8 @@ export function recoveryService(
               .where(eq(agentWakeupRequests.id, wakeup.id));
             return run;
           });
+          if (!deferredRun) return null;
+          scheduledRun = deferredRun;
           created = true;
         }
       } catch (error) {
@@ -5415,7 +5443,26 @@ export function recoveryService(
         .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
         .for("update").limit(1);
       if (!current) return null;
-      const pendingParticipant = parseIssueExecutionState(current.executionState)?.currentParticipant;
+      const pendingState = parseIssueExecutionState(current.executionState);
+      const pendingParticipant = pendingState?.currentParticipant;
+      // The board may have restored this participant while the stale quota
+      // snapshot waited for the issue lock. Do not replace its stage with a
+      // recovery park or leave a newly minted action blocking the review.
+      if (recoveryCause === "provider_quota" &&
+        pendingState?.status === "pending" &&
+        current.assigneeAgentId !== input.issue.assigneeAgentId &&
+        pendingParticipant?.type === "agent" &&
+        pendingParticipant.agentId === current.assigneeAgentId) {
+        await issueRecoveryActionService(txDb).resolveActiveForIssue({
+          companyId: current.companyId,
+          sourceIssueId: current.id,
+          actionId: routedAction.id,
+          status: "resolved",
+          outcome: "restored",
+          resolutionNote: "participant_restored_during_quota_escalation",
+        });
+        return null;
+      }
       const participantAgent = pendingParticipant?.type === "agent" &&
         pendingParticipant.agentId &&
         pendingParticipant.agentId === current.assigneeAgentId
@@ -11575,6 +11622,7 @@ export function recoveryService(
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
+    scheduleDispositionRepairAttempt,
     recordWatchdogDecision,
     scanSilentActiveRuns,
     scanTerminableSilentActiveRuns,
