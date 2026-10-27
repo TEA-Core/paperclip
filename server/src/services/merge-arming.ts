@@ -1010,6 +1010,8 @@ async function fetchGitHubNodeIdOnce(
  */
 export const ENABLE_ATTEMPT_TIMEOUT_MS = 10_000;
 export const ENABLE_WORST_CASE_MS = 3 * ENABLE_ATTEMPT_TIMEOUT_MS + 250 + 500;
+/** The deadline an enable call gets when the caller names none (a mutable object so a test can shorten it). */
+export const enableTiming: { attemptTimeoutMs: number } = { attemptTimeoutMs: ENABLE_ATTEMPT_TIMEOUT_MS };
 
 export interface EnableAutoMergeOptions {
   /** Per-request bound in ms (the request is aborted at it); defaults to ENABLE_ATTEMPT_TIMEOUT_MS. */
@@ -1085,6 +1087,61 @@ export interface PendingAutoMergeDisarm {
   requireApprovedLadder?: boolean;
   /** Set once, when the take-back has stayed unconfirmed for `disarmEscalation.afterMs`: the card needs a human (see disarmEscalation). */
   escalatedAt?: string | null;
+  /** Set once GitHub accepted the `paperclip/approved` failure on the head (see fenceRevokedHead): the head cannot merge while the arm stays on. */
+  fencedAt?: string | null;
+  /** Why the last fence write failed, until one is accepted. */
+  fenceError?: string | null;
+}
+
+/** The reason a swept in-flight record is rewritten with: nothing says the authority changed, only that the arm was never settled. */
+export const INTERRUPTED_ARM_REASON = "arm interrupted before it was settled";
+
+/**
+ * The second route for a take-back GitHub does not confirm. Turning auto-merge off is one GraphQL mutation; when it keeps
+ * failing the arm stays on, but GitHub merges on required checks, and the newest `paperclip/approved` status decides
+ * (also in scripts/ci/check-paperclip-approved.sh, which is what a merge-queue run asks). So the head's status is
+ * overwritten with a control-plane `failure` over REST: a different endpoint and permission (statuses, not pull-request
+ * auto-merge), after which the armed PR cannot land until a fresh approval or board release writes a newer success.
+ * Bounded per token; answers whether GitHub accepted it. Never throws.
+ */
+export const FENCE_ATTEMPT_TIMEOUT_MS = 10_000;
+export const REVOKED_HEAD_STATUS_DESCRIPTION = "revoked: the approval no longer holds and auto-merge could not be turned off; needs a new approval";
+export async function fenceRevokedHead(
+  tokens: string[],
+  record: { owner: string; repo: string; number: number; headSha: string | null },
+): Promise<{ fenced: boolean; error: string | null }> {
+  let error: string | null = "no GitHub token candidate";
+  for (const token of tokens) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FENCE_ATTEMPT_TIMEOUT_MS);
+      try {
+        const bounded = async () => {
+          let head = record.headSha && /^[0-9a-f]{40}$/i.test(record.headSha) ? record.headSha : null;
+          if (!head) {
+            const live = await fetchPullRequestHeadSha(token, record.owner, record.repo, record.number, controller.signal);
+            if (!live.ok) return { fenced: false, error: `could not read the PR head (${live.message ?? `HTTP ${live.status}`})` };
+            head = live.headSha;
+          }
+          const written = await writeCommitStatusWithRetry(token, record.owner, record.repo, head, "", {
+            description: REVOKED_HEAD_STATUS_DESCRIPTION, state: "failure", attempts: 2, delayMs: 250, signal: controller.signal,
+          });
+          return written.success ? { fenced: true, error: null } : { fenced: false, error: written.error ?? `HTTP ${written.status}` };
+        };
+        const answer = await Promise.race([
+          bounded(),
+          new Promise<{ fenced: false; error: string }>((resolve) => controller.signal.addEventListener("abort", () => resolve({ fenced: false, error: `timeout after ${FENCE_ATTEMPT_TIMEOUT_MS}ms` }), { once: true })),
+        ]);
+        if (answer.fenced) return answer;
+        error = answer.error;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return { fenced: false, error };
 }
 
 /**
@@ -1245,19 +1302,35 @@ export async function keepAutoMergeDisarmPending(
   reason: string,
   error: string | null,
 ): Promise<string> {
+  const record: PendingAutoMergeDisarm = {
+    owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha, reason,
+    since: new Date().toISOString(), attempts: 1, lastError: error, lastAttemptAt: new Date().toISOString(), state: "pending",
+  };
   try {
-    await recordPendingAutoMergeDisarm(db, companyId, issueId, {
-      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha, reason,
-      since: new Date().toISOString(), attempts: 1, lastError: error, lastAttemptAt: new Date().toISOString(), state: "pending",
-    });
-    // Do not wait for the first reconciler tick: retry within seconds (a restart falls back to the tick).
-    // Loaded here, not at the top, because that module imports this one.
-    try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still retries it */ }
-    return "; the take-back is recorded on the card and retried within seconds and then on every reconciler tick until GitHub confirms auto-merge is off";
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, record);
   } catch (err) {
     // The in-flight record written before the arm is still on the card: the sweep takes the arm back from it.
     return `; the take-back record could not be updated (${err instanceof Error ? err.message : String(err)}); the record written before the arm stays on the card and the sweep takes the arm back from it`;
   }
+  // The arm is in force without authority and GitHub would not turn it off: fence the head now, over the second route,
+  // so the PR cannot merge while the take-back is retried (no scheduler needed: this runs in the arming process itself).
+  let fence = "";
+  try {
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+    const fenced = await fenceRevokedHead(candidates.map((candidate) => candidate.token), record);
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, fenced.fenced
+      ? { ...record, fencedAt: new Date().toISOString(), fenceError: null }
+      : { ...record, fenceError: fenced.error });
+    fence = fenced.fenced
+      ? "; the head's paperclip/approved status was set to failure, so the PR cannot merge while auto-merge stays on"
+      : `; the head's paperclip/approved status could NOT be set to failure (${fenced.error ?? "unknown"}), so nothing but the take-back stops a merge`;
+  } catch (err) {
+    fence = `; the head could not be fenced (${err instanceof Error ? err.message : String(err)})`;
+  }
+  // Do not wait for the first reconciler tick: retry within seconds (a restart falls back to the tick).
+  // Loaded here, not at the top, because that module imports this one.
+  try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still retries it */ }
+  return `; the take-back is recorded on the card and retried within seconds and then on every reconciler tick until GitHub confirms auto-merge is off${fence}`;
 }
 
 /**
@@ -1326,7 +1399,7 @@ export async function enableAutoMerge(
 ): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {
   const maxAttempts = options.maxAttempts ?? 3;
   const baseDelay = options.retryDelayMs ?? 250;
-  const attemptTimeoutMs = options.attemptTimeoutMs ?? ENABLE_ATTEMPT_TIMEOUT_MS;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? enableTiming.attemptTimeoutMs;
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   if (options.expectedHeadOid !== undefined && !/^[0-9a-f]{40}$/i.test(options.expectedHeadOid)) {

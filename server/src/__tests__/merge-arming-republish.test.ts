@@ -3901,6 +3901,36 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       }
     }, 20_000);
 
+    // R14-B-TIMEOUT-STATUS: the database's own timeout can fire before the request's clock. Before anything is published
+    // that is the same 409 as the deadline, not a 500.
+    for (const [label, deadlines, expected] of [
+      ["a statement timeout", { totalMs: 5000, compensationMs: 300, fetchMs: 1000, statementMs: 300 }, "statement_timeout"],
+      ["a lock timeout", { totalMs: 5000, compensationMs: 300, fetchMs: 1000, lockMs: 300 }, "lock_timeout"],
+    ] as const) {
+      it(`answers 409, not 500, when ${label} cuts off the request's first write before its own deadline`, async () => {
+        const { issueId } = await seedReleasable();
+        installReleaseTransport();
+        // The intent row is the first write: with the audit table locked it waits for the database's own limit.
+        const release = await holdLock(sql`lock table activity_log in access exclusive mode`);
+        try {
+          const started = Date.now();
+          const res = await request(deadlineApp({ ...deadlines }))
+            .post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+
+          expect(Date.now() - started).toBeLessThan(4000);
+          expect(res.status).toBe(409);
+          expect(res.body.outcome).toBe("failed");
+          expect(res.body.auditRecorded).toBe(false);
+          expect(res.body.message).toContain(expected);
+          expect(res.body.message).toContain("nothing was published");
+          expect(statusWrites()).toEqual([]);
+        } finally {
+          await release();
+        }
+        expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+      }, 20_000);
+    }
+
     it("leaves no database session behind after an ordinary release", async () => {
       const { issueId } = await seedReleasable();
       installReleaseTransport();
