@@ -53,6 +53,8 @@ const SOURCE_META: Record<AttentionSourceKind, SourceMeta> = {
   issue_thread_interaction: { label: "Decision requested" },
   join_request: { label: "Join request" },
   recovery_action: { label: "Recovery" },
+  // SUP-21344: a breached weekly recovery rate, board-visible until acknowledged.
+  recovery_rate_alert: { label: "Recovery rate alert" },
   // Read compatibility for persisted decisions from the retired feature.
   productivity_review: { label: "Task" },
   blocker_attention: { label: "Blocked dependency" },
@@ -126,6 +128,7 @@ export function attentionKind(item: AttentionItem): AttentionKind {
     case "agent_error_alert":
     case "blocker_attention":
     case "recovery_action":
+    case "recovery_rate_alert":
     case "budget_alert":
       return "blocking";
     case "approval":
