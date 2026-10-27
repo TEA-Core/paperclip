@@ -4016,7 +4016,7 @@ registry.registerPath({
     "unscoped but acquire the issue-row lock for queued-run admission, same-scope coalescing and bounded " +
     "retry scheduling, and a former owner is refused once the pending stage belongs to another participant. " +
     "Delayed disposition retries also lock the source issue through their receipt/run insert and recheck the current assignee. " +
-    "Raw operator SQL live-run inserts are the one remaining residual race; see doc/restore-participant-assurance.md for the writer census. " +
+    "Raw operator SQL live-run inserts are the named residual race; see doc/restore-participant-assurance.md for the writer census. " +
     "Self-declared runs first change status/assignee under an issue-row update predicate, excluding " +
     "eligible restore in either order, but do not hold a continuous issue-row lock through run insertion. " +
     "This is not an exhaustive writer guarantee. Only the assignee and updatedAt change; status, " +

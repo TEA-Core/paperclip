@@ -343,7 +343,7 @@ durable waiting path, and an already-active action is refused by restore.
 The delayed disposition insert independently locks the issue row through its
 receipt and run write, rechecking the source assignee and terminal status so
 a stale scheduler snapshot cannot insert a former-owner run after restoration.
-A hand-run operator `heartbeat_runs` SQL insert is the one remaining residual
+A hand-run operator `heartbeat_runs` SQL insert is the named residual
 race: it bypasses issue-row admission after restore's final read, and this
 operation installs no trigger, revokes no write privileges, and promises no
 exclusivity against it or arbitrary future writers. The observed interleavings
