@@ -1,0 +1,112 @@
+{
+ "M9 no admission lock (cap raced by concurrent admissions)": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('paperclip:auto-merge-disarm-admission'))`);\n",
+  "new": ""
+ },
+ "M11 escalation deadline never reached": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "  return !Number.isNaN(since) && now - since >= disarmEscalation.afterMs;",
+  "new": "  return false;"
+ },
+ "M12 enable request has no deadline": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "options.attemptTimeoutMs ?? enableTiming.attemptTimeoutMs",
+  "new": "options.attemptTimeoutMs ?? 2_000_000_000"
+ },
+ "M13 a timed-out enable drops the record": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "result.error?.startsWith(\"timeout after \") || ",
+  "new": ""
+ },
+ "M14 sweep takes a limited number of records by default": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "const rows = options.limit === undefined ? await query : await query.limit(options.limit);",
+  "new": "const rows = await query.limit(options.limit ?? 4);"
+ },
+ "M15 an escalated record does not refuse the arm with its own answer": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "  return disarmRecordEscalated(existing as { since?: string; escalatedAt?: string }) ? \"escalated\" : \"exists\";",
+  "new": "  return \"exists\";"
+ },
+ "M20 a statement or lock timeout before the deadline answers 500": {
+  "file": "server/src/routes/issues.ts",
+  "old": "(code === \"57014\" || code === \"55P03\")",
+  "new": "false"
+ },
+ "M10 settle clears an in-flight record whose authority is unchanged instead of taking the arm back": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "    record = { ...record, state: \"pending\", reason: INTERRUPTED_ARM_REASON };\n    await recordPendingAutoMergeDisarm(db, row.companyId, row.id, record);\n",
+  "new": "    await clearAutoMergeDisarmRecord(db, row.companyId, row.id, record.token);\n    return \"none\";\n"
+ },
+ "M16 the sweep never fences the head": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "const fencing = !moot && !record.fencedAt && (record.reason !== INTERRUPTED_ARM_REASON || disarmRecordEscalated(record));",
+  "new": "const fencing = false;"
+ },
+ "M17 the arming process does not fence inline": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "const fenced = await fenceRevokedHead(candidates.map((candidate) => candidate.token), record);",
+  "new": "const fenced = { fenced: false, error: \"skipped\" };"
+ },
+ "M18 an arm only left in flight is fenced at once, before the escalation deadline": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "(record.reason !== INTERRUPTED_ARM_REASON || disarmRecordEscalated(record))",
+  "new": "(true)"
+ },
+ "M19 the status route fence writes a success instead of a failure": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "const result = await writeHeadStatus(tokens, record, { context: \"paperclip/approved\", state: \"failure\", description: REVOKED_HEAD_STATUS_DESCRIPTION });",
+  "new": "const result = await writeHeadStatus(tokens, record, { context: \"paperclip/approved\", state: \"success\", description: REVOKED_HEAD_STATUS_DESCRIPTION });"
+ },
+ "N3 enforcer: a waiver is not checked against the arm gate": {
+  "file": "scripts/ci/check-paperclip-approved.sh",
+  "old": "    waiver_arm_gate\n    note \"waived: PR body declares",
+  "new": "    note \"waived: PR body declares"
+ },
+ "N4 card block: a release is not refused while a take-back is unconfirmed": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "if (unsettled && typeof unsettled === \"object\") {\n    return { ok: false, reason: \"an auto-merge take-back is unconfirmed",
+  "new": "if (false) {\n    return { ok: false, reason: \"an auto-merge take-back is unconfirmed"
+ },
+ "N5 card block: an approval status is published while a take-back is unconfirmed": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "if (unsettled && typeof unsettled === \"object\") {\n    return { kind: \"skipped\", message: \"status:skipped:arm-unsettled",
+  "new": "if (false) {\n    return { kind: \"skipped\", message: \"status:skipped:arm-unsettled"
+ },
+ "N6 write-ahead: the arm gate is not written before the enable": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "const gate = await writeArmGate(tokens, gateTarget, \"open\").catch((error) => ({ written: false, error: String(error) }));",
+  "new": "const gate = { written: true, error: null as string | null };"
+ },
+ "N7 an arm that stands does not close the gate": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "const closed = await writeArmGate(tokens, gateTarget, \"closed\").catch((error) => ({ written: false, error: String(error) }));",
+  "new": "const closed = { written: true, error: null as string | null };"
+ },
+ "N8 the sweep does not retry a closing write": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "  if (record.gateClosing) {",
+  "new": "  if (false as boolean) {"
+ },
+ "N9 a confirmed disable does not close the gate": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "const closed = await writeArmGate(tokens, record, \"closed\");\n    if (!closed.written) {",
+  "new": "const closed = { written: true, error: null as string | null };\n    if (!closed.written) {"
+ },
+ "N10 an arm is made even when the gate could not be opened": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "  if (!gate.written) {\n    // The write may have landed",
+  "new": "  if (!gate.written && false) {\n    // The write may have landed"
+ },
+ "N1 enforcer: an open arm gate does not refuse the head": {
+  "file": "scripts/ci/check-paperclip-approved.sh",
+  "old": "if arm_gate_refusal \"$ARM_GATE_STATE\" \"$ARM_GATE_DESCRIPTION\"; then\n  fail \"$ARM_GATE_REFUSAL\"\nfi",
+  "new": "if false; then\n  fail \"$ARM_GATE_REFUSAL\"\nfi"
+ },
+ "N2 enforcer: an arm-gate status from any creator counts": {
+  "file": "scripts/ci/check-paperclip-approved.sh",
+  "old": "if [ \"$status_creator_id\" = \"$APPROVED_STATUS_CREATOR_ID\" ] && [ -z \"${arm_gate_seen:-}\" ]; then",
+  "new": "if [ -z \"${arm_gate_seen:-}\" ]; then"
+ }
+}
