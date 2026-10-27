@@ -1219,7 +1219,7 @@ server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(349,44): TS2322
 server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(393,44): TS2322
 server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(428,44): TS2322
 server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(471,44): TS2322
-server/src/__tests__/recovery-stale-recovery-action-wake-sweep.test.ts(203,12): TS18047
+server/src/__tests__/recovery-stale-recovery-action-wake-sweep.test.ts(212,12): TS18047
 server/src/__tests__/recovery-stillborn-assigned-backlog-sweep.test.ts(307,7): TS2769
 server/src/__tests__/recovery-stranded-action-sweep.test.ts(130,7): TS2769
 server/src/__tests__/recovery-stranded-action-sweep.test.ts(190,40): TS2493

@@ -139,7 +139,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompanyAndAgent() {
+  async function seedCompanyAndAgent(overrides?: { agentRole?: string }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -153,7 +153,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       id: agentId,
       companyId,
       name: "Coder",
-      role: "engineer",
+      role: overrides?.agentRole ?? "engineer",
       status: "active",
       adapterType: "codex_local",
       adapterConfig: {},
@@ -1778,8 +1778,11 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(row?.status).toBe("blocked");
   });
 
-  it("SUP-21344: exhausted drain on a blocked card with no agent assignee arms no fake monitor", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
+  it("SUP-21344: exhausted drain on a blocked card with no agent assignee arms no fake monitor but links an owned recovery issue", async () => {
+    // Role "cto" puts the seed agent on the stranded-owner ladder as a
+    // resolvable owner candidate (the action's previousOwnerAgentId is not a
+    // ladder input, so a lone engineer never becomes a recovery owner here).
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     await enableBlockedWithoutBlockersAutoHeal();
 
     const issueId = randomUUID();
@@ -1799,8 +1802,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(await countSuppressionRows(issueId)).toBe(1);
 
     // The scheduler can never fire a monitor without an agent assignee, so
-    // the drain must not write monitor columns claiming a live wake; the
-    // escalated board-owned action is the board decision item.
+    // the drain must not write monitor columns claiming a live wake.
     const [drainedIssue] = await db
       .select({
         monitorNextCheckAt: issues.monitorNextCheckAt,
@@ -1813,6 +1815,30 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(drainedIssue.monitorScheduledBy).toBeNull();
     expect((drainedIssue.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
 
+    // Instead the action now links a durable, non-terminal recovery issue
+    // owned by an invokable agent (the manager-ladder owner for the seed
+    // agent), and the owner's wake was enqueued for it.
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).not.toBeNull();
+    const [recoveryIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, action.recoveryIssueId!));
+    expect(recoveryIssue).toBeDefined();
+    expect(recoveryIssue.status).toBe("todo");
+    expect(recoveryIssue.assigneeAgentId).toBe(agentId);
+    expect(recoveryIssue.originKind).toBe("stranded_issue_recovery");
+    expect(recoveryIssue.originId).toBe(issueId);
+
+    const ownerWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(ownerWakes.length).toBeGreaterThan(0);
+
     const comments = await db
       .select({ body: issueComments.body })
       .from(issueComments)
@@ -1820,7 +1846,23 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     const drainComment = comments.find((c) => (c.body ?? "").includes("Board decision item:"));
     expect(drainComment).toBeDefined();
     expect(drainComment!.body).toContain("not monitor-dispatchable");
+    expect(drainComment!.body).toContain(action.recoveryIssueId!);
     expect(drainComment!.body).not.toContain("board check armed for");
+
+    // Idempotency: later passes reuse the linked recovery issue rather than
+    // minting a duplicate for the same exhausted action.
+    await heartbeat.reconcileBlockedWithoutBlockers();
+    const recoveryIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(1);
   });
 
   it("flag ON + replacement exhausted recovery action (different id) — writes a fresh suppression row (SUP-14244)", async () => {

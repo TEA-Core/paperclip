@@ -9026,6 +9026,147 @@ export function recoveryService(
     return input.nextCheckAt;
   }
 
+  // SUP-21344 (review round 2): a non-monitorable exhausted source cannot be
+  // given a scheduler wake on the source row itself, and the escalated
+  // board-owned action is only a read-time attention projection — it has no
+  // wake/ageing path of its own. Mint (or reuse) a durable recovery issue
+  // owned by an invokable agent, link it from the action's `recoveryIssueId`,
+  // and enqueue a wake for the owner. The recovery issue is a first-class
+  // non-terminal card: it ages through assignment/wake machinery, can be
+  // escalated or resolved by its owner, and satisfies AC1's
+  // "non-terminal recoveryIssueId" evidence. Idempotent: the origin-scoped
+  // lookup reuses an open recovery issue for the source, and an explicit
+  // `recoveryIssueId` short-circuits re-creation.
+  // Returns the recovery issue's id, or null when no invokable owner exists
+  // (in which case the escalation itself remains the board's item — there is
+  // no agent to wake, and no wake can be honestly claimed).
+  async function ensureExhaustedRecoveryIssue(input: {
+    issue: typeof issues.$inferSelect;
+    recoveryActionId: string;
+    existingRecoveryIssueId?: string | null;
+  }): Promise<string | null> {
+    if (isStrandedIssueRecoveryIssue(input.issue)) return null;
+
+    if (input.existingRecoveryIssueId) {
+      const [existing] = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, input.issue.companyId),
+            eq(issues.id, input.existingRecoveryIssueId),
+            visibleIssueCondition(),
+          ),
+        )
+        .limit(1);
+      if (existing && existing.status !== "done" && existing.status !== "cancelled") {
+        return existing.id;
+      }
+    }
+
+    const openRecoveryIssue = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.issue.companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.strandedIssueRecovery),
+          eq(issues.originId, input.issue.id),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (openRecoveryIssue) {
+      if (openRecoveryIssue.id !== input.existingRecoveryIssueId) {
+        await db
+          .update(issueRecoveryActions)
+          .set({ recoveryIssueId: openRecoveryIssue.id, updatedAt: new Date() })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, input.recoveryActionId),
+              eq(issueRecoveryActions.companyId, input.issue.companyId),
+            ),
+          );
+      }
+      return openRecoveryIssue.id;
+    }
+
+    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    if (!ownerAgentId) return null;
+
+    const titleSource = input.issue.identifier ?? input.issue.title;
+    const recoveryIssue = await issuesSvc.create(input.issue.companyId, {
+      title: `Recover exhausted recovery for ${titleSource}`,
+      description: [
+        `Recovery action \`${input.recoveryActionId}\` on ${titleSource} exhausted its attempt ceiling and was escalated to the board, but the source issue is not monitor-dispatchable (status ${input.issue.status}; agent assignee ${input.issue.assigneeAgentId ? "present" : "absent"}${input.issue.assigneeUserId ? "; user assignee present" : ""}), so no board monitor could be armed on it.`,
+        "",
+        "Next action: assign an invokable recovery owner to the source issue, fix the agent/runtime state, or record an intentional manual resolution on the source issue. Then mark this recovery issue done (or cancelled if the source was resolved another way).",
+        "",
+        `Board decision item: recovery_action:${input.recoveryActionId}`,
+      ].join("\n"),
+      status: "todo",
+      priority: "high",
+      parentId: input.issue.id,
+      projectId: input.issue.projectId,
+      goalId: input.issue.goalId,
+      assigneeAgentId: ownerAgentId,
+      originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
+      originId: input.issue.id,
+      originFingerprint: `exhausted_recovery:${input.recoveryActionId}`,
+      billingCode: input.issue.billingCode,
+    });
+
+    await db
+      .update(issueRecoveryActions)
+      .set({ recoveryIssueId: recoveryIssue.id, updatedAt: new Date() })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, input.recoveryActionId),
+          eq(issueRecoveryActions.companyId, input.issue.companyId),
+        ),
+      );
+
+    await deps.enqueueWakeup(ownerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "exhausted_recovery_issue",
+      idempotencyKey: `exhausted-recovery-issue:${input.recoveryActionId}:${recoveryIssue.id}`,
+      payload: withRecoveryContext(
+        { issueId: recoveryIssue.id, sourceIssueId: input.issue.id, recoveryActionId: input.recoveryActionId },
+        "status_only",
+      ),
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: withRecoveryContext(
+        {
+          issueId: recoveryIssue.id,
+          sourceIssueId: input.issue.id,
+          source: "recovery.exhausted_recovery_issue",
+          wakeReason: "exhausted_recovery_issue",
+          recoveryActionId: input.recoveryActionId,
+        },
+        "status_only",
+      ),
+    });
+
+    logger.info(
+      {
+        issueId: input.issue.id,
+        identifier: input.issue.identifier,
+        recoveryActionId: input.recoveryActionId,
+        recoveryIssueId: recoveryIssue.id,
+        ownerAgentId,
+        source: "recovery.exhausted_recovery_issue",
+      },
+      "minted recovery issue for exhausted non-monitorable recovery action",
+    );
+
+    return recoveryIssue.id;
+  }
+
   async function reconcileBlockedWithoutBlockers(opts?: {
     runId?: string | null;
     companyId?: string | null;
@@ -9180,6 +9321,17 @@ export function recoveryService(
                 nextCheckAt: drainNextCheckAt,
                 notes: `Board decision required: recovery action ${existingAction!.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
               });
+              // SUP-21344 (review round 2): when the source cannot host a
+              // scheduler monitor, the escalated action alone is not a
+              // dispatchable artifact. Mint/reuse a durable recovery issue
+              // owned by an invokable agent and link it from the action.
+              const recoveryIssueId = armedAt === null
+                ? await ensureExhaustedRecoveryIssue({
+                    issue: currentIssue,
+                    recoveryActionId: existingAction!.id,
+                    existingRecoveryIssueId: existingAction.recoveryIssueId ?? null,
+                  })
+                : null;
               // Dedupe by recovery action: once the armed monitor has fired
               // (monitorNextCheckAt cleared), a later pass re-arms it; without
               // this check every re-arm would post another identical comment
@@ -9201,7 +9353,9 @@ export function recoveryService(
                   candidate.id,
                   armedAt
                     ? `Board decision item: ${drainMarker} — recovery action exhausted; board check armed for ${drainNextCheckAt.toISOString()}.`
-                    : `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Assign an invokable agent owner to arm a board check.`,
+                    : recoveryIssueId
+                      ? `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Recovery issue ${recoveryIssueId} owns the next step.`
+                      : `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed, and no invokable recovery owner is available to own a recovery issue. Assign an invokable agent owner or record an intentional manual resolution.`,
                   {},
                   { authorType: "system" },
                 );
@@ -10807,6 +10961,18 @@ export function recoveryService(
         notes: `Board decision required: recovery action ${action.id} exhausted (${action.attemptCount}/${effectiveMaxAttempts}). Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
       });
     }
+    // SUP-21344 (review round 2): when the source cannot host a scheduler
+    // monitor, mint/reuse a durable recovery issue owned by an invokable
+    // agent and link it from the action (`recoveryIssueId`), with a wake for
+    // the owner. That issue — not the escalation row — is the dispatchable,
+    // ageing artifact. Null only when no invokable owner exists.
+    const exhaustedRecoveryIssueId = armedBoardCheckAt === null
+      ? await ensureExhaustedRecoveryIssue({
+          issue: sourceIssue,
+          recoveryActionId: action.id,
+          existingRecoveryIssueId: action.recoveryIssueId ?? null,
+        })
+      : null;
 
     await issuesSvc.addComment(
       sourceIssue.id,
@@ -10815,7 +10981,9 @@ export function recoveryService(
         "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.\n\n" +
         (armedBoardCheckAt
           ? `Board decision item: recovery_action:${action.id} — next board check at ${armedBoardCheckAt.toISOString()}.`
-          : `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed; the board decision item is the escalation itself. Assign an invokable agent owner to arm a board check.`),
+          : exhaustedRecoveryIssueId
+            ? `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Recovery issue ${exhaustedRecoveryIssueId} owns the next step.`
+            : `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed, and no invokable recovery owner is available to own a recovery issue. Assign an invokable agent owner or record an intentional manual resolution.`),
       {},
       { authorType: "system" },
     );
@@ -10837,6 +11005,7 @@ export function recoveryService(
         maxAttempts: effectiveMaxAttempts,
         boardMonitorNextCheckAt: armedBoardCheckAt?.toISOString() ?? null,
         boardMonitorDispatchable: armedBoardCheckAt !== null,
+        recoveryIssueId: exhaustedRecoveryIssueId,
       },
     });
   }
