@@ -1004,7 +1004,16 @@ async function fetchGitHubNodeIdOnce(
   return { ok: true, status: response.status, message: null, nodeId };
 }
 
+/**
+ * Each enable request is given up on (and its HTTP request aborted) after this long, so a call is over within
+ * `ENABLE_WORST_CASE_MS` (attempts, back-off included), well under the in-flight record's grace (`disarmTiming.inFlightGraceMs`).
+ */
+export const ENABLE_ATTEMPT_TIMEOUT_MS = 10_000;
+export const ENABLE_WORST_CASE_MS = 3 * ENABLE_ATTEMPT_TIMEOUT_MS + 250 + 500;
+
 export interface EnableAutoMergeOptions {
+  /** Per-request bound in ms (the request is aborted at it); defaults to ENABLE_ATTEMPT_TIMEOUT_MS. */
+  attemptTimeoutMs?: number;
   /** Total attempts for the arming mutation; the first call counts as attempt 1. Defaults to 3. */
   maxAttempts?: number;
   /** Base delay between attempts in ms; doubles on each retry. Defaults to 250. */
@@ -1065,51 +1074,73 @@ export interface PendingAutoMergeDisarm {
   lastAttemptAt?: string | null;
   /**
    * `in_flight`: written BEFORE the enable call, so an arm GitHub accepts is covered even if this process dies or the
-   * database is unreachable right after (the sweep then takes it back when the authority no longer matches `baseline`,
-   * and just clears it when it does). `pending` (or absent): the arm is known to be in force without authority and
-   * is taken back unconditionally.
+   * database is unreachable right after (once its grace is over the sweep takes it back unconditionally, whether or not
+   * the authority changed). `pending` (or absent): the arm is known to be in force without authority and is taken back.
    */
   state?: "in_flight" | "pending";
   /** Names one arm attempt, so a finished attempt clears only its own record. */
   token?: string;
-  /** The authority fingerprint the arm was authorized against (in_flight records only). */
+  /** The authority fingerprint the arm was authorized against (in_flight records only; kept for whoever reads the card, no code decides from it). */
   baseline?: string | null;
   requireApprovedLadder?: boolean;
+  /** Set once, when the take-back has stayed unconfirmed for `disarmEscalation.afterMs`: the card needs a human (see disarmEscalation). */
+  escalatedAt?: string | null;
 }
 
 /**
- * Most records (in flight or pending) the instance holds at once (a mutable object so a test can lower it). Arming is refused above it, so the backlog of
- * take-backs stays small enough that every sweep tries all of them: a disable is never dropped and never starved.
+ * The finite bound on how long an unconfirmed take-back is just retried. A record older than `afterMs` (measured from its
+ * `since`, read at the moment it is looked at, so it holds with no sweep or scheduler running) is escalated: every
+ * control-plane arm of that card is refused (`failed:disarm-escalated`), the sweep marks it `escalatedAt` and raises the
+ * `issue.merge_disarm_escalated` alert, and a human has to turn auto-merge off (the retries go on, so a confirmation
+ * still clears it). A mutable object so a test can lower it.
+ */
+export const disarmEscalation: { afterMs: number } = { afterMs: 15 * 60_000 };
+
+export function disarmRecordEscalated(record: { since?: string | null; escalatedAt?: string | null }, now = Date.now()): boolean {
+  if (record.escalatedAt) return true;
+  const since = Date.parse(record.since ?? "");
+  return !Number.isNaN(since) && now - since >= disarmEscalation.afterMs;
+}
+
+/**
+ * Most records (in flight or pending) the instance holds at once (a mutable object so a test can lower it). It is a hard
+ * cap: admission is serialised by an advisory lock, so the backlog never exceeds it and a sweep, which takes this many,
+ * tries every record each time: a disable is never dropped and never starved.
  */
 export const disarmBacklog: { cap: number } = { cap: 50 };
 
 const RECORD_PATH = sql`(${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm')`;
 
 /**
- * Writes the in-flight record before an enable call, in one statement that also checks there is no record on the
- * card yet and fewer than `disarmBacklog.cap` on the instance (concurrent admissions can overshoot by the number of
- * arms in flight; the sweep tries every record). `exists`: a take-back or another arm already holds the card.
- * `full`: the backlog is at its cap. In both cases nothing may be armed.
+ * Writes the in-flight record before an enable call, in one statement (under the admission lock) that also checks there
+ * is no record on the card yet and fewer than `disarmBacklog.cap` on the instance. `exists`: a take-back or another arm
+ * already holds the card. `escalated`: the record on the card has outlived `disarmEscalation.afterMs`. `full`: the
+ * backlog is at its cap. In every case nothing may be armed.
  */
-export async function openArmInFlight(db: Db, companyId: string, issueId: string, record: PendingAutoMergeDisarm): Promise<"recorded" | "exists" | "full"> {
+export async function openArmInFlight(db: Db, companyId: string, issueId: string, record: PendingAutoMergeDisarm): Promise<"recorded" | "exists" | "escalated" | "full"> {
   const patch = JSON.stringify({ autoMergeDisarm: record });
-  const rows = await db
-    .update(issues)
-    .set({
-      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+  const rows = await db.transaction(async (tx) => {
+    // One admission at a time, so the count below cannot be raced past the cap.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('paperclip:auto-merge-disarm-admission'))`);
+    return tx
+      .update(issues)
+      .set({
+        executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
         coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) || ${patch}::jsonb)`,
-    })
-    .where(and(
-      eq(issues.companyId, companyId),
-      eq(issues.id, issueId),
-      sql`${RECORD_PATH} is null`,
-      sql`(select count(*) from "issues" as other where other."execution_state" -> 'approvalStatus' -> 'autoMergeDisarm' is not null) < ${disarmBacklog.cap}`,
-    ))
-    .returning({ id: issues.id });
+      })
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.id, issueId),
+        sql`${RECORD_PATH} is null`,
+        sql`(select count(*) from "issues" as other where other."execution_state" -> 'approvalStatus' -> 'autoMergeDisarm' is not null) < ${disarmBacklog.cap}`,
+      ))
+      .returning({ id: issues.id });
+  });
   if (rows.length > 0) return "recorded";
   const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
   const existing = ((row?.executionState as Record<string, unknown> | null)?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
-  return existing ? "exists" : "full";
+  if (!existing) return "full";
+  return disarmRecordEscalated(existing as { since?: string; escalatedAt?: string }) ? "escalated" : "exists";
 }
 
 /** Removes the card's record; with a token, only when it is the record of that arm attempt. */
@@ -1141,7 +1172,7 @@ export async function recordPendingAutoMergeDisarm(db: Db, companyId: string, is
 
 /** True for the outcome of an arm that `openArmRecord` refused: nothing was sent to GitHub. */
 export function isArmRecordRefusal(message: string): boolean {
-  return /^(?:failed:disarm-record-unavailable|skipped:arm-in-progress|failed:disarm-backlog-full):/.test(message);
+  return /^(?:failed:disarm-record-unavailable|skipped:arm-in-progress|failed:disarm-escalated|failed:disarm-backlog-full):/.test(message);
 }
 
 export type ArmRecordOpening =
@@ -1166,7 +1197,7 @@ export async function openArmRecord(
   guard: AuthorityGuard,
 ): Promise<ArmRecordOpening> {
   const token = randomUUID();
-  let opened: "recorded" | "exists" | "full";
+  let opened: "recorded" | "exists" | "escalated" | "full";
   try {
     opened = await openArmInFlight(db, companyId, issueId, {
       owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha,
@@ -1179,6 +1210,9 @@ export async function openArmRecord(
   if (opened === "exists") {
     return { ok: false, kind: "skipped", message: `skipped:arm-in-progress: ${label} — a take-back or another arm is already recorded on this card; nothing was armed, the next pass tries again` };
   }
+  if (opened === "escalated") {
+    return { ok: false, kind: "failed", message: `failed:disarm-escalated: ${label} — a take-back on this card has gone unconfirmed for over ${Math.round(disarmEscalation.afterMs / 60_000)} minutes and needs a human to turn auto-merge off; nothing was armed` };
+  }
   if (opened === "full") {
     return { ok: false, kind: "failed", message: `failed:disarm-backlog-full: ${label} — ${disarmBacklog.cap} auto-merge take-backs are already waiting to be confirmed; nothing was armed` };
   }
@@ -1188,7 +1222,7 @@ export async function openArmRecord(
     forget,
     settleEnable: async (result) => {
       if (result.success) return;
-      if (result.error === "network_error" || isTransientArmingStatus(result.status)) {
+      if (result.error === "network_error" || result.error?.startsWith("timeout after ") || isTransientArmingStatus(result.status)) {
         try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still settles it */ }
       } else {
         await forget();
@@ -1292,6 +1326,7 @@ export async function enableAutoMerge(
 ): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {
   const maxAttempts = options.maxAttempts ?? 3;
   const baseDelay = options.retryDelayMs ?? 250;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? ENABLE_ATTEMPT_TIMEOUT_MS;
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   if (options.expectedHeadOid !== undefined && !/^[0-9a-f]{40}$/i.test(options.expectedHeadOid)) {
@@ -1303,39 +1338,55 @@ export async function enableAutoMerge(
     const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
     const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
 
-    try {
-      const response = await ghFetch(GITHUB_GRAPHQL_URL, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ query }),
-      });
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => { controller.abort(); resolve("timeout"); }, attemptTimeoutMs);
+    });
+    type Answer = { success: boolean; alreadyQueued: boolean; error: string | null; status: number };
+    const work = (async (): Promise<Answer> => {
+      try {
+        const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ query }),
+          signal: controller.signal,
+        });
 
-      if (!response.ok) {
+        if (!response.ok) {
+          const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+          const errors = body?.errors as Array<{ message?: string }> | undefined;
+          const firstError = errors?.[0]?.message ?? "";
+          if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
+            return { success: true, alreadyQueued: true, error: null, status: response.status };
+          }
+          return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}`, status: response.status };
+        }
+
         const body = await response.json().catch(() => null) as Record<string, unknown> | null;
         const errors = body?.errors as Array<{ message?: string }> | undefined;
-        const firstError = errors?.[0]?.message ?? "";
-        if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-          return { success: true, alreadyQueued: true, error: null, status: response.status };
+        if (errors && errors.length > 0) {
+          const firstError = errors[0]?.message ?? "";
+          if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
+            return { success: true, alreadyQueued: true, error: null, status: response.status };
+          }
+          return { success: false, alreadyQueued: false, error: firstError, status: response.status };
         }
-        return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}`, status: response.status };
-      }
 
-      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-      const errors = body?.errors as Array<{ message?: string }> | undefined;
-      if (errors && errors.length > 0) {
-        const firstError = errors[0]?.message ?? "";
-        if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-          return { success: true, alreadyQueued: true, error: null, status: response.status };
-        }
-        return { success: false, alreadyQueued: false, error: firstError, status: response.status };
+        return { success: true, alreadyQueued: false, error: null, status: response.status };
+      } catch {
+        return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
       }
-
-      return { success: true, alreadyQueued: false, error: null, status: response.status };
-    } catch {
-      return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
+    })();
+    work.catch(() => undefined);
+    try {
+      const answer = await Promise.race([work, timedOut]);
+      return answer === "timeout" ? { success: false, alreadyQueued: false, error: `timeout after ${attemptTimeoutMs}ms`, status: 0 } : answer;
+    } finally {
+      clearTimeout(timer);
     }
   };
 
