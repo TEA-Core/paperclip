@@ -366,6 +366,17 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     );
     expect(exhaustionComment).toBeDefined();
     expect(exhaustionComment!.body).toContain(`(${action.attemptCount}/${updated.maxAttempts})`);
+
+    // SUP-21344: exhaustion must leave the board a concrete artefact the monitor
+    // claimer can fire (an armed board decision monitor), not a passive comment.
+    const [sourceIssue] = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorScheduledBy: issues.monitorScheduledBy })
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue.monitorNextCheckAt).not.toBeNull();
+    expect(sourceIssue.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(sourceIssue.monitorScheduledBy).toBe("board");
+    expect(exhaustionComment!.body).toContain("Board decision item:");
   });
 
   it("does not re-fire for actions that are not stale", async () => {

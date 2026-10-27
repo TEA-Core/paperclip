@@ -52,6 +52,11 @@ import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
 import { budgetService } from "./budgets.js";
 import { TIMER_DISPATCH_PARK_RECOVERY_CAUSE, TIMER_DISPATCH_PARK_RECOVERY_KIND } from "./recovery/stranded-notice.js";
 import {
+  evaluateRecoveryRateAlert,
+  recoveryRateAlertArtifactKey,
+  type WeeklyRecoveryRate,
+} from "./recovery-observability.js";
+import {
   BLOCKER_ATTENTION_MAX_DEPTH,
   BLOCKER_ATTENTION_MAX_NODES,
   issueService,
@@ -79,6 +84,7 @@ const ATTENTION_SOURCE_KINDS: AttentionSourceKind[] = [
   "failed_run",
   "budget_alert",
   "agent_error_alert",
+  "recovery_rate_alert",
 ];
 
 const SEVERITY_RANK: Record<AttentionSeverity, number> = {
@@ -100,6 +106,7 @@ const SOURCE_RANK: Record<AttentionSourceKind, number> = {
   review: 8,
   productivity_review: 9,
   join_request: 10,
+  recovery_rate_alert: 3,
 };
 
 const PENDING_INTERACTION_STATUSES = ["pending"] as const;
@@ -1457,6 +1464,90 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           ...issueContext(sourceIssue),
           detail: genericDetail(recovery.nextAction, issueImages(recoveryImageMap, recovery.sourceIssueId)),
         }));
+      }
+
+      // SUP-21344: a breached recovery-rate alert materialises as one named
+      // board item (keyed by the earliest breached week) instead of living
+      // only as a dashboard payload. Weekly run/action counts come from the
+      // same report the dashboard serves, so the artifact can never disagree
+      // with it; it exits when no week breaches.
+      {
+        const windowWeeks = 8;
+        // Match recovery-observability's week window: from the Monday of the
+        // week (windowWeeks - 1) ago so the "complete week" claim holds.
+        const utcMidnight = Date.UTC(
+          new Date(now).getUTCFullYear(),
+          new Date(now).getUTCMonth(),
+          new Date(now).getUTCDate(),
+        );
+        const mondayOffset = (new Date(utcMidnight).getUTCDay() + 6) % 7;
+        const since = new Date(utcMidnight - (mondayOffset + (windowWeeks - 1) * 7) * 24 * 60 * 60 * 1000);
+        const runRows = (await db.execute(sql`
+          SELECT to_char(date_trunc('week', ${heartbeatRuns.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
+                 count(*)::int AS runs
+          FROM ${heartbeatRuns}
+          WHERE ${heartbeatRuns.companyId} = ${companyId} AND ${heartbeatRuns.createdAt} >= ${since.toISOString()}::timestamptz
+          GROUP BY week_start
+        `)) as unknown as Iterable<{ week_start: string; runs: number | string }>;
+        const actionRows = (await db.execute(sql`
+          SELECT to_char(date_trunc('week', ${issueRecoveryActions.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
+                 count(*)::int AS actions
+          FROM ${issueRecoveryActions}
+          WHERE ${issueRecoveryActions.companyId} = ${companyId} AND ${issueRecoveryActions.createdAt} >= ${since.toISOString()}::timestamptz
+          GROUP BY week_start
+        `)) as unknown as Iterable<{ week_start: string; actions: number | string }>;
+        const runsByWeek = new Map<string, number>();
+        for (const row of runRows) runsByWeek.set(String(row.week_start), Number(row.runs));
+        const actionsByWeek = new Map<string, number>();
+        for (const row of actionRows) actionsByWeek.set(String(row.week_start), Number(row.actions));
+        const weekly: WeeklyRecoveryRate[] = Array.from(runsByWeek.keys()).sort().map((weekStart) => {
+          const runs = runsByWeek.get(weekStart) ?? 0;
+          const recoveryActions = actionsByWeek.get(weekStart) ?? 0;
+          return { weekStart, runs, recoveryActions, ratePercent: runs > 0 ? Math.round((recoveryActions / runs) * 10000) / 100 : 0 };
+        });
+        // Only complete (elapsed) weeks count: the current partial week has an
+        // incomplete run denominator and would false-breach.
+        const completeWeeks = weekly.filter((w) => {
+          const monday = new Date(`${w.weekStart}T00:00:00.000Z`).getTime();
+          return monday + 7 * 24 * 60 * 60 * 1000 <= now;
+        });
+        const alert = evaluateRecoveryRateAlert(completeWeeks);
+        const artifactKey = recoveryRateAlertArtifactKey(alert, companyId);
+        if (artifactKey && alert.breachedWeeks[0]) {
+          const first = alert.breachedWeeks[0];
+          const activityAt = new Date(`${first.weekStart}T00:00:00.000Z`).toISOString();
+          add(createItem({
+            companyId,
+            sourceKind: "recovery_rate_alert",
+            subject: {
+              kind: "budget_incident",
+              id: artifactKey,
+              companyId,
+              title: `Recovery rate ${first.ratePercent}% in week ${first.weekStart} exceeds ${alert.thresholdPercent}%`,
+              identifier: null,
+              status: "breached",
+              href: `/${prefix}/dashboard`,
+              metadata: { artifactKey, breachedWeeks: alert.breachedWeeks.map((w) => w.weekStart) },
+            },
+            whyNow: "Recovery actions are being minted faster than the alert threshold allows.",
+            decisionVerbs: decisionVerbs(
+              { id: "acknowledge", label: "Acknowledge", description: "Record that the board has seen this alert." },
+            ),
+            inlineResolvable: false,
+            entryRule: "recovery rate for a complete week exceeds the recovery-rate alert threshold",
+            exitRule: "No week in the trailing 8-week window breaches the threshold.",
+            dedupKey: artifactKey,
+            severity: "high",
+            activityAt,
+            createdAt: activityAt,
+            updatedAt: activityAt,
+            relatedIssue: null,
+            detail: genericDetail(
+              alert.breachedWeeks.map((w) => `${w.weekStart}: ${w.ratePercent}% (${w.recoveryActions}/${w.runs})`).join("; "),
+              [],
+            ),
+          }));
+        }
       }
 
       const blockedIssues = await issueService(db).list(companyId, { status: "blocked", includeBlockedBy: true });

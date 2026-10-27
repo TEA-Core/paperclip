@@ -1749,15 +1749,25 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       maxAttempts: 5,
     });
 
-    // Passes 2 and 3: the candidate is still suppressed and the counter still
-    // increments, but no further row is written.
+    // Passes 2 and 3: SUP-21344 arms a board monitor on pass 1, so the card now
+    // has a future monitor and `hasActiveExecutionPath` drains it before the
+    // grace window (its updatedAt is now the monitor write) re-fails —
+    // the card is no longer double-counted as suppressed, no heal/escalation
+    // occurs, and no further suppression row is written.
     for (const pass of [2, 3] as const) {
       const result = await heartbeat.reconcileBlockedWithoutBlockers();
-      expect(result.exhaustedRecoverySuppressed).toBe(1);
+      expect(result.exhaustedRecoverySuppressed).toBe(0);
       expect(result.healed).toBe(0);
       expect(result.escalated).toBe(0);
       expect(await countSuppressionRows(issueId)).toBe(1);
     }
+    const [drainedIssue] = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorScheduledBy: issues.monitorScheduledBy })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(drainedIssue.monitorNextCheckAt).not.toBeNull();
+    expect(drainedIssue.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(drainedIssue.monitorScheduledBy).toBe("board");
 
     // The issue is still blocked and the terminal action is untouched.
     const row = await db
@@ -1833,9 +1843,20 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       lastAttemptAt: oldDate(),
     });
 
+    // SUP-21344: the first pass armed a board monitor and refreshed updatedAt,
+    // so the next sweep still sits inside the blocked-without-blockers grace
+    // window. Once that window elapses, the future monitor makes the card
+    // live-path skipped. Either way it must not double-record while armed.
     const second = await heartbeat.reconcileBlockedWithoutBlockers();
-    expect(second.exhaustedRecoverySuppressed).toBe(1);
-    expect(await countSuppressionRows(issueId)).toBe(2);
+    expect(second.exhaustedRecoverySuppressed).toBe(0);
+    expect(await countSuppressionRows(issueId)).toBe(1);
+    const [drainedIssue] = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorScheduledBy: issues.monitorScheduledBy })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(drainedIssue.monitorNextCheckAt).not.toBeNull();
+    expect(drainedIssue.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(drainedIssue.monitorScheduledBy).toBe("board");
 
     const rows = await db
       .select({ details: activityLog.details })
@@ -1849,7 +1870,10 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     const suppressorIds = rows
       .map((r) => ((r.details as { suppressedBy: { id: string } }).suppressedBy.id))
       .sort();
-    expect(suppressorIds).toEqual([firstActionId, replacementActionId].sort());
+    // SUP-21344: only the first suppressor is recorded while the board monitor
+    // is armed; the replacement action is recorded on a later pass once the
+    // monitor has been consumed (board acted or check elapsed).
+    expect(suppressorIds).toEqual([firstActionId]);
   });
 });
 

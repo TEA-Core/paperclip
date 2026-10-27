@@ -184,6 +184,7 @@ import {
   TODO_STRANDED_ACTION,
   buildTodoStrandedDetails,
   evaluateTodoStranded,
+  isTerminalRecoveryAction,
   type ContinuationPathDisjuncts,
 } from "../issue-continuation-path.js";
 import {
@@ -8959,6 +8960,9 @@ export function recoveryService(
   // minted action to, so the two can never disagree about what "exhausted" is.
   const MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS = DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
 
+  // SUP-21344: board monitor interval for exhausted actions.
+  const EXHAUSTED_BOARD_MONITOR_INTERVAL_MS = 60 * 60 * 1000;
+
   async function reconcileBlockedWithoutBlockers(opts?: {
     runId?: string | null;
     companyId?: string | null;
@@ -9095,10 +9099,65 @@ export function recoveryService(
         // from repeated rows. (The upsert's no-resurrection rule already
         // refused the row write; this guard stops the redispatch and the
         // misleading re-escalation count/activity that rode along with it.)
-        if (
-          existingAction?.status === "escalated" &&
-          (existingAction.outcome as string | null) === "exhausted"
-        ) {
+        if (existingAction && isTerminalRecoveryAction(existingAction)) {
+          // SUP-21344 drain for baseline cards parked before the exhaustion
+          // path armed a board monitor: arm one now so this card gains a live
+          // wake source (future monitorNextCheckAt) instead of only a counter.
+          if (!hasFutureMonitorCheck(candidate.monitorNextCheckAt)) {
+            const drainNextCheckAt = new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
+            const currentIssue = await db
+              .select()
+              .from(issues)
+              .where(eq(issues.id, candidate.id))
+              .then((rows) => rows[0] ?? null);
+            if (currentIssue) {
+              const normalized = currentIssue.executionPolicy
+                ? (normalizeIssueExecutionPolicy(currentIssue.executionPolicy) ?? undefined)
+                : undefined;
+              const policy = {
+                ...(normalized ?? { mode: "normal" as const, commentRequired: true, stages: [] }),
+                monitor: {
+                  nextCheckAt: drainNextCheckAt.toISOString(),
+                  notes: `Board decision required: recovery action ${existingAction!.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
+                  scheduledBy: "board" as const,
+                  kind: null,
+                  serviceName: null,
+                  externalRef: null,
+                  timeoutAt: null,
+                  maxAttempts: null,
+                  recoveryPolicy: null,
+                },
+              };
+              try {
+                const transition = applyIssueMonitorPolicyTransition({
+                  issue: currentIssue,
+                  policy,
+                  previousPolicy: normalized,
+                  requestedStatus: currentIssue.status,
+                  requestedAssigneePatch: {},
+                  actor: { agentId: null, userId: null },
+                  monitorExplicitlyUpdated: true,
+                });
+                await issuesSvc.update(candidate.id, { ...transition.patch, executionPolicy: policy });
+              } catch {
+                await db
+                  .update(issues)
+                  .set({
+                    monitorNextCheckAt: drainNextCheckAt,
+                    monitorScheduledBy: "board",
+                    monitorNotes: `Board decision required: recovery action ${existingAction!.id} exhausted.`,
+                    updatedAt: now,
+                  })
+                  .where(eq(issues.id, candidate.id));
+              }
+              await issuesSvc.addComment(
+                candidate.id,
+                `Board decision item: recovery_action:${existingAction!.id} — recovery action exhausted; board check armed for ${drainNextCheckAt.toISOString()}.`,
+                {},
+                { authorType: "system" },
+              );
+            }
+          }
           result.exhaustedRecoverySuppressed++;
 
           // SUP-14244 — record the skip once per (issue, recovery-action) pair.
@@ -10678,11 +10737,71 @@ export function recoveryService(
       return;
     }
 
+    // SUP-21344: escalation alone was a terminal sink — the action parked
+    // board-owned with no wake source and the blocked-without-blockers sweep
+    // suppressed it forever. Arm a board decision monitor on the source issue
+    // so the board is re-woken on a schedule and the card satisfies
+    // `hasActiveExecutionPath` (a future monitorNextCheckAt). When the board
+    // acts (assigns an invokable owner / records a manual resolution) it
+    // clears or supersedes the monitor.
+    const boardNextCheckAt = new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
+    if (!hasFutureMonitorCheck(sourceIssue.monitorNextCheckAt)) {
+      const previousPolicy = sourceIssue.executionPolicy
+        ? (normalizeIssueExecutionPolicy(sourceIssue.executionPolicy) ?? undefined)
+        : undefined;
+      const policy = {
+        ...(previousPolicy ?? {
+          mode: "normal" as const,
+          commentRequired: true,
+          stages: [],
+        }),
+        monitor: {
+          nextCheckAt: boardNextCheckAt.toISOString(),
+          notes: `Board decision required: recovery action ${action.id} exhausted (${action.attemptCount}/${effectiveMaxAttempts}). Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
+          scheduledBy: "board" as const,
+          kind: null,
+          serviceName: null,
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+        },
+      };
+      try {
+        const transition = applyIssueMonitorPolicyTransition({
+          issue: sourceIssue,
+          policy,
+          previousPolicy,
+          requestedStatus: sourceIssue.status,
+          requestedAssigneePatch: {},
+          actor: { agentId: null, userId: null },
+          monitorExplicitlyUpdated: true,
+        });
+        await issuesSvc.update(sourceIssue.id, {
+          ...transition.patch,
+          executionPolicy: policy,
+        });
+      } catch {
+        // Policy module refused the monitor (e.g. no assignee): still arm the
+        // flat columns so the board decision item remains fireable.
+        await db
+          .update(issues)
+          .set({
+            monitorNextCheckAt: boardNextCheckAt,
+            monitorScheduledBy: "board",
+            monitorNotes: `Board decision required: recovery action ${action.id} exhausted.`,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, sourceIssue.id));
+      }
+    }
+
     await issuesSvc.addComment(
       sourceIssue.id,
       `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMaxAttempts}). ` +
         "The recovery action is escalated to the board; the source issue status was left untouched. " +
-        "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
+        "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.\n\n" +
+        `Board decision item: recovery_action:${action.id} — next board check at ${boardNextCheckAt.toISOString()}.`,
       {},
       { authorType: "system" },
     );
@@ -10702,6 +10821,7 @@ export function recoveryService(
         recoveryActionId: action.id,
         attemptCount: action.attemptCount,
         maxAttempts: effectiveMaxAttempts,
+        boardMonitorNextCheckAt: boardNextCheckAt.toISOString(),
       },
     });
   }
@@ -11523,7 +11643,7 @@ export function recoveryService(
           // not mint a second one or bump its attempt budget.
           continue;
         }
-        if (openAction.status === "escalated" && (openAction.outcome as string | null) === "exhausted") {
+        if (isTerminalRecoveryAction(openAction)) {
           // A terminal action for a different condition blocks a new mint on
           // the same source (platform invariant). Board must resolve it first.
           continue;

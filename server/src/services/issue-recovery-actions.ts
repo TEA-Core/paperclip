@@ -8,6 +8,7 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
+import { isTerminalRecoveryAction } from "./issue-continuation-path.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -607,7 +608,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       // refuses to resurrect it to `active`, bump `attemptCount` past the
       // ceiling, or erase its exhaustion record — which is what re-triggered the
       // per-sweep exhaustion comment forever.
-      if (existing.status === "escalated" && (existing.outcome as string | null) === "exhausted") {
+      if (isTerminalRecoveryAction(existing)) {
         return existing;
       }
       // `maxAttempts` is an execution budget, not display metadata. Once the

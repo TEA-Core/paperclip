@@ -3,6 +3,7 @@ import {
   buildTimerDispatchSuppressionDetails,
   evaluateIssueContinuationPath,
   IN_PROGRESS_SETTLE_WINDOW_MS,
+  isTerminalRecoveryAction,
   isTimerCandidateActionable,
   shouldEmitTimerDispatchSuppression,
   TIMER_DISPATCH_SUPPRESSED_ACTION,
@@ -78,6 +79,17 @@ describe("evaluateIssueContinuationPath (§2a predicate, behavior-preserving)", 
       expect(result.disjuncts[key], `${name} disjunct flag`).toBe(true);
       expect(result.settledWithinWindow).toBe(false);
     }
+  });
+
+  it("SUP-21344: a terminal (exhausted) recovery action satisfies no §2a disjunct", () => {
+    const terminal = { id: "recovery-1", status: "escalated", outcome: "exhausted" };
+    expect(isTerminalRecoveryAction(terminal)).toBe(true);
+    expect(isTerminalRecoveryAction({ status: "escalated", outcome: null })).toBe(false);
+    expect(isTerminalRecoveryAction({ status: "active", outcome: "exhausted" })).toBe(false);
+    expect(isTerminalRecoveryAction(null)).toBe(false);
+    const result = evaluateIssueContinuationPath(emptyEvidence({ activeRecoveryAction: terminal }), { now: NOW });
+    expect(result.ok).toBe(false);
+    expect(result.disjuncts.activeRecoveryAction).toBe(false);
   });
 
   it("is ok when lastActivityAt falls inside the settle window even with no disjunct", () => {

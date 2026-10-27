@@ -17,6 +17,7 @@ import {
   classifyRecoveryHandoff,
   evaluateRecoveryRateAlert,
   MAX_WINDOW_WEEKS,
+  recoveryRateAlertArtifactKey,
   recoveryObservabilityService,
   type WeeklyRecoveryRate,
 } from "../services/recovery-observability.ts";
@@ -67,6 +68,15 @@ describe("evaluateRecoveryRateAlert", () => {
     const weekly = [week(1000, 10, "2026-07-06"), week(1000, 30, "2026-07-13")]; // 1% then 3%
     const alert = evaluateRecoveryRateAlert(weekly, 2);
     expect(alert.latestWeekBreached).toBe(true);
+  });
+
+  it("SUP-21344: a breached week yields a stable board-visible artifact key", () => {
+    const breached = evaluateRecoveryRateAlert([week(2364, 77, "2026-07-06")], 2);
+    expect(recoveryRateAlertArtifactKey(breached, "company-1")).toBe(
+      "recovery_rate_alert:company-1:2026-07-06",
+    );
+    const quiet = evaluateRecoveryRateAlert([week(1000, 1, "2026-07-06")], 2);
+    expect(recoveryRateAlertArtifactKey(quiet, "company-1")).toBeNull();
   });
 });
 

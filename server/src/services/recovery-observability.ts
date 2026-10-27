@@ -78,6 +78,8 @@ export type RecoveryObservabilityReport = {
   thresholdPercent: number;
   weekly: WeeklyRecoveryRate[];
   alert: RecoveryRateAlert;
+  /** Named board-visible artifact for a breached alert (null when quiet). */
+  alertArtifactKey: string | null;
   byCause: RecoveryCauseGroup[];
   handoff: RecoveryHandoffSummary;
   perCauseRouting: RecoveryCauseRouting[];
@@ -146,6 +148,20 @@ export function evaluateRecoveryRateAlert(
     latestWeek,
     latestWeekBreached: latestWeek != null && latestWeek.ratePercent > thresholdPercent,
   };
+}
+
+// SUP-21344: the alert is not decorative — a breached week yields a stable,
+// named board-visible artifact (the attention `recovery_rate_alert` item), so
+// a consumer can point at an artefact by id instead of re-deriving a breach
+// from the dashboard payload. Null when no week breached.
+export function recoveryRateAlertArtifactKey(
+  alert: RecoveryRateAlert,
+  companyId: string,
+): string | null {
+  const firstBreached = alert.breachedWeeks[0];
+  return alert.breached && firstBreached
+    ? `recovery_rate_alert:${companyId}:${firstBreached.weekStart}`
+    : null;
 }
 
 function round2(value: number): number {
@@ -363,6 +379,7 @@ export function recoveryObservabilityService(db: Db) {
       thresholdPercent,
       weekly,
       alert,
+      alertArtifactKey: recoveryRateAlertArtifactKey(alert, companyId),
       byCause,
       handoff,
       perCauseRouting,
