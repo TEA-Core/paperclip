@@ -286,6 +286,13 @@ async function sourceIssueId(
         .then((rows) => rows[0] ?? null);
       return { exists: Boolean(row), issueId: null };
     }
+    case "recovery_rate_alert": {
+      // SUP-21344: this kind is a synthetic attention artifact keyed by
+      // `recovery_rate_alert:<companyId>:<weekStart>`, not a stored row.
+      // There is nothing to look up; it exists only when its key names this
+      // company, and it carries no issue to authorize against.
+      return { exists: sourceId.startsWith(`recovery_rate_alert:${companyId}:`), issueId: null };
+    }
   }
 }
 

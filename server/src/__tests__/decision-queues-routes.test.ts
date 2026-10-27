@@ -471,6 +471,9 @@ describeEmbeddedPostgres("decision queue routes", () => {
       failed_run: run!.id,
       budget_alert: incident!.id,
       agent_error_alert: agentId,
+      // Synthetic alert key, not a stored row; canReadDecisionSource must
+      // resolve it as non-existent rather than trusting the id.
+      recovery_rate_alert: "recovery_rate_alert:nonexistent",
     };
     const [queue] = await db.insert(decisionQueues).values({
       companyId, key: "foreign-project", title: "Foreign project", createdByType: "system",

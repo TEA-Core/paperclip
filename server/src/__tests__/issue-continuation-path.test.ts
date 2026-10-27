@@ -20,7 +20,9 @@ import {
 const NOW = new Date("2026-09-03T12:00:00.000Z");
 const OLD_ACTIVITY = new Date("2026-09-03T11:40:00.000Z"); // 20 min ago -> outside settle window
 
-function emptyEvidence(overrides: Record<string, unknown> = {}) {
+type Evidence = Parameters<typeof evaluateIssueContinuationPath>[0];
+
+function emptyEvidence(overrides: Partial<Evidence> = {}): Evidence {
   return {
     activeRun: false,
     monitorNextCheckAt: null,
@@ -61,7 +63,14 @@ describe("evaluateIssueContinuationPath (§2a predicate, behavior-preserving)", 
   });
 
   it("is ok via each §2a disjunct in isolation (bullet 2)", () => {
-    const perDisjunct: Array<["disjunct", Record<string, unknown>]> = [
+    type DisjunctName =
+      | "activeRun"
+      | "monitorNextCheckAtInFuture"
+      | "watchdog"
+      | "scheduledRetry"
+      | "activeRecoveryAction"
+      | "successfulRunHandoffLive";
+    const perDisjunct: Array<[DisjunctName, Partial<Evidence>]> = [
       ["activeRun", { activeRun: true }],
       [
         "monitorNextCheckAtInFuture",
