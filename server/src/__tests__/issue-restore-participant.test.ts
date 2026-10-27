@@ -5,7 +5,7 @@ import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
-  activityLog, agentSessionGoalActions, agentTaskSessions, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, heartbeatRuns,
+  activityLog, agentSessionGoalActions, agentTaskSessions, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, heartbeatRunEvents, heartbeatRuns,
   issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolApplications, toolConnections, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -13,6 +13,10 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { selfDeclaredRunService } from "../services/self-declared-run.js";
+import { recoveryService } from "../services/recovery/service.js";
+import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe.sequential : describe.skip;
@@ -54,7 +58,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
 
   beforeEach(async () => {
     await db.delete(activityLog);
-    await db.delete(agentWakeupRequests);
+    await db.delete(heartbeatRunEvents);
     await db.delete(issueExecutionDecisions);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
@@ -67,6 +71,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.delete(agentTaskSessions);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -109,6 +114,78 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
   }
   async function audit() {
     return db.select().from(activityLog).where(eq(activityLog.entityId, ISSUE));
+  }
+
+  // The BEFORE UPDATE trigger pauses *after* restore's final live-run read while
+  // its transaction still holds the issue row. Only the disposable test DB has it.
+  async function pauseRestoreAtAssignment() {
+    await db.execute(sql`
+      CREATE FUNCTION pause_participant_restore() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        PERFORM pg_sleep(2);
+        RETURN NEW;
+      END $$;
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER pause_participant_restore BEFORE UPDATE OF assignee_agent_id ON issues
+      FOR EACH ROW WHEN (NEW.id = '33333333-3333-4333-8333-333333333333')
+      EXECUTE FUNCTION pause_participant_restore()
+    `);
+  }
+
+  async function waitForPausedRestore() {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [row] = await db.execute<{ paused: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND pid <> pg_backend_pid()
+            AND wait_event = 'PgSleep' AND query ILIKE '%assignee_agent_id%'
+        ) AS paused
+      `);
+      if (row?.paused) return;
+      await delay(20);
+    }
+    throw new Error("Restore did not reach its post-read assignment pause");
+  }
+
+  async function unpauseRestore() {
+    await db.execute(sql`DROP TRIGGER IF EXISTS pause_participant_restore ON issues`);
+    await db.execute(sql`DROP FUNCTION IF EXISTS pause_participant_restore()`);
+  }
+
+  async function pauseNestedWakeReceipt() {
+    await db.execute(sql`
+      CREATE FUNCTION pause_nested_wake_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        PERFORM pg_sleep(2);
+        RETURN NEW;
+      END $$;
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER pause_nested_wake_receipt BEFORE INSERT ON agent_wakeup_requests
+      FOR EACH ROW WHEN (NEW.reason = 'nested_lock_witness')
+      EXECUTE FUNCTION pause_nested_wake_receipt()
+    `);
+  }
+
+  async function waitForPausedWakeReceipt() {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [row] = await db.execute<{ paused: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND pid <> pg_backend_pid()
+            AND wait_event = 'PgSleep' AND query ILIKE '%agent_wakeup_requests%'
+        ) AS paused
+      `);
+      if (row?.paused) return;
+      await delay(20);
+    }
+    throw new Error("Nested wake did not reach its paused receipt insert");
+  }
+
+  async function unpauseNestedWakeReceipt() {
+    await db.execute(sql`DROP TRIGGER IF EXISTS pause_nested_wake_receipt ON agent_wakeup_requests`);
+    await db.execute(sql`DROP FUNCTION IF EXISTS pause_nested_wake_receipt()`);
   }
 
   it("restores only the assignee, preserving status/version and execution state and decisions; records one before/after audit without waking", async () => {
@@ -427,6 +504,224 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
   async function seedRun(status: string, contextSnapshot: Record<string, unknown> = {}) {
     await db.insert(heartbeatRuns).values({ id: RUN, companyId: COMPANY, agentId: ASSIGNEE, status, contextSnapshot });
   }
+
+  it("serializes nested-only bounded retry against restore after its final live-run read", async () => {
+    await seedRun("failed", { paperclipIssue: { id: ISSUE } });
+    await db.update(heartbeatRuns).set({
+      errorCode: "adapter_failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      responsibleUserId: "operator",
+    }).where(eq(heartbeatRuns.id, RUN));
+    await pauseRestoreAtAssignment();
+    let restoring: ReturnType<typeof post> | null = null;
+    try {
+      restoring = post();
+      const response = Promise.resolve(restoring);
+      await waitForPausedRestore();
+      const retry = heartbeatService(db).scheduleBoundedRetry(RUN, { delayMs: 60_000, maxAttempts: 1 });
+      const [result, restoration] = await Promise.all([retry, response]);
+      const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, RUN));
+      expect({ restoreStatus: restoration.status, retryOutcome: result.outcome, successorCount: successors.length })
+        .toEqual({ restoreStatus: 200, retryOutcome: "not_scheduled", successorCount: 0 });
+      expect((await snapshot()).assigneeAgentId).toBe(restoration.status === 200 ? PARTICIPANT : ASSIGNEE);
+    } finally {
+      if (restoring) await Promise.resolve(restoring);
+      await unpauseRestore();
+    }
+  }, 30_000);
+
+  it.each(["max_turns_continuation", "interaction_continuation_infra_retry"])(
+    "serializes nested-only %s continuation retry against a completed restore",
+    async (retryReason) => {
+      await seedRun("failed", { paperclipIssue: { id: ISSUE } });
+      await db.update(heartbeatRuns).set({
+        responsibleUserId: "operator",
+        errorCode: "adapter_failed",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      }).where(eq(heartbeatRuns.id, RUN));
+      await pauseRestoreAtAssignment();
+      let restoring: ReturnType<typeof post> | null = null;
+      try {
+        restoring = post();
+        const response = Promise.resolve(restoring);
+        await waitForPausedRestore();
+        const retry = heartbeatService(db).scheduleBoundedRetry(RUN, {
+          retryReason, delayMs: 60_000, maxAttempts: 1,
+        });
+        const [result, restoration] = await Promise.all([retry, response]);
+        const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, RUN));
+        expect({ restoreStatus: restoration.status, retryOutcome: result.outcome, successorCount: successors.length })
+          .toEqual({ restoreStatus: 200, retryOutcome: "not_scheduled", successorCount: 0 });
+        expect(result).toMatchObject({ errorCode: "issue_reassigned", issueId: ISSUE });
+        expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+      } finally {
+        if (restoring) await Promise.resolve(restoring);
+        await unpauseRestore();
+      }
+    },
+    30_000,
+  );
+
+  it("does not coalesce an old owner's queued run into a newly restored stage after the final read", async () => {
+    await seedRun("queued", { taskId: "same-scope" });
+    await pauseRestoreAtAssignment();
+    let restoring: ReturnType<typeof post> | null = null;
+    try {
+      restoring = post();
+      const response = Promise.resolve(restoring);
+      await waitForPausedRestore();
+      const wakeup = heartbeatService(db).wakeup(ASSIGNEE, {
+        source: "automation", triggerDetail: "system", reason: "queued_scope_refresh",
+        contextSnapshot: { taskId: "same-scope", paperclipIssue: { id: ISSUE } },
+      });
+      const [wakeResult, restoration] = await Promise.all([wakeup, response]);
+      const [queued] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, RUN));
+      expect(restoration.status).toBe(200);
+      expect(queued.contextSnapshot).not.toHaveProperty("paperclipIssue.id", ISSUE);
+      expect(wakeResult?.id).not.toBe(RUN);
+      expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+    } finally {
+      if (restoring) await Promise.resolve(restoring);
+      await unpauseRestore();
+    }
+  }, 30_000);
+
+  it("keeps the self-declared assignee/status gate ahead of its run insert after restore's final read", async () => {
+    await db.update(agents).set({ runtimeConfig: { workDelivery: "external_pull" } }).where(eq(agents.id, ASSIGNEE));
+    await seedRun("failed", { issueId: ISSUE });
+    await db.update(heartbeatRuns).set({
+      invocationSource: "self_declared",
+      errorCode: "self_declared_run_expired",
+      finishedAt: new Date(Date.now() - 16 * 60_000),
+    }).where(eq(heartbeatRuns.id, RUN));
+    await pauseRestoreAtAssignment();
+    let restoring: ReturnType<typeof post> | null = null;
+    try {
+      restoring = post();
+      const response = Promise.resolve(restoring);
+      await waitForPausedRestore();
+      const opening = selfDeclaredRunService(db).openSelfDeclaredRun(ISSUE, ASSIGNEE).then(
+        () => "opened" as const,
+        (error: unknown) => error,
+      );
+      const [result, restoration] = await Promise.all([opening, response]);
+      expect(restoration.status).toBe(200);
+      expect(result).toMatchObject({ status: 403 });
+      expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    } finally {
+      if (restoring) await Promise.resolve(restoring);
+      await unpauseRestore();
+    }
+  }, 30_000);
+
+  it("does not schedule the former owner's provider-quota run from a snapshot held across restore", async () => {
+    await seedRun("failed", { issueId: ISSUE });
+    await db.update(heartbeatRuns).set({
+      errorCode: "provider_quota",
+      resultJson: { errorFamily: "provider_quota", providerQuotaRetryNotBefore: new Date(Date.now() + 60_000).toISOString() },
+    }).where(eq(heartbeatRuns.id, RUN));
+    const sourceIssue = await snapshot();
+    const [latestRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, RUN));
+    await pauseRestoreAtAssignment();
+    let restoring: ReturnType<typeof post> | null = null;
+    try {
+      restoring = post();
+      const response = Promise.resolve(restoring);
+      await waitForPausedRestore();
+      const recovery = recoveryService(db, { enqueueWakeup: async () => null })
+        .escalateStrandedAssignedIssue({
+          issue: sourceIssue, latestRun, previousStatus: "in_progress", recoveryCause: "provider_quota",
+        });
+      const [result, restoration] = await Promise.all([recovery, response]);
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"));
+      expect(restoration.status).toBe(200);
+      expect(result).toBeNull();
+      expect(retries).toHaveLength(0);
+      expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.status, "active"))).toHaveLength(0);
+    } finally {
+      if (restoring) await Promise.resolve(restoring);
+      await unpauseRestore();
+    }
+  }, 30_000);
+
+  it("excludes delayed disposition repair while a pending stage is restored after its final read", async () => {
+    await seedRun("failed", { issueId: ISSUE, retryReason: "issue_continuation_needed" });
+    await pauseRestoreAtAssignment();
+    let restoring: ReturnType<typeof post> | null = null;
+    try {
+      restoring = post();
+      const response = Promise.resolve(restoring);
+      await waitForPausedRestore();
+      const waitingState = await collectDispositionRepairSourceState(db, { issue: await snapshot() });
+      expect(waitingState).toMatchObject({
+        hasActiveExecutionPath: false,
+        hasDurableWaitingPath: true,
+        durablePathReason: "execution_stage",
+      });
+      const sweep = recoveryService(db, { enqueueWakeup: async () => null }).reconcileStrandedAssignedIssues();
+      const [, restoration] = await Promise.all([sweep, response]);
+      expect(restoration.status).toBe(200);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "issue_disposition_repair"))).toHaveLength(0);
+      expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+    } finally {
+      if (restoring) await Promise.resolve(restoring);
+      await unpauseRestore();
+    }
+  }, 30_000);
+
+  it("does not admit an old-owner nested-only wake after restore's final read", async () => {
+    await seedRun("running");
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, ASSIGNEE));
+    await pauseRestoreAtAssignment();
+    let restoring: ReturnType<typeof post> | null = null;
+    try {
+      restoring = post();
+      const response = Promise.resolve(restoring);
+      await waitForPausedRestore();
+      const waking = heartbeatService(db).wakeup(ASSIGNEE, {
+        source: "automation", triggerDetail: "system", reason: "nested_scope_refresh",
+        allowRunCoalescing: false,
+        contextSnapshot: { taskId: randomUUID(), responsibleUserId: "operator", paperclipIssue: { id: ISSUE } },
+      });
+      const [run, restoration] = await Promise.all([waking, response]);
+      expect(restoration.status).toBe(200);
+      expect(run).toBeNull();
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+      expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+    } finally {
+      if (restoring) await Promise.resolve(restoring);
+      await unpauseRestore();
+    }
+  }, 30_000);
+
+  it("holds the nested-only issue lock through the wake receipt and run insert", async () => {
+    await seedRun("running");
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, ASSIGNEE));
+    await pauseNestedWakeReceipt();
+    let wakeFinished = false;
+    const waking = heartbeatService(db).wakeup(ASSIGNEE, {
+      source: "automation", triggerDetail: "system", reason: "nested_lock_witness",
+      allowRunCoalescing: false,
+      contextSnapshot: { taskId: randomUUID(), responsibleUserId: "operator", paperclipIssue: { id: ISSUE } },
+    }).finally(() => { wakeFinished = true; });
+    try {
+      await waitForPausedWakeReceipt();
+      const restoration = await post();
+      expect(wakeFinished).toBe(false);
+      const run = await waking;
+      expect(restoration.status).toBe(409);
+      expect(run?.status).toBe("queued");
+      expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+      expect(await audit()).toHaveLength(0);
+    } finally {
+      await waking.catch(() => null);
+      await unpauseNestedWakeReceipt();
+    }
+  }, 30_000);
 
   it.each(["active", "escalated"])("409s on %s recovery action", async (status) => {
     await db.insert(issueRecoveryActions).values({

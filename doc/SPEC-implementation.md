@@ -309,6 +309,10 @@ board inspection. A candidate that remains lock-conflicted is retried every
 eligibility changes; the cap alert is not a permanent liveness stop. Deferral
 never aborts startup, and a rolled-back attempt never reports a run failure
 or grants provider authority.
+
+A successful recovery claim continues through the existing `executeRun`
+dispatch path; these retry rules do not make the claim a no-work terminal step.
+
 Restore sets a 250ms transaction-local lock timeout. On SQLSTATE `55P03` or
 `40P01`, it returns 409 with top-level `code` and `details.code` both equal to
 `"participant_restore_lock_busy"`, `details.retryable = true`, and
@@ -316,29 +320,32 @@ Restore sets a 250ms transaction-local lock timeout. On SQLSTATE `55P03` or
 Other 409 eligibility conflicts do not carry that retry signal.
 After the issue lock and immediately before changing the assignee, a second
 live-run read refuses a run committed while the repair waited for that lock.
+
 Heartbeat wakeup requests whose only issue binding is
 `contextSnapshot.paperclipIssue.id` (a valid UUID in the agent's company) stay
-unscoped, with task key and run context unchanged, but acquire the issue-row
-lock, before the agent lock, through queued-run insertion. Other paths remain
-outside that admission lock. `scheduleBoundedRetryForRun` in `heartbeat.ts`
-derives its issue id only from top-level `contextSnapshot.issueId`; a failed
-run with only `paperclipIssue.id` can insert its `scheduled_retry` successor
-without the issue-row lock. The unscoped `enqueueWakeup` same-scope coalescing
-branch updates an existing run's context snapshot before the nested-only
-queued-run lock branch; it can add a nested binding after restore's final
-live-run read without taking the issue-row lock. These are residual races,
-not claims of coverage by the nested-only queue lock. A raw serving-role
-`heartbeat_runs` SQL insert and the provider-quota and delayed disposition
-`scheduled_retry` inserts in `server/src/services/recovery/service.ts` likewise
-do not hold the issue-row lock through insertion. Existing active recovery
-actions are refused, but a later action/scheduled run sequence is not
-serialized against restore's final live-run read. `self-declared-run.ts`
-updates the issue status to `in_progress` while requiring the old assignee
-before its separate run insert: this atomic status/assignee predicate excludes
-an eligible restore in either order, but is not a continuous issue-row lock
-across insertion. These are source-path dispositions, not measured
-interleavings or an exhaustive census; see `doc/restore-participant-assurance.md`
-for each writer and three receipt-only helpers.
+unscoped, with task key and run context unchanged. Queued-run admission locks
+the issue row, before the agent lock, through insertion, then refuses the
+former owner if the pending stage now belongs to another assignee/participant.
+The same-scope coalescing branch locks the candidate run and nested issue in
+one transaction through its context update and receipt; it refuses a stale
+former-owner binding. `scheduleBoundedRetryForRun` likewise locks a valid nested
+issue id before inserting the retry and rechecks pending-stage ownership under
+that lock. Valid non-UUID nested values remain outside these issue-row locks.
+The provider-quota escalation rechecks a pending stage under the issue lock
+after its action upsert, resolves a stale action minted against a now-restored
+participant, and its monitor locks the issue through any retry insertion.
+`self-declared-run.ts` updates the issue status to `in_progress` while requiring
+the old assignee before its separate run insert; this atomic status/assignee
+predicate excludes an eligible restore in either order.
+Delayed disposition-repair retries are ineligible for a pending execution
+stage: `collectDispositionRepairSourceState` recognizes `execution_stage` as a
+durable waiting path before the delayed writer, and an already-active repair
+action is refused by restore. A privileged raw `heartbeat_runs` SQL insert can
+still bypass issue-row admission after restore's final read; this operation
+does not install a trigger, revoke write privileges, or promise exclusivity
+against arbitrary future writers. The observed interleavings and the guarded
+disposition state are distinguished in `doc/restore-participant-assurance.md`.
+
 The operation changes only the agent assignee (and `updatedAt`) and logs the
 before/after assignment
 atomically. The status and status version remain unchanged (the version

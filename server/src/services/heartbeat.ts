@@ -16596,6 +16596,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const nestedIssueId = !issueId
+      ? readNonEmptyString(parseObject(contextSnapshot.paperclipIssue).id)
+      : null;
+    const nestedIssueLockId = nestedIssueId && isUuidLike(nestedIssueId) ? nestedIssueId : null;
 
     if (!baseSchedule) {
       const exhaustion = {
@@ -16832,6 +16836,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const scheduleResult = await db.transaction(
       async (tx): Promise<ScheduledRetryTransactionResult> => {
+        if (nestedIssueLockId) {
+          await tx.execute(
+            sql`select id from issues where company_id = ${run.companyId} and id = ${nestedIssueLockId} for update`,
+          );
+        }
         // All automatic failure paths share the same predecessor claim. A
         // duplicate monitor, restart sweep or wake must reuse its successor.
         if (
@@ -16861,6 +16870,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               run: existing,
               reusedExisting: true,
             };
+        }
+        if (nestedIssueLockId) {
+          const [lockedIssue] = await tx.select({
+            assigneeAgentId: issues.assigneeAgentId,
+            executionState: issues.executionState,
+          }).from(issues).where(and(
+            eq(issues.companyId, run.companyId),
+            eq(issues.id, nestedIssueLockId),
+          ));
+          if (!lockedIssue) return {
+            outcome: "not_scheduled",
+            reason: "Scheduled retry suppressed because the nested issue no longer exists",
+            errorCode: "issue_not_found",
+            issueId: nestedIssueLockId,
+            details: { issueId: nestedIssueLockId },
+          };
+          const state = parseObject(lockedIssue.executionState);
+          const participant = parseObject(state.currentParticipant);
+          if (
+            state.status === "pending" &&
+            lockedIssue.assigneeAgentId !== run.agentId &&
+            !(participant.type === "agent" && participant.agentId === run.agentId)
+          ) return {
+            outcome: "not_scheduled",
+            reason: "Scheduled retry suppressed because nested issue ownership changed",
+            errorCode: "issue_reassigned",
+            issueId: nestedIssueLockId,
+            details: { issueId: nestedIssueLockId, currentAssigneeAgentId: lockedIssue.assigneeAgentId },
+          };
         }
         if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
           if (issueId) {
@@ -32832,40 +32870,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             coalescedTargetRun.status === "scheduled_retry",
         },
       );
-      const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
-        writeSite: "enqueueWakeup:same-scope-coalesce",
-        runId: coalescedTargetRun.id,
-        agentId,
-        companyId: agent.companyId,
-        write: () =>
-          db
-            .update(heartbeatRuns)
-            .set({
-              contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
-              updatedAt: new Date(),
-            })
-            .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-            .returning()
-            .then((rows) => rows[0] ?? coalescedTargetRun),
-        fallback: coalescedTargetRun,
-      });
-
-      await db.insert(agentWakeupRequests).values({
-        ...durableReceiptFields,
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
+      const persistCoalescedWake = async (executor: Db) => {
+        const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
+          writeSite: "enqueueWakeup:same-scope-coalesce",
+          runId: coalescedTargetRun.id,
+          agentId,
+          companyId: agent.companyId,
+          write: () =>
+            executor
+              .update(heartbeatRuns)
+              .set({
+                contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
+                updatedAt: new Date(),
+              })
+              .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+              .returning()
+              .then((rows) => rows[0] ?? coalescedTargetRun),
+          fallback: coalescedTargetRun,
+        });
+        await executor.insert(agentWakeupRequests).values({
+          ...durableReceiptFields,
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return mergedRun;
+      };
+      const nestedIssueId = readNonEmptyString(parseObject(mergedContextSnapshot.paperclipIssue).id);
+      const mergedRun = nestedIssueId && isUuidLike(nestedIssueId)
+        ? await db.transaction(async (tx) => {
+            // Match restore's run-then-issue lock order even when this queued run
+            // was previously unbound and therefore absent from its first scan.
+            await tx.execute(sql`select id from heartbeat_runs where company_id = ${agent.companyId} and id = ${coalescedTargetRun.id} for update`);
+            const [lockedIssue] = await tx.select({
+              assigneeAgentId: issues.assigneeAgentId,
+              executionState: issues.executionState,
+            }).from(issues).where(and(
+              eq(issues.companyId, agent.companyId),
+              eq(issues.id, nestedIssueId),
+            )).for("update");
+            const state = parseObject(lockedIssue?.executionState);
+            const participant = parseObject(state.currentParticipant);
+            if (!lockedIssue || (
+              state.status === "pending" &&
+              lockedIssue.assigneeAgentId !== agentId &&
+              !(participant.type === "agent" && participant.agentId === agentId)
+            )) return null;
+            return persistCoalescedWake(tx as unknown as Db);
+          })
+        : await persistCoalescedWake(db);
+      if (!mergedRun) {
+        await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId });
+        return null;
+      }
       return mergedRun;
     }
 
@@ -32874,9 +32941,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const nestedIssueId = readNonEmptyString(parseObject(enrichedContextSnapshot.paperclipIssue).id);
     const queueOutcome = await db.transaction(async (tx) => {
       if (nestedIssueId && isUuidLike(nestedIssueId)) {
-        await tx.execute(
-          sql`select id from issues where id = ${nestedIssueId} and company_id = ${agent.companyId} for update`,
-        );
+        const [nestedIssue] = await tx.select({
+          assigneeAgentId: issues.assigneeAgentId,
+          executionState: issues.executionState,
+        }).from(issues).where(and(
+          eq(issues.id, nestedIssueId),
+          eq(issues.companyId, agent.companyId),
+        )).for("update");
+        const state = parseObject(nestedIssue?.executionState);
+        const participant = parseObject(state.currentParticipant);
+        if (nestedIssue && state.status === "pending" &&
+          nestedIssue.assigneeAgentId !== agentId &&
+          !(participant.type === "agent" && participant.agentId === agentId)) {
+          await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId }, tx);
+          return { kind: "skipped" as const };
+        }
       }
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
