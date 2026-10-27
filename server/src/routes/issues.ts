@@ -253,6 +253,7 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  DONE_TIER_STRUCTURED_FORMS,
   findMissingAdr072CloseLadderStages,
   renderDoneTierDeclaration,
   TIER1_FORM,
@@ -5034,6 +5035,10 @@ export function issueRoutes(
     // Tier-1 substitution always writable — so a missing declaration is a 422 on
     // both doors alike (SUP-14367, the SUP-13930 ghost-PASS chain).
     decisionCarried: boolean;
+    // The create door (POST with status:"done") has no comment and createIssueSchema
+    // rejects doneTier, so the close-door remedy would instruct an invalid retry.
+    // Create callers get a create-specific remedy instead (SUP-21339 review).
+    createDoor?: boolean;
     // Board actors close on the board's own judgment (SUP-13939): the tier-evidence
     // requirement is bypassed, but an audit row is written so board closes stay
     // countable in the ghost-PASS census. The delivery guard still applies in full.
@@ -5199,11 +5204,19 @@ export function issueRoutes(
       // closing actor writes in the comment they are already writing, and D6 makes
       // a Tier-1 substitution always writable, so a missing declaration is a 422,
       // never a deadlock.
-      const remedy =
-        "Include a done-tier declaration in the close comment: " +
-        `"Closed at Tier 2 (live): <probe evidence>"` +
-        ` or ${TIER1_FORM.slice(1, -1)}` +
-        ` — per SUP-12693.`;
+      const remedy = input.createDoor
+        ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
+          `${DONE_TIER_STRUCTURED_FORMS}` +
+          `. Alternatively, include a done-tier declaration in the close comment: ` +
+          `"Closed at Tier 2 (live): <probe evidence>"` +
+          ` or ${TIER1_FORM.slice(1, -1)}` +
+          ` — per SUP-12693.`
+        : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
+          `${DONE_TIER_STRUCTURED_FORMS}` +
+          `. Alternatively, include a done-tier declaration in the close comment: ` +
+          `"Closed at Tier 2 (live): <probe evidence>"` +
+          ` or ${TIER1_FORM.slice(1, -1)}` +
+          ` — per SUP-12693.`;
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 422 with no thread-readable code/remedy (SUP-15878 precedent).
@@ -15752,6 +15765,7 @@ export function issueRoutes(
           commentBody: null,
           runId: actor.runId ?? null,
           decisionCarried: false,
+          createDoor: true,
           boardActor: req.actor.type === "board",
           caller: createRefusalCaller(req),
           persistRefusalComment: false,

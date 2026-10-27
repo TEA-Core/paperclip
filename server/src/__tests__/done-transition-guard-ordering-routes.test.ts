@@ -26,7 +26,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { TIER1_FORM } from "../services/done-transition-guard.js";
+import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1282,6 +1282,9 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
       expect(res.body.details.remedy).toContain(TIER1_FORM.slice(1, -1));
       expect(res.body.details.remedy).not.toContain(TIER1_FORM);
+      // SUP-21339 review: the PATCH door response itself carries the structured forms.
+      expect(res.body.details.remedy).toContain(DONE_TIER_STRUCTURED_FORMS);
+      expect(res.body.details.remedy).toContain('"doneTier":');
 
       const statusRows = await db
         .select({ status: issues.status })
