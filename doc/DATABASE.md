@@ -286,19 +286,6 @@ that invariant. Removing or disabling a future native rollout flag must not
 delete these records; persisted experimental runs remain available for recovery
 and inspection.
 
-Migration `0302_pending_participant_run_admission` adds a live-run admission
-trigger on `heartbeat_runs` inserts and binding, owner, company or status
-updates. For valid UUIDs in `native_issue_id`, `context_snapshot.issueId` or
-`context_snapshot.paperclipIssue.id`, the trigger locks matching company issue
-rows in id order through the write. If a pending agent participant is already
-the issue assignee, a run for another agent fails with SQLSTATE `23514`.
-This serializes direct serving-role SQL with pending-participant restoration
-without revoking DML permissions or locking the entire run table. Missing,
-unbound or malformed issue bindings are not treated as a valid issue reference.
-Apply migration `0302` before exposing pending-participant restoration: without
-the trigger, direct SQL live-run writes do not take the issue-row admission
-lock. An application-only rollout does not close that race.
-
 `native_run_finalizations` also stores restart ownership and recovery state.
 The controller owner is a server boot id, PID, operating-system process-start
 timestamp, and monotonically increasing controller generation. Recovery writes

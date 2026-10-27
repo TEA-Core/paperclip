@@ -115,13 +115,6 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
   async function audit() {
     return db.select().from(activityLog).where(eq(activityLog.entityId, ISSUE));
   }
-  function sqlState(error: unknown): string | undefined {
-    for (let cause = error; cause && typeof cause === "object"; cause = "cause" in cause ? cause.cause : null) {
-      if ("code" in cause && typeof cause.code === "string") return cause.code;
-    }
-    return undefined;
-  }
-
   // The BEFORE UPDATE trigger pauses *after* restore's final live-run read while
   // its transaction still holds the issue row. Only the disposable test DB has it.
   async function pauseRestoreAtAssignment() {
@@ -687,105 +680,6 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     }
   }, 30_000);
 
-  it.each([
-    ["native", {}, ISSUE],
-    ["top-level", { issueId: ISSUE }, null],
-    ["nested", { paperclipIssue: { id: ISSUE } }, null],
-  ])("serializes serving-role SQL %s live-run insertion through the restore's final read", async (_binding, context, nativeIssueId) => {
-    await pauseRestoreAtAssignment();
-    let restoring: ReturnType<typeof post> | null = null;
-    let inserting: Promise<{ inserted: boolean; code?: string }> | null = null;
-    try {
-      restoring = post();
-      const response = Promise.resolve(restoring);
-      await waitForPausedRestore();
-      let insertSettled = false;
-      inserting = db.transaction(async (tx) => {
-        await tx.execute(sql`SET LOCAL ROLE paperclip_serving`);
-        const [role] = await tx.execute<{ name: string }>(sql`SELECT current_user AS name`);
-        if (role?.name !== "paperclip_serving") throw new Error("Serving-role SQL witness did not assume its role");
-        await tx.execute(sql`
-          INSERT INTO heartbeat_runs (company_id, agent_id, status, native_issue_id, context_snapshot)
-          VALUES (${COMPANY}, ${ASSIGNEE}, 'scheduled_retry', ${nativeIssueId}::uuid, ${JSON.stringify(context)}::jsonb)
-        `);
-      }).then(
-        () => { insertSettled = true; return { inserted: true }; },
-        (error: unknown) => {
-          insertSettled = true;
-          return { inserted: false, code: sqlState(error) };
-        },
-      );
-      await delay(100);
-      expect(insertSettled).toBe(false);
-      const [restoration, inserted] = await Promise.all([response, inserting]);
-      expect({ restoration: restoration.status, inserted }).toEqual({
-        restoration: 200, inserted: { inserted: false, code: "23514" },
-      });
-      expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
-      expect(await audit()).toHaveLength(1);
-      expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
-    } finally {
-      if (restoring) await Promise.resolve(restoring);
-      if (inserting) await inserting;
-      await unpauseRestore();
-    }
-  }, 30_000);
-
-  it("rejects a serving-role SQL update that binds an old queued run after restore's final read", async () => {
-    await seedRun("queued", { taskId: "unbound" });
-    await pauseRestoreAtAssignment();
-    let restoring: ReturnType<typeof post> | null = null;
-    let binding: Promise<{ updated: boolean; code?: string }> | null = null;
-    try {
-      restoring = post();
-      const response = Promise.resolve(restoring);
-      await waitForPausedRestore();
-      let updateSettled = false;
-      binding = db.transaction(async (tx) => {
-        await tx.execute(sql`SET LOCAL ROLE paperclip_serving`);
-        await tx.execute(sql`
-          UPDATE heartbeat_runs SET context_snapshot = ${JSON.stringify({ paperclipIssue: { id: ISSUE } })}::jsonb
-          WHERE id = ${RUN}
-        `);
-      }).then(
-        () => { updateSettled = true; return { updated: true }; },
-        (error: unknown) => { updateSettled = true; return { updated: false, code: sqlState(error) }; },
-      );
-      await delay(100);
-      expect(updateSettled).toBe(false);
-      const [restoration, result] = await Promise.all([response, binding]);
-      expect({ restoration: restoration.status, result }).toEqual({
-        restoration: 200, result: { updated: false, code: "23514" },
-      });
-      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, RUN));
-      expect(run?.contextSnapshot).toEqual({ taskId: "unbound" });
-      expect(await audit()).toHaveLength(1);
-    } finally {
-      if (restoring) await Promise.resolve(restoring);
-      if (binding) await binding;
-      await unpauseRestore();
-    }
-  }, 30_000);
-
-  it("allows the restored participant's serving-role SQL run without a restoration wake", async () => {
-    expect((await post()).status).toBe(200);
-    await db.transaction(async (tx) => {
-      await tx.execute(sql`SET LOCAL ROLE paperclip_serving`);
-      const [role] = await tx.execute<{ name: string }>(sql`SELECT current_user AS name`);
-      expect(role?.name).toBe("paperclip_serving");
-      await tx.execute(sql`
-        INSERT INTO heartbeat_runs (company_id, agent_id, status, context_snapshot)
-        VALUES (${COMPANY}, ${PARTICIPANT}, 'queued', ${JSON.stringify({ issueId: ISSUE })}::jsonb)
-      `);
-    });
-    const [run] = await db.select().from(heartbeatRuns);
-    expect(run).toMatchObject({
-      agentId: PARTICIPANT, status: "queued", contextSnapshot: { issueId: ISSUE },
-    });
-    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
-    expect(await audit()).toHaveLength(1);
-  });
-
   it("rechecks a delayed disposition insert under the issue lock after restore's final read", async () => {
     await seedRun("failed", { issueId: ISSUE, retryReason: "issue_continuation_needed" });
     const sourceIssue = await snapshot();
@@ -958,6 +852,49 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await seedRun(status, { issueId: ISSUE });
     expect((await post()).status).toBe(409);
     expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+  });
+
+  it.each([
+    ["before the issue-lock wait", true],
+    ["after the first run check but before the issue-lock write", false],
+  ])("refuses a queued run inserted %s", async (_order, queueBeforeRestore) => {
+    let signalLocked!: (pid: number) => void;
+    let releaseIssue!: () => void;
+    const locked = new Promise<number>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseIssue = resolve; });
+    const blocker = db.transaction(async (tx) => {
+      const [connection] = await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid()::int AS pid`);
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, ISSUE)).for("update");
+      signalLocked(connection!.pid);
+      await release;
+    });
+    const blockerPid = await locked;
+    if (queueBeforeRestore) await seedRun("queued", { issueId: ISSUE });
+    const restoring = Promise.resolve(post());
+    let waitedForIssue = false;
+    try {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await db.execute<{ waiting: boolean }>(sql`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+              AND ${blockerPid} = ANY(pg_blocking_pids(pid))
+          ) AS waiting
+        `);
+        if (row?.waiting) { waitedForIssue = true; break; }
+        await delay(25);
+      }
+      if (!queueBeforeRestore) await seedRun("queued", { issueId: ISSUE });
+    } finally {
+      releaseIssue();
+      await blocker;
+    }
+    const response = await restoring;
+    expect({ waitedForIssue, status: response.status }).toEqual({ waitedForIssue: true, status: 409 });
+    expect((await snapshot()).assigneeAgentId).toBe(ASSIGNEE);
+    expect(await audit()).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, RUN))).toMatchObject([{ status: "queued" }]);
   });
 
   it("returns a retryable 409 when the issue row stays locked past the repair lock timeout", async () => {

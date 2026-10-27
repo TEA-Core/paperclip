@@ -343,17 +343,11 @@ durable waiting path, and an already-active action is refused by restore.
 The delayed disposition insert independently locks the issue row through its
 receipt and run write, rechecking the source assignee and terminal status so
 a stale scheduler snapshot cannot insert a former-owner run after restoration.
-Migration `0302_pending_participant_run_admission` also guards direct SQL
-`heartbeat_runs` inserts and binding/status updates: live runs with a valid
-native issue id, top-level `contextSnapshot.issueId`, or nested
-`paperclipIssue.id` lock matching company issue rows in id order. Once a pending
-agent participant is the assignee, a run for another agent is rejected.
-Apply migration `0302` before exposing this operation; a server-only deployment
-does not serialize direct SQL run writes with restoration.
-This is neither a table lock nor a revocation of serving-role DML privileges.
-It does not guarantee that arbitrary future writers or unbound runs are safe;
-observed interleavings and admission limits are recorded in
-`doc/restore-participant-assurance.md`.
+A hand-run operator `heartbeat_runs` SQL insert is the one remaining residual
+race: it bypasses issue-row admission after restore's final read, and this
+operation installs no trigger, revokes no write privileges, and promises no
+exclusivity against it or arbitrary future writers. The observed interleavings
+and admission limits are recorded in `doc/restore-participant-assurance.md`.
 
 The operation changes only the agent assignee (and `updatedAt`) and logs the
 before/after assignment
