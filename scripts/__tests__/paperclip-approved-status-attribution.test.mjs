@@ -178,6 +178,27 @@ for (const [label, row] of [
   });
 }
 
+// Non-scalar projected fields must fail the whole status response rather than
+// turning into printable text and leaving a trusted ordinary success admissible.
+for (const [label, rows] of [
+  ["ordinary creator login array", [status("success", { ...TEA_CORE, login: [] })]],
+  ["ordinary creator login object", [status("success", { ...TEA_CORE, login: {} })]],
+  ["ordinary creator login nonempty array", [status("success", { ...TEA_CORE, login: ["success"] })]],
+  ["ordinary creator login nonempty object", [status("success", { ...TEA_CORE, login: { value: "success" } })]],
+  ["unrelated context array", [status("success", FLEET_ONLY, []), status("success", TEA_CORE)]],
+  ["unrelated context object", [status("success", FLEET_ONLY, {}), status("success", TEA_CORE)]],
+  ["unrelated state array", [status([], FLEET_ONLY, "ci/unrelated"), status("success", TEA_CORE)]],
+  ["unrelated state object", [status({}, FLEET_ONLY, "ci/unrelated"), status("success", TEA_CORE)]],
+  ["unrelated creator login array", [status("success", { ...FLEET_ONLY, login: [] }, "ci/unrelated"), status("success", TEA_CORE)]],
+  ["unrelated creator login object", [status("success", { ...FLEET_ONLY, login: {} }, "ci/unrelated"), status("success", TEA_CORE)]],
+]) {
+  test(`non-scalar ${label} refuses the entire status response`, () => {
+    const { code, err } = run(rows);
+    assert.equal(code, 1);
+    assert.match(err, /API failure/);
+  });
+}
+
 test("the newest status for the context decides, even when an older one is genuine", () => {
   // The list endpoint returns entries newest-first, which is what makes the
   // first match equivalent to the combined endpoint's reported value. A forged

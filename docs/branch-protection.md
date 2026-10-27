@@ -54,6 +54,8 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
   `/commits/<head>/statuses` list, which includes creator attribution.
   Empty status fields are mapped to a `-` placeholder before parsing: a missing or null
   creator cannot inherit a description or target URL as its App identity.
+  An array or object in a projected status field rejects the entire response
+  rather than being coerced into a string or bypassed as an unrelated row.
   A present RA HOLD/NO-GO, untrusted producer, stale head or malformed target
   blocks both approval alternatives and both cardless waivers/override.
 - The RA producer remains **shadow-only**: it records decisions and plans

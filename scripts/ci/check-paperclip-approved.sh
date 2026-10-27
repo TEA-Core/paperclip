@@ -837,7 +837,7 @@ STATUS_DEF='def f: if . == "" then "-" else . end; '
 STATUS_ROW='((.context // "") | f), ((.state // "") | f), (((.creator.id // "") | tostring) | f), ((.creator.login // "") | f), ((.description // "") | f), ((.id // "-") | tostring)'
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-  --jq "${STATUS_DEF}.[] | [${STATUS_ROW}, ((.target_url // \"\") | f)] | @tsv")" \
+  --jq "${STATUS_DEF}.[] | if ([.context, .state, .creator.id, .creator.login, .description, .target_url, .id] | any(type == \"array\" or type == \"object\")) then error(\"non-scalar status field\") else . end | [${STATUS_ROW}, ((.target_url // \"\") | f)] | @tsv")" \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
