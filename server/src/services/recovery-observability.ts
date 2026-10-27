@@ -168,6 +168,12 @@ function round2(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
+/** True when the ISO week starting at `weekStart` (YYYY-MM-DD) has fully elapsed by `now`. */
+export function isCompleteRecoveryWeek(weekStart: string, now: Date | number): boolean {
+  const monday = new Date(`${weekStart}T00:00:00.000Z`).getTime();
+  return monday + 7 * 24 * 60 * 60 * 1000 <= (typeof now === "number" ? now : now.getTime());
+}
+
 function utcWeekStart(now: Date, weeksAgo: number): Date {
   const utcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   const dayOfWeek = new Date(utcMidnight).getUTCDay(); // 0 = Sunday
@@ -230,6 +236,13 @@ export function recoveryObservabilityService(db: Db) {
     });
 
     const alert = evaluateRecoveryRateAlert(weekly, thresholdPercent);
+    // SUP-21344: the artifact key must name the same complete-week window the
+    // attention service materialises; a breach limited to the current partial
+    // week has no attention item, so it must not expose a dangling key.
+    const completeWeekAlert = evaluateRecoveryRateAlert(
+      weekly.filter((w) => isCompleteRecoveryWeek(w.weekStart, now)),
+      thresholdPercent,
+    );
 
     // Cause + latestRunErrorCode taxonomy (from the action's evidence snapshot).
     const causeRows = (await db.execute(sql`
@@ -379,7 +392,7 @@ export function recoveryObservabilityService(db: Db) {
       thresholdPercent,
       weekly,
       alert,
-      alertArtifactKey: recoveryRateAlertArtifactKey(alert, companyId),
+      alertArtifactKey: recoveryRateAlertArtifactKey(completeWeekAlert, companyId),
       byCause,
       handoff,
       perCauseRouting,

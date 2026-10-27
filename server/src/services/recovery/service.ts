@@ -9150,12 +9150,30 @@ export function recoveryService(
                   })
                   .where(eq(issues.id, candidate.id));
               }
-              await issuesSvc.addComment(
-                candidate.id,
-                `Board decision item: recovery_action:${existingAction!.id} — recovery action exhausted; board check armed for ${drainNextCheckAt.toISOString()}.`,
-                {},
-                { authorType: "system" },
-              );
+              // Dedupe by recovery action: once the armed monitor has fired
+              // (monitorNextCheckAt cleared), a later pass re-arms it; without
+              // this check every re-arm would post another identical comment
+              // while the terminal action stays unresolved.
+              const drainMarker = `recovery_action:${existingAction!.id}`;
+              const alreadyCommented = await db
+                .select({ body: issueComments.body })
+                .from(issueComments)
+                .where(
+                  and(
+                    eq(issueComments.companyId, companyId),
+                    eq(issueComments.issueId, candidate.id),
+                    eq(issueComments.authorType, "system"),
+                  ),
+                )
+                .then((rows) => rows.some((row) => (row.body ?? "").includes(drainMarker)));
+              if (!alreadyCommented) {
+                await issuesSvc.addComment(
+                  candidate.id,
+                  `Board decision item: ${drainMarker} — recovery action exhausted; board check armed for ${drainNextCheckAt.toISOString()}.`,
+                  {},
+                  { authorType: "system" },
+                );
+              }
             }
           }
           result.exhaustedRecoverySuppressed++;
@@ -10744,8 +10762,11 @@ export function recoveryService(
     // `hasActiveExecutionPath` (a future monitorNextCheckAt). When the board
     // acts (assigns an invokable owner / records a manual resolution) it
     // clears or supersedes the monitor.
-    const boardNextCheckAt = new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
-    if (!hasFutureMonitorCheck(sourceIssue.monitorNextCheckAt)) {
+    const hasExistingFutureMonitor = hasFutureMonitorCheck(sourceIssue.monitorNextCheckAt);
+    const boardNextCheckAt = hasExistingFutureMonitor
+      ? new Date(sourceIssue.monitorNextCheckAt!)
+      : new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
+    if (!hasExistingFutureMonitor) {
       const previousPolicy = sourceIssue.executionPolicy
         ? (normalizeIssueExecutionPolicy(sourceIssue.executionPolicy) ?? undefined)
         : undefined;

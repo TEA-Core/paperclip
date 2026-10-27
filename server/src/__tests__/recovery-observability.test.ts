@@ -16,6 +16,7 @@ import {
 import {
   classifyRecoveryHandoff,
   evaluateRecoveryRateAlert,
+  isCompleteRecoveryWeek,
   MAX_WINDOW_WEEKS,
   recoveryRateAlertArtifactKey,
   recoveryObservabilityService,
@@ -77,6 +78,12 @@ describe("evaluateRecoveryRateAlert", () => {
     );
     const quiet = evaluateRecoveryRateAlert([week(1000, 1, "2026-07-06")], 2);
     expect(recoveryRateAlertArtifactKey(quiet, "company-1")).toBeNull();
+  });
+
+  it("SUP-21344: a week is complete only once the following Monday is reached", () => {
+    expect(isCompleteRecoveryWeek("2026-07-06", new Date("2026-07-12T23:59:59.000Z"))).toBe(false);
+    expect(isCompleteRecoveryWeek("2026-07-06", new Date("2026-07-13T00:00:00.000Z"))).toBe(true);
+    expect(isCompleteRecoveryWeek("2026-07-13", new Date("2026-07-15T12:00:00.000Z"))).toBe(false);
   });
 });
 
@@ -291,6 +298,37 @@ describeEmbeddedPostgres("recovery observability report", () => {
     const latest = report.weekly.find((w) => w.weekStart === "2026-07-13");
     expect(latest).toMatchObject({ runs: 100, recoveryActions: 1, ratePercent: 1 });
     expect(report.alert.latestWeekBreached).toBe(false);
+    // 2026-07-06 is complete by `now` (2026-07-15), so the key is exposed.
+    expect(report.alertArtifactKey).toBe(`recovery_rate_alert:${companyId}:2026-07-06`);
+  });
+
+  it("SUP-21344: exposes no artifact key for a breach limited to the current partial week", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+    // Latest week (2026-07-13, still partial at `now`): 3 actions / 100 runs = 3%.
+    for (let i = 0; i < 3; i += 1) {
+      await seedRecoveryAction({
+        companyId,
+        n: i + 1,
+        createdAt: latestWeek,
+        cause: "stranded_assigned_issue",
+        errorCode: "process_lost",
+        status: "resolved",
+        outcome: "restored",
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        finalAssigneeAgentId: managerId,
+        finalIssueStatus: "done",
+      });
+    }
+
+    const report = await recoveryObservabilityService(db).report(companyId, {
+      now,
+      weeks: 8,
+      thresholdPercent: 2,
+    });
+
+    expect(report.alert.breached).toBe(true);
+    expect(report.alertArtifactKey).toBeNull();
   });
 
   it("computes the handed_back vs owner_completed ratio and per-cause routing", async () => {

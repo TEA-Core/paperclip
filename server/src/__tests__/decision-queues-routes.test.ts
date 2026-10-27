@@ -421,6 +421,28 @@ describeEmbeddedPostgres("decision queue routes", () => {
     }
   });
 
+  it("SUP-21344: retains a same-company recovery_rate_alert sidecar for board actors only", async () => {
+    const { companyId, agentId } = await seed();
+    const alertKey = `recovery_rate_alert:${companyId}:2026-07-06`;
+    const foreignAlertKey = `recovery_rate_alert:${randomUUID()}:2026-07-06`;
+    const [queue] = await db.insert(decisionQueues).values({
+      companyId, key: "alerts", title: "Alerts", createdByType: "system",
+    }).returning();
+    await db.insert(decisionQueueItems).values([
+      { companyId, queueId: queue!.id, sourceKind: "recovery_rate_alert" as const, sourceId: alertKey, addedByType: "system" as const },
+      { companyId, queueId: queue!.id, sourceKind: "recovery_rate_alert" as const, sourceId: foreignAlertKey, addedByType: "system" as const },
+    ]);
+    const service = decisionQueueService(db);
+    expect(await canReadDecisionSource(db, boardActor(companyId), companyId, "recovery_rate_alert", alertKey)).toBe(true);
+    expect(await canReadDecisionSource(db, boardActor(companyId), companyId, "recovery_rate_alert", foreignAlertKey)).toBe(false);
+    expect(await canReadDecisionSource(db, agentActor(companyId, agentId), companyId, "recovery_rate_alert", alertKey)).toBe(false);
+    expect((await service.listItems(companyId, "alerts", boardActor(companyId))).map((item) => item.sourceId))
+      .toEqual([alertKey]);
+    expect((await service.listItems(companyId, "alerts", agentActor(companyId, agentId))).map((item) => item.sourceId))
+      .toEqual([]);
+    expect((await service.list(companyId, boardActor(companyId)))[0]?.itemCount).toBe(1);
+  });
+
   it("matches canonical source visibility when the issue points to a foreign project", async () => {
     const { companyId, agentId, issueId, interactionId, approvalId } = await seed();
     const otherCompanyId = randomUUID();
@@ -471,8 +493,8 @@ describeEmbeddedPostgres("decision queue routes", () => {
       failed_run: run!.id,
       budget_alert: incident!.id,
       agent_error_alert: agentId,
-      // Synthetic alert key, not a stored row; canReadDecisionSource must
-      // resolve it as non-existent rather than trusting the id.
+      // Synthetic alert key naming a foreign company: canReadDecisionSource
+      // scopes the key by company, so it is non-existent for the seeded actor.
       recovery_rate_alert: "recovery_rate_alert:nonexistent",
     };
     const [queue] = await db.insert(decisionQueues).values({

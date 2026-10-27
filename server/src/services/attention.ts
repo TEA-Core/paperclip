@@ -53,6 +53,7 @@ import { budgetService } from "./budgets.js";
 import { TIMER_DISPATCH_PARK_RECOVERY_CAUSE, TIMER_DISPATCH_PARK_RECOVERY_KIND } from "./recovery/stranded-notice.js";
 import {
   evaluateRecoveryRateAlert,
+  isCompleteRecoveryWeek,
   recoveryRateAlertArtifactKey,
   type WeeklyRecoveryRate,
 } from "./recovery-observability.js";
@@ -1507,15 +1508,17 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         });
         // Only complete (elapsed) weeks count: the current partial week has an
         // incomplete run denominator and would false-breach.
-        const completeWeeks = weekly.filter((w) => {
-          const monday = new Date(`${w.weekStart}T00:00:00.000Z`).getTime();
-          return monday + 7 * 24 * 60 * 60 * 1000 <= now;
-        });
+        const completeWeeks = weekly.filter((w) => isCompleteRecoveryWeek(w.weekStart, now));
         const alert = evaluateRecoveryRateAlert(completeWeeks);
         const artifactKey = recoveryRateAlertArtifactKey(alert, companyId);
         if (artifactKey && alert.breachedWeeks[0]) {
           const first = alert.breachedWeeks[0];
-          const activityAt = new Date(`${first.weekStart}T00:00:00.000Z`).toISOString();
+          // The alert surfaces when the breached week completes (the following
+          // Monday), so timestamp it at completion, not at the week start —
+          // otherwise it never counts as new today. The key keeps weekStart.
+          const activityAt = new Date(
+            new Date(`${first.weekStart}T00:00:00.000Z`).getTime() + 7 * 24 * 60 * 60 * 1000,
+          ).toISOString();
           add(createItem({
             companyId,
             sourceKind: "recovery_rate_alert",

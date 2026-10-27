@@ -433,6 +433,10 @@ async function readableQueueItems(
       case "agent_error_alert": return row.agentId ? null : undefined;
       case "join_request": return row.joinId ? null : undefined;
       case "budget_alert": return row.budgetId ? null : undefined;
+      // SUP-21344: synthetic alert key, not a stored row. It exists (as a
+      // non-issue source) only when its key names this company.
+      case "recovery_rate_alert":
+        return row.item.sourceId.startsWith(`recovery_rate_alert:${companyId}:`) ? null : undefined;
     }
   };
   const issueIds = [...new Set(rows.map(issueIdFor).filter((id): id is string => typeof id === "string" && UUID_RE.test(id)))];
