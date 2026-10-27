@@ -336,6 +336,21 @@ waiver refusal, the release log line and the denial hint. `paperclip/release-con
 by the script and is **not** a required status check: do not add it to the ruleset (this
 document changes no ruleset).
 
+**An unsettled auto-merge arm blocks the head in CI (SUP-20772).** Before the control plane
+asks GitHub to arm auto-merge for a head it writes `paperclip/arm-gate` = failure on that
+head, and it writes `paperclip/arm-gate` = success only once the arm is settled (taken back
+and confirmed off, or standing with its authority). The enforcer, with
+`PAPERCLIP_CARD_WAIVER_RETIRED` ON or OFF, refuses a head whose newest `tea-core[bot]`
+`paperclip/arm-gate` status is not a success (`ARM GATE OPEN`, non-zero exit on
+`merge_group`, whatever stamp, release, waiver or override label the head carries; the
+advisory `pull_request` leg reports it and stays green). A status of that context from any
+other creator is ignored, so none can clear it. A head with no such status is judged as
+before. The point is the case in which GitHub refuses the control plane's take-back and
+every later write: the gate was written while GitHub still answered, so it is still there.
+It relies on `Paperclip Approval Enforcer` being a required check on the base branch (it
+already is for the fold); `paperclip/arm-gate` itself is read by the script and is **not**
+a required status check: do not add it to the ruleset (this document changes no ruleset).
+
 **Known residual bypass — do not set `PAPERCLIP_CARD_WAIVER_RETIRED` until it is
 closed.** The enforcer reads GitHub only and has no control-plane credential, so it
 cannot ask which card owns a PR. Both inputs to the refusal are chosen by the PR

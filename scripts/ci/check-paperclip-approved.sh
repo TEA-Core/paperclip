@@ -733,6 +733,35 @@ evaluate_override() {
   return 0
 }
 
+# ARM GATE (SUP-20772). The control plane writes `paperclip/arm-gate` = failure on a head BEFORE it asks GitHub to arm
+# auto-merge for it, and a success only once that arm is settled (taken back and confirmed off, or standing with its
+# authority). Taking an arm back is itself a GitHub call that can keep failing, and so can the status write that fences the head
+# afterwards, so the gate is written while GitHub still answers: when both fail it is still there. Only the control plane's own
+# identity counts (a status from anyone else is ignored: it can neither open the gate nor clear it). A head with no
+# arm-gate status is judged exactly as before; one whose newest control-plane arm-gate is not a success is refused here,
+# whatever else it carries (a stamp, a release, a waiver, the override label).
+ARM_GATE_CONTEXT="paperclip/arm-gate"
+ARM_GATE_REFUSAL=""
+arm_gate_refusal() {
+  # $1 = state of the newest control-plane arm-gate status ("" when none), $2 = its description
+  [ -n "$1" ] && [ "$1" != "$STATE" ] || return 1
+  ARM_GATE_REFUSAL="ARM GATE OPEN: ${ARM_GATE_CONTEXT} on ${HEAD_SHA} is ${1} (${2:-no description}); an auto-merge arm of this head is unsettled, so it is not mergeable until the control plane writes ${ARM_GATE_CONTEXT} = ${STATE}"
+  return 0
+}
+# waiver_arm_gate: a waiver exits before the status list is read, so it reads the gate itself. A read that fails changes
+# nothing here (the waiver was honoured without any status read before this existed).
+waiver_arm_gate() {
+  local gate
+  gate="$(gh_api_retry --paginate "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
+    --jq "[.[] | select(.context == \"${ARM_GATE_CONTEXT}\" and ((.creator.id // \"\") | tostring) == \"${APPROVED_STATUS_CREATOR_ID}\")] | (.[0] // empty) | [.state, (.description // \"\")] | @tsv" 2>/dev/null | grep -m1 . || true)"
+  [ -n "$gate" ] || return 0
+  local gate_state="${gate%%$'\t'*}" gate_description="${gate#*$'\t'}"
+  if arm_gate_refusal "$gate_state" "$gate_description"; then
+    fail "$ARM_GATE_REFUSAL"
+  fi
+  return 0
+}
+
 # waiver_unverified <what>: say, in the log, that a waiver was honoured on
 # author-controlled evidence only (branch name and author type).
 waiver_unverified() {
@@ -778,6 +807,7 @@ if [ -n "$reason_line" ]; then
   reason="$(sed -E 's/^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*//' <<<"$reason_line")"
   if waiver_honoured "body waiver 'Paperclip-Approved-Waiver: ${reason}'" \
     && require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
+    waiver_arm_gate
     note "waived: PR body declares 'Paperclip-Approved-Waiver: ${reason}' (no Paperclip card)"
     exit 0
   fi
@@ -791,6 +821,7 @@ fi
 if [ -n "$PR_LABELS" ] && printf '%s' "$PR_LABELS" | jq -e --arg l 'no-paperclip-card' 'index($l)' >/dev/null 2>&1; then
   if waiver_honoured "the 'no-paperclip-card' label" \
     && require_countersignature "the 'no-paperclip-card' label"; then
+    waiver_arm_gate
     note "waived: PR carries the 'no-paperclip-card' label (no Paperclip card)"
     exit 0
   fi
@@ -838,6 +869,8 @@ APPROVAL_CREATOR_LOGIN=""
 APPROVAL_DESCRIPTION=""
 APPROVAL_STATUS_ID=""
 CONFIRMED_RELEASE_IDS=" "
+ARM_GATE_STATE=""
+ARM_GATE_DESCRIPTION=""
 while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id; do
   [ "$status_context" = "-" ] && status_context=""
   [ "$status_state" = "-" ] && status_state=""
@@ -853,6 +886,15 @@ while IFS=$'\t' read -r status_context status_state status_creator_id status_cre
     fi
     continue
   fi
+  if [ "$status_context" = "$ARM_GATE_CONTEXT" ]; then
+    # The newest arm-gate status written by the control plane decides (the list is newest first); any other creator is ignored.
+    if [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ] && [ -z "${arm_gate_seen:-}" ]; then
+      arm_gate_seen=1
+      ARM_GATE_STATE="$status_state"
+      ARM_GATE_DESCRIPTION="$status_description"
+    fi
+    continue
+  fi
   [ "$status_context" = "$CONTEXT" ] || continue
   # The newest paperclip/approved status decides (the list is newest first). The rest of the list is
   # still read, for markers.
@@ -865,6 +907,11 @@ while IFS=$'\t' read -r status_context status_state status_creator_id status_cre
     APPROVAL_STATUS_ID="$status_id"
   fi
 done <<<"$STATUSES_TSV"
+
+# An unsettled arm of this head refuses it first, whatever stamp, release or override it carries (see ARM_GATE_CONTEXT).
+if arm_gate_refusal "$ARM_GATE_STATE" "$ARM_GATE_DESCRIPTION"; then
+  fail "$ARM_GATE_REFUSAL"
+fi
 
 # A release success the control plane has not confirmed is not an approval (switch on or off). A success
 # from any other creator is left to the FORGED refusal below.

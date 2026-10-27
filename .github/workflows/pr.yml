@@ -345,6 +345,13 @@ jobs:
         # Also pins the documented residual bypass.
         run: node --test ./scripts/__tests__/paperclip-approved-card-waiver.test.mjs
 
+      - name: Test paperclip-approved arm gate
+        # SUP-20772: a head whose newest control-plane paperclip/arm-gate status
+        # is not a success (an auto-merge arm of it is unsettled) is refused on
+        # merge_group, with a stamp, a release or a waiver; no arm-gate status
+        # means the script judges the head exactly as before.
+        run: node --test ./scripts/__tests__/paperclip-approved-arm-gate.test.mjs
+
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 

@@ -1,4 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -73,6 +78,17 @@ import { issueRoutes } from "../routes/issues.js";
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
+// The arm gate (a `paperclip/arm-gate` status the control plane writes before every enable and closes when the arm is settled)
+// is answered here, apart from the per-test GitHub fakes: by default GitHub accepts it, and a test that needs it refused, slow
+// or recorded sets `answer`. Every write is kept in `writes`, in order.
+const armGateFake = vi.hoisted(() => {
+  const created = () => ({ ok: true, status: 201, json: async () => ({ id: 9000 }) }) as unknown as Response;
+  return {
+    created,
+    writes: [] as Array<{ url: string; state: string; description: string; context: string; accepted: boolean }>,
+    answer: created as (body: { state: string; description: string; context: string }) => Response | Promise<Response>,
+  };
+});
 
 vi.mock("./secrets.js", () => ({
   secretService: () => ({
@@ -82,7 +98,24 @@ vi.mock("./secrets.js", () => ({
 }));
 
 vi.mock("./github-fetch.js", () => ({
-  ghFetch: mockGhFetch,
+  ghFetch: (url: string, init?: RequestInit) => {
+    if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { state: string; description: string; context: string };
+      if (body.context === "paperclip/arm-gate") {
+        return Promise.resolve(armGateFake.answer(body)).then((response) => {
+          armGateFake.writes.push({ url, state: body.state, description: body.description, context: body.context, accepted: response.ok });
+          return response;
+        });
+      }
+    }
+    // An arm that names no head reads the PR's live head for the arm gate; a test whose fake does not model that read gets one.
+    return Promise.resolve(mockGhFetch(url, init)).catch((error: unknown) => {
+      if (typeof url === "string" && /\/pulls\/\d+$/.test(url) && /unmocked|unexpected/i.test(String((error as Error)?.message))) {
+        return { ok: true, status: 200, json: async () => ({ head: { sha: "c".repeat(40), ref: "live-head" }, state: "open", draft: false, merged: false }) } as unknown as Response;
+      }
+      throw error;
+    });
+  },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
@@ -207,6 +240,8 @@ if (!embeddedPostgresSupport.supported) {
 // SUP-15459: the ladder-terminality predicate gates every paperclip/approved
 // write. It is pure (no I/O), so these run even where embedded Postgres is
 // absent — no DB fixtures required.
+beforeEach(() => { armGateFake.writes.length = 0; armGateFake.answer = armGateFake.created; });
+
 describe("ladderIsTerminallyApproved", () => {
   const A = "stage-a";
   const B = "stage-b";
@@ -3345,6 +3380,161 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
             const record = await disarmRecord(issueId);
             expect(record?.fencedAt).toBeFalsy();
             expect(record).toMatchObject({ fenceError: expect.stringContaining("statuses refused") });
+          });
+        });
+
+        // Round 16 (R10-AUTH-DISABLE, both routes refused): the arm gate is written BEFORE the enable, while GitHub answers. When the
+        // take-back (GraphQL) and every write made after the arm (REST) are refused, it is still there, the REAL enforcer script
+        // refuses the head on merge_group, and the card is blocked until a disable is confirmed.
+        describe("a take-back refused over both routes: the arm gate holds the head and the card", () => {
+          const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]", type: "Bot" };
+          const scriptPath = fileURLToPath(new URL("../../../scripts/ci/check-paperclip-approved.sh", import.meta.url));
+          const repoRoot = path.resolve(path.dirname(scriptPath), "..", "..");
+          const GH_SHIM = [
+            "#!/usr/bin/env bash", "set -euo pipefail", 'url=""', 'jqfilter=""',
+            'while [ "$#" -gt 0 ]; do', '  case "$1" in', "    api|--slurp|--paginate) ;;", "    -H) shift ;;", '    --jq|-q) shift; jqfilter="$1" ;;', '    *) [ -n "$url" ] || url="$1" ;;', "  esac", "  shift", "done",
+            'case "$url" in', '  */statuses*) jq -r "$jqfilter" "$GH_SHIM_DIR/statuses.json" ;;', "  */pulls/*/reviews*) echo '[]' ;;", '  */pulls/*) cat "$GH_SHIM_DIR/pull.json" ;;', '  *) echo "gh shim: unexpected call: $url" >&2; exit 1 ;;', "esac", "",
+          ].join("\n");
+          // The statuses GitHub holds on the head, newest first, as the real script reads them: the stamp the arm stood on, then what the control plane wrote.
+          const githubStatuses = () => [
+            ...armGateFake.writes.filter((w) => w.accepted).reverse().map((w, i) => ({ id: 100 + i, context: w.context, state: w.state, description: w.description, creator: CONTROL_PLANE })),
+            { id: 1, context: "paperclip/approved", state: "success", description: "approved via Paperclip", creator: CONTROL_PLANE },
+          ];
+          const enforcer = (statuses: unknown[]) => {
+            const dir = mkdtempSync(path.join(tmpdir(), "pc-armgate-"));
+            try {
+              writeFileSync(path.join(dir, "pull.json"), JSON.stringify({ head: { sha: AUTH_HEAD, ref: "SUP-42-branch" }, title: "", body: "", labels: [], user: { login: "operator", type: "User" } }));
+              writeFileSync(path.join(dir, "statuses.json"), JSON.stringify(statuses));
+              mkdirSync(path.join(dir, "bin"));
+              writeFileSync(path.join(dir, "bin", "gh"), GH_SHIM);
+              chmodSync(path.join(dir, "bin", "gh"), 0o755);
+              const queueRef = "refs/heads/gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-4242-0123456789abcdef";
+              return spawnSync("bash", [scriptPath, "merge_group"], {
+                cwd: repoRoot, encoding: "utf8",
+                env: { ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH}`, GH_SHIM_DIR: dir, GH_REPO: `${OWNER}/${REPO}`, PAPERCLIP_APPROVED_STATUS_CREATOR_ID: String(CONTROL_PLANE.id), PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN: CONTROL_PLANE.login, GITHUB_REF: queueRef, GITHUB_REF_NAME: queueRef.replace("refs/heads/", "") },
+              }).status;
+            } finally { rmSync(dir, { recursive: true, force: true }); }
+          };
+          const refuseFrom = (state: string, status = 403) => {
+            armGateFake.answer = (body) => body.state === state
+              ? ({ ok: false, status, json: async () => ({ message: "Resource not accessible by integration" }) }) as unknown as Response
+              : armGateFake.created();
+          };
+          const refusal = (status: number, message: string) => () => ({ ok: false, status, json: async () => ({ errors: [{ message }], message }) }) as unknown as Response;
+          afterEach(() => { disarmTiming.disableTimeoutMs = 10_000; });
+
+          // The arm is accepted without authority; GraphQL refuses the take-back; the REST fence is refused; the closing gate write is refused.
+          const armUnderBothRefusals = async () => {
+            const { issueId, reviewerId } = await seedAuthorityCard();
+            refuseFrom("success");
+            mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+              if (/\/statuses\//.test(url)) return refusal(403, "statuses refused")();
+              if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+              if (String(JSON.parse(String(init?.body)).query).includes("disablePullRequestAutoMerge")) return refusal(503, "Service Unavailable")();
+              await revocations[0]![1]({ issueId, reviewerId });
+              return okBody();
+            });
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+            expect(outcome.message).toContain("STILL ENABLED");
+            return issueId;
+          };
+
+          for (const [label, answer, disableTimeoutMs] of [
+            ["403", refusal(403, "Resource not accessible by integration"), 10_000],
+            ["422", refusal(422, "Pull request is not in a mergeable state"), 10_000],
+            ["503", refusal(503, "Service Unavailable"), 10_000],
+            ["a request that never answers", () => new Promise<Response>(() => {}), 80],
+          ] as const) {
+            it(`${label}: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked`, async () => {
+              disarmTiming.disableTimeoutMs = disableTimeoutMs;
+              const issueId = await armUnderBothRefusals();
+              mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+                if (/\/statuses\//.test(url)) return refusal(403, "statuses refused")();
+                if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+                if (String(JSON.parse(String(init?.body)).query).includes("disablePullRequestAutoMerge")) return answer();
+                throw new Error("unexpected enable");
+              });
+
+              await retryPendingAutoMergeDisarms(db);
+              await retryPendingAutoMergeDisarms(db);
+
+              // The opening write is the only gate write: the arm never settled, so the closing success was never even tried.
+              expect(armGateFake.writes[0]).toMatchObject({ state: "failure", context: "paperclip/arm-gate" });
+              expect(armGateFake.writes.filter((w) => w.state === "success")).toEqual([]);
+              expect(githubStatuses()[0]).toMatchObject({ context: "paperclip/arm-gate", state: "failure" });
+              expect(enforcer(githubStatuses())).not.toBe(0);
+              expect(await disarmRecord(issueId)).toMatchObject({ state: "pending" });
+              // The card is blocked: nothing is published for it and no arm goes through.
+              const published = await publishApprovalStatus(db, companyId, issueId, "SUP-42");
+              expect(published.message).toContain("arm-unsettled");
+              const second = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+              expect(second.kind).not.toBe("armed");
+              expect(enables()).toHaveLength(1);
+            });
+          }
+
+          it("opens the gate again on recovery: a confirmed disable closes it, the record goes, the enforcer passes", async () => {
+            const issueId = await armUnderBothRefusals();
+            armGateFake.answer = armGateFake.created;
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return disableOk(); });
+
+            const summary = await retryPendingAutoMergeDisarms(db);
+
+            expect(summary).toMatchObject({ checked: 1, disabled: 1 });
+            expect(await disarmRecord(issueId)).toBeUndefined();
+            expect(armGateFake.writes.at(-1)).toMatchObject({ state: "success", accepted: true });
+            // The stamp the arm stood on is a success and the gate is closed: the real script passes it.
+            expect(enforcer(githubStatuses())).toBe(0);
+          });
+
+          it("an arm that stands with its authority closes the gate; if the closing write is refused the record stays and the sweep closes it", async () => {
+            const { issueId } = await seedAuthorityCard();
+            refuseFrom("success");
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return okBody(); });
+
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+
+            expect(outcome.kind).toBe("armed");
+            expect(await disarmRecord(issueId)).toMatchObject({ gateClosing: true, state: "pending" });
+            expect(enforcer(githubStatuses())).not.toBe(0);
+
+            armGateFake.answer = armGateFake.created;
+            const summary = await retryPendingAutoMergeDisarms(db);
+
+            expect(summary).toMatchObject({ checked: 1, disabled: 1 });
+            expect(await disarmRecord(issueId)).toBeUndefined();
+            expect(disables()).toHaveLength(0);
+            const rows = (await db.select().from(activityLog)).filter((row) => row.action === "issue.merge_gate_closed");
+            expect(rows).toHaveLength(1);
+            expect(enforcer(githubStatuses())).toBe(0);
+          });
+
+          it("arms nothing when the gate cannot be written before the enable, and closes it later", async () => {
+            const { issueId } = await seedAuthorityCard();
+            refuseFrom("failure");
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return okBody(); });
+
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+
+            expect(outcome.kind).toBe("failed");
+            expect(outcome.message).toContain("failed:arm-gate-unavailable");
+            expect(enables()).toHaveLength(0);
+            expect(await disarmRecord(issueId)).toMatchObject({ gateClosing: true });
+            armGateFake.answer = armGateFake.created;
+            expect(await retryPendingAutoMergeDisarms(db)).toMatchObject({ checked: 1, disabled: 1 });
+            expect(await disarmRecord(issueId)).toBeUndefined();
+          });
+
+          it("a process that dies after the gate was written leaves it open: the sweep takes the arm back, then closes the gate", async () => {
+            disarmTiming.inFlightGraceMs = 0;
+            const { issueId } = await seedAuthorityCard();
+            await inFlightRecord(issueId, new Date(Date.now() - 60_000).toISOString());
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return disableOk(); });
+
+            expect(await retryPendingAutoMergeDisarms(db)).toMatchObject({ checked: 1, disabled: 1 });
+
+            expect(armGateFake.writes.map((w) => w.state)).toEqual(["success"]);
+            expect(await disarmRecord(issueId)).toBeUndefined();
           });
         });
 

@@ -5,7 +5,7 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import {
   clearAutoMergeDisarmRecord, disarmRecordEscalated, disableAutoMerge, fenceRevokedHead, INTERRUPTED_ARM_REASON,
-  recordPendingAutoMergeDisarm, resolveGitHubTokenCandidatesForRepo, type PendingAutoMergeDisarm,
+  recordPendingAutoMergeDisarm, resolveGitHubTokenCandidatesForRepo, writeArmGate, type PendingAutoMergeDisarm,
 } from "./merge-arming.js";
 
 const clearRecord = (db: Db, companyId: string, issueId: string) => clearAutoMergeDisarmRecord(db, companyId, issueId);
@@ -30,6 +30,7 @@ function readRecord(executionState: unknown): PendingAutoMergeDisarm | null {
     escalatedAt: typeof r.escalatedAt === "string" ? r.escalatedAt : null,
     fencedAt: typeof r.fencedAt === "string" ? r.fencedAt : null,
     fenceError: typeof r.fenceError === "string" ? r.fenceError : null,
+    gateClosing: r.gateClosing === true,
   };
 }
 
@@ -69,6 +70,27 @@ async function attemptDisarm(
 ): Promise<"disabled" | "still-armed" | "moot" | "waiting" | "none"> {
   let record = readRecord(row.executionState);
   if (!record) return "none";
+  const tokensFor = async (): Promise<string[]> => {
+    try { return (await resolveGitHubTokenCandidatesForRepo(db, row.companyId, record!.owner, record!.repo)).map((candidate) => candidate.token); } catch { return []; }
+  };
+  // Only the arm gate is left open (the arm is settled): write the closing success; the record goes with it.
+  if (record.gateClosing) {
+    const closed = await writeArmGate(await tokensFor(), record, "closed");
+    const gateWhere = { issueId: row.id, identifier: row.identifier, pr: `${record.owner}/${record.repo}#${record.number}`, since: record.since };
+    if (closed.written) {
+      await clearRecord(db, row.companyId, row.id);
+      logger.warn(gateWhere, "arm gate closed: the arm is settled and the head is mergeable again");
+      await logActivity(db, {
+        companyId: row.companyId, actorType: "system", actorId: "system", agentId: null, runId: null,
+        action: "issue.merge_gate_closed", entityType: "issue", entityId: row.id, issueId: row.id,
+        details: { ...gateWhere, attempts: record.attempts + 1 },
+      });
+      return "disabled";
+    }
+    await recordPendingAutoMergeDisarm(db, row.companyId, row.id, { ...record, attempts: record.attempts + 1, lastError: closed.error, lastAttemptAt: new Date().toISOString() });
+    logger.error({ ...gateWhere, error: closed.error, attempts: record.attempts + 1 }, "arm gate could not be closed: the arm is settled but the head stays unmergeable until the closing status is written; it will be retried");
+    return "still-armed";
+  }
   if (record.state === "in_flight") {
     // Written before an enable call. While its arm call may still be running it is left alone; after that the arm is
     // taken back whatever the authority is now (a surviving arm is simply re-armed by the next pass), so the take-back
@@ -94,6 +116,14 @@ async function attemptDisarm(
   }
   const attempts = record.attempts + 1;
   if (error === null) {
+    // Off is confirmed: the arm gate is closed first, and the record goes only once GitHub has taken that write (else the
+    // sweep goes on with `gateClosing` and the head stays unmergeable).
+    const closed = await writeArmGate(tokens, record, "closed");
+    if (!closed.written) {
+      await recordPendingAutoMergeDisarm(db, row.companyId, row.id, { ...record, attempts: record.attempts + 1, lastError: closed.error, lastAttemptAt: new Date().toISOString(), gateClosing: true, reason: "auto-merge is off; the arm gate is still open" });
+      logger.error({ ...where, error: closed.error }, "pending auto-merge disarm: GitHub confirmed auto-merge is off but the arm gate could not be closed; the head stays unmergeable until it is");
+      return "still-armed";
+    }
     await clearRecord(db, row.companyId, row.id);
     logger.warn(where, "pending auto-merge disarm: GitHub confirmed auto-merge is off");
     await logActivity(db, {

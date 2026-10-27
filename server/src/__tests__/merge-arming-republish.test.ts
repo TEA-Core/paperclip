@@ -37,7 +37,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { publishHeadBoundRelease, releaseLockKey } from "../services/merge-arming.js";
+import { clearAutoMergeDisarmRecord, publishHeadBoundRelease, recordPendingAutoMergeDisarm, releaseLockKey } from "../services/merge-arming.js";
 import { releaseRequestClock } from "../middleware/release-request-clock.js";
 import { RELEASE_AUTH_SCOPE_LIMIT, releaseScopedActor } from "../middleware/release-scoped-actor.js";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -1912,6 +1912,34 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const FLEET_CREATOR = { id: 555, login: "fleet-agent[bot]" };
     const approvedRow = (state: string, creator: { id: number; login: string }) => ({ context: "paperclip/approved", state, creator });
     const releaseLogRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release");
+
+    // Round 16: the card is blocked while an auto-merge arm of it is unsettled. A release writes a control-plane success on the head,
+    // and it must not land on top of the fence or the arm gate; both routes refuse, and the card releases again once the record is gone.
+    for (const [label, route, body] of [
+      ["standard", "release", { headSha: HEAD_SHA, reason: RELEASE_REASON }],
+      ["override", "release-override", { headSha: HEAD_SHA, overrideReason: RELEASE_REASON }],
+    ] as const) {
+      it(`${label} release: refused with 409 while an auto-merge take-back is unconfirmed on the card, and published once it is cleared`, async () => {
+        const { issueId, companyId } = await seedReleasable();
+        installReleaseTransport({ postBody: { id: 100 } });
+        await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+          owner: OWNER, repo: REPO, number: PR_NUMBER, nodeId: "PR_node", headSha: HEAD_SHA, reason: "authority revoked",
+          since: new Date().toISOString(), attempts: 1, lastError: "x", state: "pending",
+        });
+
+        const refused = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+
+        expect(refused.status).toBe(409);
+        expect(JSON.stringify(refused.body)).toContain("take-back is unconfirmed");
+        expect(statusWrites()).toEqual([]);
+
+        await clearAutoMergeDisarmRecord(db, companyId, issueId);
+        const released = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+
+        expect(released.status).toBe(200);
+        expect(released.body.outcome).toBe("released");
+      });
+    }
 
     it("is idempotent: a head whose newest paperclip/approved is a control-plane success gets no second write or log row", async () => {
       const { issueId } = await seedReleasable();
@@ -4264,6 +4292,112 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         expect(res.status).toBe(409);
         expect(res.body.message).toContain("nothing was published");
       }, 20_000);
+
+      // Round 16: the route-shape matrix, 4 pool sizes x 2 driver modes x 21 request shapes x authentication held or not = 336 cells,
+      // through the real request clock, the real board-key authentication and the real routes. A shape the router sends to a release
+      // handler must be answered inside the release deadline (409, nothing published) when authentication is stuck, and by the handler
+      // (400, the body is empty) when it is not; a shape the router does not send there is an ordinary 404 (200 for OPTIONS), and
+      // never a release answer. Nothing may leave a database session or an advisory lock behind. The 21 shapes and their expected answers
+      // are the ones release assurance's round-13 harness (not on disk) recorded; the cells here are defined by this table.
+      describe("the 336-cell route-shape matrix", () => {
+        const shapes: Array<{ name: string; expected: [number, number] }> = [
+          { name: "lower", expected: [400, 409] }, { name: "upper", expected: [400, 409] }, { name: "upper-override", expected: [400, 409] },
+          { name: "trailing-slash", expected: [400, 409] }, { name: "double-trailing", expected: [404, 404] }, { name: "double-api", expected: [404, 404] },
+          { name: "double-before-merge", expected: [404, 404] }, { name: "encoded-api", expected: [404, 404] }, { name: "encoded-id", expected: [400, 409] },
+          { name: "encoded-release", expected: [404, 404] }, { name: "encoded-slash", expected: [404, 404] }, { name: "charset", expected: [400, 409] },
+          { name: "form", expected: [400, 409] }, { name: "text", expected: [400, 409] }, { name: "vendor", expected: [400, 409] },
+          { name: "malformed-gzip", expected: [500, 500] }, { name: "head", expected: [404, 404] }, { name: "options", expected: [200, 200] },
+          { name: "get-method-override", expected: [404, 404] }, { name: "post-method-override", expected: [400, 409] }, { name: "post-method-query", expected: [400, 409] },
+        ];
+        expect(shapes).toHaveLength(21);
+        const userId = "shape-board-user";
+        const evidence: Array<Record<string, unknown>> = [];
+        afterAll(async () => {
+          const dir = process.env.SUP_20772_EVIDENCE_DIR;
+          if (!dir || evidence.length === 0) return;
+          const { mkdir, writeFile } = await import("node:fs/promises");
+          await mkdir(dir, { recursive: true });
+          await writeFile(`${dir}/route-shapes.json`, `${JSON.stringify({ measuredAt: new Date().toISOString(), cells: evidence }, null, 2)}\n`);
+        });
+
+        function send(app: express.Express, shape: string, issueId: string, token: string) {
+          const base = `/api/issues/${issueId}/merge-arming/release`;
+          const auth = (r: request.Test) => r.set("authorization", `Bearer ${token}`);
+          const json = (r: request.Test) => auth(r).set("content-type", "application/json").send("{}");
+          switch (shape) {
+            case "lower": return json(request(app).post(base));
+            case "upper": return json(request(app).post(base.toUpperCase().replace(issueId.toUpperCase(), issueId)));
+            case "upper-override": return json(request(app).post(`${base}-override`.toUpperCase().replace(issueId.toUpperCase(), issueId)));
+            case "trailing-slash": return json(request(app).post(`${base}/`));
+            case "double-trailing": return json(request(app).post(`${base}//`));
+            case "double-api": return json(request(app).post(`/api/api/issues/${issueId}/merge-arming/release`));
+            case "double-before-merge": return json(request(app).post(`/api/issues/${issueId}//merge-arming/release`));
+            case "encoded-api": return json(request(app).post(`/%61pi/issues/${issueId}/merge-arming/release`));
+            case "encoded-id": return json(request(app).post(`/api/issues/%${issueId.charCodeAt(0).toString(16)}${issueId.slice(1)}/merge-arming/release`));
+            case "encoded-release": return json(request(app).post(`/api/issues/${issueId}/merge-arming/%72elease`));
+            case "encoded-slash": return json(request(app).post(`/api/issues/${issueId}%2Fmerge-arming/release`));
+            case "charset": return auth(request(app).post(base)).set("content-type", "application/json; charset=utf-8").send("{}");
+            case "form": return auth(request(app).post(base)).set("content-type", "application/x-www-form-urlencoded").send("headSha=x");
+            case "text": return auth(request(app).post(base)).set("content-type", "text/plain").send("{}");
+            case "vendor": return auth(request(app).post(base)).set("content-type", "application/vnd.paperclip+json").send("{}");
+            case "malformed-gzip": return auth(request(app).post(base)).set("content-type", "application/json").set("content-encoding", "gzip").send(Buffer.from("not gzip"));
+            case "head": return auth(request(app).head(base));
+            case "options": return auth(request(app).options(base));
+            case "get-method-override": return auth(request(app).get(base)).set("x-http-method-override", "POST");
+            case "post-method-override": return json(request(app).post(base)).set("x-http-method-override", "GET");
+            case "post-method-query": return json(request(app).post(`${base}?_method=GET`));
+            default: throw new Error(`unknown shape ${shape}`);
+          }
+        }
+
+        it("answers every cell as the table says and leaves no session or lock behind", async () => {
+          const { issueId, companyId } = await seedReleasable();
+          const now = new Date();
+          await db.insert(authUsers).values({ id: userId, name: userId, email: `${userId}@example.test`, emailVerified: true, createdAt: now, updatedAt: now }).onConflictDoNothing();
+          await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner", updatedAt: now });
+          const key = await boardAuthService(db).createNamedBoardApiKey({ userId, name: "shape matrix" });
+          installReleaseTransport();
+          const mismatches: string[] = [];
+          let cells = 0;
+          for (const poolMax of [1, 2, 3, 10]) {
+            for (const mode of ["direct", "prepare:false"] as const) {
+              const parent = createDb(tempDb!.connectionString, mode === "direct" ? { maxConnections: poolMax } : { prepare: false, maxConnections: poolMax });
+              const app = express();
+              app.use(releaseRequestClock({ totalMs: 150 }));
+              app.use(express.json());
+              app.use(releaseScopedActor(parent, { deploymentMode: "authenticated" }, 150));
+              app.use("/api", issueRoutes(parent, {} as any, { mergeReleaseDeadlines: { totalMs: 150, compensationMs: 150, fetchMs: 100 } }));
+              app.use(errorHandler);
+              try {
+                for (const held of [false, true]) {
+                  for (const shape of shapes) {
+                    const release = held ? await holdLock(sql`lock table board_api_keys in access exclusive mode`) : undefined;
+                    const unlock = held ? setTimeout(() => { void release!(); }, 700) : undefined;
+                    const started = performance.now();
+                    let status: number;
+                    try { status = (await send(app, shape.name, issueId, key.token)).status; } finally { if (unlock) { clearTimeout(unlock); await release!(); } }
+                    const ms = Math.round((performance.now() - started) * 10) / 10;
+                    cells += 1;
+                    evidence.push({ pool: poolMax, mode, variant: shape.name, authHeld: held, status, ms });
+                    const want = shape.expected[held ? 1 : 0];
+                    if (status !== want) mismatches.push(`pool ${poolMax} ${mode} ${shape.name} auth ${held ? "held" : "free"}: ${status}, expected ${want}`);
+                    // A release shape answered by the clock answers at the release deadline, not at the end of the hold.
+                    if (held && want === 409 && ms > 1500) mismatches.push(`pool ${poolMax} ${mode} ${shape.name}: the 409 took ${ms} ms`);
+                  }
+                }
+              } finally {
+                expect(await eventually(async () => (await requestBackends()) === 0)).toBe(true);
+                await parent.$client?.end?.({ timeout: 2 }).catch?.(() => undefined);
+              }
+            }
+          }
+          const advisory = Number(((await db.execute(sql`select count(*)::int as n from pg_locks where locktype = 'advisory'`)) as unknown as Array<{ n: number }>)[0]?.n);
+          expect(cells).toBe(336);
+          expect(mismatches).toEqual([]);
+          expect(advisory).toBe(0);
+          expect(statusWrites()).toEqual([]);
+        }, 600_000);
+      });
 
       // Round 11: authentication of a release request runs on a connection the clock can cancel.
       describe("authentication of a release request", () => {

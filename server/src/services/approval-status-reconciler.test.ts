@@ -89,7 +89,13 @@ vi.mock("./github-credential.js", async (importOriginal) => ({
 }));
 
 vi.mock("./github-fetch.js", () => ({
-  ghFetch: mockGhFetch,
+  // The arming actuator writes a `paperclip/arm-gate` status around every enable; GitHub accepts it here, apart from each cell's own fake.
+  ghFetch: (url: string, init?: RequestInit) => {
+    if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
+      return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
+    }
+    return mockGhFetch(url, init);
+  },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
@@ -397,7 +403,8 @@ function postStatusCalls() {
   return mockGhFetch.mock.calls.filter((call) => {
     const url = String(call[0]);
     const init = call[1] as RequestInit | undefined;
-    return url.includes("/statuses") && init?.method === "POST";
+    // The arm gate (paperclip/arm-gate) is a separate context the arming actuator writes around every enable: these cells count approvals.
+    return url.includes("/statuses") && init?.method === "POST" && !String(init.body ?? "").includes('"paperclip/arm-gate"');
   });
 }
 

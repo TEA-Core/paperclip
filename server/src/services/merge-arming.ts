@@ -1091,6 +1091,11 @@ export interface PendingAutoMergeDisarm {
   fencedAt?: string | null;
   /** Why the last fence write failed, until one is accepted. */
   fenceError?: string | null;
+  /**
+   * The arm is settled (auto-merge is off, or it stands with its authority) and only the arm gate (see ARM_GATE_CONTEXT) is
+   * still open: the sweep writes the closing success until GitHub accepts it, and the record goes with it.
+   */
+  gateClosing?: boolean;
 }
 
 /** The reason a swept in-flight record is rewritten with: nothing says the authority changed, only that the arm was never settled. */
@@ -1106,33 +1111,39 @@ export const INTERRUPTED_ARM_REASON = "arm interrupted before it was settled";
  */
 export const FENCE_ATTEMPT_TIMEOUT_MS = 10_000;
 export const REVOKED_HEAD_STATUS_DESCRIPTION = "revoked: the approval no longer holds and auto-merge could not be turned off; needs a new approval";
-export async function fenceRevokedHead(
+
+/**
+ * Writes one control-plane commit status on a head over REST, bounded per token (10 s for the whole try, retries included).
+ * `headSha` null: the PR's live head is read first. 401/403 and any other refusal move on to the next token. Never throws.
+ */
+async function writeHeadStatus(
   tokens: string[],
   record: { owner: string; repo: string; number: number; headSha: string | null },
-): Promise<{ fenced: boolean; error: string | null }> {
+  status: { context: string; state: "success" | "failure"; description: string },
+): Promise<{ written: boolean; error: string | null }> {
   let error: string | null = "no GitHub token candidate";
   for (const token of tokens) {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), FENCE_ATTEMPT_TIMEOUT_MS);
       try {
-        const bounded = async () => {
+        const bounded = async (): Promise<{ written: boolean; error: string | null }> => {
           let head = record.headSha && /^[0-9a-f]{40}$/i.test(record.headSha) ? record.headSha : null;
           if (!head) {
             const live = await fetchPullRequestHeadSha(token, record.owner, record.repo, record.number, controller.signal);
-            if (!live.ok) return { fenced: false, error: `could not read the PR head (${live.message ?? `HTTP ${live.status}`})` };
+            if (!live.ok) return { written: false, error: `could not read the PR head (${live.message ?? `HTTP ${live.status}`})` };
             head = live.headSha;
           }
           const written = await writeCommitStatusWithRetry(token, record.owner, record.repo, head, "", {
-            description: REVOKED_HEAD_STATUS_DESCRIPTION, state: "failure", attempts: 2, delayMs: 250, signal: controller.signal,
+            description: status.description, state: status.state, context: status.context, attempts: 2, delayMs: 250, signal: controller.signal,
           });
-          return written.success ? { fenced: true, error: null } : { fenced: false, error: written.error ?? `HTTP ${written.status}` };
+          return written.success ? { written: true, error: null } : { written: false, error: written.error ?? `HTTP ${written.status}` };
         };
         const answer = await Promise.race([
           bounded(),
-          new Promise<{ fenced: false; error: string }>((resolve) => controller.signal.addEventListener("abort", () => resolve({ fenced: false, error: `timeout after ${FENCE_ATTEMPT_TIMEOUT_MS}ms` }), { once: true })),
+          new Promise<{ written: false; error: string }>((resolve) => controller.signal.addEventListener("abort", () => resolve({ written: false, error: `timeout after ${FENCE_ATTEMPT_TIMEOUT_MS}ms` }), { once: true })),
         ]);
-        if (answer.fenced) return answer;
+        if (answer.written) return answer;
         error = answer.error;
       } finally {
         clearTimeout(timer);
@@ -1141,7 +1152,39 @@ export async function fenceRevokedHead(
       error = err instanceof Error ? err.message : String(err);
     }
   }
-  return { fenced: false, error };
+  return { written: false, error };
+}
+
+export async function fenceRevokedHead(
+  tokens: string[],
+  record: { owner: string; repo: string; number: number; headSha: string | null },
+): Promise<{ fenced: boolean; error: string | null }> {
+  const result = await writeHeadStatus(tokens, record, { context: "paperclip/approved", state: "failure", description: REVOKED_HEAD_STATUS_DESCRIPTION });
+  return { fenced: result.written, error: result.error };
+}
+
+/**
+ * The arm gate: the status that keeps a head unmergeable for as long as an arm of it is unsettled, written BEFORE the
+ * enable call, while GitHub is demonstrably reachable (the take-back and the fence are both GitHub writes made AFTER the
+ * arm, so a provider that refuses both would leave nothing on GitHub). `failure` is written first and is replaced by a
+ * `success` only once the arm is settled (taken back and confirmed off, or standing with its authority). The CI check
+ * (scripts/ci/check-paperclip-approved.sh) refuses a head whose newest control-plane `paperclip/arm-gate` is not a success,
+ * and nothing but the control plane's own identity can clear it. A head with no such status is judged as before.
+ */
+export const ARM_GATE_CONTEXT = "paperclip/arm-gate";
+export const ARM_GATE_OPEN_DESCRIPTION = "an auto-merge arm of this head is unsettled; not mergeable until the control plane confirms it";
+export const ARM_GATE_CLOSED_DESCRIPTION = "arm settled: auto-merge is off or stands with its authority";
+
+export async function writeArmGate(
+  tokens: string[],
+  record: { owner: string; repo: string; number: number; headSha: string | null },
+  state: "open" | "closed",
+): Promise<{ written: boolean; error: string | null }> {
+  return writeHeadStatus(tokens, record, {
+    context: ARM_GATE_CONTEXT,
+    state: state === "open" ? "failure" : "success",
+    description: state === "open" ? ARM_GATE_OPEN_DESCRIPTION : ARM_GATE_CLOSED_DESCRIPTION,
+  });
 }
 
 /**
@@ -1229,7 +1272,7 @@ export async function recordPendingAutoMergeDisarm(db: Db, companyId: string, is
 
 /** True for the outcome of an arm that `openArmRecord` refused: nothing was sent to GitHub. */
 export function isArmRecordRefusal(message: string): boolean {
-  return /^(?:failed:disarm-record-unavailable|skipped:arm-in-progress|failed:disarm-escalated|failed:disarm-backlog-full):/.test(message);
+  return /^(?:failed:disarm-record-unavailable|skipped:arm-in-progress|failed:disarm-escalated|failed:disarm-backlog-full|failed:arm-gate-unavailable):/.test(message);
 }
 
 export type ArmRecordOpening =
@@ -1254,11 +1297,29 @@ export async function openArmRecord(
   guard: AuthorityGuard,
 ): Promise<ArmRecordOpening> {
   const token = randomUUID();
+  // The tokens the arm gate and its closing are written with, and the head they are written to (read live when the
+  // caller named none, so the gate and its closing always name the same commit).
+  let tokens: string[];
+  let head = headSha;
+  try {
+    tokens = (await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo)).map((candidate) => candidate.token);
+    for (const candidate of tokens) {
+      if (head) break;
+      const live = await fetchPullRequestHeadSha(candidate, pr.owner, pr.repo, pr.number);
+      if (live.ok) head = live.headSha;
+    }
+  } catch (error) {
+    return { ok: false, kind: "failed", message: `failed:arm-gate-unavailable: ${label} — the arm gate could not be prepared (${error instanceof Error ? error.message : String(error)}); nothing was armed` };
+  }
+  if (!head) {
+    return { ok: false, kind: "failed", message: `failed:arm-gate-unavailable: ${label} — the head the arm gate names could not be read; nothing was armed` };
+  }
+  const since = new Date().toISOString();
   let opened: "recorded" | "exists" | "escalated" | "full";
   try {
     opened = await openArmInFlight(db, companyId, issueId, {
-      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha,
-      reason: "arm in flight", since: new Date().toISOString(), attempts: 0, lastError: null,
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha: head,
+      reason: "arm in flight", since, attempts: 0, lastError: null,
       state: "in_flight", token, baseline: guard.baseline, requireApprovedLadder: guard.requireApprovedLadder,
     });
   } catch (error) {
@@ -1273,16 +1334,42 @@ export async function openArmRecord(
   if (opened === "full") {
     return { ok: false, kind: "failed", message: `failed:disarm-backlog-full: ${label} — ${disarmBacklog.cap} auto-merge take-backs are already waiting to be confirmed; nothing was armed` };
   }
-  const forget = () => clearAutoMergeDisarmRecord(db, companyId, issueId, token).catch(() => undefined);
+  const gateTarget = { owner: pr.owner, repo: pr.repo, number: pr.number, headSha: head };
+  const startRetries = async () => { try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still settles it */ } };
+  // Closes the gate, then drops the record. If GitHub will not take the closing write the record stays, marked
+  // `gateClosing`, and the sweep keeps writing it: the head stays unmergeable meanwhile (fail closed).
+  const settle = async (): Promise<void> => {
+    const closed = await writeArmGate(tokens, gateTarget, "closed").catch((error) => ({ written: false, error: String(error) }));
+    if (closed.written) {
+      await clearAutoMergeDisarmRecord(db, companyId, issueId, token).catch(() => undefined);
+      return;
+    }
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha: head, reason: "arm settled; the arm gate is still open",
+      since, attempts: 1, lastError: closed.error, lastAttemptAt: new Date().toISOString(), state: "pending", token, gateClosing: true,
+    }).catch(() => undefined);
+    await startRetries();
+  };
+  // Written before the enable call, while GitHub answers: from here until `settle` the head is not mergeable.
+  const gate = await writeArmGate(tokens, gateTarget, "open").catch((error) => ({ written: false, error: String(error) }));
+  if (!gate.written) {
+    // The write may have landed without an answer: the record stays, marked so the sweep closes the gate.
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha: head, reason: "the arm gate could not be opened; nothing was armed",
+      since, attempts: 1, lastError: gate.error, lastAttemptAt: new Date().toISOString(), state: "pending", token, gateClosing: true,
+    }).catch(() => undefined);
+    await startRetries();
+    return { ok: false, kind: "failed", message: `failed:arm-gate-unavailable: ${label} — the arm gate could not be written (${gate.error ?? "unknown"}); nothing was armed` };
+  }
   return {
     ok: true,
-    forget,
+    forget: settle,
     settleEnable: async (result) => {
       if (result.success) return;
       if (result.error === "network_error" || result.error?.startsWith("timeout after ") || isTransientArmingStatus(result.status)) {
-        try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still settles it */ }
+        await startRetries();
       } else {
-        await forget();
+        await settle();
       }
     },
   };
@@ -2585,6 +2672,13 @@ export async function publishApprovalStatus(
   issueIdentifier: string,
   options?: PublishApprovalStatusOptions,
 ): Promise<ArmingOutcome> {
+  // The card is blocked while an auto-merge arm of it is unsettled: a control-plane success written now would sit on top of
+  // the fence and the arm gate. It publishes again once GitHub has confirmed auto-merge off (or the arm settled).
+  const [blockRow] = await db.select({ executionState: issues.executionState }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  const unsettled = ((blockRow?.executionState as Record<string, unknown> | null | undefined)?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
+  if (unsettled && typeof unsettled === "object") {
+    return { kind: "skipped", message: "status:skipped:arm-unsettled: an auto-merge take-back is unconfirmed on this card; nothing is published until GitHub confirms auto-merge is off" };
+  }
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   const certification = options?.headCertification;
   if (certification) {
@@ -4390,6 +4484,13 @@ export async function resolveReleaseDeliveryTarget(
     .from(issues)
     .where(eq(issues.id, issueId));
   const state = issueRow?.executionState as Record<string, unknown> | null | undefined;
+  // The card is blocked while an auto-merge arm of it is unsettled (a take-back not yet confirmed, or the arm gate still open):
+  // a release writes a control-plane success on the head, and that must not happen on top of an arm nobody has settled.
+  // Both routes, the override included; it clears when the take-back is confirmed.
+  const unsettled = (state?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
+  if (unsettled && typeof unsettled === "object") {
+    return { ok: false, reason: "an auto-merge take-back is unconfirmed on this card; it is blocked until GitHub confirms auto-merge is off (or the arm settles)" };
+  }
   // A card whose review certified one PR for delivery keeps that boundary, on both routes: the release may
   // not move to another PR just because the recorded delivery binding was later pointed elsewhere.
   const certified = readCertifiedFinalDelivery(state);
