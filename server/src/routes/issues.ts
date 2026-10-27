@@ -5812,8 +5812,9 @@ export function issueRoutes(
       executionPolicy?: unknown;
     },
     actor: ReturnType<typeof getActorInfo>,
+    dbOrTx: Db = db,
   ) {
-    return resolveActorSourceTrustForIssue({ db, issue, actor });
+    return resolveActorSourceTrustForIssue({ db: dbOrTx, issue, actor });
   }
 
   async function assertCrossIssueInfluenceWithinRunCap(
@@ -19551,7 +19552,7 @@ export function issueRoutes(
               }, {
                 authorizationReason: issueMutationAuthorizationReason,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
-                sourceTrust: await sourceTrustForActorWrite(existing, actor),
+                sourceTrust: await sourceTrustForActorWrite(existing, actor, tx as unknown as Db),
                 onIssueTouched: noteCommittedUpdatedAt,
               }, tx);
               commentHandledInTransaction = true;

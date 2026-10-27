@@ -113,6 +113,14 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
     return { company, agent, issue, run, userId };
   }
 
+  async function endDb(database: Db) {
+    const client: unknown = database.$client;
+    if (!client || typeof client !== "object" || !("end" in client)) return;
+    const end = client.end;
+    if (typeof end !== "function") return;
+    await end.call(client);
+  }
+
   function appFor(actor: Express.Request["actor"]) {
     const app = express();
     app.use(express.json());
@@ -260,6 +268,70 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
     expect(stored.title).toBe(winner.body.title);
     expect([left.body.title, right.body.title].filter((title) => title === stored.title)).toHaveLength(1);
   });
+
+  it("finishes two agent comment patches on a one-connection pool", async () => {
+    const narrow = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    try {
+      const { company, agent, issue, run } = await seed({ assignee: true });
+      const actor: Express.Request["actor"] = {
+        type: "agent",
+        agentId: agent!.id,
+        companyId: company.id,
+        runId: run!.id,
+        source: "agent_jwt",
+      };
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = actor;
+        next();
+      });
+      const { issueRoutes } = await import("../routes/issues.js");
+      app.use("/api", issueRoutes(narrow, {} as never));
+      app.use(errorHandler);
+      const [left, right] = await Promise.all([
+        request(app).patch(`/api/issues/${issue.id}`).send({ comment: "left note" }),
+        request(app).patch(`/api/issues/${issue.id}`).send({ comment: "right note" }),
+      ]);
+      expect([left.status, right.status], JSON.stringify({ left: left.body, right: right.body })).toEqual([200, 200]);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).toHaveLength(2);
+    } finally {
+      await endDb(narrow);
+    }
+  }, 20_000);
+
+  it("finishes ten agent comment patches on the default pool", async () => {
+    const pool = createDb(tempDb!.connectionString, { maxConnections: 10 });
+    try {
+      const { company, agent, issue, run } = await seed({ assignee: true });
+      const actor: Express.Request["actor"] = {
+        type: "agent",
+        agentId: agent!.id,
+        companyId: company.id,
+        runId: run!.id,
+        source: "agent_jwt",
+      };
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = actor;
+        next();
+      });
+      const { issueRoutes } = await import("../routes/issues.js");
+      app.use("/api", issueRoutes(pool, {} as never));
+      app.use(errorHandler);
+      const responses = await Promise.all(
+        Array.from({ length: 10 }, (_, index) =>
+          request(app).patch(`/api/issues/${issue.id}`).send({ comment: `note ${index}` }),
+        ),
+      );
+      expect(responses.map((res) => res.status), JSON.stringify(responses.map((res) => res.body))).toEqual(
+        Array.from({ length: 10 }, () => 200),
+      );
+    } finally {
+      await endDb(pool);
+    }
+  }, 30_000);
 
   it("does not return a comment token for fields that lost a write between the commits", async () => {
     const { createRequire } = await import("node:module");

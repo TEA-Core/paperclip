@@ -4052,7 +4052,7 @@ registry.registerPath({
     },
     404: r.notFound,
     409: {
-      description: "Conflict. issue_version_conflict, checkout_adoption_required, and workspace_reopen_required require code and details.updatedAt and write nothing. Other conflicts on this route omit those codes. The schema is a discriminated union of those shapes.",
+      description: "Conflict. issue_version_conflict, checkout_adoption_required, and workspace_reopen_required require code and details.updatedAt and write nothing. Other conflicts on this route omit those codes. The schema is a oneOf union of those shapes.",
       content: {
         "application/json": {
           schema: {
@@ -4072,14 +4072,6 @@ registry.registerPath({
                 ],
               },
             ],
-            discriminator: {
-              propertyName: "code",
-              mapping: {
-                issue_version_conflict: "#/components/schemas/IssuePatchCompareAndSetConflict",
-                checkout_adoption_required: "#/components/schemas/IssuePatchCompareAndSetConflict",
-                workspace_reopen_required: "#/components/schemas/IssuePatchCompareAndSetConflict",
-              },
-            },
           },
         },
       },

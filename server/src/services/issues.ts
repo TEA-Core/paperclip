@@ -11694,8 +11694,10 @@ export function issueService(db: Db) {
           );
         }
       }
+      // Read on the caller's connection. The closed-over pool client deadlocks
+      // when this update already holds the only pooled connection.
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettingsService(dbOrTx).getExperimental()
       ).enableIsolatedWorkspaces;
       if (options.bindRuntimeSharedWorkspace) {
         const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
