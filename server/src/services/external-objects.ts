@@ -562,8 +562,8 @@ export function externalObjectService(
   }
 
   async function syncComment(commentId: string, dbOrTx: any = db) {
+    if (!(await isEnabled())) return;
     const runSync = async (tx: any) => {
-      if (!(await isEnabled())) return;
       const comment = await tx
         .select({
           id: issueComments.id,
@@ -594,8 +594,8 @@ export function externalObjectService(
   }
 
   async function syncDocument(documentId: string, dbOrTx: any = db) {
+    if (!(await isEnabled())) return;
     const runSync = async (tx: any) => {
-      if (!(await isEnabled())) return;
       const document = await tx
         .select({
           documentId: documents.id,

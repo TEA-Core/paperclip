@@ -375,6 +375,9 @@ import {
   ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   isTerminalOrMissingHeartbeatRun,
+  expectedUpdatedAtUnsupportedWithSideEffects,
+  issueVersionConflict,
+  workspaceReopenRequired,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -506,6 +509,9 @@ const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObject
   // INV-LADDER-1); opting in here — and only here — sanctions the rewrite and
   // re-seats both halves of the pointer from the written policy.
   rearmExecutionPolicy: z.boolean().optional(),
+  // Request-level compare-and-set token, not an issue column. Stripped before
+  // the column update. Absent leaves the write unconditional.
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
 }));
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -5811,8 +5817,9 @@ export function issueRoutes(
       executionPolicy?: unknown;
     },
     actor: ReturnType<typeof getActorInfo>,
+    dbOrTx: Db = db,
   ) {
-    return resolveActorSourceTrustForIssue({ db, issue, actor });
+    return resolveActorSourceTrustForIssue({ db: dbOrTx, issue, actor });
   }
 
   async function assertCrossIssueInfluenceWithinRunCap(
@@ -7546,6 +7553,7 @@ export function issueRoutes(
       allowVisibleIssueWrite?: boolean;
       bypassCheckoutOwnership?: boolean;
       allowCreatorDocumentWrite?: boolean;
+      noCheckoutAdoption?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -7664,11 +7672,9 @@ export function issueRoutes(
     }
     const runId = await requireAgentRunId(req, res, { checkoutRunId: issue.checkoutRunId });
     if (!runId) return false;
-    const ownership = await svc.assertCheckoutOwner(
-      issue.id,
-      actorAgentId,
-      runId,
-    );
+    const ownership = options.noCheckoutAdoption
+      ? await svc.assertCheckoutOwner(issue.id, actorAgentId, runId, { noAdoption: true })
+      : await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -17940,6 +17946,7 @@ export function issueRoutes(
         if (boundaryDecision.allowed) {
           mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing, {
             allowVisibleIssueWrite: true,
+            noCheckoutAdoption: req.body.expectedUpdatedAt !== undefined,
           });
           if (!mutationAccess) return;
         } else if (
@@ -17972,7 +17979,7 @@ export function issueRoutes(
       mutationAccess.reason === "allow_manager_chain"
     ) {
       const forbidden = Object.keys(req.body).filter(
-        (k) => !ANCESTOR_ALLOWED_FIELDS.has(k) && !ANCESTOR_WORKSPACE_CORRECTION_FIELDS.has(k),
+        (k) => k !== "expectedUpdatedAt" && !ANCESTOR_ALLOWED_FIELDS.has(k) && !ANCESTOR_WORKSPACE_CORRECTION_FIELDS.has(k),
       );
       if (forbidden.length > 0) {
         // Board ruling 2026-10-02 (F1 server half): caller-aware. The prefix is
@@ -18041,8 +18048,18 @@ export function issueRoutes(
       // SUP-16525 §4: request-level flag, not an issue column — keep it out of
       // `updateFields` so it never reaches svc.update as a spurious write.
       rearmExecutionPolicy: rearmExecutionPolicyRaw,
+      expectedUpdatedAt: expectedUpdatedAtRaw,
       ...updateFields
     } = req.body;
+    if (
+      expectedUpdatedAtRaw !== undefined &&
+      existing.updatedAt.getTime() !== new Date(expectedUpdatedAtRaw).getTime()
+    ) {
+      throw issueVersionConflict(existing.updatedAt);
+    }
+    const rejectExpectedUpdatedAtBeforeSideEffect = () => {
+      if (expectedUpdatedAtRaw !== undefined) throw expectedUpdatedAtUnsupportedWithSideEffects();
+    };
     if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
       throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
     }
@@ -18055,6 +18072,7 @@ export function issueRoutes(
               "assigneeAgentId",
               "assigneeUserId",
               "deferWakeForGoal",
+              "expectedUpdatedAt",
             ].includes(key),
         ))
     ) {
@@ -18212,6 +18230,13 @@ export function issueRoutes(
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
       (Object.keys(updateFields).length > 0 || reviewRequest !== undefined || hiddenAtRaw !== undefined);
+    if (
+      expectedUpdatedAtRaw !== undefined &&
+      closedExecutionWorkspace &&
+      (commentBody || isAgentWorkUpdate)
+    ) {
+      throw workspaceReopenRequired(existing.updatedAt);
+    }
 
     if (
       isAgentWorkUpdate &&
@@ -18231,6 +18256,7 @@ export function issueRoutes(
         res.status(403).json({ error: "Only board users can interrupt active runs from issue comments" });
         return;
       }
+      rejectExpectedUpdatedAtBeforeSideEffect();
 
       const runToInterrupt = await resolveActiveIssueRun(existing);
       if (runToInterrupt) {
@@ -18286,6 +18312,7 @@ export function issueRoutes(
       shouldResumeInProgressScheduledRetry &&
       updateFields.status === "todo"
     ) {
+      rejectExpectedUpdatedAtBeforeSideEffect();
       cancelledScheduledRetryRunId = await cancelScheduledRetrySupersededByComment({
         scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
         issue: existing,
@@ -19088,6 +19115,16 @@ export function issueRoutes(
     // certify the issue until that request-owned mutation has finished.
     let deferFinalDeliveryPrefetch = false;
     let originalDeliveryBinding: string | null = null;
+    // Refuse before evaluateDoneTransitionGuards. That guard writes
+    // issue.done_tier_declaration_skipped, and the later side-effect reject
+    // would otherwise leave the audit behind on a 400.
+    if (
+      expectedUpdatedAtRaw !== undefined &&
+      isDoneRequest &&
+      existing.assigneeAgentId
+    ) {
+      throw expectedUpdatedAtUnsupportedWithSideEffects();
+    }
     if (isDoneRequest && !missingApprovalStageGap) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
@@ -19140,6 +19177,7 @@ export function issueRoutes(
     }
 
     if (assigneeWillChange && existing.assigneeAgentId) {
+      rejectExpectedUpdatedAtBeforeSideEffect();
       await stopRunnerGoalForOwnershipChange({
         companyId: existing.companyId,
         issueId: existing.id,
@@ -19175,6 +19213,7 @@ export function issueRoutes(
       terminalizingIssue &&
       existing.assigneeAgentId
     ) {
+      rejectExpectedUpdatedAtBeforeSideEffect();
       const goalStopAction = await stopRunnerGoalForOwnershipChange({
         companyId: existing.companyId,
         issueId: existing.id,
@@ -19308,6 +19347,9 @@ export function issueRoutes(
       actorAgentId: actor.agentId ?? null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
+      ...(expectedUpdatedAtRaw !== undefined
+        ? { expectedUpdatedAt: new Date(expectedUpdatedAtRaw) }
+        : {}),
     };
     const shouldCollectCompletionPublication =
       actor.actorType === "user" && existing.status !== "done" && updateFields.status === "done";
@@ -19425,6 +19467,10 @@ export function issueRoutes(
     let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
       null;
     let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+    let committedUpdatedAt: Date | null = null;
+    const noteCommittedUpdatedAt = (updatedAt: Date) => {
+      committedUpdatedAt = updatedAt;
+    };
     let commentDeduplicated = false;
     let deduplicatedFromCommentId: string | null = null;
     let commentHandledInTransaction = false;
@@ -19437,8 +19483,31 @@ export function issueRoutes(
     // and does not depend on the incidental `reviewPolicySensitiveMutationRequested`
     // clause (which today happens to be true for every `done` PATCH, but is not
     // semantically about the approval-stage gap).
-    const shouldUseTransactionalIssueUpdate =
+    const plainCommentJoinsUpdate = Boolean(commentBody) && !(
       Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
+      || Boolean(commentAttachmentIds?.length)
+      || Boolean(decision)
+      || shouldRelayStop
+      || persistReviewActivityTransactionally
+      || reviewPolicySensitiveMutationRequested
+      || workspaceReprovisionCloseId !== null
+      || deliveryIdentityWorkspaceBranchWrite
+      || parentEdgeWriteRequested
+      || invariantPolicyToRecheck !== null
+      || (
+        missingApprovalStageGap !== null
+        && requestedTransitionStatus === "done"
+        && existing.status !== "done"
+      )
+      || (
+        missingApprovalStageGap !== null
+        && effectiveStatus === "in_review"
+        && existing.status !== "in_review"
+      )
+    );
+    const shouldUseTransactionalIssueUpdate =
+      plainCommentJoinsUpdate
+      || Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
       || Boolean(commentAttachmentIds?.length)
       || Boolean(decision)
       || shouldRelayStop
@@ -19685,6 +19754,7 @@ export function issueRoutes(
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                 authorizationReason: issueMutationAuthorizationReason,
                 sourceTrust: attachmentCommentSourceTrust,
+                onIssueTouched: noteCommittedUpdatedAt,
               },
               tx,
             );
@@ -19718,7 +19788,8 @@ export function issueRoutes(
               }, {
                 authorizationReason: issueMutationAuthorizationReason,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
-                sourceTrust: await sourceTrustForActorWrite(existing, actor),
+                sourceTrust: await sourceTrustForActorWrite(existing, actor, tx as unknown as Db),
+                onIssueTouched: noteCommittedUpdatedAt,
               }, tx);
               commentHandledInTransaction = true;
             }
@@ -20426,8 +20497,132 @@ export function issueRoutes(
       // narrows to `never` here; the runtime value is the in-transaction
       // created comment (the dedup path leaves it null, guarded out above).
       const createdComment = comment as Awaited<ReturnType<typeof svc.addComment>>;
+      const commentReferenceSummaryBefore = plainCommentJoinsUpdate
+        ? updateReferenceSummaryAfter
+          ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id)
+        : null;
       await issueReferencesSvc.syncComment(createdComment.id);
       await externalObjectsSvc.syncCommentSafely(createdComment.id);
+      if (plainCommentJoinsUpdate) {
+        if (
+          issue.assigneeAgentId &&
+          !(
+            actor.actorType === "agent" &&
+            actor.actorId === issue.assigneeAgentId
+          )
+        ) {
+          const goalProjection = await runnerGoals.projection(
+            issue.companyId,
+            issue.id,
+            issue.assigneeAgentId,
+          );
+          if (
+            goalProjection?.goal?.status === "active" &&
+            goalProjection.workingNow
+          ) {
+            const steer = queueLiveRunnerPrpCommand({
+              companyId: issue.companyId,
+              issueId: issue.id,
+              agentId: issue.assigneeAgentId,
+              type: "turn.steer",
+              payload: { text: createdComment.body },
+              commandId: `goal_comment_${createdComment.id}`,
+            });
+            if (steer) {
+              try {
+                await steer.completion;
+                goalCommentSteered = true;
+              } catch (err) {
+                logger.warn(
+                  {
+                    err,
+                    issueId: issue.id,
+                    commentId: createdComment.id,
+                    runId: steer.runId,
+                  },
+                  "failed to steer an active session goal; falling back to a boundary wake",
+                );
+              }
+            }
+          }
+        }
+        const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+        const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
+          commentReferenceSummaryBefore ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id),
+          commentReferenceSummaryAfter,
+        );
+        issueResponse = {
+          ...issueResponse,
+          relatedWork: commentReferenceSummaryAfter,
+          referencedIssueIdentifiers: commentReferenceSummaryAfter.outbound.map(
+            (item) => item.issue.identifier ?? item.issue.id,
+          ),
+        };
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+          action: "issue.comment_added",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            commentId: createdComment.id,
+            bodySnippet: createdComment.body.slice(0, 120),
+            identifier: issue.identifier,
+            issueTitle: issue.title,
+            ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
+              ? { authorizationPath: "escape_hatch_manager_chain" }
+              : {}),
+            authorizationReason: issueMutationAuthorizationReason,
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+            ...(scheduledRetrySupersededByComment
+              ? {
+                  scheduledRetrySupersededByComment: true,
+                  scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+                  ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
+                }
+              : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+            ...(hasFieldChanges ? { updated: true } : {}),
+            ...summarizeIssueReferenceActivityDetails({
+              addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+              removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+              currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+            }),
+          },
+        });
+        const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
+          issue,
+          createdComment,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions: expiredInteractions,
+          actor,
+          source: "issue.comment",
+        });
+        if (issue.status === "in_review" && expiredInteractions.length > 0) {
+          const reviewAttention = await svc
+            .listReviewAttention(issue.companyId, [issue])
+            .then((map) => map.get(issue.id));
+          if (reviewAttention?.state === "stalled") {
+            const expiredInteractionIds = expiredInteractions.map((interaction) => interaction.id).sort();
+            lostReviewPathRef = expiredInteractionIds.length === 1
+              ? expiredInteractionIds[0]!
+              : `interactions:${expiredInteractionIds.join(",")}`;
+          }
+        }
+      }
     } else if (commentBody && commentHandledInTransaction) {
       comment = null;
     } else if (commentBody && suppressibleDuplicateComment) {
@@ -20450,6 +20645,7 @@ export function issueRoutes(
         authorizationReason: issueMutationAuthorizationReason,
         clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
+        onIssueTouched: noteCommittedUpdatedAt,
       });
       await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
@@ -20582,6 +20778,11 @@ export function issueRoutes(
           (item) => item.issue.identifier ?? item.issue.id,
         ),
       };
+    }
+
+    const commentTouchedUpdatedAt = committedUpdatedAt as Date | null;
+    if (commentTouchedUpdatedAt) {
+      issueResponse = { ...issueResponse, updatedAt: commentTouchedUpdatedAt };
     }
 
     const commentIsFromAssigneeRun = comment

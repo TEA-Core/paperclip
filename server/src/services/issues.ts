@@ -96,7 +96,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { pendingReviewParticipantGraceMsFromEnv, pendingReviewRearmWindowMsFromEnv } from "../config.js";
 import { logger } from "../middleware/logger.js";
@@ -169,6 +169,35 @@ import { redactSensitiveText } from "../redaction.js";
  */
 export function redactIssueCommentBody(body: string, opts: CurrentUserRedactionOptions) {
   return redactSecretTokens(redactCurrentUserText(body, opts));
+}
+
+export const ISSUE_VERSION_CONFLICT_CODE = "issue_version_conflict";
+
+export const EXPECTED_UPDATED_AT_UNSUPPORTED_CODE = "expected_updated_at_unsupported_with_side_effects";
+
+export function expectedUpdatedAtUnsupportedWithSideEffects() {
+  return badRequest(
+    "expectedUpdatedAt cannot be combined with a request that cancels a run or stops an agent goal before the write",
+    { code: EXPECTED_UPDATED_AT_UNSUPPORTED_CODE },
+  );
+}
+
+export const CHECKOUT_ADOPTION_REQUIRED_CODE = "checkout_adoption_required";
+
+export const WORKSPACE_REOPEN_REQUIRED_CODE = "workspace_reopen_required";
+
+export function workspaceReopenRequired(updatedAt: Date) {
+  return conflict("This issue is linked to a closed workspace that must be reopened; retry without expectedUpdatedAt", {
+    code: WORKSPACE_REOPEN_REQUIRED_CODE,
+    updatedAt: updatedAt.toISOString(),
+  });
+}
+
+export function issueVersionConflict(updatedAt: Date) {
+  return conflict("Issue changed since it was read", {
+    code: ISSUE_VERSION_CONFLICT_CODE,
+    updatedAt: updatedAt.toISOString(),
+  });
 }
 import {
   resolveIssueGoalId,
@@ -11583,6 +11612,13 @@ export function issueService(db: Db) {
          */
         systemWorkspaceBinding?: boolean;
         companyGuard?: string;
+        /**
+         * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
+         * Never a column. When set, the issue UPDATE matches only if `updated_at`
+         * is still the millisecond the caller observed. A mismatch throws 409
+         * `issue_version_conflict` and writes nothing.
+         */
+        expectedUpdatedAt?: Date;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -11630,6 +11666,7 @@ export function issueService(db: Db) {
         boardApiKeyId,
         systemWorkspaceBinding,
         companyGuard,
+        expectedUpdatedAt,
         ...issueData
       } = data;
       if (
@@ -11657,8 +11694,10 @@ export function issueService(db: Db) {
           );
         }
       }
+      // Read on the caller's connection. The closed-over pool client deadlocks
+      // when this update already holds the only pooled connection.
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettingsService(dbOrTx).getExperimental()
       ).enableIsolatedWorkspaces;
       if (options.bindRuntimeSharedWorkspace) {
         const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
@@ -12079,13 +12118,31 @@ export function issueService(db: Db) {
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
+        // The version predicate is part of this UPDATE, not a check before it.
+        // A concurrent writer that commits first changes updated_at, this
+        // statement matches zero rows, and the transaction rolls back. The
+        // API exposes updatedAt at millisecond precision, so the predicate
+        // compares that observed token. Instants inside one millisecond
+        // compare equal; a token one millisecond newer or older does not.
+        // Absent expectedUpdatedAt leaves the predicate as idPredicate.
+        const writePredicate = expectedUpdatedAt === undefined
+          ? idPredicate
+          : and(
+              idPredicate,
+              sql`date_trunc('milliseconds', ${issues.updatedAt}) = date_trunc('milliseconds', ${expectedUpdatedAt.toISOString()}::timestamptz)`,
+            );
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(idPredicate)
+          .where(writePredicate)
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          if (expectedUpdatedAt !== undefined && receiptExisting) {
+            throw issueVersionConflict(receiptExisting.updatedAt);
+          }
+          return null;
+        }
         if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
@@ -12877,9 +12934,13 @@ export function issueService(db: Db) {
       id: string,
       actorAgentId: string,
       actorRunId: string | null,
+      options: { noAdoption?: boolean } = {},
     ) => {
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
+      const noAdoption = options.noAdoption === true;
+      if (!noAdoption) {
+        await clearExecutionRunIfTerminal(id);
+        await clearCheckoutRunIfTerminal(id);
+      }
       const loadCurrent = () =>
         db
           .select({
@@ -12937,7 +12998,7 @@ export function issueService(db: Db) {
         if (sameRunOwnership)
           return { ownership: sameRunOwnership, latest: null };
 
-        if (canAdoptUnownedCheckout(candidate)) {
+        if (!noAdoption && canAdoptUnownedCheckout(candidate)) {
           const adopted = await adoptUnownedCheckoutRun({
             issueId: id,
             actorAgentId,
@@ -12956,6 +13017,7 @@ export function issueService(db: Db) {
         }
 
         if (
+          !noAdoption &&
           actorRunId &&
           candidate.status === "in_progress" &&
           candidate.assigneeAgentId === actorAgentId &&
@@ -13035,6 +13097,29 @@ export function issueService(db: Db) {
           actorRun,
         };
       };
+
+      if (noAdoption) {
+        const lockIsStale =
+          (current.executionRunId != null &&
+            (await isTerminalOrMissingHeartbeatRun(current.executionRunId, db))) ||
+          (current.checkoutRunId != null &&
+            (await isTerminalOrMissingHeartbeatRun(current.checkoutRunId, db)));
+        if (lockIsStale || canAdoptUnownedCheckout(current)) {
+          const { updatedAt } = await db
+            .select({ updatedAt: issues.updatedAt })
+            .from(issues)
+            .where(eq(issues.id, id))
+            .then((rows) => rows[0]!);
+          throw conflict("Checkout adoption required before this write", {
+            code: CHECKOUT_ADOPTION_REQUIRED_CODE,
+            retryable: true,
+            issueId: current.id,
+            checkoutRunId: current.checkoutRunId,
+            executionRunId: current.executionRunId,
+            updatedAt: updatedAt.toISOString(),
+          });
+        }
+      }
 
       const resolved = await resolveOwnership(current);
       if (resolved.ownership) return resolved.ownership;
@@ -13434,6 +13519,7 @@ export function issueService(db: Db) {
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
         clientRequestId?: string;
+        onIssueTouched?: (updatedAt: Date) => void;
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
@@ -13915,10 +14001,13 @@ export function issueService(db: Db) {
         await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
       }
       // Update issue's updatedAt so comment activity is reflected in recency sorting
-      await dbOrTx
+      const touched = await dbOrTx
         .update(issues)
         .set({ updatedAt: new Date() })
-        .where(eq(issues.id, issueId));
+        .where(eq(issues.id, issueId))
+        .returning({ updatedAt: issues.updatedAt })
+        .then((rows: Array<{ updatedAt: Date }>) => rows[0] ?? null);
+      if (touched) options?.onIssueTouched?.(touched.updatedAt);
 
       // Only an explicitly authored comment from the run causally woken by an
       // inbound chat message is automatically publishable. Presentation,

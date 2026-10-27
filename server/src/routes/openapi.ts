@@ -658,6 +658,53 @@ const IssuePatchRecordOnlyForbiddenSchema = registry.register(
   }),
 );
 
+// Keep the compare-and-set objects, and still accept the older shapes this
+// route already returns. A validation 400 carries a details array. Some
+// non-CAS 409s carry a details object that omits code.
+const IssuePatchCompareAndSetBadRequestSchema = registry.register(
+  "IssuePatchCompareAndSetBadRequest",
+  z.object({
+    error: z.string(),
+    code: z.string().optional(),
+    details: z.object({ code: z.string() }).optional(),
+  }),
+);
+const IssuePatchValidationBadRequestSchema = registry.register(
+  "IssuePatchValidationBadRequest",
+  z.object({
+    error: z.string(),
+    details: z.array(z.record(z.string(), z.unknown())),
+  }),
+);
+const issuePatchCompareAndSetConflictCodes = [
+  "issue_version_conflict",
+  "checkout_adoption_required",
+  "workspace_reopen_required",
+] as const;
+const IssuePatchCompareAndSetConflictSchema = registry.register(
+  "IssuePatchCompareAndSetConflict",
+  z.object({
+    error: z.string(),
+    code: z.enum(issuePatchCompareAndSetConflictCodes),
+    details: z.object({
+      code: z.enum(issuePatchCompareAndSetConflictCodes),
+      updatedAt: z.string(),
+      retryable: z.boolean().optional(),
+      issueId: z.string().optional(),
+      checkoutRunId: z.string().nullable().optional(),
+      executionRunId: z.string().nullable().optional(),
+    }),
+  }),
+);
+const IssuePatchExistingConflictSchema = registry.register(
+  "IssuePatchExistingConflict",
+  z.object({
+    error: z.string(),
+    code: z.string().optional(),
+    details: z.record(z.string(), z.unknown()).optional(),
+  }),
+);
+
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.string(), z.unknown())) => ({
     description: "Success",
@@ -3932,7 +3979,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token. Equality is the millisecond bucket the API returns: instants in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue UPDATE commits only when that bucket still matches. A mismatch is 409 issue_version_conflict with code and the current updatedAt in details, and the issue write persists nothing. A successful response updatedAt is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. For an agent whose run does not yet hold the checkout lock (the recorded run is terminal or missing, or no run holds it), the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock. That refusal writes no issue, audit, or wake row; check out, re-read updatedAt, and retry. expectedUpdatedAt combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A comment or agent work update on an issue linked to a closed isolated workspace is rejected up front with 409 workspace_reopen_required (current updatedAt in details) and persists nothing; retry without expectedUpdatedAt to get the normal reopen. Omit expectedUpdatedAt for an unconditional update. The field grants no new permission." +
     "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
     "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
   request: {
@@ -3975,11 +4022,26 @@ registry.registerPath({
         .describe(
           "Record this card's delivery identity (ADR-091 D1) on a transition into `in_review`. Writable only by the agent run holding the issue's lease (422 `delivery_identity_write_rejected` otherwise). `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
         ),
+      expectedUpdatedAt: z.string().datetime({ offset: true }).optional().describe(
+        "Compare-and-set token for any update. Send the issue's updatedAt from a prior read. Matching uses the millisecond bucket the API returns: a token and a stored instant in the same millisecond compare equal, and a token one millisecond newer or older does not. The write commits only if that bucket still matches; otherwise the response is 409 issue_version_conflict and includes the current updatedAt. A successful response updatedAt is the committed post-write value. Omit the field to update unconditionally. Not supported with requests that cancel a run or stop an agent goal first (400 expected_updated_at_unsupported_with_side_effects).",
+      ),
     })),
   },
   responses: {
     200: r.ok(),
-    400: r.badRequest,
+    400: {
+      description: "Bad request. A compare-and-set refusal is 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A validation failure is also 400 and carries details as an array. The schema is a union of those shapes.",
+      content: {
+        "application/json": {
+          schema: {
+            anyOf: [
+              IssuePatchCompareAndSetBadRequestSchema,
+              IssuePatchValidationBadRequestSchema,
+            ],
+          },
+        },
+      },
+    },
     401: r.unauthorized,
     403: {
       description: "Forbidden; record-only selection refusals expose a named reason",
@@ -3990,6 +4052,31 @@ registry.registerPath({
       },
     },
     404: r.notFound,
+    409: {
+      description: "Conflict. issue_version_conflict, checkout_adoption_required, and workspace_reopen_required require code and details.updatedAt and write nothing. Other conflicts on this route omit those codes. The schema is a oneOf union of those shapes.",
+      content: {
+        "application/json": {
+          schema: {
+            oneOf: [
+              IssuePatchCompareAndSetConflictSchema,
+              {
+                allOf: [
+                  IssuePatchExistingConflictSchema,
+                  {
+                    not: {
+                      required: ["code"],
+                      properties: {
+                        code: { enum: [...issuePatchCompareAndSetConflictCodes] },
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    },
     422: r.unprocessable,
   },
 });
