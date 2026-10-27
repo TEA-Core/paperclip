@@ -1922,6 +1922,11 @@ async function startServerWithDatabaseTeardown(
           logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
         }
 
+        const exhaustedDrain = await heartbeat.reconcileExhaustedRecoveryDrain();
+        if (exhaustedDrain.monitorArmed > 0 || exhaustedDrain.recoveryIssueMinted > 0 || exhaustedDrain.noInvokableOwner > 0) {
+          logger.warn({ ...exhaustedDrain }, "startup exhausted recovery drain swept terminal actions into live wake paths");
+        }
+
         const permanentlyUnfinalizable = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
         if (permanentlyUnfinalizable.reported > 0) {
           logger.warn({ ...permanentlyUnfinalizable }, "startup permanently-unfinalizable-blocker sweep reported issues");
@@ -2251,6 +2256,10 @@ async function startServerWithDatabaseTeardown(
               const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
               if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
                 logger.warn({ ...staleWakes }, "periodic stale recovery action wake sweep re-fired wakes");
+              }
+              const exhaustedDrain = await heartbeat.reconcileExhaustedRecoveryDrain();
+              if (exhaustedDrain.monitorArmed > 0 || exhaustedDrain.recoveryIssueMinted > 0 || exhaustedDrain.noInvokableOwner > 0) {
+                logger.warn({ ...exhaustedDrain }, "periodic exhausted recovery drain swept terminal actions into live wake paths");
               }
             })
             .then(async () => {

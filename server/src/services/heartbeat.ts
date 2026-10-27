@@ -22713,6 +22713,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStaleRecoveryActionWakes(opts);
   }
 
+  async function reconcileExhaustedRecoveryDrain(opts?: { companyId?: string | null; now?: Date }) {
+    return recovery.reconcileExhaustedRecoveryDrain(opts);
+  }
+
   async function reconcileUnfinalizableWorkspaceBarriers() {
     return recovery.reconcileUnfinalizableWorkspaceBarriers({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -34369,6 +34373,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcilePendingReviewRearm,
     reconcileResolvedDependencyWakeBackstop,
     reconcileStaleRecoveryActionWakes,
+    reconcileExhaustedRecoveryDrain,
 
     reconcileUnfinalizableWorkspaceBarriers,
 
