@@ -17338,6 +17338,9 @@ export function issueRoutes(
           logger.error({ err }, "failed to record unhandled issues PATCH error");
         }
       };
+      // Include authorization failures raised before the PATCH handler (such as
+      // viewer read-only access) in the same record-only refusal contract.
+      res.locals.recordOnlyRefusalPhase = req.body?.deliveryRequirement === "record_only";
       res.json = ((body: unknown) => {
         const errorContext = (res as unknown as {
           __errorContext?: { error?: { name?: string } };
@@ -17358,6 +17361,18 @@ export function issueRoutes(
             () => originalJson(genericBody),
           );
           return res;
+        }
+        if (
+          res.locals.recordOnlyRefusalPhase &&
+          res.statusCode === 403 &&
+          body &&
+          typeof body === "object"
+        ) {
+          const { details, ...rest } = body as { details?: Record<string, unknown> };
+          return originalJson({
+            ...rest,
+            details: { reason: "record_only_not_authorized", ...details },
+          } as never);
         }
         return originalJson(body as never);
       }) as typeof res.json;
@@ -17474,15 +17489,19 @@ export function issueRoutes(
     const normalizedAssigneeAgentId = normalizedAssigneeAgentRef.id;
     const effectiveDeliveryRequirement =
       req.body.deliveryRequirement ?? existing.deliveryRequirement;
-    const isCurrentAssignee =
-      (req.actor.type === "agent" && req.actor.agentId === existing.assigneeAgentId) ||
-      (req.actor.type !== "agent" && req.actor.userId === existing.assigneeUserId);
-    if (req.body.deliveryRequirement === "record_only" && isCurrentAssignee) {
+    if (
+      req.body.deliveryRequirement === "record_only" &&
+      req.actor.type === "agent" &&
+      (req.actor.agentId === existing.assigneeAgentId ||
+        req.actor.agentId === normalizedAssigneeAgentId)
+    ) {
       res.status(403).json({
         error: "Only the board or an authorized non-assignee may select record_only delivery",
+        details: { reason: "record_only_self_assignee" },
       });
       return;
     }
+    res.locals.recordOnlyRefusalPhase = false;
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)
