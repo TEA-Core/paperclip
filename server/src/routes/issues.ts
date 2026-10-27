@@ -19246,8 +19246,31 @@ export function issueRoutes(
     // and does not depend on the incidental `reviewPolicySensitiveMutationRequested`
     // clause (which today happens to be true for every `done` PATCH, but is not
     // semantically about the approval-stage gap).
-    const shouldUseTransactionalIssueUpdate =
+    const plainCommentJoinsUpdate = Boolean(commentBody) && !(
       Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
+      || Boolean(commentAttachmentIds?.length)
+      || Boolean(decision)
+      || shouldRelayStop
+      || persistReviewActivityTransactionally
+      || reviewPolicySensitiveMutationRequested
+      || workspaceReprovisionCloseId !== null
+      || deliveryIdentityWorkspaceBranchWrite
+      || parentEdgeWriteRequested
+      || invariantPolicyToRecheck !== null
+      || (
+        missingApprovalStageGap !== null
+        && requestedTransitionStatus === "done"
+        && existing.status !== "done"
+      )
+      || (
+        missingApprovalStageGap !== null
+        && effectiveStatus === "in_review"
+        && existing.status !== "in_review"
+      )
+    );
+    const shouldUseTransactionalIssueUpdate =
+      plainCommentJoinsUpdate
+      || Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
       || Boolean(commentAttachmentIds?.length)
       || Boolean(decision)
       || shouldRelayStop
@@ -20237,8 +20260,132 @@ export function issueRoutes(
       // narrows to `never` here; the runtime value is the in-transaction
       // created comment (the dedup path leaves it null, guarded out above).
       const createdComment = comment as Awaited<ReturnType<typeof svc.addComment>>;
+      const commentReferenceSummaryBefore = plainCommentJoinsUpdate
+        ? updateReferenceSummaryAfter
+          ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id)
+        : null;
       await issueReferencesSvc.syncComment(createdComment.id);
       await externalObjectsSvc.syncCommentSafely(createdComment.id);
+      if (plainCommentJoinsUpdate) {
+        if (
+          issue.assigneeAgentId &&
+          !(
+            actor.actorType === "agent" &&
+            actor.actorId === issue.assigneeAgentId
+          )
+        ) {
+          const goalProjection = await runnerGoals.projection(
+            issue.companyId,
+            issue.id,
+            issue.assigneeAgentId,
+          );
+          if (
+            goalProjection?.goal?.status === "active" &&
+            goalProjection.workingNow
+          ) {
+            const steer = queueLiveRunnerPrpCommand({
+              companyId: issue.companyId,
+              issueId: issue.id,
+              agentId: issue.assigneeAgentId,
+              type: "turn.steer",
+              payload: { text: createdComment.body },
+              commandId: `goal_comment_${createdComment.id}`,
+            });
+            if (steer) {
+              try {
+                await steer.completion;
+                goalCommentSteered = true;
+              } catch (err) {
+                logger.warn(
+                  {
+                    err,
+                    issueId: issue.id,
+                    commentId: createdComment.id,
+                    runId: steer.runId,
+                  },
+                  "failed to steer an active session goal; falling back to a boundary wake",
+                );
+              }
+            }
+          }
+        }
+        const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+        const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
+          commentReferenceSummaryBefore ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id),
+          commentReferenceSummaryAfter,
+        );
+        issueResponse = {
+          ...issueResponse,
+          relatedWork: commentReferenceSummaryAfter,
+          referencedIssueIdentifiers: commentReferenceSummaryAfter.outbound.map(
+            (item) => item.issue.identifier ?? item.issue.id,
+          ),
+        };
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+          action: "issue.comment_added",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            commentId: createdComment.id,
+            bodySnippet: createdComment.body.slice(0, 120),
+            identifier: issue.identifier,
+            issueTitle: issue.title,
+            ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
+              ? { authorizationPath: "escape_hatch_manager_chain" }
+              : {}),
+            authorizationReason: issueMutationAuthorizationReason,
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+            ...(scheduledRetrySupersededByComment
+              ? {
+                  scheduledRetrySupersededByComment: true,
+                  scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+                  ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
+                }
+              : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+            ...(hasFieldChanges ? { updated: true } : {}),
+            ...summarizeIssueReferenceActivityDetails({
+              addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+              removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+              currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+            }),
+          },
+        });
+        const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
+          issue,
+          createdComment,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions: expiredInteractions,
+          actor,
+          source: "issue.comment",
+        });
+        if (issue.status === "in_review" && expiredInteractions.length > 0) {
+          const reviewAttention = await svc
+            .listReviewAttention(issue.companyId, [issue])
+            .then((map) => map.get(issue.id));
+          if (reviewAttention?.state === "stalled") {
+            const expiredInteractionIds = expiredInteractions.map((interaction) => interaction.id).sort();
+            lostReviewPathRef = expiredInteractionIds.length === 1
+              ? expiredInteractionIds[0]!
+              : `interactions:${expiredInteractionIds.join(",")}`;
+          }
+        }
+      }
     } else if (commentBody && commentHandledInTransaction) {
       comment = null;
     } else if (commentBody && suppressibleDuplicateComment) {

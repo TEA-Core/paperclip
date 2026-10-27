@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -260,6 +260,93 @@ describeEmbeddedPostgres("PATCH /api/issues/:id expectedUpdatedAt", () => {
     expect(stored.title).toBe(winner.body.title);
     expect([left.body.title, right.body.title].filter((title) => title === stored.title)).toHaveLength(1);
   });
+
+  it("does not return a comment token for fields that lost a write between the commits", async () => {
+    const { createRequire } = await import("node:module");
+    const requireFromDb = createRequire(new URL("../../../packages/db/package.json", import.meta.url));
+    const postgres = requireFromDb("postgres") as (url: string, options: { max: number }) => {
+      listen: (channel: string, callback: (payload: string) => void) => Promise<unknown>;
+      unsafe: (query: string) => Promise<unknown>;
+      end: (options?: { timeout?: number }) => Promise<unknown>;
+    };
+    const { issue, userId, company } = await seed();
+    const actor = boardActor(company.id, userId);
+    const seen = await wireUpdatedAt(actor, issue.id);
+    const barrierLock = 9141009;
+    const listener = postgres(tempDb!.connectionString, { max: 1 });
+    const locker = postgres(tempDb!.connectionString, { max: 1 });
+    const fieldCommitted = (Promise as PromiseConstructor & {
+      withResolvers: <T>() => { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void };
+    }).withResolvers<string>();
+    try {
+      await locker.unsafe(`
+        CREATE OR REPLACE FUNCTION paperclip_mention_barrier() RETURNS trigger AS $$
+        BEGIN
+          PERFORM set_config('statement_timeout', '15000', true);
+          PERFORM pg_advisory_lock(${barrierLock});
+          PERFORM pg_advisory_unlock(${barrierLock});
+          RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+        DROP TRIGGER IF EXISTS paperclip_mention_barrier ON issue_reference_mentions;
+        CREATE TRIGGER paperclip_mention_barrier
+        BEFORE DELETE ON issue_reference_mentions
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION paperclip_mention_barrier();
+        CREATE OR REPLACE FUNCTION paperclip_field_commit_notify() RETURNS trigger AS $$
+        BEGIN
+          IF NEW.title = 'First write' AND OLD.title IS DISTINCT FROM NEW.title THEN
+            PERFORM pg_notify('paperclip_field_commit', NEW.id::text);
+          END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        DROP TRIGGER IF EXISTS paperclip_field_commit_notify ON issues;
+        CREATE TRIGGER paperclip_field_commit_notify
+        AFTER UPDATE ON issues
+        FOR EACH ROW
+        EXECUTE FUNCTION paperclip_field_commit_notify()
+      `);
+      await listener.listen("paperclip_field_commit", (payload) => {
+        fieldCommitted.resolve(payload);
+      });
+      const triggers = await locker.unsafe(`SELECT tgname FROM pg_trigger WHERE tgname IN ('paperclip_mention_barrier', 'paperclip_field_commit_notify')`);
+      expect(triggers).toHaveLength(2);
+      const app = await appFor(actor);
+      const pending = request(app)
+        .patch(`/api/issues/${issue.id}`)
+        .send({ title: "First write", comment: "note", expectedUpdatedAt: seen });
+      const outcome = await Promise.race([
+        fieldCommitted.promise.then((id) => ({ kind: "committed" as const, id })),
+        pending.then((res) => ({ kind: "response" as const, status: res.status, body: res.body })),
+      ]);
+      expect(outcome.kind, JSON.stringify(outcome)).toBe("committed");
+      if (outcome.kind !== "committed") return;
+      expect(outcome.id).toBe(issue.id);
+      await db.update(issues).set({
+        title: "Concurrent write",
+        updatedAt: new Date(),
+      }).where(eq(issues.id, issue.id));
+      await locker.unsafe(`SELECT pg_advisory_unlock(${barrierLock})`);
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const chained = await request(app)
+        .patch(`/api/issues/${issue.id}`)
+        .send({ title: res.body.title, expectedUpdatedAt: res.body.updatedAt });
+      expect(chained.status, JSON.stringify(chained.body)).toBe(409);
+      expect(chained.body.code).toBe("issue_version_conflict");
+      expect((await storedTitle(issue.id)).title).toBe("Concurrent write");
+    } finally {
+      await locker.end({ timeout: 1 }).catch(() => undefined);
+      await listener.end({ timeout: 1 }).catch(() => undefined);
+      await db.execute(sql.raw(`
+        DROP TRIGGER IF EXISTS paperclip_mention_barrier ON issue_reference_mentions;
+        DROP TRIGGER IF EXISTS paperclip_field_commit_notify ON issues;
+        DROP FUNCTION IF EXISTS paperclip_mention_barrier();
+        DROP FUNCTION IF EXISTS paperclip_field_commit_notify()
+      `)).catch(() => undefined);
+    }
+  }, 30_000);
 
   it("fails closed in SQL when two updates share one expectedUpdatedAt", async () => {
     const { issue } = await seed();

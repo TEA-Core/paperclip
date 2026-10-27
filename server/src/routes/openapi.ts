@@ -676,19 +676,24 @@ const IssuePatchValidationBadRequestSchema = registry.register(
     details: z.array(z.record(z.string(), z.unknown())),
   }),
 );
+const issuePatchCompareAndSetConflictCodes = [
+  "issue_version_conflict",
+  "checkout_adoption_required",
+  "workspace_reopen_required",
+] as const;
 const IssuePatchCompareAndSetConflictSchema = registry.register(
   "IssuePatchCompareAndSetConflict",
   z.object({
     error: z.string(),
-    code: z.string().optional(),
+    code: z.enum(issuePatchCompareAndSetConflictCodes),
     details: z.object({
-      code: z.string(),
-      updatedAt: z.string().optional(),
+      code: z.enum(issuePatchCompareAndSetConflictCodes),
+      updatedAt: z.string(),
       retryable: z.boolean().optional(),
       issueId: z.string().optional(),
       checkoutRunId: z.string().nullable().optional(),
       executionRunId: z.string().nullable().optional(),
-    }).optional(),
+    }),
   }),
 );
 const IssuePatchExistingConflictSchema = registry.register(
@@ -4047,14 +4052,34 @@ registry.registerPath({
     },
     404: r.notFound,
     409: {
-      description: "Conflict. issue_version_conflict, checkout_adoption_required, and workspace_reopen_required include code and the current updatedAt and write nothing. Other conflicts on this route may return details that omit code. The schema is a union of those shapes.",
+      description: "Conflict. issue_version_conflict, checkout_adoption_required, and workspace_reopen_required require code and details.updatedAt and write nothing. Other conflicts on this route omit those codes. The schema is a discriminated union of those shapes.",
       content: {
         "application/json": {
           schema: {
-            anyOf: [
+            oneOf: [
               IssuePatchCompareAndSetConflictSchema,
-              IssuePatchExistingConflictSchema,
+              {
+                allOf: [
+                  IssuePatchExistingConflictSchema,
+                  {
+                    not: {
+                      required: ["code"],
+                      properties: {
+                        code: { enum: [...issuePatchCompareAndSetConflictCodes] },
+                      },
+                    },
+                  },
+                ],
+              },
             ],
+            discriminator: {
+              propertyName: "code",
+              mapping: {
+                issue_version_conflict: "#/components/schemas/IssuePatchCompareAndSetConflict",
+                checkout_adoption_required: "#/components/schemas/IssuePatchCompareAndSetConflict",
+                workspace_reopen_required: "#/components/schemas/IssuePatchCompareAndSetConflict",
+              },
+            },
           },
         },
       },
