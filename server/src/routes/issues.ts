@@ -11598,6 +11598,19 @@ export function issueRoutes(
         });
         return;
       }
+      // The database cut a statement or a lock wait short (its own timeout, before the request's) while nothing was
+      // published: the contract is the same 409, not a 500.
+      const code = (error as { code?: string }).code ?? (error as { cause?: { code?: string } }).cause?.code;
+      if (!publishStarted && !res.headersSent && (code === "57014" || code === "55P03")) {
+        await cancelled();
+        res.status(409).json({
+          outcome: "failed", auditRecorded: false,
+          message: code === "57014"
+            ? `status:failed:statement_timeout: a database statement of the release request ran for more than ${deadlines.statementMs}ms; nothing was published`
+            : `status:failed:lock_timeout: a database lock wait of the release request lasted more than ${deadlines.lockMs}ms; nothing was published`,
+        });
+        return;
+      }
       throw error;
     } finally {
       envelope.removeEventListener("abort", cancelScope);

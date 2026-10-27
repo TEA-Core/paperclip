@@ -37,6 +37,7 @@ import {
   openArmRecord,
   disableAutoMerge,
   enableAutoMerge,
+  enableTiming,
   ENABLE_ATTEMPT_TIMEOUT_MS,
   ENABLE_WORST_CASE_MS,
   fetchBranchHeadSha,
@@ -3193,6 +3194,249 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
             expect((await disarmRecord(issueId))?.escalatedAt).toBeFalsy();
             const rows = await db.select({ id: activityLog.id }).from(activityLog).where(eq(activityLog.action, "issue.merge_disarm_escalated"));
             expect(rows).toHaveLength(0);
+          });
+        });
+
+        // Round 15 (R10-AUTH-DISABLE, persistent failure): while GitHub will not turn auto-merge off, the head's
+        // paperclip/approved is set to failure over REST, a second route, so the armed PR cannot merge.
+        describe("a take-back GitHub keeps refusing: the second route fences the head", () => {
+          const statusPosts = () => mockGhFetch.mock.calls.filter(([url, init]) =>
+            url !== GRAPHQL_URL && /\/statuses\//.test(String(url)) && (init as RequestInit | undefined)?.method === "POST");
+          const created = () => ({ ok: true, status: 201, json: async () => ({ id: 555 }) }) as unknown as Response;
+          const refusal = (status: number, message: string) => () =>
+            ({ ok: false, status, json: async () => ({ errors: [{ message }], message }) }) as unknown as Response;
+          const provider = (disable: () => Promise<Response> | Response, statuses: () => Response = created, pull?: () => Response) =>
+            async (url: string, init?: RequestInit) => {
+              if (url === GRAPHQL_URL) {
+                if (String(JSON.parse(String(init?.body)).query).includes("disablePullRequestAutoMerge")) return disable();
+                throw new Error("unexpected enable");
+              }
+              if (/\/statuses\//.test(url)) return statuses();
+              if (pull && url.endsWith("/pulls/125")) return pull();
+              throw new Error(`unexpected ghFetch URL: ${url}`);
+            };
+          const hang = () => new Promise<Response>(() => {});
+          const revokedRecord = (issueId: string, extra: Record<string, unknown> = {}) => recordPendingAutoMergeDisarm(db, companyId, issueId, {
+            owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", headSha: AUTH_HEAD, reason: "authority revoked",
+            since: new Date().toISOString(), attempts: 1, lastError: "x", lastAttemptAt: new Date().toISOString(), state: "pending", ...extra,
+          });
+          afterEach(() => { disarmTiming.disableTimeoutMs = 10_000; disarmEscalation.afterMs = 15 * 60_000; });
+
+          // The independent provider statuses the disable can answer with, each entered through the real sweep.
+          for (const [label, answer, lastError] of [
+            ["403", refusal(403, "Resource not accessible by integration"), "Resource not accessible by integration"],
+            ["422", refusal(422, "Pull request is not in a mergeable state"), "Pull request is not in a mergeable state"],
+            ["503", refusal(503, "Service Unavailable"), "Service Unavailable"],
+            ["a request that never answers", hang, "timeout after 80ms"],
+          ] as const) {
+            it(`${label}: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers`, async () => {
+              disarmTiming.disableTimeoutMs = 80;
+              const { issueId } = await seedAuthorityCard();
+              await revokedRecord(issueId);
+              mockGhFetch.mockImplementation(provider(answer));
+
+              const first = await retryPendingAutoMergeDisarms(db);
+              const second = await retryPendingAutoMergeDisarms(db);
+
+              expect(first).toMatchObject({ checked: 1, disabled: 0, stillArmed: 1 });
+              expect(second).toMatchObject({ checked: 1, disabled: 0, stillArmed: 1 });
+              expect(await disarmRecord(issueId)).toMatchObject({ state: "pending", attempts: 3, lastError, fencedAt: expect.any(String), fenceError: null });
+              const posts = statusPosts();
+              expect(posts).toHaveLength(1);
+              expect(String(posts[0]![0])).toContain(`/statuses/${AUTH_HEAD}`);
+              expect(JSON.parse(String((posts[0]![1] as RequestInit).body))).toMatchObject({ state: "failure", context: "paperclip/approved" });
+              const fenced = (await db.select().from(activityLog)).filter((row) => row.action === "issue.merge_disarm_fenced");
+              expect(fenced).toHaveLength(1);
+
+              mockGhFetch.mockReset();
+              mockGhFetch.mockImplementation(provider(disableOk));
+              expect(await retryPendingAutoMergeDisarms(db)).toMatchObject({ checked: 1, disabled: 1 });
+              expect(await disarmRecord(issueId)).toBeUndefined();
+              expect(statusPosts()).toHaveLength(0);
+            });
+          }
+
+          it("keeps trying the fence every round while the status route refuses too, and says so", async () => {
+            const { issueId } = await seedAuthorityCard();
+            await revokedRecord(issueId);
+            mockGhFetch.mockImplementation(provider(refusal(403, "Resource not accessible by integration"), refusal(403, "statuses refused")));
+
+            await retryPendingAutoMergeDisarms(db);
+            const afterFirst = await disarmRecord(issueId);
+            expect(afterFirst?.fencedAt).toBeFalsy();
+            expect(afterFirst).toMatchObject({ attempts: 2, fenceError: expect.stringContaining("statuses refused") });
+            await retryPendingAutoMergeDisarms(db);
+            expect(statusPosts()).toHaveLength(2);
+
+            mockGhFetch.mockReset();
+            mockGhFetch.mockImplementation(provider(refusal(403, "Resource not accessible by integration")));
+            await retryPendingAutoMergeDisarms(db);
+            expect(await disarmRecord(issueId)).toMatchObject({ attempts: 4, fencedAt: expect.any(String), fenceError: null });
+            const failedRows = (await db.select().from(activityLog)).filter((row) => row.action === "issue.merge_disarm_failed");
+            expect(failedRows.some((row) => (row.details as Record<string, unknown>).fenced === false)).toBe(true);
+          });
+
+          it("reads the live head when the record has none", async () => {
+            const { issueId } = await seedAuthorityCard();
+            await revokedRecord(issueId, { headSha: null });
+            const live = "f".repeat(40);
+            mockGhFetch.mockImplementation(provider(refusal(503, "Service Unavailable"), created, () =>
+              ({ ok: true, status: 200, json: async () => ({ head: { sha: live, ref: "SUP-42-branch" }, state: "open", draft: false, merged: false }) }) as unknown as Response));
+
+            await retryPendingAutoMergeDisarms(db);
+
+            expect(statusPosts().map(([url]) => String(url))).toEqual([expect.stringContaining(`/statuses/${live}`)]);
+            expect(await disarmRecord(issueId)).toMatchObject({ fencedAt: expect.any(String) });
+          });
+
+          it("waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts", async () => {
+            disarmTiming.inFlightGraceMs = 0;
+            const { issueId } = await seedAuthorityCard();
+            await inFlightRecord(issueId, new Date(Date.now() - 60_000).toISOString());
+            mockGhFetch.mockImplementation(provider(refusal(503, "Service Unavailable")));
+
+            await retryPendingAutoMergeDisarms(db);
+
+            expect(statusPosts()).toHaveLength(0);
+            const beforeDeadline = await disarmRecord(issueId);
+            expect(beforeDeadline?.fencedAt).toBeFalsy();
+            expect(beforeDeadline).toMatchObject({ state: "pending" });
+            disarmEscalation.afterMs = 30_000;
+            await retryPendingAutoMergeDisarms(db);
+            expect(statusPosts()).toHaveLength(1);
+            expect(await disarmRecord(issueId)).toMatchObject({ fencedAt: expect.any(String), escalatedAt: expect.any(String) });
+            const alerts = (await db.select().from(activityLog)).filter((row) => row.action === "issue.merge_disarm_escalated");
+            expect(alerts).toHaveLength(1);
+            expect(alerts[0]!.details).toMatchObject({ needsHuman: true, fenced: true });
+          });
+
+          it("fences inline, in the arming process, when the take-back right after a revoked arm is refused (no sweep, no scheduler)", async () => {
+            const { issueId, reviewerId } = await seedAuthorityCard();
+            mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+              if (/\/statuses\//.test(url)) return created();
+              if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+              if (String(JSON.parse(String(init?.body)).query).includes("disablePullRequestAutoMerge")) return refusal(503, "Service Unavailable")();
+              await revocations[0]![1]({ issueId, reviewerId });
+              return okBody();
+            });
+
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+
+            expect(outcome.message).toContain("STILL ENABLED");
+            expect(outcome.message).toContain("set to failure");
+            expect(statusPosts()).toHaveLength(1);
+            expect(JSON.parse(String((statusPosts()[0]![1] as RequestInit).body))).toMatchObject({ state: "failure", context: "paperclip/approved" });
+            expect(await disarmRecord(issueId)).toMatchObject({ state: "pending", fencedAt: expect.any(String) });
+          });
+
+          it("says when the inline fence could not be written either", async () => {
+            const { issueId, reviewerId } = await seedAuthorityCard();
+            mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+              if (/\/statuses\//.test(url)) return refusal(403, "statuses refused")();
+              if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+              if (String(JSON.parse(String(init?.body)).query).includes("disablePullRequestAutoMerge")) return refusal(503, "Service Unavailable")();
+              await revocations[0]![1]({ issueId, reviewerId });
+              return okBody();
+            });
+
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+
+            expect(outcome.message).toContain("could NOT be set to failure");
+            const record = await disarmRecord(issueId);
+            expect(record?.fencedAt).toBeFalsy();
+            expect(record).toMatchObject({ fenceError: expect.stringContaining("statuses refused") });
+          });
+        });
+
+        it("tries every record in a default sweep, including ones above the admission cap", async () => {
+          disarmBacklog.cap = 3;
+          const cards: string[] = [];
+          for (let i = 0; i < 5; i++) cards.push((await seedAuthorityCard(`SUP-${1200 + i}`)).issueId);
+          const opened: string[] = [];
+          for (const [i, issueId] of cards.slice(0, 4).entries()) {
+            opened.push(await openArmInFlight(db, companyId, issueId, {
+              owner: OWNER, repo: REPO, number: 600 + i, nodeId: `PR_node_${600 + i}`, headSha: AUTH_HEAD, reason: "arm in flight",
+              since: new Date().toISOString(), attempts: 0, lastError: null, state: "in_flight", token: `c${i}`,
+            }));
+          }
+          expect(opened).toEqual(["recorded", "recorded", "recorded", "full"]);
+          // Two more records land outside admission (a pending write, or a row an earlier version left).
+          await recordPendingAutoMergeDisarm(db, companyId, cards[3]!, {
+            owner: OWNER, repo: REPO, number: 603, nodeId: "PR_node_603", headSha: AUTH_HEAD, reason: "test", since: new Date().toISOString(), attempts: 1, lastError: "x", state: "pending",
+          });
+          await recordPendingAutoMergeDisarm(db, companyId, cards[4]!, {
+            owner: OWNER, repo: REPO, number: 604, nodeId: "PR_node_604", headSha: AUTH_HEAD, reason: "test", since: new Date().toISOString(), attempts: 1, lastError: "x", state: "pending",
+          });
+          disarmTiming.inFlightGraceMs = 0;
+          mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return disableOk(); });
+
+          const summary = await retryPendingAutoMergeDisarms(db);
+
+          expect(summary).toMatchObject({ checked: 5, disabled: 5, pending: 5 });
+          for (const id of cards) expect(await disarmRecord(id)).toBeUndefined();
+        });
+
+        // The paths this round added, entered through the real arm, with the provider and the database instrumented.
+        describe("the enable-call deadline and the admission lock, entered through the real arm", () => {
+          const ADMISSION_KEY = "paperclip:auto-merge-disarm-admission";
+          const advisory = async (granted: boolean) =>
+            Number(((await db.execute(sql`select count(*)::int as n from pg_locks where locktype = 'advisory' and granted = ${granted}`)) as unknown as Array<{ n: number }>)[0]?.n);
+          afterEach(() => { enableTiming.attemptTimeoutMs = 10_000; });
+
+          it("gives up on an enable request that never answers at the default deadline, aborts it, keeps the record and holds no lock", async () => {
+            enableTiming.attemptTimeoutMs = 150;
+            const { issueId } = await seedAuthorityCard();
+            const signals: AbortSignal[] = [];
+            mockGhFetch.mockImplementation((url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+              if (url !== GRAPHQL_URL) return reject(new Error(`unexpected ghFetch URL: ${url}`));
+              signals.push(init!.signal!);
+              init!.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+            }));
+            const started = Date.now();
+
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+
+            expect(Date.now() - started).toBeLessThan(2000);
+            expect(outcome.kind).toBe("failed");
+            expect(outcome.message).toContain("timeout after 150ms");
+            expect(enables()).toHaveLength(1);
+            expect(signals).toHaveLength(1);
+            expect(signals[0]!.aborted).toBe(true);
+            expect(await disarmRecord(issueId)).toMatchObject({ state: "in_flight" });
+            expect(await advisory(true)).toBe(0);
+          });
+
+          it("takes the admission lock: an arm waits behind a holder of it, writes nothing until it is released, and then arms", async () => {
+            const { issueId } = await seedAuthorityCard();
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return okBody(); });
+            let unlock!: () => void;
+            let locked!: () => void;
+            const isLocked = new Promise<void>((resolve) => { locked = resolve; });
+            const holder = db.transaction(async (tx) => {
+              await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${ADMISSION_KEY}))`);
+              locked();
+              await new Promise<void>((resolve) => { unlock = resolve; });
+            });
+            await isLocked;
+            let arm: ReturnType<typeof armMergeOnApproval> | undefined;
+            try {
+              arm = armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+              const until = Date.now() + 3000;
+              while (Date.now() < until && (await advisory(false)) === 0) await new Promise((resolve) => setTimeout(resolve, 20));
+              expect(await advisory(false)).toBe(1);
+              expect(enables()).toHaveLength(0);
+              expect(await disarmRecord(issueId)).toBeUndefined();
+            } finally {
+              unlock();
+              await holder;
+            }
+
+            const outcome = await arm!;
+
+            expect(outcome.kind).toBe("armed");
+            expect(enables()).toHaveLength(1);
+            expect(await advisory(true)).toBe(0);
+            expect(await advisory(false)).toBe(0);
           });
         });
 

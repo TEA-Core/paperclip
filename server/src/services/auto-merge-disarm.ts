@@ -4,8 +4,8 @@ import { issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import {
-  clearAutoMergeDisarmRecord, disarmBacklog, disarmRecordEscalated, disableAutoMerge, recordPendingAutoMergeDisarm,
-  resolveGitHubTokenCandidatesForRepo, type PendingAutoMergeDisarm,
+  clearAutoMergeDisarmRecord, disarmRecordEscalated, disableAutoMerge, fenceRevokedHead, INTERRUPTED_ARM_REASON,
+  recordPendingAutoMergeDisarm, resolveGitHubTokenCandidatesForRepo, type PendingAutoMergeDisarm,
 } from "./merge-arming.js";
 
 const clearRecord = (db: Db, companyId: string, issueId: string) => clearAutoMergeDisarmRecord(db, companyId, issueId);
@@ -28,6 +28,8 @@ function readRecord(executionState: unknown): PendingAutoMergeDisarm | null {
     baseline: typeof r.baseline === "string" ? r.baseline : null,
     requireApprovedLadder: r.requireApprovedLadder === true,
     escalatedAt: typeof r.escalatedAt === "string" ? r.escalatedAt : null,
+    fencedAt: typeof r.fencedAt === "string" ? r.fencedAt : null,
+    fenceError: typeof r.fenceError === "string" ? r.fenceError : null,
   };
 }
 
@@ -43,8 +45,10 @@ export interface DisarmSweepSummary {
  * When a take-back that failed at once is tried again without waiting for the first reconciler tick (which can be
  * minutes away). Lives in process memory: a restart falls back to the tick. Tests set it to `[]`.
  */
-export const disarmTiming: { promptDelaysMs: number[]; inFlightGraceMs: number } = {
+export const disarmTiming: { promptDelaysMs: number[]; inFlightGraceMs: number; disableTimeoutMs: number } = {
   promptDelaysMs: [2_000, 5_000, 15_000, 30_000, 60_000, 120_000],
+  /** Each disable request is given up on (and aborted) after this long; a test shortens it. */
+  disableTimeoutMs: 10_000,
   // An in-flight record younger than this belongs to an arm call that may still be running (its enable call is over within ENABLE_WORST_CASE_MS, under half of it).
   inFlightGraceMs: 120_000,
 };
@@ -71,15 +75,17 @@ async function attemptDisarm(
     // never rests on knowing whether the call was accepted. Assumption, stated in the docs: no enable request this
     // process sent is accepted by GitHub after the grace (its calls are aborted after ENABLE_ATTEMPT_TIMEOUT_MS each, ENABLE_WORST_CASE_MS in all).
     if (Date.now() - Date.parse(record.since) < disarmTiming.inFlightGraceMs) return "waiting";
-    record = { ...record, state: "pending", reason: "arm interrupted before it was settled" };
+    record = { ...record, state: "pending", reason: INTERRUPTED_ARM_REASON };
     await recordPendingAutoMergeDisarm(db, row.companyId, row.id, record);
   }
   const where = { issueId: row.id, identifier: row.identifier, pr: `${record.owner}/${record.repo}#${record.number}`, since: record.since };
   let error: string | null = "no GitHub token candidate";
+  let tokens: string[] = [];
   try {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, row.companyId, record.owner, record.repo);
-    for (const candidate of candidates) {
-      const result = await disableAutoMerge(candidate.token, record.nodeId);
+    tokens = candidates.map((candidate) => candidate.token);
+    for (const token of tokens) {
+      const result = await disableAutoMerge(token, record.nodeId, { timeoutMs: disarmTiming.disableTimeoutMs });
       if (result.success) { error = null; break; }
       error = result.error ?? "unknown error";
     }
@@ -101,10 +107,24 @@ async function attemptDisarm(
   const moot = /\b(merged|closed)\b/i.test(error);
   // Past `disarmEscalation.afterMs` the card needs a human: marked once, alerted once, and every control-plane arm of it is refused.
   const escalating = !moot && !record.escalatedAt && disarmRecordEscalated(record);
+  // The second route (see fenceRevokedHead): while GitHub will not turn auto-merge off, the head's paperclip/approved is set to
+  // failure so the armed PR cannot merge. A record that is known to be an arm without authority is fenced at its first failed
+  // take-back; one that was only left in flight (nothing says the authority changed) waits for the escalation deadline.
+  const fencing = !moot && !record.fencedAt && (record.reason !== INTERRUPTED_ARM_REASON || disarmRecordEscalated(record));
+  const fence = fencing ? await fenceRevokedHead(tokens, record) : null;
+  const fenceFields = fence ? (fence.fenced ? { fencedAt: new Date().toISOString(), fenceError: null } : { fenceError: fence.error }) : {};
   if (moot) await clearRecord(db, row.companyId, row.id);
-  else await recordPendingAutoMergeDisarm(db, row.companyId, row.id, { ...record, attempts, lastError: error, lastAttemptAt: new Date().toISOString(), ...(escalating ? { escalatedAt: new Date().toISOString() } : {}) });
+  else await recordPendingAutoMergeDisarm(db, row.companyId, row.id, { ...record, attempts, lastError: error, lastAttemptAt: new Date().toISOString(), ...fenceFields, ...(escalating ? { escalatedAt: new Date().toISOString() } : {}) });
+  if (fence?.fenced) {
+    logger.warn({ ...where, attempts }, "pending auto-merge disarm: the head's paperclip/approved is now failure, so the armed PR cannot merge while the take-back is retried");
+    await logActivity(db, {
+      companyId: row.companyId, actorType: "system", actorId: "system", agentId: null, runId: null,
+      action: "issue.merge_disarm_fenced", entityType: "issue", entityId: row.id, issueId: row.id,
+      details: { ...where, attempts, reason: record.reason, headSha: record.headSha },
+    });
+  }
   logger.error(
-    { ...where, error, attempts, reason: record.reason },
+    { ...where, error, attempts, reason: record.reason, fenced: Boolean(record.fencedAt || fence?.fenced), fenceError: fence && !fence.fenced ? fence.error : record.fenceError ?? null },
     moot
       ? "pending auto-merge disarm ended: the PR is already merged or closed, so the arm could not be taken back before that"
       : "pending auto-merge disarm FAILED again: auto-merge is still enabled on a PR whose authority was revoked; it will be retried",
@@ -114,32 +134,33 @@ async function attemptDisarm(
     await logActivity(db, {
       companyId: row.companyId, actorType: "system", actorId: "system", agentId: null, runId: null,
       action: "issue.merge_disarm_escalated", entityType: "issue", entityId: row.id, issueId: row.id,
-      details: { ...where, error, attempts, reason: record.reason, needsHuman: true },
+      details: { ...where, error, attempts, reason: record.reason, needsHuman: true, fenced: Boolean(record.fencedAt || fence?.fenced) },
     });
   }
   if (moot || worthARow(attempts)) {
     await logActivity(db, {
       companyId: row.companyId, actorType: "system", actorId: "system", agentId: null, runId: null,
       action: moot ? "issue.merge_disarm_moot" : "issue.merge_disarm_failed", entityType: "issue", entityId: row.id, issueId: row.id,
-      details: { ...where, error, attempts, reason: record.reason },
+      details: { ...where, error, attempts, reason: record.reason, ...(moot ? {} : { fenced: Boolean(record.fencedAt || fence?.fenced), fenceError: fence && !fence.fenced ? fence.error : record.fenceError ?? null }) },
     });
   }
   return moot ? "moot" : "still-armed";
 }
 
 /**
- * Retries every pending disarm until GitHub confirms auto-merge is off. Records are taken least recently tried first, so
- * a handful that GitHub keeps refusing cannot starve the rest, and more than `limit` waiting is logged at error level.
+ * Retries every pending disarm until GitHub confirms auto-merge is off. Every record is tried each sweep (least recently
+ * tried first); only a caller that passes `limit` takes fewer, and then more than `limit` waiting is logged at error level.
  */
 export async function retryPendingAutoMergeDisarms(db: Db, options: { limit?: number } = {}): Promise<DisarmSweepSummary> {
   const pendingOnly = sql`${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm' is not null`;
-  const rows = await db
+  const query = db
     .select({ id: issues.id, companyId: issues.companyId, identifier: issues.identifier, executionState: issues.executionState })
     .from(issues)
     .where(pendingOnly)
-    .orderBy(sql`coalesce(${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm' ->> 'lastAttemptAt', '')`, issues.id)
-    // Admission holds the backlog to the cap (a hard cap), so this takes all of them.
-    .limit(options.limit ?? disarmBacklog.cap);
+    .orderBy(sql`coalesce(${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm' ->> 'lastAttemptAt', '')`, issues.id);
+  // No default limit: every record is tried each sweep, whatever the count (admission holds new ones to the cap, but a
+  // record an earlier version or a direct write left above it is not skipped). `limit` is for a caller that wants fewer.
+  const rows = options.limit === undefined ? await query : await query.limit(options.limit);
   const [{ n }] = await db.select({ n: sql<number>`count(*)::int` }).from(issues).where(pendingOnly);
   const summary: DisarmSweepSummary = { checked: 0, disabled: 0, stillArmed: 0, pending: n };
   // A few at a time, so one provider that never answers (each try is bounded) cannot hold up the rest of the backlog.
