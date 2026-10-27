@@ -4013,10 +4013,10 @@ registry.registerPath({
     "candidate continues on a 5-second periodic retry, rather than remaining stranded after the cap. " +
     "The repair's 250ms lock timeout returns 409 with details.code=participant_restore_lock_busy, " +
     "details.retryable=true, and Retry-After: 1. Nested-only paperclipIssue.id heartbeat wakes stay " +
-    "unscoped but acquire the issue-row lock for queued-run admission. A bounded retry deriving only " +
-    "top-level contextSnapshot.issueId and a same-scope context coalescing update before that admission " +
-    "can bypass this nested-only lock; neither is serialized by this repair. Raw serving-role SQL inserts " +
-    "and delayed recovery scheduled_retry inserts may also race after the final live-run check. " +
+    "unscoped but acquire the issue-row lock for queued-run admission, same-scope coalescing and bounded " +
+    "retry scheduling, and a former owner is refused once the pending stage belongs to another participant. " +
+    "Raw serving-role SQL inserts may still race after the final live-run check; " +
+    "see doc/restore-participant-assurance.md for the writer census. " +
     "Self-declared runs first change status/assignee under an issue-row update predicate, excluding " +
     "eligible restore in either order, but do not hold a continuous issue-row lock through run insertion. " +
     "This is not an exhaustive writer guarantee. Only the assignee and updatedAt change; status, " +
