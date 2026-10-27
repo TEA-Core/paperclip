@@ -94,11 +94,11 @@ export const TIER1_FORM =
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
 export const DONE_TIER_TIER2_JSON =
-  'doneTier: { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }';
 export const DONE_TIER_TIER1_LANDED_JSON =
-  'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
 export const DONE_TIER_TIER1_DELEGATED_JSON =
-  'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
 export const DONE_TIER_STRUCTURED_FORMS =
   `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 

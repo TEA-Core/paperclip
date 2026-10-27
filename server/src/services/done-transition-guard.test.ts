@@ -5562,15 +5562,15 @@ describe("evaluateDoneTierDeclaration", () => {
     });
 
     it("SUP-21328: missing-tier remedy names structured doneTier with an exact JSON form per tier", async () => {
-      expect(DONE_TIER_STRUCTURED_FORMS).toContain("doneTier");
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain('"doneTier":');
       expect(DONE_TIER_TIER2_JSON).toBe(
-        'doneTier: { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }',
+        '"doneTier": { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }',
       );
       expect(DONE_TIER_TIER1_LANDED_JSON).toBe(
-        'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }',
+        '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }',
       );
       expect(DONE_TIER_TIER1_DELEGATED_JSON).toBe(
-        'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }',
+        '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }',
       );
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
