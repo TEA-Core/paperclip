@@ -658,6 +658,48 @@ const IssuePatchRecordOnlyForbiddenSchema = registry.register(
   }),
 );
 
+// Keep the compare-and-set objects, and still accept the older shapes this
+// route already returns. A validation 400 carries a details array. Some
+// non-CAS 409s carry a details object that omits code.
+const IssuePatchCompareAndSetBadRequestSchema = registry.register(
+  "IssuePatchCompareAndSetBadRequest",
+  z.object({
+    error: z.string(),
+    code: z.string().optional(),
+    details: z.object({ code: z.string() }).optional(),
+  }),
+);
+const IssuePatchValidationBadRequestSchema = registry.register(
+  "IssuePatchValidationBadRequest",
+  z.object({
+    error: z.string(),
+    details: z.array(z.record(z.string(), z.unknown())),
+  }),
+);
+const IssuePatchCompareAndSetConflictSchema = registry.register(
+  "IssuePatchCompareAndSetConflict",
+  z.object({
+    error: z.string(),
+    code: z.string().optional(),
+    details: z.object({
+      code: z.string(),
+      updatedAt: z.string().optional(),
+      retryable: z.boolean().optional(),
+      issueId: z.string().optional(),
+      checkoutRunId: z.string().nullable().optional(),
+      executionRunId: z.string().nullable().optional(),
+    }).optional(),
+  }),
+);
+const IssuePatchExistingConflictSchema = registry.register(
+  "IssuePatchExistingConflict",
+  z.object({
+    error: z.string(),
+    code: z.string().optional(),
+    details: z.record(z.string(), z.unknown()).optional(),
+  }),
+);
+
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.string(), z.unknown())) => ({
     description: "Success",
@@ -3982,14 +4024,15 @@ registry.registerPath({
   responses: {
     200: r.ok(),
     400: {
-      description: "Bad request. expectedUpdatedAt combined with a pre-write run or goal side effect is 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit.",
+      description: "Bad request. A compare-and-set refusal is 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A validation failure is also 400 and carries details as an array. The schema is a union of those shapes.",
       content: {
         "application/json": {
-          schema: z.object({
-            error: z.string(),
-            code: z.string().optional(),
-            details: z.object({ code: z.string() }).optional(),
-          }),
+          schema: {
+            anyOf: [
+              IssuePatchCompareAndSetBadRequestSchema,
+              IssuePatchValidationBadRequestSchema,
+            ],
+          },
         },
       },
     },
@@ -4004,21 +4047,15 @@ registry.registerPath({
     },
     404: r.notFound,
     409: {
-      description: "Conflict. issue_version_conflict includes the current updatedAt and writes nothing. checkout_adoption_required is retryable, includes updatedAt, writes no issue or audit row. workspace_reopen_required includes updatedAt and writes nothing.",
+      description: "Conflict. issue_version_conflict, checkout_adoption_required, and workspace_reopen_required include code and the current updatedAt and write nothing. Other conflicts on this route may return details that omit code. The schema is a union of those shapes.",
       content: {
         "application/json": {
-          schema: z.object({
-            error: z.string(),
-            code: z.string().optional(),
-            details: z.object({
-              code: z.string(),
-              updatedAt: z.string().optional(),
-              retryable: z.boolean().optional(),
-              issueId: z.string().optional(),
-              checkoutRunId: z.string().nullable().optional(),
-              executionRunId: z.string().nullable().optional(),
-            }).optional(),
-          }),
+          schema: {
+            anyOf: [
+              IssuePatchCompareAndSetConflictSchema,
+              IssuePatchExistingConflictSchema,
+            ],
+          },
         },
       },
     },

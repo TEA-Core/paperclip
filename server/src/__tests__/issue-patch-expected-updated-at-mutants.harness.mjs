@@ -171,7 +171,10 @@ function runKiller(testName) {
     ["exec", "vitest", "run", "server/src/__tests__/issue-patch-expected-updated-at.test.ts", "-t", testName],
     { cwd: root, encoding: "utf8", timeout: 180_000 },
   );
-  return child.status ?? 1;
+  if (child.error || child.status === null) {
+    throw new Error(`vitest did not complete: ${child.error ?? `signal ${child.signal}`}`);
+  }
+  return child.status;
 }
 
 const results = [];
