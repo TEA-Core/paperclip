@@ -1,0 +1,62 @@
+{
+ "M9 no admission lock (cap raced by concurrent admissions)": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('paperclip:auto-merge-disarm-admission'))`);\n",
+  "new": ""
+ },
+ "M10 settle clears an in-flight record whose authority is unchanged instead of taking the arm back": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "    record = { ...record, state: \"pending\", reason: INTERRUPTED_ARM_REASON };\n    await recordPendingAutoMergeDisarm(db, row.companyId, row.id, record);\n",
+  "new": "    await clearAutoMergeDisarmRecord(db, row.companyId, row.id, record.token);\n    return \"none\";\n"
+ },
+ "M11 escalation deadline never reached": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "  return !Number.isNaN(since) && now - since >= disarmEscalation.afterMs;",
+  "new": "  return false;"
+ },
+ "M12 enable request has no deadline": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "options.attemptTimeoutMs ?? enableTiming.attemptTimeoutMs",
+  "new": "options.attemptTimeoutMs ?? 2_000_000_000"
+ },
+ "M13 a timed-out enable drops the record": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "result.error?.startsWith(\"timeout after \") || ",
+  "new": ""
+ },
+ "M14 sweep takes a limited number of records by default": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "const rows = options.limit === undefined ? await query : await query.limit(options.limit);",
+  "new": "const rows = await query.limit(options.limit ?? 4);"
+ },
+ "M15 an escalated record does not refuse the arm with its own answer": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "  return disarmRecordEscalated(existing as { since?: string; escalatedAt?: string }) ? \"escalated\" : \"exists\";",
+  "new": "  return \"exists\";"
+ },
+ "M16 the sweep never fences the head": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "const fencing = !moot && !record.fencedAt && (record.reason !== INTERRUPTED_ARM_REASON || disarmRecordEscalated(record));",
+  "new": "const fencing = false;"
+ },
+ "M17 the arming process does not fence inline": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "const fenced = await fenceRevokedHead(candidates.map((candidate) => candidate.token), record);",
+  "new": "const fenced = { fenced: false, error: \"skipped\" };"
+ },
+ "M18 an arm only left in flight is fenced at once, before the escalation deadline": {
+  "file": "server/src/services/auto-merge-disarm.ts",
+  "old": "(record.reason !== INTERRUPTED_ARM_REASON || disarmRecordEscalated(record))",
+  "new": "(true)"
+ },
+ "M19 the status route fence writes a success instead of a failure": {
+  "file": "server/src/services/merge-arming.ts",
+  "old": "description: REVOKED_HEAD_STATUS_DESCRIPTION, state: \"failure\", attempts: 2",
+  "new": "description: REVOKED_HEAD_STATUS_DESCRIPTION, state: \"success\", attempts: 2"
+ },
+ "M20 a statement or lock timeout before the deadline answers 500": {
+  "file": "server/src/routes/issues.ts",
+  "old": "(code === \"57014\" || code === \"55P03\")",
+  "new": "false"
+ }
+}

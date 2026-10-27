@@ -1,0 +1,2693 @@
+{
+  "measuredAt": "2026-10-27T10:54:58.494Z",
+  "cells": [
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 63.3
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 43.3
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 43.6
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 46.2
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 21.1
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 6.9
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.6
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41.9
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 6.3
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 11.7
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 43.5
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 34.9
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 36.4
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.8
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 4.7
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 12.4
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 10.8
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 11.2
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 47.8
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41.6
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 168
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.8
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 171.4
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.4
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.6
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.7
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 710.3
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.6
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165.6
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 711.2
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 707.9
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 182.2
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 173.8
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 175
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 168.6
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 3.7
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 711.2
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 710.2
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 709.9
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 171.7
+    },
+    {
+      "pool": 1,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167.1
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 38.1
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 36.2
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 33.6
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 17.5
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 4.9
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 9.9
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.2
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.3
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 4.7
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.3
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 43.5
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.7
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 36
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 2.4
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 14.7
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 11.3
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 9.9
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.2
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41.9
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 161.4
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 160.5
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 163.6
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.9
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.1
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.2
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.4
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 707.2
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 157.6
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 710.4
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 711.4
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.1
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 161.9
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 5.5
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.6
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 712.4
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.1
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 161.9
+    },
+    {
+      "pool": 1,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 163.8
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 45
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 38.1
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 38.4
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41.2
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 33.9
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 6.1
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.6
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.2
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 42.6
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 4.8
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 13.3
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41.3
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 39.9
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 39.4
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.3
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 2.4
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 14.3
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 9.4
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.8
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.9
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.9
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 170
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 169.6
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 168.8
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.7
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 709.2
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.6
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.6
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.3
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167.5
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 709.9
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 709.7
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 170.7
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 168.1
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167.5
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.8
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 4.2
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.8
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 706.8
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 711.5
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 171.4
+    },
+    {
+      "pool": 2,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167.2
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 39.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35.5
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.5
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 23.5
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 5.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 13.7
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35.8
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 4.8
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 11.7
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 42.8
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.5
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 42.6
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35.6
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 7.2
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 12.8
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 10.2
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 12.1
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 44.9
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.9
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.1
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.2
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 160.7
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.7
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 707.2
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.4
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.1
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 709.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.1
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.2
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.8
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.4
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 161.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 4.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.4
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 710.3
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 707.1
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.4
+    },
+    {
+      "pool": 2,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 160.4
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 44.2
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 38.4
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.9
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 43.6
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 29.9
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 5
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.3
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 45.7
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 6.5
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 8.9
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 43.8
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 45.7
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 42
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.4
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 2.5
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 13.8
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 12.3
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 7.6
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 44.5
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 39.6
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165.9
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 168.4
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167.4
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.1
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.8
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.1
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.5
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 179.5
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.6
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.3
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165.2
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 168.9
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 170.2
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.4
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 3.6
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.2
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 705.7
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.7
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165
+    },
+    {
+      "pool": 3,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165.6
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41.8
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.7
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.4
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 25.1
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 5
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 13.7
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 7.2
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 46.2
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 4.5
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.5
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 44.8
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 36.5
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.6
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 34.9
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 2.2
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 14.6
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 7.7
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.4
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 45.8
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 34.6
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.9
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 157.6
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.8
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.1
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.9
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.6
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.6
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.4
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 157.4
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.9
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 155.8
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.9
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.3
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 156.5
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 3.4
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.2
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 707.4
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 710
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 156.9
+    },
+    {
+      "pool": 3,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 45.4
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 36.5
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.5
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35.5
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 21.7
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 5.8
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 15.7
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 5.3
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 58.1
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 5.5
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 9.6
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 44.1
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35.6
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 37.2
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 34.4
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 2.3
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 15.3
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 8.6
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 11.2
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 45
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 39.2
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 173.1
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 170.5
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 168.5
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167.6
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.2
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.6
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.9
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 703.8
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.8
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.4
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.5
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 166.8
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 167.8
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 169.6
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 3.7
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 708.4
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.9
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 164.6
+    },
+    {
+      "pool": 10,
+      "mode": "direct",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 165.1
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": false,
+      "status": 400,
+      "ms": 44.7
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35.3
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 34.2
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": false,
+      "status": 400,
+      "ms": 38.9
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": false,
+      "status": 404,
+      "ms": 20.7
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 4.5
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": false,
+      "status": 404,
+      "ms": 11.2
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": false,
+      "status": 404,
+      "ms": 11.7
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": false,
+      "status": 400,
+      "ms": 40.9
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": false,
+      "status": 404,
+      "ms": 4.9
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.4
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": false,
+      "status": 400,
+      "ms": 42.2
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": false,
+      "status": 400,
+      "ms": 35.2
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": false,
+      "status": 400,
+      "ms": 41.4
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": false,
+      "status": 400,
+      "ms": 33.5
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": false,
+      "status": 500,
+      "ms": 2.2
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": false,
+      "status": 404,
+      "ms": 12.6
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": false,
+      "status": 200,
+      "ms": 10.4
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": false,
+      "status": 404,
+      "ms": 10.6
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": false,
+      "status": 400,
+      "ms": 47.9
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": false,
+      "status": 400,
+      "ms": 42.8
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "lower",
+      "authHeld": true,
+      "status": 409,
+      "ms": 160.8
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "upper",
+      "authHeld": true,
+      "status": 409,
+      "ms": 162.3
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "upper-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 157.8
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "trailing-slash",
+      "authHeld": true,
+      "status": 409,
+      "ms": 159.7
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "double-trailing",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.2
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "double-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 704.7
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "double-before-merge",
+      "authHeld": true,
+      "status": 404,
+      "ms": 708.2
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-api",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.8
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-id",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.3
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-release",
+      "authHeld": true,
+      "status": 404,
+      "ms": 706.4
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "encoded-slash",
+      "authHeld": true,
+      "status": 404,
+      "ms": 707.7
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "charset",
+      "authHeld": true,
+      "status": 409,
+      "ms": 156.4
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "form",
+      "authHeld": true,
+      "status": 409,
+      "ms": 158.5
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "text",
+      "authHeld": true,
+      "status": 409,
+      "ms": 157.8
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "vendor",
+      "authHeld": true,
+      "status": 409,
+      "ms": 160.1
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "malformed-gzip",
+      "authHeld": true,
+      "status": 500,
+      "ms": 3.4
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "head",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.5
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "options",
+      "authHeld": true,
+      "status": 200,
+      "ms": 707.5
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "get-method-override",
+      "authHeld": true,
+      "status": 404,
+      "ms": 705.5
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "post-method-override",
+      "authHeld": true,
+      "status": 409,
+      "ms": 161.8
+    },
+    {
+      "pool": 10,
+      "mode": "prepare:false",
+      "variant": "post-method-query",
+      "authHeld": true,
+      "status": 409,
+      "ms": 162.2
+    }
+  ]
+}

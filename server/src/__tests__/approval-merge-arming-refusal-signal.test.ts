@@ -454,6 +454,8 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
       issueId,
       expect.anything(),
       expect.objectContaining({ number: 572 }),
+      // The head the publisher stamped is not a full SHA in this fixture, so the arm stays unbound.
+      {},
     );
 
     // The arming refusal is durable and first-class, not just an inert comment.

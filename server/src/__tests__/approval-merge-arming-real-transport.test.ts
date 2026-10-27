@@ -43,7 +43,19 @@ vi.mock("../services/secrets.js", () => ({
 }));
 
 vi.mock("../services/github-fetch.js", () => ({
-  ghFetch: mockGhFetch,
+  ghFetch: (url: string, init?: RequestInit) => {
+    // The arming actuator writes a `paperclip/arm-gate` status around every enable; GitHub accepts it here, apart from each test's own fake.
+    if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
+      return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
+    }
+    // An arm that names no head reads the PR's live head for the gate; a fake that does not model that read gets one.
+    return Promise.resolve(mockGhFetch(url, init)).catch((error: unknown) => {
+      if (typeof url === "string" && /\/pulls\/\d+$/.test(url) && /unmocked|unexpected/i.test(String((error as Error)?.message))) {
+        return { ok: true, status: 200, json: async () => ({ head: { sha: "c".repeat(40), ref: "live-head" }, state: "open", draft: false, merged: false }) } as unknown as Response;
+      }
+      throw error;
+    });
+  },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));

@@ -87,6 +87,36 @@
 #   1. PR body contains a line:  Paperclip-Approved-Waiver: <reason>
 #   2. PR carries the label:     no-paperclip-card
 #
+# RETIRED FOR CARDED PRs (SUP-20772) -- ARMED BY PAPERCLIP_CARD_WAIVER_RETIRED=1.
+# Anyone with `pull_requests:write` can write either waiver, and that includes
+# every fleet agent, so a free-text waiver is no control. Once the switch is on:
+#   - On a card-bound head (`SUP-<n>-...`) neither waiver is honoured. The gate
+#     falls through to the status check; the PR lands on a real stamp or on the
+#     board release (POST /api/issues/:id/merge-arming/release), which publishes
+#     paperclip/approved as the control plane, bound to the exact head SHA.
+#   - On a cardless head both waivers stay, but only for an author that is a
+#     person (user.type User) or this repository's own automation
+#     (github-actions[bot]) or the control-plane App itself (tea-core, the
+#     identity the lockfile refresh opens its PR as). Any other App-authored PR
+#     (the fleet's) cannot self-waive.
+# The switch ships OFF so merging this change cannot freeze anything before the
+# release route is deployed. Turn it on (repository variable of the same name)
+# only after the route answers on the live control plane.
+#
+# KNOWN RESIDUAL BYPASS -- DO NOT SET THE SWITCH UNTIL BOTH HALVES ARE CLOSED.
+# This script reads GitHub only. It holds no control-plane credential, so it
+# cannot ask which card owns a PR. Both inputs to the refusal are therefore ones
+# the PR author controls:
+#   1. Card binding is judged from the head ref (`SUP-<n>...`). A card work item
+#      pushed to any other branch name reads as cardless and keeps its waiver.
+#   2. Author type is GitHub's label, not an identity proof. A machine token that
+#      is a GitHub `User` (the fleet's shared operator token is one) reads as a person.
+# So with the switch on this closes the honest mistake and the `SUP-` branch path
+# only; it does not stop an agent that renames its branch or pushes as a User.
+# Closing it needs control-plane data (the card's recorded delivery PR/branch)
+# fed to this check by a path the author cannot write, plus a fleet token that is
+# not a User. Every waiver honoured with the switch on is logged `UNVERIFIED`.
+#
 # COUNTERSIGNATURE on fold-sync heads -- ADVISORY SINCE 2026-09-07, NOT ENFORCED.
 # A PR whose head ref starts with `fold-sync/` cannot earn `paperclip/approved`
 # at all -- the head must stay `fold-sync/*` for pr.yml's lockfile exemption,
@@ -496,6 +526,15 @@ PR_LABELS="$(jq -c '(.labels // []) | map(.name)' <<<"$PR_JSON")"
 
 PR_HEAD_REF="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
 PR_AUTHOR="$(jq -r '.user.login // ""' <<<"$PR_JSON")"
+PR_AUTHOR_TYPE="$(jq -r '.user.type // ""' <<<"$PR_JSON")"
+PR_AUTHOR_ID="$(jq -r '.user.id // ""' <<<"$PR_JSON")"
+
+# A card-bound head is `SUP-<n>` or `SUP-<n>-...` (the execution-workspace
+# branch). Case-insensitive so `sup-123-x` cannot step round the rule. This is
+# judged from a name the PR author chooses, so it is NOT proof a PR has no card;
+# see KNOWN RESIDUAL BYPASS in the header.
+CARD_BOUND=0
+[[ "$PR_HEAD_REF" =~ ^[Ss][Uu][Pp]-[0-9]+(-|$) ]] && CARD_BOUND=1
 
 # --- fold-sync heads: a waiver must be countersigned by a human ---------------
 # A fold PR cannot earn `paperclip/approved` at all. `isDeliveredByCard()`
@@ -694,13 +733,81 @@ evaluate_override() {
   return 0
 }
 
+# ARM GATE (SUP-20772). The control plane writes `paperclip/arm-gate` = failure on a head BEFORE it asks GitHub to arm
+# auto-merge for it, and a success only once that arm is settled (taken back and confirmed off, or standing with its
+# authority). Taking an arm back is itself a GitHub call that can keep failing, and so can the status write that fences the head
+# afterwards, so the gate is written while GitHub still answers: when both fail it is still there. Only the control plane's own
+# identity counts (a status from anyone else is ignored: it can neither open the gate nor clear it). A head with no
+# arm-gate status is judged exactly as before; one whose newest control-plane arm-gate is not a success is refused here,
+# whatever else it carries (a stamp, a release, a waiver, the override label).
+ARM_GATE_CONTEXT="paperclip/arm-gate"
+ARM_GATE_REFUSAL=""
+arm_gate_refusal() {
+  # $1 = state of the newest control-plane arm-gate status ("" when none), $2 = its description
+  [ -n "$1" ] && [ "$1" != "$STATE" ] || return 1
+  ARM_GATE_REFUSAL="ARM GATE OPEN: ${ARM_GATE_CONTEXT} on ${HEAD_SHA} is ${1} (${2:-no description}); an auto-merge arm of this head is unsettled, so it is not mergeable until the control plane writes ${ARM_GATE_CONTEXT} = ${STATE}"
+  return 0
+}
+# waiver_arm_gate: a waiver exits before the status list is read, so it reads the gate itself. A read that fails changes
+# nothing here (the waiver was honoured without any status read before this existed).
+waiver_arm_gate() {
+  local gate
+  gate="$(gh_api_retry --paginate "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
+    --jq "[.[] | select(.context == \"${ARM_GATE_CONTEXT}\" and ((.creator.id // \"\") | tostring) == \"${APPROVED_STATUS_CREATOR_ID}\")] | (.[0] // empty) | [.state, (.description // \"\")] | @tsv" 2>/dev/null | grep -m1 . || true)"
+  [ -n "$gate" ] || return 0
+  local gate_state="${gate%%$'\t'*}" gate_description="${gate#*$'\t'}"
+  if arm_gate_refusal "$gate_state" "$gate_description"; then
+    fail "$ARM_GATE_REFUSAL"
+  fi
+  return 0
+}
+
+# waiver_unverified <what>: say, in the log, that a waiver was honoured on
+# author-controlled evidence only (branch name and author type).
+waiver_unverified() {
+  note "UNVERIFIED: ${1} honoured on head '${PR_HEAD_REF}' by author ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — no card binding was checked against the control plane, and a card work item on a non-SUP branch or a machine token typed User passes this check"
+}
+
+# waiver_retirement_on: the single reading of PAPERCLIP_CARD_WAIVER_RETIRED.
+# Only the exact value 1 arms it. Everything that exists because of the board
+# release (the waiver refusal, the release log line and the denial hint) is gated on
+# this. The confirmation marker rule is not: it applies to the one description only the
+# release route writes (see RELEASE_CONFIRMED_CONTEXT), so with the switch off every other
+# input is read, judged and printed exactly as it was before SUP-20772.
+waiver_retirement_on() {
+  [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ]
+}
+
+# waiver_honoured <what>
+#   0 -> the waiver counts
+#   1 -> refused (SUP-20772): the gate falls through to the status check
+# Always 0 until PAPERCLIP_CARD_WAIVER_RETIRED=1; see the header, including
+# KNOWN RESIDUAL BYPASS: neither the branch name nor the author type below is
+# control-plane data, so a honoured waiver is logged UNVERIFIED, never trusted.
+waiver_honoured() {
+  local what="$1"
+  waiver_retirement_on || return 0
+  if [ "$CARD_BOUND" = "1" ]; then
+    note "REFUSED: ${what} on card-bound head '${PR_HEAD_REF}' — a card-bound PR lands on a control-plane paperclip/approved or a board release (POST /api/issues/:id/merge-arming/release), never a waiver"
+    return 1
+  fi
+  case "${PR_AUTHOR_TYPE}:${PR_AUTHOR}" in
+    User:*|Bot:github-actions\[bot\]) waiver_unverified "$what"; return 0 ;;
+  esac
+  [ "$PR_AUTHOR_TYPE" = "Bot" ] && [ "$PR_AUTHOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ] && { waiver_unverified "$what"; return 0; }
+  note "REFUSED: ${what} on PR #${PR_NUMBER} authored by ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — only a person, github-actions[bot] or ${APPROVED_STATUS_CREATOR_LOGIN} may waive a cardless PR"
+  return 1
+}
+
 # Waiver 1: body line "Paperclip-Approved-Waiver: <reason>" with a non-empty
 # reason (a cardless PR never gets a paperclip/approved status, so the
 # waiver is checked before the status lookup).
 reason_line="$(grep -E '^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*[^[:space:]]' <<<"$PR_BODY" | head -1 || true)"
 if [ -n "$reason_line" ]; then
   reason="$(sed -E 's/^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*//' <<<"$reason_line")"
-  if require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
+  if waiver_honoured "body waiver 'Paperclip-Approved-Waiver: ${reason}'" \
+    && require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
+    waiver_arm_gate
     note "waived: PR body declares 'Paperclip-Approved-Waiver: ${reason}' (no Paperclip card)"
     exit 0
   fi
@@ -712,7 +819,9 @@ fi
 # label to its own PR. Leaving one of the two waiver forms uncountersigned would
 # leave the gate exactly as open as before.
 if [ -n "$PR_LABELS" ] && printf '%s' "$PR_LABELS" | jq -e --arg l 'no-paperclip-card' 'index($l)' >/dev/null 2>&1; then
-  if require_countersignature "the 'no-paperclip-card' label"; then
+  if waiver_honoured "the 'no-paperclip-card' label" \
+    && require_countersignature "the 'no-paperclip-card' label"; then
+    waiver_arm_gate
     note "waived: PR carries the 'no-paperclip-card' label (no Paperclip card)"
     exit 0
   fi
@@ -731,21 +840,94 @@ fi
 # unpaginated read sees `missing` and — this leg being fail-closed — blocks an
 # approved entry out of the queue. Pagination preserves order across pages, so
 # the first matching row is still the newest.
+# A board release (POST /api/issues/:id/merge-arming/release) is a control-plane success whose
+# description starts "released by ". This script holds no control-plane credential and cannot ask the
+# database whether the release was CONFIRMED, so the control plane says so on GitHub: after it commits the
+# confirmation it writes a second status, `paperclip/release-confirmed`, whose description is
+# "confirms status <id of the success>". With the switch ON, a release-described success counts only when
+# that marker, written by the same control-plane creator, names it; a release with no marker (a write that
+# timed out, a release the control plane voided or never confirmed) is treated as not approved. This holds
+# with the switch OFF as well, because a release success can land late (after the control plane answered
+# that the release failed) and nothing on the producer side can stop an HTTP request that lands late: the
+# marker is the only thing that says the control plane saw its release in time. "released by " is written
+# only by that route, so every other status is judged exactly as it was before SUP-20772; the switch gates
+# the waiver refusal, the log line and the hint, not this rule.
+RELEASE_CONFIRMED_CONTEXT="paperclip/release-confirmed"
+# Every field has a value: tab-IFS `read` collapses an empty field into its neighbour, which would shift a
+# later column (a description, an id) into the creator columns. An empty field is "-" and is mapped back
+# to empty after the read, so a missing or null creator stays untrusted.
+STATUS_DEF='def f: if . == "" then "-" else . end; '
+STATUS_ROW='((.context // "") | f), ((.state // "") | f), (((.creator.id // "") | tostring) | f), ((.creator.login // "") | f), ((.description // "") | f), ((.id // "-") | tostring)'
 STATUSES_TSV="$(gh_api_retry --paginate \
   "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
-  --jq '.[] | [(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")] | @tsv')" \
+  --jq "${STATUS_DEF}.[] | [${STATUS_ROW}] | @tsv")" \
   || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
 APPROVAL_STATE="missing"
 APPROVAL_CREATOR_ID=""
 APPROVAL_CREATOR_LOGIN=""
-while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login; do
+APPROVAL_DESCRIPTION=""
+APPROVAL_STATUS_ID=""
+CONFIRMED_RELEASE_IDS=" "
+ARM_GATE_STATE=""
+ARM_GATE_DESCRIPTION=""
+while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id; do
+  [ "$status_context" = "-" ] && status_context=""
+  [ "$status_state" = "-" ] && status_state=""
+  [ "$status_creator_id" = "-" ] && status_creator_id=""
+  [ "$status_creator_login" = "-" ] && status_creator_login=""
+  if [ "$status_context" = "$RELEASE_CONFIRMED_CONTEXT" ]; then
+    # Only the control plane's own marker counts, and only one that names a numeric status id.
+    if [ "$status_state" = "$STATE" ] && [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ]; then
+      confirmed_id="${status_description#confirms status }"
+      case "$status_description" in
+        "confirms status "*) case "$confirmed_id" in ''|*[!0-9]*) ;; *) CONFIRMED_RELEASE_IDS="${CONFIRMED_RELEASE_IDS}${confirmed_id} " ;; esac ;;
+      esac
+    fi
+    continue
+  fi
+  if [ "$status_context" = "$ARM_GATE_CONTEXT" ]; then
+    # The newest arm-gate status written by the control plane decides (the list is newest first); any other creator is ignored.
+    if [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ] && [ -z "${arm_gate_seen:-}" ]; then
+      arm_gate_seen=1
+      ARM_GATE_STATE="$status_state"
+      ARM_GATE_DESCRIPTION="$status_description"
+    fi
+    continue
+  fi
   [ "$status_context" = "$CONTEXT" ] || continue
-  APPROVAL_STATE="${status_state:-missing}"
-  APPROVAL_CREATOR_ID="$status_creator_id"
-  APPROVAL_CREATOR_LOGIN="$status_creator_login"
-  break
+  # The newest paperclip/approved status decides (the list is newest first). The rest of the list is
+  # still read, for markers.
+  if [ -z "${approval_seen:-}" ]; then
+    approval_seen=1
+    APPROVAL_STATE="${status_state:-missing}"
+    APPROVAL_CREATOR_ID="$status_creator_id"
+    APPROVAL_CREATOR_LOGIN="$status_creator_login"
+    APPROVAL_DESCRIPTION="$status_description"
+    APPROVAL_STATUS_ID="$status_id"
+  fi
 done <<<"$STATUSES_TSV"
+
+# An unsettled arm of this head refuses it first, whatever stamp, release or override it carries (see ARM_GATE_CONTEXT).
+if arm_gate_refusal "$ARM_GATE_STATE" "$ARM_GATE_DESCRIPTION"; then
+  fail "$ARM_GATE_REFUSAL"
+fi
+
+# A release success the control plane has not confirmed is not an approval (switch on or off). A success
+# from any other creator is left to the FORGED refusal below.
+if [ "$APPROVAL_STATE" = "$STATE" ] && [ "$APPROVAL_CREATOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ]; then
+  case "$APPROVAL_DESCRIPTION" in
+    "released by "*)
+      case "$CONFIRMED_RELEASE_IDS" in
+        *" ${APPROVAL_STATUS_ID} "*) ;;
+        *)
+          err "UNCONFIRMED RELEASE: ${CONTEXT} on ${HEAD_SHA} is a board release (status ${APPROVAL_STATUS_ID}) that the control plane has not marked confirmed (${RELEASE_CONFIRMED_CONTEXT})"
+          APPROVAL_STATE="unconfirmed-release"
+          ;;
+      esac
+      ;;
+  esac
+fi
 
 if [ "$APPROVAL_STATE" = "$STATE" ]; then
   # `paperclip/approved` is a plain commit status, and the `fleet-only`
@@ -763,6 +945,11 @@ if [ "$APPROVAL_STATE" = "$STATE" ]; then
     fail "${CONTEXT} on ${HEAD_SHA} was not published by the control plane"
   fi
   note "pass: ${CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA} (published by ${APPROVAL_CREATOR_LOGIN})"
+  if waiver_retirement_on; then
+    case "$APPROVAL_DESCRIPTION" in
+      "released by "*) note "board release: ${APPROVAL_DESCRIPTION}" ;;
+    esac
+  fi
   if [ "$MODE" = "advisory" ]; then
     advisory_summary_present
   fi
@@ -798,6 +985,9 @@ fi
 err "FAIL: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE} — PR #${PR_NUMBER} head ${HEAD_SHA} is not approved"
 err "  an approval is produced by the control plane when the card's review stage records 'approved'"
 err "  (a hand PATCH of the card status skips publishApprovalStatus — no status is ever published)"
+if waiver_retirement_on; then
+  err "  a card-bound PR can also be released by the board: POST /api/issues/:id/merge-arming/release {headSha, reason}"
+fi
 err "  or waive a cardless PR: body line 'Paperclip-Approved-Waiver: <reason>' or the 'no-paperclip-card' label"
 err "  or have a person with write access apply the '${OVERRIDE_LABEL}' label AFTER the last push${OVERRIDE_REFUSAL:+ — override not honored: ${OVERRIDE_REFUSAL}}"
 exit 1

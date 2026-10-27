@@ -1,0 +1,42 @@
+import subprocess, shutil, json, os, re, sys
+root=os.environ.get('REPO_ROOT','.'); sp=sys.argv[1]; mode=sys.argv[2]
+SERVER=[('src/services/merge-arming.test.ts','a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline'),
+        ('src/__tests__/merge-arming-republish.test.ts','answers 409, not 500|take-back is unconfirmed on the card')]
+def parse(txt):
+    m=re.search(r'Tests\s+(?:(\d+) failed \| )?(\d+) passed',txt)
+    failed=int(m.group(1) or 0) if m else -1; passed=int(m.group(2)) if m else -1
+    if not m:
+        m2=re.search(r'Tests\s+(\d+) failed',txt); failed=int(m2.group(1)) if m2 else -1
+    return failed,passed
+def run():
+    out=[]
+    for f,flt in SERVER:
+        r=subprocess.run(['npx','vitest','run',f,'-t',flt],cwd=root+'/server',capture_output=True,text=True,timeout=900)
+        txt=r.stdout+r.stderr
+        failed,passed=parse(txt)
+        out.append({'file':f,'filter':flt,'failed':failed,'passed':passed,'failedNames':re.findall(r'^\s+×\s+(.+?)\s+\d+ms$',txt,re.M)[:16]})
+    r=subprocess.run(['node','--test','scripts/__tests__/paperclip-approved-arm-gate.test.mjs'],cwd=root,capture_output=True,text=True,timeout=300)
+    txt=r.stdout+r.stderr
+    p=re.search(r'# pass (\d+)',txt); f=re.search(r'# fail (\d+)',txt)
+    out.append({'file':'scripts/__tests__/paperclip-approved-arm-gate.test.mjs','failed':int(f.group(1)) if f else -1,'passed':int(p.group(1)) if p else -1,'failedNames':re.findall(r'^not ok \d+ - (.+)$',txt,re.M)[:16]})
+    return out
+def bak(p): shutil.copy(root+'/'+p,sp+'/b16_'+p.replace('/','_'))
+def res(p): shutil.copy(sp+'/b16_'+p.replace('/','_'),root+'/'+p)
+results={}
+if mode=='old':
+    files=['server/src/services/merge-arming.ts','server/src/services/auto-merge-disarm.ts','scripts/ci/check-paperclip-approved.sh']
+    for p in files: bak(p)
+    try:
+        for p in files: open(root+'/'+p,'w').write(subprocess.run(['git','show','e02a09eef:'+p],cwd=root,capture_output=True,text=True).stdout)
+        results['previous head e02a09ee']=run()
+    finally:
+        for p in files: res(p)
+else:
+    for name,m in json.load(open(sys.argv[3])).items():
+        p=m['file']; bak(p)
+        try:
+            s=open(root+'/'+p).read(); assert m['old'] in s,name
+            open(root+'/'+p,'w').write(s.replace(m['old'],m['new'],1))
+            results[name]=run()
+        finally: res(p)
+print(json.dumps(results,indent=1))

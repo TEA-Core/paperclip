@@ -1,10 +1,15 @@
 import type { Db } from "@paperclipai/db";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { IssueExecutionStage } from "@paperclipai/shared";
 import { and, eq, ilike, inArray, sql, type SQL } from "drizzle-orm";
 import {
+  agents,
+  authUsers,
+  companyMemberships,
   externalObjectMentions,
   externalObjects,
+  issueExecutionDecisions,
   issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
   issues,
@@ -14,6 +19,7 @@ import {
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   isGitHubTokenResolution,
+  resolveControlPlaneGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
   resolveGitHubTokenForRepo,
   type GitHubTokenResolution,
@@ -998,13 +1004,35 @@ async function fetchGitHubNodeIdOnce(
   return { ok: true, status: response.status, message: null, nodeId };
 }
 
+/**
+ * Each enable request is given up on (and its HTTP request aborted) after this long, so a call is over within
+ * `ENABLE_WORST_CASE_MS` (attempts, back-off included), well under the in-flight record's grace (`disarmTiming.inFlightGraceMs`).
+ */
+export const ENABLE_ATTEMPT_TIMEOUT_MS = 10_000;
+export const ENABLE_WORST_CASE_MS = 3 * ENABLE_ATTEMPT_TIMEOUT_MS + 250 + 500;
+/** The deadline an enable call gets when the caller names none (a mutable object so a test can shorten it). */
+export const enableTiming: { attemptTimeoutMs: number } = { attemptTimeoutMs: ENABLE_ATTEMPT_TIMEOUT_MS };
+
 export interface EnableAutoMergeOptions {
+  /** Per-request bound in ms (the request is aborted at it); defaults to ENABLE_ATTEMPT_TIMEOUT_MS. */
+  attemptTimeoutMs?: number;
   /** Total attempts for the arming mutation; the first call counts as attempt 1. Defaults to 3. */
   maxAttempts?: number;
   /** Base delay between attempts in ms; doubles on each retry. Defaults to 250. */
   retryDelayMs?: number;
   /** Injectable sleep, for tests. Defaults to a real setTimeout. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * The head the arm is authorized for. GitHub then refuses the mutation if the PR's head is
+   * something else, so an authorization given for one head cannot arm another (SUP-20772).
+   */
+  expectedHeadOid?: string;
+  /**
+   * Called before EVERY attempt, the first and each retry. A non-null answer (why the authority no longer
+   * holds) stops the call with that reason and the mutation is not sent: a retry must not be the moment an
+   * approval that was revoked in between gets armed.
+   */
+  beforeAttempt?: () => Promise<string | null>;
 }
 
 /**
@@ -1029,6 +1057,428 @@ function isTransientArmingStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/**
+ * An accepted arm that the card's authority no longer backs, and that could not be turned off at once
+ * (a 403, a 5xx, a timeout). It is kept on the card (`executionState.approvalStatus.autoMergeDisarm`) and
+ * retried on every reconciler tick until GitHub confirms auto-merge is off, so an accepted arm is never
+ * left silently in force.
+ */
+export interface PendingAutoMergeDisarm {
+  owner: string;
+  repo: string;
+  number: number;
+  nodeId: string;
+  headSha: string | null;
+  reason: string;
+  since: string;
+  attempts: number;
+  lastError: string | null;
+  lastAttemptAt?: string | null;
+  /**
+   * `in_flight`: written BEFORE the enable call, so an arm GitHub accepts is covered even if this process dies or the
+   * database is unreachable right after (once its grace is over the sweep takes it back unconditionally, whether or not
+   * the authority changed). `pending` (or absent): the arm is known to be in force without authority and is taken back.
+   */
+  state?: "in_flight" | "pending";
+  /** Names one arm attempt, so a finished attempt clears only its own record. */
+  token?: string;
+  /** The authority fingerprint the arm was authorized against (in_flight records only; kept for whoever reads the card, no code decides from it). */
+  baseline?: string | null;
+  requireApprovedLadder?: boolean;
+  /** Set once, when the take-back has stayed unconfirmed for `disarmEscalation.afterMs`: the card needs a human (see disarmEscalation). */
+  escalatedAt?: string | null;
+  /** Set once GitHub accepted the `paperclip/approved` failure on the head (see fenceRevokedHead): the head cannot merge while the arm stays on. */
+  fencedAt?: string | null;
+  /** Why the last fence write failed, until one is accepted. */
+  fenceError?: string | null;
+  /**
+   * The arm is settled (auto-merge is off, or it stands with its authority) and only the arm gate (see ARM_GATE_CONTEXT) is
+   * still open: the sweep writes the closing success until GitHub accepts it, and the record goes with it.
+   */
+  gateClosing?: boolean;
+}
+
+/** The reason a swept in-flight record is rewritten with: nothing says the authority changed, only that the arm was never settled. */
+export const INTERRUPTED_ARM_REASON = "arm interrupted before it was settled";
+
+/**
+ * The second route for a take-back GitHub does not confirm. Turning auto-merge off is one GraphQL mutation; when it keeps
+ * failing the arm stays on, but GitHub merges on required checks, and the newest `paperclip/approved` status decides
+ * (also in scripts/ci/check-paperclip-approved.sh, which is what a merge-queue run asks). So the head's status is
+ * overwritten with a control-plane `failure` over REST: a different endpoint and permission (statuses, not pull-request
+ * auto-merge), after which the armed PR cannot land until a fresh approval or board release writes a newer success.
+ * Bounded per token; answers whether GitHub accepted it. Never throws.
+ */
+export const FENCE_ATTEMPT_TIMEOUT_MS = 10_000;
+export const REVOKED_HEAD_STATUS_DESCRIPTION = "revoked: the approval no longer holds and auto-merge could not be turned off; needs a new approval";
+
+/**
+ * Writes one control-plane commit status on a head over REST, bounded per token (10 s for the whole try, retries included).
+ * `headSha` null: the PR's live head is read first. 401/403 and any other refusal move on to the next token. Never throws.
+ */
+async function writeHeadStatus(
+  tokens: string[],
+  record: { owner: string; repo: string; number: number; headSha: string | null },
+  status: { context: string; state: "success" | "failure"; description: string },
+): Promise<{ written: boolean; error: string | null }> {
+  let error: string | null = "no GitHub token candidate";
+  for (const token of tokens) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FENCE_ATTEMPT_TIMEOUT_MS);
+      try {
+        const bounded = async (): Promise<{ written: boolean; error: string | null }> => {
+          let head = record.headSha && /^[0-9a-f]{40}$/i.test(record.headSha) ? record.headSha : null;
+          if (!head) {
+            const live = await fetchPullRequestHeadSha(token, record.owner, record.repo, record.number, controller.signal);
+            if (!live.ok) return { written: false, error: `could not read the PR head (${live.message ?? `HTTP ${live.status}`})` };
+            head = live.headSha;
+          }
+          const written = await writeCommitStatusWithRetry(token, record.owner, record.repo, head, "", {
+            description: status.description, state: status.state, context: status.context, attempts: 2, delayMs: 250, signal: controller.signal,
+          });
+          return written.success ? { written: true, error: null } : { written: false, error: written.error ?? `HTTP ${written.status}` };
+        };
+        const answer = await Promise.race([
+          bounded(),
+          new Promise<{ written: false; error: string }>((resolve) => controller.signal.addEventListener("abort", () => resolve({ written: false, error: `timeout after ${FENCE_ATTEMPT_TIMEOUT_MS}ms` }), { once: true })),
+        ]);
+        if (answer.written) return answer;
+        error = answer.error;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return { written: false, error };
+}
+
+export async function fenceRevokedHead(
+  tokens: string[],
+  record: { owner: string; repo: string; number: number; headSha: string | null },
+): Promise<{ fenced: boolean; error: string | null }> {
+  const result = await writeHeadStatus(tokens, record, { context: "paperclip/approved", state: "failure", description: REVOKED_HEAD_STATUS_DESCRIPTION });
+  return { fenced: result.written, error: result.error };
+}
+
+/**
+ * The arm gate: the status that keeps a head unmergeable for as long as an arm of it is unsettled, written BEFORE the
+ * enable call, while GitHub is demonstrably reachable (the take-back and the fence are both GitHub writes made AFTER the
+ * arm, so a provider that refuses both would leave nothing on GitHub). `failure` is written first and is replaced by a
+ * `success` only once the arm is settled (taken back and confirmed off, or standing with its authority). The CI check
+ * (scripts/ci/check-paperclip-approved.sh) refuses a head whose newest control-plane `paperclip/arm-gate` is not a success,
+ * and nothing but the control plane's own identity can clear it. A head with no such status is judged as before.
+ */
+export const ARM_GATE_CONTEXT = "paperclip/arm-gate";
+export const ARM_GATE_OPEN_DESCRIPTION = "an auto-merge arm of this head is unsettled; not mergeable until the control plane confirms it";
+export const ARM_GATE_CLOSED_DESCRIPTION = "arm settled: auto-merge is off or stands with its authority";
+
+export async function writeArmGate(
+  tokens: string[],
+  record: { owner: string; repo: string; number: number; headSha: string | null },
+  state: "open" | "closed",
+): Promise<{ written: boolean; error: string | null }> {
+  return writeHeadStatus(tokens, record, {
+    context: ARM_GATE_CONTEXT,
+    state: state === "open" ? "failure" : "success",
+    description: state === "open" ? ARM_GATE_OPEN_DESCRIPTION : ARM_GATE_CLOSED_DESCRIPTION,
+  });
+}
+
+/**
+ * The finite bound on how long an unconfirmed take-back is just retried. A record older than `afterMs` (measured from its
+ * `since`, read at the moment it is looked at, so it holds with no sweep or scheduler running) is escalated: every
+ * control-plane arm of that card is refused (`failed:disarm-escalated`), the sweep marks it `escalatedAt` and raises the
+ * `issue.merge_disarm_escalated` alert, and a human has to turn auto-merge off (the retries go on, so a confirmation
+ * still clears it). A mutable object so a test can lower it.
+ */
+export const disarmEscalation: { afterMs: number } = { afterMs: 15 * 60_000 };
+
+export function disarmRecordEscalated(record: { since?: string | null; escalatedAt?: string | null }, now = Date.now()): boolean {
+  if (record.escalatedAt) return true;
+  const since = Date.parse(record.since ?? "");
+  return !Number.isNaN(since) && now - since >= disarmEscalation.afterMs;
+}
+
+/**
+ * Most records (in flight or pending) the instance holds at once (a mutable object so a test can lower it). It is a hard
+ * cap: admission is serialised by an advisory lock, so the backlog never exceeds it and a sweep, which takes this many,
+ * tries every record each time: a disable is never dropped and never starved.
+ */
+export const disarmBacklog: { cap: number } = { cap: 50 };
+
+const RECORD_PATH = sql`(${issues.executionState} -> 'approvalStatus' -> 'autoMergeDisarm')`;
+
+/**
+ * Writes the in-flight record before an enable call, in one statement (under the admission lock) that also checks there
+ * is no record on the card yet and fewer than `disarmBacklog.cap` on the instance. `exists`: a take-back or another arm
+ * already holds the card. `escalated`: the record on the card has outlived `disarmEscalation.afterMs`. `full`: the
+ * backlog is at its cap. In every case nothing may be armed.
+ */
+export async function openArmInFlight(db: Db, companyId: string, issueId: string, record: PendingAutoMergeDisarm): Promise<"recorded" | "exists" | "escalated" | "full"> {
+  const patch = JSON.stringify({ autoMergeDisarm: record });
+  const rows = await db.transaction(async (tx) => {
+    // One admission at a time, so the count below cannot be raced past the cap.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('paperclip:auto-merge-disarm-admission'))`);
+    return tx
+      .update(issues)
+      .set({
+        executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) || ${patch}::jsonb)`,
+      })
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.id, issueId),
+        sql`${RECORD_PATH} is null`,
+        sql`(select count(*) from "issues" as other where other."execution_state" -> 'approvalStatus' -> 'autoMergeDisarm' is not null) < ${disarmBacklog.cap}`,
+      ))
+      .returning({ id: issues.id });
+  });
+  if (rows.length > 0) return "recorded";
+  const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  const existing = ((row?.executionState as Record<string, unknown> | null)?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
+  if (!existing) return "full";
+  return disarmRecordEscalated(existing as { since?: string; escalatedAt?: string }) ? "escalated" : "exists";
+}
+
+/** Removes the card's record; with a token, only when it is the record of that arm attempt. */
+export async function clearAutoMergeDisarmRecord(db: Db, companyId: string, issueId: string, token?: string): Promise<void> {
+  await db
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) - 'autoMergeDisarm')`,
+    })
+    .where(and(
+      eq(issues.companyId, companyId),
+      eq(issues.id, issueId),
+      ...(token ? [sql`${RECORD_PATH} ->> 'token' = ${token}`] : []),
+    ));
+}
+
+/** Writes the record into the card's approvalStatus subtree atomically (other keys are preserved). */
+export async function recordPendingAutoMergeDisarm(db: Db, companyId: string, issueId: string, record: PendingAutoMergeDisarm): Promise<void> {
+  const patch = JSON.stringify({ autoMergeDisarm: record });
+  await db
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) || ${patch}::jsonb)`,
+    })
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+}
+
+/** True for the outcome of an arm that `openArmRecord` refused: nothing was sent to GitHub. */
+export function isArmRecordRefusal(message: string): boolean {
+  return /^(?:failed:disarm-record-unavailable|skipped:arm-in-progress|failed:disarm-escalated|failed:disarm-backlog-full|failed:arm-gate-unavailable):/.test(message);
+}
+
+export type ArmRecordOpening =
+  | { ok: true; forget: () => Promise<void>; settleEnable: (result: { success: boolean; error: string | null; status: number }) => Promise<void> }
+  | { ok: false; kind: "failed" | "skipped"; message: string };
+
+/**
+ * Every enable call goes through this first: it writes the in-flight take-back record (see openArmInFlight) and refuses
+ * the arm when the record cannot be written, the card already holds one, or the backlog is at its cap. `settleEnable`
+ * is told how the enable call ended: an answer that is not an acceptance drops the record (nothing is armed); no
+ * answer (a network error, a 5xx) keeps it and starts the prompt retries, because the arm may be in force. `forget`
+ * drops the record once the caller knows the arm is settled (it stands with its authority, or it was taken back).
+ */
+export async function openArmRecord(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number },
+  label: string,
+  nodeId: string,
+  headSha: string | null,
+  guard: AuthorityGuard,
+): Promise<ArmRecordOpening> {
+  const token = randomUUID();
+  // The tokens the arm gate and its closing are written with, and the head they are written to (read live when the
+  // caller named none, so the gate and its closing always name the same commit).
+  let tokens: string[];
+  let head = headSha;
+  try {
+    tokens = (await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo)).map((candidate) => candidate.token);
+    for (const candidate of tokens) {
+      if (head) break;
+      const live = await fetchPullRequestHeadSha(candidate, pr.owner, pr.repo, pr.number);
+      if (live.ok) head = live.headSha;
+    }
+  } catch (error) {
+    return { ok: false, kind: "failed", message: `failed:arm-gate-unavailable: ${label} — the arm gate could not be prepared (${error instanceof Error ? error.message : String(error)}); nothing was armed` };
+  }
+  if (!head) {
+    return { ok: false, kind: "failed", message: `failed:arm-gate-unavailable: ${label} — the head the arm gate names could not be read; nothing was armed` };
+  }
+  const since = new Date().toISOString();
+  let opened: "recorded" | "exists" | "escalated" | "full";
+  try {
+    opened = await openArmInFlight(db, companyId, issueId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha: head,
+      reason: "arm in flight", since, attempts: 0, lastError: null,
+      state: "in_flight", token, baseline: guard.baseline, requireApprovedLadder: guard.requireApprovedLadder,
+    });
+  } catch (error) {
+    return { ok: false, kind: "failed", message: `failed:disarm-record-unavailable: ${label} — the take-back record could not be written (${error instanceof Error ? error.message : String(error)}); nothing was armed` };
+  }
+  if (opened === "exists") {
+    return { ok: false, kind: "skipped", message: `skipped:arm-in-progress: ${label} — a take-back or another arm is already recorded on this card; nothing was armed, the next pass tries again` };
+  }
+  if (opened === "escalated") {
+    return { ok: false, kind: "failed", message: `failed:disarm-escalated: ${label} — a take-back on this card has gone unconfirmed for over ${Math.round(disarmEscalation.afterMs / 60_000)} minutes and needs a human to turn auto-merge off; nothing was armed` };
+  }
+  if (opened === "full") {
+    return { ok: false, kind: "failed", message: `failed:disarm-backlog-full: ${label} — ${disarmBacklog.cap} auto-merge take-backs are already waiting to be confirmed; nothing was armed` };
+  }
+  const gateTarget = { owner: pr.owner, repo: pr.repo, number: pr.number, headSha: head };
+  const startRetries = async () => { try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still settles it */ } };
+  // Closes the gate, then drops the record. If GitHub will not take the closing write the record stays, marked
+  // `gateClosing`, and the sweep keeps writing it: the head stays unmergeable meanwhile (fail closed).
+  const settle = async (): Promise<void> => {
+    const closed = await writeArmGate(tokens, gateTarget, "closed").catch((error) => ({ written: false, error: String(error) }));
+    if (closed.written) {
+      await clearAutoMergeDisarmRecord(db, companyId, issueId, token).catch(() => undefined);
+      return;
+    }
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha: head, reason: "arm settled; the arm gate is still open",
+      since, attempts: 1, lastError: closed.error, lastAttemptAt: new Date().toISOString(), state: "pending", token, gateClosing: true,
+    }).catch(() => undefined);
+    await startRetries();
+  };
+  // Written before the enable call, while GitHub answers: from here until `settle` the head is not mergeable.
+  const gate = await writeArmGate(tokens, gateTarget, "open").catch((error) => ({ written: false, error: String(error) }));
+  if (!gate.written) {
+    // The write may have landed without an answer: the record stays, marked so the sweep closes the gate.
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha: head, reason: "the arm gate could not be opened; nothing was armed",
+      since, attempts: 1, lastError: gate.error, lastAttemptAt: new Date().toISOString(), state: "pending", token, gateClosing: true,
+    }).catch(() => undefined);
+    await startRetries();
+    return { ok: false, kind: "failed", message: `failed:arm-gate-unavailable: ${label} — the arm gate could not be written (${gate.error ?? "unknown"}); nothing was armed` };
+  }
+  return {
+    ok: true,
+    forget: settle,
+    settleEnable: async (result) => {
+      if (result.success) return;
+      if (result.error === "network_error" || result.error?.startsWith("timeout after ") || isTransientArmingStatus(result.status)) {
+        await startRetries();
+      } else {
+        await settle();
+      }
+    },
+  };
+}
+
+/**
+ * Keeps an arm that could not be turned off on the card, to be retried every reconciler tick until GitHub
+ * confirms it is off. Answers a sentence for the outcome message. Never throws.
+ */
+export async function keepAutoMergeDisarmPending(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number },
+  nodeId: string,
+  headSha: string | null,
+  reason: string,
+  error: string | null,
+): Promise<string> {
+  const record: PendingAutoMergeDisarm = {
+    owner: pr.owner, repo: pr.repo, number: pr.number, nodeId, headSha, reason,
+    since: new Date().toISOString(), attempts: 1, lastError: error, lastAttemptAt: new Date().toISOString(), state: "pending",
+  };
+  try {
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, record);
+  } catch (err) {
+    // The in-flight record written before the arm is still on the card: the sweep takes the arm back from it.
+    return `; the take-back record could not be updated (${err instanceof Error ? err.message : String(err)}); the record written before the arm stays on the card and the sweep takes the arm back from it`;
+  }
+  // The arm is in force without authority and GitHub would not turn it off: fence the head now, over the second route,
+  // so the PR cannot merge while the take-back is retried (no scheduler needed: this runs in the arming process itself).
+  let fence = "";
+  try {
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+    const fenced = await fenceRevokedHead(candidates.map((candidate) => candidate.token), record);
+    await recordPendingAutoMergeDisarm(db, companyId, issueId, fenced.fenced
+      ? { ...record, fencedAt: new Date().toISOString(), fenceError: null }
+      : { ...record, fenceError: fenced.error });
+    fence = fenced.fenced
+      ? "; the head's paperclip/approved status was set to failure, so the PR cannot merge while auto-merge stays on"
+      : `; the head's paperclip/approved status could NOT be set to failure (${fenced.error ?? "unknown"}), so nothing but the take-back stops a merge`;
+  } catch (err) {
+    fence = `; the head could not be fenced (${err instanceof Error ? err.message : String(err)})`;
+  }
+  // Do not wait for the first reconciler tick: retry within seconds (a restart falls back to the tick).
+  // Loaded here, not at the top, because that module imports this one.
+  try { (await import("./auto-merge-disarm.js")).startPromptDisarmRetries(db, companyId, issueId); } catch { /* the tick still retries it */ }
+  return `; the take-back is recorded on the card and retried within seconds and then on every reconciler tick until GitHub confirms auto-merge is off${fence}`;
+}
+
+/**
+ * Turns auto-merge back off. Used only to take back an arm whose authority was revoked while the
+ * enable call was in flight (a revocation that commits inside the GitHub call cannot be seen before it).
+ * Every attempt is bounded (a provider call that never answers is given up on, and its request aborted),
+ * a transient failure is retried, and the answer says plainly whether auto-merge is off: `success` is
+ * true only when GitHub accepted the disable or said auto-merge was not enabled.
+ */
+export async function disableAutoMerge(
+  token: string,
+  nodeId: string,
+  options: { timeoutMs?: number; attempts?: number; retryDelayMs?: number } = {},
+): Promise<{ success: boolean; error: string | null }> {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const attempts = options.attempts ?? 3;
+  const retryDelayMs = options.retryDelayMs ?? 250;
+  const query = `mutation { disablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
+  const once = async (): Promise<{ success: boolean; error: string | null; transient: boolean }> => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => { controller.abort(); resolve("timeout"); }, timeoutMs);
+    });
+    try {
+      const work = (async () => {
+        const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ query }),
+          signal: controller.signal,
+        });
+        const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+        const errors = body?.errors as Array<{ message?: string }> | undefined;
+        if (!response.ok) return { success: false, error: errors?.[0]?.message ?? `HTTP ${response.status}`, transient: isTransientArmingStatus(response.status) };
+        if (errors && errors.length > 0) {
+          const message = errors[0]?.message ?? "";
+          // Nothing to take back: GitHub says auto-merge is not enabled. ("already merged" is NOT this: the
+          // merge happened, and the answer must say auto-merge was not turned off.)
+          if (/auto[- ]?merge (?:is )?not (?:currently )?enabled|is not enabled/i.test(message)) return { success: true, error: null, transient: false };
+          return { success: false, error: message, transient: false };
+        }
+        return { success: true, error: null, transient: false };
+      })();
+      work.catch(() => undefined);
+      const result = await Promise.race([work, timedOut]);
+      return result === "timeout" ? { success: false, error: `timeout after ${timeoutMs}ms`, transient: true } : result;
+    } catch {
+      return { success: false, error: "network_error", transient: true };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  let result = await once();
+  for (let attempt = 1; attempt < attempts && !result.success && result.transient; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs * 2 ** (attempt - 1)));
+    result = await once();
+  }
+  return { success: result.success, error: result.error };
+}
+
 export async function enableAutoMerge(
   token: string,
   nodeId: string,
@@ -1036,44 +1486,67 @@ export async function enableAutoMerge(
 ): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {
   const maxAttempts = options.maxAttempts ?? 3;
   const baseDelay = options.retryDelayMs ?? 250;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? enableTiming.attemptTimeoutMs;
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
+  if (options.expectedHeadOid !== undefined && !/^[0-9a-f]{40}$/i.test(options.expectedHeadOid)) {
+    return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0 };
+  }
   const attempt = async (): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> => {
-    const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
+    const refusal = await options.beforeAttempt?.();
+    if (refusal) return { success: false, alreadyQueued: false, error: `authority_changed: ${refusal}`, status: 0 };
+    const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
+    const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
 
-    try {
-      const response = await ghFetch(GITHUB_GRAPHQL_URL, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ query }),
-      });
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => { controller.abort(); resolve("timeout"); }, attemptTimeoutMs);
+    });
+    type Answer = { success: boolean; alreadyQueued: boolean; error: string | null; status: number };
+    const work = (async (): Promise<Answer> => {
+      try {
+        const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ query }),
+          signal: controller.signal,
+        });
 
-      if (!response.ok) {
+        if (!response.ok) {
+          const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+          const errors = body?.errors as Array<{ message?: string }> | undefined;
+          const firstError = errors?.[0]?.message ?? "";
+          if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
+            return { success: true, alreadyQueued: true, error: null, status: response.status };
+          }
+          return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}`, status: response.status };
+        }
+
         const body = await response.json().catch(() => null) as Record<string, unknown> | null;
         const errors = body?.errors as Array<{ message?: string }> | undefined;
-        const firstError = errors?.[0]?.message ?? "";
-        if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-          return { success: true, alreadyQueued: true, error: null, status: response.status };
+        if (errors && errors.length > 0) {
+          const firstError = errors[0]?.message ?? "";
+          if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
+            return { success: true, alreadyQueued: true, error: null, status: response.status };
+          }
+          return { success: false, alreadyQueued: false, error: firstError, status: response.status };
         }
-        return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}`, status: response.status };
-      }
 
-      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-      const errors = body?.errors as Array<{ message?: string }> | undefined;
-      if (errors && errors.length > 0) {
-        const firstError = errors[0]?.message ?? "";
-        if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-          return { success: true, alreadyQueued: true, error: null, status: response.status };
-        }
-        return { success: false, alreadyQueued: false, error: firstError, status: response.status };
+        return { success: true, alreadyQueued: false, error: null, status: response.status };
+      } catch {
+        return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
       }
-
-      return { success: true, alreadyQueued: false, error: null, status: response.status };
-    } catch {
-      return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
+    })();
+    work.catch(() => undefined);
+    try {
+      const answer = await Promise.race([work, timedOut]);
+      return answer === "timeout" ? { success: false, alreadyQueued: false, error: `timeout after ${attemptTimeoutMs}ms`, status: 0 } : answer;
+    } finally {
+      clearTimeout(timer);
     }
   };
 
@@ -1392,6 +1865,85 @@ export function readCertifiedFinalDelivery(executionState: Record<string, unknow
       ? fields.displayName : `${fields.owner}/${fields.repo}#${fields.number}`,
     decisionId: fields.decisionId,
   };
+}
+
+/** The board release the publisher CONFIRMED on a card: which status it was, and which PR and head it covered. */
+export interface ConfirmedRelease {
+  owner: string;
+  repo: string;
+  number: number;
+  headSha: string;
+  /** GitHub's id of the success status the release wrote. */
+  statusId: string;
+}
+
+/** The confirmed release recorded on the card (`approvalStatus.releaseConfirmation`), if well formed. */
+export function readConfirmedRelease(executionState: Record<string, unknown> | null | undefined): ConfirmedRelease | undefined {
+  const raw = (executionState?.approvalStatus as Record<string, unknown> | null | undefined)?.releaseConfirmation;
+  if (!raw || typeof raw !== "object") return undefined;
+  const f = raw as Record<string, unknown>;
+  if (
+    typeof f.owner !== "string" || !f.owner ||
+    typeof f.repo !== "string" || !f.repo ||
+    typeof f.number !== "number" || !Number.isSafeInteger(f.number) || f.number <= 0 ||
+    typeof f.headSha !== "string" || !f.headSha ||
+    typeof f.statusId !== "string" || !f.statusId
+  ) return undefined;
+  return { owner: f.owner, repo: f.repo, number: f.number, headSha: f.headSha, statusId: f.statusId };
+}
+
+/**
+ * Whether the card carries a board-release confirmation for `headSha`: the head was released through the
+ * head-bound release path. `headSha` defaults to the card's published head. Inside that path (and only
+ * there) a paused agent decider no longer stands behind the approval, and a direct merge is never used.
+ */
+export function isBoardReleasedHead(executionState: Record<string, unknown> | null | undefined, headSha?: string | null): boolean {
+  const confirmed = readConfirmedRelease(executionState);
+  if (!confirmed) return false;
+  const approval = (executionState?.approvalStatus ?? {}) as Record<string, unknown>;
+  const head = headSha ?? (typeof approval.publishedHeadSha === "string" ? approval.publishedHeadSha : null);
+  return !!head && confirmed.headSha === head;
+}
+
+/**
+ * The id of the board-release status a consumer may act on for this exact repository, PR and head, or
+ * null. It requires BOTH the card's certified final delivery for that triple (a release only stands in
+ * for the review on a certified card) and a release the publisher confirmed for the same triple. A
+ * release whose confirmation is unknown (a write that timed out, a status that could not be confirmed or
+ * voided) has no such record, so it is never consumed.
+ */
+export function consumableReleaseStatusId(
+  executionState: Record<string, unknown> | null | undefined,
+  target: { owner: string; repo: string; number: number; headSha: string },
+): string | null {
+  const same = (a: { owner: string; repo: string; number: number; headSha: string }) =>
+    a.number === target.number && a.headSha === target.headSha &&
+    a.owner.toLowerCase() === target.owner.toLowerCase() && a.repo.toLowerCase() === target.repo.toLowerCase();
+  const certified = readCertifiedFinalDelivery(executionState);
+  const confirmed = readConfirmedRelease(executionState);
+  return certified && confirmed && same(certified) && same(confirmed) ? confirmed.statusId : null;
+}
+
+/**
+ * Records, on the publication lock's own connection, that the release wrote and confirmed exactly this
+ * status. It is the last write of a release, so a status that is never confirmed never has a record.
+ */
+export async function recordReleaseConfirmation(
+  conn: Db,
+  companyId: string,
+  issueId: string,
+  confirmation: ConfirmedRelease,
+): Promise<void> {
+  const patch = JSON.stringify({ releaseConfirmation: { ...confirmation, at: new Date().toISOString() } });
+  const updated = await conn
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}',
+        coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb) || ${patch}::jsonb)`,
+    })
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+    .returning({ id: issues.id });
+  if (updated.length === 0) throw new Error("card not found while recording the release confirmation");
 }
 
 /**
@@ -2120,6 +2672,13 @@ export async function publishApprovalStatus(
   issueIdentifier: string,
   options?: PublishApprovalStatusOptions,
 ): Promise<ArmingOutcome> {
+  // The card is blocked while an auto-merge arm of it is unsettled: a control-plane success written now would sit on top of
+  // the fence and the arm gate. It publishes again once GitHub has confirmed auto-merge off (or the arm settled).
+  const [blockRow] = await db.select({ executionState: issues.executionState }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  const unsettled = ((blockRow?.executionState as Record<string, unknown> | null | undefined)?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
+  if (unsettled && typeof unsettled === "object") {
+    return { kind: "skipped", message: "status:skipped:arm-unsettled: an auto-merge take-back is unconfirmed on this card; nothing is published until GitHub confirms auto-merge is off" };
+  }
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   const certification = options?.headCertification;
   if (certification) {
@@ -3041,7 +3600,8 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
   owner: string,
   repo: string,
   headSha: string,
-): Promise<{ ok: true; approved: boolean } | { ok: false; reason: string }> {
+  options: HeadStatusReadOptions = {},
+): Promise<{ ok: true; approved: boolean; controlPlaneApproved: boolean } | { ok: false; reason: string }> {
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
   if (candidates.length === 0) {
     const tokenResult = await resolveGitHubTokenForRepo(db, companyId, owner, repo);
@@ -3053,8 +3613,8 @@ export async function fetchHeadApprovedStatusViaTokenCandidates(
   let lastStatus = 0;
   let lastMessage: string | null = null;
   for (const candidate of candidates) {
-    const result = await fetchHeadCommitStatuses(candidate.token, owner, repo, headSha);
-    if (result.ok) return { ok: true, approved: result.approved };
+    const result = await fetchHeadCommitStatuses(candidate.token, owner, repo, headSha, options);
+    if (result.ok) return { ok: true, approved: result.approved, controlPlaneApproved: result.controlPlaneApproved };
     lastStatus = result.status;
     lastMessage = result.message;
     if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) {
@@ -3294,17 +3854,47 @@ export async function fetchLastMergeQueueEjectionViaTokenCandidates(
   return { ok: false, reason: `pr_error: HTTP ${lastStatus} ${lastMessage ?? ""}` };
 }
 
+// The `tea-core` App; the only identity scripts/ci/check-paperclip-approved.sh accepts as the
+// producer of `paperclip/approved` (its APPROVED_STATUS_CREATOR_ID default).
+export const CONTROL_PLANE_STATUS_CREATOR_ID = "317012809";
+
 /**
  * SUP-15315: reads one head SHA's commit statuses from the GitHub statuses API
  * (GET, read-only) and reports whether a `paperclip/approved` status with state
  * `success` is present. Uses the shared ghFetch transport — no new HTTP layer.
  */
+/**
+ * How a head's `paperclip/approved` statuses are read. `strict` is for deciding whether to arm a merge:
+ * only the NEWEST status counts, and it must be a control-plane success. A board release (SUP-20772) is a
+ * human decision on one head and not a review, so under `strict` it counts only when it is the status the
+ * publisher CONFIRMED: `confirmedReleaseStatusId` is that status's id, and any other release status (one
+ * whose confirmation is unknown, a later duplicate, a voided one) is not consumed.
+ */
+export interface HeadStatusReadOptions {
+  strict?: boolean;
+  confirmedReleaseStatusId?: string | null;
+  signal?: AbortSignal;
+}
+
+interface HeadStatusRead {
+  ok: boolean;
+  approved: boolean;
+  controlPlaneApproved: boolean;
+  /** The newest status, when it is a control-plane success: its id, whether it is a board release, and its description. */
+  newest: { id: string | null; release: boolean; description: string | null } | null;
+  /** Ids of the release statuses the control plane has marked confirmed on this head (see RELEASE_CONFIRMED_CONTEXT). */
+  confirmedMarkers: string[];
+  status: number;
+  message: string | null;
+}
+
 async function fetchHeadCommitStatusesOnce(
   token: string,
   owner: string,
   repo: string,
   headSha: string,
-): Promise<{ ok: boolean; approved: boolean; status: number; message: string | null }> {
+  options: HeadStatusReadOptions = {},
+): Promise<HeadStatusRead> {
   const url =
     `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
     `/statuses/${encodeURIComponent(headSha)}?per_page=100`;
@@ -3317,29 +3907,53 @@ async function fetchHeadCommitStatusesOnce(
 
   let response: Response;
   try {
-    response = await ghFetch(url, { headers });
+    response = await ghFetch(url, { headers, signal: options.signal });
   } catch {
-    return { ok: false, approved: false, status: 0, message: "network_error" };
+    return { ok: false, approved: false, controlPlaneApproved: false, newest: null, confirmedMarkers: [], status: 0, message: "network_error" };
   }
 
   if (!response.ok) {
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     const message = body?.message as string | undefined;
-    return { ok: false, approved: false, status: response.status, message: message ?? null };
+    return { ok: false, approved: false, controlPlaneApproved: false, newest: null, confirmedMarkers: [], status: response.status, message: message ?? null };
   }
 
   const body = await response.json().catch(() => null);
   const list = Array.isArray(body) ? body : [];
+  const confirmedMarkers: string[] = [];
   let approved = false;
+  let newestSeen = false;
+  let controlPlaneApproved = false;
+  let newest: HeadStatusRead["newest"] = null;
   for (const raw of list) {
     if (typeof raw !== "object" || raw === null) continue;
     const status = raw as Record<string, unknown>;
-    if (status.context === "paperclip/approved" && status.state === "success") {
-      approved = true;
-      break;
+    if (status.context === RELEASE_CONFIRMED_CONTEXT) {
+      const markerCreator = status.creator as Record<string, unknown> | null | undefined;
+      const confirmed = typeof status.description === "string" ? /^confirms status (\d+)$/.exec(status.description)?.[1] : undefined;
+      if (status.state === "success" && String(markerCreator?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID && confirmed) confirmedMarkers.push(confirmed);
+      continue;
+    }
+    if (status.context !== "paperclip/approved") continue;
+    if (!options.strict && status.state === "success") approved = true;
+    if (!newestSeen) {
+      newestSeen = true;
+      const creator = status.creator as Record<string, unknown> | null | undefined;
+      controlPlaneApproved = status.state === "success" && String(creator?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID;
+      const id = status.id === undefined || status.id === null ? null : String(status.id);
+      const release = isHeadBoundReleaseDescription(status.description);
+      if (controlPlaneApproved) newest = { id, release, description: typeof status.description === "string" ? status.description : null };
+      // Strict reading, for deciding whether to arm a merge: only the NEWEST paperclip/approved status
+      // counts (a later failure revokes an earlier success), it must have been written by the control
+      // plane (a success from any other identity is a forgery, not a stamp), and a board release counts
+      // only when it is the one the publisher confirmed (SUP-20772).
+      if (options.strict) {
+        approved = controlPlaneApproved &&
+          (!release || (id !== null && options.confirmedReleaseStatusId != null && id === options.confirmedReleaseStatusId));
+      }
     }
   }
-  return { ok: true, approved, status: response.status, message: null };
+  return { ok: true, approved, controlPlaneApproved, newest, confirmedMarkers, status: response.status, message: null };
 }
 
 /**
@@ -3353,8 +3967,9 @@ async function fetchHeadCommitStatuses(
   owner: string,
   repo: string,
   headSha: string,
-): Promise<{ ok: boolean; approved: boolean; status: number; message: string | null }> {
-  return withTransientReadRetry(() => fetchHeadCommitStatusesOnce(token, owner, repo, headSha));
+  options: HeadStatusReadOptions = {},
+): Promise<HeadStatusRead> {
+  return withTransientReadRetry(() => fetchHeadCommitStatusesOnce(token, owner, repo, headSha, options), { signal: options.signal });
 }
 
 export interface HeadShaSuccess extends GitHubFetchResult {
@@ -3405,6 +4020,7 @@ async function fetchPullRequestHeadShaOnce(
   owner: string,
   repo: string,
   number: number,
+  signal?: AbortSignal,
 ): Promise<HeadShaResult> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`;
   const headers: Record<string, string> = {
@@ -3416,7 +4032,7 @@ async function fetchPullRequestHeadShaOnce(
 
   let response: Response;
   try {
-    response = await ghFetch(url, { headers });
+    response = await ghFetch(url, { headers, signal });
   } catch {
     return { ok: false, status: 0, message: "network_error", headSha: null, headRef: null, open: null, draft: null, merged: null };
   }
@@ -3480,8 +4096,9 @@ async function fetchPullRequestHeadSha(
   owner: string,
   repo: string,
   number: number,
+  signal?: AbortSignal,
 ): Promise<HeadShaResult> {
-  return withTransientReadRetry(() => fetchPullRequestHeadShaOnce(token, owner, repo, number));
+  return withTransientReadRetry(() => fetchPullRequestHeadShaOnce(token, owner, repo, number, signal), { signal });
 }
 
 export interface OpenPullRequestListItem {
@@ -3577,7 +4194,11 @@ async function writeCommitStatus(
   repo: string,
   headSha: string,
   issueIdentifier: string,
-): Promise<{ success: boolean; error: string | null; status: number; transient: boolean }> {
+  description?: string,
+  state: "success" | "failure" = "success",
+  signal?: AbortSignal,
+  context: string = "paperclip/approved",
+): Promise<{ success: boolean; error: string | null; status: number; transient: boolean; statusId?: string | null }> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/statuses/${encodeURIComponent(headSha)}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
@@ -3587,10 +4208,10 @@ async function writeCommitStatus(
   };
 
   const body = JSON.stringify({
-    state: "success",
-    context: "paperclip/approved",
-    description: `${issueIdentifier} approved via Paperclip`,
-    target_url: `https://paperclip.example.com/issues/${issueIdentifier}`,
+    state,
+    context,
+    description: description ?? `${issueIdentifier} approved via Paperclip`,
+    ...(issueIdentifier ? { target_url: `https://paperclip.example.com/issues/${issueIdentifier}` } : {}),
   });
 
   let response: Response;
@@ -3599,6 +4220,7 @@ async function writeCommitStatus(
       method: "POST",
       headers,
       body,
+      signal,
     });
   } catch {
     // No response at all — the request never reached GitHub. Transient by
@@ -3608,7 +4230,15 @@ async function writeCommitStatus(
   }
 
   if (response.ok) {
-    return { success: true, error: null, status: response.status, transient: false };
+    const created = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const id = created?.id;
+    return {
+      success: true,
+      error: null,
+      status: response.status,
+      transient: false,
+      statusId: typeof id === "number" || (typeof id === "string" && id.length > 0) ? String(id) : null,
+    };
   }
 
   const responseBody = await response.json().catch(() => null) as Record<string, unknown> | null;
@@ -3672,6 +4302,22 @@ export interface TransientReadRetryOptions {
   delayMs?: number;
   /** Injectable delay seam for tests (defaults to a real setTimeout). */
   delay?: (ms: number) => Promise<void>;
+  /** A caller's deadline: once aborted, no further attempt is made and the wait between attempts ends. */
+  signal?: AbortSignal;
+}
+
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /**
@@ -3691,13 +4337,13 @@ export async function withTransientReadRetry<T extends { status: number }>(
 ): Promise<T> {
   const attempts = Math.max(1, options.attempts ?? 3);
   const delayMs = options.delayMs ?? 1000;
-  const delay =
-    options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const delay = options.delay ?? ((ms: number) => abortableDelay(ms, options.signal));
 
   let result = await fetchOnce();
   let made = 1;
-  while (isTransientReadStatus(result.status) && made < attempts) {
+  while (isTransientReadStatus(result.status) && made < attempts && !options.signal?.aborted) {
     await delay(delayMs);
+    if (options.signal?.aborted) break;
     result = await fetchOnce();
     made += 1;
   }
@@ -3711,6 +4357,14 @@ export interface WriteCommitStatusRetryOptions {
   delayMs?: number;
   /** Injectable delay seam for tests (defaults to a real setTimeout). */
   delay?: (ms: number) => Promise<void>;
+  /** Overrides the default "<issue> approved via Paperclip" status description. */
+  description?: string;
+  /** The status state to write (default success). */
+  state?: "success" | "failure";
+  /** A caller's deadline: cancels the request in flight and stops further attempts. */
+  signal?: AbortSignal;
+  /** The status context to write (default `paperclip/approved`). */
+  context?: string;
 }
 
 export interface WriteCommitStatusResult {
@@ -3722,6 +4376,8 @@ export interface WriteCommitStatusResult {
   transient: boolean;
   /** How many attempts were actually made (1 for a deterministic refusal). */
   attempts: number;
+  /** GitHub's id for the status it accepted, when the answer carried one. */
+  statusId?: string | null;
 }
 
 /**
@@ -3742,17 +4398,641 @@ export async function writeCommitStatusWithRetry(
 ): Promise<WriteCommitStatusResult> {
   const attempts = Math.max(1, options.attempts ?? 3);
   const delayMs = options.delayMs ?? 1000;
-  const delay =
-    options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const delay = options.delay ?? ((ms: number) => abortableDelay(ms, options.signal));
 
-  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier);
+  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
   let made = 1;
-  while (!result.success && result.transient && made < attempts) {
+  while (!result.success && result.transient && made < attempts && !options.signal?.aborted) {
     await delay(delayMs);
-    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier);
+    if (options.signal?.aborted) break;
+    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
     made += 1;
   }
   return { ...result, attempts: made };
+}
+
+// GitHub rejects a commit-status description over 140 characters.
+const COMMIT_STATUS_DESCRIPTION_MAX = 140;
+
+/** `released by <actor> for <sha>: <reason>`, with the reason cut to fit GitHub's limit. */
+export function headBoundReleaseDescription(actor: string, headSha: string, reason: string): string {
+  const prefix = `released by ${actor} for ${headSha}: `;
+  const text = reason.replace(/\s+/g, " ").trim();
+  const room = Math.max(COMMIT_STATUS_DESCRIPTION_MAX - prefix.length, 0);
+  return `${prefix}${text.length > room ? `${text.slice(0, Math.max(room - 1, 0))}…` : text}`.slice(0, COMMIT_STATUS_DESCRIPTION_MAX);
+}
+
+/**
+ * The second control-plane status of a board release. The CI check holds no control-plane credential, so
+ * it cannot ask the database which release was confirmed; the control plane tells it, on GitHub, by
+ * writing this status AFTER the confirmation is committed. CI accepts a release-described success only
+ * when this marker names that very status (fail closed). Nothing else writes it.
+ */
+export const RELEASE_CONFIRMED_CONTEXT = "paperclip/release-confirmed";
+export function releaseConfirmedDescription(statusId: string): string {
+  return `confirms status ${statusId}`;
+}
+
+/** True for a status description written by {@link headBoundReleaseDescription}. */
+export function isHeadBoundReleaseDescription(description: unknown): boolean {
+  return typeof description === "string" && description.startsWith("released by ");
+}
+
+export type HeadBoundReleaseOutcome =
+  | { kind: "released" | "already_approved"; headSha: string; message: string; confirmationMarker?: "written" | "pending" }
+  /** The status was written, but the PR head had moved on by the time the write was confirmed. */
+  | { kind: "stale"; headSha: string; message: string }
+  | { kind: "refused" | "failed"; message: string };
+
+/** Why a release was allowed: a certified delivery or completed ladder, or the explicit override. */
+export type ReleaseBasis = "certified_delivery" | "approved_ladder" | "override";
+
+/**
+ * The PR a board release may target: the one the card's verified delivery identity names. The
+ * recorded `executionState.delivery` is cross-checked against the project repo and the card's
+ * control-plane delivery branch (resolveDeliveryIdentity), so a PR that was merely cited on the card
+ * is never a target. The recorded head is not compared: a release is the board's decision on the
+ * live head, and the live PR's branch is matched to the bound branch at publish time instead.
+ */
+export async function resolveReleaseDeliveryTarget(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  opts: {
+    headSha: string;
+    mode: "standard" | "override";
+    /** Null when the card's stage decisions pass the approval path's integrity check, else why not. */
+    ladderIntegrity: (conn: Db, issueId: string) => Promise<string | null>;
+    /** Null when the decision the certified delivery names was an eligible approval, else why not. */
+    certificateProvenance: (conn: Db, issueId: string, decisionId: string) => Promise<string | null>;
+  },
+): Promise<
+  | { ok: true; target: { owner: string; repo: string; number: number; displayName: string; branch: string }; basis: ReleaseBasis }
+  | { ok: false; reason: string }
+> {
+  const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+  if (identity.recordedUnusable) return { ok: false, reason: identity.recordedUnusable };
+  if (!identity.binding || !identity.repo) {
+    return { ok: false, reason: "card has no verified delivery PR binding; a cited PR is not a release target" };
+  }
+  const bindingError = deliveryBindingValidationError(identity.binding, identity.repo, issueId);
+  if (bindingError) return { ok: false, reason: bindingError };
+  const { owner, repo } = identity.repo;
+  const number = identity.binding.prNumber;
+  const [issueRow] = await db
+    .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+    .from(issues)
+    .where(eq(issues.id, issueId));
+  const state = issueRow?.executionState as Record<string, unknown> | null | undefined;
+  // The card is blocked while an auto-merge arm of it is unsettled (a take-back not yet confirmed, or the arm gate still open):
+  // a release writes a control-plane success on the head, and that must not happen on top of an arm nobody has settled.
+  // Both routes, the override included; it clears when the take-back is confirmed.
+  const unsettled = (state?.approvalStatus as Record<string, unknown> | undefined)?.autoMergeDisarm;
+  if (unsettled && typeof unsettled === "object") {
+    return { ok: false, reason: "an auto-merge take-back is unconfirmed on this card; it is blocked until GitHub confirms auto-merge is off (or the arm settles)" };
+  }
+  // A card whose review certified one PR for delivery keeps that boundary, on both routes: the release may
+  // not move to another PR just because the recorded delivery binding was later pointed elsewhere.
+  const certified = readCertifiedFinalDelivery(state);
+  const samePrAsCertified = certified !== undefined &&
+    certified.number === number &&
+    certified.owner.toLowerCase() === owner.toLowerCase() &&
+    certified.repo.toLowerCase() === repo.toLowerCase();
+  if (certified && !samePrAsCertified) {
+    return {
+      ok: false,
+      reason: `the card's certified final delivery is ${certified.displayName}, not ${owner}/${repo}#${number}; a release may not change the certified PR`,
+    };
+  }
+  const target = { owner, repo, number, displayName: `${owner}/${repo}#${number}`, branch: identity.binding.branch };
+  if (opts.mode === "override") return { ok: true, target, basis: "override" };
+
+  // The default route only re-publishes what the card's own review already decided on this exact head.
+  if (issueRow?.status === "cancelled") {
+    return { ok: false, reason: "the card is cancelled; only the explicit override can release it" };
+  }
+  let ladderWhy = "the ladder is not complete, or not approved on this head";
+  if (samePrAsCertified && certified!.headSha === opts.headSha) {
+    // The certificate stands in for the ladder only while the decision that minted it was a genuine
+    // approval by someone who is still eligible: it is not exempt from the decider rules.
+    const provenance = await opts.certificateProvenance(db, issueId, certified!.decisionId);
+    if (provenance === null) return { ok: true, target, basis: "certified_delivery" };
+    ladderWhy = provenance;
+  }
+  // A completed approving ladder, as the approval path (approve-head) understands it: a done card, an
+  // approving last decision, a non-empty policy whose every stage is completed, stage decisions that pass
+  // the same integrity check (no missing decision, no skipped stage, no self-approval), and an approved
+  // head equal to the head being released.
+  const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
+  const decidedHeadMatches = opts.headSha.length > 0 &&
+    [approvalStatus?.publishedHeadSha, approvalStatus?.approvedHeadSha].includes(opts.headSha);
+  const stages = Array.isArray((issueRow?.executionPolicy as { stages?: unknown } | null)?.stages)
+    ? (issueRow!.executionPolicy as { stages: Array<{ id?: unknown } | null> }).stages
+    : [];
+  const completedIds = Array.isArray(state?.completedStageIds) ? (state!.completedStageIds as unknown[]) : [];
+  if (
+    issueRow?.status === "done" &&
+    state?.lastDecisionOutcome === "approved" &&
+    stages.length > 0 &&
+    stages.every((stage) => stage !== null && typeof stage === "object" && typeof stage.id === "string" && completedIds.includes(stage.id)) &&
+    decidedHeadMatches
+  ) {
+    const integrity = await opts.ladderIntegrity(db, issueId);
+    if (integrity === null) return { ok: true, target, basis: "approved_ladder" };
+    ladderWhy = integrity;
+  }
+  return {
+    ok: false,
+    reason:
+      `the card has no completed approving ladder or certified delivery bound to head ${opts.headSha} (${ladderWhy}); ` +
+      "the explicit override (merge-arming/release-override) is the only way to release it",
+  };
+}
+
+/**
+ * Board-triggered merge release: publish `paperclip/approved` on exactly `headSha` of one PR, as
+ * the control plane's own App token and no other credential (CI accepts only that creator, so a
+ * fallback write would look released and not be). Whether the card may be released at all is decided
+ * by the caller (resolveReleaseDeliveryTarget); this function only publishes. The status is keyed by
+ * SHA, so a head that moves after the live read cannot inherit it. The live PR is read first and must
+ * be open, non-draft, on `expectedBranch` and at `headSha`, even when the head already carries a
+ * control-plane success (which is then left alone). Releases of one head are serialized.
+ */
+/** Bounds on the release path: a hung GitHub call or database wait must not hold the publication lock for ever. */
+export interface ReleaseDeadlines {
+  /** One GitHub call. */
+  fetchMs: number;
+  /** Waiting for the publication lock. */
+  lockMs: number;
+  /** One SQL statement on the lock connection. */
+  statementMs: number;
+  /**
+   * Idle in the lock transaction (it idles while GitHub is called). A backstop that frees the lock if
+   * this process dies mid-release; it does not bound the release (every statement resets it).
+   */
+  idleInTransactionMs: number;
+  /**
+   * The release as a whole, from the credential lookup to the last write. Its abort signal cancels the
+   * GitHub requests in flight and ends every wait, and no further write is started once it has fired.
+   */
+  totalMs: number;
+  /** What the compensating failure writes may still spend after `totalMs` has fired. */
+  compensationMs: number;
+}
+export const DEFAULT_RELEASE_DEADLINES: ReleaseDeadlines = {
+  fetchMs: 10_000,
+  lockMs: 20_000,
+  statementMs: 30_000,
+  idleInTransactionMs: 180_000,
+  totalMs: 60_000,
+  compensationMs: 15_000,
+};
+
+/** The advisory-lock key that serializes releases of one head (statuses are repository and SHA scoped). */
+export function releaseLockKey(companyId: string, owner: string, repo: string, headSha: string): string {
+  return `merge-release:${companyId}:${owner}/${repo}@${headSha}`.toLowerCase();
+}
+
+export async function publishHeadBoundRelease(
+  db: Db,
+  companyId: string,
+  target: { owner: string; repo: string; number: number },
+  input: {
+    headSha: string;
+    description: string;
+    expectedBranch: string;
+    retryDelayMs?: number;
+    deadlines?: Partial<ReleaseDeadlines>;
+    /** The caller's own end-to-end deadline, when it started the clock earlier (it is combined with `totalMs`). */
+    signal?: AbortSignal;
+    /** Cancels the late-landing checks that outlive the answer (their timers are cleared and their requests aborted). */
+    afterAnswerSignal?: AbortSignal;
+    /**
+     * Re-resolves eligibility and target from the card as it is now. Called inside the publication
+     * lock, right before the write, so a cancel, a reversed decision or a retarget after the first
+     * read cannot still release the old target.
+     */
+    revalidate: (conn: Db) => Promise<
+      | { ok: true; target: { owner: string; repo: string; number: number; branch: string } }
+      | { ok: false; reason: string }
+    >;
+    /**
+     * Destroys the request's database connection (see createRequestScopedDb). Called when the release is
+     * abandoned: an open transaction then rolls back on the server and its lock is freed, so work that was
+     * waiting on the database cannot commit after the answer. Absent for a shared-pool client.
+     */
+    abandon?: () => void | Promise<void>;
+    /** The id of the release status the card has CONFIRMED for this head, as it is now, or null. */
+    confirmedStatusId: (conn: Db) => Promise<string | null>;
+    /**
+     * Records that the release wrote and confirmed exactly this status. It runs last, on the lock's own
+     * connection: a status that is never confirmed (a write that timed out, a head that could not be
+     * re-read, a failed void) has no record, and no consumer acts on a release without one.
+     */
+    recordConfirmation: (conn: Db, statusId: string) => Promise<void>;
+  },
+): Promise<HeadBoundReleaseOutcome> {
+  const { owner, repo, number } = target;
+  const deadlines = { ...DEFAULT_RELEASE_DEADLINES, ...input.deadlines };
+  // One clock for the whole release. Its signal is handed to every GitHub request, so a request that
+  // outlives the deadline is cancelled and a retry loop stops instead of running on after we return.
+  const envelope = AbortSignal.any([...(input.signal ? [input.signal] : []), AbortSignal.timeout(deadlines.totalMs)]);
+  // Where the release is. `open`: nothing is committed and the deadline abandons it. `sealing`: the
+  // confirmation is being written and committed; the deadline no longer abandons it (the write is bounded
+  // by the connection's statement timeout), so the answer and the committed state cannot disagree.
+  // `abandoned`: the deadline fired first; the connection is destroyed and nothing may commit.
+  let phase: "open" | "sealing" | "abandoned" | "done" = "open";
+  // A success status may be on the head and has not been voided or confirmed (and committed) yet.
+  let statusMayExist = false;
+  const abandon = () => {
+    if (phase !== "open") return;
+    phase = "abandoned";
+    // A success status that may be on the head is voided while the session, and with it the publication
+    // lock, is still held, so a concurrent release of the head cannot write its own success before this
+    // release's failure lands. Only then is the session ended.
+    Promise.resolve()
+      .then(() => (statusMayExist ? voidSuccess(`the deadline passed (${deadlines.totalMs}ms)`) : undefined))
+      .catch(() => undefined)
+      .then(() => input.abandon?.())
+      .catch(() => undefined);
+  };
+  if (envelope.aborted) abandon();
+  else envelope.addEventListener("abort", abandon, { once: true });
+  const deadlineOutcome = (): HeadBoundReleaseOutcome => ({
+    kind: "failed",
+    message: `status:failed:deadline: the release did not finish within ${deadlines.totalMs}ms; a status write that was in flight has an unknown outcome and is not consumable`,
+  });
+  const aborted = Symbol("aborted");
+  // Waits for `work`, or gives up when the envelope fires. Work that cannot be cancelled (a database
+  // wait, the secret store) is abandoned, not awaited, and its late failure is swallowed.
+  const raceEnvelope = <T>(work: Promise<T>): Promise<T | typeof aborted> => {
+    work.catch(() => undefined);
+    return Promise.race([
+      work,
+      new Promise<typeof aborted>((resolve) => {
+        if (envelope.aborted) resolve(aborted);
+        else envelope.addEventListener("abort", () => resolve(aborted), { once: true });
+      }),
+    ]);
+  };
+  const credential = await raceEnvelope(resolveControlPlaneGitHubToken(db, companyId, owner, repo, envelope));
+  if (credential === aborted || (!credential && envelope.aborted)) {
+    phase = "done";
+    return deadlineOutcome();
+  }
+  if (!credential) {
+    phase = "done";
+    return { kind: "failed", message: `status:failed:auth_required: control-plane GitHub App credential unavailable for ${owner}/${repo}` };
+  }
+  // One GitHub call, cancelled and given up on after `fetchMs` or when `parent` fires.
+  let compensationSignal: AbortSignal | undefined;
+  // The compensating failure writes outlive `totalMs`, so they run on their own, later, clock.
+  const compensation = () => (compensationSignal ??= AbortSignal.timeout(deadlines.compensationMs));
+  const bounded = async <T>(run: (signal: AbortSignal) => Promise<T>, onTimeout: T, parent: AbortSignal = envelope): Promise<T> => {
+    const signal = AbortSignal.any([parent, AbortSignal.timeout(deadlines.fetchMs)]);
+    const gaveUp = new Promise<T>((resolve) => {
+      if (signal.aborted) resolve(onTimeout);
+      else signal.addEventListener("abort", () => resolve(onTimeout), { once: true });
+    });
+    return Promise.race([run(signal), gaveUp]);
+  };
+  const failureStatusWrite = (headSha: string, description: string) =>
+    bounded(
+      (signal) => writeCommitStatusWithRetry(credential.token, owner, repo, headSha, "", {
+        description,
+        state: "failure",
+        attempts: 2,
+        delayMs: input.retryDelayMs ?? 1000,
+        signal,
+      }),
+      { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+      compensation(),
+    );
+  const timedOut = (what: string) => ({ ok: false as const, status: 0, message: `timeout: ${what} did not answer within ${deadlines.fetchMs}ms` });
+  const readPullRequest = () =>
+    bounded(
+      (signal) => fetchPullRequestHeadSha(credential.token, owner, repo, number, signal),
+      { ...timedOut("the PR read"), headSha: null, headRef: null, open: null, draft: null, merged: null } as HeadShaResult,
+    );
+  // Re-read the live PR and refuse unless it is still the open PR on the bound branch at `headSha`.
+  const liveRefusal = async (afterWrite = false): Promise<HeadBoundReleaseOutcome | null> => {
+    const live = await readPullRequest();
+    if (!live.ok) return { kind: "failed", message: `status:failed:pr_read: HTTP ${live.status} ${live.message ?? ""}`.trim() };
+    if (afterWrite && live.merged && live.headRef === input.expectedBranch && live.headSha === input.headSha) return null;
+    if (live.merged || live.draft || live.state !== "open") {
+      return { kind: "refused", message: `status:refused:pr-not-open: ${owner}/${repo}#${number} is not an open, non-draft PR` };
+    }
+    if (live.headRef !== input.expectedBranch) {
+      return {
+        kind: "refused",
+        message: `status:refused:branch-mismatch: ${owner}/${repo}#${number} is on ${live.headRef ?? "(unreadable)"}, not the card's delivery branch ${input.expectedBranch}`,
+      };
+    }
+    if (live.headSha !== input.headSha) {
+      return {
+        kind: "refused",
+        message: `status:refused:head-mismatch: ${owner}/${repo}#${number} head is ${live.headSha}, not ${input.headSha}`,
+      };
+    }
+    return null;
+  };
+  const eligibilityRefusal = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => {
+    const again = await input.revalidate(conn);
+    if (!again.ok) {
+      return { kind: "refused", message: `status:refused:eligibility-changed: ${again.reason}` };
+    }
+    const t = again.target;
+    if (t.owner !== owner || t.repo !== repo || t.number !== number || t.branch !== input.expectedBranch) {
+      return {
+        kind: "refused",
+        message: `status:refused:eligibility-changed: the card's delivery now targets ${t.owner}/${t.repo}#${t.number}, not ${owner}/${repo}#${number}`,
+      };
+    }
+    return null;
+  };
+  // The PR's liveness and the card's eligibility, both as they are now.
+  // `conn` is the lock's own connection: eligibility is read on it, never on a second pool connection.
+  const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => (await liveRefusal()) ?? (await eligibilityRefusal(conn));
+  // A success that cannot be confirmed is voided by a failure status; the answer says whether that worked.
+  // Single-flight: the deadline's void and the release's own never both write a failure status.
+  let voiding: Promise<string> | undefined;
+  const voidSuccess = (why: string): Promise<string> =>
+    (voiding ??= (async () => {
+      const voided = await failureStatusWrite(input.headSha, `voided: ${why}`);
+      if (voided.success) statusMayExist = false;
+      return voided.success ? "it was voided by a failure status" : `it could NOT be voided (${voided.error ?? `HTTP ${voided.status}`}), and is not consumable without a recorded confirmation`;
+    })());
+  // The only things that may still happen after the answer: a status write the release gave up on lands as a
+  // success on top of the void. If it is then still the newest status of the head and this release never
+  // confirmed it, a failure is written over it, once, on a clock of its own. Two triggers: the write answers
+  // late with a success (compensateLateSuccess), or it ended with no answer, e.g. an aborted request that
+  // GitHub nevertheless accepted (recheckAfterNoAnswer: the head is read again after `fetchMs` and
+  // `compensationMs`). Residuals: the time until the landing is seen, a process that ends before it, and a
+  // concurrent release of the same user with the same description that could be voided again (availability only).
+  const writeLateVoid = (signal: AbortSignal) =>
+    writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+      description: "voided: a status write the release had given up on landed after it",
+      state: "failure",
+      attempts: 2,
+      delayMs: input.retryDelayMs ?? 1000,
+      signal,
+    });
+  const afterAnswerClock = () =>
+    AbortSignal.any([AbortSignal.timeout(deadlines.compensationMs), ...(input.afterAnswerSignal ? [input.afterAnswerSignal] : [])]);
+  const compensateLateSuccess = (inFlight: Promise<Awaited<ReturnType<typeof writeCommitStatusWithRetry>>>) => {
+    void inFlight.then(async (landed) => {
+      if (!landed.success || input.afterAnswerSignal?.aborted) return;
+      const landedId = "statusId" in landed && typeof landed.statusId === "string" ? landed.statusId : null;
+      if (landedId !== null && landedId === confirmedStatusId) return;
+      const signal = afterAnswerClock();
+      const newest = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal });
+      const stillNewest = newest.ok
+        ? newest.controlPlaneApproved && newest.newest?.release === true && (landedId === null || newest.newest.id === landedId)
+        : true; // unreadable: fail closed
+      if (!stillNewest) return;
+      await writeLateVoid(signal);
+    }).catch(() => undefined);
+  };
+  const recheckAfterNoAnswer = () => {
+    for (const delay of [deadlines.fetchMs, deadlines.compensationMs]) {
+      const timer = setTimeout(() => {
+        void (async () => {
+          if (confirmedStatusId || input.afterAnswerSignal?.aborted) return;
+          await voiding?.catch(() => undefined);
+          const signal = afterAnswerClock();
+          const read = await fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal });
+          // Unreadable: fail closed. Otherwise only this release's own unconfirmed success is voided.
+          const ours = read.ok
+            ? read.newest?.release === true && read.newest.description === input.description && read.newest.id !== confirmedStatusId
+            : true;
+          if (!ours || confirmedStatusId) return;
+          await writeLateVoid(signal);
+        })().catch(() => undefined);
+      }, delay);
+      timer.unref();
+      input.afterAnswerSignal?.addEventListener("abort", () => clearTimeout(timer), { once: true });
+    }
+  };
+  // The marker CI requires beside a release success (RELEASE_CONFIRMED_CONTEXT). It is written only after
+  // the confirmation is committed, on the compensation clock.
+  const writeConfirmationMarker = (statusId: string) =>
+    bounded(
+      (signal) => writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+        description: releaseConfirmedDescription(statusId),
+        context: RELEASE_CONFIRMED_CONTEXT,
+        attempts: 2,
+        delayMs: input.retryDelayMs ?? 1000,
+        signal,
+      }),
+      { success: false, error: `timeout: the marker write did not answer within ${deadlines.fetchMs}ms`, status: 0, transient: false, attempts: 1 },
+      compensation(),
+    );
+  let confirmedStatusId: string | null = null;
+  const publishLocked = async (conn: Db): Promise<HeadBoundReleaseOutcome> => {
+    if (envelope.aborted) return deadlineOutcome();
+    // The live PR is checked before anything else, so an "already approved" answer is never given for a
+    // PR that is stale, a draft, closed, merged or off its branch.
+    const firstRefusal = await recheck(conn);
+    if (firstRefusal) return firstRefusal;
+    const existing = await bounded(
+      (signal) => fetchHeadCommitStatuses(credential.token, owner, repo, input.headSha, { signal }),
+      { ...timedOut("the status read"), approved: false, controlPlaneApproved: false, newest: null, confirmedMarkers: [] } as Awaited<ReturnType<typeof fetchHeadCommitStatuses>>,
+    );
+    if (!existing.ok) return { kind: "failed", message: `status:failed:status_read: HTTP ${existing.status} ${existing.message ?? ""}`.trim() };
+    if (existing.controlPlaneApproved) {
+      // A release status counts as "already published" only when this card CONFIRMED it. One whose
+      // confirmation is unknown (a write that timed out, a failed void) is not a release: the write
+      // below replaces it with one that is confirmed.
+      const unconfirmedRelease = existing.newest?.release === true &&
+        (existing.newest.id === null || existing.newest.id !== (await input.confirmedStatusId(conn)));
+      if (!unconfirmedRelease) {
+        // The status lookup took time: look at the head again before answering that it is approved.
+        const stillLive = await recheck(conn);
+        if (stillLive) return stillLive;
+        // A release this card confirmed whose marker never reached GitHub (the write failed after the
+        // commit) gets it now, so CI can accept it. The write is idempotent.
+        let markerNote = "";
+        if (existing.newest?.release && existing.newest.id && !existing.confirmedMarkers.includes(existing.newest.id)) {
+          const marker = await writeConfirmationMarker(existing.newest.id);
+          markerNote = marker.success ? "; the confirmation marker was re-written" : `; the confirmation marker could NOT be re-written (${marker.error ?? `HTTP ${marker.status}`})`;
+        }
+        return { kind: "already_approved", headSha: input.headSha, message: `paperclip/approved already published by the control plane on this head${markerNote}` };
+      }
+    }
+    // GitHub has no compare-and-swap on a commit status, so a push landing between the last live read and
+    // the POST can still leave one status on the old SHA. It is keyed by SHA, so the new head does not
+    // inherit it, and the head is read once more after the write: a head that moved is reported as stale
+    // (and the status written to the old head is set to failure, so no success stays on it), never as a
+    // release. A transient failure is retried only after the live head and eligibility are checked again.
+    const attempts = 3;
+    for (let attempt = 1; ; attempt += 1) {
+      const refusal = await recheck(conn);
+      if (refusal) return refusal;
+      // Nothing is written once the release's clock has run out.
+      if (envelope.aborted) return deadlineOutcome();
+      statusMayExist = true;
+      let inFlight: ReturnType<typeof writeCommitStatusWithRetry> | undefined;
+      const write = await bounded(
+        (signal) => (inFlight = writeCommitStatusWithRetry(credential.token, owner, repo, input.headSha, "", {
+          description: input.description,
+          attempts: 1,
+          signal,
+        })),
+        { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+      );
+      if (write.success) {
+        // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
+        const after = await liveRefusal(true);
+        if (after && after.kind === "failed") {
+          // The success cannot be confirmed to cover the live head, so it is voided: nothing may consume it.
+          // The board can release again, which writes a fresh success (the newest status then decides).
+          const outcome = await voidSuccess(`the head of ${number} could not be confirmed after the release`);
+          return {
+            kind: "failed",
+            message: `status:failed:post_write_pr_read: ${after.message}; the status on ${input.headSha} WAS written but the head could not be confirmed; ${outcome}`,
+          };
+        }
+        if (after) {
+          const marked = await failureStatusWrite(input.headSha, `superseded: ${number} is no longer the live head ${input.headSha.slice(0, 12)} the release covered`);
+          if (marked.success) statusMayExist = false;
+          return {
+            kind: "stale",
+            headSha: input.headSha,
+            message:
+              `status:stale:head-moved-after-write: ${after.message}; ` +
+              (marked.success
+                ? `the status written to ${input.headSha} was followed by a failure status`
+                : `a failure status on ${input.headSha} could NOT be written (${marked.error ?? `HTTP ${marked.status}`})`),
+          };
+        }
+        // The head is still live, but the card's authority is read once more: a decision reversed, a card
+        // cancelled or a delivery retargeted while the write was in flight must not stay released.
+        const revoked = await eligibilityRefusal(conn);
+        if (revoked) {
+          const outcome = await voidSuccess("the card's eligibility changed while the release was written");
+          return { kind: "stale", headSha: input.headSha, message: `status:stale:eligibility-changed-after-write: ${revoked.message}; ${outcome}` };
+        }
+        // Confirmed: the live head is still the one released. Record that, last, so only a confirmed
+        // status is ever consumable.
+        const statusId = "statusId" in write && typeof write.statusId === "string" ? write.statusId : null;
+        if (!statusId) {
+          const outcome = await voidSuccess("GitHub did not say which status it accepted");
+          return { kind: "failed", message: `status:failed:unconfirmed: GitHub did not return the id of the status it accepted on ${input.headSha}; ${outcome}` };
+        }
+        // Past this point the deadline does not abandon the release: either the confirmation commits and
+        // the answer says released, or it does not and the answer says failed. A release the deadline
+        // already abandoned never reaches the write.
+        if (phase !== "open") {
+          const outcome = await voidSuccess("the release was abandoned before it was confirmed");
+          return { kind: "failed", message: `status:failed:deadline: the release was abandoned before it could be confirmed; ${outcome}` };
+        }
+        phase = "sealing";
+        try {
+          // The deadline does not reach this write, so it gets a shorter statement bound of its own.
+          await conn.execute(sql`select set_config('statement_timeout', ${`${Math.min(deadlines.statementMs, deadlines.compensationMs)}ms`}, true)`);
+          await input.recordConfirmation(conn, statusId);
+          confirmedStatusId = statusId;
+        } catch (error) {
+          const outcome = await voidSuccess("the release could not be recorded as confirmed");
+          return {
+            kind: "failed",
+            message: `status:failed:confirmation_not_recorded: ${error instanceof Error ? error.message : String(error)}; the status on ${input.headSha} WAS written; ${outcome}`,
+          };
+        }
+        return { kind: "released", headSha: input.headSha, message: input.description };
+      }
+      if (!write.transient || attempt >= attempts || envelope.aborted) {
+        if (write.status === 0) {
+          // No answer at all (a timeout, a dropped connection, the deadline): GitHub may still have
+          // accepted the write, so the success is voided rather than left for a consumer to find.
+          // GitHub may still accept that write later, and it then sits on top of the void. Commit statuses have no
+          // compare-and-set, so the void cannot be made to outrank it; it is voided again if it lands. Armed only
+          // here, where the release ends on the write, never for a failure the loop goes on to retry.
+          if (inFlight) {
+            compensateLateSuccess(inFlight);
+            recheckAfterNoAnswer();
+          }
+          const outcome = await voidSuccess("the release's status write did not answer");
+          return { kind: "failed", message: `status:failed:status_write: ${write.error ?? "no answer"}; the status may have been written; ${outcome}` };
+        }
+        statusMayExist = false;
+        return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
+      }
+      statusMayExist = false;
+      await new Promise<void>((resolve) => setTimeout(resolve, input.retryDelayMs ?? 1000));
+    }
+  };
+  // At most one release per company/repo/head at a time: the second caller waits, then sees the first
+  // one's status and answers already_approved instead of writing again.
+  const lockKey = releaseLockKey(companyId, owner, repo, input.headSha);
+  // Even a release stuck where the signal cannot reach it (the pool, the lock, a database call) answers
+  // by `totalMs` plus the compensation window; the abandoned work ends at its next checkpoint.
+  let hardStop: ReturnType<typeof setTimeout> | undefined;
+  const stopped = new Promise<HeadBoundReleaseOutcome>((resolve) => {
+    // A release that is sealing (writing its confirmation) is never answered as failed from here: its
+    // own result decides, and the statement timeout on its connection bounds it.
+    const arm = () => { hardStop = setTimeout(() => { if (phase !== "sealing") resolve(deadlineOutcome()); }, deadlines.compensationMs); };
+    if (envelope.aborted) arm();
+    else envelope.addEventListener("abort", arm, { once: true });
+  });
+  try {
+    const run = db
+      .transaction(async (tx) => {
+        if (envelope.aborted) return deadlineOutcome();
+        // Bounded: a waiter gives up instead of queueing for ever, a hung statement is cancelled, and a
+        // release that stalls while idle in its transaction is cut off by the server, which frees the lock.
+        await tx.execute(sql`select
+          set_config('lock_timeout', ${`${deadlines.lockMs}ms`}, true),
+          set_config('statement_timeout', ${`${deadlines.statementMs}ms`}, true),
+          set_config('idle_in_transaction_session_timeout', ${`${deadlines.idleInTransactionMs}ms`}, true)`);
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        return publishLocked(tx as unknown as Db);
+      })
+      .catch(async (error): Promise<HeadBoundReleaseOutcome> => {
+        // The transaction ended abnormally (the deadline destroyed its connection, a statement timed out,
+        // the commit failed): nothing it wrote is committed. A success that may already be on the head is
+        // voided, since no confirmation will ever exist for it.
+        if (!statusMayExist) {
+          if (phase === "abandoned") return deadlineOutcome();
+          throw error;
+        }
+        const outcome = await voidSuccess("the release did not complete");
+        const why = phase === "abandoned" ? `the deadline passed (${deadlines.totalMs}ms)` : (error instanceof Error ? error.message : String(error));
+        return {
+          kind: "failed",
+          message: `status:failed:deadline: the release was interrupted: ${why}; a status on ${input.headSha} may have been written; ${outcome}`,
+        };
+      });
+    run.catch(() => undefined);
+    const outcome = await Promise.race([run, stopped]);
+    // Only a release that really committed its confirmation tells CI so: the marker is written after the
+    // commit, never before, and a failed marker write leaves the release unconfirmed for CI (fail closed).
+    if (outcome.kind === "released" && confirmedStatusId) {
+      statusMayExist = false;
+      const marker = await writeConfirmationMarker(confirmedStatusId);
+      return {
+        ...outcome,
+        confirmationMarker: marker.success ? "written" : "pending",
+        message: marker.success
+          ? outcome.message
+          : `${outcome.message} (the CI confirmation marker could NOT be written: ${marker.error ?? `HTTP ${marker.status}`}; CI does not accept this release until it is, and a repeat release or the reconciler writes it)`,
+      };
+    }
+    return outcome;
+  } catch (error) {
+    // The transaction is rolled back (which frees the lock) before we get here.
+    const code = (error as { code?: string }).code ?? (error as { cause?: { code?: string } }).cause?.code;
+    if (code === "55P03") {
+      return { kind: "failed", message: `status:failed:lock_timeout: another release of this head held the publication lock for more than ${deadlines.lockMs}ms` };
+    }
+    if (code === "57014") {
+      return { kind: "failed", message: `status:failed:statement_timeout: a database statement of the release ran for more than ${deadlines.statementMs}ms` };
+    }
+    throw error;
+  } finally {
+    phase = "done";
+    if (hardStop) clearTimeout(hardStop);
+  }
 }
 
 /**
@@ -3989,16 +5269,209 @@ export async function postPullRequestComment(
   return { success: false, status: response.status, error: message ?? `HTTP ${response.status}` };
 }
 
+/**
+ * Everything that is the authority for arming one card, as a string to compare before and after: the
+ * card's own record (cancelled, done or reopened, stage ladder, completed stages, last decision, approved and published
+ * heads, the certified delivery, the recorded release confirmation), every decision row of the card
+ * (outcome, decider) and the standing of each decider (whether an agent is a current agent of the company, a user's
+ * membership and existence). A decision reversed, a certificate removed, a reviewer terminated or a
+ * member removed after it was taken changes the answer. Two reads of it that differ mean the authority a
+ * caller acted on is not the authority that exists now.
+ */
+export async function computeAuthorityFingerprint(db: Db, companyId: string, issueId: string, headSha?: string | null): Promise<string> {
+  const [row] = await db
+    .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+    .limit(1);
+  if (!row) return "missing";
+  const state = (row.executionState && typeof row.executionState === "object" ? row.executionState : {}) as Record<string, unknown>;
+  const approval = (state.approvalStatus && typeof state.approvalStatus === "object" ? state.approvalStatus : {}) as Record<string, unknown>;
+  // On a board-released head a paused agent has lapsed; on any other head paused is ordinary churn.
+  const lapsePaused = isBoardReleasedHead(state, headSha);
+  const policy = (row.executionPolicy && typeof row.executionPolicy === "object" ? row.executionPolicy : {}) as { stages?: Array<{ id?: unknown; phase?: unknown }> };
+  const decisions = await db
+    .select({
+      id: issueExecutionDecisions.id,
+      stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      actorUserId: issueExecutionDecisions.actorUserId,
+    })
+    .from(issueExecutionDecisions)
+    .where(and(eq(issueExecutionDecisions.issueId, issueId), eq(issueExecutionDecisions.companyId, companyId)));
+  decisions.sort((a, b) => a.id.localeCompare(b.id));
+  const agentIds = [...new Set(decisions.map((d) => d.actorAgentId).filter((id): id is string => !!id))].sort();
+  const userIds = [...new Set(decisions.map((d) => d.actorUserId).filter((id): id is string => !!id))].sort();
+  const certificate = approval.finalDelivery ?? null;
+  if (typeof certificate === "object" && certificate !== null) {
+    const decisionId = (certificate as { decisionId?: unknown }).decisionId;
+    if (typeof decisionId === "string" && !decisions.some((d) => d.id === decisionId)) {
+      // A certificate naming a decision that does not exist is itself a difference worth recording.
+      agentIds.push(`certificate-decision-missing:${decisionId}`);
+    }
+  }
+  const agentRows = agentIds.length === 0 ? [] : await db
+    .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+    .from(agents)
+    .where(inArray(agents.id, agentIds.filter((id) => !id.startsWith("certificate-decision-missing:"))));
+  const memberRows = userIds.length === 0 ? [] : await db
+    .select({ principalId: companyMemberships.principalId, status: companyMemberships.status })
+    .from(companyMemberships)
+    .innerJoin(authUsers, eq(authUsers.id, companyMemberships.principalId))
+    .where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      inArray(companyMemberships.principalId, userIds),
+    ));
+  const agentStanding = agentIds.map((id) => {
+    const agent = agentRows.find((candidate) => candidate.id === id);
+    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "pending_approval" && !(lapsePaused && agent.status === "paused")];
+  });
+  memberRows.sort((a, b) => a.principalId.localeCompare(b.principalId));
+  return JSON.stringify([
+    // cancelled, done or anything else: a reopened (or cancelled) card is a different card.
+    row.status === "cancelled" ? "cancelled" : row.status === "done" ? "done" : "open",
+    lapsePaused,
+    (policy.stages ?? []).map((stage) => [stage?.id, stage?.phase ?? null]),
+    state.completedStageIds ?? null,
+    state.lastDecisionId ?? null,
+    state.lastDecisionOutcome ?? null,
+    approval.publishedHeadSha ?? null,
+    approval.approvedHeadSha ?? null,
+    certificate,
+    (approval.releaseConfirmation as { statusId?: unknown } | undefined)?.statusId ?? null,
+    decisions,
+    agentStanding,
+    memberRows,
+  ]);
+}
+
+/**
+ * Why the deciders of a card no longer stand behind its approval, or null. For each pre-merge stage of
+ * the policy that has decision rows, the newest decision (every decision at the newest instant) must be an
+ * approval, and an agent that decided it must still be a current agent of the company (not terminated or
+ * awaiting approval). A stage with no decision rows (an auto-skipped one) is left to the stage-integrity
+ * checks the consumers already run, and users are not checked here (a local board has no user row).
+ */
+async function decisionStandingProblem(db: Db, companyId: string, issueId: string, policy: unknown, lapsePaused = false): Promise<string | null> {
+  const stages = (policy && typeof policy === "object" && Array.isArray((policy as { stages?: unknown }).stages)
+    ? (policy as { stages: Array<{ id?: unknown; phase?: unknown }> }).stages : []);
+  const preMerge = new Set(stages.filter((st) => typeof st?.id === "string" && st.phase !== "post_merge").map((st) => st.id as string));
+  const decisions = await db
+    .select({
+      stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      createdAt: issueExecutionDecisions.createdAt,
+    })
+    .from(issueExecutionDecisions)
+    .where(and(eq(issueExecutionDecisions.issueId, issueId), eq(issueExecutionDecisions.companyId, companyId)));
+  const byStage = new Map<string, typeof decisions>();
+  for (const decision of decisions) {
+    if (!preMerge.has(decision.stageId)) continue;
+    byStage.set(decision.stageId, [...(byStage.get(decision.stageId) ?? []), decision]);
+  }
+  for (const [stageId, list] of byStage) {
+    const newest = Math.max(...list.map((d) => d.createdAt.getTime()));
+    for (const decision of list.filter((d) => d.createdAt.getTime() === newest)) {
+      if (decision.outcome !== "approved") return `the latest decision of stage ${stageId} is ${decision.outcome}, not approved`;
+      if (decision.actorAgentId) {
+        const [agent] = await db
+          .select({ companyId: agents.companyId, status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, decision.actorAgentId));
+        if (!agent || agent.companyId !== companyId || agent.status === "terminated" || agent.status === "pending_approval") {
+          return `the agent that decided stage ${stageId} is no longer a current agent of the company`;
+        }
+        if (lapsePaused && agent.status === "paused") {
+          return `the agent that decided stage ${stageId} is paused, and a paused agent's approval does not stand on a board-released head`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The authority a merge actuator acts on, captured when it is created and checked again whenever
+ * `stillHolds` is called: before every enable attempt (retries included), before a direct merge and
+ * after an accepted enable. A consumer creates it just before its own final read of the card, so a change
+ * after that read is a difference. `stillHolds` answers why the authority no longer holds, or null.
+ */
+export interface AuthorityGuard {
+  stillHolds(): Promise<string | null>;
+  /** What the guard compares against, so a record can rebuild the same guard later (after a restart). */
+  readonly baseline: string;
+  readonly requireApprovedLadder: boolean;
+  readonly headSha: string | null;
+}
+export async function createAuthorityGuard(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  options: { requireApprovedLadder?: boolean; headSha?: string | null; baseline?: string } = {},
+): Promise<AuthorityGuard> {
+  const baseline = options.baseline ?? await computeAuthorityFingerprint(db, companyId, issueId, options.headSha);
+  return {
+    baseline,
+    requireApprovedLadder: options.requireApprovedLadder === true,
+    headSha: options.headSha ?? null,
+    async stillHolds() {
+      const [fresh] = await db
+        .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+        .limit(1);
+      if (!fresh) return "the card no longer exists";
+      if (options.requireApprovedLadder) {
+        if (fresh.status === "cancelled") return "the card was cancelled";
+        if (!ladderIsTerminallyApproved(
+          fresh.executionPolicy as Parameters<typeof ladderIsTerminallyApproved>[0],
+          fresh.executionState as Parameters<typeof ladderIsTerminallyApproved>[1],
+        )) {
+          return "the card's ladder is no longer approved";
+        }
+      }
+      const lapsePaused = isBoardReleasedHead(fresh.executionState as Record<string, unknown> | null, options.headSha);
+      const standing = await decisionStandingProblem(db, companyId, issueId, fresh.executionPolicy, lapsePaused);
+      if (standing) return standing;
+      return (await computeAuthorityFingerprint(db, companyId, issueId, options.headSha)) === baseline
+        ? null
+        : "the card's approval record, its decisions or a decider's standing changed";
+    },
+  };
+}
+
 export async function armMergeOnApproval(
   db: Db,
   companyId: string,
   issueId: string,
   decision: MergeArmingDecision,
   certifiedPr?: LinkedPullRequest | null,
+  /**
+   * The head the caller authorized. GitHub then refuses to enable auto-merge on a PR whose head is
+   * anything else, so a push landing after the caller's last read cannot be armed by this call.
+   */
+  options: {
+    expectedHeadOid?: string;
+    /**
+     * The authority guard the caller created just before its own final read of the card. Without one, the
+     * authority as this call first reads it is the baseline. A difference before an enable attempt, a retry
+     * or a direct merge stops the arm, and one found after an accepted enable turns auto-merge back off.
+     */
+    authorityGuard?: AuthorityGuard;
+  } = {},
 ): Promise<ArmingOutcome> {
   if (decision.outcome !== "approved") {
     return { kind: "skipped", message: `skipped:not-approved: Decision outcome is "${decision.outcome}", not "approved"` };
   }
+
+  // The authority this call acts on is captured before its first read: the delivery, owner and token
+  // lookups take time, and a card whose decision, ladder, head, certificate or release changed in that
+  // time is not what was authorized. It is read again right before the merge lever is pulled.
+  const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true, headSha: options.expectedHeadOid });
+  const authorityChanged = () => guard.stillHolds();
 
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   if (deliveryIdentity.recordedUnusable) {
@@ -4085,6 +5558,7 @@ export async function armMergeOnApproval(
     const [candidateRow] = await db
       .select({
         id: issues.id,
+        status: issues.status,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
       })
@@ -4120,6 +5594,12 @@ export async function armMergeOnApproval(
       kind: "skipped",
       message: `skipped:owner-not-approved: incomplete review/approval stages: ${ladderIncompleteStageIds(policy, state).join(", ")}`,
     };
+  }
+
+  // Right now, before anything is sent: a card whose authority already differs from what the caller checked.
+  const changedAtStart = await authorityChanged();
+  if (changedAtStart) {
+    return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedAtStart}; nothing was armed` };
   }
 
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
@@ -4165,8 +5645,35 @@ export async function armMergeOnApproval(
       nodeId = nodeIdResult.nodeId;
     }
 
-    const result = await enableAutoMerge(token, nodeId);
+    // Written BEFORE the enable call: an arm GitHub accepts is then covered even if this process dies, or the
+    // database fails, right after (see PendingAutoMergeDisarm). If it cannot be written, nothing is armed.
+    const armRecord = await openArmRecord(db, companyId, ownerRow.id, pr, pr.displayName, nodeId, options.expectedHeadOid ?? null, guard);
+    if (!armRecord.ok) return { kind: armRecord.kind, message: armRecord.message };
+    const forget = armRecord.forget;
+
+    const result = await enableAutoMerge(token, nodeId, {
+      ...(options.expectedHeadOid ? { expectedHeadOid: options.expectedHeadOid } : {}),
+      // Before the first attempt and before every retry.
+      beforeAttempt: authorityChanged,
+    });
+    await armRecord.settleEnable(result);
     if (result.success) {
+      // A revocation that committed while the call was in flight could not be seen before it: look again,
+      // and take the arm back if the authority is no longer what was checked.
+      // A recheck that cannot be completed is treated as a change: an arm that cannot be re-verified is taken back.
+      const changedDuringArm = await authorityChanged().catch((error) =>
+        `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
+      if (changedDuringArm) {
+        const disabled = await disableAutoMerge(token, nodeId);
+        if (disabled.success) await forget();
+        const kept = disabled.success ? "" : await keepAutoMergeDisarmPending(db, companyId, ownerRow.id, pr, nodeId, options.expectedHeadOid ?? null, changedDuringArm, disabled.error);
+        return {
+          kind: "failed",
+          message: `failed:authority-revoked: ${pr.displayName} — ${changedDuringArm} while auto-merge was being enabled; ` +
+            (disabled.success ? "auto-merge was disabled again" : `auto-merge could NOT be disabled (${disabled.error ?? "unknown"}) and is STILL ENABLED${kept}`),
+        };
+      }
+      await forget();
       if (result.alreadyQueued) {
         return {
           kind: "skipped",
@@ -4177,6 +5684,9 @@ export async function armMergeOnApproval(
         kind: "armed",
         message: `armed: Auto-merge enabled for ${pr.displayName}`,
       };
+    }
+    if (result.error?.startsWith("authority_changed:")) {
+      return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${result.error.slice("authority_changed:".length).trim()}; nothing was armed` };
     }
 
     if (result.status === 401 || result.status === 403) {
@@ -4210,14 +5720,34 @@ export async function armMergeOnApproval(
           message: `skipped:no-approved-head: ${pr.displayName} — publishedHeadSha is null, cannot pin the direct merge`,
         };
       }
+      // A caller that verified a head (the live head, with a current approval) merges THAT head and no
+      // other: the card's recorded head can be an older one, and a direct merge has no second chance.
+      if (options.expectedHeadOid && options.expectedHeadOid !== publishedHeadSha) {
+        return {
+          kind: "skipped",
+          message: `skipped:head-mismatch: ${pr.displayName} — the verified head ${options.expectedHeadOid} is not the card's published head ${publishedHeadSha}; no direct merge`,
+        };
+      }
+      const mergeHead = options.expectedHeadOid ?? publishedHeadSha;
+      // A direct merge cannot be taken back, so a head the board released is armed through auto-merge only.
+      if (isBoardReleasedHead(executionState, mergeHead)) {
+        return {
+          kind: "skipped",
+          message: `skipped:direct-merge-not-used: ${pr.displayName} — head ${mergeHead} was released by the board and auto-merge could not be enabled (clean status); a direct merge cannot be taken back, so merge it through the queue or by hand`,
+        };
+      }
 
       const defaultMergeMethod = await fetchDefaultMergeMethod(token, pr.owner, pr.repo) ?? "MERGE";
-      const mergeResult = await mergePullRequest(token, nodeId, publishedHeadSha, defaultMergeMethod);
+      const changedBeforeMerge = await authorityChanged();
+      if (changedBeforeMerge) {
+        return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedBeforeMerge}; no direct merge` };
+      }
+      const mergeResult = await mergePullRequest(token, nodeId, mergeHead, defaultMergeMethod);
 
       if (mergeResult.success) {
         return {
           kind: "armed",
-          message: `armed:direct-merge: ${pr.displayName} (head ${publishedHeadSha})`,
+          message: `armed:direct-merge: ${pr.displayName} (head ${mergeHead})`,
         };
       }
 

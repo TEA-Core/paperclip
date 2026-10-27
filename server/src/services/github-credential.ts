@@ -147,8 +147,12 @@ async function ghAppFetch(
   jwt: string,
   method = "GET",
   body?: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<any> {
   const controller = new AbortController();
+  // A caller's end-to-end deadline cancels this request too, not only its own wait for the answer.
+  if (signal?.aborted) controller.abort(signal.reason);
+  else signal?.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
   const timer = setTimeout(
     () => controller.abort(new Error(`GitHub App API timeout after ${GH_FETCH_TIMEOUT_MS}ms: ${path}`)),
     GH_FETCH_TIMEOUT_MS,
@@ -230,6 +234,7 @@ export async function resolveAppInstallationToken(
   accessContext?: Record<string, unknown>,
   app: GitHubAppDescriptor = DEFAULT_GITHUB_APP,
   permissions?: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<GitHubTokenResolution | null> {
   const permissionsKey = permissions
     ? JSON.stringify(Object.entries(permissions).sort(([a], [b]) => a.localeCompare(b)))
@@ -289,10 +294,10 @@ export async function resolveAppInstallationToken(
   let installationId: string;
   try {
     if (owner && repo) {
-      const installation = await ghAppFetch(`/repos/${owner}/${repo}/installation`, jwt);
+      const installation = await ghAppFetch(`/repos/${owner}/${repo}/installation`, jwt, "GET", undefined, signal);
       installationId = String(installation.id);
     } else {
-      const installations = await ghAppFetch(`/app/installations`, jwt);
+      const installations = await ghAppFetch(`/app/installations`, jwt, "GET", undefined, signal);
       if (!installations.length) {
         logger.warn(
           { companyId },
@@ -337,6 +342,7 @@ export async function resolveAppInstallationToken(
       jwt,
       "POST",
       Object.keys(mintBody).length > 0 ? mintBody : undefined,
+      signal,
     );
   } catch (err) {
     logger.warn(
@@ -504,6 +510,23 @@ export async function resolveGitHubTokenCandidatesForRepo(
   }
 
   return candidates;
+}
+
+/**
+ * The control plane's own GitHub App installation token (the `tea-core` App, DEFAULT_GITHUB_APP) and
+ * nothing else. Used where only that identity's write is honoured downstream (a commit status
+ * scripts/ci/check-paperclip-approved.sh accepts from creator 317012809): there is deliberately no
+ * PAT, project-env or fleet fallback, because a write by any other credential is rejected by CI and
+ * would leave a release that looks done and is not.
+ */
+export async function resolveControlPlaneGitHubToken(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  signal?: AbortSignal,
+): Promise<GitHubTokenResolution | null> {
+  return resolveAppInstallationToken(companyId, secretService(db), owner, repo, undefined, DEFAULT_GITHUB_APP, undefined, signal);
 }
 
 export async function resolveGitHubTokenForRepo(
